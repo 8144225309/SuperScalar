@@ -1,0 +1,1066 @@
+#include "superscalar/ladder.h"
+#include "superscalar/adaptor.h"
+#include "superscalar/regtest.h"
+#include "superscalar/lsp_channels.h"
+#include "cJSON.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+extern void reverse_bytes(unsigned char *data, size_t len);
+extern void sha256_tagged(const char *, const unsigned char *, size_t,
+                           unsigned char *);
+
+#define TEST_ASSERT(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        return 0; \
+    } \
+} while(0)
+
+#define TEST_ASSERT_EQ(a, b, msg) do { \
+    if ((a) != (b)) { \
+        printf("  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
+               __func__, __LINE__, msg, (long)(a), (long)(b)); \
+        return 0; \
+    } \
+} while(0)
+
+/* Secret keys */
+static const unsigned char lsp_sec[32] = { [0 ... 31] = 0x10 };
+static const unsigned char client_secs[4][32] = {
+    { [0 ... 31] = 0x21 },
+    { [0 ... 31] = 0x32 },
+    { [0 ... 31] = 0x43 },
+    { [0 ... 31] = 0x54 },
+};
+
+static secp256k1_context *test_ctx(void) {
+    return secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+}
+
+static void make_client_keypairs(secp256k1_context *ctx,
+                                  secp256k1_keypair *client_kps) {
+    for (int i = 0; i < 4; i++)
+        secp256k1_keypair_create(ctx, &client_kps[i], client_secs[i]);
+}
+
+/* Compute funding spk for 5-of-5 (LSP + 4 clients) */
+static int compute_funding_spk(
+    secp256k1_context *ctx,
+    const secp256k1_keypair *lsp_kp,
+    const secp256k1_keypair *client_kps,
+    unsigned char *spk_out34,
+    secp256k1_xonly_pubkey *tweaked_xonly_out)
+{
+    secp256k1_pubkey pks[5];
+    secp256k1_keypair_pub(ctx, &pks[0], lsp_kp);
+    for (int i = 0; i < 4; i++)
+        secp256k1_keypair_pub(ctx, &pks[i + 1], &client_kps[i]);
+
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, 5)) return 0;
+
+    unsigned char ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tw_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &tmp.cache, tweak))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, tweaked_xonly_out, NULL, &tw_pk))
+        return 0;
+
+    build_p2tr_script_pubkey(spk_out34, tweaked_xonly_out);
+    return 1;
+}
+
+/* --- Unit tests --- */
+
+/* Test 12: Create 3 overlapping factories, verify IDs and lifecycle params */
+int test_ladder_create_factories(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);  /* 100 active, 30 dying */
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Create 3 factories at different blocks */
+    for (int i = 0; i < 3; i++) {
+        fake_txid[0] = (unsigned char)i;
+        ladder_advance_block(&lad, (uint32_t)(i * 100));
+        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                           fake_txid, 0, fund_spk, 34),
+                    "create factory");
+    }
+
+    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories");
+    TEST_ASSERT_EQ(lad.factories[0].factory_id, 0, "factory 0 id");
+    TEST_ASSERT_EQ(lad.factories[1].factory_id, 1, "factory 1 id");
+    TEST_ASSERT_EQ(lad.factories[2].factory_id, 2, "factory 2 id");
+
+    /* Verify lifecycle params */
+    TEST_ASSERT_EQ(lad.factories[0].factory.active_blocks, 100, "f0 active");
+    TEST_ASSERT_EQ(lad.factories[0].factory.dying_blocks, 30, "f0 dying");
+    TEST_ASSERT_EQ(lad.factories[0].factory.created_block, 0, "f0 created");
+    TEST_ASSERT_EQ(lad.factories[1].factory.created_block, 100, "f1 created");
+    TEST_ASSERT_EQ(lad.factories[2].factory.created_block, 200, "f2 created");
+
+    /* All should be initialized and funded */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(lad.factories[i].is_initialized, "initialized");
+        TEST_ASSERT(lad.factories[i].is_funded, "funded");
+    }
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 13: Advance blocks, verify ACTIVE→DYING→EXPIRED transitions */
+int test_ladder_state_transitions(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Create factory at block 0 */
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* At block 0: ACTIVE */
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 0");
+
+    /* At block 50: still ACTIVE */
+    ladder_advance_block(&lad, 50);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 50");
+
+    /* At block 99: last ACTIVE block */
+    ladder_advance_block(&lad, 99);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 99");
+
+    /* At block 100: DYING starts */
+    ladder_advance_block(&lad, 100);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying at 100");
+
+    /* At block 129: last DYING block */
+    ladder_advance_block(&lad, 129);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying at 129");
+
+    /* At block 130: EXPIRED */
+    ladder_advance_block(&lad, 130);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "expired at 130");
+
+    /* Verify helpers */
+    ladder_factory_t *active = ladder_get_active(&lad);
+    TEST_ASSERT(active == NULL, "no active factory");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 14: Record 4 client departures, verify ladder_can_close returns true,
+   build coop close with extracted keys */
+int test_ladder_key_turnover_close(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    secp256k1_pubkey client_pks[4];
+    make_client_keypairs(ctx, client_kps);
+    for (int i = 0; i < 4; i++)
+        secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i]);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Can't close yet */
+    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't close yet");
+
+    /* Simulate PTLC key turnover for each client */
+    secp256k1_pubkey all_pks[5];
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        all_pks[i + 1] = client_pks[i];
+    }
+
+    for (int c = 0; c < 4; c++) {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, all_pks, 5);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                        fake_txid, all_kps, 5, &ka, NULL, &all_pks[c + 1]),
+                    "create pre-sig");
+
+        unsigned char sig[64];
+        TEST_ASSERT(adaptor_adapt(ctx, sig, presig, client_secs[c],
+                                    nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, sig, presig,
+                                            nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+                                                extracted),
+                    "record turnover");
+    }
+
+    /* Now can close */
+    TEST_ASSERT(ladder_can_close(&lad, 0), "can close now");
+
+    /* Build close tx */
+    tx_output_t output;
+    output.amount_sats = 100000 - 500;
+    build_p2tr_script_pubkey(output.script_pubkey, &fund_tweaked);
+    output.script_pubkey_len = 34;
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &output, 1),
+                "build close");
+    TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
+
+    tx_buf_free(&close_tx);
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 15: Create factory at block 0, advance to dying, create factory 2,
+   verify both exist with correct states */
+int test_ladder_overlapping(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid1[32], fake_txid2[32];
+    memset(fake_txid1, 0xAA, 32);
+    memset(fake_txid2, 0xBB, 32);
+
+    /* Create factory 0 at block 0 */
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid1, 0, fund_spk, 34),
+                "create factory 0");
+
+    /* Advance to block 100: factory 0 enters dying */
+    ladder_advance_block(&lad, 100);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f0 dying");
+
+    /* Create factory 1 at block 100 */
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid2, 0, fund_spk, 34),
+                "create factory 1");
+
+    /* Update block to re-evaluate states */
+    ladder_advance_block(&lad, 100);
+
+    /* Verify both exist with correct states */
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories");
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f0 dying");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f1 active");
+
+    /* Get active/dying by state */
+    ladder_factory_t *active = ladder_get_active(&lad);
+    ladder_factory_t *dying = ladder_get_dying(&lad);
+    TEST_ASSERT(active != NULL, "found active");
+    TEST_ASSERT(dying != NULL, "found dying");
+    TEST_ASSERT_EQ(active->factory_id, 1, "active is f1");
+    TEST_ASSERT_EQ(dying->factory_id, 0, "dying is f0");
+
+    /* Advance past factory 0 expiry */
+    ladder_advance_block(&lad, 130);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f1 still active");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- Regtest tests --- */
+
+/* Helper: derive bech32m address from tweaked xonly key */
+static int derive_factory_address(regtest_t *rt, secp256k1_context *ctx,
+                                    const secp256k1_xonly_pubkey *tweaked,
+                                    char *addr_out, size_t addr_len) {
+    unsigned char ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, ser, tweaked);
+    char key_hex[65];
+    hex_encode(ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(rt, "getdescriptorinfo", params);
+    if (!desc_result) return 0;
+
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    if (!dstart) { free(desc_result); return 0; }
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(rt, "deriveaddresses", params);
+    if (!addr_result) return 0;
+
+    char *start = strchr(addr_result, '"'); start++;
+    char *end = strchr(start, '"');
+    size_t len = (size_t)(end - start);
+    if (len >= addr_len) { free(addr_result); return 0; }
+    memcpy(addr_out, start, len);
+    addr_out[len] = '\0';
+    free(addr_result);
+    return 1;
+}
+
+/* Test 16 (regtest): Fund factory, advance through ACTIVE→DYING→EXPIRED */
+int test_regtest_ladder_lifecycle(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_ladder_life");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    /* Find vout */
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding_txid_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                found_vout = v;
+                fund_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find vout");
+
+    /* Use small block counts for regtest: active=10, dying=5 */
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 10, 5);
+
+    /* Get current block height */
+    char *height_str = regtest_exec(&rt, "getblockcount", "");
+    TEST_ASSERT(height_str != NULL, "getblockcount");
+    uint32_t start_height = (uint32_t)atoi(height_str);
+    free(height_str);
+    lad.current_block = start_height;
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund_amount,
+                                       fund_txid_bytes, (uint32_t)found_vout,
+                                       fund_spk, 34),
+                "create factory");
+    printf("  Factory created at block %u\n", start_height);
+
+    /* ACTIVE: mine 5 blocks, verify still active */
+    regtest_mine_blocks(&rt, 5, mine_addr);
+    ladder_advance_block(&lad, start_height + 5);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active +5");
+    printf("  Block %u: ACTIVE\n", start_height + 5);
+
+    /* DYING: mine 5 more (total 10), should be dying */
+    regtest_mine_blocks(&rt, 5, mine_addr);
+    ladder_advance_block(&lad, start_height + 10);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying +10");
+    printf("  Block %u: DYING\n", start_height + 10);
+
+    /* EXPIRED: mine 5 more (total 15), should be expired */
+    regtest_mine_blocks(&rt, 5, mine_addr);
+    ladder_advance_block(&lad, start_height + 15);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "expired +15");
+    printf("  Block %u: EXPIRED\n", start_height + 15);
+
+    printf("  Lifecycle transitions verified on-chain!\n");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 17 (regtest): Full demo - fund factory 1, PTLC migrate, coop-close,
+   fund factory 2 with reclaimed UTXO */
+int test_regtest_ladder_ptlc_migration(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_ladder_ptlc");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    secp256k1_pubkey client_pks[4];
+    make_client_keypairs(ctx, client_kps);
+    for (int i = 0; i < 4; i++)
+        secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i]);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    /* Fund factory 1 */
+    char funding1_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding1_hex),
+                "fund factory 1");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    printf("  Factory 1 funded: %s\n", funding1_hex);
+
+    unsigned char fund1_txid[32];
+    hex_decode(funding1_hex, fund1_txid, 32);
+    reverse_bytes(fund1_txid, 32);
+
+    uint64_t fund1_amount = 0;
+    int fund1_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding1_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                fund1_vout = v;
+                fund1_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(fund1_vout >= 0, "find factory 1 vout");
+
+    /* Create ladder and factory 1 */
+    char *height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t start_height = (uint32_t)atoi(height_str);
+    free(height_str);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 10, 5);  /* active=10, dying=5 */
+    lad.current_block = start_height;
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund1_amount,
+                                       fund1_txid, (uint32_t)fund1_vout,
+                                       fund_spk, 34),
+                "create factory 1");
+
+    /* Advance to dying period */
+    regtest_mine_blocks(&rt, 10, mine_addr);
+    ladder_advance_block(&lad, start_height + 10);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 dying");
+    printf("  Factory 1 now DYING at block %u\n", start_height + 10);
+
+    /* PTLC key turnover for all 4 clients */
+    secp256k1_pubkey all_pks[5];
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        all_pks[i + 1] = client_pks[i];
+    }
+
+    for (int c = 0; c < 4; c++) {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, all_pks, 5);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                        fund1_txid, all_kps, 5, &ka, NULL, &all_pks[c + 1]),
+                    "create pre-sig");
+
+        unsigned char sig[64];
+        TEST_ASSERT(adaptor_adapt(ctx, sig, presig, client_secs[c],
+                                    nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, sig, presig,
+                                            nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+                                                extracted),
+                    "record turnover");
+    }
+    TEST_ASSERT(ladder_can_close(&lad, 0), "can close factory 1");
+
+    /* Build and broadcast cooperative close of factory 1 */
+    /* Output goes to a fresh P2TR address the LSP controls */
+    tx_output_t close_output;
+    close_output.amount_sats = fund1_amount - 500;
+    {
+        secp256k1_pubkey lsp_pk;
+        secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+        secp256k1_xonly_pubkey lsp_xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &lsp_xonly);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw;
+        secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &lsp_xonly, tweak);
+        secp256k1_xonly_pubkey tw_xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw);
+        build_p2tr_script_pubkey(close_output.script_pubkey, &tw_xonly);
+        close_output.script_pubkey_len = 34;
+    }
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1),
+                "build close tx");
+
+    char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
+    hex_encode(close_tx.data, close_tx.len, close_hex);
+
+    char close_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, close_hex, close_txid_hex);
+    free(close_hex);
+    TEST_ASSERT(sent, "broadcast close");
+    printf("  Factory 1 coop close: %s\n", close_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, close_txid_hex);
+    TEST_ASSERT(conf > 0, "close confirmed");
+
+    /* Now fund factory 2 using a new funding tx */
+    char funding2_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding2_hex),
+                "fund factory 2");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    printf("  Factory 2 funded: %s\n", funding2_hex);
+
+    unsigned char fund2_txid[32];
+    hex_decode(funding2_hex, fund2_txid, 32);
+    reverse_bytes(fund2_txid, 32);
+
+    uint64_t fund2_amount = 0;
+    int fund2_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding2_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                fund2_vout = v;
+                fund2_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(fund2_vout >= 0, "find factory 2 vout");
+
+    /* Update current block */
+    height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t cur_height = (uint32_t)atoi(height_str);
+    free(height_str);
+    ladder_advance_block(&lad, cur_height);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund2_amount,
+                                       fund2_txid, (uint32_t)fund2_vout,
+                                       fund_spk, 34),
+                "create factory 2");
+
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories in ladder");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
+    printf("  Factory 2 created and ACTIVE. Full migration demo complete!\n");
+
+    tx_buf_free(&close_tx);
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 18 (regtest): Fund factory, advance past CLTV timeout, broadcast
+   pre-signed distribution tx, verify clients receive funds */
+int test_regtest_ladder_distribution_fallback(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_dist");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    char funding_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_hex),
+                "fund");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid[32];
+    hex_decode(funding_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                found_vout = v;
+                fund_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find vout");
+
+    /* Get current height */
+    char *height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t start_height = (uint32_t)atoi(height_str);
+    free(height_str);
+
+    /* nLockTime = current height + 20 (simulates CLTV timeout) */
+    uint32_t nlocktime = start_height + 20;
+
+    /* Build factory with 5 keypairs */
+    secp256k1_keypair all_kps[5];
+    secp256k1_pubkey all_pks[5];
+    all_kps[0] = lsp_kp;
+    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i]);
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Build distribution tx: 5 equal outputs (1 per participant) */
+    uint64_t dist_fee = 500;
+    uint64_t per_output = (fund_amount - dist_fee) / 5;
+    uint64_t remainder = (fund_amount - dist_fee) - per_output * 5;
+
+    tx_output_t dist_outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &all_pks[i]);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw;
+        secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak);
+        secp256k1_xonly_pubkey tw_xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw);
+        build_p2tr_script_pubkey(dist_outputs[i].script_pubkey, &tw_xonly);
+        dist_outputs[i].script_pubkey_len = 34;
+        dist_outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+                                               dist_outputs, 5, nlocktime),
+                "build distribution tx");
+    TEST_ASSERT(dist_tx.len > 0, "dist tx non-empty");
+    printf("  Distribution tx built (nLockTime=%u)\n", nlocktime);
+
+    /* Try broadcasting before nLockTime — should fail (BIP-113 median time) */
+    char *dist_hex = (char *)malloc(dist_tx.len * 2 + 1);
+    hex_encode(dist_tx.data, dist_tx.len, dist_hex);
+
+    char dist_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, dist_hex, dist_txid_hex);
+    /* This might succeed or fail depending on current height vs nLockTime */
+    if (sent) {
+        printf("  Distribution tx already accepted (height >= nLockTime)\n");
+    } else {
+        printf("  Distribution tx rejected (height < nLockTime), mining...\n");
+
+        /* Mine until past nLockTime */
+        height_str = regtest_exec(&rt, "getblockcount", "");
+        uint32_t cur = (uint32_t)atoi(height_str);
+        free(height_str);
+
+        int blocks_needed = (int)(nlocktime - cur + 1);
+        if (blocks_needed > 0)
+            regtest_mine_blocks(&rt, blocks_needed, mine_addr);
+
+        /* Try again */
+        sent = regtest_send_raw_tx(&rt, dist_hex, dist_txid_hex);
+        TEST_ASSERT(sent, "distribution tx accepted after nLockTime");
+    }
+    free(dist_hex);
+
+    printf("  Distribution tx broadcast: %s\n", dist_txid_hex);
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, dist_txid_hex);
+    TEST_ASSERT(conf > 0, "distribution tx confirmed");
+    printf("  Distribution tx confirmed! Clients receive fallback funds.\n");
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- Continuous Ladder Daemon (Gap #3) tests --- */
+
+/* Test: ladder_evict_expired removes EXPIRED factories and compacts array */
+int test_ladder_evict_expired(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Create 3 factories at blocks 0, 100, 200 */
+    for (int i = 0; i < 3; i++) {
+        fake_txid[0] = (unsigned char)i;
+        ladder_advance_block(&lad, (uint32_t)(i * 100));
+        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                           fake_txid, 0, fund_spk, 34),
+                    "create factory");
+    }
+    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories");
+
+    /* Advance to block 310: factory 0 EXPIRED (0+100+30=130), factory 1 EXPIRED (100+100+30=230),
+       factory 2 DYING (200+100=300..330) */
+    ladder_advance_block(&lad, 310);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_EXPIRED, "f1 expired");
+    TEST_ASSERT_EQ(lad.factories[2].cached_state, FACTORY_DYING, "f2 dying");
+
+    /* Evict expired */
+    size_t freed = ladder_evict_expired(&lad);
+    TEST_ASSERT_EQ(freed, 2, "freed 2 slots");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory remaining");
+    TEST_ASSERT_EQ(lad.factories[0].factory_id, 2, "remaining is factory 2");
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "still dying");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: auto-rotation trigger fires only on ACTIVE→DYING transition,
+   and rot_attempted_mask prevents double-trigger */
+int test_rotation_trigger_condition(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Save old state */
+    factory_state_t old_state = lad.factories[0].cached_state;
+    TEST_ASSERT_EQ(old_state, FACTORY_ACTIVE, "starts active");
+
+    /* Advance to DYING */
+    ladder_advance_block(&lad, 100);
+    factory_state_t new_state = lad.factories[0].cached_state;
+    TEST_ASSERT_EQ(new_state, FACTORY_DYING, "now dying");
+
+    /* Simulate trigger condition check */
+    uint32_t attempted_mask = 0;
+    int should_trigger = (new_state == FACTORY_DYING &&
+                          old_state == FACTORY_ACTIVE &&
+                          !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(should_trigger, "trigger fires on ACTIVE->DYING");
+
+    /* Mark as attempted */
+    attempted_mask |= (1u << lad.factories[0].factory_id);
+
+    /* Same transition again (e.g. re-checking same height) — should NOT trigger */
+    old_state = new_state;
+    ladder_advance_block(&lad, 101);
+    new_state = lad.factories[0].cached_state;
+    should_trigger = (new_state == FACTORY_DYING &&
+                      old_state == FACTORY_ACTIVE &&
+                      !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(!should_trigger, "no double trigger (state same)");
+
+    /* Factory 0 already attempted, so even with forced condition it's masked */
+    should_trigger = (1 && !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(!should_trigger, "masked by attempted_mask");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: rotation context fields survive the save/restore pattern
+   used in lsp_channels_rotate_factory */
+int test_rotation_context_save_restore(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Build a minimal factory for lsp_channels_init */
+    unsigned char lsp_sec_local[32];
+    memset(lsp_sec_local, 0x10, 32);
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec_local);
+
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    for (int i = 0; i < 4; i++) {
+        unsigned char s[32];
+        memset(s, 0x21 + i * 0x11, 32);
+        secp256k1_keypair_create(ctx, &all_kps[i + 1], s);
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0xBB, 32);
+    memset(fake_spk, 0xCC, 34);
+    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Init mgr with rot fields set */
+    lsp_channel_mgr_t mgr;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "init mgr");
+
+    /* Set rot fields */
+    memset(mgr.rot_lsp_seckey, 0xAA, 32);
+    mgr.rot_fee_est = (void *)0xDEADBEEF;
+    memset(mgr.rot_fund_spk, 0xBB, 34);
+    mgr.rot_fund_spk_len = 34;
+    strncpy(mgr.rot_fund_addr, "tb1qtest123", sizeof(mgr.rot_fund_addr));
+    strncpy(mgr.rot_mine_addr, "tb1qmine456", sizeof(mgr.rot_mine_addr));
+    mgr.rot_step_blocks = 10;
+    mgr.rot_states_per_layer = 4;
+    mgr.rot_is_regtest = 1;
+    mgr.rot_funding_sats = 100000;
+    mgr.rot_auto_rotate = 1;
+    mgr.rot_attempted_mask = 0x05;
+    mgr.bridge_fd = 42;
+    mgr.persist = (void *)0xCAFEBABE;
+    mgr.ladder = (void *)0x12345678;
+
+    /* Save state (same pattern as lsp_channels_rotate_factory) */
+    int saved_bridge_fd = mgr.bridge_fd;
+    void *saved_persist = mgr.persist;
+    void *saved_ladder = mgr.ladder;
+    unsigned char saved_seckey[32];
+    memcpy(saved_seckey, mgr.rot_lsp_seckey, 32);
+    void *saved_fee_est = mgr.rot_fee_est;
+    uint16_t saved_step_blocks = mgr.rot_step_blocks;
+    uint32_t saved_spl = mgr.rot_states_per_layer;
+    int saved_is_regtest = mgr.rot_is_regtest;
+    uint64_t saved_funding_sats = mgr.rot_funding_sats;
+    int saved_auto_rotate = mgr.rot_auto_rotate;
+    uint32_t saved_attempted_mask = mgr.rot_attempted_mask;
+
+    /* Re-init (memsets mgr to 0) */
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "reinit mgr");
+
+    /* Verify fields are zeroed */
+    TEST_ASSERT_EQ(mgr.bridge_fd, -1, "bridge_fd reset to -1");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, 0, "persist zeroed");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.ladder, 0, "ladder zeroed");
+    TEST_ASSERT_EQ(mgr.rot_auto_rotate, 0, "rot_auto_rotate zeroed");
+
+    /* Restore */
+    mgr.bridge_fd = saved_bridge_fd;
+    mgr.persist = saved_persist;
+    mgr.ladder = saved_ladder;
+    memcpy(mgr.rot_lsp_seckey, saved_seckey, 32);
+    mgr.rot_fee_est = saved_fee_est;
+    mgr.rot_step_blocks = saved_step_blocks;
+    mgr.rot_states_per_layer = saved_spl;
+    mgr.rot_is_regtest = saved_is_regtest;
+    mgr.rot_funding_sats = saved_funding_sats;
+    mgr.rot_auto_rotate = saved_auto_rotate;
+    mgr.rot_attempted_mask = saved_attempted_mask;
+
+    /* Verify restored values */
+    TEST_ASSERT_EQ(mgr.bridge_fd, 42, "bridge_fd restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, (long)(uintptr_t)0xCAFEBABE, "persist restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.ladder, (long)(uintptr_t)0x12345678, "ladder restored");
+    unsigned char expected_seckey[32];
+    memset(expected_seckey, 0xAA, 32);
+    TEST_ASSERT(memcmp(mgr.rot_lsp_seckey, expected_seckey, 32) == 0, "seckey restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.rot_fee_est, (long)(uintptr_t)0xDEADBEEF, "fee_est restored");
+    TEST_ASSERT_EQ(mgr.rot_step_blocks, 10, "step_blocks restored");
+    TEST_ASSERT_EQ(mgr.rot_states_per_layer, 4, "spl restored");
+    TEST_ASSERT_EQ(mgr.rot_is_regtest, 1, "is_regtest restored");
+    TEST_ASSERT_EQ((long)mgr.rot_funding_sats, 100000, "funding_sats restored");
+    TEST_ASSERT_EQ(mgr.rot_auto_rotate, 1, "auto_rotate restored");
+    TEST_ASSERT_EQ(mgr.rot_attempted_mask, 0x05, "attempted_mask restored");
+
+    memset(saved_seckey, 0, 32);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
