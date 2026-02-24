@@ -216,7 +216,7 @@ typedef struct {
     fee_estimator_t *fee;
     regtest_t *rt;
     jit_channel_t *jit_ch;  /* JIT channel, or NULL */
-    int auto_accept_jit;    /* 1 = auto-accept JIT offers (GAP-3) */
+    int auto_accept_jit;    /* 1 = auto-accept JIT offers */
 } daemon_cb_data_t;
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -578,7 +578,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             printf("Client %u: JIT offer received (%llu sats, reason: %s)\n",
                    my_index, (unsigned long long)jit_amount, jit_reason);
 
-            /* Gate JIT acceptance behind flag (GAP-3) */
+            /* Gate JIT acceptance behind flag */
             if (!cbd->auto_accept_jit) {
                 printf("Client %u: rejecting JIT offer "
                        "(use --auto-accept-jit to enable)\n", my_index);

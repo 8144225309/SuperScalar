@@ -189,7 +189,7 @@ int test_persist_htlc_round_trip(void) {
     return 1;
 }
 
-/* ---- Test: HTLC delete (GAP-4b) ---- */
+/* ---- Test: HTLC delete ---- */
 
 int test_persist_htlc_delete(void) {
     persist_t db;
@@ -225,10 +225,55 @@ int test_persist_htlc_delete(void) {
     TEST_ASSERT_EQ(loaded[0].id, 11, "remaining htlc id");
     TEST_ASSERT_EQ(loaded[0].amount_sats, 3000, "remaining amount");
 
+    /* Verify remaining HTLC fields fully */
+    {
+        unsigned char expected_hash[32];
+        memset(expected_hash, 0xBB, 32);
+        TEST_ASSERT(memcmp(loaded[0].payment_hash, expected_hash, 32) == 0,
+                    "remaining htlc hash");
+    }
+    TEST_ASSERT_EQ(loaded[0].cltv_expiry, 600, "remaining cltv");
+
     /* Delete h2 */
     TEST_ASSERT(persist_delete_htlc(&db, 0, 11), "delete htlc 11");
     count = persist_load_htlcs(&db, 0, loaded, 16);
     TEST_ASSERT_EQ(count, 0, "count after second delete");
+
+    /* Deleting non-existent HTLC should succeed (no-op in SQLite) */
+    TEST_ASSERT(persist_delete_htlc(&db, 0, 999), "delete non-existent");
+
+    /* Cross-channel isolation: HTLCs on different channels are independent */
+    htlc_t h3 = {0};
+    h3.id = 20;
+    h3.direction = HTLC_OFFERED;
+    h3.state = HTLC_STATE_ACTIVE;
+    h3.amount_sats = 7000;
+    memset(h3.payment_hash, 0xCC, 32);
+
+    htlc_t h4 = {0};
+    h4.id = 20;  /* same htlc_id, different channel */
+    h4.direction = HTLC_OFFERED;
+    h4.state = HTLC_STATE_ACTIVE;
+    h4.amount_sats = 9000;
+    memset(h4.payment_hash, 0xDD, 32);
+
+    TEST_ASSERT(persist_save_htlc(&db, 0, &h3), "save ch0 htlc");
+    TEST_ASSERT(persist_save_htlc(&db, 1, &h4), "save ch1 htlc");
+
+    /* Delete from channel 0 only */
+    TEST_ASSERT(persist_delete_htlc(&db, 0, 20), "delete ch0 htlc");
+    count = persist_load_htlcs(&db, 0, loaded, 16);
+    TEST_ASSERT_EQ(count, 0, "ch0 empty after delete");
+
+    /* Channel 1 still has its HTLC */
+    count = persist_load_htlcs(&db, 1, loaded, 16);
+    TEST_ASSERT_EQ(count, 1, "ch1 still has htlc");
+    TEST_ASSERT_EQ(loaded[0].amount_sats, 9000, "ch1 htlc amount");
+
+    /* Delete wrong channel — no effect */
+    TEST_ASSERT(persist_delete_htlc(&db, 0, 20), "delete wrong channel");
+    count = persist_load_htlcs(&db, 1, loaded, 16);
+    TEST_ASSERT_EQ(count, 1, "ch1 unaffected by wrong-channel delete");
 
     persist_close(&db);
     return 1;
@@ -675,7 +720,7 @@ int test_persist_basepoints(void) {
     return 1;
 }
 
-/* ---- Test: LSP recovery round-trip (GAP-2) ---- */
+/* ---- Test: LSP recovery round-trip ---- */
 
 int test_lsp_recovery_round_trip(void) {
     persist_t db;
@@ -767,6 +812,30 @@ int test_lsp_recovery_round_trip(void) {
                         ch->local_amount, ch->remote_amount,
                         ch->commitment_number), "update balance");
     }
+
+    /* Save an active HTLC on channel 0 for recovery testing */
+    {
+        htlc_t test_htlc;
+        memset(&test_htlc, 0, sizeof(test_htlc));
+        test_htlc.id = 42;
+        test_htlc.direction = HTLC_OFFERED;
+        test_htlc.state = HTLC_STATE_ACTIVE;
+        test_htlc.amount_sats = 2500;
+        memset(test_htlc.payment_hash, 0xDD, 32);
+        test_htlc.cltv_expiry = 700;
+        TEST_ASSERT(persist_save_htlc(&db, 0, &test_htlc), "save test htlc");
+
+        /* Also save a fulfilled HTLC — should NOT be loaded on recovery */
+        htlc_t dead_htlc;
+        memset(&dead_htlc, 0, sizeof(dead_htlc));
+        dead_htlc.id = 43;
+        dead_htlc.direction = HTLC_OFFERED;
+        dead_htlc.state = HTLC_STATE_FULFILLED;
+        dead_htlc.amount_sats = 1000;
+        memset(dead_htlc.payment_hash, 0xEE, 32);
+        dead_htlc.cltv_expiry = 800;
+        TEST_ASSERT(persist_save_htlc(&db, 0, &dead_htlc), "save dead htlc");
+    }
     TEST_ASSERT(persist_commit(&db), "commit");
 
     /* Now recover: load factory from DB, init channels from DB */
@@ -781,8 +850,8 @@ int test_lsp_recovery_round_trip(void) {
                 "init from db");
     TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "n_channels");
 
-    /* Verify recovered channel state matches saved state (check first 2 which had payments) */
-    for (size_t c = 0; c < 2; c++) {
+    /* Verify ALL 4 channels recovered correctly */
+    for (size_t c = 0; c < 4; c++) {
         const channel_t *orig = &mgr.entries[c].channel;
         const channel_t *rec = &rec_mgr.entries[c].channel;
 
@@ -805,7 +874,7 @@ int test_lsp_recovery_round_trip(void) {
                            orig->local_htlc_basepoint_secret, 32) == 0,
                     "htlc secret match");
 
-        /* Verify remote basepoint pubkeys match */
+        /* Verify ALL 4 remote basepoint pubkeys match */
         unsigned char orig_ser[33], rec_ser[33];
         size_t slen;
 
@@ -825,9 +894,40 @@ int test_lsp_recovery_round_trip(void) {
             &rec->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
         TEST_ASSERT(memcmp(orig_ser, rec_ser, 33) == 0, "remote delay bp");
 
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, orig_ser, &slen,
+            &orig->remote_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, rec_ser, &slen,
+            &rec->remote_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+        TEST_ASSERT(memcmp(orig_ser, rec_ser, 33) == 0, "remote revoc bp");
+
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, orig_ser, &slen,
+            &orig->remote_htlc_basepoint, SECP256K1_EC_COMPRESSED);
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, rec_ser, &slen,
+            &rec->remote_htlc_basepoint, SECP256K1_EC_COMPRESSED);
+        TEST_ASSERT(memcmp(orig_ser, rec_ser, 33) == 0, "remote htlc bp");
+
         /* Verify channel is marked ready */
         TEST_ASSERT_EQ(rec_mgr.entries[c].ready, 1, "channel ready");
     }
+
+    /* Verify HTLC recovery: channel 0 should have 1 active HTLC (not the fulfilled one) */
+    TEST_ASSERT_EQ(rec_mgr.entries[0].channel.n_htlcs, 1, "ch0 htlc count");
+    TEST_ASSERT_EQ(rec_mgr.entries[0].channel.htlcs[0].id, 42, "ch0 htlc id");
+    TEST_ASSERT_EQ(rec_mgr.entries[0].channel.htlcs[0].amount_sats, 2500, "ch0 htlc amount");
+    TEST_ASSERT_EQ(rec_mgr.entries[0].channel.htlcs[0].state, HTLC_STATE_ACTIVE, "ch0 htlc state");
+    {
+        unsigned char expected_hash[32];
+        memset(expected_hash, 0xDD, 32);
+        TEST_ASSERT(memcmp(rec_mgr.entries[0].channel.htlcs[0].payment_hash,
+                           expected_hash, 32) == 0, "ch0 htlc hash");
+    }
+
+    /* Channel 1 should have no HTLCs */
+    TEST_ASSERT_EQ(rec_mgr.entries[1].channel.n_htlcs, 0, "ch1 no htlcs");
 
     secp256k1_context_destroy(ctx);
     persist_close(&db);

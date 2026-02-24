@@ -86,7 +86,7 @@ typedef struct {
     /* Factory arity (Upgrade 2) */
     int leaf_arity;                /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
 
-    /* Configurable confirmation timeout (GAP-7) */
+    /* Configurable confirmation timeout */
     int confirm_timeout_secs;      /* 0 = use default (3600 regtest, 7200 non-regtest) */
 } lsp_channel_mgr_t;
 

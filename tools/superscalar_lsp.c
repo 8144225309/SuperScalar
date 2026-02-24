@@ -505,8 +505,13 @@ int main(int argc, char *argv[]) {
             leaf_arity = atoi(argv[++i]);
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
-        else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
             confirm_timeout_arg = atoi(argv[++i]);
+            if (confirm_timeout_arg <= 0) {
+                fprintf(stderr, "Error: --confirm-timeout must be positive\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -517,7 +522,7 @@ int main(int argc, char *argv[]) {
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
 
-    /* Resolve confirmation timeout (GAP-7) */
+    /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
                                : (is_regtest ? 3600 : 7200);
 
@@ -643,11 +648,19 @@ int main(int argc, char *argv[]) {
                     network, (unsigned long long)fee_rate);
     }
 
-    /* === GAP-2: Recovery probe === */
+    /* === Recovery probe: skip ceremony if factory exists in DB === */
     if (use_db && daemon_mode) {
         factory_t rec_f;
         memset(&rec_f, 0, sizeof(rec_f));
         if (persist_load_factory(&db, 0, &rec_f, ctx)) {
+            if (rec_f.n_participants < 2) {
+                fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
+                        rec_f.n_participants);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
             printf("LSP: found existing factory in DB, entering recovery mode\n");
 
             /* Set up LSP with listen socket only (skip ceremony) */
@@ -852,27 +865,55 @@ int main(int argc, char *argv[]) {
                                             &jit_count);
                 mgr.n_jit_channels = jit_count;
                 for (size_t ji = 0; ji < jit_count; ji++) {
-                    if (jits[ji].state == JIT_STATE_OPEN) {
-                        unsigned char ls[4][32], rb[4][33];
-                        if (persist_load_basepoints(&db,
-                                jits[ji].jit_channel_id, ls, rb)) {
-                            memcpy(jits[ji].channel.local_payment_basepoint_secret, ls[0], 32);
-                            memcpy(jits[ji].channel.local_delayed_payment_basepoint_secret, ls[1], 32);
-                            memcpy(jits[ji].channel.local_revocation_basepoint_secret, ls[2], 32);
-                            memcpy(jits[ji].channel.local_htlc_basepoint_secret, ls[3], 32);
-                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_payment_basepoint, ls[0]);
-                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_delayed_payment_basepoint, ls[1]);
-                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_revocation_basepoint, ls[2]);
-                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_htlc_basepoint, ls[3]);
-                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_payment_basepoint, rb[0], 33);
-                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_delayed_payment_basepoint, rb[1], 33);
-                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_revocation_basepoint, rb[2], 33);
-                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_htlc_basepoint, rb[3], 33);
-                        }
-                        size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
-                        watchtower_set_channel(&rec_wt, wt_idx,
-                                                &jits[ji].channel);
+                    if (jits[ji].state != JIT_STATE_OPEN)
+                        continue;
+
+                    unsigned char ls[4][32], rb[4][33];
+                    if (!persist_load_basepoints(&db,
+                            jits[ji].jit_channel_id, ls, rb)) {
+                        fprintf(stderr, "LSP recovery: JIT channel %u "
+                                "missing basepoints, disabling\n",
+                                jits[ji].jit_channel_id);
+                        jits[ji].state = JIT_STATE_CLOSED;
+                        continue;
                     }
+
+                    channel_t *jch = &jits[ji].channel;
+                    memcpy(jch->local_payment_basepoint_secret, ls[0], 32);
+                    memcpy(jch->local_delayed_payment_basepoint_secret, ls[1], 32);
+                    memcpy(jch->local_revocation_basepoint_secret, ls[2], 32);
+                    memcpy(jch->local_htlc_basepoint_secret, ls[3], 32);
+
+                    int bp_ok = 1;
+                    bp_ok &= secp256k1_ec_pubkey_create(ctx,
+                                &jch->local_payment_basepoint, ls[0]);
+                    bp_ok &= secp256k1_ec_pubkey_create(ctx,
+                                &jch->local_delayed_payment_basepoint, ls[1]);
+                    bp_ok &= secp256k1_ec_pubkey_create(ctx,
+                                &jch->local_revocation_basepoint, ls[2]);
+                    bp_ok &= secp256k1_ec_pubkey_create(ctx,
+                                &jch->local_htlc_basepoint, ls[3]);
+                    bp_ok &= secp256k1_ec_pubkey_parse(ctx,
+                                &jch->remote_payment_basepoint, rb[0], 33);
+                    bp_ok &= secp256k1_ec_pubkey_parse(ctx,
+                                &jch->remote_delayed_payment_basepoint, rb[1], 33);
+                    bp_ok &= secp256k1_ec_pubkey_parse(ctx,
+                                &jch->remote_revocation_basepoint, rb[2], 33);
+                    bp_ok &= secp256k1_ec_pubkey_parse(ctx,
+                                &jch->remote_htlc_basepoint, rb[3], 33);
+                    memset(ls, 0, sizeof(ls));
+
+                    if (!bp_ok) {
+                        fprintf(stderr, "LSP recovery: JIT channel %u "
+                                "has corrupt basepoints, disabling\n",
+                                jits[ji].jit_channel_id);
+                        jits[ji].state = JIT_STATE_CLOSED;
+                        continue;
+                    }
+
+                    size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
+                    if (wt_idx < WATCHTOWER_MAX_CHANNELS)
+                        watchtower_set_channel(&rec_wt, wt_idx, jch);
                 }
                 if (jit_count > 0)
                     printf("LSP recovery: loaded %zu JIT channels from DB\n",
@@ -1233,7 +1274,7 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        /* Save factory channel basepoints to DB for recovery (GAP-2) */
+        /* Save factory channel basepoints to DB for recovery */
         if (use_db) {
             if (!persist_begin(&db)) {
                 fprintf(stderr, "LSP: warning: persist_begin failed for basepoint save\n");
@@ -1258,7 +1299,7 @@ int main(int argc, char *argv[]) {
         /* Set persistence pointer (Phase 23) */
         mgr.persist = use_db ? &db : NULL;
 
-        /* Set configurable confirmation timeout (GAP-7) */
+        /* Set configurable confirmation timeout */
         mgr.confirm_timeout_secs = confirm_timeout_secs;
 
         /* Load persisted state (Phase 23) */

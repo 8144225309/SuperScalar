@@ -277,7 +277,7 @@ extern int test_basepoint_independence(void);
 extern int test_random_basepoints(void);
 extern int test_persist_basepoints(void);
 
-/* LSP Recovery (GAP-2) */
+/* LSP Recovery */
 extern int test_lsp_recovery_round_trip(void);
 
 /* Client Watchtower (Bidirectional Revocation) */
@@ -608,7 +608,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_random_basepoints);
     RUN_TEST(test_persist_basepoints);
 
-    printf("\n=== LSP Recovery (GAP-2) ===\n");
+    printf("\n=== LSP Recovery ===\n");
     RUN_TEST(test_lsp_recovery_round_trip);
 
     printf("\n=== Client Watchtower ===\n");

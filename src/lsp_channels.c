@@ -255,6 +255,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                                        local_secrets[1],
                                        local_secrets[2]);
         channel_set_local_htlc_basepoint(&entry->channel, local_secrets[3]);
+        memset(local_secrets, 0, sizeof(local_secrets));
 
         /* Set remote basepoints from loaded pubkeys */
         secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc;
@@ -279,7 +280,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
 
-        /* Load active HTLCs from DB (GAP-4b) */
+        /* Load active HTLCs from DB */
         {
             htlc_t loaded_htlcs[MAX_HTLCS];
             size_t n_loaded = persist_load_htlcs(pdb, (uint32_t)c,
@@ -611,6 +612,22 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
+    /* Persist in-flight HTLC BEFORE commitment exchange.
+       If we crash after CS but before persist, the HTLC is in committed
+       state but not tracked. Persisting first avoids that window. */
+    if (mgr->persist) {
+        htlc_t persist_htlc;
+        memset(&persist_htlc, 0, sizeof(persist_htlc));
+        persist_htlc.id = dest_htlc_id;
+        persist_htlc.direction = HTLC_OFFERED;
+        persist_htlc.state = HTLC_STATE_ACTIVE;
+        persist_htlc.amount_sats = amount_sats;
+        memcpy(persist_htlc.payment_hash, payment_hash, 32);
+        persist_htlc.cltv_expiry = cltv_expiry;
+        persist_save_htlc((persist_t *)mgr->persist,
+                            (uint32_t)dest_idx, &persist_htlc);
+    }
+
     /* Forward ADD_HTLC to destination */
     {
         cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
@@ -668,20 +685,6 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
         }
         cJSON_Delete(ack_msg.json);
-    }
-
-    /* Persist in-flight HTLC for replay on reconnect (GAP-4b) */
-    if (mgr->persist) {
-        htlc_t persist_htlc;
-        memset(&persist_htlc, 0, sizeof(persist_htlc));
-        persist_htlc.id = dest_htlc_id;
-        persist_htlc.direction = HTLC_OFFERED;
-        persist_htlc.state = HTLC_STATE_ACTIVE;
-        persist_htlc.amount_sats = amount_sats;
-        memcpy(persist_htlc.payment_hash, payment_hash, 32);
-        persist_htlc.cltv_expiry = cltv_expiry;
-        persist_save_htlc((persist_t *)mgr->persist,
-                            (uint32_t)dest_idx, &persist_htlc);
     }
 
     printf("LSP: HTLC %llu forwarded: client %zu -> client %zu (%llu sats)\n",
@@ -957,7 +960,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (mgr->persist)
         persist_deactivate_invoice((persist_t *)mgr->persist, payment_hash);
 
-    /* Delete settled HTLC from persistence (GAP-4b) */
+    /* Delete settled HTLC from persistence */
     if (mgr->persist)
         persist_delete_htlc((persist_t *)mgr->persist,
                               (uint32_t)client_idx, htlc_id);
@@ -1085,6 +1088,10 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         channel_t *ch = &mgr->entries[client_idx].channel;
         channel_fail_htlc(ch, htlc_id);
+        /* Delete failed HTLC from persistence */
+        if (mgr->persist)
+            persist_delete_htlc((persist_t *)mgr->persist,
+                                  (uint32_t)client_idx, htlc_id);
         printf("LSP: HTLC %llu failed by client %zu: %s\n",
                (unsigned long long)htlc_id, client_idx, reason);
         return 1;
@@ -1364,6 +1371,10 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             } else {
                 /* Fail the HTLC */
                 channel_fail_htlc(ch, htlc_id);
+                /* Delete failed HTLC from persistence */
+                if (mgr->persist)
+                    persist_delete_htlc((persist_t *)mgr->persist,
+                                          (uint32_t)client_idx, htlc_id);
                 cJSON *fail = wire_build_update_fail_htlc(htlc_id, "bridge_pay_failed");
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FAIL_HTLC, fail);
                 cJSON_Delete(fail);
@@ -1516,24 +1527,11 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack);
     }
 
-    /* Replay in-flight HTLCs from persistence (GAP-4b) */
-    if (mgr->persist) {
-        htlc_t pending[MAX_HTLCS];
-        size_t n_pending = persist_load_htlcs((persist_t *)mgr->persist,
-                                                (uint32_t)c, pending, MAX_HTLCS);
-        for (size_t h = 0; h < n_pending; h++) {
-            if (pending[h].state != HTLC_STATE_ACTIVE) continue;
-            cJSON *add = wire_build_update_add_htlc(
-                pending[h].id,
-                pending[h].amount_sats * 1000,  /* sats → msat */
-                pending[h].payment_hash,
-                pending[h].cltv_expiry);
-            if (wire_send(new_fd, MSG_UPDATE_ADD_HTLC, add))
-                printf("LSP reconnect: replayed HTLC %llu to client %zu\n",
-                       (unsigned long long)pending[h].id, c);
-            cJSON_Delete(add);
-        }
-    }
+    /* In-flight HTLCs: no replay needed on reconnect.
+       Both sides already have committed HTLCs from before disconnect.
+       Recovery path loads HTLCs into channel.htlcs[] via init_from_db.
+       Normal reconnect path retains them in memory.
+       Replaying ADD without full commitment exchange would be a protocol violation. */
 
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);
