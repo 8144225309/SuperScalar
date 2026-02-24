@@ -1365,7 +1365,10 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
     noise_state_t ns;
     if (!noise_handshake_initiator(&ns, fd, ctx))
         return 0;
-    wire_set_encryption(fd, &ns);
+    if (!wire_set_encryption(fd, &ns)) {
+        memset(&ns, 0, sizeof(ns));
+        return 0;
+    }
     memset(&ns, 0, sizeof(ns));
     return 1;
 }
@@ -1374,7 +1377,10 @@ int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
     noise_state_t ns;
     if (!noise_handshake_responder(&ns, fd, ctx))
         return 0;
-    wire_set_encryption(fd, &ns);
+    if (!wire_set_encryption(fd, &ns)) {
+        memset(&ns, 0, sizeof(ns));
+        return 0;
+    }
     memset(&ns, 0, sizeof(ns));
     return 1;
 }

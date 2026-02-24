@@ -284,6 +284,21 @@ void persist_close(persist_t *p) {
     }
 }
 
+int persist_begin(persist_t *p) {
+    if (!p || !p->db) return 0;
+    return sqlite3_exec(p->db, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK;
+}
+
+int persist_commit(persist_t *p) {
+    if (!p || !p->db) return 0;
+    return sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+}
+
+int persist_rollback(persist_t *p) {
+    if (!p || !p->db) return 0;
+    return sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK;
+}
+
 /* --- Factory --- */
 
 int persist_save_factory(persist_t *p, const factory_t *f,

@@ -108,6 +108,7 @@ for arg in "$@"; do
         --client-breach)  MODE_CLIENT_BREACH=1 ;;
         --rotation)       MODE_ROTATION=1 ;;
         --all)            MODE_BASIC=1; MODE_BREACH=1; MODE_CLIENT_BREACH=1; MODE_ROTATION=1 ;;
+        --signet)         NETWORK="signet"; CLI_ARGS="-signet" ;;
         --dashboard) LAUNCH_DASHBOARD=1 ;;
         --help|-h)
             echo "Usage: bash tools/run_demo.sh [OPTIONS]"
@@ -118,6 +119,7 @@ for arg in "$@"; do
             echo "  --client-breach  Client-side breach detection (clients catch LSP cheat)"
             echo "  --rotation       Full factory rotation (Factory 0 → Factory 1)"
             echo "  --all            Run all demos sequentially"
+            echo "  --signet         Use signet (only --basic works; breach/rotation need mining)"
             echo "  --dashboard      Launch web dashboard after demo"
             echo "  --help           Show this help"
             exit 0 ;;
@@ -203,20 +205,25 @@ else
     ok "bitcoind already running"
 fi
 
-# Ensure wallet exists
+# Ensure wallet exists and is loaded
 if ! bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getbalance >/dev/null 2>&1; then
-    bitcoin-cli $CLI_ARGS createwallet superscalar_lsp >/dev/null 2>&1 || true
-    ok "Created wallet 'superscalar_lsp'"
+    bitcoin-cli $CLI_ARGS createwallet superscalar_lsp >/dev/null 2>&1 || \
+        bitcoin-cli $CLI_ARGS loadwallet superscalar_lsp >/dev/null 2>&1 || true
+    ok "Wallet 'superscalar_lsp' ready"
 fi
 
 # Fund wallet if needed (use integer comparison to avoid bc dependency)
 BALANCE=$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getbalance 2>/dev/null || echo "0")
 BALANCE_INT=$(printf '%.0f' "$BALANCE" 2>/dev/null || echo "0")
 if [ "$BALANCE_INT" -lt 1 ] 2>/dev/null; then
-    step "Funding wallet..."
-    ADDR=$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)
-    bitcoin-cli $CLI_ARGS generatetoaddress 101 "$ADDR" >/dev/null 2>&1
-    ok "Mined 101 blocks, wallet funded"
+    if [ "$NETWORK" = "regtest" ]; then
+        step "Funding wallet..."
+        ADDR=$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)
+        bitcoin-cli $CLI_ARGS generatetoaddress 101 "$ADDR" >/dev/null 2>&1
+        ok "Mined 101 blocks, wallet funded"
+    else
+        step "Wallet balance low — fund manually on $NETWORK"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -356,7 +363,9 @@ Factory creation takes 3 round-trips:
     fi
 
     # Mine a block to confirm the close tx
-    bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
+    if [ "$NETWORK" = "regtest" ]; then
+        bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
+    fi
     sleep 1
 fi
 
@@ -364,6 +373,11 @@ fi
 # Demo 2: Breach — Revoked Commitment + Penalty TX
 # ---------------------------------------------------------------------------
 if [ "$MODE_BREACH" = "1" ]; then
+  if [ "$NETWORK" != "regtest" ]; then
+    banner "Demo: Breach Detection & Penalty — SKIPPED"
+    step "Breach demo requires block mining (regtest only)"
+    echo ""
+  else
     banner "Demo: Breach Detection & Penalty"
 
     explain "This demo tests the watchtower's breach detection. After normal
@@ -390,12 +404,18 @@ compares against mempool/chain transactions every 5 seconds."
 
     bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
     sleep 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 # Demo 2b: Client-Side Breach Detection
 # ---------------------------------------------------------------------------
 if [ "$MODE_CLIENT_BREACH" = "1" ]; then
+  if [ "$NETWORK" != "regtest" ]; then
+    banner "Demo: Client-Side Breach Detection — SKIPPED"
+    step "Client breach demo requires block mining (regtest only)"
+    echo ""
+  else
     banner "Demo: Client-Side Breach Detection"
 
     explain "This demo tests CLIENT-SIDE watchtower protection. The LSP runs
@@ -421,12 +441,18 @@ if the LSP acts maliciously."
         -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" \
         >/dev/null 2>&1 || true
     sleep 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 # Demo 3: Factory Rotation (Factory 0 → Factory 1)
 # ---------------------------------------------------------------------------
 if [ "$MODE_ROTATION" = "1" ]; then
+  if [ "$NETWORK" != "regtest" ]; then
+    banner "Demo: Factory Rotation — SKIPPED"
+    step "Rotation demo requires block mining (regtest only)"
+    echo ""
+  else
     banner "Demo: Factory Rotation + PTLC Key Turnover"
 
     explain "This demo shows the full factory rotation lifecycle:
@@ -451,6 +477,7 @@ overlapping factory lifetimes ensure zero downtime for clients."
 
     bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
     sleep 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -28,8 +28,9 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
                                secp256k1_context *ctx);
 
 /* Register encryption state for an fd.
-   After this, wire_send/wire_recv on this fd will encrypt/decrypt. */
-void wire_set_encryption(int fd, const noise_state_t *ns);
+   After this, wire_send/wire_recv on this fd will encrypt/decrypt.
+   Returns 1 on success, 0 if fd table is full. */
+int wire_set_encryption(int fd, const noise_state_t *ns);
 
 /* Clear encryption state for an fd. */
 void wire_clear_encryption(int fd);
