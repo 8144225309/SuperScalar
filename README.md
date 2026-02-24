@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 255 tests on regtest. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 257 tests (234 unit + 23 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -41,7 +41,7 @@ cmake .. && make -j$(nproc)
 
 ## Tests
 
-233 unit + 22 regtest integration tests.
+234 unit + 23 regtest integration tests.
 
 ```bash
 cd build
@@ -196,6 +196,164 @@ The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy
 
 ---
 
+## Running on Signet
+
+SuperScalar works on signet (and testnet4) with real Bitcoin transactions. This guide walks through a full factory lifecycle: create, pay, close.
+
+### Prerequisites
+
+- A synced `bitcoind` running on signet with a funded wallet
+- The built `superscalar_lsp` and `superscalar_client` binaries
+- At least ~50,000 sats in the wallet (factory funding + fees)
+
+### 1. Start bitcoind
+
+```bash
+bitcoind -signet -daemon -txindex=1 -fallbackfee=0.00001 \
+  -rpcuser=YOUR_USER -rpcpassword=YOUR_PASS
+```
+
+If your `bitcoind` is in a non-standard location or uses a custom datadir, note the paths — you'll need `--cli-path` and `--datadir` below.
+
+Get signet coins from a faucet (e.g. https://signetfaucet.com) if your wallet is empty.
+
+### 2. Generate keys
+
+The LSP and each client need a unique 32-byte secret key. On signet, deterministic keys are blocked — you must provide real ones.
+
+```bash
+# Generate random keys (requires openssl or /dev/urandom)
+LSP_KEY=$(openssl rand -hex 32)
+CLIENT1_KEY=$(openssl rand -hex 32)
+CLIENT2_KEY=$(openssl rand -hex 32)
+
+# Or use encrypted keyfiles (prompted for passphrase)
+./superscalar_lsp --keyfile lsp.key --passphrase "your passphrase" ...
+```
+
+Save these keys. If the LSP crashes and restarts (with `--db`), it needs the same key to recover channels.
+
+### 3. Start the LSP
+
+```bash
+./superscalar_lsp \
+  --network signet \
+  --port 9735 \
+  --clients 2 \
+  --amount 50000 \
+  --seckey $LSP_KEY \
+  --daemon \
+  --db lsp.db \
+  --cli-path /path/to/bitcoin-cli \
+  --rpcuser YOUR_USER \
+  --rpcpassword YOUR_PASS \
+  --wallet YOUR_WALLET
+```
+
+| Flag | Why |
+|------|-----|
+| `--network signet` | Use signet instead of regtest |
+| `--wallet YOUR_WALLET` | Use your existing funded wallet (skips `createwallet`) |
+| `--db lsp.db` | Persist factory, channels, HTLCs — survives crashes |
+| `--daemon` | Long-lived mode (Ctrl+C for cooperative close) |
+| `--amount 50000` | Fund the factory with 50k sats |
+
+Optional flags: `--datadir`, `--rpcport` if your bitcoind uses non-standard paths.
+
+The LSP will:
+1. Check wallet balance (fails if insufficient)
+2. Query fee estimate from the node
+3. Listen for client connections
+4. Wait for all clients to connect before proceeding
+
+### 4. Connect clients
+
+In separate terminals (or machines — use `--host` for remote):
+
+```bash
+# Client 1
+./superscalar_client \
+  --network signet \
+  --seckey $CLIENT1_KEY \
+  --port 9735 \
+  --host 127.0.0.1 \
+  --daemon \
+  --db client1.db \
+  --cli-path /path/to/bitcoin-cli \
+  --rpcuser YOUR_USER \
+  --rpcpassword YOUR_PASS
+
+# Client 2
+./superscalar_client \
+  --network signet \
+  --seckey $CLIENT2_KEY \
+  --port 9735 \
+  --host 127.0.0.1 \
+  --daemon \
+  --db client2.db \
+  --cli-path /path/to/bitcoin-cli \
+  --rpcuser YOUR_USER \
+  --rpcpassword YOUR_PASS
+```
+
+Once all clients connect, the ceremony runs automatically:
+
+1. **Factory creation**: LSP funds a MuSig2 UTXO, all parties co-sign the tree
+2. **Funding confirmation**: LSP broadcasts and waits for 1 confirmation (~10 min on signet)
+3. **Channel setup**: Basepoint exchange, channel ready
+4. **Daemon mode**: LSP and clients stay online, forwarding HTLCs
+
+### 5. Send payments
+
+From a client using `--send`:
+
+```bash
+./superscalar_client \
+  --network signet \
+  --seckey $CLIENT1_KEY \
+  --port 9735 \
+  --send 1:1000:$(openssl rand -hex 32)
+```
+
+Format: `--send DEST_CLIENT:AMOUNT_SATS:PREIMAGE_HEX`
+
+Or in daemon mode, payments flow through the LSP automatically when triggered via the wire protocol.
+
+### 6. Shutdown
+
+Press **Ctrl+C** on the LSP. It will:
+1. Cooperatively close the factory (single on-chain tx)
+2. Wait for confirmation
+3. Exit cleanly
+
+If the LSP crashes instead, restart with the same `--seckey` and `--db`. It will recover the factory and channels from the database and accept client reconnections.
+
+### Monitoring
+
+```bash
+python3 tools/dashboard.py \
+  --lsp-db lsp.db \
+  --client-db client1.db \
+  --btc-cli /path/to/bitcoin-cli \
+  --btc-network signet \
+  --btc-rpcuser YOUR_USER \
+  --btc-rpcpassword YOUR_PASS
+```
+
+Open http://localhost:8080 for real-time factory, channel, and payment status.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "wallet balance insufficient" | Fund your wallet via faucet, or use `--wallet` to point at a funded wallet |
+| "cannot connect to bitcoind" | Check `--cli-path`, `--rpcuser`, `--rpcpassword`, `--datadir` match your setup |
+| "funding tx not confirmed within timeout" | Signet blocks are ~10 min; increase `--confirm-timeout` if needed |
+| Client "expected FACTORY_PROPOSE" | LSP isn't running or wrong `--host`/`--port` |
+| LSP crash recovery not working | Must use same `--seckey` and `--db` as the original run |
+
+---
+
 ## Standalone Binaries
 
 ### superscalar_lsp
@@ -220,6 +378,10 @@ superscalar_lsp [OPTIONS]
 | `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
 | `--rpcuser` | USER | rpcuser | Bitcoin RPC username |
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
+| `--datadir` | PATH | — | Bitcoin datadir |
+| `--rpcport` | PORT | — | Bitcoin RPC port |
+| `--wallet` | NAME | superscalar_lsp | Bitcoin wallet (skip createwallet if set) |
+| `--confirm-timeout` | SECS | 3600/7200 | Confirmation polling timeout |
 | `--report` | PATH | — | Write JSON diagnostic report |
 | `--breach-test` | — | off | Broadcast revoked commitment, trigger penalty |
 | `--cheat-daemon` | — | off | Broadcast revoked commitment, sleep (clients detect) |
@@ -249,6 +411,9 @@ superscalar_client [OPTIONS]
 | `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
 | `--rpcuser` | USER | rpcuser | Bitcoin RPC username |
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
+| `--datadir` | PATH | — | Bitcoin datadir |
+| `--rpcport` | PORT | — | Bitcoin RPC port |
+| `--auto-accept-jit` | — | off | Auto-accept JIT channel offers |
 
 ### superscalar_bridge
 
