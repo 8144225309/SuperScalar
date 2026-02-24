@@ -591,8 +591,8 @@ int test_regtest_intra_factory_payment(void) {
     /* Initialize regtest */
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: regtest not available\n");
-        return 1;
+        printf("  FAIL: regtest not available\n");
+        return 0;
     }
     if (!regtest_create_wallet(&rt, "test_channels")) {
         char *lr = regtest_exec(&rt, "loadwallet", "\"test_channels\"");
@@ -695,9 +695,9 @@ int test_regtest_intra_factory_payment(void) {
             }
         }
         if (!funded) {
-            printf("  SKIP: no funded wallet available\n");
+            printf("  FAIL: no funded wallet available\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return 0;
         }
     }
 
@@ -962,8 +962,8 @@ int test_regtest_multi_payment(void) {
     /* Initialize regtest */
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: regtest not available\n");
-        return 1;
+        printf("  FAIL: regtest not available\n");
+        return 0;
     }
     if (!regtest_create_wallet(&rt, "test_multi_pay")) {
         char *lr = regtest_exec(&rt, "loadwallet", "\"test_multi_pay\"");
@@ -1067,9 +1067,9 @@ int test_regtest_multi_payment(void) {
             }
         }
         if (!funded) {
-            printf("  SKIP: no funded wallet available\n");
+            printf("  FAIL: no funded wallet available\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return 0;
         }
     }
 

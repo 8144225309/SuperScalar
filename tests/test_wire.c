@@ -609,8 +609,8 @@ int test_regtest_wire_factory(void) {
     /* Initialize regtest */
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: regtest not available\n");
-        return 1;
+        printf("  FAIL: regtest not available\n");
+        return 0;
     }
     if (!regtest_create_wallet(&rt, "test_wire_factory")) {
         /* Wallet exists but may not be loaded */
@@ -718,9 +718,9 @@ int test_regtest_wire_factory(void) {
             }
         }
         if (!funded) {
-            printf("  SKIP: no funded wallet available\n");
+            printf("  FAIL: no funded wallet available\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return 0;
         }
     }
 
@@ -858,8 +858,8 @@ int test_regtest_wire_factory(void) {
 int test_regtest_wire_factory_arity1(void) {
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: regtest not available\n");
-        return 1;
+        printf("  FAIL: regtest not available\n");
+        return 0;
     }
     if (!regtest_create_wallet(&rt, "test_wire_arity1")) {
         char *lr = regtest_exec(&rt, "loadwallet", "\"test_wire_arity1\"");
@@ -961,9 +961,9 @@ int test_regtest_wire_factory_arity1(void) {
             }
         }
         if (!funded) {
-            printf("  SKIP: no funded wallet available\n");
+            printf("  FAIL: no funded wallet available\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return 0;
         }
     }
 

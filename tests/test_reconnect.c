@@ -1904,8 +1904,8 @@ int test_ptlc_wire_round_trip(void) {
 int test_ptlc_wire_over_socket(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
-        printf("  SKIP: socketpair not available\n");
-        return 1;
+        printf("  FAIL: socketpair not available\n");
+        return 0;
     }
 
     unsigned char presig[64], msg32[32];

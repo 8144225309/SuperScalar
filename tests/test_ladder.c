@@ -388,9 +388,9 @@ int test_regtest_ladder_lifecycle(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_ladder_life");
 
@@ -490,9 +490,9 @@ int test_regtest_ladder_ptlc_migration(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_ladder_ptlc");
 
@@ -698,9 +698,9 @@ int test_regtest_ladder_distribution_fallback(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_dist");
 

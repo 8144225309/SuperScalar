@@ -224,9 +224,9 @@ int test_regtest_basic_dw(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_dw");
 
@@ -296,9 +296,9 @@ int test_regtest_old_first_attack(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_old_first");
 
@@ -384,9 +384,9 @@ int test_regtest_musig_onchain(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_musig_oc");
 
@@ -512,9 +512,9 @@ int test_regtest_nsequence_edge(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_nseq");
 
@@ -592,8 +592,8 @@ int test_regtest_nsequence_edge(void) {
 int test_regtest_cpfp_penalty_bump(void) {
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not available\n");
-        return 1;
+        printf("  FAIL: bitcoind not available\n");
+        return 0;
     }
     regtest_create_wallet(&rt, "test_cpfp_bump");
 
@@ -643,9 +643,9 @@ int test_regtest_breach_penalty_cpfp(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_breach_cpfp");
 
