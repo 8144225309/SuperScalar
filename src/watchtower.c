@@ -255,12 +255,21 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 htlc_active_idx++;
             }
 
-            /* Persist HTLC outputs if DB available */
-            if (wt->db && wt->db->db) {
+            /* Persist HTLC outputs if DB available (transactional) */
+            if (wt->db && wt->db->db && entry->n_htlc_outputs > 0) {
+                persist_begin(wt->db);
+                int htlc_ok = 1;
                 for (size_t h = 0; h < entry->n_htlc_outputs; h++) {
-                    persist_save_old_commitment_htlc(wt->db, channel_id,
-                        old_commit_num, &entry->htlc_outputs[h]);
+                    if (!persist_save_old_commitment_htlc(wt->db, channel_id,
+                            old_commit_num, &entry->htlc_outputs[h])) {
+                        htlc_ok = 0;
+                        break;
+                    }
                 }
+                if (htlc_ok)
+                    persist_commit(wt->db);
+                else
+                    persist_rollback(wt->db);
             }
         }
     }

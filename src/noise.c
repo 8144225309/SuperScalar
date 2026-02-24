@@ -133,14 +133,14 @@ static void ensure_fd_table(void) {
     }
 }
 
-void wire_set_encryption(int fd, const noise_state_t *ns) {
+int wire_set_encryption(int fd, const noise_state_t *ns) {
     ensure_fd_table();
     /* Find existing or free slot */
     int free_slot = -1;
     for (int i = 0; i < MAX_ENCRYPTED_FDS; i++) {
         if (fd_table[i].active && fd_table[i].fd == fd) {
             fd_table[i].state = *ns;
-            return;
+            return 1;
         }
         if (!fd_table[i].active && free_slot < 0)
             free_slot = i;
@@ -149,9 +149,10 @@ void wire_set_encryption(int fd, const noise_state_t *ns) {
         fd_table[free_slot].fd = fd;
         fd_table[free_slot].state = *ns;
         fd_table[free_slot].active = 1;
-    } else {
-        fprintf(stderr, "noise: fd table full, cannot register fd %d\n", fd);
+        return 1;
     }
+    fprintf(stderr, "noise: fd table full, cannot register fd %d\n", fd);
+    return 0;
 }
 
 void wire_clear_encryption(int fd) {

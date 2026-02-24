@@ -20,6 +20,15 @@ int persist_open(persist_t *p, const char *path);
 /* Close database. */
 void persist_close(persist_t *p);
 
+/* Begin a transaction. Returns 1 on success, 0 on error. */
+int persist_begin(persist_t *p);
+
+/* Commit the current transaction. Returns 1 on success, 0 on error. */
+int persist_commit(persist_t *p);
+
+/* Rollback the current transaction. Returns 1 on success, 0 on error. */
+int persist_rollback(persist_t *p);
+
 /* --- Factory persistence --- */
 
 /* Save factory metadata (funding info, participants, step_blocks, etc.).

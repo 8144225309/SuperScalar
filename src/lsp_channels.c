@@ -1830,10 +1830,17 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Persist new factory */
+    /* Persist new factory (transactional) */
     if (mgr->persist) {
-        persist_save_factory((persist_t *)mgr->persist, &lsp->factory, mgr->ctx, 0);
-        persist_save_tree_nodes((persist_t *)mgr->persist, &lsp->factory, 0);
+        persist_t *db = (persist_t *)mgr->persist;
+        persist_begin(db);
+        if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
+            !persist_save_tree_nodes(db, &lsp->factory, 0)) {
+            fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
+            persist_rollback(db);
+        } else {
+            persist_commit(db);
+        }
     }
 
     /* --- Phase D: Reinitialize channels --- */
@@ -1920,11 +1927,23 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                                     &mgr->entries[c].channel);
     }
 
-    /* Persist new channel state */
+    /* Persist new channel state (transactional) */
     if (mgr->persist) {
-        for (size_t c = 0; c < mgr->n_channels; c++)
-            persist_save_channel((persist_t *)mgr->persist,
-                                  &mgr->entries[c].channel, 0, (uint32_t)c);
+        persist_t *db = (persist_t *)mgr->persist;
+        persist_begin(db);
+        int ch_ok = 1;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            if (!persist_save_channel(db, &mgr->entries[c].channel, 0, (uint32_t)c)) {
+                ch_ok = 0;
+                break;
+            }
+        }
+        if (ch_ok) {
+            persist_commit(db);
+        } else {
+            fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
+            persist_rollback(db);
+        }
     }
 
     /* Migrate any active JIT channels into the new factory */

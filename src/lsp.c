@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/select.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -221,6 +222,17 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
     /* Collect NONCE_BUNDLEs from all clients */
     for (size_t c = 0; c < lsp->n_clients; c++) {
+        /* select() guard: don't block forever if client disconnects */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[c], &rfds);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        int ret = select(lsp->client_fds[c] + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for NONCE_BUNDLE from client %zu\n", c);
+            goto fail;
+        }
+
         wire_msg_t msg;
         if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_NONCE_BUNDLE) {
             fprintf(stderr, "LSP: expected NONCE_BUNDLE from client %zu, got 0x%02x\n",
@@ -303,6 +315,17 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
     /* Collect PSIG_BUNDLEs from all clients */
     for (size_t c = 0; c < lsp->n_clients; c++) {
+        /* select() guard: don't block forever if client disconnects */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[c], &rfds);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        int ret = select(lsp->client_fds[c] + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for PSIG_BUNDLE from client %zu\n", c);
+            goto fail;
+        }
+
         wire_msg_t msg;
         if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_PSIG_BUNDLE) {
             fprintf(stderr, "LSP: expected PSIG_BUNDLE from client %zu\n", c);
@@ -426,6 +449,17 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     musig_pubnonce_serialize(lsp->ctx, all_pubnonces[0], &lsp_pubnonce);
 
     for (size_t c = 0; c < lsp->n_clients; c++) {
+        /* select() guard: don't block forever if client disconnects */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[c], &rfds);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        int ret = select(lsp->client_fds[c] + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for CLOSE_NONCE from client %zu\n", c);
+            goto close_fail;
+        }
+
         wire_msg_t msg;
         if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_CLOSE_NONCE) {
             fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
@@ -483,6 +517,17 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
     /* Collect CLOSE_PSIG from all clients */
     for (size_t c = 0; c < lsp->n_clients; c++) {
+        /* select() guard: don't block forever if client disconnects */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[c], &rfds);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        int ret = select(lsp->client_fds[c] + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for CLOSE_PSIG from client %zu\n", c);
+            goto close_fail;
+        }
+
         wire_msg_t msg;
         if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_CLOSE_PSIG) {
             fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);

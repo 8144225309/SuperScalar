@@ -415,11 +415,17 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         watchtower_set_channel(mgr->watchtower, wt_idx, &jit->channel);
     }
 
-    /* Persist */
+    /* Persist (transactional) */
     if (mgr->persist) {
-        persist_save_jit_channel((persist_t *)mgr->persist, jit);
-        persist_save_basepoints((persist_t *)mgr->persist,
-                                  jit->jit_channel_id, &jit->channel);
+        persist_t *db = (persist_t *)mgr->persist;
+        persist_begin(db);
+        if (!persist_save_jit_channel(db, jit) ||
+            !persist_save_basepoints(db, jit->jit_channel_id, &jit->channel)) {
+            fprintf(stderr, "LSP JIT: persist failed, rolling back\n");
+            persist_rollback(db);
+        } else {
+            persist_commit(db);
+        }
     }
 
     memset(lsp_seckey, 0, 32);
