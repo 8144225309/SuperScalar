@@ -397,7 +397,66 @@ int test_lsp_bridge_accept(void) {
     return 1;
 }
 
-/* ---- Test 8: LSP inbound via bridge (full socketpair) ---- */
+/* ---- Test 8: Bridge handles MSG_BRIDGE_REGISTER from LSP ---- */
+
+int test_bridge_register_forward(void) {
+    int sv[2];  /* sv[0]=plugin side, sv[1]=bridge plugin_fd */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    bridge_t br;
+    bridge_init(&br);
+    br.plugin_fd = sv[1];
+
+    /* Build a REGISTER message as the LSP would send */
+    unsigned char hash[32];
+    memset(hash, 0x55, 32);
+    cJSON *reg = wire_build_bridge_register(hash, 75000, 3);
+    TEST_ASSERT(reg != NULL, "build register");
+
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_REGISTER;
+    msg.json = reg;
+
+    /* Bridge should handle it successfully */
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "handle register");
+    cJSON_Delete(reg);
+
+    /* Read the JSON that bridge forwarded to the plugin side */
+    char buf[4096];
+    ssize_t n = read(sv[0], buf, sizeof(buf) - 1);
+    TEST_ASSERT(n > 0, "read plugin output");
+    buf[n] = '\0';
+
+    /* Parse and verify the forwarded JSON */
+    cJSON *fwd = cJSON_Parse(buf);
+    TEST_ASSERT(fwd != NULL, "parse forwarded JSON");
+
+    cJSON *method = cJSON_GetObjectItem(fwd, "method");
+    TEST_ASSERT(method != NULL && cJSON_IsString(method), "method exists");
+    TEST_ASSERT(strcmp(method->valuestring, "invoice_registered") == 0,
+                 "method is invoice_registered");
+
+    cJSON *amt = cJSON_GetObjectItem(fwd, "amount_msat");
+    TEST_ASSERT(amt != NULL && cJSON_IsNumber(amt), "amount_msat exists");
+    TEST_ASSERT_EQ((uint64_t)amt->valuedouble, 75000, "amount_msat value");
+
+    cJSON *dc = cJSON_GetObjectItem(fwd, "dest_client");
+    TEST_ASSERT(dc != NULL && cJSON_IsNumber(dc), "dest_client exists");
+    TEST_ASSERT_EQ((size_t)dc->valuedouble, 3, "dest_client value");
+
+    /* Verify payment_hash hex round-trips */
+    unsigned char parsed_hash[32];
+    TEST_ASSERT(wire_json_get_hex(fwd, "payment_hash", parsed_hash, 32) == 32,
+                 "payment_hash hex");
+    TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "payment_hash matches");
+
+    cJSON_Delete(fwd);
+    close(sv[0]);
+    close(sv[1]);
+    return 1;
+}
+
+/* ---- Test 9: LSP inbound via bridge (full socketpair) ---- */
 
 int test_lsp_inbound_via_bridge(void) {
     /* Test the bridge origin tracking + fulfill back-propagation path */

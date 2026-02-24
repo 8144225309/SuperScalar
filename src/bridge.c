@@ -206,6 +206,24 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         return ok;
     }
 
+    case MSG_BRIDGE_REGISTER: {
+        unsigned char payment_hash[32];
+        uint64_t amount_msat;
+        size_t dest_client;
+        if (!wire_parse_bridge_register(msg->json, payment_hash,
+                                          &amount_msat, &dest_client))
+            return 0;
+
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "method", "invoice_registered");
+        wire_json_add_hex(j, "payment_hash", payment_hash, 32);
+        cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+        cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
+        int ok = bridge_send_plugin_json(br, j);
+        cJSON_Delete(j);
+        return ok;
+    }
+
     default:
         fprintf(stderr, "Bridge: unexpected LSP msg 0x%02x\n", msg->msg_type);
         return 0;

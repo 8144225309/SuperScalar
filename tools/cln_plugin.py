@@ -5,7 +5,7 @@ SuperScalar CLN Plugin
 Bridges Core Lightning to the SuperScalar bridge daemon via TCP.
 Handles:
   - htlc_accepted hook: forwards inbound HTLCs to bridge
-  - superscalar-pay RPC: sends outbound payments via bridge
+  - superscalar-pay RPC: convenience wrapper for lightning-cli pay
   - pay_request from bridge: calls lightning-cli pay for outbound LN payments
 
 Usage:
@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
@@ -28,6 +29,7 @@ bridge_sock = None
 pending_htlcs = {}   # htlc_id -> rpc_id for resolving
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 next_request_id = 1
+next_htlc_id = 1
 lock = threading.Lock()
 
 
@@ -70,23 +72,36 @@ def connect_bridge():
 
 
 def bridge_reader():
-    """Read responses from bridge and resolve pending HTLCs/pays."""
+    """Read responses from bridge and resolve pending HTLCs/pays.
+    Reconnects automatically on disconnect."""
     global bridge_sock
-    buf = b""
     while True:
-        try:
-            data = bridge_sock.recv(4096)
-            if not data:
-                log("Bridge connection closed")
+        buf = b""
+        while True:
+            try:
+                if bridge_sock is None:
+                    break
+                data = bridge_sock.recv(4096)
+                if not data:
+                    log("Bridge connection closed")
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    msg = json.loads(line)
+                    handle_bridge_msg(msg)
+            except Exception as e:
+                log(f"bridge_reader error: {e}")
                 break
-            buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                msg = json.loads(line)
-                handle_bridge_msg(msg)
-        except Exception as e:
-            log(f"bridge_reader error: {e}")
-            break
+
+        # Connection lost — attempt reconnect
+        bridge_sock = None
+        log("Bridge disconnected, will retry in 5s...")
+        time.sleep(5)
+        while not connect_bridge():
+            log("Bridge reconnect failed, retrying in 5s...")
+            time.sleep(5)
+        log("Bridge reconnected")
 
 
 def handle_bridge_msg(msg):
@@ -161,7 +176,7 @@ def _do_pay(bolt11, request_id):
     try:
         result = subprocess.run(
             [LIGHTNING_CLI, "pay", bolt11],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=600
         )
         if result.returncode == 0:
             pay_result = json.loads(result.stdout)
@@ -199,9 +214,11 @@ def handle_htlc_accepted(rpc_id, params):
     amount_msat = int(htlc.get("amount_msat", "0msat").replace("msat", ""))
     cltv_expiry = htlc.get("cltv_expiry", 0)
 
-    # Assign local htlc_id
+    # Assign local htlc_id (monotonic to avoid collisions after pops)
+    global next_htlc_id
     with lock:
-        htlc_id = len(pending_htlcs) + 1
+        htlc_id = next_htlc_id
+        next_htlc_id += 1
         pending_htlcs[htlc_id] = rpc_id
 
     ok = send_to_bridge({
@@ -276,9 +293,9 @@ def main():
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
 
             connected = connect_bridge()
-            if connected:
-                t = threading.Thread(target=bridge_reader, daemon=True)
-                t.start()
+            # Always start bridge_reader — it reconnects on disconnect
+            t = threading.Thread(target=bridge_reader, daemon=True)
+            t.start()
 
             send_to_cln({
                 "jsonrpc": "2.0",
@@ -294,24 +311,39 @@ def main():
         elif method == "superscalar-pay":
             bolt11 = request.get("params", [""])[0] if request.get("params") else ""
             log(f"superscalar-pay: {bolt11[:30]}...")
-            with lock:
-                req_id = next_request_id
-                next_request_id += 1
-                pending_pays[req_id] = request["id"]
-            ok = send_to_bridge({
-                "method": "htlc_accepted",
-                "payment_hash": "",
-                "bolt11": bolt11,
-                "request_id": req_id
-            })
-            if not ok:
-                with lock:
-                    pending_pays.pop(req_id, None)
-                send_to_cln({
-                    "jsonrpc": "2.0",
-                    "id": request["id"],
-                    "result": {"status": "failed", "error": "bridge not connected"}
-                })
+            rpc_id = request["id"]
+            # Pay directly via lightning-cli (reuses existing _do_pay path)
+            def _pay_and_respond(bolt11_str, rpc_id_val):
+                try:
+                    result = subprocess.run(
+                        [LIGHTNING_CLI, "pay", bolt11_str],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    if result.returncode == 0:
+                        pay_result = json.loads(result.stdout)
+                        preimage = pay_result.get("payment_preimage", "00" * 32)
+                        send_to_cln({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id_val,
+                            "result": {"status": "complete", "payment_preimage": preimage}
+                        })
+                    else:
+                        log(f"superscalar-pay failed: {result.stderr[:100]}")
+                        send_to_cln({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id_val,
+                            "result": {"status": "failed"}
+                        })
+                except Exception as e:
+                    log(f"superscalar-pay exception: {e}")
+                    send_to_cln({
+                        "jsonrpc": "2.0",
+                        "id": rpc_id_val,
+                        "result": {"status": "failed"}
+                    })
+            t = threading.Thread(target=_pay_and_respond,
+                                 args=(bolt11, rpc_id), daemon=True)
+            t.start()
 
 
 if __name__ == "__main__":

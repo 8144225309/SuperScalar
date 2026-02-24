@@ -184,6 +184,7 @@ extern int test_bridge_outbound_flow(void);
 extern int test_bridge_unknown_hash(void);
 extern int test_lsp_bridge_accept(void);
 extern int test_lsp_inbound_via_bridge(void);
+extern int test_bridge_register_forward(void);
 
 /* Phase 15: Daemon mode */
 extern int test_register_invoice_wire(void);
@@ -515,6 +516,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_unknown_hash);
     RUN_TEST(test_lsp_bridge_accept);
     RUN_TEST(test_lsp_inbound_via_bridge);
+    RUN_TEST(test_bridge_register_forward);
 
     printf("\n=== Daemon Mode (Phase 15) ===\n");
     RUN_TEST(test_register_invoice_wire);
