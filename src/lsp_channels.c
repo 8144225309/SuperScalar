@@ -172,6 +172,138 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     return 1;
 }
 
+int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
+                               secp256k1_context *ctx,
+                               const factory_t *factory,
+                               const unsigned char *lsp_seckey32,
+                               size_t n_clients,
+                               void *db) {
+    persist_t *pdb = (persist_t *)db;
+    if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
+    if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
+
+    memset(mgr, 0, sizeof(*mgr));
+    mgr->ctx = ctx;
+    mgr->n_channels = n_clients;
+    mgr->bridge_fd = -1;
+    mgr->n_invoices = 0;
+    mgr->n_htlc_origins = 0;
+    mgr->next_request_id = 1;
+    mgr->leaf_arity = factory->leaf_arity;
+
+    for (size_t c = 0; c < n_clients; c++) {
+        lsp_channel_entry_t *entry = &mgr->entries[c];
+        entry->channel_id = (uint32_t)c;
+        entry->ready = 0;
+        entry->last_message_time = time(NULL);
+        entry->offline_detected = 0;
+
+        /* Find leaf output for this client */
+        size_t node_idx;
+        uint32_t vout;
+        client_to_leaf(c, factory, &node_idx, &vout);
+
+        const factory_node_t *state_node = &factory->nodes[node_idx];
+        if (vout >= state_node->n_outputs) return 0;
+
+        /* Funding info from the leaf output */
+        const unsigned char *funding_txid = state_node->txid;
+        uint64_t funding_amount = state_node->outputs[vout].amount_sats;
+        const unsigned char *funding_spk = state_node->outputs[vout].script_pubkey;
+        size_t funding_spk_len = state_node->outputs[vout].script_pubkey_len;
+
+        /* LSP pubkey (participant 0) */
+        secp256k1_pubkey lsp_pubkey;
+        if (!secp256k1_ec_pubkey_create(ctx, &lsp_pubkey, lsp_seckey32))
+            return 0;
+
+        /* Client pubkey (participant c+1) */
+        const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
+
+        /* Commitment tx fee */
+        fee_estimator_t _fe;
+        fee_init(&_fe, 1000);
+        uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+        uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
+        uint64_t local_amount = usable / 2;
+        uint64_t remote_amount = usable - local_amount;
+
+        /* Initialize channel: LSP = local, client = remote */
+        if (!channel_init(&entry->channel, ctx,
+                           lsp_seckey32,
+                           &lsp_pubkey,
+                           client_pubkey,
+                           funding_txid, vout,
+                           funding_amount,
+                           funding_spk, funding_spk_len,
+                           local_amount, remote_amount,
+                           CHANNEL_DEFAULT_CSV_DELAY))
+            return 0;
+        entry->channel.funder_is_local = 1;
+
+        /* Load basepoints from DB instead of generating random ones */
+        unsigned char local_secrets[4][32];
+        unsigned char remote_bps[4][33];
+        if (!persist_load_basepoints(pdb, (uint32_t)c, local_secrets, remote_bps)) {
+            fprintf(stderr, "LSP recovery: failed to load basepoints for channel %zu\n", c);
+            return 0;
+        }
+
+        /* Set local basepoints from loaded secrets */
+        channel_set_local_basepoints(&entry->channel,
+                                       local_secrets[0],
+                                       local_secrets[1],
+                                       local_secrets[2]);
+        channel_set_local_htlc_basepoint(&entry->channel, local_secrets[3]);
+
+        /* Set remote basepoints from loaded pubkeys */
+        secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc;
+        if (!secp256k1_ec_pubkey_parse(ctx, &rpay, remote_bps[0], 33) ||
+            !secp256k1_ec_pubkey_parse(ctx, &rdelay, remote_bps[1], 33) ||
+            !secp256k1_ec_pubkey_parse(ctx, &rrevoc, remote_bps[2], 33) ||
+            !secp256k1_ec_pubkey_parse(ctx, &rhtlc, remote_bps[3], 33)) {
+            fprintf(stderr, "LSP recovery: failed to parse remote basepoints for channel %zu\n", c);
+            return 0;
+        }
+        channel_set_remote_basepoints(&entry->channel, &rpay, &rdelay, &rrevoc);
+        channel_set_remote_htlc_basepoint(&entry->channel, &rhtlc);
+
+        /* Load channel state (balances, commitment_number) from DB */
+        uint64_t loaded_local, loaded_remote, loaded_cn;
+        if (!persist_load_channel_state(pdb, (uint32_t)c,
+                                          &loaded_local, &loaded_remote, &loaded_cn)) {
+            fprintf(stderr, "LSP recovery: failed to load channel state for channel %zu\n", c);
+            return 0;
+        }
+        entry->channel.local_amount = loaded_local;
+        entry->channel.remote_amount = loaded_remote;
+        entry->channel.commitment_number = loaded_cn;
+
+        /* Load active HTLCs from DB (GAP-4b) */
+        {
+            htlc_t loaded_htlcs[MAX_HTLCS];
+            size_t n_loaded = persist_load_htlcs(pdb, (uint32_t)c,
+                                                    loaded_htlcs, MAX_HTLCS);
+            for (size_t h = 0; h < n_loaded; h++) {
+                if (loaded_htlcs[h].state != HTLC_STATE_ACTIVE) continue;
+                if (entry->channel.n_htlcs >= MAX_HTLCS) break;
+                entry->channel.htlcs[entry->channel.n_htlcs++] = loaded_htlcs[h];
+            }
+            if (n_loaded > 0)
+                printf("LSP recovery: loaded %zu HTLCs for channel %zu\n",
+                       n_loaded, c);
+        }
+
+        /* Initialize nonce pool (fresh nonces — reconnect re-exchanges) */
+        if (!channel_init_nonce_pool(&entry->channel, MUSIG_NONCE_POOL_MAX))
+            return 0;
+
+        entry->ready = 1;  /* channels are already operational */
+    }
+
+    return 1;
+}
+
 int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
@@ -538,6 +670,20 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
+    /* Persist in-flight HTLC for replay on reconnect (GAP-4b) */
+    if (mgr->persist) {
+        htlc_t persist_htlc;
+        memset(&persist_htlc, 0, sizeof(persist_htlc));
+        persist_htlc.id = dest_htlc_id;
+        persist_htlc.direction = HTLC_OFFERED;
+        persist_htlc.state = HTLC_STATE_ACTIVE;
+        persist_htlc.amount_sats = amount_sats;
+        memcpy(persist_htlc.payment_hash, payment_hash, 32);
+        persist_htlc.cltv_expiry = cltv_expiry;
+        persist_save_htlc((persist_t *)mgr->persist,
+                            (uint32_t)dest_idx, &persist_htlc);
+    }
+
     printf("LSP: HTLC %llu forwarded: client %zu -> client %zu (%llu sats)\n",
            (unsigned long long)new_htlc_id, sender_idx, dest_idx,
            (unsigned long long)amount_sats);
@@ -810,6 +956,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Deactivate fulfilled invoice in persistence */
     if (mgr->persist)
         persist_deactivate_invoice((persist_t *)mgr->persist, payment_hash);
+
+    /* Delete settled HTLC from persistence (GAP-4b) */
+    if (mgr->persist)
+        persist_delete_htlc((persist_t *)mgr->persist,
+                              (uint32_t)client_idx, htlc_id);
 
     /* Check if this HTLC originated from the bridge */
     uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
@@ -1363,6 +1514,25 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON_Delete(ack);
+    }
+
+    /* Replay in-flight HTLCs from persistence (GAP-4b) */
+    if (mgr->persist) {
+        htlc_t pending[MAX_HTLCS];
+        size_t n_pending = persist_load_htlcs((persist_t *)mgr->persist,
+                                                (uint32_t)c, pending, MAX_HTLCS);
+        for (size_t h = 0; h < n_pending; h++) {
+            if (pending[h].state != HTLC_STATE_ACTIVE) continue;
+            cJSON *add = wire_build_update_add_htlc(
+                pending[h].id,
+                pending[h].amount_sats * 1000,  /* sats → msat */
+                pending[h].payment_hash,
+                pending[h].cltv_expiry);
+            if (wire_send(new_fd, MSG_UPDATE_ADD_HTLC, add))
+                printf("LSP reconnect: replayed HTLC %llu to client %zu\n",
+                       (unsigned long long)pending[h].id, c);
+            cJSON_Delete(add);
+        }
     }
 
     printf("LSP: client %zu reconnected (commitment=%llu)\n",

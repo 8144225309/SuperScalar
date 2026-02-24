@@ -110,6 +110,9 @@ int persist_save_htlc(persist_t *p, uint32_t channel_id,
 size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
                             htlc_t *htlcs_out, size_t max_htlcs);
 
+/* Delete an HTLC entry (after settle/fail). */
+int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id);
+
 /* --- Nonce pool persistence --- */
 
 /* Save serialized nonce pool state. */

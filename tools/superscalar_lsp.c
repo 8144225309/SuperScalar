@@ -72,6 +72,7 @@ static void usage(const char *prog) {
         "  --no-jit            Disable JIT channel fallback\n"
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
+        "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -324,7 +325,8 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
    Returns 1 on success. */
 static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
                                                 const char *mine_addr,
-                                                int is_regtest) {
+                                                int is_regtest,
+                                                int confirm_timeout) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_signed) {
@@ -393,7 +395,7 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
             regtest_mine_blocks(rt, 1, mine_addr);
         } else {
             printf("  node[%zu] broadcast OK, waiting for confirmation...\n", i);
-            regtest_wait_for_confirmation(rt, txid_out, 3600);
+            regtest_wait_for_confirmation(rt, txid_out, confirm_timeout);
         }
 
         unsigned char display_txid[32];
@@ -438,6 +440,7 @@ int main(int argc, char *argv[]) {
     int no_jit = 0;
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
     int force_close = 0;
+    int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -502,6 +505,8 @@ int main(int argc, char *argv[]) {
             leaf_arity = atoi(argv[++i]);
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
+        else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc)
+            confirm_timeout_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -511,6 +516,10 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* Resolve confirmation timeout (GAP-7) */
+    int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
+                               : (is_regtest ? 3600 : 7200);
 
     /* Test flags that mine blocks require regtest */
     if (!is_regtest && (test_expiry || test_distrib ||
@@ -632,6 +641,272 @@ int main(int argc, char *argv[]) {
         if (!is_regtest)
             fprintf(stderr, "WARNING: estimatesmartfee failed on %s; using static --fee-rate %llu sat/kvB\n",
                     network, (unsigned long long)fee_rate);
+    }
+
+    /* === GAP-2: Recovery probe === */
+    if (use_db && daemon_mode) {
+        factory_t rec_f;
+        memset(&rec_f, 0, sizeof(rec_f));
+        if (persist_load_factory(&db, 0, &rec_f, ctx)) {
+            printf("LSP: found existing factory in DB, entering recovery mode\n");
+
+            /* Set up LSP with listen socket only (skip ceremony) */
+            lsp_t lsp;
+            lsp_init(&lsp, ctx, &lsp_kp, port, rec_f.n_participants - 1);
+            g_lsp = &lsp;
+
+            signal(SIGINT, sigint_handler);
+            signal(SIGTERM, sigint_handler);
+
+            /* Open listen socket for reconnections */
+            lsp.listen_fd = wire_listen(NULL, lsp.port);
+            if (lsp.listen_fd < 0) {
+                fprintf(stderr, "LSP recovery: listen failed on port %d\n", port);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Populate pubkeys from recovered factory */
+            size_t rec_n_clients = rec_f.n_participants - 1;
+            lsp.n_clients = rec_n_clients;
+            for (size_t i = 0; i < rec_n_clients; i++)
+                lsp.client_pubkeys[i] = rec_f.pubkeys[i + 1];
+
+            /* Copy factory and set fee estimator */
+            lsp.factory = rec_f;
+            lsp.factory.fee = &fee_est;
+
+            /* Load DW counter state from DB */
+            {
+                uint32_t epoch_out, n_layers_out;
+                uint32_t layer_states_out[DW_MAX_LAYERS];
+                if (persist_load_dw_counter(&db, 0, &epoch_out, &n_layers_out,
+                                              layer_states_out, DW_MAX_LAYERS)) {
+                    for (uint32_t li = 0; li < n_layers_out &&
+                         li < lsp.factory.counter.n_layers; li++)
+                        lsp.factory.counter.layers[li].current_state =
+                            layer_states_out[li];
+                    printf("LSP recovery: DW counter loaded (epoch %u)\n",
+                           dw_counter_epoch(&lsp.factory.counter));
+                }
+            }
+
+            /* Set factory lifecycle from current block height */
+            {
+                int cur_height = regtest_get_block_height(&rt);
+                if (cur_height > 0)
+                    factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height,
+                                          active_blocks, dying_blocks);
+            }
+
+            /* Initialize channels from DB */
+            lsp_channel_mgr_t mgr;
+            if (!lsp_channels_init_from_db(&mgr, ctx, &lsp.factory, lsp_seckey,
+                                             rec_n_clients, &db)) {
+                fprintf(stderr, "LSP recovery: channel init from DB failed\n");
+                lsp_cleanup(&lsp);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            mgr.persist = &db;
+            mgr.confirm_timeout_secs = confirm_timeout_secs;
+
+            /* Set fee rate on all channels */
+            for (size_t c = 0; c < mgr.n_channels; c++)
+                mgr.entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
+
+            /* Load persisted state: invoices, HTLC origins, request_id */
+            mgr.next_request_id = persist_load_counter(&db, "next_request_id", 1);
+
+            {
+                unsigned char inv_hashes[MAX_INVOICE_REGISTRY][32];
+                size_t inv_dests[MAX_INVOICE_REGISTRY];
+                uint64_t inv_amounts[MAX_INVOICE_REGISTRY];
+                size_t n_inv = persist_load_invoices(&db,
+                    inv_hashes, inv_dests, inv_amounts, MAX_INVOICE_REGISTRY);
+                for (size_t i = 0; i < n_inv; i++) {
+                    if (mgr.n_invoices >= MAX_INVOICE_REGISTRY) break;
+                    invoice_entry_t *inv = &mgr.invoices[mgr.n_invoices++];
+                    memcpy(inv->payment_hash, inv_hashes[i], 32);
+                    inv->dest_client = inv_dests[i];
+                    inv->amount_msat = inv_amounts[i];
+                    inv->bridge_htlc_id = 0;
+                    inv->active = 1;
+                }
+                if (n_inv > 0)
+                    printf("LSP recovery: loaded %zu invoices from DB\n", n_inv);
+            }
+
+            {
+                unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
+                uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
+                size_t orig_sender[MAX_HTLC_ORIGINS];
+                uint64_t orig_htlc[MAX_HTLC_ORIGINS];
+                size_t n_orig = persist_load_htlc_origins(&db,
+                    orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
+                    MAX_HTLC_ORIGINS);
+                for (size_t i = 0; i < n_orig; i++) {
+                    if (mgr.n_htlc_origins >= MAX_HTLC_ORIGINS) break;
+                    htlc_origin_t *o = &mgr.htlc_origins[mgr.n_htlc_origins++];
+                    memcpy(o->payment_hash, orig_hashes[i], 32);
+                    o->bridge_htlc_id = orig_bridge[i];
+                    o->request_id = orig_req[i];
+                    o->sender_idx = orig_sender[i];
+                    o->sender_htlc_id = orig_htlc[i];
+                    o->active = 1;
+                }
+                if (n_orig > 0)
+                    printf("LSP recovery: loaded %zu HTLC origins from DB\n", n_orig);
+            }
+
+            /* Initialize watchtower */
+            static watchtower_t rec_wt;
+            memset(&rec_wt, 0, sizeof(rec_wt));
+            watchtower_init(&rec_wt, mgr.n_channels, &rt, &fee_est, &db);
+            for (size_t c = 0; c < mgr.n_channels; c++)
+                watchtower_set_channel(&rec_wt, c, &mgr.entries[c].channel);
+            mgr.watchtower = &rec_wt;
+
+            /* Initialize ladder */
+            ladder_t rec_lad;
+            ladder_init(&rec_lad, ctx, &lsp_kp, active_blocks, dying_blocks);
+            {
+                int cur_h = regtest_get_block_height(&rt);
+                if (cur_h > 0) rec_lad.current_block = (uint32_t)cur_h;
+            }
+            {
+                ladder_factory_t *lf = &rec_lad.factories[0];
+                lf->factory = lsp.factory;
+                lf->factory_id = rec_lad.next_factory_id++;
+                lf->is_initialized = 1;
+                lf->is_funded = 1;
+                lf->cached_state = factory_get_state(&lsp.factory,
+                                                       rec_lad.current_block);
+                tx_buf_init(&lf->distribution_tx, 256);
+                rec_lad.n_factories = 1;
+            }
+            mgr.ladder = &rec_lad;
+
+            /* Wire rotation parameters */
+            memcpy(mgr.rot_lsp_seckey, lsp_seckey, 32);
+            mgr.rot_fee_est = &fee_est;
+            memcpy(mgr.rot_fund_spk, lsp.factory.funding_spk,
+                   lsp.factory.funding_spk_len);
+            mgr.rot_fund_spk_len = lsp.factory.funding_spk_len;
+
+            /* Derive funding + mining addresses for rotation */
+            {
+                musig_keyagg_t ka;
+                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                for (size_t i = 0; i < lsp.factory.n_participants; i++)
+                    all_pks[i] = lsp.factory.pubkeys[i];
+                musig_aggregate_keys(ctx, &ka, all_pks,
+                                       lsp.factory.n_participants);
+                unsigned char is2[32];
+                secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey);
+                unsigned char twk[32];
+                sha256_tagged("TapTweak", is2, 32, twk);
+                musig_keyagg_t kac = ka;
+                secp256k1_pubkey tpk;
+                secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk,
+                                                         &kac.cache, twk);
+                secp256k1_xonly_pubkey txo;
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk);
+                unsigned char ts2[32];
+                secp256k1_xonly_pubkey_serialize(ctx, ts2, &txo);
+                char rfa[128];
+                if (derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
+                    strncpy(mgr.rot_fund_addr, rfa,
+                            sizeof(mgr.rot_fund_addr) - 1);
+            }
+            {
+                char rma[128];
+                if (regtest_get_new_address(&rt, rma, sizeof(rma)))
+                    strncpy(mgr.rot_mine_addr, rma,
+                            sizeof(mgr.rot_mine_addr) - 1);
+            }
+            mgr.rot_step_blocks = step_blocks;
+            mgr.rot_states_per_layer = 4;
+            mgr.rot_leaf_arity = leaf_arity;
+            mgr.rot_is_regtest = is_regtest;
+            mgr.rot_funding_sats = funding_sats;
+            mgr.rot_auto_rotate = 1;
+            mgr.rot_attempted_mask = 0;
+
+            /* JIT Channel Fallback */
+            jit_channels_init(&mgr);
+            if (no_jit) mgr.jit_enabled = 0;
+            mgr.jit_funding_sats = (jit_amount_arg > 0) ?
+                (uint64_t)jit_amount_arg :
+                (funding_sats / (uint64_t)rec_n_clients);
+
+            /* Load JIT channels from DB */
+            {
+                jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+                size_t jit_count = 0;
+                persist_load_jit_channels(&db, jits, JIT_MAX_CHANNELS,
+                                            &jit_count);
+                mgr.n_jit_channels = jit_count;
+                for (size_t ji = 0; ji < jit_count; ji++) {
+                    if (jits[ji].state == JIT_STATE_OPEN) {
+                        unsigned char ls[4][32], rb[4][33];
+                        if (persist_load_basepoints(&db,
+                                jits[ji].jit_channel_id, ls, rb)) {
+                            memcpy(jits[ji].channel.local_payment_basepoint_secret, ls[0], 32);
+                            memcpy(jits[ji].channel.local_delayed_payment_basepoint_secret, ls[1], 32);
+                            memcpy(jits[ji].channel.local_revocation_basepoint_secret, ls[2], 32);
+                            memcpy(jits[ji].channel.local_htlc_basepoint_secret, ls[3], 32);
+                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_payment_basepoint, ls[0]);
+                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_delayed_payment_basepoint, ls[1]);
+                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_revocation_basepoint, ls[2]);
+                            secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_htlc_basepoint, ls[3]);
+                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_payment_basepoint, rb[0], 33);
+                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_delayed_payment_basepoint, rb[1], 33);
+                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_revocation_basepoint, rb[2], 33);
+                            secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_htlc_basepoint, rb[3], 33);
+                        }
+                        size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
+                        watchtower_set_channel(&rec_wt, wt_idx,
+                                                &jits[ji].channel);
+                    }
+                }
+                if (jit_count > 0)
+                    printf("LSP recovery: loaded %zu JIT channels from DB\n",
+                           jit_count);
+            }
+
+            printf("LSP recovery: entering daemon mode "
+                   "(waiting for client reconnections)...\n");
+            lsp_channels_run_daemon_loop(&mgr, &lsp, &g_shutdown);
+
+            /* Persist updated channel balances on shutdown */
+            if (persist_begin(&db)) {
+                int bal_ok = 1;
+                for (size_t c = 0; c < mgr.n_channels; c++) {
+                    const channel_t *ch = &mgr.entries[c].channel;
+                    if (!persist_update_channel_balance(&db, (uint32_t)c,
+                        ch->local_amount, ch->remote_amount,
+                        ch->commitment_number)) {
+                        bal_ok = 0;
+                        break;
+                    }
+                }
+                if (bal_ok) persist_commit(&db);
+                else persist_rollback(&db);
+            }
+
+            printf("LSP recovery: daemon shutdown complete\n");
+            jit_channels_cleanup(&mgr);
+            persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
     }
 
     /* === Phase 1: Accept clients === */
@@ -757,8 +1032,8 @@ int main(int argc, char *argv[]) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
         printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-        int timeout_secs = (strcmp(network, "regtest") == 0) ? 3600 : 7200;
-        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, timeout_secs);
+        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex,
+                                                    confirm_timeout_secs);
         if (conf < 1) {
             fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
             lsp_cleanup(&lsp);
@@ -958,8 +1233,33 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
+        /* Save factory channel basepoints to DB for recovery (GAP-2) */
+        if (use_db) {
+            if (!persist_begin(&db)) {
+                fprintf(stderr, "LSP: warning: persist_begin failed for basepoint save\n");
+            } else {
+                int bp_ok = 1;
+                for (size_t c = 0; c < mgr.n_channels; c++) {
+                    if (!persist_save_basepoints(&db, (uint32_t)c,
+                                                   &mgr.entries[c].channel)) {
+                        fprintf(stderr, "LSP: warning: failed to persist basepoints "
+                                "for channel %zu\n", c);
+                        bp_ok = 0;
+                        break;
+                    }
+                }
+                if (bp_ok)
+                    persist_commit(&db);
+                else
+                    persist_rollback(&db);
+            }
+        }
+
         /* Set persistence pointer (Phase 23) */
         mgr.persist = use_db ? &db : NULL;
+
+        /* Set configurable confirmation timeout (GAP-7) */
+        mgr.confirm_timeout_secs = confirm_timeout_secs;
 
         /* Load persisted state (Phase 23) */
         if (use_db) {
@@ -1162,7 +1462,8 @@ int main(int argc, char *argv[]) {
                    lsp.factory.n_nodes, network);
 
             if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
-                                                      mine_addr, is_regtest)) {
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
                 fprintf(stderr, "FORCE CLOSE: tree broadcast failed\n");
                 lsp_cleanup(&lsp);
                 memset(lsp_seckey, 0, 32);
@@ -1231,7 +1532,8 @@ int main(int argc, char *argv[]) {
             tree_ok = broadcast_factory_tree(&lsp.factory, &rt, mine_addr);
         } else {
             tree_ok = broadcast_factory_tree_any_network(&lsp.factory, &rt,
-                                                          mine_addr, 0);
+                                                          mine_addr, 0,
+                                                          confirm_timeout_secs);
         }
         if (!tree_ok) {
             fprintf(stderr, "BREACH TEST: factory tree broadcast failed\n");
@@ -1319,7 +1621,8 @@ int main(int argc, char *argv[]) {
         } else {
             /* On signet/testnet, wait for natural block confirmation */
             printf("Waiting for revoked commitment to confirm...\n");
-            regtest_wait_for_confirmation(&rt, old_txid_str, 1800);
+            regtest_wait_for_confirmation(&rt, old_txid_str,
+                                                confirm_timeout_secs);
         }
 
         if (breach_test == 2) {
@@ -2296,7 +2599,7 @@ int main(int argc, char *argv[]) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
         printf("LSP: waiting for close tx confirmation on %s...\n", network);
-        regtest_wait_for_confirmation(&rt, close_txid, 3600);
+        regtest_wait_for_confirmation(&rt, close_txid, confirm_timeout_secs);
     }
     tx_buf_free(&close_tx);
 

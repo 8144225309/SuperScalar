@@ -170,6 +170,7 @@ extern int test_persist_open_close(void);
 extern int test_persist_channel_round_trip(void);
 extern int test_persist_revocation_round_trip(void);
 extern int test_persist_htlc_round_trip(void);
+extern int test_persist_htlc_delete(void);
 extern int test_persist_factory_round_trip(void);
 extern int test_persist_nonce_pool_round_trip(void);
 extern int test_persist_multi_channel(void);
@@ -275,6 +276,9 @@ extern int test_basepoint_independence(void);
 /* Random Basepoints */
 extern int test_random_basepoints(void);
 extern int test_persist_basepoints(void);
+
+/* LSP Recovery (GAP-2) */
+extern int test_lsp_recovery_round_trip(void);
 
 /* Client Watchtower (Bidirectional Revocation) */
 extern int test_client_watchtower_init(void);
@@ -497,6 +501,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_channel_round_trip);
     RUN_TEST(test_persist_revocation_round_trip);
     RUN_TEST(test_persist_htlc_round_trip);
+    RUN_TEST(test_persist_htlc_delete);
     RUN_TEST(test_persist_factory_round_trip);
     RUN_TEST(test_persist_nonce_pool_round_trip);
     RUN_TEST(test_persist_multi_channel);
@@ -602,6 +607,9 @@ static void run_unit_tests(void) {
     printf("\n=== Random Basepoints ===\n");
     RUN_TEST(test_random_basepoints);
     RUN_TEST(test_persist_basepoints);
+
+    printf("\n=== LSP Recovery (GAP-2) ===\n");
+    RUN_TEST(test_lsp_recovery_round_trip);
 
     printf("\n=== Client Watchtower ===\n");
     RUN_TEST(test_client_watchtower_init);

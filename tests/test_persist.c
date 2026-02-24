@@ -2,6 +2,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
+#include "superscalar/lsp_channels.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -183,6 +184,51 @@ int test_persist_htlc_round_trip(void) {
     TEST_ASSERT_EQ(loaded[1].amount_sats, 3000, "htlc 1 amount");
     TEST_ASSERT(memcmp(loaded[1].payment_preimage, h2.payment_preimage, 32) == 0,
                 "htlc 1 preimage");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: HTLC delete (GAP-4b) ---- */
+
+int test_persist_htlc_delete(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    /* Save two HTLCs on channel 0 */
+    htlc_t h1 = {0};
+    h1.direction = HTLC_OFFERED;
+    h1.state = HTLC_STATE_ACTIVE;
+    h1.amount_sats = 5000;
+    memset(h1.payment_hash, 0xAA, 32);
+    h1.cltv_expiry = 500;
+    h1.id = 10;
+
+    htlc_t h2 = {0};
+    h2.direction = HTLC_OFFERED;
+    h2.state = HTLC_STATE_ACTIVE;
+    h2.amount_sats = 3000;
+    memset(h2.payment_hash, 0xBB, 32);
+    h2.cltv_expiry = 600;
+    h2.id = 11;
+
+    TEST_ASSERT(persist_save_htlc(&db, 0, &h1), "save htlc 1");
+    TEST_ASSERT(persist_save_htlc(&db, 0, &h2), "save htlc 2");
+
+    /* Delete h1 */
+    TEST_ASSERT(persist_delete_htlc(&db, 0, 10), "delete htlc 10");
+
+    /* Only h2 should remain */
+    htlc_t loaded[16];
+    size_t count = persist_load_htlcs(&db, 0, loaded, 16);
+    TEST_ASSERT_EQ(count, 1, "count after delete");
+    TEST_ASSERT_EQ(loaded[0].id, 11, "remaining htlc id");
+    TEST_ASSERT_EQ(loaded[0].amount_sats, 3000, "remaining amount");
+
+    /* Delete h2 */
+    TEST_ASSERT(persist_delete_htlc(&db, 0, 11), "delete htlc 11");
+    count = persist_load_htlcs(&db, 0, loaded, 16);
+    TEST_ASSERT_EQ(count, 0, "count after second delete");
 
     persist_close(&db);
     return 1;
@@ -623,6 +669,165 @@ int test_persist_basepoints(void) {
     /* Verify loading non-existent channel fails */
     TEST_ASSERT(!persist_load_basepoints(&db, 99, loaded_local, loaded_remote),
                 "non-existent channel fails");
+
+    secp256k1_context_destroy(ctx);
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: LSP recovery round-trip (GAP-2) ---- */
+
+int test_lsp_recovery_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    secp256k1_context *ctx = test_ctx();
+
+    /* Create factory with 5 participants (LSP + 4 clients) */
+    unsigned char extra_sec3[32], extra_sec4[32];
+    memset(extra_sec3, 0x33, 32);
+    memset(extra_sec4, 0x44, 32);
+    secp256k1_pubkey pks[5];
+    secp256k1_ec_pubkey_create(ctx, &pks[0], seckeys[0]);  /* LSP */
+    secp256k1_ec_pubkey_create(ctx, &pks[1], seckeys[1]);  /* Client 0 */
+    secp256k1_ec_pubkey_create(ctx, &pks[2], seckeys[2]);  /* Client 1 */
+    secp256k1_ec_pubkey_create(ctx, &pks[3], extra_sec3);  /* Client 2 */
+    secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4);  /* Client 3 */
+
+    factory_t f;
+    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    f.cltv_timeout = 200;
+    f.fee_per_tx = 500;
+
+    /* Set funding (need valid funding for channel init) */
+    extern void sha256_tagged(const char *, const unsigned char *, size_t,
+                               unsigned char *);
+    musig_keyagg_t ka;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 3), "keyagg");
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char twk[32];
+    sha256_tagged("TapTweak", internal_ser, 32, twk);
+    musig_keyagg_t kac = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &kac.cache, twk);
+    secp256k1_xonly_pubkey txo;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &txo);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAB, 32);
+    factory_set_funding(&f, fake_txid, 0, 200000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Initialize channels the normal way */
+    lsp_channel_mgr_t mgr;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init channels");
+
+    /* Simulate basepoint exchange: set remote basepoints */
+    for (size_t c = 0; c < 4; c++) {
+        channel_t *ch = &mgr.entries[c].channel;
+        secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc;
+        unsigned char rs[32];
+        memset(rs, 0x60 + (unsigned char)c, 32);
+        secp256k1_ec_pubkey_create(ctx, &rpay, rs);
+        rs[0]++;
+        secp256k1_ec_pubkey_create(ctx, &rdelay, rs);
+        rs[0]++;
+        secp256k1_ec_pubkey_create(ctx, &rrevoc, rs);
+        rs[0]++;
+        secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
+        channel_set_remote_basepoints(ch, &rpay, &rdelay, &rrevoc);
+        channel_set_remote_htlc_basepoint(ch, &rhtlc);
+    }
+
+    /* Simulate some payments (modify balances) - only test first 2 channels */
+    mgr.entries[0].channel.local_amount = 30000;
+    mgr.entries[0].channel.remote_amount = 50000;
+    mgr.entries[0].channel.commitment_number = 5;
+    mgr.entries[1].channel.local_amount = 35000;
+    mgr.entries[1].channel.remote_amount = 45000;
+    mgr.entries[1].channel.commitment_number = 3;
+
+    /* Persist: factory, channels, basepoints */
+    TEST_ASSERT(persist_begin(&db), "begin");
+    TEST_ASSERT(persist_save_factory(&db, &f, ctx, 0), "save factory");
+    for (size_t c = 0; c < 4; c++) {
+        TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
+                                           (uint32_t)c), "save channel");
+        TEST_ASSERT(persist_save_basepoints(&db, (uint32_t)c,
+                                              &mgr.entries[c].channel),
+                    "save basepoints");
+    }
+    /* Update balances after payments */
+    for (size_t c = 0; c < 4; c++) {
+        const channel_t *ch = &mgr.entries[c].channel;
+        TEST_ASSERT(persist_update_channel_balance(&db, (uint32_t)c,
+                        ch->local_amount, ch->remote_amount,
+                        ch->commitment_number), "update balance");
+    }
+    TEST_ASSERT(persist_commit(&db), "commit");
+
+    /* Now recover: load factory from DB, init channels from DB */
+    factory_t rec_f;
+    memset(&rec_f, 0, sizeof(rec_f));
+    TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "load factory");
+    TEST_ASSERT_EQ(rec_f.n_participants, 5, "n_participants");
+
+    lsp_channel_mgr_t rec_mgr;
+    TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                            seckeys[0], 4, &db),
+                "init from db");
+    TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "n_channels");
+
+    /* Verify recovered channel state matches saved state (check first 2 which had payments) */
+    for (size_t c = 0; c < 2; c++) {
+        const channel_t *orig = &mgr.entries[c].channel;
+        const channel_t *rec = &rec_mgr.entries[c].channel;
+
+        TEST_ASSERT_EQ(rec->local_amount, orig->local_amount, "local_amount");
+        TEST_ASSERT_EQ(rec->remote_amount, orig->remote_amount, "remote_amount");
+        TEST_ASSERT_EQ(rec->commitment_number, orig->commitment_number,
+                        "commitment_number");
+
+        /* Verify local basepoint secrets match */
+        TEST_ASSERT(memcmp(rec->local_payment_basepoint_secret,
+                           orig->local_payment_basepoint_secret, 32) == 0,
+                    "pay secret match");
+        TEST_ASSERT(memcmp(rec->local_delayed_payment_basepoint_secret,
+                           orig->local_delayed_payment_basepoint_secret, 32) == 0,
+                    "delay secret match");
+        TEST_ASSERT(memcmp(rec->local_revocation_basepoint_secret,
+                           orig->local_revocation_basepoint_secret, 32) == 0,
+                    "revoc secret match");
+        TEST_ASSERT(memcmp(rec->local_htlc_basepoint_secret,
+                           orig->local_htlc_basepoint_secret, 32) == 0,
+                    "htlc secret match");
+
+        /* Verify remote basepoint pubkeys match */
+        unsigned char orig_ser[33], rec_ser[33];
+        size_t slen;
+
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, orig_ser, &slen,
+            &orig->remote_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, rec_ser, &slen,
+            &rec->remote_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        TEST_ASSERT(memcmp(orig_ser, rec_ser, 33) == 0, "remote pay bp");
+
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, orig_ser, &slen,
+            &orig->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, rec_ser, &slen,
+            &rec->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        TEST_ASSERT(memcmp(orig_ser, rec_ser, 33) == 0, "remote delay bp");
+
+        /* Verify channel is marked ready */
+        TEST_ASSERT_EQ(rec_mgr.entries[c].ready, 1, "channel ready");
+    }
 
     secp256k1_context_destroy(ctx);
     persist_close(&db);

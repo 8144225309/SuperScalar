@@ -216,6 +216,7 @@ typedef struct {
     fee_estimator_t *fee;
     regtest_t *rt;
     jit_channel_t *jit_ch;  /* JIT channel, or NULL */
+    int auto_accept_jit;    /* 1 = auto-accept JIT offers (GAP-3) */
 } daemon_cb_data_t;
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -577,7 +578,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             printf("Client %u: JIT offer received (%llu sats, reason: %s)\n",
                    my_index, (unsigned long long)jit_amount, jit_reason);
 
-            /* Auto-accept (PoC) */
+            /* Gate JIT acceptance behind flag (GAP-3) */
+            if (!cbd->auto_accept_jit) {
+                printf("Client %u: rejecting JIT offer "
+                       "(use --auto-accept-jit to enable)\n", my_index);
+                break;
+            }
+
+            /* Auto-accept */
             secp256k1_pubkey my_pk;
             secp256k1_keypair_pub(ctx, &my_pk, keypair);
             cJSON *accept = wire_build_jit_accept(jit_cidx, ctx, &my_pk);
@@ -1009,6 +1017,7 @@ static void usage(const char *prog) {
         "  --cli-path PATH                   Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER                    Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS                Bitcoin RPC password (default: rpcpass)\n"
+        "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -1028,6 +1037,7 @@ int main(int argc, char *argv[]) {
     const char *rpcuser = "rpcuser";
     const char *rpcpassword = "rpcpass";
     int fee_rate = 1000;
+    int auto_accept_jit = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1106,6 +1116,8 @@ int main(int argc, char *argv[]) {
             }
             sha256(act->preimage, 32, act->payment_hash);
 
+        } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
+            auto_accept_jit = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -1235,6 +1247,7 @@ int main(int argc, char *argv[]) {
         cbd.wt = &client_wt;
         cbd.fee = &client_fee;
         cbd.rt = rt_ok ? &rt : NULL;
+        cbd.auto_accept_jit = auto_accept_jit;
 
         /* Load persisted client invoices (Phase 23) */
         if (use_db) {

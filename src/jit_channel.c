@@ -227,7 +227,9 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     if (mgr->rot_is_regtest) {
         regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
     } else {
-        if (regtest_wait_for_confirmation(rt, fund_txid_hex, 7200) < 1) {
+        int jit_timeout = mgr->confirm_timeout_secs > 0 ?
+                          mgr->confirm_timeout_secs : 7200;
+        if (regtest_wait_for_confirmation(rt, fund_txid_hex, jit_timeout) < 1) {
             fprintf(stderr, "LSP JIT: funding not confirmed\n");
             memset(lsp_seckey, 0, 32);
             return 0;

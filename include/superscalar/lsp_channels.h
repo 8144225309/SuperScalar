@@ -85,6 +85,9 @@ typedef struct {
 
     /* Factory arity (Upgrade 2) */
     int leaf_arity;                /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
+
+    /* Configurable confirmation timeout (GAP-7) */
+    int confirm_timeout_secs;      /* 0 = use default (3600 regtest, 7200 non-regtest) */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -96,6 +99,18 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        const factory_t *factory,
                        const unsigned char *lsp_seckey32,
                        size_t n_clients);
+
+/* Initialize channels from DB (recovery after restart).
+   Same as lsp_channels_init EXCEPT: loads basepoints and channel state
+   from DB instead of generating fresh ones. Sets entry->ready = 1.
+   db: persist_t* passed as void* to avoid header dependency.
+   Returns 1 on success. */
+int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
+                               secp256k1_context *ctx,
+                               const factory_t *factory,
+                               const unsigned char *lsp_seckey32,
+                               size_t n_clients,
+                               void *db);
 
 /* Exchange MSG_CHANNEL_BASEPOINTS with all clients.
    Must be called after lsp_channels_init() and before lsp_channels_send_ready().

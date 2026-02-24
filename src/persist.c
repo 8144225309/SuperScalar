@@ -856,6 +856,24 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
     return count;
 }
 
+int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "DELETE FROM htlcs WHERE channel_id = ? AND htlc_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)htlc_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 /* --- Nonce pool --- */
 
 int persist_save_nonce_pool(persist_t *p, uint32_t channel_id,
