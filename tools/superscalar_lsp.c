@@ -896,21 +896,36 @@ int main(int argc, char *argv[]) {
 
     /* Persist factory + tree nodes + DW counter */
     if (use_db) {
-        if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
-            fprintf(stderr, "LSP: warning: failed to persist factory\n");
-        if (!persist_save_tree_nodes(&db, &lsp.factory, 0))
-            fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
-        /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-        {
-            uint32_t init_layers[DW_MAX_LAYERS];
-            for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
-                init_layers[li] = lsp.factory.counter.layers[li].config.max_states;
-            persist_save_dw_counter(&db, 0, 0, lsp.factory.counter.n_layers, init_layers);
+        if (!persist_begin(&db)) {
+            fprintf(stderr, "LSP: warning: persist_begin failed for initial factory\n");
+        } else {
+            int init_ok = 1;
+            if (!persist_save_factory(&db, &lsp.factory, ctx, 0)) {
+                fprintf(stderr, "LSP: warning: failed to persist factory\n");
+                init_ok = 0;
+            }
+            if (init_ok && !persist_save_tree_nodes(&db, &lsp.factory, 0)) {
+                fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
+                init_ok = 0;
+            }
+            if (init_ok) {
+                /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
+                uint32_t init_layers[DW_MAX_LAYERS];
+                for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
+                    init_layers[li] = lsp.factory.counter.layers[li].config.max_states;
+                persist_save_dw_counter(&db, 0, 0, lsp.factory.counter.n_layers, init_layers);
+            }
+            if (init_ok) {
+                /* Save ladder factory state (Tier 2) */
+                persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
+                    lsp.factory.created_block, lsp.factory.active_blocks,
+                    lsp.factory.dying_blocks);
+            }
+            if (init_ok)
+                persist_commit(&db);
+            else
+                persist_rollback(&db);
         }
-        /* Save ladder factory state (Tier 2) */
-        persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
-            lsp.factory.created_block, lsp.factory.active_blocks,
-            lsp.factory.dying_blocks);
     }
 
     /* Report: factory tree */
@@ -1004,8 +1019,21 @@ int main(int argc, char *argv[]) {
 
         /* Persist initial channel state */
         if (use_db) {
-            for (size_t c = 0; c < mgr.n_channels; c++)
-                persist_save_channel(&db, &mgr.entries[c].channel, 0, (uint32_t)c);
+            if (!persist_begin(&db)) {
+                fprintf(stderr, "LSP: warning: persist_begin failed for channels\n");
+            } else {
+                int ch_ok = 1;
+                for (size_t c = 0; c < mgr.n_channels; c++) {
+                    if (!persist_save_channel(&db, &mgr.entries[c].channel, 0, (uint32_t)c)) {
+                        ch_ok = 0;
+                        break;
+                    }
+                }
+                if (ch_ok)
+                    persist_commit(&db);
+                else
+                    persist_rollback(&db);
+            }
         }
 
         /* Report: channel init */
@@ -1169,10 +1197,22 @@ int main(int argc, char *argv[]) {
 
         /* Persist updated channel balances */
         if (use_db) {
-            for (size_t c = 0; c < mgr.n_channels; c++) {
-                const channel_t *ch = &mgr.entries[c].channel;
-                persist_update_channel_balance(&db, (uint32_t)c,
-                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            if (!persist_begin(&db)) {
+                fprintf(stderr, "LSP: warning: persist_begin failed for balance update\n");
+            } else {
+                int bal_ok = 1;
+                for (size_t c = 0; c < mgr.n_channels; c++) {
+                    const channel_t *ch = &mgr.entries[c].channel;
+                    if (!persist_update_channel_balance(&db, (uint32_t)c,
+                        ch->local_amount, ch->remote_amount, ch->commitment_number)) {
+                        bal_ok = 0;
+                        break;
+                    }
+                }
+                if (bal_ok)
+                    persist_commit(&db);
+                else
+                    persist_rollback(&db);
             }
         }
 

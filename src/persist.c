@@ -262,6 +262,7 @@ int persist_open(persist_t *p, const char *path) {
 
     /* Enable WAL mode for better concurrent performance */
     sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_busy_timeout(p->db, 5000);
 
     /* Create schema */
     char *errmsg = NULL;

@@ -266,12 +266,21 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
-        persist_save_factory(cbd->db, factory, ctx, 0);
-        uint32_t client_idx = my_index - 1;
-        persist_save_channel(cbd->db, ch, 0, client_idx);
-        persist_save_basepoints(cbd->db, client_idx, ch);
-        cbd->saved_initial = 1;
-        printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
+        if (persist_begin(cbd->db)) {
+            uint32_t client_idx = my_index - 1;
+            if (persist_save_factory(cbd->db, factory, ctx, 0) &&
+                persist_save_channel(cbd->db, ch, 0, client_idx) &&
+                persist_save_basepoints(cbd->db, client_idx, ch)) {
+                persist_commit(cbd->db);
+                cbd->saved_initial = 1;
+                printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
+            } else {
+                fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
+                persist_rollback(cbd->db);
+            }
+        } else {
+            fprintf(stderr, "Client %u: persist_begin failed for initial save\n", my_index);
+        }
     }
 
     /* Wire channel into client watchtower */
@@ -725,9 +734,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
                 /* Persist JIT channel */
                 if (cbd && cbd->db) {
-                    persist_save_jit_channel(cbd->db, jit);
-                    persist_save_basepoints(cbd->db, jit->jit_channel_id,
-                                              &jit->channel);
+                    if (persist_begin(cbd->db)) {
+                        if (persist_save_jit_channel(cbd->db, jit) &&
+                            persist_save_basepoints(cbd->db, jit->jit_channel_id,
+                                                      &jit->channel)) {
+                            persist_commit(cbd->db);
+                        } else {
+                            fprintf(stderr, "Client %u: JIT persist failed, rolling back\n", my_index);
+                            persist_rollback(cbd->db);
+                        }
+                    } else {
+                        fprintf(stderr, "Client %u: persist_begin failed for JIT channel\n", my_index);
+                    }
                 }
 
                 printf("Client %u: JIT channel %08x open (%llu sats)\n",
@@ -792,9 +810,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
-                persist_save_factory(cbd->db, factory, ctx, 0);
-                persist_save_channel(cbd->db, ch, 0, my_index - 1);
-                printf("Client %u: persisted rotated factory + channel\n", my_index);
+                if (persist_begin(cbd->db)) {
+                    if (persist_save_factory(cbd->db, factory, ctx, 0) &&
+                        persist_save_channel(cbd->db, ch, 0, my_index - 1)) {
+                        persist_commit(cbd->db);
+                        printf("Client %u: persisted rotated factory + channel\n", my_index);
+                    } else {
+                        fprintf(stderr, "Client %u: rotation persist failed, rolling back\n", my_index);
+                        persist_rollback(cbd->db);
+                    }
+                } else {
+                    fprintf(stderr, "Client %u: persist_begin failed for rotation\n", my_index);
+                }
             }
             break;
         }

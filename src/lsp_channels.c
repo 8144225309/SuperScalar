@@ -1833,11 +1833,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* Persist new factory (transactional) */
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
-        persist_begin(db);
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP rotate: persist_begin failed\n");
+            return 0;
+        }
         if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
             !persist_save_tree_nodes(db, &lsp->factory, 0)) {
             fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
             persist_rollback(db);
+            return 0;
         } else {
             persist_commit(db);
         }
@@ -1930,7 +1934,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* Persist new channel state (transactional) */
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
-        persist_begin(db);
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP rotate: persist_begin failed for channels\n");
+            return 0;
+        }
         int ch_ok = 1;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             if (!persist_save_channel(db, &mgr->entries[c].channel, 0, (uint32_t)c)) {
@@ -1943,6 +1950,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         } else {
             fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
             persist_rollback(db);
+            return 0;
         }
     }
 

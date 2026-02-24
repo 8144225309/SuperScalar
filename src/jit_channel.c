@@ -418,11 +418,17 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     /* Persist (transactional) */
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
-        persist_begin(db);
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP JIT: persist_begin failed\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
         if (!persist_save_jit_channel(db, jit) ||
             !persist_save_basepoints(db, jit->jit_channel_id, &jit->channel)) {
             fprintf(stderr, "LSP JIT: persist failed, rolling back\n");
             persist_rollback(db);
+            memset(lsp_seckey, 0, 32);
+            return 0;
         } else {
             persist_commit(db);
         }
