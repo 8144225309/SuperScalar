@@ -1426,6 +1426,12 @@ int test_regtest_init_full(void) {
     TEST_ASSERT(strcmp(rt.rpcpassword, "mypass") == 0, "rpcpassword stored");
     TEST_ASSERT(strcmp(rt.network, "signet") == 0, "network stored");
 
+    /* Test datadir and rpcport fields */
+    strncpy(rt.datadir, "/tmp/btc", sizeof(rt.datadir) - 1);
+    rt.rpcport = 38332;
+    TEST_ASSERT(strcmp(rt.datadir, "/tmp/btc") == 0, "datadir stored");
+    TEST_ASSERT(rt.rpcport == 38332, "rpcport stored");
+
     /* Test regtest_init_full with NULL defaults */
     regtest_t rt2;
     /* init_full won't connect (no bitcoind), so just verify it doesn't crash
@@ -1439,6 +1445,8 @@ int test_regtest_init_full(void) {
 
     TEST_ASSERT(strcmp(rt2.cli_path, "bitcoin-cli") == 0, "default cli_path");
     TEST_ASSERT(strcmp(rt2.rpcuser, "rpcuser") == 0, "default rpcuser");
+    TEST_ASSERT(rt2.rpcport == 0, "default rpcport is 0");
+    TEST_ASSERT(rt2.datadir[0] == '\0', "default datadir is empty");
 
     return 1;
 }

@@ -14,13 +14,15 @@ typedef struct {
     char rpcpassword[64];
     char wallet[64];
     char network[16];  /* "regtest", "signet", "testnet", "mainnet" */
+    int  rpcport;      /* 0 = use network default */
 } regtest_t;
 
 int   regtest_init(regtest_t *rt);
 int   regtest_init_network(regtest_t *rt, const char *network);
 int   regtest_init_full(regtest_t *rt, const char *network,
                         const char *cli_path, const char *rpcuser,
-                        const char *rpcpassword);
+                        const char *rpcpassword, const char *datadir,
+                        int rpcport);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
 int   regtest_get_block_height(regtest_t *rt);
 int   regtest_create_wallet(regtest_t *rt, const char *name);

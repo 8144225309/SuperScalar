@@ -44,6 +44,14 @@ static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
             rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
     }
 
+    if (rt->datadir[0] != '\0') {
+        size_t cur = strlen(buf);
+        snprintf(buf + cur, buf_len - cur, " -datadir=%s", rt->datadir);
+    }
+    if (rt->rpcport > 0) {
+        size_t cur = strlen(buf);
+        snprintf(buf + cur, buf_len - cur, " -rpcport=%d", rt->rpcport);
+    }
     if (rt->wallet[0] != '\0') {
         size_t cur = strlen(buf);
         snprintf(buf + cur, buf_len - cur, " -rpcwallet=%s", rt->wallet);
@@ -83,7 +91,8 @@ int regtest_init_network(regtest_t *rt, const char *network) {
 
 int regtest_init_full(regtest_t *rt, const char *network,
                       const char *cli_path, const char *rpcuser,
-                      const char *rpcpassword) {
+                      const char *rpcpassword, const char *datadir,
+                      int rpcport) {
     memset(rt, 0, sizeof(*rt));
     strncpy(rt->cli_path,
             cli_path ? cli_path : "bitcoin-cli",
@@ -97,18 +106,15 @@ int regtest_init_full(regtest_t *rt, const char *network,
     strncpy(rt->network,
             network ? network : "regtest",
             sizeof(rt->network) - 1);
+    if (datadir)
+        strncpy(rt->datadir, datadir, sizeof(rt->datadir) - 1);
+    rt->rpcport = rpcport;
 
-    /* Verify connection */
-    char cmd[512];
-    if (strcmp(rt->network, "mainnet") == 0) {
-        snprintf(cmd, sizeof(cmd),
-            "%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->cli_path, rt->rpcuser, rt->rpcpassword);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-            "%s -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
-    }
+    /* Verify connection using build_cli_prefix for consistency */
+    char prefix[512];
+    build_cli_prefix(rt, prefix, sizeof(prefix));
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "%s getblockchaininfo 2>&1", prefix);
 
     char *result = run_command(cmd);
     if (!result) return 0;

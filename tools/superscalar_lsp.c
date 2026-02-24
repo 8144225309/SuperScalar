@@ -60,6 +60,9 @@ static void usage(const char *prog) {
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
+        "  --datadir PATH      Bitcoin datadir (default: bitcoind default)\n"
+        "  --rpcport PORT      Bitcoin RPC port (default: network default)\n"
+        "  --wallet NAME       Bitcoin wallet name (default: create 'superscalar_lsp')\n"
         "  --breach-test       After demo: broadcast revoked commitment, trigger penalty\n"
         "  --cheat-daemon      After demo: broadcast revoked commitment, sleep (no penalty)\n"
         "  --test-expiry       After demo: mine past CLTV, recover via timeout script\n"
@@ -428,6 +431,9 @@ int main(int argc, char *argv[]) {
     const char *cli_path = NULL;
     const char *rpcuser = NULL;
     const char *rpcpassword = NULL;
+    const char *datadir = NULL;
+    int rpcport = 0;
+    const char *wallet_name = NULL;
     int64_t cltv_timeout_arg = -1;  /* -1 = auto */
     int breach_test = 0;
     int test_expiry = 0;
@@ -479,6 +485,12 @@ int main(int argc, char *argv[]) {
             rpcuser = argv[++i];
         else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
             rpcpassword = argv[++i];
+        else if (strcmp(argv[i], "--datadir") == 0 && i + 1 < argc)
+            datadir = argv[++i];
+        else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
+            rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--wallet") == 0 && i + 1 < argc)
+            wallet_name = argv[++i];
         else if (strcmp(argv[i], "--cltv-timeout") == 0 && i + 1 < argc)
             cltv_timeout_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--breach-test") == 0)
@@ -623,8 +635,9 @@ int main(int argc, char *argv[]) {
     /* Initialize bitcoin-cli connection */
     regtest_t rt;
     int rt_ok;
-    if (cli_path || rpcuser || rpcpassword) {
-        rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword);
+    if (cli_path || rpcuser || rpcpassword || datadir || rpcport) {
+        rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
+                                  datadir, rpcport);
     } else {
         rt_ok = regtest_init_network(&rt, network);
     }
@@ -633,7 +646,12 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    regtest_create_wallet(&rt, "superscalar_lsp");
+    if (wallet_name) {
+        /* Use existing wallet — just set the name, don't create */
+        strncpy(rt.wallet, wallet_name, sizeof(rt.wallet) - 1);
+    } else {
+        regtest_create_wallet(&rt, "superscalar_lsp");
+    }
 
     /* Initialize fee estimator */
     fee_estimator_t fee_est;
@@ -952,6 +970,7 @@ int main(int argc, char *argv[]) {
 
     /* === Phase 1: Accept clients === */
     printf("LSP: listening on port %d, waiting for %d clients...\n", port, n_clients);
+    fflush(stdout);
 
     lsp_t lsp;
     lsp_init(&lsp, ctx, &lsp_kp, port, (size_t)n_clients);

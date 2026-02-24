@@ -1017,6 +1017,8 @@ static void usage(const char *prog) {
         "  --cli-path PATH                   Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER                    Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS                Bitcoin RPC password (default: rpcpass)\n"
+        "  --datadir PATH                    Bitcoin datadir (default: bitcoind default)\n"
+        "  --rpcport PORT                    Bitcoin RPC port (default: network default)\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --help                            Show this help\n",
         prog);
@@ -1036,6 +1038,8 @@ int main(int argc, char *argv[]) {
     const char *cli_path = "bitcoin-cli";
     const char *rpcuser = "rpcuser";
     const char *rpcpassword = "rpcpass";
+    const char *datadir = NULL;
+    int rpcport = 0;
     int fee_rate = 1000;
     int auto_accept_jit = 0;
 
@@ -1069,6 +1073,10 @@ int main(int argc, char *argv[]) {
             rpcuser = argv[++i];
         else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
             rpcpassword = argv[++i];
+        else if (strcmp(argv[i], "--datadir") == 0 && i + 1 < argc)
+            datadir = argv[++i];
+        else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
+            rpcport = atoi(argv[++i]);
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
@@ -1229,7 +1237,8 @@ int main(int argc, char *argv[]) {
 
     /* Initialize regtest + watchtower for client-side breach detection */
     regtest_t rt;
-    int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword);
+    int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
+                                  datadir, rpcport);
     if (!rt_ok)
         fprintf(stderr, "Client: regtest init failed (watchtower disabled)\n");
 
