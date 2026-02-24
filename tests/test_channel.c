@@ -762,9 +762,9 @@ int test_regtest_channel_unilateral(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_chan");
 
@@ -1827,9 +1827,9 @@ int test_regtest_htlc_success(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_htlc_succ");
 
@@ -2046,9 +2046,9 @@ int test_regtest_htlc_timeout(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_htlc_to");
 
@@ -2365,9 +2365,9 @@ int test_regtest_channel_coop_close(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_coop_c");
 
@@ -2968,9 +2968,9 @@ int test_regtest_channel_penalty(void) {
     secp256k1_context *ctx = test_ctx();
     regtest_t rt;
     if (!regtest_init(&rt)) {
-        printf("  SKIP: bitcoind not running\n");
+        printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 0;
     }
     regtest_create_wallet(&rt, "test_penalty");
 
