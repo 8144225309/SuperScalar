@@ -3316,3 +3316,903 @@ int test_random_basepoints(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Adversarial Test 1: Unilateral close with multiple in-flight HTLCs ---- */
+
+int test_regtest_multi_htlc_unilateral(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_multi_htlc");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    /* Create 2-of-2 MuSig funding */
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    /* Derive bech32m address */
+    secp256k1_pubkey pks[2] = { local_fund_pk, remote_fund_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 2);
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char ka_tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, ka_tweak);
+
+    musig_keyagg_t tmp_ka = ka;
+    secp256k1_pubkey ka_tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak)) return 0;
+    secp256k1_xonly_pubkey ka_tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk)) return 0;
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char chan_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "address start");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "address end");
+        size_t len = (size_t)(end - start);
+        memcpy(chan_addr, start, len);
+        chan_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    /* Fund channel */
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, chan_addr, 0.001, funding_txid_hex),
+                "fund channel");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find funding vout");
+
+    /* Get current block height for CLTV */
+    char *blockcount_result = regtest_exec(&rt, "getblockcount", "");
+    TEST_ASSERT(blockcount_result != NULL, "getblockcount");
+    int current_height = atoi(blockcount_result);
+    free(blockcount_result);
+
+    /* Set up channel with 2 HTLCs */
+    channel_t ch;
+    uint32_t csv_delay = 6;
+    fee_estimator_t fe; fee_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    uint64_t usable = fund_amount - commit_fee;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+
+    TEST_ASSERT(channel_init(&ch, ctx, local_funding_secret,
+                               &local_fund_pk, &remote_fund_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34,
+                               local_amt, remote_amt, csv_delay),
+                "init channel");
+    ch.funder_is_local = 1;
+
+    unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
+    unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
+    unsigned char chan_revocation_sec[32] = { [0 ... 31] = 0xC3 };
+    channel_set_local_basepoints(&ch, chan_payment_sec, chan_delayed_sec,
+                                   chan_revocation_sec);
+
+    unsigned char lsp_payment_sec[32] = { [0 ... 31] = 0xD1 };
+    unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
+    unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
+    secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
+    channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
+
+    unsigned char chan_htlc_sec[32] = { [0 ... 31] = 0xC4 };
+    unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
+    channel_set_local_htlc_basepoint(&ch, chan_htlc_sec);
+    secp256k1_pubkey lsp_htlc_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
+    channel_set_remote_htlc_basepoint(&ch, &lsp_htlc_bp);
+
+    /* HTLC #0: received (we have preimage, spend via success path) */
+    unsigned char preimage0[32] = { [0 ... 31] = 0x42 };
+    unsigned char payment_hash0[32];
+    sha256(preimage0, 32, payment_hash0);
+
+    uint64_t htlc_amount0 = 5000;
+    uint64_t htlc_id0;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_RECEIVED, htlc_amount0, payment_hash0,
+                                   (uint32_t)(current_height + 50), &htlc_id0),
+                "add received htlc #0");
+
+    /* HTLC #1: offered (no preimage, spend via timeout path) */
+    unsigned char payment_hash1[32] = { [0 ... 31] = 0x77 };
+    uint32_t cltv_expiry1 = (uint32_t)(current_height + 10);
+    uint64_t htlc_amount1 = 3000;
+    uint64_t htlc_id1;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, htlc_amount1, payment_hash1,
+                                   cltv_expiry1, &htlc_id1),
+                "add offered htlc #1");
+
+    printf("  Channel with 2 HTLCs: received(%lu sats) + offered(%lu sats)\n",
+           (unsigned long)htlc_amount0, (unsigned long)htlc_amount1);
+
+    /* Build and sign commitment with both HTLCs */
+    tx_buf_t commit_unsigned;
+    tx_buf_init(&commit_unsigned, 512);
+    unsigned char commit_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &commit_unsigned, commit_txid),
+                "build commitment with 2 HTLCs");
+
+    secp256k1_keypair remote_kp;
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
+    tx_buf_t commit_signed;
+    tx_buf_init(&commit_signed, 1024);
+    TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned,
+                                          &remote_kp),
+                "sign commitment");
+
+    /* Broadcast commitment */
+    char *commit_hex = (char *)malloc(commit_signed.len * 2 + 1);
+    hex_encode(commit_signed.data, commit_signed.len, commit_hex);
+    char commit_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_hex);
+    free(commit_hex);
+    TEST_ASSERT(sent, "broadcast commitment with 2 HTLCs");
+    printf("  Commitment tx: %s\n", commit_txid_hex);
+
+    /* Mine past CLTV expiry and CSV delay */
+    regtest_mine_blocks(&rt, (int)cltv_expiry1 - current_height + 1, mine_addr);
+
+    /* Parse all outputs from the unsigned commitment tx.
+       Output layout: nVersion(4) + varint(1) + txid(32) + vout(4) +
+       scriptSig_len(1) + nSequence(4) = 46 bytes, then output_count varint. */
+    uint8_t n_outs = commit_unsigned.data[46];
+    uint64_t out_amts[8];
+    unsigned char out_spks[8][34];
+    size_t out_off = 47;
+    for (int i = 0; i < (int)n_outs && i < 8; i++) {
+        out_amts[i] = 0;
+        for (int b = 0; b < 8; b++)
+            out_amts[i] |= ((uint64_t)commit_unsigned.data[out_off + b]) << (b * 8);
+        uint8_t spk_len = commit_unsigned.data[out_off + 8];
+        if (spk_len <= 34)
+            memcpy(out_spks[i], &commit_unsigned.data[out_off + 9], spk_len);
+        out_off += 8 + 1 + spk_len;
+    }
+
+    /* Find HTLC outputs by matching exact amounts */
+    int htlc0_vout = -1, htlc1_vout = -1;
+    for (int i = 0; i < (int)n_outs; i++) {
+        if (out_amts[i] == htlc_amount0) htlc0_vout = i;
+        else if (out_amts[i] == htlc_amount1) htlc1_vout = i;
+    }
+    TEST_ASSERT(htlc0_vout >= 0, "find HTLC #0 output");
+    TEST_ASSERT(htlc1_vout >= 0, "find HTLC #1 output");
+
+    /* Store preimage for HTLC #0 success */
+    memcpy(ch.htlcs[0].payment_preimage, preimage0, 32);
+
+    /* Spend HTLC #0 via success path (provide preimage) */
+    tx_buf_t success_tx;
+    tx_buf_init(&success_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_success_tx(&ch, &success_tx,
+                                                commit_txid, (uint32_t)htlc0_vout,
+                                                out_amts[htlc0_vout], out_spks[htlc0_vout], 34,
+                                                0),
+                "build htlc #0 success tx");
+
+    char *success_hex = (char *)malloc(success_tx.len * 2 + 1);
+    hex_encode(success_tx.data, success_tx.len, success_hex);
+    char success_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, success_hex, success_txid_hex);
+    free(success_hex);
+    TEST_ASSERT(sent, "broadcast htlc #0 success");
+    printf("  HTLC #0 success tx: %s\n", success_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, success_txid_hex);
+    TEST_ASSERT(conf > 0, "htlc #0 success confirmed");
+
+    /* Spend HTLC #1 via timeout path */
+    tx_buf_t timeout_tx;
+    tx_buf_init(&timeout_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_timeout_tx(&ch, &timeout_tx,
+                                                commit_txid, (uint32_t)htlc1_vout,
+                                                out_amts[htlc1_vout], out_spks[htlc1_vout], 34,
+                                                1),
+                "build htlc #1 timeout tx");
+
+    char *timeout_hex = (char *)malloc(timeout_tx.len * 2 + 1);
+    hex_encode(timeout_tx.data, timeout_tx.len, timeout_hex);
+    char timeout_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, timeout_hex, timeout_txid_hex);
+    free(timeout_hex);
+    TEST_ASSERT(sent, "broadcast htlc #1 timeout");
+    printf("  HTLC #1 timeout tx: %s\n", timeout_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    conf = regtest_get_confirmations(&rt, timeout_txid_hex);
+    TEST_ASSERT(conf > 0, "htlc #1 timeout confirmed");
+
+    printf("  Both HTLCs resolved independently on-chain!\n");
+
+    tx_buf_free(&commit_unsigned);
+    tx_buf_free(&commit_signed);
+    tx_buf_free(&success_tx);
+    tx_buf_free(&timeout_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Adversarial Test 6: Penalty tx with HTLC outputs (breach during active payment) ---- */
+
+int test_regtest_penalty_with_htlcs(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_htlc_pen");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted — "
+               "run on a fresh chain or earlier in test order\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    /* Build factory tree on-chain */
+    secp256k1_keypair kps[5];
+    if (!make_factory_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_factory_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute factory funding spk");
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "address start");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "address end");
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find factory vout");
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);
+    for (int i = 0; i < 15; i++)
+        dw_counter_advance(&f.counter);
+
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Broadcast factory tree */
+    size_t broadcast_groups[][2] = {
+        {0, 1}, {1, 2}, {2, 4}, {4, 6},
+    };
+    char txid_hexes[6][65];
+    for (int g = 0; g < 4; g++) {
+        size_t start = broadcast_groups[g][0];
+        size_t end = broadcast_groups[g][1];
+        for (size_t i = start; i < end; i++) {
+            factory_node_t *node = &f.nodes[i];
+            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+            int bsent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+            free(tx_hex);
+            TEST_ASSERT(bsent, "broadcast factory node");
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    }
+
+    /* Set up cheater + honest channels on leaf state_left (node 4) output 0 */
+    factory_node_t *leaf = &f.nodes[4];
+    unsigned char chan_funding_txid[32];
+    memcpy(chan_funding_txid, leaf->txid, 32);
+    unsigned char chan_spk[34];
+    memcpy(chan_spk, leaf->outputs[0].script_pubkey, 34);
+    uint64_t chan_amount = leaf->outputs[0].amount_sats;
+
+    secp256k1_pubkey client_a_pk, lsp_pk;
+    if (!secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
+
+    uint32_t csv_delay = 6;
+    fee_estimator_t fe; fee_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    uint64_t usable = chan_amount > commit_fee ? chan_amount - commit_fee : chan_amount;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+
+    /* Cheater (Client A) */
+    channel_t cheater_ch;
+    TEST_ASSERT(channel_init(&cheater_ch, ctx, factory_seckeys[1],
+                               &client_a_pk, &lsp_pk,
+                               chan_funding_txid, 0, chan_amount,
+                               chan_spk, 34,
+                               local_amt, remote_amt, csv_delay),
+                "init cheater channel");
+    cheater_ch.funder_is_local = 0;
+
+    unsigned char ch_pay_sec[32] = { [0 ... 31] = 0xC1 };
+    unsigned char ch_del_sec[32] = { [0 ... 31] = 0xC2 };
+    unsigned char ch_rev_sec[32] = { [0 ... 31] = 0xC3 };
+    unsigned char ch_htlc_sec[32] = { [0 ... 31] = 0xC4 };
+    channel_set_local_basepoints(&cheater_ch, ch_pay_sec, ch_del_sec, ch_rev_sec);
+    channel_set_local_htlc_basepoint(&cheater_ch, ch_htlc_sec);
+
+    unsigned char lsp_pay_sec[32] = { [0 ... 31] = 0xD1 };
+    unsigned char lsp_del_sec[32] = { [0 ... 31] = 0xD2 };
+    unsigned char lsp_rev_sec[32] = { [0 ... 31] = 0xD3 };
+    unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
+    secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp, lsp_htlc_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_pay_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_del_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_rev_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
+    channel_set_remote_basepoints(&cheater_ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
+    channel_set_remote_htlc_basepoint(&cheater_ch, &lsp_htlc_bp);
+
+    /* Honest (LSP) — mirror */
+    channel_t honest_ch;
+    TEST_ASSERT(channel_init(&honest_ch, ctx, factory_seckeys[0],
+                               &lsp_pk, &client_a_pk,
+                               chan_funding_txid, 0, chan_amount,
+                               chan_spk, 34,
+                               remote_amt, local_amt, csv_delay),
+                "init honest channel");
+    honest_ch.funder_is_local = 1;
+
+    secp256k1_pubkey ch_pay_bp, ch_del_bp, ch_rev_bp, ch_htlc_bp_pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_pay_bp, ch_pay_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_del_bp, ch_del_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_rev_bp, ch_rev_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_htlc_bp_pub, ch_htlc_sec)) return 0;
+    channel_set_local_basepoints(&honest_ch, lsp_pay_sec, lsp_del_sec, lsp_rev_sec);
+    channel_set_remote_basepoints(&honest_ch, &ch_pay_bp, &ch_del_bp, &ch_rev_bp);
+    channel_set_local_htlc_basepoint(&honest_ch, lsp_htlc_sec);
+    channel_set_remote_htlc_basepoint(&honest_ch, &ch_htlc_bp_pub);
+
+    /* Exchange per-commitment points for cn=0 */
+    secp256k1_pubkey cheater_pcp0, honest_pcp0;
+    channel_get_per_commitment_point(&cheater_ch, 0, &cheater_pcp0);
+    channel_get_per_commitment_point(&honest_ch, 0, &honest_pcp0);
+    channel_set_remote_pcp(&cheater_ch, 0, &honest_pcp0);
+    channel_set_remote_pcp(&honest_ch, 0, &cheater_pcp0);
+
+    /* Add HTLC — this advances commitment_number from 0 to 1 on both sides */
+    unsigned char htlc_hash[32] = { [0 ... 31] = 0x88 };
+    uint64_t htlc_amt = 3000;
+    uint64_t htlc_id;
+    TEST_ASSERT(channel_add_htlc(&cheater_ch, HTLC_OFFERED, htlc_amt, htlc_hash,
+                                   500000, &htlc_id),
+                "cheater add htlc");
+    TEST_ASSERT(channel_add_htlc(&honest_ch, HTLC_RECEIVED, htlc_amt, htlc_hash,
+                                   500000, &htlc_id),
+                "honest add htlc");
+
+    /* Exchange per-commitment points for cn=1 (the HTLC commitment) */
+    secp256k1_pubkey cheater_pcp1, honest_pcp1;
+    channel_get_per_commitment_point(&cheater_ch, 1, &cheater_pcp1);
+    channel_get_per_commitment_point(&honest_ch, 1, &honest_pcp1);
+    channel_set_remote_pcp(&cheater_ch, 1, &honest_pcp1);
+    channel_set_remote_pcp(&honest_ch, 1, &cheater_pcp1);
+
+    /* Build + sign commitment #1 with HTLC (cn=1 after HTLC add) */
+    tx_buf_t commit1_unsigned;
+    tx_buf_init(&commit1_unsigned, 512);
+    unsigned char commit1_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&cheater_ch, &commit1_unsigned, commit1_txid),
+                "build cheater commitment #1 with HTLC");
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0])) return 0;
+    tx_buf_t commit1_signed;
+    tx_buf_init(&commit1_signed, 1024);
+    TEST_ASSERT(channel_sign_commitment(&cheater_ch, &commit1_signed, &commit1_unsigned,
+                                          &lsp_kp),
+                "sign cheater commitment #1 with HTLC");
+
+    /* Advance to commitment #2, revoke #1 (the HTLC commitment) */
+    TEST_ASSERT(channel_update(&cheater_ch, 1000), "cheater update");
+    TEST_ASSERT(channel_update(&honest_ch, -1000), "honest mirror update");
+
+    unsigned char secret1[32];
+    TEST_ASSERT(channel_get_revocation_secret(&cheater_ch, 1, secret1),
+                "get cheater revocation secret #1");
+    TEST_ASSERT(channel_receive_revocation(&honest_ch, 1, secret1),
+                "honest receive revocation #1");
+
+    secp256k1_pubkey cheater_pcp2, honest_pcp2;
+    channel_get_per_commitment_point(&cheater_ch, 2, &cheater_pcp2);
+    channel_get_per_commitment_point(&honest_ch, 2, &honest_pcp2);
+    channel_set_remote_pcp(&cheater_ch, 2, &honest_pcp2);
+    channel_set_remote_pcp(&honest_ch, 2, &cheater_pcp2);
+
+    /* BREACH: broadcast revoked commitment #1 (which has HTLC output) */
+    char *commit1_hex = (char *)malloc(commit1_signed.len * 2 + 1);
+    hex_encode(commit1_signed.data, commit1_signed.len, commit1_hex);
+    char commit1_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, commit1_hex, commit1_txid_hex);
+    free(commit1_hex);
+    TEST_ASSERT(sent, "broadcast revoked commitment #1 with HTLC");
+    printf("  BREACH: revoked commitment with HTLC broadcast: %s\n", commit1_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    /* Parse all outputs from the commitment tx (output order may vary) */
+    uint8_t n_outs = commit1_unsigned.data[46];
+    uint64_t out_amts[8];
+    unsigned char out_spks[8][34];
+    size_t out_off = 47;
+    for (int i = 0; i < (int)n_outs && i < 8; i++) {
+        out_amts[i] = 0;
+        for (int b = 0; b < 8; b++)
+            out_amts[i] |= ((uint64_t)commit1_unsigned.data[out_off + b]) << (b * 8);
+        uint8_t spk_len = commit1_unsigned.data[out_off + 8];
+        if (spk_len <= 34)
+            memcpy(out_spks[i], &commit1_unsigned.data[out_off + 9], spk_len);
+        out_off += 8 + 1 + spk_len;
+    }
+
+    /* Identify outputs: HTLC has exact htlc_amt, to_local is the smaller
+       of the two remaining outputs (funder pays fee, so to_local < to_remote) */
+    int htlc_vout = -1, to_local_vout = -1;
+    for (int i = 0; i < (int)n_outs; i++) {
+        if (out_amts[i] == htlc_amt) {
+            htlc_vout = i;
+        }
+    }
+    for (int i = 0; i < (int)n_outs; i++) {
+        if (i == htlc_vout) continue;
+        if (to_local_vout < 0 || out_amts[i] < out_amts[to_local_vout])
+            to_local_vout = i;
+    }
+    TEST_ASSERT(to_local_vout >= 0, "find to_local vout");
+    TEST_ASSERT(htlc_vout >= 0, "find HTLC vout");
+    printf("  Outputs: to_local[%d]=%lu, htlc[%d]=%lu\n",
+           to_local_vout, (unsigned long)out_amts[to_local_vout],
+           htlc_vout, (unsigned long)out_amts[htlc_vout]);
+
+    /* Build penalty for to_local output (commitment was at cn=1) */
+    tx_buf_t penalty_tx;
+    tx_buf_init(&penalty_tx, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&honest_ch, &penalty_tx,
+                                           commit1_txid, (uint32_t)to_local_vout,
+                                           out_amts[to_local_vout],
+                                           out_spks[to_local_vout], 34,
+                                           1, NULL, 0),
+                "build to_local penalty tx");
+
+    char *penalty_hex = (char *)malloc(penalty_tx.len * 2 + 1);
+    hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
+    char penalty_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, penalty_hex, penalty_txid_hex);
+    free(penalty_hex);
+    TEST_ASSERT(sent, "broadcast to_local penalty tx");
+    printf("  Penalty tx (to_local): %s\n", penalty_txid_hex);
+
+    /* Build HTLC penalty tx (sweep HTLC output from breached commitment) */
+    tx_buf_t htlc_penalty_tx;
+    tx_buf_init(&htlc_penalty_tx, 512);
+    TEST_ASSERT(channel_build_htlc_penalty_tx(&honest_ch, &htlc_penalty_tx,
+                                                commit1_txid, (uint32_t)htlc_vout,
+                                                out_amts[htlc_vout],
+                                                out_spks[htlc_vout], 34,
+                                                1, 0, NULL, 0),
+                "build HTLC penalty tx");
+
+    char *htlc_pen_hex = (char *)malloc(htlc_penalty_tx.len * 2 + 1);
+    hex_encode(htlc_penalty_tx.data, htlc_penalty_tx.len, htlc_pen_hex);
+    char htlc_pen_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, htlc_pen_hex, htlc_pen_txid_hex);
+    free(htlc_pen_hex);
+    TEST_ASSERT(sent, "broadcast HTLC penalty tx");
+    printf("  Penalty tx (HTLC): %s\n", htlc_pen_txid_hex);
+
+    /* Mine and verify both penalties confirm */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf1 = regtest_get_confirmations(&rt, penalty_txid_hex);
+    int conf2 = regtest_get_confirmations(&rt, htlc_pen_txid_hex);
+    TEST_ASSERT(conf1 > 0, "to_local penalty confirmed");
+    TEST_ASSERT(conf2 > 0, "HTLC penalty confirmed");
+    printf("  Both penalty txs confirmed! Cheater fully punished.\n");
+
+    tx_buf_free(&commit1_unsigned);
+    tx_buf_free(&commit1_signed);
+    tx_buf_free(&penalty_tx);
+    tx_buf_free(&htlc_penalty_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Adversarial Test 9: HTLC timeout race — preimage at exact CLTV block ---- */
+
+int test_regtest_htlc_timeout_race(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_htlc_race");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+
+    /* Mine 101 blocks for coinbase maturity. If the regtest chain has been
+       running a long time (>33 halvings = ~4950 blocks), the block subsidy
+       is <1 sat and we can't fund anything — skip gracefully. */
+    regtest_mine_blocks(&rt, 101, mine_addr);
+    double bal = regtest_get_balance(&rt);
+    if (bal < 0.0001) {
+        printf("  SKIP: regtest subsidy exhausted (balance %.8f BTC) — "
+               "run on a fresh chain or earlier in the test order\n", bal);
+        secp256k1_context_destroy(ctx);
+        return 1;  /* skip, not fail */
+    }
+
+    /* Create 2-of-2 MuSig funding */
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    /* Derive bech32m address */
+    secp256k1_pubkey fund_pks[2] = { local_fund_pk, remote_fund_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, fund_pks, 2);
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char ka_tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, ka_tweak);
+
+    musig_keyagg_t tmp_ka = ka;
+    secp256k1_pubkey ka_tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak)) return 0;
+    secp256k1_xonly_pubkey ka_tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk)) return 0;
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char chan_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "address start");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "address end");
+        size_t len = (size_t)(end - start);
+        memcpy(chan_addr, start, len);
+        chan_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, chan_addr, 0.0001, funding_txid_hex),
+                "fund channel");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find funding vout");
+
+    char *blockcount_result = regtest_exec(&rt, "getblockcount", "");
+    TEST_ASSERT(blockcount_result != NULL, "getblockcount");
+    int current_height = atoi(blockcount_result);
+    free(blockcount_result);
+
+    uint32_t cltv_expiry = (uint32_t)(current_height + 10);
+
+    /* Channel setup: we have a received HTLC (we know the preimage) */
+    channel_t ch;
+    uint32_t csv_delay = 6;
+    fee_estimator_t fe; fee_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : 0;
+    /* Give remote enough to satisfy CHANNEL_RESERVE_SATS after HTLC deduction.
+       HTLC is RECEIVED (remote offers), so remote_amt >= htlc + reserve. */
+    uint64_t remote_amt = usable > 2000 ? usable - 2000 : usable / 2;
+    uint64_t local_amt = usable - remote_amt;
+
+    TEST_ASSERT(channel_init(&ch, ctx, local_funding_secret,
+                               &local_fund_pk, &remote_fund_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34,
+                               local_amt, remote_amt, csv_delay),
+                "init channel");
+    ch.funder_is_local = 1;
+
+    unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
+    unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
+    unsigned char chan_revocation_sec[32] = { [0 ... 31] = 0xC3 };
+    channel_set_local_basepoints(&ch, chan_payment_sec, chan_delayed_sec,
+                                   chan_revocation_sec);
+
+    unsigned char lsp_payment_sec[32] = { [0 ... 31] = 0xD1 };
+    unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
+    unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
+    secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
+    channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
+
+    unsigned char chan_htlc_sec[32] = { [0 ... 31] = 0xC4 };
+    unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
+    channel_set_local_htlc_basepoint(&ch, chan_htlc_sec);
+    secp256k1_pubkey lsp_htlc_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
+    channel_set_remote_htlc_basepoint(&ch, &lsp_htlc_bp);
+
+    /* Add received HTLC (we know the preimage) */
+    unsigned char preimage[32] = { [0 ... 31] = 0x42 };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    uint64_t htlc_amount = 2000;
+    uint64_t htlc_id;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_RECEIVED, htlc_amount, payment_hash,
+                                   cltv_expiry, &htlc_id),
+                "add received htlc");
+
+    /* Build and sign commitment */
+    tx_buf_t commit_unsigned;
+    tx_buf_init(&commit_unsigned, 512);
+    unsigned char commit_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &commit_unsigned, commit_txid),
+                "build commitment");
+
+    secp256k1_keypair remote_kp;
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
+    tx_buf_t commit_signed;
+    tx_buf_init(&commit_signed, 1024);
+    TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned,
+                                          &remote_kp),
+                "sign commitment");
+
+    /* Broadcast commitment */
+    char *commit_hex = (char *)malloc(commit_signed.len * 2 + 1);
+    hex_encode(commit_signed.data, commit_signed.len, commit_hex);
+    char commit_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_hex);
+    free(commit_hex);
+    TEST_ASSERT(sent, "broadcast commitment");
+
+    /* Mine past cltv_expiry so both CSV delay and CLTV are satisfied */
+    regtest_mine_blocks(&rt, (int)cltv_expiry - current_height + 1, mine_addr);
+
+    /* Parse all outputs from commitment tx (BIP69 ordering varies) */
+    uint8_t n_outs = commit_unsigned.data[46];
+    uint64_t out_amts[8];
+    unsigned char out_spks[8][34];
+    size_t out_off = 47;
+    for (int i = 0; i < (int)n_outs && i < 8; i++) {
+        out_amts[i] = 0;
+        for (int b = 0; b < 8; b++)
+            out_amts[i] |= ((uint64_t)commit_unsigned.data[out_off + b]) << (b * 8);
+        uint8_t spk_len = commit_unsigned.data[out_off + 8];
+        if (spk_len <= 34)
+            memcpy(out_spks[i], &commit_unsigned.data[out_off + 9], spk_len);
+        out_off += 8 + 1 + spk_len;
+    }
+
+    /* Find the HTLC output by matching exact htlc_amount */
+    int htlc_vout = -1;
+    for (int i = 0; i < (int)n_outs; i++) {
+        if (out_amts[i] == htlc_amount) {
+            htlc_vout = i;
+            break;
+        }
+    }
+    TEST_ASSERT(htlc_vout >= 0, "find HTLC output vout");
+    uint64_t htlc_out_amt = out_amts[htlc_vout];
+    unsigned char htlc_spk[34];
+    memcpy(htlc_spk, out_spks[htlc_vout], 34);
+    printf("  HTLC output at vout %d, amount %lu sats\n",
+           htlc_vout, (unsigned long)htlc_out_amt);
+
+    /* Store preimage */
+    memcpy(ch.htlcs[0].payment_preimage, preimage, 32);
+
+    /* Build success tx (preimage path) */
+    tx_buf_t success_tx;
+    tx_buf_init(&success_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_success_tx(&ch, &success_tx,
+                                                commit_txid, (uint32_t)htlc_vout,
+                                                htlc_out_amt, htlc_spk, 34,
+                                                0),
+                "build htlc success tx");
+
+    /* Broadcast success tx first — should confirm */
+    char *success_hex = (char *)malloc(success_tx.len * 2 + 1);
+    hex_encode(success_tx.data, success_tx.len, success_hex);
+    char success_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, success_hex, success_txid_hex);
+    free(success_hex);
+    TEST_ASSERT(sent, "broadcast htlc success at CLTV boundary");
+    printf("  HTLC success tx at CLTV boundary: %s\n", success_txid_hex);
+
+    /* Build timeout tx (same HTLC output — double-spend) */
+    tx_buf_t timeout_tx;
+    tx_buf_init(&timeout_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_timeout_tx(&ch, &timeout_tx,
+                                                commit_txid, (uint32_t)htlc_vout,
+                                                htlc_out_amt, htlc_spk, 34,
+                                                0),
+                "build htlc timeout tx");
+
+    /* Try broadcasting timeout — should fail (same output already spent) */
+    char *timeout_hex = (char *)malloc(timeout_tx.len * 2 + 1);
+    hex_encode(timeout_tx.data, timeout_tx.len, timeout_hex);
+    char timeout_txid_hex[65];
+    int timeout_sent = regtest_send_raw_tx(&rt, timeout_hex, timeout_txid_hex);
+    free(timeout_hex);
+    /* Timeout should be rejected because success already claims the output */
+    TEST_ASSERT(!timeout_sent, "htlc timeout rejected (success already in mempool)");
+    printf("  HTLC timeout correctly rejected — success path wins!\n");
+
+    /* Mine and verify success confirms */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, success_txid_hex);
+    TEST_ASSERT(conf > 0, "htlc success confirmed");
+    printf("  HTLC success confirmed — preimage wins at CLTV boundary.\n");
+
+    tx_buf_free(&commit_unsigned);
+    tx_buf_free(&commit_signed);
+    tx_buf_free(&success_tx);
+    tx_buf_free(&timeout_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

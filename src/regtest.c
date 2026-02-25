@@ -226,6 +226,21 @@ int regtest_fund_address(regtest_t *rt, const char *address,
     return 1;
 }
 
+int regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address) {
+    if (strcmp(rt->network, "regtest") != 0) return 0;
+
+    /* Mine initial 101 blocks for coinbase maturity */
+    if (!regtest_mine_blocks(rt, 101, address)) return 0;
+
+    /* Mine additional blocks if subsidy is too low (regtest halves every 150) */
+    for (int i = 0; i < 100; i++) {
+        double bal = regtest_get_balance(rt);
+        if (bal >= min_btc) return 1;
+        if (!regtest_mine_blocks(rt, 25, address)) return 0;
+    }
+    return 0;
+}
+
 int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
     char *params = (char *)malloc(strlen(tx_hex) + 4);
     if (!params) return 0;

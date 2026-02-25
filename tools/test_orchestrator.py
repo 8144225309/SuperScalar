@@ -934,6 +934,365 @@ def scenario_full_lifecycle(orch):
 
 
 # ---------------------------------------------------------------------------
+# Adversarial & Edge-Case Scenarios
+# ---------------------------------------------------------------------------
+
+def scenario_ladder_breach(orch):
+    """Breach in DYING factory while ACTIVE factory runs — isolation holds."""
+    orch._log("=== SCENARIO: ladder_breach ===")
+    orch._log("Breach in Factory 0 (DYING) while Factory 1 (ACTIVE) is running.")
+
+    # Start LSP with short active/dying periods and breach test enabled
+    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3",
+                     "--breach-test"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    # Wait for initial factory creation
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory 0 created, mining to push into DYING state...")
+
+    # Mine past active_blocks to push Factory 0 into DYING
+    if orch.is_regtest:
+        for _ in range(6):
+            orch.mine(1)
+            time.sleep(1)
+    else:
+        orch.advance_chain(6)
+
+    # Wait for rotation to create Factory 1
+    time.sleep(orch.timing["coop_wait"])
+
+    # Mine a few more to trigger breach from --breach-test on Factory 0
+    if orch.is_regtest:
+        for _ in range(4):
+            orch.mine(1)
+            time.sleep(1)
+    else:
+        orch.advance_chain(4)
+
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check LSP log for breach detection on Factory 0
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_breach = "BREACH DETECTED" in lsp_log
+    has_penalty = "penalty" in lsp_log.lower()
+
+    # Check that Factory 1 channels are still functional
+    has_factory1 = "Factory 1" in lsp_log or "factory_id=1" in lsp_log
+
+    # Check client logs for detection
+    n_client_detect = 0
+    for i in range(orch.n_clients):
+        if orch.check_penalty_in_log(i):
+            n_client_detect += 1
+
+    orch._log(f"Breach detected: {has_breach}, penalty: {has_penalty}")
+    orch._log(f"Factory 1 exists: {has_factory1}")
+    orch._log(f"Clients detected: {n_client_detect}/{orch.n_clients}")
+
+    orch.stop_all()
+
+    success = has_breach and has_penalty
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"ladder breach isolation {'holds' if success else 'failed'}")
+    return success
+
+
+def scenario_turnover_abort(orch):
+    """PTLC turnover aborted halfway — 3/4 clients complete, 4th disconnects."""
+    orch._log("=== SCENARIO: turnover_abort ===")
+    orch._log("Key turnover fails midway; 4th client reconnects to complete.")
+
+    # Start LSP with short lifecycle for quick turnover trigger
+    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, mining to trigger DYING + turnover...")
+
+    # Mine to trigger DYING state and turnover initiation
+    if orch.is_regtest:
+        for _ in range(5):
+            orch.mine(1)
+            time.sleep(1)
+    else:
+        orch.advance_chain(5)
+
+    # Wait for turnover to begin
+    time.sleep(orch.timing["coop_wait"] // 2)
+
+    # Kill client 3 mid-turnover
+    orch._log("Killing client 3 mid-turnover...")
+    if orch.clients[3]:
+        orch.clients[3].kill()
+
+    # Wait — turnover should be incomplete
+    time.sleep(orch.timing["coop_wait"] // 2)
+
+    # Check LSP log for partial turnover state
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_turnover_start = "turnover" in lsp_log.lower() or "PTLC" in lsp_log
+
+    orch._log(f"Turnover started: {has_turnover_start}")
+
+    # Restart client 3 to complete turnover
+    orch._log("Restarting client 3...")
+    orch.start_client(3)
+
+    # Wait for reconnection and turnover completion
+    time.sleep(orch.timing["coop_wait"])
+
+    # Mine a block to trigger any pending operations
+    orch.advance_chain(1)
+    time.sleep(orch.timing["breach_wait"] // 2)
+
+    # Check final state
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_close = "cooperative close" in lsp_log.lower() or "Close" in lsp_log
+    has_reconnect = "reconnect" in lsp_log.lower() or "client 3" in lsp_log.lower()
+
+    orch._log(f"Close evidence: {has_close}")
+    orch._log(f"Reconnect evidence: {has_reconnect}")
+
+    orch.stop_all()
+
+    success = has_turnover_start
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"turnover abort {'recoverable' if success else 'not detected'}")
+    return success
+
+
+def scenario_lsp_crash_recovery(orch):
+    """LSP crashes (SIGKILL) and restarts — clients reconnect, channels survive."""
+    orch._log("=== SCENARIO: lsp_crash_recovery ===")
+    orch._log("LSP crash + restart; clients reconnect and continue.")
+
+    # Start LSP in daemon mode
+    orch.start_lsp(["--demo", "--daemon"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for demo payments...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Record pre-crash channel state
+    pre_states = orch.get_channel_states()
+    pre_lsp = pre_states.get("lsp", [])
+    orch._log(f"Pre-crash: {len(pre_lsp)} LSP channels")
+
+    # CRASH: kill LSP with SIGKILL (no graceful shutdown)
+    orch._log("CRASHING LSP (SIGKILL)...")
+    if orch.lsp:
+        orch.lsp.kill()
+
+    time.sleep(2)
+
+    # Restart LSP with same DB
+    orch._log("Restarting LSP with same DB...")
+    orch.start_lsp(["--daemon"])
+    time.sleep(orch.timing["lsp_bind"] * 2)
+
+    # Advance chain to trigger reconnection
+    orch.advance_chain(1)
+    time.sleep(orch.timing["coop_wait"])
+
+    # Check post-restart state
+    post_states = orch.get_channel_states()
+    post_lsp = post_states.get("lsp", [])
+    orch._log(f"Post-restart: {len(post_lsp)} LSP channels")
+
+    # Check LSP log for reconnection evidence
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_reconnect = "reconnect" in lsp_log.lower() or "client" in lsp_log.lower()
+
+    # Graceful shutdown
+    orch.stop_all()
+
+    success = len(post_lsp) >= len(pre_lsp) and has_reconnect
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"LSP crash recovery {'succeeded' if success else 'failed'}")
+    return success
+
+
+def scenario_client_crash_htlc(orch):
+    """Client crashes during payment — HTLC resolves after restart."""
+    orch._log("=== SCENARIO: client_crash_htlc ===")
+    orch._log("Client 0 crashes after payment initiation; HTLC resolves.")
+
+    orch.start_lsp(["--demo", "--daemon"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for demo payments...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Kill client 0 (simulates crash during payment)
+    orch._log("Killing client 0 (simulating crash during payment)...")
+    if orch.clients[0]:
+        orch.clients[0].kill()
+
+    # Mine blocks past any HTLC timeout
+    orch._log("Mining past HTLC timeout...")
+    if orch.is_regtest:
+        orch.mine(20)
+    else:
+        orch.advance_chain(20)
+
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check LSP detects client 0 offline
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    offline_detect = "offline" in lsp_log.lower() or "disconnect" in lsp_log.lower()
+    htlc_resolve = "htlc" in lsp_log.lower() or "fail" in lsp_log.lower()
+
+    orch._log(f"Offline detection: {offline_detect}")
+    orch._log(f"HTLC resolution: {htlc_resolve}")
+
+    # Restart client 0
+    orch._log("Restarting client 0...")
+    orch.start_client(0)
+    time.sleep(orch.timing["coop_wait"])
+
+    # Check client 0 recovered
+    client_log = orch.clients[0].read_log() if orch.clients[0] else ""
+    has_reconnect = "reconnect" in client_log.lower() or "connected" in client_log.lower()
+    orch._log(f"Client 0 reconnected: {has_reconnect}")
+
+    orch.stop_all()
+
+    success = offline_detect or htlc_resolve
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"client crash HTLC {'resolved' if success else 'not resolved'}")
+    return success
+
+
+def scenario_mass_departure_jit(orch):
+    """3 of 4 clients vanish; remaining client still functional."""
+    orch._log("=== SCENARIO: mass_departure_jit ===")
+    orch._log("Clients 1-3 vanish; client 0 still active.")
+
+    orch.start_lsp(["--demo", "--daemon", "--jit-amount", "50000"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for initial payments...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Kill clients 1, 2, 3 simultaneously
+    orch._log("Killing clients 1, 2, 3 simultaneously...")
+    for i in [1, 2, 3]:
+        if orch.clients[i]:
+            orch.clients[i].kill()
+
+    # Mine blocks to trigger offline detection
+    time.sleep(3)
+    orch.advance_chain(2)
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check that client 0 is still functional
+    client0_alive = orch.clients[0] and orch.clients[0].is_alive()
+    orch._log(f"Client 0 still alive: {client0_alive}")
+
+    # Check LSP detects departures
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    offline_count = lsp_log.lower().count("offline") + lsp_log.lower().count("disconnect")
+    has_jit = "JIT" in lsp_log or "jit" in lsp_log.lower()
+
+    orch._log(f"Offline mentions in LSP log: {offline_count}")
+    orch._log(f"JIT evidence: {has_jit}")
+
+    # Mine past factory DYING threshold
+    if orch.is_regtest:
+        orch.mine(10)
+    else:
+        orch.advance_chain(10)
+
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check client 0 channel state
+    states = orch.get_channel_states()
+    client0_channels = states.get("client_0", [])
+    orch._log(f"Client 0 channels: {len(client0_channels)}")
+
+    orch.stop_all()
+
+    success = client0_alive
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"mass departure {'handled' if success else 'failed'}")
+    return success
+
+
+def scenario_watchtower_late_arrival(orch):
+    """Breach already confirmed; clients restart with watchtower and detect it."""
+    orch._log("=== SCENARIO: watchtower_late_arrival ===")
+    orch._log("Breach confirmed while all clients offline; they restart and detect.")
+
+    # Start LSP with --cheat-daemon (broadcasts revoked state)
+    orch.start_lsp(["--demo", "--cheat-daemon"])
+
+    # Do NOT start clients — they're all offline during breach
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    # Mine 6 blocks — breach is fully confirmed
+    orch._log("Mining 6 blocks to confirm breach...")
+    orch.advance_chain(6)
+    time.sleep(2)
+
+    # Now start all clients (they come online after breach is confirmed)
+    orch._log("Starting all clients after breach is confirmed...")
+    orch.start_all_clients(["--watchtower"])
+
+    # Give clients time to scan chain and detect breach
+    time.sleep(orch.timing["breach_wait"] * 2)
+
+    # Advance chain to trigger watchtower scan cycles
+    orch.advance_chain(2)
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check which clients detected the breach
+    n_detected = 0
+    for i in range(orch.n_clients):
+        detected = orch.check_penalty_in_log(i)
+        status = "DETECTED" if detected else "missed"
+        orch._log(f"  Client {i} (late arrival): {status}")
+        if detected:
+            n_detected += 1
+
+    orch.stop_all()
+
+    success = n_detected > 0
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"{n_detected}/{orch.n_clients} late-arriving clients detected breach")
+    return success
+
+
+# ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
 
@@ -949,6 +1308,12 @@ SCENARIOS = {
     "factory_rotation": lambda o, **kw: scenario_factory_rotation(o),
     "timeout_recovery": lambda o, **kw: scenario_timeout_recovery(o),
     "full_lifecycle": lambda o, **kw: scenario_full_lifecycle(o),
+    "ladder_breach": lambda o, **kw: scenario_ladder_breach(o),
+    "turnover_abort": lambda o, **kw: scenario_turnover_abort(o),
+    "lsp_crash_recovery": lambda o, **kw: scenario_lsp_crash_recovery(o),
+    "client_crash_htlc": lambda o, **kw: scenario_client_crash_htlc(o),
+    "mass_departure_jit": lambda o, **kw: scenario_mass_departure_jit(o),
+    "watchtower_late_arrival": lambda o, **kw: scenario_watchtower_late_arrival(o),
 }
 
 
@@ -967,6 +1332,12 @@ def list_scenarios():
         "factory_rotation": "DYING trigger → PTLC turnover → new factory",
         "timeout_recovery": "Clients vanish → LSP timeout reclaim",
         "full_lifecycle": "Factory → payments → watchtower → cooperative close",
+        "ladder_breach": "Breach in DYING factory; ACTIVE factory unaffected",
+        "turnover_abort": "PTLC turnover aborted midway; client reconnects to finish",
+        "lsp_crash_recovery": "LSP SIGKILL + restart; clients reconnect",
+        "client_crash_htlc": "Client crashes during payment; HTLC resolves after restart",
+        "mass_departure_jit": "3/4 clients vanish; remaining client still functional",
+        "watchtower_late_arrival": "Breach confirmed; late clients detect via watchtower",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")

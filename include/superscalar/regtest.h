@@ -28,6 +28,7 @@ int   regtest_get_block_height(regtest_t *rt);
 int   regtest_create_wallet(regtest_t *rt, const char *name);
 int   regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len);
 int   regtest_mine_blocks(regtest_t *rt, int n, const char *address);
+int   regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address);
 int   regtest_fund_address(regtest_t *rt, const char *address, double btc_amount, char *txid_out);
 int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);

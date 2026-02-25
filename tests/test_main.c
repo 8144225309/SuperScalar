@@ -270,6 +270,16 @@ extern int test_ptlc_wire_round_trip(void);
 extern int test_ptlc_wire_over_socket(void);
 extern int test_multi_factory_ladder_monitor(void);
 
+/* Adversarial & Edge-Case Tests */
+extern int test_regtest_dw_exhaustion_close(void);
+extern int test_regtest_htlc_timeout_race(void);
+extern int test_regtest_penalty_with_htlcs(void);
+extern int test_regtest_multi_htlc_unilateral(void);
+extern int test_regtest_watchtower_late_detection(void);
+extern int test_regtest_ptlc_no_coop_close(void);
+extern int test_regtest_all_offline_recovery(void);
+extern int test_regtest_tree_ordering(void);
+
 /* Basepoint Exchange (Gap #1) */
 extern int test_wire_channel_basepoints_round_trip(void);
 extern int test_basepoint_independence(void);
@@ -745,6 +755,16 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest CPFP Anchor (P2A) ===\n");
     RUN_TEST(test_regtest_cpfp_penalty_bump);
     RUN_TEST(test_regtest_breach_penalty_cpfp);
+
+    printf("\n=== Adversarial & Edge-Case Tests ===\n");
+    RUN_TEST(test_regtest_dw_exhaustion_close);
+    RUN_TEST(test_regtest_htlc_timeout_race);
+    RUN_TEST(test_regtest_penalty_with_htlcs);
+    RUN_TEST(test_regtest_multi_htlc_unilateral);
+    RUN_TEST(test_regtest_watchtower_late_detection);
+    RUN_TEST(test_regtest_ptlc_no_coop_close);
+    RUN_TEST(test_regtest_all_offline_recovery);
+    RUN_TEST(test_regtest_tree_ordering);
 }
 
 int main(int argc, char *argv[]) {

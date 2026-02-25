@@ -2657,3 +2657,311 @@ int test_factory_arity1_split_round_leaf_advance(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Adversarial Test 5: Factory tree node ordering enforcement.
+   Broadcasting leaf before parent must fail. Correct order must succeed. */
+int test_regtest_tree_ordering(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_tree_ord");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted — "
+               "run on a fresh chain or earlier in test order\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(result, '"');
+        start++;
+        char *end = strchr(start, '"');
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(result);
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                   &found_vout, &fund_amount),
+                "find factory vout");
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);
+    for (int i = 0; i < 15; i++)
+        dw_counter_advance(&f.counter);
+
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    printf("  Tree built: %zu nodes\n", f.n_nodes);
+
+    /* Try broadcasting state_left (node 4) FIRST — parent not on-chain */
+    {
+        factory_node_t *leaf_node = &f.nodes[4];
+        char *tx_hex = (char *)malloc(leaf_node->signed_tx.len * 2 + 1);
+        hex_encode(leaf_node->signed_tx.data, leaf_node->signed_tx.len, tx_hex);
+        char bad_txid[65];
+        int bad_sent = regtest_send_raw_tx(&rt, tx_hex, bad_txid);
+        free(tx_hex);
+        TEST_ASSERT(!bad_sent, "leaf node rejected (parent not on-chain)");
+        printf("  Leaf broadcast correctly rejected (parent missing)\n");
+    }
+
+    /* Broadcast in correct order: kickoff_root(0) → state_root(1) → kickoff_left(2) → state_left(4) */
+    size_t ordered_nodes[] = { 0, 1, 2, 4 };
+    char ordered_txids[6][65];
+
+    for (int step = 0; step < 4; step++) {
+        size_t idx = ordered_nodes[step];
+        factory_node_t *node = &f.nodes[idx];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int sent = regtest_send_raw_tx(&rt, tx_hex, ordered_txids[idx]);
+        free(tx_hex);
+        TEST_ASSERT(sent, "broadcast node in correct order");
+        printf("  Broadcast node %zu: %s\n", idx, ordered_txids[idx]);
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    }
+
+    /* Verify all 4 confirmed */
+    for (int step = 0; step < 4; step++) {
+        size_t idx = ordered_nodes[step];
+        int conf = regtest_get_confirmations(&rt, ordered_txids[idx]);
+        TEST_ASSERT(conf > 0, "ordered node confirmed");
+    }
+
+    /* Verify leaf output exists on-chain */
+    char gettxout_params[256];
+    snprintf(gettxout_params, sizeof(gettxout_params),
+             "\"%s\" 0", ordered_txids[4]);
+    char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
+    TEST_ASSERT(txout != NULL, "leaf output exists");
+
+    cJSON *txout_json = cJSON_Parse(txout);
+    free(txout);
+    TEST_ASSERT(txout_json != NULL, "parse gettxout");
+    cJSON *conf_item = cJSON_GetObjectItem(txout_json, "confirmations");
+    int leaf_conf = conf_item ? conf_item->valueint : -1;
+    cJSON_Delete(txout_json);
+    TEST_ASSERT(leaf_conf > 0, "leaf output confirmed");
+
+    printf("  Tree ordering enforced by consensus!\n");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Adversarial Test 10: DW state exhaustion — factory handles gracefully. */
+int test_regtest_dw_exhaustion_close(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_dw_exhaust");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "address start");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "address end");
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                   &found_vout, &fund_amount),
+                "find factory vout");
+
+    /* Small DW counter for fast exhaustion */
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build initial tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign initial tree");
+
+    /* Exhaust all DW states */
+    int advance_count = 0;
+    while (factory_advance(&f))
+        advance_count++;
+    printf("  DW exhausted after %d advances\n", advance_count);
+    TEST_ASSERT(advance_count > 0, "at least one advance");
+
+    /* Extra advance must fail */
+    TEST_ASSERT(!factory_advance(&f), "advance refused after exhaustion");
+
+    /* Cooperative close still works */
+    secp256k1_pubkey close_pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &close_pks[i], &kps[i])) return 0;
+    }
+
+    uint64_t close_fee = 500; /* ~3 sat/vB for a 5-output coop close (~170 vB) */
+    uint64_t per_out = (fund_amount - close_fee) / 5;
+    uint64_t rem = (fund_amount - close_fee) - per_out * 5;
+
+    tx_output_t close_outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_xonly_pubkey xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &close_pks[i])) return 0;
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw;
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak)) return 0;
+        secp256k1_xonly_pubkey tw_xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw)) return 0;
+        build_p2tr_script_pubkey(close_outputs[i].script_pubkey, &tw_xonly);
+        close_outputs[i].script_pubkey_len = 34;
+        close_outputs[i].amount_sats = per_out + (i == 4 ? rem : 0);
+    }
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    unsigned char close_txid[32];
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, close_txid,
+                                                  close_outputs, 5),
+                "coop close after exhaustion");
+
+    char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
+    hex_encode(close_tx.data, close_tx.len, close_hex);
+    char close_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, close_hex, close_txid_hex);
+    free(close_hex);
+    TEST_ASSERT(sent, "broadcast coop close");
+    printf("  Coop close tx: %s\n", close_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, close_txid_hex);
+    TEST_ASSERT(conf > 0, "coop close confirmed");
+
+    printf("  DW exhaustion handled gracefully: advance refused, coop close works!\n");
+
+    tx_buf_free(&close_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

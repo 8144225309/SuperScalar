@@ -1069,3 +1069,332 @@ int test_rotation_context_save_restore(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Adversarial Test 3: PTLC turnover completes but LSP refuses cooperative close.
+   Distribution tx nLockTime fallback returns funds to all clients. */
+int test_regtest_ptlc_no_coop_close(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_no_coop");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    char funding_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_hex),
+                "fund");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid[32];
+    hex_decode(funding_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                found_vout = v;
+                fund_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find vout");
+
+    char *height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t start_height = (uint32_t)atoi(height_str);
+    free(height_str);
+
+    /* nLockTime simulates CLTV timeout after factory expires */
+    uint32_t nlocktime = start_height + 20;
+
+    /* Build factory */
+    secp256k1_keypair all_kps[5];
+    secp256k1_pubkey all_pks[5];
+    all_kps[0] = lsp_kp;
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* LSP has all client keys (PTLC turnover complete) but refuses coop close.
+       Build distribution tx as fallback: 5 equal outputs (1 per participant). */
+    uint64_t dist_fee = 500;
+    uint64_t per_output = (fund_amount - dist_fee) / 5;
+    uint64_t remainder = (fund_amount - dist_fee) - per_output * 5;
+
+    tx_output_t dist_outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_xonly_pubkey xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &all_pks[i])) return 0;
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw;
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak)) return 0;
+        secp256k1_xonly_pubkey tw_xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw)) return 0;
+        build_p2tr_script_pubkey(dist_outputs[i].script_pubkey, &tw_xonly);
+        dist_outputs[i].script_pubkey_len = 34;
+        dist_outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+                                               dist_outputs, 5, nlocktime),
+                "build distribution tx");
+    printf("  Distribution tx built (nLockTime=%u, LSP refused coop close)\n", nlocktime);
+
+    /* Mine past nLockTime */
+    height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t cur = (uint32_t)atoi(height_str);
+    free(height_str);
+
+    int blocks_needed = (int)(nlocktime - cur + 1);
+    if (blocks_needed > 0)
+        regtest_mine_blocks(&rt, blocks_needed, mine_addr);
+
+    /* Broadcast distribution tx */
+    char *dist_hex = (char *)malloc(dist_tx.len * 2 + 1);
+    hex_encode(dist_tx.data, dist_tx.len, dist_hex);
+    char dist_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, dist_hex, dist_txid_hex);
+    free(dist_hex);
+    TEST_ASSERT(sent, "distribution tx accepted after nLockTime");
+    printf("  Distribution tx broadcast: %s\n", dist_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, dist_txid_hex);
+    TEST_ASSERT(conf > 0, "distribution tx confirmed");
+
+    /* Verify each client output amount matches expected */
+    for (int i = 0; i < 5; i++) {
+        uint64_t out_amt;
+        unsigned char out_spk[64];
+        size_t out_spk_len;
+        int got = regtest_get_tx_output(&rt, dist_txid_hex, (uint32_t)i,
+                                          &out_amt, out_spk, &out_spk_len);
+        TEST_ASSERT(got, "get distribution output");
+        uint64_t expected = per_output + (i == 4 ? remainder : 0);
+        TEST_ASSERT(out_amt == expected, "output amount matches");
+    }
+    printf("  All 5 participants receive correct distribution amounts.\n");
+    printf("  PTLC turnover + no coop close → distribution fallback works!\n");
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Adversarial Test 4: All clients offline — distribution tx recovery.
+   LSP can recover via distribution tx after nLockTime, and client funds are preserved. */
+int test_regtest_all_offline_recovery(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_offline_rec");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (regtest_get_balance(&rt) < 0.002) {
+        printf("  SKIP: regtest subsidy exhausted\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    char funding_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_hex),
+                "fund");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid[32];
+    hex_decode(funding_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                found_vout = v;
+                fund_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find vout");
+
+    char *height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t start_height = (uint32_t)atoi(height_str);
+    free(height_str);
+
+    uint32_t nlocktime = start_height + 20;
+
+    secp256k1_keypair all_kps[5];
+    secp256k1_pubkey all_pks[5];
+    all_kps[0] = lsp_kp;
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* "All clients go offline" — no client operations performed.
+       LSP builds distribution tx with N+1 outputs. */
+    uint64_t dist_fee = 500;
+    uint64_t per_output = (fund_amount - dist_fee) / 5;
+    uint64_t remainder = (fund_amount - dist_fee) - per_output * 5;
+
+    tx_output_t dist_outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_xonly_pubkey xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &all_pks[i])) return 0;
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw;
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak)) return 0;
+        secp256k1_xonly_pubkey tw_xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw)) return 0;
+        build_p2tr_script_pubkey(dist_outputs[i].script_pubkey, &tw_xonly);
+        dist_outputs[i].script_pubkey_len = 34;
+        dist_outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+                                               dist_outputs, 5, nlocktime),
+                "build distribution tx");
+
+    /* Mine past nLockTime */
+    height_str = regtest_exec(&rt, "getblockcount", "");
+    uint32_t cur = (uint32_t)atoi(height_str);
+    free(height_str);
+    int blocks_needed = (int)(nlocktime - cur + 1);
+    if (blocks_needed > 0)
+        regtest_mine_blocks(&rt, blocks_needed, mine_addr);
+
+    char *dist_hex = (char *)malloc(dist_tx.len * 2 + 1);
+    hex_encode(dist_tx.data, dist_tx.len, dist_hex);
+    char dist_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, dist_hex, dist_txid_hex);
+    free(dist_hex);
+    TEST_ASSERT(sent, "distribution tx accepted");
+    printf("  Distribution tx (all offline): %s\n", dist_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int dist_conf = regtest_get_confirmations(&rt, dist_txid_hex);
+    TEST_ASSERT(dist_conf > 0, "distribution tx confirmed");
+
+    /* Verify: distribution tx has 5 outputs (1 LSP + 4 clients) */
+    int output_count = 0;
+    for (int v = 0; v < 6; v++) {
+        uint64_t amt;
+        unsigned char spk[64];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, dist_txid_hex, (uint32_t)v,
+                                    &amt, spk, &spk_len))
+            output_count++;
+    }
+    TEST_ASSERT(output_count == 5, "distribution tx has 5 outputs");
+
+    /* Verify: each output >= expected balance (P2TR to participant keys) */
+    for (int i = 0; i < 5; i++) {
+        uint64_t out_amt;
+        unsigned char out_spk[64];
+        size_t out_spk_len;
+        TEST_ASSERT(regtest_get_tx_output(&rt, dist_txid_hex, (uint32_t)i,
+                                            &out_amt, out_spk, &out_spk_len),
+                    "get output");
+        TEST_ASSERT(out_amt >= per_output, "output amount sufficient");
+        /* Verify output is P2TR (0x5120 prefix) */
+        TEST_ASSERT(out_spk_len == 34 && out_spk[0] == 0x51 && out_spk[1] == 0x20,
+                    "output is P2TR");
+    }
+
+    printf("  All offline recovery complete: 5 P2TR outputs, client funds preserved.\n");
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
