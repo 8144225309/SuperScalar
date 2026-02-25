@@ -414,6 +414,9 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
 }
 
 int main(int argc, char *argv[]) {
+    /* Ignore SIGPIPE — write() to dead client sockets returns EPIPE instead of killing us */
+    signal(SIGPIPE, SIG_IGN);
+
     int port = 9735;
     int n_clients = 4;
     int n_payments = 0;
@@ -680,6 +683,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             printf("LSP: found existing factory in DB, entering recovery mode\n");
+            fflush(stdout);
 
             /* Set up LSP with listen socket only (skip ceremony) */
             lsp_t lsp;
@@ -875,14 +879,14 @@ int main(int argc, char *argv[]) {
                 }
                 char rfa[128];
                 if (derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
-                    strncpy(mgr.rot_fund_addr, rfa,
-                            sizeof(mgr.rot_fund_addr) - 1);
+                    snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr),
+                             "%s", rfa);
             }
             {
                 char rma[128];
                 if (regtest_get_new_address(&rt, rma, sizeof(rma)))
-                    strncpy(mgr.rot_mine_addr, rma,
-                            sizeof(mgr.rot_mine_addr) - 1);
+                    snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr),
+                             "%s", rma);
             }
             mgr.rot_step_blocks = step_blocks;
             mgr.rot_states_per_layer = 4;
@@ -964,6 +968,7 @@ int main(int argc, char *argv[]) {
 
             printf("LSP recovery: entering daemon mode "
                    "(waiting for client reconnections)...\n");
+            fflush(stdout);
             lsp_channels_run_daemon_loop(&mgr, &lsp, &g_shutdown);
 
             /* Persist updated channel balances on shutdown */
@@ -1477,8 +1482,8 @@ int main(int argc, char *argv[]) {
         mgr.rot_fee_est = &fee_est;
         memcpy(mgr.rot_fund_spk, fund_spk, 34);
         mgr.rot_fund_spk_len = 34;
-        strncpy(mgr.rot_fund_addr, fund_addr, sizeof(mgr.rot_fund_addr) - 1);
-        strncpy(mgr.rot_mine_addr, mine_addr, sizeof(mgr.rot_mine_addr) - 1);
+        snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr), "%s", fund_addr);
+        snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr), "%s", mine_addr);
         mgr.rot_step_blocks = step_blocks;
         mgr.rot_states_per_layer = 4;
         mgr.rot_leaf_arity = leaf_arity;
@@ -1613,6 +1618,7 @@ int main(int argc, char *argv[]) {
 
         if (daemon_mode) {
             printf("LSP: channels ready, entering daemon mode...\n");
+            fflush(stdout);
 
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
@@ -1651,6 +1657,7 @@ int main(int argc, char *argv[]) {
     /* === Breach Test: broadcast factory tree + revoked commitment === */
     if (breach_test && channels_active) {
         printf("\n=== BREACH TEST ===\n");
+        fflush(stdout);
         printf("Broadcasting factory tree (all %zu nodes)...\n", lsp.factory.n_nodes);
 
         int tree_ok;
@@ -1670,92 +1677,80 @@ int main(int argc, char *argv[]) {
         }
         printf("Factory tree confirmed on-chain.\n");
 
-        /* Rebuild old REMOTE commitment #0 (the one the client holds,
-         * now revoked — this is what would appear on-chain in a breach) */
-        channel_t *ch0 = &mgr.entries[0].channel;
-        uint64_t saved_num = ch0->commitment_number;
-        uint64_t saved_local = ch0->local_amount;
-        uint64_t saved_remote = ch0->remote_amount;
-        size_t saved_n_htlcs = ch0->n_htlcs;
+        /* Broadcast revoked commitments for ALL channels so every client's
+         * watchtower can detect the breach independently. */
+        static const unsigned char client_fills[4] = { 0x22, 0x33, 0x44, 0x55 };
+        for (size_t ci = 0; ci < mgr.n_channels; ci++) {
+            channel_t *chX = &mgr.entries[ci].channel;
+            uint64_t saved_num = chX->commitment_number;
+            uint64_t saved_local = chX->local_amount;
+            uint64_t saved_remote = chX->remote_amount;
+            size_t saved_n_htlcs = chX->n_htlcs;
 
-        /* Temporarily revert to commitment #0 with no HTLCs */
-        ch0->commitment_number = 0;
-        ch0->local_amount = init_local;
-        ch0->remote_amount = init_remote;
-        ch0->n_htlcs = 0;
+            /* Temporarily revert to commitment #0 with no HTLCs */
+            chX->commitment_number = 0;
+            chX->local_amount = init_local;
+            chX->remote_amount = init_remote;
+            chX->n_htlcs = 0;
 
-        tx_buf_t old_commit_tx;
-        tx_buf_init(&old_commit_tx, 512);
-        unsigned char old_txid[32];
-        int built = channel_build_commitment_tx_for_remote(ch0, &old_commit_tx, old_txid);
+            tx_buf_t old_commit_tx;
+            tx_buf_init(&old_commit_tx, 512);
+            unsigned char old_txid[32];
+            int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
 
-        /* Restore current state */
-        ch0->commitment_number = saved_num;
-        ch0->local_amount = saved_local;
-        ch0->remote_amount = saved_remote;
-        ch0->n_htlcs = saved_n_htlcs;
+            /* Restore current state */
+            chX->commitment_number = saved_num;
+            chX->local_amount = saved_local;
+            chX->remote_amount = saved_remote;
+            chX->n_htlcs = saved_n_htlcs;
 
-        if (!built) {
-            fprintf(stderr, "BREACH TEST: failed to rebuild old commitment\n");
+            if (!built) {
+                fprintf(stderr, "BREACH TEST: failed to rebuild old commitment for channel %zu\n", ci);
+                tx_buf_free(&old_commit_tx);
+                continue;
+            }
+
+            /* Sign with both LSP + client keys */
+            unsigned char cli_sec[32];
+            memset(cli_sec, client_fills[ci], 32);
+            secp256k1_keypair cli_kp;
+            if (!secp256k1_keypair_create(ctx, &cli_kp, cli_sec)) {
+                fprintf(stderr, "BREACH TEST: keypair create failed for channel %zu\n", ci);
+                memset(cli_sec, 0, 32);
+                tx_buf_free(&old_commit_tx);
+                continue;
+            }
+            memset(cli_sec, 0, 32);
+
+            tx_buf_t old_signed;
+            tx_buf_init(&old_signed, 512);
+            if (!channel_sign_commitment(chX, &old_signed, &old_commit_tx, &cli_kp)) {
+                fprintf(stderr, "BREACH TEST: failed to sign old commitment for channel %zu\n", ci);
+                tx_buf_free(&old_signed);
+                tx_buf_free(&old_commit_tx);
+                continue;
+            }
             tx_buf_free(&old_commit_tx);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
 
-        /* Sign the old commitment (need both LSP + client 0 keys) */
-        unsigned char c0_sec[32];
-        memset(c0_sec, 0x22, 32);  /* Client 0 key = 0x22 repeated (same as demo) */
-        secp256k1_keypair c0_kp;
-        if (!secp256k1_keypair_create(ctx, &c0_kp, c0_sec)) {
-            fprintf(stderr, "BREACH TEST: keypair create failed\n");
-            memset(c0_sec, 0, 32);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        memset(c0_sec, 0, 32);  /* wipe secret */
-
-        tx_buf_t old_signed;
-        tx_buf_init(&old_signed, 512);
-        if (!channel_sign_commitment(ch0, &old_signed, &old_commit_tx, &c0_kp)) {
-            fprintf(stderr, "BREACH TEST: failed to sign old commitment\n");
+            char *old_hex = malloc(old_signed.len * 2 + 1);
+            hex_encode(old_signed.data, old_signed.len, old_hex);
+            char old_txid_str[65];
+            int sent = regtest_send_raw_tx(&rt, old_hex, old_txid_str);
+            free(old_hex);
             tx_buf_free(&old_signed);
-            tx_buf_free(&old_commit_tx);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+
+            if (!sent) {
+                fprintf(stderr, "BREACH TEST: failed to broadcast revoked commitment for channel %zu\n", ci);
+                continue;
+            }
+            printf("Revoked commitment broadcast (ch %zu): %s\n", ci, old_txid_str);
         }
-        tx_buf_free(&old_commit_tx);
 
-        /* Broadcast old (revoked) signed commitment */
-        char *old_hex = malloc(old_signed.len * 2 + 1);
-        hex_encode(old_signed.data, old_signed.len, old_hex);
-        char old_txid_str[65];
-        int sent = regtest_send_raw_tx(&rt, old_hex, old_txid_str);
-        free(old_hex);
-        tx_buf_free(&old_signed);
-
-        if (!sent) {
-            fprintf(stderr, "BREACH TEST: failed to broadcast revoked commitment\n");
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        printf("Revoked commitment broadcast: %s\n", old_txid_str);
-
-        /* Confirm the revoked commitment so watchtower can detect it */
+        /* Confirm all revoked commitments so watchtowers can detect them */
         if (is_regtest) {
             regtest_mine_blocks(&rt, 1, mine_addr);
         } else {
-            /* On signet/testnet, wait for natural block confirmation */
-            printf("Waiting for revoked commitment to confirm...\n");
-            regtest_wait_for_confirmation(&rt, old_txid_str,
-                                                confirm_timeout_secs);
+            printf("Waiting for revoked commitments to confirm...\n");
         }
 
         if (breach_test == 2) {

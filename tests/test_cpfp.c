@@ -302,7 +302,7 @@ int test_watchtower_pending_tracking(void) {
     /* Add a pending entry */
     TEST_ASSERT(wt.n_pending < WATCHTOWER_MAX_PENDING, "room for pending");
     watchtower_pending_t *p = &wt.pending[wt.n_pending++];
-    strncpy(p->txid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 64);
+    memcpy(p->txid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 64);
     p->txid[64] = '\0';
     p->anchor_vout = 1;
     p->anchor_amount = 240;

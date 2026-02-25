@@ -70,7 +70,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             WATCHTOWER_MAX_PENDING);
         for (size_t i = 0; i < n_loaded && wt->n_pending < WATCHTOWER_MAX_PENDING; i++) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
-            strncpy(p->txid, pending_txids[i], 64);
+            memcpy(p->txid, pending_txids[i], 64);
             p->txid[64] = '\0';
             p->anchor_vout = pending_vouts[i];
             p->anchor_amount = pending_amounts[i];
@@ -307,6 +307,7 @@ int watchtower_check(watchtower_t *wt) {
         if (e->type == WATCH_FACTORY_NODE) {
             printf("FACTORY BREACH on node %u (txid: %s)!\n",
                    e->channel_id, txid_hex);
+            fflush(stdout);
 
             /* Broadcast the pre-built latest state tx as response */
             if (e->response_tx && e->response_tx_len > 0) {
@@ -341,6 +342,7 @@ int watchtower_check(watchtower_t *wt) {
         /* WATCH_COMMITMENT: build and broadcast penalty tx */
         printf("BREACH DETECTED on channel %u, commitment %llu (txid: %s)!\n",
                e->channel_id, (unsigned long long)e->commit_num, txid_hex);
+        fflush(stdout);
 
         /* If in mempool but not confirmed, mine a block (regtest only) */
         if (in_mempool && conf < 0 && strcmp(wt->rt->network, "regtest") == 0) {
@@ -384,6 +386,7 @@ int watchtower_check(watchtower_t *wt) {
             hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
             if (regtest_send_raw_tx(wt->rt, penalty_hex, penalty_txid)) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
+                fflush(stdout);
                 penalties_broadcast++;
                 penalty_sent = 1;
                 if (wt->db && wt->db->db)
@@ -404,7 +407,7 @@ int watchtower_check(watchtower_t *wt) {
         if (penalty_sent && wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < WATCHTOWER_MAX_PENDING) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
-            strncpy(p->txid, penalty_txid, 64);
+            memcpy(p->txid, penalty_txid, 64);
             p->txid[64] = '\0';
             p->anchor_vout = 1;
             p->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;

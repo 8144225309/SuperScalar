@@ -210,7 +210,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     /* Use the same funding address derivation as the main factory */
     char funding_addr[128];
     if (mgr->rot_fund_addr[0]) {
-        strncpy(funding_addr, mgr->rot_fund_addr, sizeof(funding_addr) - 1);
+        snprintf(funding_addr, sizeof(funding_addr), "%s", mgr->rot_fund_addr);
     } else {
         /* Can't derive address without bitcoin-cli, use raw funding */
         fprintf(stderr, "LSP JIT: no funding address configured\n");

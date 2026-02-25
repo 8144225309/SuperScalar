@@ -877,8 +877,9 @@ int test_noise_handshake(void) {
         if (!ok) _exit(1);
 
         /* Write keys to parent for comparison */
-        write(sv[1], resp_ns.send_key, 32);
-        write(sv[1], resp_ns.recv_key, 32);
+        ssize_t w3 = write(sv[1], resp_ns.send_key, 32);
+        ssize_t w4 = write(sv[1], resp_ns.recv_key, 32);
+        (void)w3; (void)w4;
 
         close(sv[1]);
         secp256k1_context_destroy(child_ctx);
@@ -893,8 +894,9 @@ int test_noise_handshake(void) {
 
     /* Read responder's keys */
     unsigned char resp_send[32], resp_recv[32];
-    read(sv[0], resp_send, 32);
-    read(sv[0], resp_recv, 32);
+    ssize_t r1 = read(sv[0], resp_send, 32);
+    ssize_t r2 = read(sv[0], resp_recv, 32);
+    (void)r1; (void)r2;
 
     /* Initiator's send_key should == Responder's recv_key */
     TEST_ASSERT_MEM_EQ(init_ns.send_key, resp_recv, 32,
@@ -1041,8 +1043,9 @@ int test_encrypted_tamper_reject(void) {
     wire_set_encryption(tv[0], ns);
 
     /* Write tampered frame to tv[1] */
-    write(tv[1], len_buf, 4);
-    write(tv[1], raw, frame_len);
+    ssize_t w1 = write(tv[1], len_buf, 4);
+    ssize_t w2 = write(tv[1], raw, frame_len);
+    (void)w1; (void)w2;
     close(tv[1]);
 
     /* wire_recv should fail due to tag mismatch */

@@ -1696,6 +1696,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
     uint32_t dying_id = dying->factory_id;
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
+    fflush(stdout);
 
     /* Build combined keypair/pubkey arrays for adaptor protocol */
     size_t n_total = 1 + lsp->n_clients;
@@ -1817,10 +1818,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: Phase B — cooperative close of factory %u\n", dying_id);
 
     tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
-    uint64_t close_fee = fee_estimate(fe, 200);
+    /* Close TX: 1 P2TR key-path input (~68 vB overhead) + n_total P2TR outputs (~43 vB each) */
+    size_t close_vsize = 68 + 43 * n_total;
+    uint64_t close_fee = fee_estimate(fe, close_vsize);
     if (close_fee == 0) {
-        /* Floor: 1 sat/vB for 200 vB close tx */
-        close_fee = 200;
+        /* Floor: 1 sat/vB */
+        close_fee = close_vsize;
         fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
                 "using 1 sat/vB floor (%llu sats)\n",
                 (unsigned long long)close_fee);
@@ -2147,6 +2150,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!mgr || !lsp || !shutdown_flag) return 0;
 
     printf("LSP: daemon loop started (Ctrl+C to stop)\n");
+    fflush(stdout);
 
     while (!(*shutdown_flag)) {
         fd_set rfds;
@@ -2206,12 +2210,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     /* Factory lifecycle monitoring */
                     factory_state_t fstate = factory_get_state(
                         &lsp->factory, (uint32_t)height);
-                    if (fstate == FACTORY_DYING)
+                    if (fstate == FACTORY_DYING) {
                         printf("LSP: factory DYING (%u blocks to expiry)\n",
                                factory_blocks_until_expired(&lsp->factory,
                                                             (uint32_t)height));
-                    else if (fstate == FACTORY_EXPIRED)
+                        fflush(stdout);
+                    } else if (fstate == FACTORY_EXPIRED) {
                         printf("LSP: factory EXPIRED at height %d\n", height);
+                        fflush(stdout);
+                    }
 
                     /* Ladder state tracking (Tier 2 → Tier 3: multi-factory) */
                     if (mgr->ladder) {
@@ -2233,6 +2240,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     st_names[si] : "UNKNOWN";
                                 printf("LSP: ladder factory %zu -> %s at height %d\n",
                                        fi, st_str, height);
+                                fflush(stdout);
                                 if (mgr->persist) {
                                     const char *ps[] = {
                                         "active", "dying", "expired" };
@@ -2266,20 +2274,26 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     }
                                 }
 
-                                /* Auto-rotate when a factory enters DYING */
+                                /* Auto-rotate when factory enters DYING
+                                   (or jumps directly to EXPIRED, skipping DYING
+                                    — can happen if blocks mine faster than poll) */
                                 if (mgr->rot_auto_rotate &&
-                                    lf->cached_state == FACTORY_DYING &&
+                                    (lf->cached_state == FACTORY_DYING ||
+                                     lf->cached_state == FACTORY_EXPIRED) &&
                                     old_states[fi] == FACTORY_ACTIVE &&
                                     !(mgr->rot_attempted_mask & (1u << lf->factory_id))) {
                                     printf("LSP: factory %u DYING — starting auto-rotation\n",
                                            lf->factory_id);
+                                    fflush(stdout);
                                     mgr->rot_attempted_mask |= (1u << lf->factory_id);
                                     int ok = lsp_channels_rotate_factory(mgr, lsp);
-                                    if (ok)
+                                    if (ok) {
                                         printf("LSP: auto-rotation complete — new factory active\n");
-                                    else
+                                        fflush(stdout);
+                                    } else {
                                         fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
                                                 lf->factory_id);
+                                    }
                                 }
                             }
                         }
@@ -2355,6 +2369,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             if (jit_amt > 0) {
                                 printf("LSP: opening JIT channel for client %zu "
                                        "(factory expired)\n", c);
+                                fflush(stdout);
                                 jit_channel_create(mgr, lsp, c, jit_amt,
                                                     "factory_expired");
                             }

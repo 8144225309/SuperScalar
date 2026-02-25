@@ -220,9 +220,13 @@ typedef struct {
 } daemon_cb_data_t;
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
-   Call after each client_handle_commitment_signed in daemon mode. */
+   Call after each client_handle_commitment_signed in daemon mode.
+   old_local/old_remote are the channel amounts at the OLD commitment being
+   revoked (before the state-advancing add/fulfill that preceded this). */
 static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
-                                         secp256k1_context *ctx) {
+                                         secp256k1_context *ctx,
+                                         uint64_t old_local, uint64_t old_remote,
+                                         const htlc_t *old_htlcs, size_t old_n_htlcs) {
     wire_msg_t rev_msg;
     if (!wire_recv(fd, &rev_msg))
         return;
@@ -238,12 +242,12 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         uint64_t old_cn = ch->commitment_number - 1;
         channel_receive_revocation(ch, old_cn, lsp_rev_secret);
 
-        /* Register with client watchtower */
+        /* Register with client watchtower using the OLD commitment's amounts */
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 rev_chan_id, old_cn,
-                ch->local_amount, ch->remote_amount,
-                NULL, 0);
+                old_local, old_remote,
+                old_htlcs, old_n_htlcs);
         }
 
         /* Store LSP's next per-commitment point */
@@ -339,7 +343,15 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
         switch (msg.msg_type) {
-        case MSG_UPDATE_ADD_HTLC:
+        case MSG_UPDATE_ADD_HTLC: {
+            /* Save pre-add state (this is the OLD commitment being revoked) */
+            uint64_t pre_add_local = ch->local_amount;
+            uint64_t pre_add_remote = ch->remote_amount;
+            htlc_t pre_add_htlcs[MAX_HTLCS];
+            size_t pre_add_n_htlcs = ch->n_htlcs;
+            if (pre_add_n_htlcs > 0)
+                memcpy(pre_add_htlcs, ch->htlcs, pre_add_n_htlcs * sizeof(htlc_t));
+
             client_handle_add_htlc(ch, &msg);
             cJSON_Delete(msg.json);
 
@@ -352,7 +364,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
-                client_recv_lsp_revocation(fd, ch, cbd, ctx);
+                client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                    pre_add_local, pre_add_remote,
+                    pre_add_n_htlcs > 0 ? pre_add_htlcs : NULL, pre_add_n_htlcs);
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -401,6 +415,15 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     }
                     printf("Client %u: fulfilling HTLC %llu with real preimage\n",
                            my_index, (unsigned long long)htlc_id);
+
+                    /* Save pre-fulfill state (old commitment being revoked) */
+                    uint64_t pre_ful_local = ch->local_amount;
+                    uint64_t pre_ful_remote = ch->remote_amount;
+                    htlc_t pre_ful_htlcs[MAX_HTLCS];
+                    size_t pre_ful_n_htlcs = ch->n_htlcs;
+                    if (pre_ful_n_htlcs > 0)
+                        memcpy(pre_ful_htlcs, ch->htlcs, pre_ful_n_htlcs * sizeof(htlc_t));
+
                     client_fulfill_payment(fd, ch, htlc_id, preimage);
 
                     /* Handle COMMITMENT_SIGNED for the fulfill */
@@ -408,7 +431,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
                         if (msg.json) cJSON_Delete(msg.json);
                         /* Receive LSP's own revocation (bidirectional) */
-                        client_recv_lsp_revocation(fd, ch, cbd, ctx);
+                        client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                            pre_ful_local, pre_ful_remote,
+                            pre_ful_n_htlcs > 0 ? pre_ful_htlcs : NULL, pre_ful_n_htlcs);
                     } else {
                         if (msg.json) cJSON_Delete(msg.json);
                     }
@@ -421,12 +446,16 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 }
             }
             break;
+        }
 
         case MSG_COMMITMENT_SIGNED:
             client_handle_commitment_signed(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
-            /* Receive LSP's own revocation (bidirectional) */
-            client_recv_lsp_revocation(fd, ch, cbd, ctx);
+            /* Receive LSP's own revocation (bidirectional).
+               No add/fulfill preceded this, so current state = old commitment state. */
+            client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                ch->local_amount, ch->remote_amount,
+                ch->n_htlcs > 0 ? ch->htlcs : NULL, ch->n_htlcs);
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
                 persist_update_channel_balance(cbd->db, my_index - 1,
@@ -438,6 +467,15 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Parse and apply the HTLC fulfill to update channel state */
             uint64_t ful_htlc_id;
             unsigned char ful_preimage[32];
+
+            /* Save pre-fulfill state (old commitment being revoked) */
+            uint64_t pre_ful2_local = ch->local_amount;
+            uint64_t pre_ful2_remote = ch->remote_amount;
+            htlc_t pre_ful2_htlcs[MAX_HTLCS];
+            size_t pre_ful2_n_htlcs = ch->n_htlcs;
+            if (pre_ful2_n_htlcs > 0)
+                memcpy(pre_ful2_htlcs, ch->htlcs, pre_ful2_n_htlcs * sizeof(htlc_t));
+
             if (wire_parse_update_fulfill_htlc(msg.json, &ful_htlc_id, ful_preimage)) {
                 channel_fulfill_htlc(ch, ful_htlc_id, ful_preimage);
                 printf("Client %u: HTLC %llu fulfilled\n",
@@ -451,7 +489,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 if (msg.json) cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
-                client_recv_lsp_revocation(fd, ch, cbd, ctx);
+                client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                    pre_ful2_local, pre_ful2_remote,
+                    pre_ful2_n_htlcs > 0 ? pre_ful2_htlcs : NULL, pre_ful2_n_htlcs);
             } else {
                 if (msg.json) cJSON_Delete(msg.json);
             }
@@ -731,7 +771,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 /* Finalize JIT channel init — for client, swap local/remote
                    since LSP's local is client's remote */
                 jit->jit_channel_id = jit_ch_id;
-                strncpy(jit->funding_txid_hex, fund_txid_hex, 64);
+                memcpy(jit->funding_txid_hex, fund_txid_hex, 64);
+                jit->funding_txid_hex[64] = '\0';
                 jit->funding_amount = fund_amount;
                 jit->funding_vout = fund_vout;
                 jit->funding_confirmed = 1;
@@ -1041,6 +1082,9 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Ignore SIGPIPE — write() to dead LSP socket returns EPIPE instead of killing us */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *seckey_hex = NULL;
     int port = 9735;
     const char *host = "127.0.0.1";
@@ -1348,7 +1392,9 @@ int main(int argc, char *argv[]) {
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
                                                 daemon_channel_cb, &cbd);
-                first_run = 0;
+                /* Only switch to reconnect mode once factory is persisted */
+                if (ok || cbd.saved_initial)
+                    first_run = 0;
             } else {
                 printf("Client: reconnecting from persisted state...\n");
                 cbd.saved_initial = 1;  /* already saved on first run */
@@ -1358,6 +1404,10 @@ int main(int argc, char *argv[]) {
             if (g_shutdown) break;
             if (!ok) {
                 fprintf(stderr, "Client: disconnected, retrying in 5s...\n");
+                /* Run watchtower check between reconnect attempts so we can
+                   detect on-chain breaches even when the LSP is unreachable. */
+                if (cbd.wt)
+                    watchtower_check(cbd.wt);
                 sleep(5);
             } else {
                 break;  /* clean exit */

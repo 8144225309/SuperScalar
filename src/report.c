@@ -153,7 +153,9 @@ void report_flush(report_t *r) {
 #ifdef _WIN32
     _chsize(_fileno(r->fp), (long)strlen(json_str));
 #else
-    ftruncate(fileno(r->fp), (off_t)strlen(json_str));
+    if (ftruncate(fileno(r->fp), (off_t)strlen(json_str)) != 0) {
+        /* best-effort truncation; ignore failure */
+    }
 #endif
     free(json_str);
 }
