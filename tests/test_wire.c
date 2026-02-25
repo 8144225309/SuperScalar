@@ -55,9 +55,11 @@ static secp256k1_context *test_ctx(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 }
 
-static void make_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+static int make_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+    return 1;
 }
 
 /* ---- Test 1: pubkey-only factory produces identical tree ---- */
@@ -65,7 +67,7 @@ static void make_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
 int test_wire_pubkey_only_factory(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build factory with keypairs (reference) */
     factory_t f_ref;
@@ -79,8 +81,9 @@ int test_wire_pubkey_only_factory(void) {
 
     /* Build factory with pubkeys only */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     factory_t f_pk;
     factory_init_from_pubkeys(&f_pk, ctx, pks, 5, 10, 4);
@@ -147,9 +150,9 @@ int test_wire_crypto_serialization(void) {
 
     /* Test pubkey round-trip via HELLO message */
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[0])) return 0;
     secp256k1_pubkey pk;
-    secp256k1_keypair_pub(ctx, &pk, &kp);
+    if (!secp256k1_keypair_pub(ctx, &pk, &kp)) return 0;
 
     cJSON *hello = wire_build_hello(ctx, &pk);
     cJSON *pk_item = cJSON_GetObjectItem(hello, "pubkey");
@@ -163,8 +166,8 @@ int test_wire_crypto_serialization(void) {
 
     unsigned char ser1[33], ser2[33];
     size_t len1 = 33, len2 = 33;
-    secp256k1_ec_pubkey_serialize(ctx, ser1, &len1, &pk, SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, ser2, &len2, &pk2, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser1, &len1, &pk, SECP256K1_EC_COMPRESSED)) return 0;
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser2, &len2, &pk2, SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT_MEM_EQ(ser1, ser2, 33, "pubkey round-trip");
 
     cJSON_Delete(hello);
@@ -202,9 +205,9 @@ int test_wire_crypto_serialization(void) {
 int test_wire_nonce_bundle(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[1]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[1])) return 0;
     secp256k1_pubkey pk;
-    secp256k1_keypair_pub(ctx, &pk, &kp);
+    if (!secp256k1_keypair_pub(ctx, &pk, &kp)) return 0;
 
     /* Build a bundle with 3 entries */
     wire_bundle_entry_t entries[3];
@@ -269,7 +272,7 @@ int test_wire_psig_bundle(void) {
 int test_wire_close_unsigned(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build reference factory */
     factory_t f;
@@ -280,20 +283,21 @@ int test_wire_close_unsigned(void) {
 
     /* Compute proper funding SPK */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
@@ -333,7 +337,7 @@ int test_wire_close_unsigned(void) {
 int test_wire_distributed_signing(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build reference factory with all keypairs, sign it the old way */
     factory_t f_ref;
@@ -343,21 +347,22 @@ int test_wire_distributed_signing(void) {
     fake_txid[0] = 0xCC;
 
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
     secp256k1_pubkey tweaked_pk;
     musig_keyagg_t ka_copy = ka;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
@@ -401,7 +406,7 @@ int test_wire_distributed_signing(void) {
         TEST_ASSERT(factory_sessions_init(fp), "init sessions");
 
         unsigned char sk[32];
-        secp256k1_keypair_sec(ctx, sk, &kps[p]);
+        if (!secp256k1_keypair_sec(ctx, sk, &kps[p])) return 0;
 
         for (size_t n = 0; n < fp->n_nodes; n++) {
             int slot = factory_find_signer_slot(fp, n, (uint32_t)p);
@@ -500,7 +505,7 @@ int test_wire_channel_basepoints_round_trip(void) {
     {
         unsigned char sec6[32] = { [0 ... 31] = 0x77 };
         secp256k1_pubkey pk6;
-        secp256k1_ec_pubkey_create(ctx, &pk6, sec6);
+        if (!secp256k1_ec_pubkey_create(ctx, &pk6, sec6)) return 0;
 
         /* Build message */
         cJSON *j = wire_build_channel_basepoints(
@@ -524,10 +529,10 @@ int test_wire_channel_basepoints_round_trip(void) {
         for (int i = 0; i < 6; i++) {
             unsigned char ser1[33], ser2[33];
             size_t l1 = 33, l2 = 33;
-            secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &expected[i],
-                                           SECP256K1_EC_COMPRESSED);
-            secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &out[i],
-                                           SECP256K1_EC_COMPRESSED);
+            if (!secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &expected[i],
+                                           SECP256K1_EC_COMPRESSED)) return 0;
+            if (!secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &out[i],
+                                           SECP256K1_EC_COMPRESSED)) return 0;
             TEST_ASSERT(memcmp(ser1, ser2, 33) == 0, "pubkey round-trip mismatch");
         }
     }
@@ -545,7 +550,7 @@ int test_basepoint_independence(void) {
     /* Create pubkeys */
     secp256k1_pubkey pks[5];
     for (int i = 0; i < 5; i++) {
-        secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i]);
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return 0;
     }
 
     /* Build a factory for testing */
@@ -619,31 +624,32 @@ int test_regtest_wire_factory(void) {
 
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Compute funding SPK */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak_val[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     /* Derive bech32m address via bitcoin-cli descriptors */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
     char tweaked_hex[65];
     hex_encode(tweaked_ser, 32, tweaked_hex);
 
@@ -761,7 +767,7 @@ int test_regtest_wire_factory(void) {
             usleep(100000 * (c + 1));  /* stagger connections: 100ms, 200ms, ... */
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
-            secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]);
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
 
             int ok = client_run_ceremony(child_ctx, &child_kp, "127.0.0.1", port);
             secp256k1_context_destroy(child_ctx);
@@ -867,31 +873,32 @@ int test_regtest_wire_factory_arity1(void) {
 
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Compute funding SPK (5-of-5 MuSig2 taproot) */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak_val[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     /* Derive bech32m address */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
     char tweaked_hex[65];
     hex_encode(tweaked_ser, 32, tweaked_hex);
 
@@ -999,7 +1006,7 @@ int test_regtest_wire_factory_arity1(void) {
             usleep(100000 * (c + 1));
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
-            secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]);
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
 
             int ok = client_run_ceremony(child_ctx, &child_kp, "127.0.0.1", port);
             secp256k1_context_destroy(child_ctx);

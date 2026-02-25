@@ -123,13 +123,13 @@ int test_client_daemon_autofulfill(void) {
     unsigned char client_seckey[32];
     memset(client_seckey, 0x22, 32);
     secp256k1_pubkey client_pubkey;
-    secp256k1_ec_pubkey_create(ctx, &client_pubkey, client_seckey);
+    if (!secp256k1_ec_pubkey_create(ctx, &client_pubkey, client_seckey)) return 0;
 
     /* LSP keypair */
     unsigned char lsp_seckey[32];
     memset(lsp_seckey, 0x11, 32);
     secp256k1_pubkey lsp_pubkey;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pubkey, lsp_seckey);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pubkey, lsp_seckey)) return 0;
 
     /* Initialize a minimal client channel (just needs HTLC tracking) */
     channel_t ch;

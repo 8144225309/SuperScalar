@@ -54,14 +54,14 @@ static int setup_factory(
     if (!secp256k1_keypair_create(ctx, &kps[1], client_seckey)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     if (!musig_aggregate_keys(ctx, keyagg, pubkeys, 2)) return 0;
 
     /* tweaked output key for P2TR key-path (no script tree) */
     unsigned char internal_key[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_key, &keyagg->agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_key, &keyagg->agg_pubkey)) return 0;
 
     extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
     unsigned char tweak[32];
@@ -69,9 +69,9 @@ static int setup_factory(
 
     musig_keyagg_t addr_keyagg = *keyagg;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &addr_keyagg.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &addr_keyagg.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
 
     unsigned char spk[34];
     build_p2tr_script_pubkey(spk, &tweaked_xonly);
@@ -92,7 +92,7 @@ static int setup_factory(
         /* fallback: rawtr() descriptor */
         char key_hex[65];
         unsigned char tweaked_ser[32];
-        secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+        if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
         hex_encode(tweaked_ser, 32, key_hex);
 
         snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
@@ -264,9 +264,9 @@ int test_regtest_basic_dw(void) {
     unsigned char out_seckey[32];
     memset(out_seckey, 0x30, 32);
     secp256k1_keypair out_kp;
-    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    if (!secp256k1_keypair_create(ctx, &out_kp, out_seckey)) return 0;
     secp256k1_xonly_pubkey out_xpk;
-    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp)) return 0;
 
     uint64_t output_amount = fund_amount - 1000; /* leave room for fee */
 
@@ -340,9 +340,9 @@ int test_regtest_old_first_attack(void) {
     unsigned char out_seckey[32];
     memset(out_seckey, 0x30, 32);
     secp256k1_keypair out_kp;
-    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    if (!secp256k1_keypair_create(ctx, &out_kp, out_seckey)) return 0;
     secp256k1_xonly_pubkey out_xpk;
-    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp)) return 0;
 
     uint64_t output_amount = fund_amount - 1000;
 
@@ -415,9 +415,9 @@ int test_regtest_musig_onchain(void) {
     unsigned char out_seckey[32];
     memset(out_seckey, 0x30, 32);
     secp256k1_keypair out_kp;
-    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    if (!secp256k1_keypair_create(ctx, &out_kp, out_seckey)) return 0;
     secp256k1_xonly_pubkey out_xpk;
-    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp)) return 0;
 
     tx_output_t output;
     output.amount_sats = fund_amount - 1000;
@@ -440,8 +440,8 @@ int test_regtest_musig_onchain(void) {
 
     /* Round 1: each signer generates a nonce */
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     secp256k1_musig_secnonce secnonces[2];
     secp256k1_musig_pubnonce pubnonces[2];
@@ -550,9 +550,9 @@ int test_regtest_nsequence_edge(void) {
     unsigned char out_seckey[32];
     memset(out_seckey, 0x30, 32);
     secp256k1_keypair out_kp;
-    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    if (!secp256k1_keypair_create(ctx, &out_kp, out_seckey)) return 0;
     secp256k1_xonly_pubkey out_xpk;
-    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp)) return 0;
 
     uint64_t output_amount = fund_amount - 1000;
 
@@ -677,8 +677,8 @@ int test_regtest_breach_penalty_cpfp(void) {
 
     /* --- Set up LSP + client channels --- */
     secp256k1_pubkey lsp_pk, client_pk;
-    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
-    secp256k1_keypair_pub(ctx, &client_pk, &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &client_pk, &kps[1])) return 0;
 
     fee_estimator_t fe;
     fee_init(&fe, 1000);

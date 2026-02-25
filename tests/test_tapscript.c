@@ -49,9 +49,11 @@ static secp256k1_context *test_ctx(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 }
 
-static void make_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+static int make_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+    return 1;
 }
 
 /* ---- Unit test 1: TapLeaf hash ---- */
@@ -61,9 +63,9 @@ int test_tapscript_leaf_hash(void) {
 
     /* Create a known keypair for LSP */
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[0])) return 0;
     secp256k1_xonly_pubkey lsp_xonly;
-    secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &kp)) return 0;
 
     tapscript_leaf_t leaf;
     tapscript_build_cltv_timeout(&leaf, 500, &lsp_xonly, ctx);
@@ -97,20 +99,20 @@ int test_tapscript_tweak_with_tree(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[0])) return 0;
     secp256k1_xonly_pubkey internal_key;
-    secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp)) return 0;
 
     /* Key-path only tweak */
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &internal_key);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &internal_key)) return 0;
     unsigned char kp_tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, kp_tweak);
 
     secp256k1_pubkey kp_tweaked_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &kp_tweaked_full, &internal_key, kp_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &kp_tweaked_full, &internal_key, kp_tweak)) return 0;
     secp256k1_xonly_pubkey kp_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &kp_tweaked, NULL, &kp_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &kp_tweaked, NULL, &kp_tweaked_full)) return 0;
 
     /* Tweak with a taptree */
     tapscript_leaf_t leaf;
@@ -127,8 +129,8 @@ int test_tapscript_tweak_with_tree(void) {
 
     /* The two tweaked keys should differ */
     unsigned char kp_ser[32], tree_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, kp_ser, &kp_tweaked);
-    secp256k1_xonly_pubkey_serialize(ctx, tree_ser, &tree_tweaked);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, kp_ser, &kp_tweaked)) return 0;
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tree_ser, &tree_tweaked)) return 0;
     TEST_ASSERT(memcmp(kp_ser, tree_ser, 32) != 0, "tweaked keys differ");
 
     /* Both produce valid 34-byte P2TR scriptPubKeys */
@@ -148,9 +150,9 @@ int test_tapscript_control_block(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[0])) return 0;
     secp256k1_xonly_pubkey internal_key;
-    secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp)) return 0;
 
     /* Build taptree */
     tapscript_leaf_t leaf;
@@ -177,7 +179,7 @@ int test_tapscript_control_block(void) {
 
     /* Internal key in control block matches */
     unsigned char ik_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ik_ser, &internal_key);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ik_ser, &internal_key)) return 0;
     TEST_ASSERT(memcmp(cb + 1, ik_ser, 32) == 0, "control block internal key");
 
     secp256k1_context_destroy(ctx);
@@ -190,9 +192,9 @@ int test_tapscript_sighash(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &kp, seckeys[0])) return 0;
     secp256k1_xonly_pubkey xonly;
-    secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp)) return 0;
 
     /* Build a dummy tx */
     unsigned char fake_txid[32];
@@ -238,26 +240,27 @@ int test_tapscript_sighash(void) {
 int test_factory_tree_with_timeout(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Compute funding spk (same as Phase 1) */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     musig_keyagg_t tmp = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
@@ -433,38 +436,39 @@ int test_regtest_timeout_spend(void) {
     regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Get LSP xonly pubkey */
     secp256k1_xonly_pubkey lsp_xonly;
-    secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &kps[0]);
+    if (!secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &kps[0])) return 0;
 
     /* Compute funding spk (5-of-5, key-path-only for the funding output) */
     secp256k1_pubkey all_pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &all_pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &all_pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t fund_ka;
     musig_aggregate_keys(ctx, &fund_ka, all_pks, 5);
 
     unsigned char ik_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ik_ser, &fund_ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ik_ser, &fund_ka.agg_pubkey)) return 0;
     unsigned char fund_tweak[32];
     sha256_tagged("TapTweak", ik_ser, 32, fund_tweak);
 
     musig_keyagg_t fund_tmp = fund_ka;
     secp256k1_pubkey fund_tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &fund_tweaked_pk,
-                                             &fund_tmp.cache, fund_tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &fund_tweaked_pk,
+                                             &fund_tmp.cache, fund_tweak)) return 0;
     secp256k1_xonly_pubkey fund_tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tweaked_xonly, NULL,
-                                         &fund_tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tweaked_xonly, NULL,
+                                         &fund_tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &fund_tweaked_xonly);
 
     /* Derive bech32m address */
     unsigned char tw_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &fund_tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &fund_tweaked_xonly)) return 0;
     char key_hex[65];
     hex_encode(tw_ser, 32, key_hex);
 
@@ -606,12 +610,12 @@ int test_regtest_timeout_spend(void) {
     unsigned char lsp_out_spk[34];
     {
         unsigned char lsp_ik[32];
-        secp256k1_xonly_pubkey_serialize(ctx, lsp_ik, &lsp_xonly);
+        if (!secp256k1_xonly_pubkey_serialize(ctx, lsp_ik, &lsp_xonly)) return 0;
         unsigned char lsp_tw[32];
         sha256_tagged("TapTweak", lsp_ik, 32, lsp_tw);
         secp256k1_pubkey lsp_tw_full;
-        secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xonly, lsp_tw);
-        secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tweaked, NULL, &lsp_tw_full);
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xonly, lsp_tw)) return 0;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tweaked, NULL, &lsp_tw_full)) return 0;
         build_p2tr_script_pubkey(lsp_out_spk, &lsp_tweaked);
     }
 
@@ -646,10 +650,10 @@ int test_regtest_timeout_spend(void) {
     unsigned char timeout_sig[64];
     {
         unsigned char lsp_seckey[32];
-        secp256k1_keypair_sec(ctx, lsp_seckey, &kps[0]);
+        if (!secp256k1_keypair_sec(ctx, lsp_seckey, &kps[0])) return 0;
 
         secp256k1_keypair lsp_signkp;
-        secp256k1_keypair_create(ctx, &lsp_signkp, lsp_seckey);
+        if (!secp256k1_keypair_create(ctx, &lsp_signkp, lsp_seckey)) return 0;
         memset(lsp_seckey, 0, 32);
 
         /* Sign with BIP-340 schnorrsig */
@@ -718,26 +722,27 @@ int test_regtest_timeout_spend(void) {
 int test_multi_level_timeout_unit(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
+    if (!make_keypairs(ctx, kps)) return 0;
 
     /* Compute funding spk */
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     musig_keyagg_t tmp = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);

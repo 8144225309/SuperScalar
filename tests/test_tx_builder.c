@@ -96,9 +96,9 @@ int test_build_p2tr_script_pubkey(void) {
     };
 
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckey);
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
     secp256k1_xonly_pubkey xpk;
-    secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
 
     unsigned char spk[34];
     build_p2tr_script_pubkey(spk, &xpk);
@@ -108,7 +108,7 @@ int test_build_p2tr_script_pubkey(void) {
     TEST_ASSERT_EQ(spk[1], 0x20, "OP_PUSHBYTES_32");
 
     unsigned char xpk_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, xpk_ser, &xpk);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, xpk_ser, &xpk)) return 0;
     TEST_ASSERT(memcmp(spk + 2, xpk_ser, 32) == 0, "key bytes match");
 
     secp256k1_context_destroy(ctx);
@@ -124,9 +124,9 @@ int test_build_unsigned_tx(void) {
     unsigned char seckey[32];
     memset(seckey, 0x03, 32);
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckey);
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
     secp256k1_xonly_pubkey xpk;
-    secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
 
     tx_output_t output;
     output.amount_sats = 50000;
@@ -185,9 +185,9 @@ int test_finalize_signed_tx(void) {
     unsigned char seckey[32];
     memset(seckey, 0x04, 32);
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, seckey);
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
     secp256k1_xonly_pubkey xpk;
-    secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
 
     tx_output_t output;
     output.amount_sats = 40000;

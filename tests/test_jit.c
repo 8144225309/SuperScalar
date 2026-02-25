@@ -109,8 +109,8 @@ int test_jit_offer_round_trip(void) {
     /* Compare pubkeys */
     unsigned char ser1[33], ser2[33];
     size_t l1 = 33, l2 = 33;
-    secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &pk, SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &pk_out, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &pk, SECP256K1_EC_COMPRESSED)) return 0;
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &pk_out, SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT(memcmp(ser1, ser2, 33) == 0, "pubkey mismatch");
 
     cJSON_Delete(j);
@@ -125,7 +125,7 @@ int test_jit_accept_round_trip(void) {
     unsigned char seckey[32];
     memset(seckey, 0x43, 32);
     secp256k1_pubkey pk;
-    secp256k1_ec_pubkey_create(ctx, &pk, seckey);
+    if (!secp256k1_ec_pubkey_create(ctx, &pk, seckey)) return 0;
 
     cJSON *j = wire_build_jit_accept(3, ctx, &pk);
     TEST_ASSERT(j != NULL, "build jit_accept");
@@ -137,8 +137,8 @@ int test_jit_accept_round_trip(void) {
 
     unsigned char ser1[33], ser2[33];
     size_t l1 = 33, l2 = 33;
-    secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &pk, SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &pk_out, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &pk, SECP256K1_EC_COMPRESSED)) return 0;
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &pk_out, SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT(memcmp(ser1, ser2, 33) == 0, "pubkey mismatch");
 
     cJSON_Delete(j);
@@ -303,8 +303,8 @@ int test_client_jit_accept_flow(void) {
     memset(lsp_sec, 0x11, 32);
     memset(cli_sec, 0x22, 32);
     secp256k1_pubkey lsp_pk, cli_pk;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec);
-    secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec)) return 0;
 
     /* LSP builds offer */
     cJSON *offer = wire_build_jit_offer(1, 25000, "new_client", ctx, &lsp_pk);
@@ -592,8 +592,8 @@ int test_jit_watchtower_revocation(void) {
     memset(lsp_sec, 0x55, 32);
     memset(cli_sec, 0x66, 32);
     secp256k1_pubkey lsp_pk, cli_pk;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec);
-    secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec)) return 0;
 
     /* Build a minimal funding outpoint */
     unsigned char fund_txid[32];
@@ -700,7 +700,7 @@ int test_jit_persist_reload_active(void) {
                                (i == 1) ? &jit.channel.remote_delayed_payment_basepoint :
                                (i == 2) ? &jit.channel.remote_revocation_basepoint :
                                           &jit.channel.remote_htlc_basepoint;
-        secp256k1_ec_pubkey_create(ctx, rp, rsec);
+        if (!secp256k1_ec_pubkey_create(ctx, rp, rsec)) return 0;
     }
 
     /* Save JIT + basepoints */

@@ -602,10 +602,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
             fprintf(stderr, "Client %u: random rotation basepoint generation failed\n", my_index);
             free(secnonces); free(nonce_entries); return 0;
         }
-        secp256k1_ec_pubkey_create(ctx, &cpay, rot_bp_ps);
-        secp256k1_ec_pubkey_create(ctx, &cdel, rot_bp_ds);
-        secp256k1_ec_pubkey_create(ctx, &crev, rot_bp_rs);
-        secp256k1_ec_pubkey_create(ctx, &chtlc, rot_bp_hs);
+        if (!secp256k1_ec_pubkey_create(ctx, &cpay, rot_bp_ps) ||
+            !secp256k1_ec_pubkey_create(ctx, &cdel, rot_bp_ds) ||
+            !secp256k1_ec_pubkey_create(ctx, &crev, rot_bp_rs) ||
+            !secp256k1_ec_pubkey_create(ctx, &chtlc, rot_bp_hs)) {
+            fprintf(stderr, "Client %u: rotation basepoint pubkey derivation failed\n", my_index);
+            free(secnonces); free(nonce_entries); return 0;
+        }
         /* Generate random per-commitment secrets for cn=0 and cn=1 (outer-scoped rot_pcs0, rot_pcs1) */
         if (!channel_read_random_bytes(rot_pcs0, 32) ||
             !channel_read_random_bytes(rot_pcs1, 32)) {
@@ -613,8 +616,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
             free(secnonces); free(nonce_entries); return 0;
         }
         secp256k1_pubkey cfpcp, cspcp;
-        secp256k1_ec_pubkey_create(ctx, &cfpcp, rot_pcs0);
-        secp256k1_ec_pubkey_create(ctx, &cspcp, rot_pcs1);
+        if (!secp256k1_ec_pubkey_create(ctx, &cfpcp, rot_pcs0) ||
+            !secp256k1_ec_pubkey_create(ctx, &cspcp, rot_pcs1)) {
+            fprintf(stderr, "Client %u: rotation PCS pubkey derivation failed\n", my_index);
+            free(secnonces); free(nonce_entries); return 0;
+        }
 
         uint32_t client_idx = my_index - 1;
         cJSON *bp_msg = wire_build_channel_basepoints(
@@ -1044,10 +1050,13 @@ int client_run_with_channels(secp256k1_context *ctx,
                 fprintf(stderr, "Client %u: random basepoint generation failed\n", my_index);
                 goto fail;
             }
-            secp256k1_ec_pubkey_create(ctx, &client_pay_bp, bp_ps);
-            secp256k1_ec_pubkey_create(ctx, &client_delay_bp, bp_ds);
-            secp256k1_ec_pubkey_create(ctx, &client_revoc_bp, bp_rs);
-            secp256k1_ec_pubkey_create(ctx, &client_htlc_bp, bp_hs);
+            if (!secp256k1_ec_pubkey_create(ctx, &client_pay_bp, bp_ps) ||
+                !secp256k1_ec_pubkey_create(ctx, &client_delay_bp, bp_ds) ||
+                !secp256k1_ec_pubkey_create(ctx, &client_revoc_bp, bp_rs) ||
+                !secp256k1_ec_pubkey_create(ctx, &client_htlc_bp, bp_hs)) {
+                fprintf(stderr, "Client %u: basepoint pubkey derivation failed\n", my_index);
+                goto fail;
+            }
 
             /* Generate random per-commitment secrets for cn=0 and cn=1.
                We generate them before channel_init so we can send the points,
@@ -1059,8 +1068,11 @@ int client_run_with_channels(secp256k1_context *ctx,
                 goto fail;
             }
             secp256k1_pubkey client_first_pcp, client_second_pcp;
-            secp256k1_ec_pubkey_create(ctx, &client_first_pcp, pcs_secret0);
-            secp256k1_ec_pubkey_create(ctx, &client_second_pcp, pcs_secret1);
+            if (!secp256k1_ec_pubkey_create(ctx, &client_first_pcp, pcs_secret0) ||
+                !secp256k1_ec_pubkey_create(ctx, &client_second_pcp, pcs_secret1)) {
+                fprintf(stderr, "Client %u: PCS pubkey derivation failed\n", my_index);
+                goto fail;
+            }
 
             uint32_t client_idx = my_index - 1;
             cJSON *bp_msg = wire_build_channel_basepoints(
@@ -1337,10 +1349,15 @@ int client_run_reconnect(secp256k1_context *ctx,
     }
 
     secp256k1_pubkey reconn_lsp_pay_bp, reconn_lsp_delay_bp, reconn_lsp_revoc_bp, reconn_lsp_htlc_bp;
-    secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_pay_bp, remote_bps[0], 33);
-    secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_delay_bp, remote_bps[1], 33);
-    secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_revoc_bp, remote_bps[2], 33);
-    secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_htlc_bp, remote_bps[3], 33);
+    if (!secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_pay_bp, remote_bps[0], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_delay_bp, remote_bps[1], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_revoc_bp, remote_bps[2], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_htlc_bp, remote_bps[3], 33)) {
+        fprintf(stderr, "Client reconnect: failed to parse remote basepoints\n");
+        wire_close(fd);
+        factory_free(&factory);
+        return 0;
+    }
 
     channel_t channel;
     if (!client_init_channel(&channel, ctx, &factory, keypair, my_index,

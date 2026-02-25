@@ -11,7 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --- Compiler warnings (INTERFACE so they never leak to FetchContent deps) ---
 add_library(project_warnings INTERFACE)
 target_compile_options(project_warnings INTERFACE
-    -Wall -Wextra -Werror -Wno-unused-result
+    -Wall -Wextra -Werror
 )
 
 # --- Sanitizers (opt-in) ---

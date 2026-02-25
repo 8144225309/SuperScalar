@@ -40,7 +40,7 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 } while(0)
 
 /* Helper: set up a channel pair for penalty tx testing */
-static void setup_penalty_channel_pair(secp256k1_context *ctx,
+static int setup_penalty_channel_pair(secp256k1_context *ctx,
                                          channel_t *lsp_ch, channel_t *client_ch,
                                          unsigned char *local_txid_out,
                                          uint64_t local_amount, uint64_t remote_amount) {
@@ -49,8 +49,8 @@ static void setup_penalty_channel_pair(secp256k1_context *ctx,
     memset(client_sec, 0x22, 32);
 
     secp256k1_pubkey lsp_pk, client_pk;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec);
-    secp256k1_ec_pubkey_create(ctx, &client_pk, client_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &client_pk, client_sec)) return 0;
 
     unsigned char funding_txid[32];
     memset(funding_txid, 0xAA, 32);
@@ -103,6 +103,7 @@ static void setup_penalty_channel_pair(secp256k1_context *ctx,
         channel_build_commitment_tx(lsp_ch, &unsigned_tx, local_txid_out);
         tx_buf_free(&unsigned_tx);
     }
+    return 1;
 }
 
 /* Test 1: penalty tx with P2A anchor has 2 outputs, anchor = 240 sats */
@@ -112,7 +113,7 @@ int test_penalty_tx_has_anchor(void) {
 
     channel_t lsp_ch, client_ch;
     unsigned char local_txid[32];
-    setup_penalty_channel_pair(ctx, &lsp_ch, &client_ch, local_txid, 70000, 29846);
+    if (!setup_penalty_channel_pair(ctx, &lsp_ch, &client_ch, local_txid, 70000, 29846)) return 0;
 
     /* Advance to commitment #1 so we can revoke #0 */
     channel_generate_local_pcs(&lsp_ch, 1);
@@ -222,7 +223,7 @@ int test_htlc_penalty_tx_has_anchor(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     channel_t lsp_ch, client_ch;
-    setup_penalty_channel_pair(ctx, &lsp_ch, &client_ch, NULL, 70000, 29846);
+    if (!setup_penalty_channel_pair(ctx, &lsp_ch, &client_ch, NULL, 70000, 29846)) return 0;
 
     /* Add an HTLC */
     uint64_t htlc_id;

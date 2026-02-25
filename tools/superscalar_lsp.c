@@ -190,15 +190,15 @@ static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
         /* Aggregate pubkey */
         {
             unsigned char xonly_ser[32];
-            (void)secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->keyagg.agg_pubkey);
-            report_add_hex(rpt, "agg_pubkey", xonly_ser, 32);
+            if (secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->keyagg.agg_pubkey))
+                report_add_hex(rpt, "agg_pubkey", xonly_ser, 32);
         }
 
         /* Tweaked pubkey */
         {
             unsigned char xonly_ser[32];
-            (void)secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey);
-            report_add_hex(rpt, "tweaked_pubkey", xonly_ser, 32);
+            if (secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey))
+                report_add_hex(rpt, "tweaked_pubkey", xonly_ser, 32);
         }
 
         if (node->has_taptree)

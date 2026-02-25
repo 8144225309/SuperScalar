@@ -194,9 +194,12 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     unsigned char agg_ser[32];
     secp256k1_pubkey agg_pk;
     secp256k1_xonly_pubkey agg_xonly;
-    (void)secp256k1_musig_pubkey_get(mgr->ctx, &agg_pk, &jit_ka.cache);
-    (void)secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &agg_xonly, NULL, &agg_pk);
-    secp256k1_xonly_pubkey_serialize(mgr->ctx, agg_ser, &agg_xonly);
+    if (!secp256k1_musig_pubkey_get(mgr->ctx, &agg_pk, &jit_ka.cache))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &agg_xonly, NULL, &agg_pk))
+        return 0;
+    if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, agg_ser, &agg_xonly))
+        return 0;
 
     unsigned char funding_spk[34];
     funding_spk[0] = 0x51;  /* OP_1 */

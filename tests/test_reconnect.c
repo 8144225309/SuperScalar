@@ -51,7 +51,7 @@ int test_reconnect_wire(void) {
     unsigned char seckey[32];
     memset(seckey, 0x22, 32);
     secp256k1_pubkey pubkey;
-    secp256k1_ec_pubkey_create(ctx, &pubkey, seckey);
+    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, seckey)) return 0;
 
     uint64_t commitment_number = 42;
     cJSON *msg = wire_build_reconnect(ctx, &pubkey, commitment_number);
@@ -67,10 +67,10 @@ int test_reconnect_wire(void) {
     /* Compare pubkeys */
     unsigned char orig_ser[33], parsed_ser[33];
     size_t len1 = 33, len2 = 33;
-    secp256k1_ec_pubkey_serialize(ctx, orig_ser, &len1, &pubkey,
-                                   SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, parsed_ser, &len2, &parsed_pk,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, orig_ser, &len1, &pubkey,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
+    if (!secp256k1_ec_pubkey_serialize(ctx, parsed_ser, &len2, &parsed_pk,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT_MEM_EQ(orig_ser, parsed_ser, 33, "pubkey mismatch");
     cJSON_Delete(msg);
 
@@ -102,13 +102,13 @@ int test_reconnect_pubkey_match(void) {
     unsigned char lsp_sec[32];
     memset(lsp_sec, 0x10, 32);
     secp256k1_pubkey lsp_pk;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec)) return 0;
 
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     for (int i = 0; i < 4; i++) {
         memset(client_secs[i], 0x21 + i, 32);
-        secp256k1_ec_pubkey_create(ctx, &client_pks[i], client_secs[i]);
+        if (!secp256k1_ec_pubkey_create(ctx, &client_pks[i], client_secs[i])) return 0;
     }
 
     /* Create socketpair for the reconnect channel */
@@ -181,7 +181,7 @@ int test_reconnect_pubkey_match(void) {
         secp256k1_context *cctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
         secp256k1_pubkey cpk;
-        secp256k1_ec_pubkey_create(cctx, &cpk, csec);
+        if (!secp256k1_ec_pubkey_create(cctx, &cpk, csec)) return 0;
 
         for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
             secp256k1_musig_secnonce sn;
@@ -245,10 +245,10 @@ int test_reconnect_nonce_reexchange(void) {
     unsigned char sec[32];
     memset(sec, 0x10, 32);
     secp256k1_pubkey pk, pk2;
-    secp256k1_ec_pubkey_create(ctx, &pk, sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &pk, sec)) return 0;
     unsigned char sec2[32];
     memset(sec2, 0x21, 32);
-    secp256k1_ec_pubkey_create(ctx, &pk2, sec2);
+    if (!secp256k1_ec_pubkey_create(ctx, &pk2, sec2)) return 0;
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
@@ -333,8 +333,9 @@ int test_client_persist_reload(void) {
         { [0 ... 31] = 0x54 },
     };
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return 0;
+    }
 
     /* Build factory */
     factory_t factory;
@@ -448,8 +449,8 @@ int test_preimage_fulfills_htlc(void) {
     memset(sec1, 0x10, 32);
     memset(sec2, 0x21, 32);
     secp256k1_pubkey pk1, pk2;
-    secp256k1_ec_pubkey_create(ctx, &pk1, sec1);
-    secp256k1_ec_pubkey_create(ctx, &pk2, sec2);
+    if (!secp256k1_ec_pubkey_create(ctx, &pk1, sec1)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk2, sec2)) return 0;
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
@@ -496,7 +497,7 @@ int test_balance_reporting(void) {
     for (int i = 0; i < 5; i++) {
         unsigned char sec[32];
         memset(sec, 0x10 + i * 0x11, 32);
-        secp256k1_ec_pubkey_create(ctx, &pks[i], sec);
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], sec)) return 0;
     }
 
     factory_t factory;
@@ -635,11 +636,11 @@ int test_watchtower_watch_and_check(void) {
     memset(sec_a, 0xAA, 32);
     memset(sec_b, 0xBB, 32);
     secp256k1_keypair kp_a, kp_b;
-    secp256k1_keypair_create(ctx, &kp_a, sec_a);
-    secp256k1_keypair_create(ctx, &kp_b, sec_b);
+    if (!secp256k1_keypair_create(ctx, &kp_a, sec_a)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kp_b, sec_b)) return 0;
     secp256k1_pubkey pk_a, pk_b;
-    secp256k1_keypair_pub(ctx, &pk_a, &kp_a);
-    secp256k1_keypair_pub(ctx, &pk_b, &kp_b);
+    if (!secp256k1_keypair_pub(ctx, &pk_a, &kp_a)) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pk_b, &kp_b)) return 0;
 
     /* Build funding SPK */
     secp256k1_pubkey pks[2] = { pk_a, pk_b };
@@ -648,13 +649,13 @@ int test_watchtower_watch_and_check(void) {
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey xonly_tmp;
     unsigned char ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return 0;
     unsigned char twk[32];
     sha256_tagged("TapTweak", ser, 32, twk);
     secp256k1_pubkey tweaked_pub;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_pub, &ka.agg_pubkey, twk);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_pub, &ka.agg_pubkey, twk)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pub)) return 0;
     extern void build_p2tr_script_pubkey(unsigned char *out,
                                            const secp256k1_xonly_pubkey *xpk);
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
@@ -1123,10 +1124,10 @@ static int make_test_channel(channel_t *ch, secp256k1_context *ctx,
     memset(seckey, 0x11, 32);
 
     secp256k1_pubkey local_pk, remote_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_pk, seckey);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_pk, seckey)) return 0;
     unsigned char remote_sec[32];
     memset(remote_sec, 0x22, 32);
-    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_sec)) return 0;
 
     unsigned char txid[32], spk[34];
     memset(txid, 0xAA, 32);
@@ -1215,10 +1216,10 @@ int test_watchtower_wired(void) {
     /* Set remote basepoints */
     secp256k1_pubkey rpay, rdel, rrev, rhtlc;
     unsigned char rs[32];
-    memset(rs, 0x41, 32); secp256k1_ec_pubkey_create(ctx, &rpay, rs);
-    memset(rs, 0x42, 32); secp256k1_ec_pubkey_create(ctx, &rdel, rs);
-    memset(rs, 0x43, 32); secp256k1_ec_pubkey_create(ctx, &rrev, rs);
-    memset(rs, 0x44, 32); secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
+    memset(rs, 0x41, 32); if (!secp256k1_ec_pubkey_create(ctx, &rpay, rs)) return 0;
+    memset(rs, 0x42, 32); if (!secp256k1_ec_pubkey_create(ctx, &rdel, rs)) return 0;
+    memset(rs, 0x43, 32); if (!secp256k1_ec_pubkey_create(ctx, &rrev, rs)) return 0;
+    memset(rs, 0x44, 32); if (!secp256k1_ec_pubkey_create(ctx, &rhtlc, rs)) return 0;
     channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
     channel_set_remote_htlc_basepoint(&ch, &rhtlc);
 
@@ -1554,10 +1555,10 @@ int test_breach_detect_old_commitment(void) {
 
     secp256k1_pubkey rpay, rdel, rrev, rhtlc;
     unsigned char rs[32];
-    memset(rs, 0x41, 32); secp256k1_ec_pubkey_create(ctx, &rpay, rs);
-    memset(rs, 0x42, 32); secp256k1_ec_pubkey_create(ctx, &rdel, rs);
-    memset(rs, 0x43, 32); secp256k1_ec_pubkey_create(ctx, &rrev, rs);
-    memset(rs, 0x44, 32); secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
+    memset(rs, 0x41, 32); if (!secp256k1_ec_pubkey_create(ctx, &rpay, rs)) return 0;
+    memset(rs, 0x42, 32); if (!secp256k1_ec_pubkey_create(ctx, &rdel, rs)) return 0;
+    memset(rs, 0x43, 32); if (!secp256k1_ec_pubkey_create(ctx, &rrev, rs)) return 0;
+    memset(rs, 0x44, 32); if (!secp256k1_ec_pubkey_create(ctx, &rhtlc, rs)) return 0;
     channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
     channel_set_remote_htlc_basepoint(&ch, &rhtlc);
 
@@ -1668,7 +1669,7 @@ int test_ladder_daemon_integration(void) {
     unsigned char lsp_sec[32];
     memset(lsp_sec, 0x10, 32);
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     ladder_t lad;
     ladder_init(&lad, ctx, &lsp_kp, 20, 10);
@@ -1715,8 +1716,9 @@ int test_distribution_tx_amounts(void) {
         { [0 ... 31] = 0x54 },
     };
     secp256k1_keypair kps[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
@@ -1779,8 +1781,8 @@ int test_turnover_extract_and_close(void) {
     secp256k1_keypair kps[5];
     secp256k1_pubkey pks[5];
     for (int i = 0; i < 5; i++) {
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
     }
 
     /* Create ladder with one factory */
@@ -1817,7 +1819,7 @@ int test_turnover_extract_and_close(void) {
                     "presig");
 
         unsigned char client_sec[32];
-        secp256k1_keypair_sec(ctx, client_sec, &kps[pidx]);
+        if (!secp256k1_keypair_sec(ctx, client_sec, &kps[pidx])) return 0;
 
         unsigned char adapted[64];
         TEST_ASSERT(adaptor_adapt(ctx, adapted, presig, client_sec, nonce_parity),
@@ -1991,7 +1993,7 @@ int test_multi_factory_ladder_monitor(void) {
     unsigned char lsp_sec[32];
     memset(lsp_sec, 0x10, 32);
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     ladder_t lad;
     ladder_init(&lad, ctx, &lsp_kp, 20, 10);  /* active=20, dying=10 */
@@ -2002,7 +2004,7 @@ int test_multi_factory_ladder_monitor(void) {
     for (int i = 0; i < 4; i++) {
         unsigned char sec[32];
         memset(sec, fills[i], 32);
-        secp256k1_keypair_create(ctx, &client_kps[i], sec);
+        if (!secp256k1_keypair_create(ctx, &client_kps[i], sec)) return 0;
     }
 
     /* Factory 0: created at block 100 */

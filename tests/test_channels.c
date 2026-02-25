@@ -109,7 +109,7 @@ int test_channel_msg_round_trip(void) {
         unsigned char secret[32];
         memset(secret, 0xDD, 32);
         secp256k1_pubkey pk;
-        secp256k1_ec_pubkey_create(ctx, &pk, secret);
+        if (!secp256k1_ec_pubkey_create(ctx, &pk, secret)) return 0;
         cJSON *msg = wire_build_revoke_and_ack(3, secret, ctx, &pk);
         uint32_t ch_id;
         unsigned char parsed_secret[32], parsed_point[33];
@@ -178,26 +178,28 @@ int test_channel_msg_round_trip(void) {
 int test_lsp_channel_init(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
 
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     /* Build factory from pubkeys */
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
@@ -602,32 +604,34 @@ int test_regtest_intra_factory_payment(void) {
 
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
 
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak_val[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     /* Derive bech32m address */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
     char tweaked_hex[65];
     hex_encode(tweaked_ser, 32, tweaked_hex);
 
@@ -753,7 +757,7 @@ int test_regtest_intra_factory_payment(void) {
             usleep(100000 * (c + 1));
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
-            secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]);
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
 
             void *cb_data;
             if (c == 0) cb_data = &sender_data;       /* Client A = sender */
@@ -973,32 +977,34 @@ int test_regtest_multi_payment(void) {
 
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
 
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, pks, 5);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak_val[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     /* Derive bech32m address */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
     char tweaked_hex[65];
     hex_encode(tweaked_ser, 32, tweaked_hex);
 
@@ -1171,7 +1177,7 @@ int test_regtest_multi_payment(void) {
             usleep(100000 * (c + 1));
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
-            secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]);
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
 
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,

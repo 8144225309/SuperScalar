@@ -42,8 +42,8 @@ int test_musig_aggregate_keys(void) {
     TEST_ASSERT(secp256k1_keypair_create(ctx, &kp2, test_seckey2), "keypair2");
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kp1);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kp2);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kp1)) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kp2)) return 0;
 
     musig_keyagg_t keyagg;
     TEST_ASSERT(musig_aggregate_keys(ctx, &keyagg, pubkeys, 2), "key aggregation");
@@ -67,12 +67,12 @@ int test_musig_sign_verify(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     TEST_ASSERT(musig_aggregate_keys(ctx, &keyagg, pubkeys, 2), "key aggregation");
@@ -93,12 +93,12 @@ int test_musig_wrong_message(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     musig_aggregate_keys(ctx, &keyagg, pubkeys, 2);
@@ -120,12 +120,12 @@ int test_musig_taproot_sign(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     musig_aggregate_keys(ctx, &keyagg, pubkeys, 2);
@@ -141,17 +141,17 @@ int test_musig_taproot_sign(void) {
     musig_aggregate_keys(ctx, &keyagg2, pubkeys, 2);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &keyagg2.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &keyagg2.agg_pubkey)) return 0;
 
     extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &keyagg2.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &keyagg2.cache, tweak)) return 0;
 
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
 
     TEST_ASSERT(secp256k1_schnorrsig_verify(ctx, sig, test_msg, 32, &tweaked_xonly),
                 "taproot sig verification against tweaked key");
@@ -195,7 +195,7 @@ static int compute_tweaked_xonly(
         return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
 
     unsigned char tweak[32];
     if (merkle_root) {
@@ -222,12 +222,12 @@ int test_musig_split_round_basic(void) {
 
     /* Setup 2 signers */
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     TEST_ASSERT(musig_aggregate_keys(ctx, &keyagg, pubkeys, 2), "key aggregation");
@@ -280,12 +280,12 @@ int test_musig_split_round_taproot(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     musig_aggregate_keys(ctx, &keyagg, pubkeys, 2);
@@ -337,12 +337,12 @@ int test_musig_nonce_pool(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kp1, kp2;
-    secp256k1_keypair_create(ctx, &kp1, test_seckey1);
-    secp256k1_keypair_create(ctx, &kp2, test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kp1, test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kp2, test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kp1);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kp2);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kp1)) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kp2)) return 0;
 
     musig_keyagg_t keyagg;
     musig_aggregate_keys(ctx, &keyagg, pubkeys, 2);
@@ -425,8 +425,8 @@ int test_musig_partial_sig_verify(void) {
     secp256k1_pubkey pubkeys[3];
 
     for (int i = 0; i < 3; i++) {
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
-        secp256k1_keypair_pub(ctx, &pubkeys[i], &kps[i]);
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pubkeys[i], &kps[i])) return 0;
     }
 
     musig_keyagg_t keyagg;
@@ -489,12 +489,12 @@ int test_musig_serialization(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     secp256k1_keypair kps[2];
-    secp256k1_keypair_create(ctx, &kps[0], test_seckey1);
-    secp256k1_keypair_create(ctx, &kps[1], test_seckey2);
+    if (!secp256k1_keypair_create(ctx, &kps[0], test_seckey1)) return 0;
+    if (!secp256k1_keypair_create(ctx, &kps[1], test_seckey2)) return 0;
 
     secp256k1_pubkey pubkeys[2];
-    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
-    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1])) return 0;
 
     musig_keyagg_t keyagg;
     musig_aggregate_keys(ctx, &keyagg, pubkeys, 2);
@@ -566,8 +566,8 @@ int test_musig_split_round_5of5(void) {
     secp256k1_pubkey pubkeys[5];
 
     for (int i = 0; i < 5; i++) {
-        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
-        secp256k1_keypair_pub(ctx, &pubkeys[i], &kps[i]);
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pubkeys[i], &kps[i])) return 0;
     }
 
     musig_keyagg_t keyagg;

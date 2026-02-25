@@ -27,13 +27,13 @@ extern void sha256(const unsigned char *, size_t, unsigned char *);
 } while(0)
 
 /* Helper: set up a pair of channels (LSP-side and client-side) for the same funding output */
-static void setup_channel_pair(secp256k1_context *ctx,
+static int setup_channel_pair(secp256k1_context *ctx,
                                  channel_t *lsp_ch, channel_t *client_ch,
                                  const unsigned char *lsp_sec,
                                  const unsigned char *client_sec) {
     secp256k1_pubkey lsp_pk, client_pk;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec);
-    secp256k1_ec_pubkey_create(ctx, &client_pk, client_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &client_pk, client_sec)) return 0;
 
     unsigned char funding_txid[32];
     memset(funding_txid, 0xAA, 32);
@@ -76,6 +76,7 @@ static void setup_channel_pair(secp256k1_context *ctx,
 
     /* Nonce pools not set up here — add via channel_init_nonce_pool
        if commitment signing is needed in specific tests. */
+    return 1;
 }
 
 /* Test 1: watchtower init with NULL regtest doesn't crash */
@@ -103,7 +104,7 @@ int test_bidirectional_revocation(void) {
     memset(client_sec, 0x22, 32);
 
     channel_t lsp_ch, client_ch;
-    setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec);
+    if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
 
     /* Simulate a payment: LSP sends commitment_signed to client, client revokes old */
     /* Both sides advance commitment_number */
@@ -153,7 +154,7 @@ int test_client_watch_revoked_commitment(void) {
     memset(client_sec, 0x22, 32);
 
     channel_t lsp_ch, client_ch;
-    setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec);
+    if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
 
     /* Set up watchtower for client side */
     watchtower_t wt;
@@ -209,7 +210,7 @@ int test_lsp_revoke_and_ack_wire(void) {
     secp256k1_pubkey next_pcp;
     unsigned char pcp_sec[32];
     memset(pcp_sec, 0x77, 32);
-    secp256k1_ec_pubkey_create(ctx, &next_pcp, pcp_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &next_pcp, pcp_sec)) return 0;
 
     cJSON *j = wire_build_revoke_and_ack(7, rev_secret, ctx, &next_pcp);
     TEST_ASSERT(j != NULL, "wire_build_revoke_and_ack should succeed");
@@ -230,10 +231,10 @@ int test_lsp_revoke_and_ack_wire(void) {
 
     unsigned char orig_ser[33], parsed_ser[33];
     size_t len1 = 33, len2 = 33;
-    secp256k1_ec_pubkey_serialize(ctx, orig_ser, &len1, &next_pcp,
-                                   SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, parsed_ser, &len2, &parsed_pk,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, orig_ser, &len1, &next_pcp,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
+    if (!secp256k1_ec_pubkey_serialize(ctx, parsed_ser, &len2, &parsed_pk,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT(memcmp(orig_ser, parsed_ser, 33) == 0,
                 "next PCP should round-trip");
 
@@ -326,7 +327,7 @@ int test_htlc_penalty_watch(void) {
     memset(client_sec, 0x22, 32);
 
     channel_t lsp_ch, client_ch;
-    setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec);
+    if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
 
     /* Exchange HTLC basepoints (setup_channel_pair doesn't do this) */
     channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);

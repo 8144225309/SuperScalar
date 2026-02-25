@@ -43,10 +43,12 @@ static secp256k1_context *test_ctx(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 }
 
-static void make_client_keypairs(secp256k1_context *ctx,
+static int make_client_keypairs(secp256k1_context *ctx,
                                   secp256k1_keypair *client_kps) {
-    for (int i = 0; i < 4; i++)
-        secp256k1_keypair_create(ctx, &client_kps[i], client_secs[i]);
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_create(ctx, &client_kps[i], client_secs[i])) return 0;
+    }
+    return 1;
 }
 
 /* Compute funding spk for 5-of-5 (LSP + 4 clients) */
@@ -58,15 +60,16 @@ static int compute_funding_spk(
     secp256k1_xonly_pubkey *tweaked_xonly_out)
 {
     secp256k1_pubkey pks[5];
-    secp256k1_keypair_pub(ctx, &pks[0], lsp_kp);
-    for (int i = 0; i < 4; i++)
-        secp256k1_keypair_pub(ctx, &pks[i + 1], &client_kps[i]);
+    if (!secp256k1_keypair_pub(ctx, &pks[0], lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i + 1], &client_kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     if (!musig_aggregate_keys(ctx, &ka, pks, 5)) return 0;
 
     unsigned char ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", ser, 32, tweak);
 
@@ -88,10 +91,10 @@ int test_ladder_create_factories(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -142,10 +145,10 @@ int test_ladder_state_transitions(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -200,13 +203,14 @@ int test_ladder_key_turnover_close(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
     secp256k1_pubkey client_pks[4];
-    make_client_keypairs(ctx, client_kps);
-    for (int i = 0; i < 4; i++)
-        secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i]);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i])) return 0;
+    }
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -229,7 +233,7 @@ int test_ladder_key_turnover_close(void) {
     secp256k1_pubkey all_pks[5];
     secp256k1_keypair all_kps[5];
     all_kps[0] = lsp_kp;
-    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
     for (int i = 0; i < 4; i++) {
         all_kps[i + 1] = client_kps[i];
         all_pks[i + 1] = client_pks[i];
@@ -287,10 +291,10 @@ int test_ladder_overlapping(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -350,7 +354,7 @@ static int derive_factory_address(regtest_t *rt, secp256k1_context *ctx,
                                     const secp256k1_xonly_pubkey *tweaked,
                                     char *addr_out, size_t addr_len) {
     unsigned char ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ser, tweaked);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, tweaked)) return 0;
     char key_hex[65];
     hex_encode(ser, 32, key_hex);
 
@@ -399,10 +403,10 @@ int test_regtest_ladder_lifecycle(void) {
     regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -501,13 +505,14 @@ int test_regtest_ladder_ptlc_migration(void) {
     regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
     secp256k1_pubkey client_pks[4];
-    make_client_keypairs(ctx, client_kps);
-    for (int i = 0; i < 4; i++)
-        secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i]);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i])) return 0;
+    }
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -572,7 +577,7 @@ int test_regtest_ladder_ptlc_migration(void) {
     secp256k1_pubkey all_pks[5];
     secp256k1_keypair all_kps[5];
     all_kps[0] = lsp_kp;
-    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
     for (int i = 0; i < 4; i++) {
         all_kps[i + 1] = client_kps[i];
         all_pks[i + 1] = client_pks[i];
@@ -610,17 +615,17 @@ int test_regtest_ladder_ptlc_migration(void) {
     close_output.amount_sats = fund1_amount - 500;
     {
         secp256k1_pubkey lsp_pk;
-        secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+        if (!secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp)) return 0;
         secp256k1_xonly_pubkey lsp_xonly;
-        secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk);
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk)) return 0;
         unsigned char ser[32];
-        secp256k1_xonly_pubkey_serialize(ctx, ser, &lsp_xonly);
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &lsp_xonly)) return 0;
         unsigned char tweak[32];
         sha256_tagged("TapTweak", ser, 32, tweak);
         secp256k1_pubkey tw;
-        secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &lsp_xonly, tweak);
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &lsp_xonly, tweak)) return 0;
         secp256k1_xonly_pubkey tw_xonly;
-        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw);
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw)) return 0;
         build_p2tr_script_pubkey(close_output.script_pubkey, &tw_xonly);
         close_output.script_pubkey_len = 34;
     }
@@ -709,10 +714,10 @@ int test_regtest_ladder_distribution_fallback(void) {
     regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -763,10 +768,10 @@ int test_regtest_ladder_distribution_fallback(void) {
     secp256k1_keypair all_kps[5];
     secp256k1_pubkey all_pks[5];
     all_kps[0] = lsp_kp;
-    secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp);
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
     for (int i = 0; i < 4; i++) {
         all_kps[i + 1] = client_kps[i];
-        secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i]);
+        if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
     }
 
     factory_t f;
@@ -784,15 +789,15 @@ int test_regtest_ladder_distribution_fallback(void) {
     tx_output_t dist_outputs[5];
     for (int i = 0; i < 5; i++) {
         secp256k1_xonly_pubkey xonly;
-        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &all_pks[i]);
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &all_pks[i])) return 0;
         unsigned char ser[32];
-        secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly);
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
         unsigned char tweak[32];
         sha256_tagged("TapTweak", ser, 32, tweak);
         secp256k1_pubkey tw;
-        secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak);
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tw, &xonly, tweak)) return 0;
         secp256k1_xonly_pubkey tw_xonly;
-        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw);
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw)) return 0;
         build_p2tr_script_pubkey(dist_outputs[i].script_pubkey, &tw_xonly);
         dist_outputs[i].script_pubkey_len = 34;
         dist_outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
@@ -852,10 +857,10 @@ int test_ladder_evict_expired(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -902,10 +907,10 @@ int test_rotation_trigger_condition(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
 
     secp256k1_keypair client_kps[4];
-    make_client_keypairs(ctx, client_kps);
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -968,14 +973,14 @@ int test_rotation_context_save_restore(void) {
     unsigned char lsp_sec_local[32];
     memset(lsp_sec_local, 0x10, 32);
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec_local);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec_local)) return 0;
 
     secp256k1_keypair all_kps[5];
     all_kps[0] = lsp_kp;
     for (int i = 0; i < 4; i++) {
         unsigned char s[32];
         memset(s, 0x21 + i * 0x11, 32);
-        secp256k1_keypair_create(ctx, &all_kps[i + 1], s);
+        if (!secp256k1_keypair_create(ctx, &all_kps[i + 1], s)) return 0;
     }
 
     factory_t f;

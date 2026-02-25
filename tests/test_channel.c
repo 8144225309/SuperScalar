@@ -90,9 +90,9 @@ static int setup_channel(channel_t *ch, secp256k1_context *ctx,
 
     /* Compute remote basepoints from secrets */
     secp256k1_pubkey rp, rd, rr;
-    secp256k1_ec_pubkey_create(ctx, &rp, remote_payment_secret);
-    secp256k1_ec_pubkey_create(ctx, &rd, remote_delayed_secret);
-    secp256k1_ec_pubkey_create(ctx, &rr, remote_revocation_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &rp, remote_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &rd, remote_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &rr, remote_revocation_secret)) return 0;
 
     channel_set_remote_basepoints(ch, &rp, &rd, &rr);
 
@@ -111,7 +111,7 @@ static int compute_channel_funding_spk(secp256k1_context *ctx,
 
     /* Key-path-only taproot tweak */
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
@@ -122,7 +122,7 @@ static int compute_channel_funding_spk(secp256k1_context *ctx,
         return 0;
 
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
     build_p2tr_script_pubkey(spk_out34, &tweaked_xonly);
     return 1;
 }
@@ -159,11 +159,11 @@ int test_channel_key_derivation(void) {
 
     unsigned char pub_ser[33], sec_ser[33];
     size_t len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &derived_pub,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &derived_pub,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &derived_from_sec,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &derived_from_sec,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT_MEM_EQ(pub_ser, sec_ser, 33, "simple derivation pubkey matches privkey");
 
     /* Revocation derivation: pubkey path */
@@ -190,11 +190,11 @@ int test_channel_key_derivation(void) {
                 "create from revocation secret");
 
     len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &rev_derived_pub,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &rev_derived_pub,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &rev_from_sec,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &rev_from_sec,
+                                   SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT_MEM_EQ(pub_ser, sec_ser, 33, "revocation pubkey matches privkey");
 
     secp256k1_context_destroy(ctx);
@@ -207,8 +207,8 @@ int test_channel_commitment_tx(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -275,8 +275,8 @@ int test_channel_sign_commitment(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -301,7 +301,7 @@ int test_channel_sign_commitment(void) {
 
     /* Sign with both keypairs */
     secp256k1_keypair remote_kp;
-    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
 
     tx_buf_t signed_tx;
     tx_buf_init(&signed_tx, 512);
@@ -326,15 +326,15 @@ int test_channel_sign_commitment(void) {
     musig_aggregate_keys(ctx, &ka, pks, 2);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     musig_keyagg_t ka2 = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka2.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka2.cache, tweak)) return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
 
     int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32, &tweaked_xonly);
     TEST_ASSERT(valid, "schnorr sig valid");
@@ -351,8 +351,8 @@ int test_channel_update(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -404,8 +404,8 @@ int test_channel_revocation(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -433,9 +433,9 @@ int test_channel_revocation(void) {
 
     /* Remote needs local's revocation basepoint as its "remote_revocation_basepoint" */
     secp256k1_pubkey lp, ld, lr;
-    secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
-    secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret);
-    secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret)) return 0;
 
     channel_set_local_basepoints(&remote_ch, remote_payment_secret,
                                    remote_delayed_secret,
@@ -496,8 +496,8 @@ int test_channel_penalty_tx(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -525,9 +525,9 @@ int test_channel_penalty_tx(void) {
     remote_ch.funder_is_local = 0;  /* funder is the other side */
 
     secp256k1_pubkey lp, ld, lr;
-    secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
-    secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret);
-    secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret)) return 0;
 
     channel_set_local_basepoints(&remote_ch, remote_payment_secret,
                                    remote_delayed_secret,
@@ -551,7 +551,7 @@ int test_channel_penalty_tx(void) {
                 "build local commitment #0");
 
     secp256k1_keypair remote_kp;
-    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
 
     tx_buf_t local_signed;
     tx_buf_init(&local_signed, 512);
@@ -670,9 +670,11 @@ static const unsigned char factory_seckeys[5][32] = {
     { [0 ... 31] = 0x54 },  /* Client D */
 };
 
-static void make_factory_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_create(ctx, &kps[i], factory_seckeys[i]);
+static int make_factory_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], factory_seckeys[i])) return 0;
+    }
+    return 1;
 }
 
 static int compute_factory_funding_spk(
@@ -682,14 +684,15 @@ static int compute_factory_funding_spk(
     secp256k1_xonly_pubkey *tweaked_xonly_out
 ) {
     secp256k1_pubkey pks[5];
-    for (int i = 0; i < 5; i++)
-        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
 
     musig_keyagg_t ka;
     if (!musig_aggregate_keys(ctx, &ka, pks, 5)) return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
@@ -774,7 +777,7 @@ int test_regtest_channel_unilateral(void) {
 
     /* Create 5 keypairs, build factory */
     secp256k1_keypair kps[5];
-    make_factory_keypairs(ctx, kps);
+    if (!make_factory_keypairs(ctx, kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -783,7 +786,7 @@ int test_regtest_channel_unilateral(void) {
 
     /* Derive bech32m address */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
     char key_hex[65];
     hex_encode(tweaked_ser, 32, key_hex);
 
@@ -885,8 +888,8 @@ int test_regtest_channel_unilateral(void) {
 
     /* Channel is between Client A (index 1) and LSP (index 0) */
     secp256k1_pubkey client_a_pk, lsp_pk;
-    secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1]);
-    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    if (!secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
 
     /* Channel funding keys must match factory leaf output order:
        setup_leaf_outputs uses [client_a, LSP] for channel A */
@@ -919,9 +922,9 @@ int test_regtest_channel_unilateral(void) {
     unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
     unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
     secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
     channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
 
     /* Build and sign commitment tx */
@@ -932,7 +935,7 @@ int test_regtest_channel_unilateral(void) {
                 "build commitment tx");
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0])) return 0;
 
     tx_buf_t commit_signed;
     tx_buf_init(&commit_signed, 512);
@@ -979,10 +982,10 @@ int test_regtest_channel_unilateral(void) {
                 "derive revocation pubkey");
 
     secp256k1_xonly_pubkey rev_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &rev_xonly, NULL, &rev_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &rev_xonly, NULL, &rev_pub)) return 0;
 
     secp256k1_xonly_pubkey delayed_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &delayed_xonly, NULL, &delayed_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &delayed_xonly, NULL, &delayed_pub)) return 0;
 
     /* Rebuild CSV leaf */
     tapscript_leaf_t csv_leaf;
@@ -1014,19 +1017,19 @@ int test_regtest_channel_unilateral(void) {
        Output: simple P2TR to a destination key */
     unsigned char dest_secret[32] = { [0 ... 31] = 0xF1 };
     secp256k1_keypair dest_kp;
-    secp256k1_keypair_create(ctx, &dest_kp, dest_secret);
+    if (!secp256k1_keypair_create(ctx, &dest_kp, dest_secret)) return 0;
     secp256k1_xonly_pubkey dest_xonly;
-    secp256k1_keypair_xonly_pub(ctx, &dest_xonly, NULL, &dest_kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &dest_xonly, NULL, &dest_kp)) return 0;
 
     /* Key-path-only tweak for destination */
     unsigned char dest_internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, dest_internal_ser, &dest_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, dest_internal_ser, &dest_xonly)) return 0;
     unsigned char dest_tweak[32];
     sha256_tagged("TapTweak", dest_internal_ser, 32, dest_tweak);
     secp256k1_pubkey dest_tweaked_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &dest_tweaked_full, &dest_xonly, dest_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &dest_tweaked_full, &dest_xonly, dest_tweak)) return 0;
     secp256k1_xonly_pubkey dest_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &dest_tweaked, NULL, &dest_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &dest_tweaked, NULL, &dest_tweaked_full)) return 0;
 
     uint64_t spend_amount = local_amt - 500;  /* fee */
     tx_output_t spend_output;
@@ -1051,7 +1054,7 @@ int test_regtest_channel_unilateral(void) {
 
     /* Sign with delayed_payment privkey */
     secp256k1_keypair delayed_kp;
-    secp256k1_keypair_create(ctx, &delayed_kp, delayed_priv);
+    if (!secp256k1_keypair_create(ctx, &delayed_kp, delayed_priv)) return 0;
     unsigned char spend_sig[64];
     TEST_ASSERT(secp256k1_schnorrsig_sign32(ctx, spend_sig, spend_sighash,
                                               &delayed_kp, NULL),
@@ -1127,7 +1130,7 @@ static int setup_channel_with_htlc(channel_t *ch, secp256k1_context *ctx,
     channel_set_local_htlc_basepoint(ch, local_htlc_secret);
 
     secp256k1_pubkey remote_htlc_bp;
-    secp256k1_ec_pubkey_create(ctx, &remote_htlc_bp, remote_htlc_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_htlc_bp, remote_htlc_secret)) return 0;
     channel_set_remote_htlc_basepoint(ch, &remote_htlc_bp);
 
     return 1;
@@ -1141,9 +1144,9 @@ int test_htlc_offered_scripts(void) {
     /* Generate test keys */
     unsigned char key_sec[32] = { [0 ... 31] = 0xAA };
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, key_sec);
+    if (!secp256k1_keypair_create(ctx, &kp, key_sec)) return 0;
     secp256k1_xonly_pubkey xonly;
-    secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp)) return 0;
 
     unsigned char payment_hash[32] = { [0 ... 31] = 0xBB };
 
@@ -1196,9 +1199,9 @@ int test_htlc_received_scripts(void) {
 
     unsigned char key_sec[32] = { [0 ... 31] = 0xCC };
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, key_sec);
+    if (!secp256k1_keypair_create(ctx, &kp, key_sec)) return 0;
     secp256k1_xonly_pubkey xonly;
-    secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp)) return 0;
 
     unsigned char payment_hash[32] = { [0 ... 31] = 0xDD };
 
@@ -1243,9 +1246,9 @@ int test_htlc_control_block_2leaf(void) {
 
     unsigned char key_sec[32] = { [0 ... 31] = 0xEE };
     secp256k1_keypair kp;
-    secp256k1_keypair_create(ctx, &kp, key_sec);
+    if (!secp256k1_keypair_create(ctx, &kp, key_sec)) return 0;
     secp256k1_xonly_pubkey internal_key;
-    secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(ctx, &internal_key, NULL, &kp)) return 0;
 
     /* Build two leaves */
     unsigned char payment_hash[32] = { [0 ... 31] = 0xFF };
@@ -1284,7 +1287,7 @@ int test_htlc_control_block_2leaf(void) {
 
     /* Verify internal key is at bytes 1..32 */
     unsigned char key_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, key_ser, &internal_key);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, key_ser, &internal_key)) return 0;
     TEST_ASSERT_MEM_EQ(control_block + 1, key_ser, 32,
                        "internal key in control block");
 
@@ -1302,8 +1305,8 @@ int test_htlc_add_fulfill(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1369,8 +1372,8 @@ int test_htlc_add_fail(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1418,8 +1421,8 @@ int test_htlc_commitment_tx(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1494,8 +1497,8 @@ int test_htlc_success_spend(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1594,8 +1597,8 @@ int test_htlc_timeout_spend(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1668,8 +1671,8 @@ int test_htlc_penalty(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1697,9 +1700,9 @@ int test_htlc_penalty(void) {
     remote_ch.funder_is_local = 0;  /* funder is the other side */
 
     secp256k1_pubkey lp, ld, lr;
-    secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
-    secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret);
-    secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret)) return 0;
 
     channel_set_local_basepoints(&remote_ch, remote_payment_secret,
                                    remote_delayed_secret,
@@ -1719,7 +1722,7 @@ int test_htlc_penalty(void) {
     channel_set_local_htlc_basepoint(&remote_ch, remote_htlc_secret);
 
     secp256k1_pubkey local_htlc_bp;
-    secp256k1_ec_pubkey_create(ctx, &local_htlc_bp, local_htlc_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_htlc_bp, local_htlc_secret)) return 0;
     channel_set_remote_htlc_basepoint(&remote_ch, &local_htlc_bp);
 
     /* Add offered HTLC on local's channel (commitment #0 had no HTLCs,
@@ -1839,8 +1842,8 @@ int test_regtest_htlc_success(void) {
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -1853,18 +1856,18 @@ int test_regtest_htlc_success(void) {
     musig_aggregate_keys(ctx, &ka, pks, 2);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char ka_tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, ka_tweak);
 
     musig_keyagg_t tmp_ka = ka;
     secp256k1_pubkey ka_tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak)) return 0;
     secp256k1_xonly_pubkey ka_tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk)) return 0;
 
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly)) return 0;
     char key_hex[65];
     hex_encode(tweaked_ser, 32, key_hex);
 
@@ -1944,16 +1947,16 @@ int test_regtest_htlc_success(void) {
     unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
     unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
     secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
     channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
 
     unsigned char chan_htlc_sec[32] = { [0 ... 31] = 0xC4 };
     unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
     channel_set_local_htlc_basepoint(&ch, chan_htlc_sec);
     secp256k1_pubkey lsp_htlc_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
     channel_set_remote_htlc_basepoint(&ch, &lsp_htlc_bp);
 
     /* Add received HTLC */
@@ -1975,7 +1978,7 @@ int test_regtest_htlc_success(void) {
                 "build commitment");
 
     secp256k1_keypair remote_kp;
-    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
     tx_buf_t commit_signed;
     tx_buf_init(&commit_signed, 1024);
     TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned,
@@ -2058,8 +2061,8 @@ int test_regtest_htlc_timeout(void) {
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2072,18 +2075,18 @@ int test_regtest_htlc_timeout(void) {
     musig_aggregate_keys(ctx, &ka, pks, 2);
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
     unsigned char ka_tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, ka_tweak);
 
     musig_keyagg_t tmp_ka = ka;
     secp256k1_pubkey ka_tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak)) return 0;
     secp256k1_xonly_pubkey ka_tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk)) return 0;
 
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly)) return 0;
     char key_hex[65];
     hex_encode(tweaked_ser, 32, key_hex);
 
@@ -2172,16 +2175,16 @@ int test_regtest_htlc_timeout(void) {
     unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
     unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
     secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
     channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
 
     unsigned char chan_htlc_sec[32] = { [0 ... 31] = 0xC4 };
     unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
     channel_set_local_htlc_basepoint(&ch, chan_htlc_sec);
     secp256k1_pubkey lsp_htlc_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
     channel_set_remote_htlc_basepoint(&ch, &lsp_htlc_bp);
 
     /* Add offered HTLC (local can reclaim after timeout) */
@@ -2200,7 +2203,7 @@ int test_regtest_htlc_timeout(void) {
                 "build commitment");
 
     secp256k1_keypair remote_kp;
-    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
     tx_buf_t commit_signed;
     tx_buf_init(&commit_signed, 1024);
     TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned,
@@ -2272,8 +2275,8 @@ int test_channel_cooperative_close(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2303,15 +2306,15 @@ int test_channel_cooperative_close(void) {
 
     /* Local output: simple P2TR */
     secp256k1_xonly_pubkey local_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &local_xonly, NULL, &local_fund_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &local_xonly, NULL, &local_fund_pk)) return 0;
     unsigned char local_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, local_ser, &local_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, local_ser, &local_xonly)) return 0;
     unsigned char local_tweak[32];
     sha256_tagged("TapTweak", local_ser, 32, local_tweak);
     secp256k1_pubkey local_tw_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &local_tw_full, &local_xonly, local_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &local_tw_full, &local_xonly, local_tweak)) return 0;
     secp256k1_xonly_pubkey local_tw;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &local_tw, NULL, &local_tw_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &local_tw, NULL, &local_tw_full)) return 0;
 
     build_p2tr_script_pubkey(outputs[0].script_pubkey, &local_tw);
     outputs[0].script_pubkey_len = 34;
@@ -2319,15 +2322,15 @@ int test_channel_cooperative_close(void) {
 
     /* Remote output: simple P2TR */
     secp256k1_xonly_pubkey remote_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &remote_xonly, NULL, &remote_fund_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &remote_xonly, NULL, &remote_fund_pk)) return 0;
     unsigned char remote_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, remote_ser, &remote_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, remote_ser, &remote_xonly)) return 0;
     unsigned char remote_tweak[32];
     sha256_tagged("TapTweak", remote_ser, 32, remote_tweak);
     secp256k1_pubkey remote_tw_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &remote_tw_full, &remote_xonly, remote_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &remote_tw_full, &remote_xonly, remote_tweak)) return 0;
     secp256k1_xonly_pubkey remote_tw;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &remote_tw, NULL, &remote_tw_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &remote_tw, NULL, &remote_tw_full)) return 0;
 
     build_p2tr_script_pubkey(outputs[1].script_pubkey, &remote_tw);
     outputs[1].script_pubkey_len = 34;
@@ -2335,7 +2338,7 @@ int test_channel_cooperative_close(void) {
 
     /* Sign cooperative close */
     secp256k1_keypair remote_kp;
-    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
@@ -2377,7 +2380,7 @@ int test_regtest_channel_coop_close(void) {
 
     /* Build factory tree on-chain (same pattern as test_regtest_channel_unilateral) */
     secp256k1_keypair kps[5];
-    make_factory_keypairs(ctx, kps);
+    if (!make_factory_keypairs(ctx, kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -2385,7 +2388,7 @@ int test_regtest_channel_coop_close(void) {
                 "compute factory funding spk");
 
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
     char key_hex[65];
     hex_encode(tweaked_ser, 32, key_hex);
 
@@ -2481,8 +2484,8 @@ int test_regtest_channel_coop_close(void) {
     uint64_t chan_amount = leaf->outputs[0].amount_sats;
 
     secp256k1_pubkey client_a_pk, lsp_pk;
-    secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1]);
-    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    if (!secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
 
     channel_t ch;
     uint64_t usable = chan_amount;
@@ -2507,15 +2510,15 @@ int test_regtest_channel_coop_close(void) {
 
     /* Local (Client A) gets their balance minus half fee */
     secp256k1_xonly_pubkey ca_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &ca_xonly, NULL, &client_a_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ca_xonly, NULL, &client_a_pk)) return 0;
     unsigned char ca_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, ca_ser, &ca_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ca_ser, &ca_xonly)) return 0;
     unsigned char ca_tweak[32];
     sha256_tagged("TapTweak", ca_ser, 32, ca_tweak);
     secp256k1_pubkey ca_tw_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &ca_tw_full, &ca_xonly, ca_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &ca_tw_full, &ca_xonly, ca_tweak)) return 0;
     secp256k1_xonly_pubkey ca_tw;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &ca_tw, NULL, &ca_tw_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ca_tw, NULL, &ca_tw_full)) return 0;
 
     build_p2tr_script_pubkey(close_outputs[0].script_pubkey, &ca_tw);
     close_outputs[0].script_pubkey_len = 34;
@@ -2523,15 +2526,15 @@ int test_regtest_channel_coop_close(void) {
 
     /* Remote (LSP) gets their balance minus half fee */
     secp256k1_xonly_pubkey lsp_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk)) return 0;
     unsigned char lsp_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, lsp_ser, &lsp_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, lsp_ser, &lsp_xonly)) return 0;
     unsigned char lsp_tweak[32];
     sha256_tagged("TapTweak", lsp_ser, 32, lsp_tweak);
     secp256k1_pubkey lsp_tw_full;
-    secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xonly, lsp_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xonly, lsp_tweak)) return 0;
     secp256k1_xonly_pubkey lsp_tw;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tw, NULL, &lsp_tw_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tw, NULL, &lsp_tw_full)) return 0;
 
     build_p2tr_script_pubkey(close_outputs[1].script_pubkey, &lsp_tw);
     close_outputs[1].script_pubkey_len = 34;
@@ -2539,7 +2542,7 @@ int test_regtest_channel_coop_close(void) {
 
     /* Build and sign cooperative close */
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0])) return 0;
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
@@ -2580,8 +2583,8 @@ int test_commitment_number_overflow(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2640,8 +2643,8 @@ int test_htlc_double_fulfill_rejected(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2691,8 +2694,8 @@ int test_htlc_fail_after_fulfill_rejected(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2742,8 +2745,8 @@ int test_htlc_fulfill_after_fail_rejected(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2792,8 +2795,8 @@ int test_htlc_max_count_enforcement(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2842,8 +2845,8 @@ int test_htlc_dust_amount_rejected(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2882,8 +2885,8 @@ int test_htlc_reserve_enforcement(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
 
     unsigned char fund_spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
@@ -2927,7 +2930,7 @@ int test_factory_advance_past_exhaustion(void) {
     secp256k1_keypair keypairs[5];
     for (int i = 0; i < 5; i++) {
         memset(seckeys[i], (unsigned char)(0x10 + i), 32);
-        secp256k1_keypair_create(ctx, &keypairs[i], seckeys[i]);
+        if (!secp256k1_keypair_create(ctx, &keypairs[i], seckeys[i])) return 0;
     }
 
     factory_t f;
@@ -2980,7 +2983,7 @@ int test_regtest_channel_penalty(void) {
 
     /* Build factory tree on-chain */
     secp256k1_keypair kps[5];
-    make_factory_keypairs(ctx, kps);
+    if (!make_factory_keypairs(ctx, kps)) return 0;
 
     unsigned char fund_spk[34];
     secp256k1_xonly_pubkey fund_tweaked;
@@ -2988,7 +2991,7 @@ int test_regtest_channel_penalty(void) {
                 "compute factory funding spk");
 
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked)) return 0;
     char key_hex[65];
     hex_encode(tweaked_ser, 32, key_hex);
 
@@ -3084,8 +3087,8 @@ int test_regtest_channel_penalty(void) {
     uint64_t chan_amount = leaf->outputs[0].amount_sats;
 
     secp256k1_pubkey client_a_pk, lsp_pk;
-    secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1]);
-    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    if (!secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
 
     uint32_t csv_delay = 6;
 
@@ -3118,9 +3121,9 @@ int test_regtest_channel_penalty(void) {
     unsigned char lsp_del_sec[32] = { [0 ... 31] = 0xD2 };
     unsigned char lsp_rev_sec[32] = { [0 ... 31] = 0xD3 };
     secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
-    secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_pay_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_del_sec);
-    secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_rev_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_pay_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_del_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_rev_sec)) return 0;
     channel_set_remote_basepoints(&cheater_ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
 
     /* HONEST channel (LSP perspective — mirror) */
@@ -3134,9 +3137,9 @@ int test_regtest_channel_penalty(void) {
     honest_ch.funder_is_local = 1;  /* LSP (local here) is funder */
 
     secp256k1_pubkey ch_pay_bp, ch_del_bp, ch_rev_bp;
-    secp256k1_ec_pubkey_create(ctx, &ch_pay_bp, ch_pay_sec);
-    secp256k1_ec_pubkey_create(ctx, &ch_del_bp, ch_del_sec);
-    secp256k1_ec_pubkey_create(ctx, &ch_rev_bp, ch_rev_sec);
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_pay_bp, ch_pay_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_del_bp, ch_del_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ch_rev_bp, ch_rev_sec)) return 0;
 
     channel_set_local_basepoints(&honest_ch, lsp_pay_sec, lsp_del_sec, lsp_rev_sec);
     channel_set_remote_basepoints(&honest_ch, &ch_pay_bp, &ch_del_bp, &ch_rev_bp);
@@ -3156,7 +3159,7 @@ int test_regtest_channel_penalty(void) {
                 "build cheater commitment #0");
 
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0]);
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0])) return 0;
 
     tx_buf_t commit0_signed;
     tx_buf_init(&commit0_signed, 1024);
@@ -3252,8 +3255,8 @@ int test_random_basepoints(void) {
 
     /* Set up a minimal channel */
     secp256k1_pubkey local_pk, remote_pk;
-    secp256k1_ec_pubkey_create(ctx, &local_pk, local_funding_secret);
-    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_funding_secret);
+    if (!secp256k1_ec_pubkey_create(ctx, &local_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_funding_secret)) return 0;
 
     unsigned char spk[34];
     TEST_ASSERT(compute_channel_funding_spk(ctx, &local_pk, &remote_pk, spk),
@@ -3304,10 +3307,10 @@ int test_random_basepoints(void) {
         ch1.local_payment_basepoint_secret), "create from pay secret");
     unsigned char vser[33], cser[33];
     len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, vser, &len, &verify_pk, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, vser, &len, &verify_pk, SECP256K1_EC_COMPRESSED)) return 0;
     len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, cser, &len,
-        &ch1.local_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, cser, &len,
+        &ch1.local_payment_basepoint, SECP256K1_EC_COMPRESSED)) return 0;
     TEST_ASSERT_MEM_EQ(vser, cser, 33, "pay secret matches pubkey");
 
     secp256k1_context_destroy(ctx);
