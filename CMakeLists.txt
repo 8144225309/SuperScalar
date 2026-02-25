@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
+# cJSON v1.7.18 declares cmake_minimum_required(VERSION 1.0) which CMake 4.0+
+# rejects.  This silences the error without patching the vendored dep.
+# Ignored on CMake < 3.31 (variable simply doesn't exist yet).
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 project(superscalar C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
