@@ -305,7 +305,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     }
 
     secp256k1_pubkey my_pubkey;
-    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+    if (!secp256k1_keypair_pub(ctx, &my_pubkey, keypair)) {
+        fprintf(stderr, "Client %u: keypair_pub failed\n", my_index);
+        return 0;
+    }
 
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
@@ -537,7 +540,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Adapt with our secret key */
             unsigned char my_seckey[32];
-            secp256k1_keypair_sec(ctx, my_seckey, keypair);
+            if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+                fprintf(stderr, "Client %u: keypair_sec failed\n", my_index);
+                break;
+            }
             unsigned char adapted_sig[64];
             if (!adaptor_adapt(ctx, adapted_sig, presig, my_seckey, nonce_parity)) {
                 fprintf(stderr, "Client %u: adaptor_adapt failed\n", my_index);
@@ -587,7 +593,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Auto-accept */
             secp256k1_pubkey my_pk;
-            secp256k1_keypair_pub(ctx, &my_pk, keypair);
+            if (!secp256k1_keypair_pub(ctx, &my_pk, keypair)) {
+                fprintf(stderr, "Client %u: keypair_pub failed\n", my_index);
+                break;
+            }
             cJSON *accept = wire_build_jit_accept(jit_cidx, ctx, &my_pk);
             wire_send(fd, MSG_JIT_ACCEPT, accept);
             cJSON_Delete(accept);
@@ -902,9 +911,13 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (my_slot < 0) break;
 
             unsigned char my_seckey[32];
-            secp256k1_keypair_sec(ctx, my_seckey, keypair);
+            if (!secp256k1_keypair_sec(ctx, my_seckey, keypair))
+                break;
             secp256k1_pubkey my_pk;
-            secp256k1_keypair_pub(ctx, &my_pk, keypair);
+            if (!secp256k1_keypair_pub(ctx, &my_pk, keypair)) {
+                memset(my_seckey, 0, 32);
+                break;
+            }
 
             secp256k1_musig_secnonce my_secnonce;
             secp256k1_musig_pubnonce my_pubnonce;
@@ -930,7 +943,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Create client's partial sig */
             secp256k1_musig_partial_sig my_psig;
             secp256k1_keypair my_kp;
-            secp256k1_keypair_create(ctx, &my_kp, my_seckey);
+            if (!secp256k1_keypair_create(ctx, &my_kp, my_seckey)) {
+                memset(my_seckey, 0, 32);
+                break;
+            }
             memset(my_seckey, 0, 32);
 
             if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, &my_kp,
@@ -1296,21 +1312,29 @@ int main(int argc, char *argv[]) {
                                 memcpy(cbd.jit_ch->channel.local_delayed_payment_basepoint_secret, ls[1], 32);
                                 memcpy(cbd.jit_ch->channel.local_revocation_basepoint_secret, ls[2], 32);
                                 memcpy(cbd.jit_ch->channel.local_htlc_basepoint_secret, ls[3], 32);
-                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_payment_basepoint, ls[0]);
-                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_delayed_payment_basepoint, ls[1]);
-                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_revocation_basepoint, ls[2]);
-                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_htlc_basepoint, ls[3]);
-                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_payment_basepoint, rb[0], 33);
-                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_delayed_payment_basepoint, rb[1], 33);
-                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_revocation_basepoint, rb[2], 33);
-                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_htlc_basepoint, rb[3], 33);
+                                int bp_ok = 1;
+                                bp_ok &= secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_payment_basepoint, ls[0]);
+                                bp_ok &= secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_delayed_payment_basepoint, ls[1]);
+                                bp_ok &= secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_revocation_basepoint, ls[2]);
+                                bp_ok &= secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_htlc_basepoint, ls[3]);
+                                bp_ok &= secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_payment_basepoint, rb[0], 33);
+                                bp_ok &= secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_delayed_payment_basepoint, rb[1], 33);
+                                bp_ok &= secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_revocation_basepoint, rb[2], 33);
+                                bp_ok &= secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_htlc_basepoint, rb[3], 33);
+                                if (!bp_ok) {
+                                    fprintf(stderr, "Client: failed to restore JIT basepoints\n");
+                                    free(cbd.jit_ch);
+                                    cbd.jit_ch = NULL;
+                                }
                             }
-                            /* Register with watchtower */
-                            if (cbd.wt)
-                                watchtower_set_channel(cbd.wt, 0,
-                                    &cbd.jit_ch->channel);
-                            printf("Client: loaded JIT channel %08x from DB\n",
-                                   cbd.jit_ch->jit_channel_id);
+                            if (cbd.jit_ch) {
+                                /* Register with watchtower */
+                                if (cbd.wt)
+                                    watchtower_set_channel(cbd.wt, 0,
+                                        &cbd.jit_ch->channel);
+                                printf("Client: loaded JIT channel %08x from DB\n",
+                                       cbd.jit_ch->jit_channel_id);
+                            }
                         }
                         break;  /* Only one JIT per client */
                     }

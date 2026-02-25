@@ -29,8 +29,8 @@ typedef struct {
     int port;
 } lsp_t;
 
-/* Initialize LSP state. */
-void lsp_init(lsp_t *lsp, secp256k1_context *ctx,
+/* Initialize LSP state. Returns 1 on success, 0 on failure. */
+int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
               const secp256k1_keypair *keypair, int port,
               size_t expected_clients);
 

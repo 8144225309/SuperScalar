@@ -149,8 +149,9 @@ static int add_node(
         if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]))
             return -1;
 
-        tapscript_build_cltv_timeout(&node->timeout_leaf, node_cltv,
-                                      &lsp_xonly, f->ctx);
+        if (!tapscript_build_cltv_timeout(&node->timeout_leaf, node_cltv,
+                                          &lsp_xonly, f->ctx))
+            return -1;
         tapscript_merkle_root(node->merkle_root, &node->timeout_leaf, 1);
 
         /* Tweak internal key with merkle root */
@@ -357,9 +358,9 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
 
 /* ---- Public API ---- */
 
-void factory_init(factory_t *f, secp256k1_context *ctx,
-                  const secp256k1_keypair *keypairs, size_t n_participants,
-                  uint16_t step_blocks, uint32_t states_per_layer) {
+int factory_init(factory_t *f, secp256k1_context *ctx,
+                 const secp256k1_keypair *keypairs, size_t n_participants,
+                 uint16_t step_blocks, uint32_t states_per_layer) {
     memset(f, 0, sizeof(*f));
     f->ctx = ctx;
     f->n_participants = n_participants;
@@ -368,10 +369,9 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
     f->fee_per_tx = 200;  /* 1 sat/vB floor for ~200 vB tx; overridden by factory_build_tree */
 
     for (size_t i = 0; i < n_participants; i++) {
-        int ok;
         f->keypairs[i] = keypairs[i];
-        ok = secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i]);
-        (void)ok;
+        if (!secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i]))
+            return 0;
     }
 
     /* Default arity-2: 2 DW layers, 2 leaf nodes */
@@ -383,6 +383,7 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
     for (int i = 0; i < 2; i++)
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
+    return 1;
 }
 
 void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,

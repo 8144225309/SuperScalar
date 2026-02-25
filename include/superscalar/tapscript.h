@@ -21,7 +21,7 @@ void tapscript_build_hashlock(tapscript_leaf_t *leaf,
                                const unsigned char *hash32);
 
 /* Build CLTV timeout script: <locktime> OP_CLTV OP_DROP <L_pubkey> OP_CHECKSIG */
-void tapscript_build_cltv_timeout(
+int tapscript_build_cltv_timeout(
     tapscript_leaf_t *leaf,
     uint32_t locktime,
     const secp256k1_xonly_pubkey *lsp_pubkey,
@@ -29,7 +29,7 @@ void tapscript_build_cltv_timeout(
 );
 
 /* Build CSV delay script: <delay> OP_CSV OP_DROP <pubkey> OP_CHECKSIG */
-void tapscript_build_csv_delay(
+int tapscript_build_csv_delay(
     tapscript_leaf_t *leaf,
     uint32_t delay,
     const secp256k1_xonly_pubkey *pubkey,
@@ -95,28 +95,28 @@ int finalize_script_path_tx(
 
 /* Offered HTLC success leaf (remote claims with preimage, no CSV):
    OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <remote_key> OP_CHECKSIG */
-void tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
     const unsigned char *payment_hash32,
     const secp256k1_xonly_pubkey *remote_htlcpubkey,
     const secp256k1_context *ctx);
 
 /* Offered HTLC timeout leaf (local reclaims after CLTV + CSV):
    <cltv> OP_CLTV OP_DROP <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
-void tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
     uint32_t cltv_expiry, uint32_t to_self_delay,
     const secp256k1_xonly_pubkey *local_htlcpubkey,
     const secp256k1_context *ctx);
 
 /* Received HTLC success leaf (local claims with preimage + CSV):
    OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
-void tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
     const unsigned char *payment_hash32, uint32_t to_self_delay,
     const secp256k1_xonly_pubkey *local_htlcpubkey,
     const secp256k1_context *ctx);
 
 /* Received HTLC timeout leaf (remote reclaims after CLTV, no CSV):
    <cltv> OP_CLTV OP_DROP <remote_key> OP_CHECKSIG */
-void tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
     uint32_t cltv_expiry,
     const secp256k1_xonly_pubkey *remote_htlcpubkey,
     const secp256k1_context *ctx);

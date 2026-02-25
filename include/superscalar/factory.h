@@ -129,7 +129,7 @@ typedef struct {
     uint32_t dying_blocks;         /* duration of dying period (default: 432 = 3*144) */
 } factory_t;
 
-void factory_init(factory_t *f, secp256k1_context *ctx,
+int factory_init(factory_t *f, secp256k1_context *ctx,
                   const secp256k1_keypair *keypairs, size_t n_participants,
                   uint16_t step_blocks, uint32_t states_per_layer);
 

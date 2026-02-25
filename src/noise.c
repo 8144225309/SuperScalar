@@ -227,8 +227,11 @@ int noise_handshake_initiator(noise_state_t *ns, int fd,
     /* Send our ephemeral pubkey (33 bytes compressed) */
     unsigned char pub_ser[33];
     size_t pub_len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
+                                        SECP256K1_EC_COMPRESSED)) {
+        memset(eph_sec, 0, 32);
+        return 0;
+    }
     if (!noise_write_all(fd, pub_ser, 33)) {
         memset(eph_sec, 0, 32);
         return 0;
@@ -286,8 +289,11 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
     /* Send our ephemeral pubkey */
     unsigned char pub_ser[33];
     size_t pub_len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
+                                        SECP256K1_EC_COMPRESSED)) {
+        memset(eph_sec, 0, 32);
+        return 0;
+    }
     if (!noise_write_all(fd, pub_ser, 33)) {
         memset(eph_sec, 0, 32);
         return 0;

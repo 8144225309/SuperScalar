@@ -8,13 +8,14 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
-void lsp_init(lsp_t *lsp, secp256k1_context *ctx,
-              const secp256k1_keypair *keypair, int port,
-              size_t expected_clients) {
+int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
+             const secp256k1_keypair *keypair, int port,
+             size_t expected_clients) {
     memset(lsp, 0, sizeof(*lsp));
     lsp->ctx = ctx;
     lsp->lsp_keypair = *keypair;
-    secp256k1_keypair_pub(ctx, &lsp->lsp_pubkey, keypair);
+    if (!secp256k1_keypair_pub(ctx, &lsp->lsp_pubkey, keypair))
+        return 0;
     lsp->port = port;
     lsp->expected_clients = expected_clients;
     lsp->listen_fd = -1;
@@ -22,6 +23,7 @@ void lsp_init(lsp_t *lsp, secp256k1_context *ctx,
 
     for (size_t i = 0; i < LSP_MAX_CLIENTS; i++)
         lsp->client_fds[i] = -1;
+    return 1;
 }
 
 int lsp_accept_clients(lsp_t *lsp) {
@@ -187,7 +189,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
     /* Generate LSP's nonces */
     unsigned char lsp_seckey[32];
-    secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair);
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+        goto fail;
 
     size_t secnonce_idx = 0;
     for (size_t i = 0; i < f->n_nodes; i++) {
@@ -418,7 +421,10 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
     /* Generate LSP's nonce */
     unsigned char lsp_seckey[32];
-    secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair);
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
 
     secp256k1_musig_secnonce lsp_secnonce;
     secp256k1_musig_pubnonce lsp_pubnonce;

@@ -144,10 +144,10 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                   uint64_t local_amount, uint64_t remote_amount,
                   uint32_t to_self_delay);
 
-void channel_set_local_basepoints(channel_t *ch,
-                                    const unsigned char *payment_secret32,
-                                    const unsigned char *delayed_payment_secret32,
-                                    const unsigned char *revocation_secret32);
+int channel_set_local_basepoints(channel_t *ch,
+                                   const unsigned char *payment_secret32,
+                                   const unsigned char *delayed_payment_secret32,
+                                   const unsigned char *revocation_secret32);
 
 void channel_set_remote_basepoints(channel_t *ch,
                                      const secp256k1_pubkey *payment,
@@ -289,8 +289,8 @@ int channel_generate_random_basepoints(channel_t *ch);
 
 /* --- HTLC basepoints --- */
 
-void channel_set_local_htlc_basepoint(channel_t *ch,
-                                        const unsigned char *htlc_secret32);
+int channel_set_local_htlc_basepoint(channel_t *ch,
+                                       const unsigned char *htlc_secret32);
 
 void channel_set_remote_htlc_basepoint(channel_t *ch,
                                          const secp256k1_pubkey *htlc_basepoint);

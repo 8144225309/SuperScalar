@@ -4,19 +4,21 @@
 
 extern void reverse_bytes(unsigned char *, size_t);
 
-void ladder_init(ladder_t *lad, secp256k1_context *ctx,
-                 const secp256k1_keypair *lsp_keypair,
-                 uint32_t active_blocks, uint32_t dying_blocks)
+int ladder_init(ladder_t *lad, secp256k1_context *ctx,
+                const secp256k1_keypair *lsp_keypair,
+                uint32_t active_blocks, uint32_t dying_blocks)
 {
     memset(lad, 0, sizeof(*lad));
     lad->ctx = ctx;
     lad->lsp_keypair = *lsp_keypair;
-    secp256k1_keypair_pub(ctx, &lad->lsp_pubkey, lsp_keypair);
+    if (!secp256k1_keypair_pub(ctx, &lad->lsp_pubkey, lsp_keypair))
+        return 0;
     lad->active_blocks = active_blocks;
     lad->dying_blocks = dying_blocks;
     lad->current_block = 0;
     lad->n_factories = 0;
     lad->next_factory_id = 0;
+    return 1;
 }
 
 int ladder_create_factory(ladder_t *lad,
@@ -48,7 +50,10 @@ int ladder_create_factory(ladder_t *lad,
         all_keypairs[i + 1] = client_keypairs[i];
 
     /* Initialize factory */
-    factory_init(&lf->factory, lad->ctx, all_keypairs, n_participants, 1, 4);
+    if (!factory_init(&lf->factory, lad->ctx, all_keypairs, n_participants, 1, 4)) {
+        tx_buf_free(&lf->distribution_tx);
+        return 0;
+    }
 
     /* Set lifecycle */
     factory_set_lifecycle(&lf->factory, lad->current_block,

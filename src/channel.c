@@ -218,7 +218,8 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
 
             /* Compute taproot-tweaked P2TR SPK from this keyagg */
             unsigned char internal_ser[32];
-            secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+            if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
+                continue;
             unsigned char twk[32];
             sha256_tagged("TapTweak", internal_ser, 32, twk);
 
@@ -227,8 +228,9 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                                                     &ka.agg_pubkey, twk))
                 continue;
             secp256k1_xonly_pubkey tweaked_xonly;
-            secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL,
-                                                &tweaked_full);
+            if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL,
+                                                     &tweaked_full))
+                continue;
             unsigned char test_spk[34];
             build_p2tr_script_pubkey(test_spk, &tweaked_xonly);
 
@@ -269,22 +271,25 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     return 1;
 }
 
-void channel_set_local_basepoints(channel_t *ch,
-                                    const unsigned char *payment_secret32,
-                                    const unsigned char *delayed_payment_secret32,
-                                    const unsigned char *revocation_secret32) {
+int channel_set_local_basepoints(channel_t *ch,
+                                   const unsigned char *payment_secret32,
+                                   const unsigned char *delayed_payment_secret32,
+                                   const unsigned char *revocation_secret32) {
     memcpy(ch->local_payment_basepoint_secret, payment_secret32, 32);
-    secp256k1_ec_pubkey_create(ch->ctx, &ch->local_payment_basepoint,
-                                payment_secret32);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &ch->local_payment_basepoint,
+                                     payment_secret32))
+        return 0;
 
     memcpy(ch->local_delayed_payment_basepoint_secret,
            delayed_payment_secret32, 32);
-    secp256k1_ec_pubkey_create(ch->ctx, &ch->local_delayed_payment_basepoint,
-                                delayed_payment_secret32);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &ch->local_delayed_payment_basepoint,
+                                     delayed_payment_secret32))
+        return 0;
 
     memcpy(ch->local_revocation_basepoint_secret, revocation_secret32, 32);
-    secp256k1_ec_pubkey_create(ch->ctx, &ch->local_revocation_basepoint,
-                                revocation_secret32);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &ch->local_revocation_basepoint,
+                                     revocation_secret32))
+        return 0;
 
 #if BASEPOINT_DIAG
     {
@@ -299,6 +304,7 @@ void channel_set_local_basepoints(channel_t *ch,
                 s1[0],s1[1],s1[2],s1[3], s2[0],s2[1],s2[2],s2[3], s3[0],s3[1],s3[2],s3[3]);
     }
 #endif
+    return 1;
 }
 
 void channel_set_remote_basepoints(channel_t *ch,
@@ -343,8 +349,16 @@ int channel_generate_random_basepoints(channel_t *ch) {
             ps[0], ps[1], ds[0], ds[1], rs[0], rs[1], hs[0], hs[1]);
 #endif
 
-    channel_set_local_basepoints(ch, ps, ds, rs);
-    channel_set_local_htlc_basepoint(ch, hs);
+    if (!channel_set_local_basepoints(ch, ps, ds, rs)) {
+        memset(ps, 0, 32); memset(ds, 0, 32);
+        memset(rs, 0, 32); memset(hs, 0, 32);
+        return 0;
+    }
+    if (!channel_set_local_htlc_basepoint(ch, hs)) {
+        memset(ps, 0, 32); memset(ds, 0, 32);
+        memset(rs, 0, 32); memset(hs, 0, 32);
+        return 0;
+    }
 
     memset(ps, 0, 32);
     memset(ds, 0, 32);
@@ -506,16 +520,19 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
 
     /* 5. Build to-local output: P2TR(revocation_key, csv_script) */
     secp256k1_xonly_pubkey revocation_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
-                                        &revocation_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
+                                             &revocation_pubkey))
+        return 0;
 
     secp256k1_xonly_pubkey delayed_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &delayed_xonly, NULL,
-                                        &delayed_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &delayed_xonly, NULL,
+                                             &delayed_pubkey))
+        return 0;
 
     tapscript_leaf_t csv_leaf;
-    tapscript_build_csv_delay(&csv_leaf, ch->to_self_delay, &delayed_xonly,
-                               ch->ctx);
+    if (!tapscript_build_csv_delay(&csv_leaf, ch->to_self_delay, &delayed_xonly,
+                                    ch->ctx))
+        return 0;
 
     unsigned char merkle_root[32];
     tapscript_merkle_root(merkle_root, &csv_leaf, 1);
@@ -541,12 +558,14 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
 
     /* 6. Build to-remote output: P2TR(remote_payment_key) with key-path-only */
     secp256k1_xonly_pubkey remote_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_xonly, NULL,
-                                        &remote_payment_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_xonly, NULL,
+                                             &remote_payment_pubkey))
+        return 0;
 
     /* Key-path-only tweak: TapTweak(key, empty) */
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &remote_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &remote_xonly))
+        return 0;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
@@ -555,8 +574,9 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
                                             &remote_xonly, tweak))
         return 0;
     secp256k1_xonly_pubkey remote_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_tweaked, NULL,
-                                        &remote_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_tweaked, NULL,
+                                             &remote_tweaked_full))
+        return 0;
 
     build_p2tr_script_pubkey(outputs[1].script_pubkey, &remote_tweaked);
     outputs[1].script_pubkey_len = 34;
@@ -573,10 +593,12 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
                               &ch->remote_htlc_basepoint, &pcp);
 
         secp256k1_xonly_pubkey local_htlc_xonly, remote_htlc_xonly;
-        secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
-                                            &local_htlc_pub);
-        secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
-                                            &remote_htlc_pub);
+        if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
+                                                 &local_htlc_pub))
+            return 0;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
+                                                 &remote_htlc_pub))
+            return 0;
 
         for (size_t i = 0; i < ch->n_htlcs; i++) {
             if (ch->htlcs[i].state != HTLC_STATE_ACTIVE)
@@ -585,17 +607,21 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             tapscript_leaf_t success_leaf, timeout_leaf;
 
             if (ch->htlcs[i].direction == HTLC_OFFERED) {
-                tapscript_build_htlc_offered_success(&success_leaf,
-                    ch->htlcs[i].payment_hash, &remote_htlc_xonly, ch->ctx);
-                tapscript_build_htlc_offered_timeout(&timeout_leaf,
-                    ch->htlcs[i].cltv_expiry, ch->to_self_delay,
-                    &local_htlc_xonly, ch->ctx);
+                if (!tapscript_build_htlc_offered_success(&success_leaf,
+                        ch->htlcs[i].payment_hash, &remote_htlc_xonly, ch->ctx))
+                    return 0;
+                if (!tapscript_build_htlc_offered_timeout(&timeout_leaf,
+                        ch->htlcs[i].cltv_expiry, ch->to_self_delay,
+                        &local_htlc_xonly, ch->ctx))
+                    return 0;
             } else {
-                tapscript_build_htlc_received_success(&success_leaf,
-                    ch->htlcs[i].payment_hash, ch->to_self_delay,
-                    &local_htlc_xonly, ch->ctx);
-                tapscript_build_htlc_received_timeout(&timeout_leaf,
-                    ch->htlcs[i].cltv_expiry, &remote_htlc_xonly, ch->ctx);
+                if (!tapscript_build_htlc_received_success(&success_leaf,
+                        ch->htlcs[i].payment_hash, ch->to_self_delay,
+                        &local_htlc_xonly, ch->ctx))
+                    return 0;
+                if (!tapscript_build_htlc_received_timeout(&timeout_leaf,
+                        ch->htlcs[i].cltv_expiry, &remote_htlc_xonly, ch->ctx))
+                    return 0;
             }
 
             /* 2-leaf merkle root */
@@ -755,12 +781,14 @@ int channel_build_penalty_tx(const channel_t *ch,
 
     /* 5. Rebuild CSV tapscript leaf + merkle root */
     secp256k1_xonly_pubkey delayed_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &delayed_xonly, NULL,
-                                        &delayed_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &delayed_xonly, NULL,
+                                             &delayed_pubkey))
+        return 0;
 
     tapscript_leaf_t csv_leaf;
-    tapscript_build_csv_delay(&csv_leaf, ch->to_self_delay, &delayed_xonly,
-                               ch->ctx);
+    if (!tapscript_build_csv_delay(&csv_leaf, ch->to_self_delay, &delayed_xonly,
+                                    ch->ctx))
+        return 0;
 
     unsigned char merkle_root[32];
     tapscript_merkle_root(merkle_root, &csv_leaf, 1);
@@ -771,11 +799,13 @@ int channel_build_penalty_tx(const channel_t *ch,
         return 0;
 
     secp256k1_xonly_pubkey revocation_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
-                                        &revocation_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
+                                             &revocation_pubkey))
+        return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly))
+        return 0;
 
     unsigned char tweak_data[64];
     memcpy(tweak_data, internal_ser, 32);
@@ -792,12 +822,14 @@ int channel_build_penalty_tx(const channel_t *ch,
 
     /* 7. Build penalty tx output: P2TR(local_payment_basepoint) key-path-only */
     secp256k1_xonly_pubkey local_pay_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
-                                        &ch->local_payment_basepoint);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
 
     /* Key-path-only tweak for output */
     unsigned char out_internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, out_internal_ser, &local_pay_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, out_internal_ser, &local_pay_xonly))
+        return 0;
     unsigned char out_tweak[32];
     sha256_tagged("TapTweak", out_internal_ser, 32, out_tweak);
 
@@ -806,8 +838,9 @@ int channel_build_penalty_tx(const channel_t *ch,
                                             &local_pay_xonly, out_tweak))
         return 0;
     secp256k1_xonly_pubkey out_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
-                                        &out_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
+                                             &out_tweaked_full))
+        return 0;
 
     /* Fee: computed from fee rate.
        With P2A anchor: ~165 vB (1-in, 2-out). Without: ~152 vB (1-in, 1-out). */
@@ -876,7 +909,10 @@ int channel_init_nonce_pool(channel_t *ch, size_t count) {
     unsigned char seckey[32];
     memcpy(seckey, ch->local_funding_secret, 32);
     secp256k1_pubkey pk;
-    secp256k1_ec_pubkey_create(ch->ctx, &pk, seckey);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &pk, seckey)) {
+        memset(seckey, 0, 32);
+        return 0;
+    }
     int ok = musig_nonce_pool_generate(ch->ctx, &ch->local_nonce_pool,
                                          count, seckey, &pk,
                                          &ch->funding_keyagg.cache);
@@ -1059,11 +1095,13 @@ int channel_verify_and_aggregate_commitment_sig(
 
 /* ---- HTLC basepoints ---- */
 
-void channel_set_local_htlc_basepoint(channel_t *ch,
-                                        const unsigned char *htlc_secret32) {
+int channel_set_local_htlc_basepoint(channel_t *ch,
+                                       const unsigned char *htlc_secret32) {
     memcpy(ch->local_htlc_basepoint_secret, htlc_secret32, 32);
-    secp256k1_ec_pubkey_create(ch->ctx, &ch->local_htlc_basepoint,
-                                htlc_secret32);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &ch->local_htlc_basepoint,
+                                     htlc_secret32))
+        return 0;
+    return 1;
 }
 
 void channel_set_remote_htlc_basepoint(channel_t *ch,
@@ -1330,35 +1368,44 @@ static int channel_rebuild_htlc_leaves(
     if (!channel_derive_revocation_pubkey(ch->ctx, &revocation_pubkey,
                                             &ch->remote_revocation_basepoint, &pcp))
         return 0;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, revocation_xonly_out, NULL,
-                                        &revocation_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, revocation_xonly_out, NULL,
+                                             &revocation_pubkey))
+        return 0;
 
     /* Derive HTLC keys */
     secp256k1_pubkey local_htlc_pub, remote_htlc_pub;
-    channel_derive_pubkey(ch->ctx, &local_htlc_pub,
-                          &ch->local_htlc_basepoint, &pcp);
-    channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
-                          &ch->remote_htlc_basepoint, &pcp);
+    if (!channel_derive_pubkey(ch->ctx, &local_htlc_pub,
+                                &ch->local_htlc_basepoint, &pcp))
+        return 0;
+    if (!channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
+                                &ch->remote_htlc_basepoint, &pcp))
+        return 0;
 
     secp256k1_xonly_pubkey local_htlc_xonly, remote_htlc_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
-                                        &local_htlc_pub);
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
-                                        &remote_htlc_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
+                                             &local_htlc_pub))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
+                                             &remote_htlc_pub))
+        return 0;
 
     /* Build leaves based on direction */
     if (h->direction == HTLC_OFFERED) {
-        tapscript_build_htlc_offered_success(success_leaf,
-            h->payment_hash, &remote_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_offered_timeout(timeout_leaf,
-            h->cltv_expiry, ch->to_self_delay,
-            &local_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_offered_success(success_leaf,
+                h->payment_hash, &remote_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_offered_timeout(timeout_leaf,
+                h->cltv_expiry, ch->to_self_delay,
+                &local_htlc_xonly, ch->ctx))
+            return 0;
     } else {
-        tapscript_build_htlc_received_success(success_leaf,
-            h->payment_hash, ch->to_self_delay,
-            &local_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_received_timeout(timeout_leaf,
-            h->cltv_expiry, &remote_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_received_success(success_leaf,
+                h->payment_hash, ch->to_self_delay,
+                &local_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_received_timeout(timeout_leaf,
+                h->cltv_expiry, &remote_htlc_xonly, ch->ctx))
+            return 0;
     }
 
     return 1;
@@ -1391,11 +1438,13 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     /* Build destination output: P2TR(local_payment_basepoint) key-path-only */
     secp256k1_xonly_pubkey dest_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
-                                        &ch->local_payment_basepoint);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
 
     unsigned char dest_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly))
+        return 0;
     unsigned char dest_tweak[32];
     sha256_tagged("TapTweak", dest_ser, 32, dest_tweak);
 
@@ -1404,8 +1453,9 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
                                             &dest_xonly, dest_tweak))
         return 0;
     secp256k1_xonly_pubkey dest_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
-                                        &dest_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
+                                             &dest_tweaked_full))
+        return 0;
 
     uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
     uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
@@ -1529,11 +1579,13 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     /* Build destination output */
     secp256k1_xonly_pubkey dest_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
-                                        &ch->local_payment_basepoint);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
 
     unsigned char dest_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly))
+        return 0;
     unsigned char dest_tweak[32];
     sha256_tagged("TapTweak", dest_ser, 32, dest_tweak);
 
@@ -1542,8 +1594,9 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
                                             &dest_xonly, dest_tweak))
         return 0;
     secp256k1_xonly_pubkey dest_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
-                                        &dest_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
+                                             &dest_tweaked_full))
+        return 0;
 
     uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
     uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
@@ -1658,19 +1711,23 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
        The remote channel published this commitment, so "local" in the scripts
        is remote's keys and "remote" is our keys. */
     secp256k1_pubkey remote_htlc_pub, local_htlc_pub;
-    channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
-                          &ch->remote_htlc_basepoint, &pcp);
-    channel_derive_pubkey(ch->ctx, &local_htlc_pub,
-                          &ch->local_htlc_basepoint, &pcp);
+    if (!channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
+                                &ch->remote_htlc_basepoint, &pcp))
+        return 0;
+    if (!channel_derive_pubkey(ch->ctx, &local_htlc_pub,
+                                &ch->local_htlc_basepoint, &pcp))
+        return 0;
 
     /* Note: from the remote's commitment perspective, their "local" htlc key
        uses remote_htlc_basepoint and their "remote" htlc key uses local_htlc_basepoint */
 
     secp256k1_xonly_pubkey remote_htlc_xonly, local_htlc_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
-                                        &remote_htlc_pub);
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
-                                        &local_htlc_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
+                                             &remote_htlc_pub))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
+                                             &local_htlc_pub))
+        return 0;
 
     /* Build leaves. From the broadcaster's (remote's) perspective:
        - "local_htlcpubkey" = remote_htlc_pub (broadcaster's key)
@@ -1681,19 +1738,23 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     if (h->direction == HTLC_OFFERED) {
         /* From our perspective this is offered. On remote's commitment,
            this appears as a received HTLC. */
-        tapscript_build_htlc_received_success(&success_leaf,
-            h->payment_hash, ch->to_self_delay,
-            &remote_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_received_timeout(&timeout_leaf,
-            h->cltv_expiry, &local_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_received_success(&success_leaf,
+                h->payment_hash, ch->to_self_delay,
+                &remote_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_received_timeout(&timeout_leaf,
+                h->cltv_expiry, &local_htlc_xonly, ch->ctx))
+            return 0;
     } else {
         /* From our perspective this is received. On remote's commitment,
            this appears as an offered HTLC. */
-        tapscript_build_htlc_offered_success(&success_leaf,
-            h->payment_hash, &local_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_offered_timeout(&timeout_leaf,
-            h->cltv_expiry, ch->to_self_delay,
-            &remote_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_offered_success(&success_leaf,
+                h->payment_hash, &local_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_offered_timeout(&timeout_leaf,
+                h->cltv_expiry, ch->to_self_delay,
+                &remote_htlc_xonly, ch->ctx))
+            return 0;
     }
 
     tapscript_leaf_t htlc_leaves[2] = { success_leaf, timeout_leaf };
@@ -1706,11 +1767,13 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
         return 0;
 
     secp256k1_xonly_pubkey revocation_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
-                                        &revocation_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
+                                             &revocation_pubkey))
+        return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly))
+        return 0;
 
     unsigned char tweak_data[64];
     memcpy(tweak_data, internal_ser, 32);
@@ -1727,11 +1790,13 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 
     /* 6. Build output */
     secp256k1_xonly_pubkey local_pay_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
-                                        &ch->local_payment_basepoint);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
 
     unsigned char out_internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, out_internal_ser, &local_pay_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, out_internal_ser, &local_pay_xonly))
+        return 0;
     unsigned char out_tweak[32];
     sha256_tagged("TapTweak", out_internal_ser, 32, out_tweak);
 
@@ -1740,8 +1805,9 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
                                             &local_pay_xonly, out_tweak))
         return 0;
     secp256k1_xonly_pubkey out_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
-                                        &out_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
+                                             &out_tweaked_full))
+        return 0;
 
     /* Fee: with P2A anchor ~165 vB, without ~152 vB */
     int has_anchor = (anchor_spk && anchor_spk_len == P2A_SPK_LEN);

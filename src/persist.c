@@ -356,8 +356,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
         unsigned char pk_ser[33];
         size_t pk_len = 33;
-        secp256k1_ec_pubkey_serialize(ctx, pk_ser, &pk_len, &f->pubkeys[i],
-                                       SECP256K1_EC_COMPRESSED);
+        if (!secp256k1_ec_pubkey_serialize(ctx, pk_ser, &pk_len, &f->pubkeys[i],
+                                            SECP256K1_EC_COMPRESSED))
+            return 0;
         char pk_hex[67];
         hex_encode(pk_ser, 33, pk_hex);
 
@@ -453,7 +454,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
+        return 0;
     unsigned char twk[32];
     sha256_tagged("TapTweak", internal_ser, 32, twk);
 
@@ -463,7 +465,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                                                    &ka_copy.cache, twk))
         return 0;
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
+        return 0;
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
@@ -1895,23 +1898,27 @@ int persist_save_basepoints(persist_t *p, uint32_t channel_id,
     char rpay_hex[67], rdelay_hex[67], rrevoc_hex[67], rhtlc_hex[67];
 
     slen = 33;
-    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
-        &ch->remote_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+            &ch->remote_payment_basepoint, SECP256K1_EC_COMPRESSED))
+        return 0;
     hex_encode(ser, 33, rpay_hex);
 
     slen = 33;
-    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
-        &ch->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+            &ch->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED))
+        return 0;
     hex_encode(ser, 33, rdelay_hex);
 
     slen = 33;
-    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
-        &ch->remote_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+            &ch->remote_revocation_basepoint, SECP256K1_EC_COMPRESSED))
+        return 0;
     hex_encode(ser, 33, rrevoc_hex);
 
     slen = 33;
-    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
-        &ch->remote_htlc_basepoint, SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+            &ch->remote_htlc_basepoint, SECP256K1_EC_COMPRESSED))
+        return 0;
     hex_encode(ser, 33, rhtlc_hex);
 
     const char *sql =

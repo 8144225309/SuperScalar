@@ -57,7 +57,7 @@ void tapscript_build_hashlock(tapscript_leaf_t *leaf,
     tapscript_compute_leaf_hash(leaf);
 }
 
-void tapscript_build_cltv_timeout(
+int tapscript_build_cltv_timeout(
     tapscript_leaf_t *leaf,
     uint32_t locktime,
     const secp256k1_xonly_pubkey *lsp_pubkey,
@@ -76,7 +76,8 @@ void tapscript_build_cltv_timeout(
 
     /* <32-byte x-only pubkey> push */
     leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
-    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, lsp_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, lsp_pubkey))
+        return 0;
     pos += 32;
 
     /* OP_CHECKSIG */
@@ -86,9 +87,10 @@ void tapscript_build_cltv_timeout(
 
     /* Compute leaf hash */
     tapscript_compute_leaf_hash(leaf);
+    return 1;
 }
 
-void tapscript_build_csv_delay(
+int tapscript_build_csv_delay(
     tapscript_leaf_t *leaf,
     uint32_t delay,
     const secp256k1_xonly_pubkey *pubkey,
@@ -107,7 +109,8 @@ void tapscript_build_csv_delay(
 
     /* <32-byte x-only pubkey> push */
     leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
-    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, pubkey))
+        return 0;
     pos += 32;
 
     /* OP_CHECKSIG */
@@ -115,6 +118,7 @@ void tapscript_build_csv_delay(
 
     leaf->script_len = pos;
     tapscript_compute_leaf_hash(leaf);
+    return 1;
 }
 
 void tapscript_compute_leaf_hash(tapscript_leaf_t *leaf) {
@@ -373,7 +377,7 @@ int finalize_script_path_tx(
 
 /* --- HTLC script builders --- */
 
-void tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
     const unsigned char *payment_hash32,
     const secp256k1_xonly_pubkey *remote_htlcpubkey,
     const secp256k1_context *ctx)
@@ -391,15 +395,17 @@ void tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
     pos += 32;
     leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
     leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
-    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, remote_htlcpubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, remote_htlcpubkey))
+        return 0;
     pos += 32;
     leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
 
     leaf->script_len = pos;
     tapscript_compute_leaf_hash(leaf);
+    return 1;
 }
 
-void tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
     uint32_t cltv_expiry, uint32_t to_self_delay,
     const secp256k1_xonly_pubkey *local_htlcpubkey,
     const secp256k1_context *ctx)
@@ -414,15 +420,17 @@ void tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
     leaf->script[pos++] = 0xb2;  /* OP_CHECKSEQUENCEVERIFY */
     leaf->script[pos++] = 0x75;  /* OP_DROP */
     leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
-    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey))
+        return 0;
     pos += 32;
     leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
 
     leaf->script_len = pos;
     tapscript_compute_leaf_hash(leaf);
+    return 1;
 }
 
-void tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
     const unsigned char *payment_hash32, uint32_t to_self_delay,
     const secp256k1_xonly_pubkey *local_htlcpubkey,
     const secp256k1_context *ctx)
@@ -443,21 +451,23 @@ void tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
     leaf->script[pos++] = 0xb2;  /* OP_CHECKSEQUENCEVERIFY */
     leaf->script[pos++] = 0x75;  /* OP_DROP */
     leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
-    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey))
+        return 0;
     pos += 32;
     leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
 
     leaf->script_len = pos;
     tapscript_compute_leaf_hash(leaf);
+    return 1;
 }
 
-void tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
+int tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
     uint32_t cltv_expiry,
     const secp256k1_xonly_pubkey *remote_htlcpubkey,
     const secp256k1_context *ctx)
 {
     /* Identical structure to cltv_timeout: <cltv> OP_CLTV OP_DROP <key> OP_CHECKSIG */
-    tapscript_build_cltv_timeout(leaf, cltv_expiry, remote_htlcpubkey, ctx);
+    return tapscript_build_cltv_timeout(leaf, cltv_expiry, remote_htlcpubkey, ctx);
 }
 
 /* --- 2-leaf control block --- */

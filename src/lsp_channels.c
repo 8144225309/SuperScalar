@@ -737,7 +737,8 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     }
 
     unsigned char lsp_seckey[32];
-    secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair);
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+        return 0;
 
     secp256k1_musig_secnonce lsp_secnonce;
     secp256k1_musig_pubnonce lsp_pubnonce;
@@ -812,7 +813,10 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
     /* Step 7: Create LSP's partial sig */
     secp256k1_keypair lsp_kp;
-    secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey);
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
     memset(lsp_seckey, 0, 32);
 
     secp256k1_musig_partial_sig lsp_psig;
@@ -1413,13 +1417,15 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     int found = -1;
     unsigned char client_ser[33], cmp_ser[33];
     size_t len1 = 33, len2 = 33;
-    secp256k1_ec_pubkey_serialize(mgr->ctx, client_ser, &len1, &client_pk,
-                                   SECP256K1_EC_COMPRESSED);
+    if (!secp256k1_ec_pubkey_serialize(mgr->ctx, client_ser, &len1, &client_pk,
+                                        SECP256K1_EC_COMPRESSED))
+        return 0;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         len2 = 33;
-        secp256k1_ec_pubkey_serialize(mgr->ctx, cmp_ser, &len2,
-                                       &lsp->client_pubkeys[c],
-                                       SECP256K1_EC_COMPRESSED);
+        if (!secp256k1_ec_pubkey_serialize(mgr->ctx, cmp_ser, &len2,
+                                            &lsp->client_pubkeys[c],
+                                            SECP256K1_EC_COMPRESSED))
+            return 0;
         if (memcmp(client_ser, cmp_ser, 33) == 0) {
             found = (int)c;
             break;
@@ -1700,7 +1706,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!secp256k1_keypair_create(mgr->ctx, &lsp_kp, mgr->rot_lsp_seckey))
         return 0;
     rot_kps[0] = lsp_kp;
-    secp256k1_keypair_pub(mgr->ctx, &rot_pks[0], &lsp_kp);
+    if (!secp256k1_keypair_pub(mgr->ctx, &rot_pks[0], &lsp_kp))
+        return 0;
     for (size_t i = 0; i < lsp->n_clients; i++) {
         rot_pks[i + 1] = lsp->client_pubkeys[i];
         /* We don't have client secret keys — only their pubkeys.

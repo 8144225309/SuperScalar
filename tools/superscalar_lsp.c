@@ -190,14 +190,14 @@ static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
         /* Aggregate pubkey */
         {
             unsigned char xonly_ser[32];
-            secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->keyagg.agg_pubkey);
+            (void)secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->keyagg.agg_pubkey);
             report_add_hex(rpt, "agg_pubkey", xonly_ser, 32);
         }
 
         /* Tweaked pubkey */
         {
             unsigned char xonly_ser[32];
-            secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey);
+            (void)secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey);
             report_add_hex(rpt, "tweaked_pubkey", xonly_ser, 32);
         }
 
@@ -683,7 +683,13 @@ int main(int argc, char *argv[]) {
 
             /* Set up LSP with listen socket only (skip ceremony) */
             lsp_t lsp;
-            lsp_init(&lsp, ctx, &lsp_kp, port, rec_f.n_participants - 1);
+            if (!lsp_init(&lsp, ctx, &lsp_kp, port, rec_f.n_participants - 1)) {
+                fprintf(stderr, "LSP recovery: lsp_init failed\n");
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
             g_lsp = &lsp;
 
             signal(SIGINT, sigint_handler);
@@ -804,7 +810,13 @@ int main(int argc, char *argv[]) {
 
             /* Initialize ladder */
             ladder_t rec_lad;
-            ladder_init(&rec_lad, ctx, &lsp_kp, active_blocks, dying_blocks);
+            if (!ladder_init(&rec_lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
+                fprintf(stderr, "LSP recovery: ladder_init failed\n");
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
             {
                 int cur_h = regtest_get_block_height(&rt);
                 if (cur_h > 0) rec_lad.current_block = (uint32_t)cur_h;
@@ -838,17 +850,29 @@ int main(int argc, char *argv[]) {
                 musig_aggregate_keys(ctx, &ka, all_pks,
                                        lsp.factory.n_participants);
                 unsigned char is2[32];
-                secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey);
+                if (!secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey)) {
+                    fprintf(stderr, "LSP recovery: xonly serialize failed\n");
+                    return 1;
+                }
                 unsigned char twk[32];
                 sha256_tagged("TapTweak", is2, 32, twk);
                 musig_keyagg_t kac = ka;
                 secp256k1_pubkey tpk;
-                secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk,
-                                                         &kac.cache, twk);
+                if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk,
+                                                             &kac.cache, twk)) {
+                    fprintf(stderr, "LSP recovery: tweak add failed\n");
+                    return 1;
+                }
                 secp256k1_xonly_pubkey txo;
-                secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk);
+                if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk)) {
+                    fprintf(stderr, "LSP recovery: xonly from pubkey failed\n");
+                    return 1;
+                }
                 unsigned char ts2[32];
-                secp256k1_xonly_pubkey_serialize(ctx, ts2, &txo);
+                if (!secp256k1_xonly_pubkey_serialize(ctx, ts2, &txo)) {
+                    fprintf(stderr, "LSP recovery: xonly serialize failed\n");
+                    return 1;
+                }
                 char rfa[128];
                 if (derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
                     strncpy(mgr.rot_fund_addr, rfa,
@@ -973,7 +997,12 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     lsp_t lsp;
-    lsp_init(&lsp, ctx, &lsp_kp, port, (size_t)n_clients);
+    if (!lsp_init(&lsp, ctx, &lsp_kp, port, (size_t)n_clients)) {
+        fprintf(stderr, "LSP: lsp_init failed\n");
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     g_lsp = &lsp;
 
     signal(SIGINT, sigint_handler);
@@ -1023,22 +1052,46 @@ int main(int argc, char *argv[]) {
 
     /* Compute tweaked xonly pubkey for P2TR */
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) {
+        fprintf(stderr, "LSP: xonly serialize failed\n");
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     musig_keyagg_t ka_copy = ka;
     secp256k1_pubkey tweaked_pk;
-    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak);
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) {
+        fprintf(stderr, "LSP: tweak add failed\n");
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     secp256k1_xonly_pubkey tweaked_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) {
+        fprintf(stderr, "LSP: xonly from pubkey failed\n");
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     /* Derive bech32m address */
     unsigned char tweaked_ser[32];
-    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) {
+        fprintf(stderr, "LSP: xonly serialize failed\n");
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
 
     char fund_addr[128];
     if (!derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
@@ -1209,7 +1262,13 @@ int main(int argc, char *argv[]) {
 
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, active_blocks, dying_blocks);
+    if (!ladder_init(&lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
+        fprintf(stderr, "LSP: ladder_init failed\n");
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     {
         int cur_h = regtest_get_block_height(&rt);
         if (cur_h > 0) lad.current_block = (uint32_t)cur_h;
@@ -1449,14 +1508,21 @@ int main(int argc, char *argv[]) {
                         memcpy(jits[ji].channel.local_delayed_payment_basepoint_secret, ls[1], 32);
                         memcpy(jits[ji].channel.local_revocation_basepoint_secret, ls[2], 32);
                         memcpy(jits[ji].channel.local_htlc_basepoint_secret, ls[3], 32);
-                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_payment_basepoint, ls[0]);
-                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_delayed_payment_basepoint, ls[1]);
-                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_revocation_basepoint, ls[2]);
-                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_htlc_basepoint, ls[3]);
-                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_payment_basepoint, rb[0], 33);
-                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_delayed_payment_basepoint, rb[1], 33);
-                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_revocation_basepoint, rb[2], 33);
-                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_htlc_basepoint, rb[3], 33);
+                        int bp_ok = 1;
+                        bp_ok &= secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_payment_basepoint, ls[0]);
+                        bp_ok &= secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_delayed_payment_basepoint, ls[1]);
+                        bp_ok &= secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_revocation_basepoint, ls[2]);
+                        bp_ok &= secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_htlc_basepoint, ls[3]);
+                        bp_ok &= secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_payment_basepoint, rb[0], 33);
+                        bp_ok &= secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_delayed_payment_basepoint, rb[1], 33);
+                        bp_ok &= secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_revocation_basepoint, rb[2], 33);
+                        bp_ok &= secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_htlc_basepoint, rb[3], 33);
+                        if (!bp_ok) {
+                            fprintf(stderr, "LSP: JIT channel %u has corrupt basepoints\n",
+                                    jits[ji].jit_channel_id);
+                            jits[ji].state = JIT_STATE_CLOSED;
+                            continue;
+                        }
                     }
                     size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
                     watchtower_set_channel(&wt, wt_idx, &jits[ji].channel);
@@ -1642,7 +1708,14 @@ int main(int argc, char *argv[]) {
         unsigned char c0_sec[32];
         memset(c0_sec, 0x22, 32);  /* Client 0 key = 0x22 repeated (same as demo) */
         secp256k1_keypair c0_kp;
-        secp256k1_keypair_create(ctx, &c0_kp, c0_sec);
+        if (!secp256k1_keypair_create(ctx, &c0_kp, c0_sec)) {
+            fprintf(stderr, "BREACH TEST: keypair create failed\n");
+            memset(c0_sec, 0, 32);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
         memset(c0_sec, 0, 32);  /* wipe secret */
 
         tx_buf_t old_signed;
@@ -1850,7 +1923,13 @@ int main(int argc, char *argv[]) {
 
         /* LSP pubkey for signing + destination */
         secp256k1_xonly_pubkey lsp_xonly;
-        secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &lsp_kp);
+        if (!secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &lsp_kp)) {
+            fprintf(stderr, "EXPIRY TEST: keypair xonly pub failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
         unsigned char dest_spk[34];
         build_p2tr_script_pubkey(dest_spk, &lsp_xonly);
 
@@ -1905,7 +1984,10 @@ int main(int argc, char *argv[]) {
 
             unsigned char sig[64], aux[32];
             memset(aux, 0xEE, 32);
-            secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux);
+            if (!secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux)) {
+                fprintf(stderr, "EXPIRY TEST: schnorr sign failed\n");
+                return 1;
+            }
 
             unsigned char cb[65];
             size_t cb_len;
@@ -1986,7 +2068,10 @@ int main(int argc, char *argv[]) {
 
             unsigned char sig[64], aux[32];
             memset(aux, 0xFF, 32);
-            secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux);
+            if (!secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux)) {
+                fprintf(stderr, "EXPIRY TEST: schnorr sign failed\n");
+                return 1;
+            }
 
             unsigned char cb[65];
             size_t cb_len;
@@ -2046,7 +2131,10 @@ int main(int argc, char *argv[]) {
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);
-                secp256k1_keypair_create(ctx, &dk[ci + 1], ds);
+                if (!secp256k1_keypair_create(ctx, &dk[ci + 1], ds)) {
+                    fprintf(stderr, "DISTRIB TEST: keypair create failed\n");
+                    return 1;
+                }
             }
         }
         memcpy(df.keypairs, dk, n_total * sizeof(secp256k1_keypair));
@@ -2131,7 +2219,10 @@ int main(int argc, char *argv[]) {
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);
-                secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds);
+                if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
+                    fprintf(stderr, "TURNOVER TEST: keypair create failed\n");
+                    return 1;
+                }
             }
         }
 
@@ -2141,8 +2232,12 @@ int main(int argc, char *argv[]) {
 
         /* Build keyagg for the funding key (used as message) */
         secp256k1_pubkey turnover_pks[FACTORY_MAX_SIGNERS];
-        for (size_t ti = 0; ti < n_total; ti++)
-            secp256k1_keypair_pub(ctx, &turnover_pks[ti], &all_kps[ti]);
+        for (size_t ti = 0; ti < n_total; ti++) {
+            if (!secp256k1_keypair_pub(ctx, &turnover_pks[ti], &all_kps[ti])) {
+                fprintf(stderr, "TURNOVER TEST: keypair pub failed\n");
+                return 1;
+            }
+        }
 
         musig_keyagg_t turnover_ka;
         musig_aggregate_keys(ctx, &turnover_ka, turnover_pks, n_total);
@@ -2173,7 +2268,10 @@ int main(int argc, char *argv[]) {
 
             /* Client adapts with their secret key */
             unsigned char client_sec[32];
-            secp256k1_keypair_sec(ctx, client_sec, &all_kps[participant_idx]);
+            if (!secp256k1_keypair_sec(ctx, client_sec, &all_kps[participant_idx])) {
+                fprintf(stderr, "TURNOVER TEST: keypair sec failed\n");
+                return 1;
+            }
             unsigned char adapted_sig[64];
             if (!adaptor_adapt(ctx, adapted_sig, presig, client_sec, nonce_parity)) {
                 fprintf(stderr, "TURNOVER TEST: adapt failed for client %d\n", ci);
@@ -2295,13 +2393,20 @@ int main(int argc, char *argv[]) {
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);
-                secp256k1_keypair_create(ctx, &rot_kps[ci + 1], ds);
+                if (!secp256k1_keypair_create(ctx, &rot_kps[ci + 1], ds)) {
+                    fprintf(stderr, "rotation: keypair_create failed for client %d\n", ci);
+                    return 1;
+                }
             }
         }
 
         secp256k1_pubkey rot_pks[FACTORY_MAX_SIGNERS];
-        for (size_t ti = 0; ti < n_total; ti++)
-            secp256k1_keypair_pub(ctx, &rot_pks[ti], &rot_kps[ti]);
+        for (size_t ti = 0; ti < n_total; ti++) {
+            if (!secp256k1_keypair_pub(ctx, &rot_pks[ti], &rot_kps[ti])) {
+                fprintf(stderr, "rotation: keypair_pub failed for participant %zu\n", ti);
+                return 1;
+            }
+        }
 
         musig_keyagg_t rot_ka;
         musig_aggregate_keys(ctx, &rot_ka, rot_pks, n_total);

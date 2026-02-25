@@ -38,7 +38,7 @@ typedef struct {
     uint32_t current_block;
 } ladder_t;
 
-void ladder_init(ladder_t *lad, secp256k1_context *ctx,
+int ladder_init(ladder_t *lad, secp256k1_context *ctx,
                  const secp256k1_keypair *lsp_keypair,
                  uint32_t active_blocks, uint32_t dying_blocks);
 
