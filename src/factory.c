@@ -1183,6 +1183,7 @@ int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
                            uint32_t l_stock_vout,
                            uint64_t l_stock_amount,
                            uint32_t epoch) {
+    (void)l_stock_amount;
     if (!f->has_shachain)
         return 0;
 

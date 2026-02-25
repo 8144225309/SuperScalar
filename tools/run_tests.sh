@@ -3,13 +3,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
 
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+
 echo "=== Building ==="
 cd "$BUILD_DIR"
 cmake .. -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -5
-make -j$(nproc) 2>&1 | tail -20
+make -j"$NPROC" 2>&1 | tail -20
 
 echo ""
 echo "=== Running ALL tests ==="
-export LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build
-export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 ./test_superscalar --all 2>&1

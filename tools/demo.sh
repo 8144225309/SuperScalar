@@ -22,7 +22,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
-export LD_LIBRARY_PATH="$BUILD_DIR/_deps/secp256k1-zkp-build/src:$BUILD_DIR/_deps/cjson-build"
 
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"

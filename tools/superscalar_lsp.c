@@ -242,7 +242,7 @@ static void report_channel_state(report_t *rpt, const char *label,
                                   const lsp_channel_mgr_t *mgr) {
     report_begin_section(rpt, label);
     for (size_t c = 0; c < mgr->n_channels; c++) {
-        char key[16];
+        char key[32];
         snprintf(key, sizeof(key), "channel_%zu", c);
         report_begin_section(rpt, key);
         const channel_t *ch = &mgr->entries[c].channel;

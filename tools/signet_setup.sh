@@ -41,7 +41,6 @@ CLIENT2DB="$DATADIR/client2.db"
 CLIENT3DB="$DATADIR/client3.db"
 CLIENT4DB="$DATADIR/client4.db"
 SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
-LD_LIBRARY_PATH_SC="$SCBIN/_deps/secp256k1-zkp-build/src:$SCBIN/_deps/cjson-build"
 
 # ==========================================================================
 # Helper commands
@@ -483,8 +482,7 @@ cmd_start_bridge() {
         info "Bridge is already running"
     else
         step "Starting bridge (LSP port 9735, plugin port 9736)..."
-        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-            "$SCBIN/superscalar_bridge" \
+        "$SCBIN/superscalar_bridge" \
                 --lsp-port 9735 \
                 --plugin-port 9736 \
             > "$LOGDIR/bridge.log" 2>&1 &
@@ -517,8 +515,7 @@ cmd_start_lsp() {
     else
         step "Starting LSP (4 clients, 200k sats, arity-1, signet)..."
         # step-blocks=1 for fast demo, arity-1 for per-client leaves
-        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-            "$SCBIN/superscalar_lsp" \
+        "$SCBIN/superscalar_lsp" \
                 --network signet \
                 --cli-path "$BTCBIN/bitcoin-cli" \
                 --rpcuser "$RPCUSER" \
@@ -562,8 +559,7 @@ cmd_start_client() {
         info "Client is already running"
     else
         step "Starting client (daemon mode)..."
-        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-            "$SCBIN/superscalar_client" \
+        "$SCBIN/superscalar_client" \
                 --keyfile "$DATADIR/client1.key" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
@@ -600,8 +596,7 @@ cmd_start_client2() {
         info "Client 2 is already running"
     else
         step "Starting client 2 (daemon mode)..."
-        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-            "$SCBIN/superscalar_client" \
+        "$SCBIN/superscalar_client" \
                 --keyfile "$DATADIR/client2.key" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
@@ -640,8 +635,7 @@ _start_demo_clients() {
         local DBFILE="$DATADIR/client${i}.db"
         local LOGFILE="$LOGDIR/${LOGPFX}_client${i}.log"
 
-        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-            "$SCBIN/superscalar_client" \
+        "$SCBIN/superscalar_client" \
                 --keyfile "$KEYFILE" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network "$NET" \
@@ -677,8 +671,7 @@ cmd_demo_coop() {
     detail "On signet, factory creation waits for funding tx confirmation (~10 min)."
 
     # Start LSP in background first (needs to listen before clients connect)
-    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-        "$SCBIN/superscalar_lsp" \
+    "$SCBIN/superscalar_lsp" \
             --network signet \
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
@@ -740,8 +733,7 @@ cmd_demo_force_close() {
     detail "Arity-1 tree has 14 nodes with 3 DW layers. Most nSequence values are 0-3 blocks."
 
     # Start LSP in background first
-    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-        "$SCBIN/superscalar_lsp" \
+    "$SCBIN/superscalar_lsp" \
             --network signet \
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
@@ -813,8 +805,7 @@ cmd_demo_breach() {
     fi
 
     # Start LSP with --cheat-daemon (broadcasts revoked commitment, then sleeps)
-    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
-        "$SCBIN/superscalar_lsp" \
+    "$SCBIN/superscalar_lsp" \
             --network "$NET" \
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \

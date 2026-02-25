@@ -2,10 +2,10 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
 
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+
 cd "$BUILD_DIR"
-make -j$(nproc) 2>&1 | tail -5
+make -j"$NPROC" 2>&1 | tail -5
 
 echo "=== Running unit tests ==="
-export LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build
-export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 ./test_superscalar --unit 2>&1

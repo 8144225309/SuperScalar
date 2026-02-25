@@ -1012,8 +1012,6 @@ int channel_verify_and_aggregate_commitment_sig(
     musig_signing_session_t session;
     musig_session_init(&session, &ch->funding_keyagg, 2);
 
-    int peer_signer_idx = 1 - ch->local_funding_signer_idx;
-
     if (ch->local_funding_signer_idx == 0) {
         musig_session_set_pubnonce(&session, 0, &my_pubnonce);
         musig_session_set_pubnonce(&session, 1, &peer_pubnonce);

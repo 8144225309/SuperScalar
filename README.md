@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 257 tests (234 unit + 23 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 258 tests (235 unit + 23 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -28,11 +28,14 @@ Creates a 5-of-5 factory, opens 4 channels, runs payments, and cooperative-close
 ```bash
 # Ubuntu / Debian
 sudo apt install build-essential cmake libsqlite3-dev python3
+
+# macOS (SQLite3 ships with Xcode; install CMake via Homebrew if needed)
+brew install cmake
 ```
 
 ```bash
 mkdir -p build && cd build
-cmake .. && make -j$(nproc)
+cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 ```
 
 **Auto-fetched** (CMake FetchContent):
@@ -41,25 +44,22 @@ cmake .. && make -j$(nproc)
 
 ## Tests
 
-234 unit + 23 regtest integration tests.
+235 unit + 23 regtest integration tests.
 
 ```bash
 cd build
 
 # Unit tests only (no bitcoind needed)
-LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
-  ./test_superscalar --unit
+./test_superscalar --unit
 
 # Integration tests (needs bitcoind -regtest)
 bitcoind -regtest -daemon -rpcuser=rpcuser -rpcpassword=rpcpass \
   -fallbackfee=0.00001 -txindex=1
-LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
-  ./test_superscalar --regtest
+./test_superscalar --regtest
 bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 
 # All tests
-LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
-  ./test_superscalar --all
+./test_superscalar --all
 ```
 
 ---

@@ -21,9 +21,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/.."
 BUILD_DIR="$PROJECT_DIR/build"
-LIB_PATH="$BUILD_DIR/_deps/secp256k1-zkp-build/src:$BUILD_DIR/_deps/cjson-build"
-export LD_LIBRARY_PATH="$LIB_PATH"
-export DYLD_LIBRARY_PATH="$LIB_PATH"  # macOS
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
 RESULTS=()
 PASS=0
@@ -61,7 +59,7 @@ START=$(date +%s)
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-if cmake .. && make -j$(nproc); then
+if cmake .. && make -j"$NPROC"; then
     ELAPSED=$(( $(date +%s) - START ))
     record "Build" "PASS" "$ELAPSED"
 else

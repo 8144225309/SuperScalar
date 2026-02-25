@@ -51,14 +51,6 @@ TIMING = {
                 "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
 }
 
-# Library path for finding secp256k1-zkp and cJSON (Linux + macOS)
-_LIB_PATH = ":".join([
-    os.path.join(BUILD_DIR, "_deps", "secp256k1-zkp-build", "src"),
-    os.path.join(BUILD_DIR, "_deps", "cjson-build"),
-])
-LIB_ENV = {"LD_LIBRARY_PATH": _LIB_PATH, "DYLD_LIBRARY_PATH": _LIB_PATH}
-
-
 def client_seckey(index):
     """Deterministic 32-byte hex secret key for client index."""
     fill = CLIENT_KEY_FILLS[index] if index < len(CLIENT_KEY_FILLS) else (0x22 + index)
@@ -164,10 +156,6 @@ class Actor:
     def start(self):
         env = dict(os.environ)
         env.update(self.env)
-        for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
-            if key in self.env:
-                existing = os.environ.get(key, "")
-                env[key] = self.env[key] + (":" + existing if existing else "")
         self.log_fh = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             self.cmd,
@@ -300,8 +288,7 @@ class Orchestrator:
             cmd.extend(["--keyfile", lsp_keyfile, "--passphrase", "orchestrator"])
         if extra_flags:
             cmd.extend(extra_flags)
-        self.lsp = Actor("LSP", cmd, self._lsp_log(),
-                         env=LIB_ENV)
+        self.lsp = Actor("LSP", cmd, self._lsp_log())
         pid = self.lsp.start()
         self._log(f"LSP started (PID {pid})")
         time.sleep(self.timing["lsp_bind"])
@@ -327,8 +314,7 @@ class Orchestrator:
                          "--passphrase", "orchestrator"])
         if extra_flags:
             cmd.extend(extra_flags)
-        actor = Actor(f"Client-{index}", cmd, self._client_log(index),
-                      env=LIB_ENV)
+        actor = Actor(f"Client-{index}", cmd, self._client_log(index))
         pid = actor.start()
         self.clients[index] = actor
         self._log(f"Client {index} started (PID {pid})")

@@ -23,9 +23,6 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
-LIB_PATH="$BUILD_DIR/_deps/secp256k1-zkp-build/src:$BUILD_DIR/_deps/cjson-build"
-export LD_LIBRARY_PATH="$LIB_PATH"
-export DYLD_LIBRARY_PATH="$LIB_PATH"  # macOS
 
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"

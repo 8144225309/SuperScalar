@@ -572,8 +572,6 @@ int test_basepoint_independence(void) {
     /* Verify remote basepoints are ZEROED (not populated by init) */
     for (size_t c = 0; c < 4; c++) {
         lsp_channel_entry_t *entry = &mgr.entries[c];
-        unsigned char ser[33];
-        size_t len = 33;
         /* A zeroed secp256k1_pubkey won't serialize successfully,
            so we check if the raw bytes are zero */
         unsigned char zero[sizeof(secp256k1_pubkey)];
