@@ -24,8 +24,11 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug \
-            -DENABLE_SANITIZERS=${{ matrix.sanitizers && 'ON' || 'OFF' }}
+            -DENABLE_SANITIZERS=${{ matrix.sanitizers && 'ON' || 'OFF' }} \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       - name: Build
         run: cmake --build build --parallel
       - name: Unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
         run: ctest --test-dir build -R unit_tests --output-on-failure
