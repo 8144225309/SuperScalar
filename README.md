@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 258 tests (235 unit + 23 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 266 tests (235 unit + 31 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -44,7 +44,9 @@ cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null ||
 
 ## Tests
 
-235 unit + 23 regtest integration tests.
+235 unit + 31 regtest integration tests (including 8 adversarial/edge-case tests).
+
+See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
 
 ```bash
 cd build
