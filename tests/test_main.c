@@ -197,6 +197,9 @@ extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
 extern int test_client_persist_reload(void);
 
+/* Security hardening */
+extern int test_secure_zero_basic(void);
+
 /* Phase 17: Demo polish */
 extern int test_create_invoice_wire(void);
 extern int test_preimage_fulfills_htlc(void);
@@ -538,6 +541,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
     RUN_TEST(test_client_persist_reload);
+
+    printf("\n=== Security Hardening ===\n");
+    RUN_TEST(test_secure_zero_basic);
 
     printf("\n=== Demo Polish (Phase 17) ===\n");
     RUN_TEST(test_create_invoice_wire);

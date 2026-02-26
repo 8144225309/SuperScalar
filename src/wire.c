@@ -2,6 +2,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/noise.h"
 #include "superscalar/crypto_aead.h"
+#include "superscalar/types.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1366,10 +1367,10 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
     if (!noise_handshake_initiator(&ns, fd, ctx))
         return 0;
     if (!wire_set_encryption(fd, &ns)) {
-        memset(&ns, 0, sizeof(ns));
+        secure_zero(&ns, sizeof(ns));
         return 0;
     }
-    memset(&ns, 0, sizeof(ns));
+    secure_zero(&ns, sizeof(ns));
     return 1;
 }
 
@@ -1378,9 +1379,9 @@ int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
     if (!noise_handshake_responder(&ns, fd, ctx))
         return 0;
     if (!wire_set_encryption(fd, &ns)) {
-        memset(&ns, 0, sizeof(ns));
+        secure_zero(&ns, sizeof(ns));
         return 0;
     }
-    memset(&ns, 0, sizeof(ns));
+    secure_zero(&ns, sizeof(ns));
     return 1;
 }

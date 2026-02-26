@@ -3,6 +3,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Volatile function pointer prevents the compiler from optimizing away
+   the memset call when the buffer is "dead" after zeroing.
+   Same approach as libsodium and Bitcoin Core. */
+static void *(*const volatile secure_memset_ptr)(void *, int, size_t) = memset;
+
+void secure_zero(void *ptr, size_t len) {
+    secure_memset_ptr(ptr, 0, len);
+}
+
 void tx_buf_init(tx_buf_t *buf, size_t initial_cap) {
     buf->data = (unsigned char *)malloc(initial_cap);
     buf->len = 0;
