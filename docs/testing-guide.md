@@ -53,9 +53,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
 | Unit tests | 271 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5 |
-| Regtest integration | 26 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP |
+| Regtest integration | 27 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery |
 | Adversarial regtest | 11 | Yes | Fund safety under attack: breach penalties, HTLC edge cases, timeout recovery, DW exhaustion, wrong preimage rejection, double-spend rejection |
-| **Total** | **308** | | |
+| **Total** | **309** | | |
 
 ---
 
@@ -99,7 +99,7 @@ cd build
 ./test_superscalar --regtest
 ```
 
-Expected output: `Results: 37/37 passed`
+Expected output: `Results: 38/38 passed`
 
 ### Step 3: Stop bitcoind
 

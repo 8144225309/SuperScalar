@@ -166,6 +166,7 @@ extern int test_fee_policy_balance_split(void);
 extern int test_channel_wire_framing(void);
 extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
+extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
 extern int test_persist_open_close(void);
@@ -856,6 +857,9 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
     RUN_TEST(test_regtest_intra_factory_payment);
     RUN_TEST(test_regtest_multi_payment);
+
+    printf("\n=== Regtest LSP Recovery ===\n");
+    RUN_TEST(test_regtest_lsp_restart_recovery);
 
     printf("\n=== Regtest CPFP Anchor (P2A) ===\n");
     RUN_TEST(test_regtest_cpfp_penalty_bump);

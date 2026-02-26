@@ -7,6 +7,7 @@
 #include "superscalar/client.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
+#include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -1715,4 +1716,434 @@ int test_noise_nk_wrong_pubkey(void) {
     close(sv[0]);
     secp256k1_context_destroy(ctx);
     return 1;
+}
+
+/* ---- Regtest: LSP crash recovery from SQLite ----
+   Proves: after a payment, the LSP can persist channel state to SQLite,
+   lose all in-memory state ("crash"), recover from the database, and the
+   recovered channels have correct balances, commitment numbers, and
+   basepoint secrets. Then cooperative close confirms on regtest. */
+
+int test_regtest_lsp_restart_recovery(void) {
+    /* Phase 1: Standard regtest factory setup */
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: regtest not available\n");
+        return 0;
+    }
+    if (!regtest_create_wallet(&rt, "test_recovery")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_recovery\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_recovery", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Compute funding SPK */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    /* Derive bech32m address */
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    /* Mine and fund */
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "balance for funding");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    /* Generate payment preimage and hash */
+    unsigned char preimage[32] = { [0 ... 31] = 0x77 };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    int port = 19700 + (getpid() % 1000);
+
+    /* Prepare per-client test data (same as intra_factory_payment) */
+    payment_test_data_t sender_data, payee_data, idle_data;
+    memcpy(sender_data.payment_hash, payment_hash, 32);
+    memset(sender_data.preimage, 0, 32);
+    sender_data.is_sender = 1;
+    sender_data.payment_done = 0;
+
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+    payee_data.is_sender = 0;
+    payee_data.payment_done = 0;
+
+    memset(&idle_data, 0, sizeof(idle_data));
+
+    /* Fork 4 client processes */
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (unsigned)(c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
+                _exit(1);
+            void *cb_data;
+            if (c == 0) cb_data = &sender_data;
+            else if (c == 1) cb_data = &payee_data;
+            else cb_data = &idle_data;
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", port,
+                                               payment_client_cb, cb_data);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    /* Parent: run LSP */
+    lsp_t lsp;
+    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    int lsp_ok = 1;
+
+    if (!lsp_accept_clients(&lsp)) {
+        fprintf(stderr, "LSP: accept clients failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_run_factory_creation(&lsp, funding_txid, funding_vout,
+                                             funding_amount, fund_spk, 34,
+                                             10, 4, 0)) {
+        fprintf(stderr, "LSP: factory creation failed\n");
+        lsp_ok = 0;
+    }
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+        fprintf(stderr, "LSP: channel init failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        fprintf(stderr, "LSP: basepoint exchange failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        fprintf(stderr, "LSP: send channel_ready failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Phase 2: Process a payment (Client A → Client B, 5000 sats) */
+    if (lsp_ok) {
+        wire_msg_t msg;
+        if (!wire_recv(lsp.client_fds[0], &msg)) {
+            fprintf(stderr, "LSP: recv from client 0 failed\n");
+            lsp_ok = 0;
+        } else {
+            if (msg.msg_type == MSG_UPDATE_ADD_HTLC) {
+                if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 0, &msg)) {
+                    fprintf(stderr, "LSP: handle ADD_HTLC failed\n");
+                    lsp_ok = 0;
+                }
+            } else {
+                fprintf(stderr, "LSP: expected ADD_HTLC, got 0x%02x\n",
+                        msg.msg_type);
+                lsp_ok = 0;
+            }
+            cJSON_Delete(msg.json);
+        }
+        if (lsp_ok) {
+            if (!wire_recv(lsp.client_fds[1], &msg)) {
+                fprintf(stderr, "LSP: recv from client 1 failed\n");
+                lsp_ok = 0;
+            } else {
+                if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+                    if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 1, &msg)) {
+                        fprintf(stderr, "LSP: handle FULFILL_HTLC failed\n");
+                        lsp_ok = 0;
+                    }
+                } else {
+                    fprintf(stderr, "LSP: expected FULFILL, got 0x%02x\n",
+                            msg.msg_type);
+                    lsp_ok = 0;
+                }
+                cJSON_Delete(msg.json);
+            }
+        }
+    }
+
+    /* Phase 3: Record pre-crash channel state */
+    uint64_t pre_local[4], pre_remote[4], pre_commit[4];
+    unsigned char pre_bp_pay[4][32], pre_bp_delay[4][32];
+    unsigned char pre_bp_revoc[4][32], pre_bp_htlc[4][32];
+    if (lsp_ok) {
+        for (int c = 0; c < 4; c++) {
+            const channel_t *ch = &ch_mgr.entries[c].channel;
+            pre_local[c] = ch->local_amount;
+            pre_remote[c] = ch->remote_amount;
+            pre_commit[c] = ch->commitment_number;
+            memcpy(pre_bp_pay[c],
+                   ch->local_payment_basepoint_secret, 32);
+            memcpy(pre_bp_delay[c],
+                   ch->local_delayed_payment_basepoint_secret, 32);
+            memcpy(pre_bp_revoc[c],
+                   ch->local_revocation_basepoint_secret, 32);
+            memcpy(pre_bp_htlc[c],
+                   ch->local_htlc_basepoint_secret, 32);
+        }
+        printf("LSP: pre-crash state: ch0 local=%llu remote=%llu cn=%llu\n",
+               (unsigned long long)pre_local[0],
+               (unsigned long long)pre_remote[0],
+               (unsigned long long)pre_commit[0]);
+    }
+
+    /* Phase 4: Persist to SQLite */
+    const char *db_path = "/tmp/test_lsp_recovery.db";
+    persist_t db;
+    int db_open = 0;
+    if (lsp_ok) {
+        unlink(db_path);
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "LSP: persist_open failed\n");
+            lsp_ok = 0;
+        } else {
+            db_open = 1;
+        }
+    }
+    if (lsp_ok && !persist_begin(&db)) {
+        fprintf(stderr, "LSP: persist_begin failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !persist_save_factory(&db, &lsp.factory, ctx, 0)) {
+        fprintf(stderr, "LSP: persist_save_factory failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok) {
+        for (int c = 0; c < 4; c++) {
+            if (!persist_save_channel(&db, &ch_mgr.entries[c].channel,
+                                        0, (uint32_t)c) ||
+                !persist_save_basepoints(&db, (uint32_t)c,
+                                           &ch_mgr.entries[c].channel) ||
+                !persist_update_channel_balance(&db, (uint32_t)c,
+                    ch_mgr.entries[c].channel.local_amount,
+                    ch_mgr.entries[c].channel.remote_amount,
+                    ch_mgr.entries[c].channel.commitment_number)) {
+                fprintf(stderr, "LSP: persist channel %d failed\n", c);
+                lsp_ok = 0;
+                break;
+            }
+        }
+    }
+    if (lsp_ok && !persist_commit(&db)) {
+        fprintf(stderr, "LSP: persist_commit failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Phase 5: "Crash" — zero out channel manager */
+    if (lsp_ok) {
+        printf("LSP: === SIMULATING CRASH ===\n");
+        memset(&ch_mgr, 0, sizeof(ch_mgr));
+    }
+
+    /* Phase 6: Recover from SQLite */
+    factory_t rec_f;
+    lsp_channel_mgr_t rec_mgr;
+    memset(&rec_f, 0, sizeof(rec_f));
+    memset(&rec_mgr, 0, sizeof(rec_mgr));
+    if (lsp_ok) {
+        printf("LSP: === RECOVERING FROM SQLITE ===\n");
+        if (!persist_load_factory(&db, 0, &rec_f, ctx)) {
+            fprintf(stderr, "LSP: persist_load_factory failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok && rec_f.n_participants != 5) {
+        fprintf(stderr, "LSP: recovered n_participants=%zu, expected 5\n",
+                rec_f.n_participants);
+        lsp_ok = 0;
+    }
+    if (lsp_ok) {
+        if (!lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                         seckeys[0], 4, &db)) {
+            fprintf(stderr, "LSP: init_from_db failed\n");
+            lsp_ok = 0;
+        }
+    }
+
+    /* Phase 7: Verify recovered state matches pre-crash state */
+    if (lsp_ok && rec_mgr.n_channels != 4) {
+        fprintf(stderr, "LSP: recovered n_channels=%zu, expected 4\n",
+                rec_mgr.n_channels);
+        lsp_ok = 0;
+    }
+    if (lsp_ok) {
+        for (int c = 0; c < 4; c++) {
+            const channel_t *rec = &rec_mgr.entries[c].channel;
+            if (rec->local_amount != pre_local[c]) {
+                fprintf(stderr, "ch%d local %llu != %llu\n", c,
+                        (unsigned long long)rec->local_amount,
+                        (unsigned long long)pre_local[c]);
+                lsp_ok = 0; break;
+            }
+            if (rec->remote_amount != pre_remote[c]) {
+                fprintf(stderr, "ch%d remote %llu != %llu\n", c,
+                        (unsigned long long)rec->remote_amount,
+                        (unsigned long long)pre_remote[c]);
+                lsp_ok = 0; break;
+            }
+            if (rec->commitment_number != pre_commit[c]) {
+                fprintf(stderr, "ch%d commit_num %llu != %llu\n", c,
+                        (unsigned long long)rec->commitment_number,
+                        (unsigned long long)pre_commit[c]);
+                lsp_ok = 0; break;
+            }
+            if (memcmp(rec->local_payment_basepoint_secret,
+                       pre_bp_pay[c], 32) != 0 ||
+                memcmp(rec->local_delayed_payment_basepoint_secret,
+                       pre_bp_delay[c], 32) != 0 ||
+                memcmp(rec->local_revocation_basepoint_secret,
+                       pre_bp_revoc[c], 32) != 0 ||
+                memcmp(rec->local_htlc_basepoint_secret,
+                       pre_bp_htlc[c], 32) != 0) {
+                fprintf(stderr, "ch%d basepoint secret mismatch\n", c);
+                lsp_ok = 0; break;
+            }
+            if (!rec_mgr.entries[c].ready) {
+                fprintf(stderr, "ch%d not marked ready\n", c);
+                lsp_ok = 0; break;
+            }
+        }
+    }
+    if (lsp_ok) {
+        printf("LSP: recovery verified — 4 channels match pre-crash state\n");
+    }
+
+    /* Clean up DB */
+    if (db_open) {
+        persist_close(&db);
+        unlink(db_path);
+    }
+
+    /* Phase 8: Cooperative close on regtest */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        size_t n_total = 5;
+        uint64_t per_party = close_total / n_total;
+
+        tx_output_t close_outputs[5];
+        for (size_t i = 0; i < n_total; i++) {
+            close_outputs[i].amount_sats = per_party;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        close_outputs[n_total - 1].amount_sats =
+            close_total - per_party * (n_total - 1);
+
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs,
+                                        n_total)) {
+            fprintf(stderr, "LSP: cooperative close failed\n");
+            lsp_ok = 0;
+        } else {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                int conf = regtest_get_confirmations(&rt, close_txid);
+                if (conf < 1) {
+                    fprintf(stderr, "LSP: close tx not confirmed\n");
+                    lsp_ok = 0;
+                }
+            } else {
+                fprintf(stderr, "LSP: broadcast close tx failed\n");
+                lsp_ok = 0;
+            }
+        }
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_cleanup(&lsp);
+
+    /* Wait for children */
+    int all_children_ok = 1;
+    for (int c = 0; c < 4; c++) {
+        int status;
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "Client %d failed (status %d)\n", c + 1,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            all_children_ok = 0;
+        }
+    }
+
+    secp256k1_context_destroy(ctx);
+    return lsp_ok && all_children_ok;
 }
