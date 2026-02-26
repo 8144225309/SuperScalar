@@ -505,6 +505,100 @@ int regtest_get_raw_tx(regtest_t *rt, const char *txid,
     return 1;
 }
 
+/* --- Shared faucet for regtest test suites --- */
+static regtest_t g_faucet;
+static char g_faucet_addr[128];
+static int g_faucet_ready = 0;
+
+int regtest_init_faucet(void) {
+    if (g_faucet_ready) return 1;
+
+    if (!regtest_init(&g_faucet)) return 0;
+
+    if (!regtest_create_wallet(&g_faucet, "faucet")) {
+        /* Wallet may already exist from a previous run — try loading */
+        char *lr = regtest_exec(&g_faucet, "loadwallet", "\"faucet\"");
+        if (lr) free(lr);
+        strncpy(g_faucet.wallet, "faucet", sizeof(g_faucet.wallet) - 1);
+    }
+
+    if (!regtest_get_new_address(&g_faucet, g_faucet_addr, sizeof(g_faucet_addr)))
+        return 0;
+
+    /* Check if chain already has blocks (stale regtest, not wiped). */
+    int height = regtest_get_block_height(&g_faucet);
+    if (height > 1000) {
+        fprintf(stderr, "WARNING: regtest chain at height %d — "
+                "consider wiping (rm -rf ~/.bitcoin/regtest) for clean results\n",
+                height);
+    }
+
+    /* Mine 200 blocks while subsidy is high.
+       Blocks 0-149: 50 BTC each = 7,500 BTC
+       Blocks 150-199: 25 BTC each = 1,250 BTC
+       Total: ~8,750 BTC (only first 100 are spendable due to maturity). */
+    if (!regtest_mine_blocks(&g_faucet, 200, g_faucet_addr))
+        return 0;
+
+    double bal = regtest_get_balance(&g_faucet);
+    if (bal < 10.0) {
+        fprintf(stderr, "WARNING: faucet balance %.4f BTC after init — "
+                "subsidy may be exhausted (height %d). Wipe regtest.\n",
+                bal, regtest_get_block_height(&g_faucet));
+    }
+
+    g_faucet_ready = 1;
+    return 1;
+}
+
+int regtest_fund_from_faucet(regtest_t *rt, double amount) {
+    if (!g_faucet_ready) return 0;
+
+    /* Check faucet balance — try to replenish if running low */
+    double bal = regtest_get_balance(&g_faucet);
+    if (bal < amount + 1.0) {
+        /* Try to mine more blocks to replenish */
+        fprintf(stderr, "faucet: balance %.4f BTC low, mining 50 blocks to replenish\n", bal);
+        regtest_mine_blocks(&g_faucet, 50, g_faucet_addr);
+        bal = regtest_get_balance(&g_faucet);
+        if (bal < amount) {
+            fprintf(stderr, "faucet: EXHAUSTED (%.4f BTC < %.4f needed). "
+                    "Wipe regtest: rm -rf ~/.bitcoin/regtest\n", bal, amount);
+            return 0;
+        }
+    }
+
+    /* Get new address in the target wallet */
+    char addr[128];
+    if (!regtest_get_new_address(rt, addr, sizeof(addr)))
+        return 0;
+
+    /* Send from faucet to target wallet */
+    if (!regtest_fund_address(&g_faucet, addr, amount, NULL))
+        return 0;
+
+    /* Mine 1 block to confirm (to faucet address, keeps subsidy in faucet) */
+    if (!regtest_mine_blocks(&g_faucet, 1, g_faucet_addr))
+        return 0;
+
+    return 1;
+}
+
+void regtest_faucet_health_report(void) {
+    if (!g_faucet_ready) {
+        printf("\n  [faucet] not initialized\n");
+        return;
+    }
+    int height = regtest_get_block_height(&g_faucet);
+    double bal = regtest_get_balance(&g_faucet);
+    printf("\n  [faucet] height=%d  balance=%.4f BTC", height, bal);
+    if (height > 2000)
+        printf("  WARNING: chain getting tall, wipe before next run");
+    if (bal < 50.0)
+        printf("  WARNING: balance low, subsidy degrading");
+    printf("\n");
+}
+
 double regtest_get_balance(regtest_t *rt) {
     char *result = regtest_exec(rt, "getbalance", "");
     if (!result) return -1.0;

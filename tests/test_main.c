@@ -737,9 +737,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_dw_counter_with_leaves_4);
 }
 
+extern int regtest_init_faucet(void);
+extern void regtest_faucet_health_report(void);
+
 static void run_regtest_tests(void) {
     printf("\n=== Regtest Integration ===\n");
     printf("(requires bitcoind -regtest)\n\n");
+
+    /* Pre-fund a shared faucet wallet while block subsidy is high.
+       This prevents chain exhaustion when tests run sequentially. */
+    if (!regtest_init_faucet())
+        printf("  WARNING: faucet init failed, tests will mine individually\n");
+
     RUN_TEST(test_regtest_basic_dw);
     RUN_TEST(test_regtest_old_first_attack);
     RUN_TEST(test_regtest_musig_onchain);
@@ -781,6 +790,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_ptlc_no_coop_close);
     RUN_TEST(test_regtest_all_offline_recovery);
     RUN_TEST(test_regtest_tree_ordering);
+
+    regtest_faucet_health_report();
 }
 
 int main(int argc, char *argv[]) {

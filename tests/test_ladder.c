@@ -400,7 +400,8 @@ int test_regtest_ladder_lifecycle(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
@@ -502,7 +503,8 @@ int test_regtest_ladder_ptlc_migration(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
@@ -711,7 +713,8 @@ int test_regtest_ladder_distribution_fallback(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
@@ -1085,12 +1088,9 @@ int test_regtest_ptlc_no_coop_close(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_for_balance(&rt, 0.002, mine_addr);
-    if (regtest_get_balance(&rt) < 0.002) {
-        printf("  SKIP: regtest subsidy exhausted\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.002, "factory setup for funding");
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
@@ -1245,12 +1245,9 @@ int test_regtest_all_offline_recovery(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_for_balance(&rt, 0.002, mine_addr);
-    if (regtest_get_balance(&rt) < 0.002) {
-        printf("  SKIP: regtest subsidy exhausted\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.002, "factory setup for funding");
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;

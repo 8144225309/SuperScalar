@@ -433,7 +433,8 @@ int test_regtest_timeout_spend(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[5];
     if (!make_keypairs(ctx, kps)) return 0;

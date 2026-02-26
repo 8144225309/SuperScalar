@@ -474,7 +474,8 @@ int test_regtest_ptlc_turnover(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* 5 participants: LSP + 4 clients */
     static const unsigned char seckeys[5][32] = {

@@ -232,7 +232,8 @@ int test_regtest_basic_dw(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[2];
     musig_keyagg_t keyagg;
@@ -304,7 +305,8 @@ int test_regtest_old_first_attack(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[2];
     musig_keyagg_t keyagg;
@@ -392,7 +394,8 @@ int test_regtest_musig_onchain(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[2];
     musig_keyagg_t keyagg;
@@ -520,7 +523,8 @@ int test_regtest_nsequence_edge(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     secp256k1_keypair kps[2];
     musig_keyagg_t keyagg;
@@ -600,7 +604,8 @@ int test_regtest_cpfp_penalty_bump(void) {
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
                 "get mining address");
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Test regtest_get_utxo_for_bump */
     char txid_out[65];
@@ -652,7 +657,8 @@ int test_regtest_breach_penalty_cpfp(void) {
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
                 "get mining address");
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* --- Set up a 2-of-2 MuSig funding UTXO --- */
     secp256k1_keypair kps[2];
@@ -870,7 +876,8 @@ int test_regtest_watchtower_late_detection(void) {
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
                 "get mining address");
-    regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
 
     /* Set up 2-of-2 MuSig funding UTXO */
     secp256k1_keypair kps[2];

@@ -44,6 +44,20 @@ int regtest_get_raw_tx(regtest_t *rt, const char *txid,
 /* Get wallet balance in BTC. Returns -1.0 on error. */
 double regtest_get_balance(regtest_t *rt);
 
+/* Shared faucet: call once before running regtest tests.
+   Mines 200 blocks into a "faucet" wallet while subsidy is high (~8,750 BTC).
+   Safe to call multiple times (no-op after first success). */
+int regtest_init_faucet(void);
+
+/* Fund a test wallet from the shared faucet.
+   Sends `amount` BTC to a new address in rt's wallet, confirms with 1 block.
+   Auto-mines if balance is low. Returns 1 on success, 0 if exhausted. */
+int regtest_fund_from_faucet(regtest_t *rt, double amount);
+
+/* Print faucet health: block height, balance, warning if degraded.
+   Call after regtest tests to catch exhaustion trends early. */
+void regtest_faucet_health_report(void);
+
 /* Poll for tx confirmation. Returns confirmations count, -1 on timeout. */
 int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
                                     int timeout_secs);

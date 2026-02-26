@@ -773,7 +773,8 @@ int test_regtest_channel_unilateral(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Create 5 keypairs, build factory */
     secp256k1_keypair kps[5];
@@ -1838,7 +1839,8 @@ int test_regtest_htlc_success(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
@@ -2057,7 +2059,8 @@ int test_regtest_htlc_timeout(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
@@ -2376,7 +2379,8 @@ int test_regtest_channel_coop_close(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Build factory tree on-chain (same pattern as test_regtest_channel_unilateral) */
     secp256k1_keypair kps[5];
@@ -2979,7 +2983,8 @@ int test_regtest_channel_penalty(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     /* Build factory tree on-chain */
     secp256k1_keypair kps[5];
@@ -3331,12 +3336,9 @@ int test_regtest_multi_htlc_unilateral(void) {
 
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    regtest_mine_for_balance(&rt, 0.002, mine_addr);
-    if (regtest_get_balance(&rt) < 0.002) {
-        printf("  SKIP: regtest subsidy exhausted\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.002, "factory setup for funding");
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
@@ -3613,13 +3615,9 @@ int test_regtest_penalty_with_htlcs(void) {
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
 
-    regtest_mine_for_balance(&rt, 0.002, mine_addr);
-    if (regtest_get_balance(&rt) < 0.002) {
-        printf("  SKIP: regtest subsidy exhausted — "
-               "run on a fresh chain or earlier in test order\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.002, "factory setup for funding");
 
     /* Build factory tree on-chain */
     secp256k1_keypair kps[5];
@@ -3953,17 +3951,9 @@ int test_regtest_htlc_timeout_race(void) {
     char mine_addr[128];
     regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
 
-    /* Mine 101 blocks for coinbase maturity. If the regtest chain has been
-       running a long time (>33 halvings = ~4950 blocks), the block subsidy
-       is <1 sat and we can't fund anything — skip gracefully. */
-    regtest_mine_blocks(&rt, 101, mine_addr);
-    double bal = regtest_get_balance(&rt);
-    if (bal < 0.0001) {
-        printf("  SKIP: regtest subsidy exhausted (balance %.8f BTC) — "
-               "run on a fresh chain or earlier in the test order\n", bal);
-        secp256k1_context_destroy(ctx);
-        return 1;  /* skip, not fail */
-    }
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.0001, "factory setup for funding");
 
     /* Create 2-of-2 MuSig funding */
     secp256k1_pubkey local_fund_pk, remote_fund_pk;

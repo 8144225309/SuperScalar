@@ -681,53 +681,12 @@ int test_regtest_wire_factory(void) {
     fund_addr[alen] = '\0';
     free(addr_result);
 
-    /* Mine initial blocks and fund.
-       On long-lived regtest chains (height > 150*64 = 9600), block subsidy
-       has halved to 0.  Fall back to an existing funded wallet. */
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
                 "get mine address");
-    regtest_mine_blocks(&rt, 101, mine_addr);
-
-    char *bal_s = regtest_exec(&rt, "getbalance", "");
-    double wallet_bal = bal_s ? atof(bal_s) : 0;
-    if (bal_s) free(bal_s);
-
-    if (wallet_bal < 0.01) {
-        /* Block subsidy exhausted — fund from an existing wallet */
-        static const char *faucet_wallets[] = {
-            "test_dw", "test_factory", "test_ladder_life", NULL
-        };
-        int funded = 0;
-        for (int w = 0; faucet_wallets[w] && !funded; w++) {
-            regtest_t faucet;
-            memcpy(&faucet, &rt, sizeof(faucet));
-            faucet.wallet[0] = '\0';
-            char wparams[128];
-            snprintf(wparams, sizeof(wparams), "\"%s\"", faucet_wallets[w]);
-            char *lr = regtest_exec(&faucet, "loadwallet", wparams);
-            if (lr) free(lr);
-            strncpy(faucet.wallet, faucet_wallets[w],
-                    sizeof(faucet.wallet) - 1);
-
-            /* Send 0.01 BTC to our wallet's address */
-            char sp[256];
-            snprintf(sp, sizeof(sp), "\"%s\" 0.01", mine_addr);
-            char *sr = regtest_exec(&faucet, "sendtoaddress", sp);
-            if (sr && !strstr(sr, "error")) {
-                free(sr);
-                regtest_mine_blocks(&rt, 1, mine_addr);
-                funded = 1;
-            } else {
-                if (sr) free(sr);
-            }
-        }
-        if (!funded) {
-            printf("  FAIL: no funded wallet available\n");
-            secp256k1_context_destroy(ctx);
-            return 0;
-        }
-    }
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "factory setup for funding");
 
     char funding_txid_hex[65];
     TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
@@ -934,44 +893,9 @@ int test_regtest_wire_factory_arity1(void) {
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
                 "get mine address");
-    regtest_mine_blocks(&rt, 101, mine_addr);
-
-    char *bal_s = regtest_exec(&rt, "getbalance", "");
-    double wallet_bal = bal_s ? atof(bal_s) : 0;
-    if (bal_s) free(bal_s);
-
-    if (wallet_bal < 0.01) {
-        static const char *faucet_wallets[] = {
-            "test_dw", "test_factory", "test_wire_factory", NULL
-        };
-        int funded = 0;
-        for (int w = 0; faucet_wallets[w] && !funded; w++) {
-            regtest_t faucet;
-            memcpy(&faucet, &rt, sizeof(faucet));
-            faucet.wallet[0] = '\0';
-            char wparams[128];
-            snprintf(wparams, sizeof(wparams), "\"%s\"", faucet_wallets[w]);
-            char *lr = regtest_exec(&faucet, "loadwallet", wparams);
-            if (lr) free(lr);
-            strncpy(faucet.wallet, faucet_wallets[w],
-                    sizeof(faucet.wallet) - 1);
-            char sp[256];
-            snprintf(sp, sizeof(sp), "\"%s\" 0.01", mine_addr);
-            char *sr = regtest_exec(&faucet, "sendtoaddress", sp);
-            if (sr && !strstr(sr, "error")) {
-                free(sr);
-                regtest_mine_blocks(&rt, 1, mine_addr);
-                funded = 1;
-            } else {
-                if (sr) free(sr);
-            }
-        }
-        if (!funded) {
-            printf("  FAIL: no funded wallet available\n");
-            secp256k1_context_destroy(ctx);
-            return 0;
-        }
-    }
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "factory setup for funding");
 
     char funding_txid_hex[65];
     TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
