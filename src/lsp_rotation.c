@@ -394,7 +394,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
-        memset(saved_seckey, 0, 32);
+        secure_zero(saved_seckey, 32);
         return 0;
     }
 
@@ -404,7 +404,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->persist = saved_persist;
     mgr->ladder = saved_ladder;
     memcpy(mgr->rot_lsp_seckey, saved_seckey, 32);
-    memset(saved_seckey, 0, 32);
+    secure_zero(saved_seckey, 32);
     mgr->rot_fee_est = saved_fee_est;
     memcpy(mgr->rot_fund_spk, saved_fund_spk, 34);
     mgr->rot_fund_spk_len = saved_fund_spk_len;

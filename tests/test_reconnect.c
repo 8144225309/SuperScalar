@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 extern void sha256_tagged(const char *, const unsigned char *, size_t,
@@ -150,6 +151,7 @@ int test_reconnect_pubkey_match(void) {
 
     /* Set up channel manager */
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &factory, lsp_sec, 4),
                 "lsp_channels_init failed");
 
@@ -513,6 +515,7 @@ int test_balance_reporting(void) {
     TEST_ASSERT(factory_build_tree(&factory), "factory_build_tree");
 
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &factory, lsp_sec, 4),
                 "lsp_channels_init");
 
@@ -2108,6 +2111,55 @@ int test_wire_plaintext_refused_after_handshake(void) {
 
     close(sv[0]);
     close(sv[1]);
+    return 1;
+}
+
+/* Test: send nonce not incremented on write failure */
+int test_nonce_stable_on_send_failure(void) {
+    /* Ignore SIGPIPE so write to closed socket returns EPIPE instead of killing us */
+    signal(SIGPIPE, SIG_IGN);
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+                "socketpair");
+
+    /* Set up encryption on the sender */
+    noise_state_t ns;
+    memset(&ns, 0, sizeof(ns));
+    memset(ns.send_key, 0xAA, 32);
+    memset(ns.recv_key, 0xBB, 32);
+    ns.send_nonce = 0;
+    ns.recv_nonce = 0;
+    TEST_ASSERT(wire_set_encryption(sv[0], &ns), "set encryption");
+
+    /* Send one message successfully */
+    cJSON *j1 = cJSON_CreateObject();
+    cJSON_AddStringToObject(j1, "test", "hello");
+    TEST_ASSERT(wire_send(sv[0], 0x42, j1), "first send should succeed");
+    cJSON_Delete(j1);
+
+    /* Verify nonce advanced to 1 */
+    noise_state_t *state = wire_get_encryption(sv[0]);
+    TEST_ASSERT(state != NULL, "should have encryption state");
+    TEST_ASSERT_EQ(state->send_nonce, 1, "nonce should be 1 after successful send");
+
+    /* Close the read end to force write failure */
+    close(sv[1]);
+
+    /* Try to send — should fail (broken pipe) */
+    cJSON *j2 = cJSON_CreateObject();
+    cJSON_AddStringToObject(j2, "test", "world");
+    int result = wire_send(sv[0], 0x43, j2);
+    cJSON_Delete(j2);
+    TEST_ASSERT(result == 0, "send should fail on closed pipe");
+
+    /* Verify nonce did NOT advance past 1 */
+    state = wire_get_encryption(sv[0]);
+    TEST_ASSERT(state != NULL, "should still have encryption state");
+    TEST_ASSERT_EQ(state->send_nonce, 1, "nonce should still be 1 after failed send");
+
+    wire_clear_encryption(sv[0]);
+    close(sv[0]);
     return 1;
 }
 

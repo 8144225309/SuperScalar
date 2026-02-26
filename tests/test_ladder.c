@@ -994,6 +994,7 @@ int test_rotation_context_save_restore(void) {
 
     /* Init mgr with rot fields set */
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "init mgr");
 
     /* Set rot fields */

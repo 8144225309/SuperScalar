@@ -447,7 +447,7 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
         if (!channel_get_received_revocation(ch, commitment_num, secret))
             return 0;
         int ok = secp256k1_ec_pubkey_create(ch->ctx, pcp_out, secret);
-        memset(secret, 0, 32);
+        secure_zero(secret, 32);
         return ok;
     }
     return 0;
@@ -475,7 +475,7 @@ int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_nu
     if (!channel_get_local_pcs(ch, commitment_num, secret))
         return 0;
     int ok = secp256k1_ec_pubkey_create(ch->ctx, point_out, secret);
-    memset(secret, 0, 32);
+    secure_zero(secret, 32);
     return ok;
 }
 
@@ -903,8 +903,8 @@ int channel_build_penalty_tx(const channel_t *ch,
     }
 
     tx_buf_free(&unsigned_tx);
-    memset(revocation_privkey, 0, 32);
-    memset(pcp_secret, 0, 32);
+    secure_zero(revocation_privkey, 32);
+    secure_zero(pcp_secret, 32);
     return 1;
 }
 
@@ -915,13 +915,13 @@ int channel_init_nonce_pool(channel_t *ch, size_t count) {
     memcpy(seckey, ch->local_funding_secret, 32);
     secp256k1_pubkey pk;
     if (!secp256k1_ec_pubkey_create(ch->ctx, &pk, seckey)) {
-        memset(seckey, 0, 32);
+        secure_zero(seckey, 32);
         return 0;
     }
     int ok = musig_nonce_pool_generate(ch->ctx, &ch->local_nonce_pool,
                                          count, seckey, &pk,
                                          &ch->funding_keyagg.cache);
-    memset(seckey, 0, 32);
+    secure_zero(seckey, 32);
     ch->remote_nonce_count = 0;
     ch->remote_nonce_next = 0;
     return ok;
@@ -1517,14 +1517,14 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     secp256k1_keypair kp;
     if (!secp256k1_keypair_create(ch->ctx, &kp, signing_key)) {
-        memset(signing_key, 0, 32);
+        secure_zero(signing_key, 32);
         tx_buf_free(&unsigned_tx);
         return 0;
     }
 
     unsigned char sig64[64];
     if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &kp, NULL)) {
-        memset(signing_key, 0, 32);
+        secure_zero(signing_key, 32);
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1552,7 +1552,7 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
         success_leaf.script, success_leaf.script_len,
         control_block, cb_len);
 
-    memset(signing_key, 0, 32);
+    secure_zero(signing_key, 32);
     tx_buf_free(&unsigned_tx);
     return 1;
 }
@@ -1648,14 +1648,14 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     secp256k1_keypair kp;
     if (!secp256k1_keypair_create(ch->ctx, &kp, signing_key)) {
-        memset(signing_key, 0, 32);
+        secure_zero(signing_key, 32);
         tx_buf_free(&unsigned_tx);
         return 0;
     }
 
     unsigned char sig64[64];
     if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &kp, NULL)) {
-        memset(signing_key, 0, 32);
+        secure_zero(signing_key, 32);
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1682,7 +1682,7 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
         sig64, timeout_leaf.script, timeout_leaf.script_len,
         control_block, cb_len);
 
-    memset(signing_key, 0, 32);
+    secure_zero(signing_key, 32);
     tx_buf_free(&unsigned_tx);
     return 1;
 }
@@ -1869,7 +1869,7 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     }
 
     tx_buf_free(&unsigned_tx);
-    memset(revocation_privkey, 0, 32);
-    memset(pcp_secret, 0, 32);
+    secure_zero(revocation_privkey, 32);
+    secure_zero(pcp_secret, 32);
     return 1;
 }

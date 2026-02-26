@@ -246,7 +246,6 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
             return 0;
         }
         free(plaintext);
-        ns->send_nonce++;
 
         /* Write: [4-byte len = pt_len + 16][ciphertext][tag] */
         uint32_t frame_len = pt_len + 16;
@@ -260,9 +259,13 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
                  write_all(fd, ciphertext, pt_len) &&
                  write_all(fd, tag, 16);
         free(ciphertext);
-        if (ok && g_wire_log_cb)
+        if (!ok) return 0;
+
+        /* Increment nonce only after successful transmission */
+        ns->send_nonce++;
+        if (g_wire_log_cb)
             g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
-        return ok;
+        return 1;
     }
 
     /* Refuse plaintext if encryption was established on this fd */

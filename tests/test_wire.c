@@ -571,6 +571,7 @@ int test_basepoint_independence(void) {
 
     /* Init LSP channel manager */
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4),
                 "lsp_channels_init");
 

@@ -212,6 +212,7 @@ int test_lsp_channel_init(void) {
 
     /* Initialize channel manager */
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4),
                 "lsp_channels_init");
     TEST_ASSERT_EQ(mgr.n_channels, 4, "n_channels");
@@ -793,6 +794,7 @@ int test_regtest_intra_factory_payment(void) {
 
     /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
     lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
         if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
@@ -1209,6 +1211,7 @@ int test_regtest_multi_payment(void) {
 
     /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
     lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
         if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
@@ -1382,5 +1385,115 @@ int test_regtest_multi_payment(void) {
 
     TEST_ASSERT(lsp_ok, "LSP multi-payment operations");
     TEST_ASSERT(all_children_ok, "all clients completed");
+    return 1;
+}
+
+/* ---- Test: Fee policy balance split ---- */
+
+int test_fee_policy_balance_split(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Build factory */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    factory_t f;
+    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xDD;
+    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    fee_estimator_t fe;
+    fee_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+
+    /* Test 1: Default 50-50 split (pct=0 means default 50) */
+    {
+        lsp_channel_mgr_t mgr;
+        memset(&mgr, 0, sizeof(mgr));
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init default");
+        for (size_t c = 0; c < 4; c++) {
+            channel_t *ch = &mgr.entries[c].channel;
+            uint64_t usable = ch->funding_amount - commit_fee;
+            TEST_ASSERT_EQ(ch->local_amount, usable / 2, "default 50% local");
+            TEST_ASSERT_EQ(ch->remote_amount, usable - usable / 2, "default 50% remote");
+        }
+    }
+
+    /* Test 2: Greedy LSP with 70% share */
+    {
+        lsp_channel_mgr_t mgr;
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.lsp_balance_pct = 70;
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 70%");
+        for (size_t c = 0; c < 4; c++) {
+            channel_t *ch = &mgr.entries[c].channel;
+            uint64_t usable = ch->funding_amount - commit_fee;
+            uint64_t expected_local = (usable * 70) / 100;
+            TEST_ASSERT_EQ(ch->local_amount, expected_local, "70% local");
+            TEST_ASSERT_EQ(ch->remote_amount, usable - expected_local, "30% remote");
+        }
+    }
+
+    /* Test 3: Generous LSP with 20% share */
+    {
+        lsp_channel_mgr_t mgr;
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.lsp_balance_pct = 20;
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 20%");
+        for (size_t c = 0; c < 4; c++) {
+            channel_t *ch = &mgr.entries[c].channel;
+            uint64_t usable = ch->funding_amount - commit_fee;
+            uint64_t expected_local = (usable * 20) / 100;
+            TEST_ASSERT_EQ(ch->local_amount, expected_local, "20% local");
+            TEST_ASSERT_EQ(ch->remote_amount, usable - expected_local, "80% remote");
+        }
+    }
+
+    /* Test 4: pct > 100 clamped to 100 */
+    {
+        lsp_channel_mgr_t mgr;
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.lsp_balance_pct = 150;
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 150%");
+        for (size_t c = 0; c < 4; c++) {
+            channel_t *ch = &mgr.entries[c].channel;
+            uint64_t usable = ch->funding_amount - commit_fee;
+            TEST_ASSERT_EQ(ch->local_amount, usable, "clamped 100% local");
+            TEST_ASSERT_EQ(ch->remote_amount, (uint64_t)0, "clamped 0% remote");
+        }
+    }
+
+    /* Test 5: Fee policy fields survive init */
+    {
+        lsp_channel_mgr_t mgr;
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.routing_fee_ppm = 1000;
+        mgr.lsp_balance_pct = 60;
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init fee");
+        TEST_ASSERT_EQ(mgr.routing_fee_ppm, 1000, "fee_ppm preserved");
+        TEST_ASSERT_EQ(mgr.lsp_balance_pct, 60, "balance_pct preserved");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

@@ -76,6 +76,8 @@ static void usage(const char *prog) {
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
+        "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
+        "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -450,6 +452,8 @@ int main(int argc, char *argv[]) {
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
+    uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
+    uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -524,6 +528,15 @@ int main(int argc, char *argv[]) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
                 fprintf(stderr, "Error: --confirm-timeout must be positive\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--routing-fee-ppm") == 0 && i + 1 < argc)
+            routing_fee_ppm = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--lsp-balance-pct") == 0 && i + 1 < argc) {
+            lsp_balance_pct = (uint16_t)atoi(argv[++i]);
+            if (lsp_balance_pct > 100) {
+                fprintf(stderr, "Error: --lsp-balance-pct must be 0-100\n");
                 return 1;
             }
         }
@@ -1343,6 +1356,10 @@ int main(int argc, char *argv[]) {
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close) {
+        /* Set fee policy before init (init preserves these across memset) */
+        memset(&mgr, 0, sizeof(mgr));
+        mgr.routing_fee_ppm = routing_fee_ppm;
+        mgr.lsp_balance_pct = lsp_balance_pct;
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -2607,6 +2624,9 @@ int main(int argc, char *argv[]) {
 
         /* Initialize new channel manager + send CHANNEL_READY */
         lsp_channel_mgr_t mgr2;
+        memset(&mgr2, 0, sizeof(mgr2));
+        mgr2.routing_fee_ppm = routing_fee_ppm;
+        mgr2.lsp_balance_pct = lsp_balance_pct;
         if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);

@@ -162,6 +162,7 @@ extern int test_regtest_wire_factory_arity1(void);
 /* Phase 10: Channel operations over wire */
 extern int test_channel_msg_round_trip(void);
 extern int test_lsp_channel_init(void);
+extern int test_fee_policy_balance_split(void);
 extern int test_channel_wire_framing(void);
 extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
@@ -201,6 +202,7 @@ extern int test_client_persist_reload(void);
 /* Security hardening */
 extern int test_secure_zero_basic(void);
 extern int test_wire_plaintext_refused_after_handshake(void);
+extern int test_nonce_stable_on_send_failure(void);
 extern int test_fd_table_grows_beyond_16(void);
 
 /* Phase 17: Demo polish */
@@ -511,6 +513,7 @@ static void run_unit_tests(void) {
     printf("\n=== Channel Operations (Phase 10) ===\n");
     RUN_TEST(test_channel_msg_round_trip);
     RUN_TEST(test_lsp_channel_init);
+    RUN_TEST(test_fee_policy_balance_split);
     RUN_TEST(test_channel_wire_framing);
 
     printf("\n=== Persistence (Phase 13) ===\n");
@@ -548,6 +551,7 @@ static void run_unit_tests(void) {
     printf("\n=== Security Hardening ===\n");
     RUN_TEST(test_secure_zero_basic);
     RUN_TEST(test_wire_plaintext_refused_after_handshake);
+    RUN_TEST(test_nonce_stable_on_send_failure);
     RUN_TEST(test_fd_table_grows_beyond_16);
     RUN_TEST(test_channel_near_exhaustion);
 

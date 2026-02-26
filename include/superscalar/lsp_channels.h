@@ -88,6 +88,12 @@ typedef struct {
 
     /* Configurable confirmation timeout */
     int confirm_timeout_secs;      /* 0 = use default (3600 regtest, 7200 non-regtest) */
+
+    /* Fee policy: configurable per-LSP operator strategy.
+       Altruistic (default): routing_fee_ppm=0, lsp_balance_pct=50
+       Greedy (profitable):  routing_fee_ppm=1000, lsp_balance_pct=60 (example) */
+    uint64_t routing_fee_ppm;      /* routing fee in parts-per-million (0 = free) */
+    uint16_t lsp_balance_pct;      /* LSP's share of channel capacity (0-100, default 50) */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

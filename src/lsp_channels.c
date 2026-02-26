@@ -37,7 +37,7 @@ void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Get LSP's next per-commitment point */
     secp256k1_pubkey next_pcp;
     if (!channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp)) {
-        memset(lsp_rev_secret, 0, 32);
+        secure_zero(lsp_rev_secret, 32);
         return;
     }
 
@@ -48,7 +48,7 @@ void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     wire_send(lsp->client_fds[client_idx], MSG_LSP_REVOKE_AND_ACK, j);
     cJSON_Delete(j);
 
-    memset(lsp_rev_secret, 0, 32);
+    secure_zero(lsp_rev_secret, 32);
 }
 
 /*
@@ -96,7 +96,12 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32) return 0;
     if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
 
+    /* Preserve fee policy set before init (caller may configure these) */
+    uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
+    uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     memset(mgr, 0, sizeof(*mgr));
+    mgr->routing_fee_ppm = saved_fee_ppm;
+    mgr->lsp_balance_pct = saved_bal_pct;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -139,7 +144,11 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         fee_init(&_fe, 1000);
         uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
-        uint64_t local_amount = usable / 2;
+        /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
+        uint16_t pct = mgr->lsp_balance_pct;
+        if (pct == 0) pct = 50;  /* 0 means "use default" */
+        if (pct > 100) pct = 100;
+        uint64_t local_amount = (usable * pct) / 100;
         uint64_t remote_amount = usable - local_amount;
 
         /* Initialize channel: LSP = local, client = remote */
@@ -183,7 +192,12 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
     if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
 
+    /* Preserve fee policy set before init (caller may configure these) */
+    uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
+    uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     memset(mgr, 0, sizeof(*mgr));
+    mgr->routing_fee_ppm = saved_fee_ppm;
+    mgr->lsp_balance_pct = saved_bal_pct;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -226,7 +240,10 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         fee_init(&_fe, 1000);
         uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
-        uint64_t local_amount = usable / 2;
+        uint16_t pct2 = mgr->lsp_balance_pct;
+        if (pct2 == 0) pct2 = 50;
+        if (pct2 > 100) pct2 = 100;
+        uint64_t local_amount = (usable * pct2) / 100;
         uint64_t remote_amount = usable - local_amount;
 
         /* Initialize channel: LSP = local, client = remote */
@@ -605,9 +622,23 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (old_dest_n_htlcs > 0)
         memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
+    /* Apply routing fee (LSP retains the difference in its channel balance) */
+    uint64_t fwd_amount_sats = amount_sats;
+    uint64_t fwd_amount_msat = amount_msat;
+    if (mgr->routing_fee_ppm > 0) {
+        uint64_t fee_msat = (amount_msat * mgr->routing_fee_ppm + 999999) / 1000000;
+        if (fee_msat >= amount_msat) {
+            fprintf(stderr, "LSP: routing fee exceeds payment amount\n");
+            return 0;
+        }
+        fwd_amount_msat = amount_msat - fee_msat;
+        fwd_amount_sats = fwd_amount_msat / 1000;
+        if (fwd_amount_sats == 0) return 0;
+    }
+
     /* Add HTLC to destination's channel (offered from LSP) */
     uint64_t dest_htlc_id;
-    if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
+    if (!channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
                            payment_hash, cltv_expiry, &dest_htlc_id)) {
         fprintf(stderr, "LSP: forward add_htlc failed to client %zu\n", dest_idx);
         return 0;
@@ -622,7 +653,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         persist_htlc.id = dest_htlc_id;
         persist_htlc.direction = HTLC_OFFERED;
         persist_htlc.state = HTLC_STATE_ACTIVE;
-        persist_htlc.amount_sats = amount_sats;
+        persist_htlc.amount_sats = fwd_amount_sats;
         memcpy(persist_htlc.payment_hash, payment_hash, 32);
         persist_htlc.cltv_expiry = cltv_expiry;
         persist_save_htlc((persist_t *)mgr->persist,
@@ -631,7 +662,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Forward ADD_HTLC to destination */
     {
-        cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
+        cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, fwd_amount_msat,
                                                    payment_hash, cltv_expiry);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);

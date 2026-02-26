@@ -50,6 +50,10 @@ void hmac_sha256(unsigned char out[32], const unsigned char *key, size_t key_len
     memcpy(outer_buf, o_pad, 64);
     memcpy(outer_buf + 64, inner_hash, 32);
     sha256(outer_buf, 96, out);
+
+    secure_zero(k_pad, 64);
+    secure_zero(i_pad, 64);
+    secure_zero(o_pad, 64);
 }
 
 /* --- HKDF (RFC 5869) --- */

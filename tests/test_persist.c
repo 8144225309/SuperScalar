@@ -769,6 +769,7 @@ int test_lsp_recovery_round_trip(void) {
 
     /* Initialize channels the normal way */
     lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init channels");
 
     /* Simulate basepoint exchange: set remote basepoints */
@@ -846,6 +847,7 @@ int test_lsp_recovery_round_trip(void) {
     TEST_ASSERT_EQ(rec_f.n_participants, 5, "n_participants");
 
     lsp_channel_mgr_t rec_mgr;
+    memset(&rec_mgr, 0, sizeof(rec_mgr));
     TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
                                             seckeys[0], 4, &db),
                 "init from db");
