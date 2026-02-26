@@ -471,6 +471,16 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return 1;
 }
 
+/* --- CLTV validation --- */
+
+int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out) {
+    if (cltv_expiry <= FACTORY_CLTV_DELTA)
+        return 0;
+    if (fwd_cltv_out)
+        *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA;
+    return 1;
+}
+
 /* --- HTLC handling --- */
 
 /* Handle ADD_HTLC from a client: add to sender's channel, forward to recipient. */
@@ -644,15 +654,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (fwd_amount_sats == 0) return 0;
     }
 
-    /* CLTV delta enforcement: subtract safety margin for factory close.
-       Reject if incoming cltv_expiry is too low to leave room for the delta. */
-    uint32_t fwd_cltv_expiry = cltv_expiry;
-    if (fwd_cltv_expiry <= FACTORY_CLTV_DELTA) {
+    /* CLTV delta enforcement: subtract safety margin for factory close. */
+    uint32_t fwd_cltv_expiry;
+    if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry)) {
         fprintf(stderr, "LSP: cltv_expiry %u too low (need > %d)\n",
                 cltv_expiry, FACTORY_CLTV_DELTA);
         return 0;
     }
-    fwd_cltv_expiry -= FACTORY_CLTV_DELTA;
 
     /* Add HTLC to destination's channel (offered from LSP) */
     uint64_t dest_htlc_id;

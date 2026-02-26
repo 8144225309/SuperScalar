@@ -13,6 +13,11 @@
    close before the upstream HTLC expires. 40 blocks ~ 6.7 hours. */
 #define FACTORY_CLTV_DELTA 40
 
+/* Validate and adjust cltv_expiry for HTLC forwarding through a factory channel.
+   Returns 1 if cltv_expiry has enough room for the delta, 0 if too low.
+   On success, *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA. */
+int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out);
+
 /* Per-client channel entry managed by the LSP */
 typedef struct {
     channel_t channel;          /* Poon-Dryja channel (LSP=local, client=remote) */

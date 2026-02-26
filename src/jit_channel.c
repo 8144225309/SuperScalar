@@ -531,6 +531,7 @@ int jit_channels_check_funding(void *mgr_ptr) {
         if (jits[i].state != JIT_STATE_FUNDING) continue;
         if (jits[i].funding_txid_hex[0] == '\0') continue;
 
+        /* cppcheck-suppress nullPointerRedundantCheck ; mgr->watchtower checked at line 525 */
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
         if (conf >= 1) {

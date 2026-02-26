@@ -23,8 +23,9 @@ static char *run_command(const char *cmd) {
         len += n;
         if (len >= cap - 1) {
             cap *= 2;
-            buf = (char *)realloc(buf, cap);
-            if (!buf) { pclose(fp); return NULL; }
+            char *tmp = (char *)realloc(buf, cap);
+            if (!tmp) { free(buf); pclose(fp); return NULL; }
+            buf = tmp;
         }
     }
     buf[len] = '\0';

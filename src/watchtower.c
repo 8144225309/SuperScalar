@@ -424,7 +424,7 @@ int watchtower_check(watchtower_t *wt) {
         for (size_t h = 0; h < e->n_htlc_outputs; h++) {
             /* Temporarily set ch->htlcs[0] to stored HTLC metadata */
             size_t saved_n = ch->n_htlcs;
-            htlc_t saved_h0;
+            htlc_t saved_h0 = {0};
             if (saved_n > 0)
                 saved_h0 = ch->htlcs[0];
             ch->n_htlcs = 1;

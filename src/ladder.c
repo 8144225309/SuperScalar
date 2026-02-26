@@ -196,6 +196,7 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
     secp256k1_keypair saved_keypairs[FACTORY_MAX_SIGNERS];
     memcpy(saved_keypairs, f->keypairs,
            f->n_participants * sizeof(secp256k1_keypair));
+    /* cppcheck-suppress uninitvar ; loop above initializes all [0..n_participants) elements */
     memcpy(f->keypairs, close_keypairs,
            f->n_participants * sizeof(secp256k1_keypair));
 

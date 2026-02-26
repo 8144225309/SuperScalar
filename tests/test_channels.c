@@ -1431,40 +1431,35 @@ int test_fee_policy_balance_split(void) {
 /* --- CLTV Delta Enforcement (Phase 2: item 2.3) --- */
 
 int test_cltv_delta_enforcement(void) {
-    /* FACTORY_CLTV_DELTA = 40.
-       Verify that:
-       1. An HTLC with cltv_expiry <= 40 is rejected
-       2. An HTLC with cltv_expiry = 500 is forwarded with cltv_expiry = 460 */
+    /* Test lsp_validate_cltv_for_forward — the production function used by
+       handle_add_htlc to enforce the CLTV safety margin. */
+    uint32_t fwd;
 
-    /* Just test the compile-time constant is correct and validate the logic
-       that would be exercised through the forwarding code. */
-    TEST_ASSERT_EQ(FACTORY_CLTV_DELTA, 40, "CLTV delta is 40");
+    /* cltv_expiry below delta: rejected */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd) == 0,
+                "cltv 30 should be rejected");
 
-    /* Test rejection: cltv_expiry too low */
-    {
-        uint32_t cltv_expiry = 30;  /* below FACTORY_CLTV_DELTA */
-        TEST_ASSERT(cltv_expiry <= FACTORY_CLTV_DELTA, "low cltv rejected");
-    }
+    /* cltv_expiry == delta: rejected (need strictly >) */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA, &fwd) == 0,
+                "cltv == delta should be rejected");
 
-    /* Test subtraction: cltv_expiry = 500 */
-    {
-        uint32_t cltv_expiry = 500;
-        uint32_t fwd_cltv = cltv_expiry - FACTORY_CLTV_DELTA;
-        TEST_ASSERT_EQ(fwd_cltv, 460, "fwd cltv subtracted");
-    }
+    /* cltv_expiry == 0: rejected */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd) == 0,
+                "cltv 0 should be rejected");
 
-    /* Test edge case: cltv_expiry = FACTORY_CLTV_DELTA is rejected (need strictly >) */
-    {
-        uint32_t cltv_expiry = FACTORY_CLTV_DELTA;
-        TEST_ASSERT(cltv_expiry <= FACTORY_CLTV_DELTA, "exact delta rejected");
-    }
+    /* cltv_expiry = delta + 1: passes, fwd = 1 */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA + 1, &fwd) == 1,
+                "cltv delta+1 should pass");
+    TEST_ASSERT_EQ(fwd, (uint32_t)1, "fwd should be 1");
 
-    /* Test edge case: cltv_expiry = FACTORY_CLTV_DELTA + 1 passes */
-    {
-        uint32_t cltv_expiry = FACTORY_CLTV_DELTA + 1;
-        uint32_t fwd_cltv = cltv_expiry - FACTORY_CLTV_DELTA;
-        TEST_ASSERT_EQ(fwd_cltv, (uint32_t)1, "delta+1 passes with fwd=1");
-    }
+    /* cltv_expiry = 500: passes, fwd = 460 */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd) == 1,
+                "cltv 500 should pass");
+    TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
+
+    /* NULL fwd_cltv_out: just validates without writing */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL) == 1,
+                "NULL out should still return 1");
 
     return 1;
 }
@@ -1568,22 +1563,23 @@ int test_fee_estimator_null_fallback(void) {
 }
 
 int test_accept_timeout(void) {
-    /* LSP with 1s timeout, no client connects, verify clean timeout return */
+    /* Test that lsp_accept_clients returns 0 when no client connects
+       within the timeout period. Uses a real listen socket on a high port. */
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-
     unsigned char sec[32];
     memset(sec, 0x77, 32);
     secp256k1_keypair kp;
-    if (!secp256k1_keypair_create(ctx, &kp, sec)) return 0;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &kp, sec), "keypair create");
 
     lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
     TEST_ASSERT(lsp_init(&lsp, ctx, &kp, 19876, 1), "lsp_init");
-    lsp.accept_timeout_sec = 1;  /* 1 second timeout */
+    lsp.accept_timeout_sec = 1;
 
-    /* lsp_accept_clients should fail (timeout, no client) */
-    int ret = lsp_accept_clients(&lsp);
-    TEST_ASSERT(!ret, "accept times out with no client");
+    /* No client connects — should timeout and return 0 */
+    int ok = lsp_accept_clients(&lsp);
+    TEST_ASSERT(ok == 0, "accept should timeout with no client");
 
     lsp_cleanup(&lsp);
     secp256k1_context_destroy(ctx);
@@ -1591,7 +1587,8 @@ int test_accept_timeout(void) {
 }
 
 int test_noise_nk_handshake(void) {
-    /* NK handshake over socketpair: verify encrypted round-trip */
+    /* End-to-end NK handshake over socketpair using fork.
+       Same pattern as test_noise_handshake (NN) in test_reconnect.c. */
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -1599,7 +1596,8 @@ int test_noise_nk_handshake(void) {
     unsigned char server_sec[32];
     memset(server_sec, 0xAA, 32);
     secp256k1_pubkey server_pub;
-    if (!secp256k1_ec_pubkey_create(ctx, &server_pub, server_sec)) return 0;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &server_pub, server_sec),
+                "server pubkey create");
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
@@ -1632,14 +1630,13 @@ int test_noise_nk_handshake(void) {
 
     /* Read responder's keys */
     unsigned char resp_send[32], resp_recv[32];
-    ssize_t r1 = read(sv[0], resp_send, 32);
-    ssize_t r2 = read(sv[0], resp_recv, 32);
-    (void)r1; (void)r2;
+    read(sv[0], resp_send, 32);
+    read(sv[0], resp_recv, 32);
 
-    /* Initiator's send_key should == Responder's recv_key */
+    /* Initiator's send_key == Responder's recv_key */
     TEST_ASSERT(memcmp(init_ns.send_key, resp_recv, 32) == 0,
                 "NK: initiator.send != responder.recv");
-    /* Initiator's recv_key should == Responder's send_key */
+    /* Initiator's recv_key == Responder's send_key */
     TEST_ASSERT(memcmp(init_ns.recv_key, resp_send, 32) == 0,
                 "NK: initiator.recv != responder.send");
 
@@ -1654,8 +1651,9 @@ int test_noise_nk_handshake(void) {
 }
 
 int test_noise_nk_wrong_pubkey(void) {
-    /* NK handshake with wrong pinned server pubkey should produce
-       mismatched keys (MITM detection) */
+    /* NK handshake where client pins the wrong server pubkey.
+       The handshake completes but derived keys mismatch — MITM detected.
+       Uses fork+socketpair like test_noise_nk_handshake. */
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -1663,11 +1661,12 @@ int test_noise_nk_wrong_pubkey(void) {
     unsigned char server_sec[32];
     memset(server_sec, 0xBB, 32);
 
-    /* Wrong key that client pins */
+    /* Wrong key that client will pin */
     unsigned char wrong_sec[32];
     memset(wrong_sec, 0xCC, 32);
     secp256k1_pubkey wrong_pub;
-    if (!secp256k1_ec_pubkey_create(ctx, &wrong_pub, wrong_sec)) return 0;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &wrong_pub, wrong_sec),
+                "wrong pubkey create");
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
@@ -1696,22 +1695,22 @@ int test_noise_nk_wrong_pubkey(void) {
     close(sv[1]);
     noise_state_t init_ns;
     int ok = noise_handshake_nk_initiator(&init_ns, sv[0], ctx, &wrong_pub);
-    TEST_ASSERT(ok, "NK handshake should complete (key mismatch detected by data)");
+    TEST_ASSERT(ok, "NK initiator handshake should succeed (key mismatch detected later)");
 
     /* Read responder's keys */
     unsigned char resp_send[32], resp_recv[32];
-    ssize_t r1 = read(sv[0], resp_send, 32);
-    ssize_t r2 = read(sv[0], resp_recv, 32);
-    (void)r1; (void)r2;
+    read(sv[0], resp_send, 32);
+    read(sv[0], resp_recv, 32);
 
-    /* Keys should NOT match — wrong es DH produces different key material */
-    int send_match = (memcmp(init_ns.send_key, resp_recv, 32) == 0);
-    int recv_match = (memcmp(init_ns.recv_key, resp_send, 32) == 0);
-    TEST_ASSERT(!send_match || !recv_match,
+    /* Keys must NOT match — wrong pinned key means es DH diverges */
+    TEST_ASSERT(memcmp(init_ns.send_key, resp_recv, 32) != 0,
                 "NK keys should mismatch with wrong server pubkey");
 
     int status;
     waitpid(pid, &status, 0);
+    /* Responder succeeds — it doesn't know the client pinned wrong key */
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "NK responder child failed");
 
     close(sv[0]);
     secp256k1_context_destroy(ctx);

@@ -1034,35 +1034,30 @@ int test_regtest_wire_factory_arity1(void) {
 /* --- Wire frame size limit (Phase 2: item 2.5) --- */
 
 int test_wire_oversized_frame_rejected(void) {
-    /* WIRE_MAX_FRAME_SIZE is 64KB.  Build a JSON payload that exceeds it. */
+    /* WIRE_MAX_FRAME_SIZE is 64KB.  Forge a 4-byte length header claiming a
+       payload larger than the limit, then verify wire_recv rejects it.
+       (Avoids writing 65KB+ through a socketpair — macOS buffers are ~8KB.) */
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
 
-    /* Build a JSON object with a huge string value (> 65536 bytes total frame) */
-    cJSON *big = cJSON_CreateObject();
-    size_t pad_len = WIRE_MAX_FRAME_SIZE + 100;
-    char *pad = (char *)malloc(pad_len + 1);
-    TEST_ASSERT(pad != NULL, "alloc pad");
-    memset(pad, 'A', pad_len);
-    pad[pad_len] = '\0';
-    cJSON_AddStringToObject(big, "data", pad);
-    free(pad);
+    /* Write a 4-byte big-endian length = WIRE_MAX_FRAME_SIZE + 100 */
+    uint32_t fake_len = WIRE_MAX_FRAME_SIZE + 100;
+    unsigned char hdr[4];
+    hdr[0] = (unsigned char)(fake_len >> 24);
+    hdr[1] = (unsigned char)(fake_len >> 16);
+    hdr[2] = (unsigned char)(fake_len >> 8);
+    hdr[3] = (unsigned char)(fake_len);
+    ssize_t w = write(sv[0], hdr, 4);
+    (void)w;
+    close(sv[0]);
 
-    /* wire_send should succeed (it writes regardless of receiver) */
-    int sent = wire_send(sv[0], MSG_HELLO, big);
-    cJSON_Delete(big);
-    /* Close writer to signal EOF */
-    wire_close(sv[0]);
-
-    /* wire_recv should reject because total frame exceeds WIRE_MAX_FRAME_SIZE */
+    /* wire_recv reads 4-byte header, sees length > WIRE_MAX_FRAME_SIZE, returns 0 */
     wire_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     int got = wire_recv(sv[1], &msg);
     if (msg.json) cJSON_Delete(msg.json);
-    wire_close(sv[1]);
+    close(sv[1]);
 
-    /* Either the send failed (because the JSON is too large to serialize into
-       a frame that fits in the 4-byte length), or the recv rejects it. */
-    TEST_ASSERT(sent == 0 || got == 0, "oversized frame rejected");
+    TEST_ASSERT(got == 0, "oversized frame rejected by wire_recv");
     return 1;
 }
