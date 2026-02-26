@@ -612,3 +612,56 @@ int test_musig_split_round_5of5(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Gap 4: Nonce pool edge cases — zero count and over-max clamping */
+int test_musig_nonce_pool_edge_cases(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, test_seckey1)) return 0;
+    secp256k1_pubkey pk;
+    if (!secp256k1_keypair_pub(ctx, &pk, &kp)) return 0;
+
+    /* Case 1: Generate pool with count=0 — succeeds but immediately empty */
+    musig_nonce_pool_t pool0;
+    TEST_ASSERT(musig_nonce_pool_generate(ctx, &pool0, 0, test_seckey1,
+                                           &pk, NULL),
+                "generate with count=0 succeeds");
+    TEST_ASSERT(musig_nonce_pool_remaining(&pool0) == 0,
+                "zero-count pool has 0 remaining");
+
+    secp256k1_musig_secnonce *sec;
+    secp256k1_musig_pubnonce pub;
+    TEST_ASSERT(!musig_nonce_pool_next(&pool0, &sec, &pub),
+                "next on zero-count pool returns 0");
+
+    /* Case 2: Over-max clamping — request MUSIG_NONCE_POOL_MAX + 1 */
+    musig_nonce_pool_t pool_over;
+    TEST_ASSERT(musig_nonce_pool_generate(ctx, &pool_over, MUSIG_NONCE_POOL_MAX + 1,
+                                           test_seckey1, &pk, NULL),
+                "over-max generate succeeds");
+    TEST_ASSERT(musig_nonce_pool_remaining(&pool_over) == MUSIG_NONCE_POOL_MAX,
+                "clamped to MUSIG_NONCE_POOL_MAX");
+
+    /* Case 3: Exactly at max — should work */
+    musig_nonce_pool_t pool_max;
+    TEST_ASSERT(musig_nonce_pool_generate(ctx, &pool_max, MUSIG_NONCE_POOL_MAX,
+                                           test_seckey1, &pk, NULL),
+                "max count generate succeeds");
+    TEST_ASSERT(musig_nonce_pool_remaining(&pool_max) == MUSIG_NONCE_POOL_MAX,
+                "max count pool full");
+
+    /* Draw all nonces to exhaustion */
+    for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+        TEST_ASSERT(musig_nonce_pool_next(&pool_max, &sec, &pub),
+                    "draw from max pool");
+    }
+    TEST_ASSERT(musig_nonce_pool_remaining(&pool_max) == 0,
+                "max pool exhausted");
+    TEST_ASSERT(!musig_nonce_pool_next(&pool_max, &sec, &pub),
+                "max pool returns 0 after exhaustion");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

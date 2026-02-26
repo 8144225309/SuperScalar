@@ -1061,3 +1061,69 @@ int test_wire_oversized_frame_rejected(void) {
     TEST_ASSERT(got == 0, "oversized frame rejected by wire_recv");
     return 1;
 }
+
+/* Gap 5: Wire frame truncation — partial header, truncated body, zero-length frame.
+   Proves: wire_recv handles connection failures cleanly without leaking or crashing. */
+
+int test_wire_recv_truncated_header(void) {
+    /* Write only 2 of 4 header bytes, then close the writer */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    unsigned char partial_hdr[2] = { 0x00, 0x0A };
+    ssize_t w = write(sv[0], partial_hdr, 2);
+    (void)w;
+    close(sv[0]);
+
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    int got = wire_recv(sv[1], &msg);
+    if (msg.json) cJSON_Delete(msg.json);
+    close(sv[1]);
+
+    TEST_ASSERT(got == 0, "truncated header (2/4 bytes) returns 0");
+    return 1;
+}
+
+int test_wire_recv_truncated_body(void) {
+    /* Write a valid 4-byte header claiming 10 bytes, then only 3 body bytes */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    unsigned char hdr[4] = { 0x00, 0x00, 0x00, 0x0A };  /* frame_len = 10 */
+    unsigned char partial_body[3] = { 0x01, '{', '}' };
+    ssize_t w = write(sv[0], hdr, 4);
+    (void)w;
+    w = write(sv[0], partial_body, 3);
+    (void)w;
+    close(sv[0]);  /* body cut short: 3 of 10 */
+
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    int got = wire_recv(sv[1], &msg);
+    if (msg.json) cJSON_Delete(msg.json);
+    close(sv[1]);
+
+    TEST_ASSERT(got == 0, "truncated body (3/10 bytes) returns 0");
+    return 1;
+}
+
+int test_wire_recv_zero_length_frame(void) {
+    /* frame_len = 0: caught by the < 1 guard in wire_recv */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    unsigned char hdr[4] = { 0x00, 0x00, 0x00, 0x00 };
+    ssize_t w = write(sv[0], hdr, 4);
+    (void)w;
+    close(sv[0]);
+
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    int got = wire_recv(sv[1], &msg);
+    if (msg.json) cJSON_Delete(msg.json);
+    close(sv[1]);
+
+    TEST_ASSERT(got == 0, "zero-length frame rejected");
+    return 1;
+}

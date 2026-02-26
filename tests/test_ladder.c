@@ -1396,3 +1396,647 @@ int test_regtest_all_offline_recovery(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- Security Model Tests --- */
+
+/* Test: Partial departure blocks cooperative close.
+   Record key turnover for only 2 of 4 clients; verify ladder_can_close returns 0.
+   Then record remaining 2; verify it returns 1.
+   Proves: offline clients prevent rotation from completing. */
+int test_ladder_partial_departure_blocks_close(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    secp256k1_pubkey client_pks[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i])) return 0;
+    }
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Build keypair arrays for PTLC */
+    secp256k1_pubkey all_pks[5];
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        all_pks[i + 1] = client_pks[i];
+    }
+
+    /* Record turnover for clients 1 and 2 only (clients 3 and 4 are "offline") */
+    for (int c = 0; c < 2; c++) {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, all_pks, 5);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                        fake_txid, all_kps, 5, &ka, NULL, &all_pks[c + 1]),
+                    "create pre-sig");
+
+        unsigned char sig[64];
+        TEST_ASSERT(adaptor_adapt(ctx, sig, presig, client_secs[c],
+                                    nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, sig, presig,
+                                            nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+                                                extracted),
+                    "record turnover");
+    }
+
+    /* 2 of 4 departed — cannot close */
+    TEST_ASSERT(!ladder_can_close(&lad, 0), "2/4 departed: cannot close");
+
+    /* ladder_build_close should also fail with missing clients */
+    tx_output_t output;
+    output.amount_sats = 99500;
+    build_p2tr_script_pubkey(output.script_pubkey, &fund_tweaked);
+    output.script_pubkey_len = 34;
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(!ladder_build_close(&lad, 0, &close_tx, &output, 1),
+                "build_close fails with partial departure");
+    tx_buf_free(&close_tx);
+
+    /* Record turnover for remaining clients 3 and 4 */
+    for (int c = 2; c < 4; c++) {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, all_pks, 5);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                        fake_txid, all_kps, 5, &ka, NULL, &all_pks[c + 1]),
+                    "create pre-sig");
+
+        unsigned char sig[64];
+        TEST_ASSERT(adaptor_adapt(ctx, sig, presig, client_secs[c],
+                                    nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, sig, presig,
+                                            nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+                                                extracted),
+                    "record turnover");
+    }
+
+    /* All 4 departed — can close */
+    TEST_ASSERT(ladder_can_close(&lad, 0), "4/4 departed: can close");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: Factory tree currently requires exactly 5 participants (LSP + 4 clients).
+   Rotation MUST include all 4 clients — fewer participants fails gracefully.
+   Proves: the current security model requires full participation for rotation,
+   and the code handles the constraint without crashing. */
+int test_ladder_restructure_fewer_clients(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Create original factory with 4 clients (5 participants total) — works */
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create original factory");
+    TEST_ASSERT_EQ(lad.factories[0].factory.n_participants, 5,
+                   "original has 5 participants");
+
+    /* Advance to DYING */
+    ladder_advance_block(&lad, 100);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "factory dying");
+
+    /* Attempt to create new factory with only 2 clients — must fail
+       because factory_build_tree requires exactly 5 participants */
+    unsigned char fake_txid2[32];
+    memset(fake_txid2, 0xBB, 32);
+    secp256k1_keypair online_kps[2];
+    online_kps[0] = client_kps[0];
+    online_kps[1] = client_kps[1];
+
+    int result_2 = ladder_create_factory(&lad, online_kps, 2, 100000,
+                                          fake_txid2, 0, fund_spk, 34);
+    TEST_ASSERT(!result_2, "3 participants (LSP+2) fails gracefully");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
+
+    /* Attempt with 3 clients (4 participants) — also fails */
+    secp256k1_keypair three_kps[3];
+    three_kps[0] = client_kps[0];
+    three_kps[1] = client_kps[1];
+    three_kps[2] = client_kps[2];
+
+    int result_3 = ladder_create_factory(&lad, three_kps, 3, 100000,
+                                          fake_txid2, 0, fund_spk, 34);
+    TEST_ASSERT(!result_3, "4 participants (LSP+3) fails gracefully");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
+
+    /* Attempt with 1 client (2 participants) — also fails */
+    int result_1 = ladder_create_factory(&lad, client_kps, 1, 100000,
+                                          fake_txid2, 0, fund_spk, 34);
+    TEST_ASSERT(!result_1, "2 participants (LSP+1) fails gracefully");
+
+    /* Create new factory with the full 4 clients — this is the only
+       valid path for rotation. All clients must participate. */
+    unsigned char fake_txid3[32];
+    memset(fake_txid3, 0xCC, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid3, 0, fund_spk, 34),
+                "full 4 clients (5 participants) works");
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories after successful create");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE,
+                   "new factory is ACTIVE");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: DW cross-layer delay ordering.
+   DW formula: delay = step * (max_states - 1 - state_index).
+   State 0 = oldest (max delay), state max-1 = newest (delay 0).
+
+   The security invariant: when the counter advances, the innermost layer
+   ticks fastest (like an odometer). A newer global state always has a
+   LOWER total delay sum across layers than an older state. This ensures
+   the newest state's transactions confirm first, invalidating older states. */
+int test_dw_cross_layer_delay_ordering(void) {
+    /* Test with a 3-layer counter (step=1, states_per_layer=4) */
+    dw_counter_t ctr;
+    dw_counter_init(&ctr, 3, 1, 4);
+
+    TEST_ASSERT_EQ(ctr.n_layers, 3, "3 layers");
+    TEST_ASSERT_EQ(ctr.total_states, 64, "4^3 = 64 total states");
+
+    /* At epoch 0 (oldest state), all layers are at state 0.
+       delay = step * (max_states - 1 - 0) = 1 * 3 = 3 per layer.
+       Total path delay = 3 * 3 = 9. This is the MAXIMUM total delay. */
+    for (uint32_t i = 0; i < ctr.n_layers; i++) {
+        uint16_t delay = dw_delay_for_state(&ctr.layers[i].config,
+                                             ctr.layers[i].current_state);
+        TEST_ASSERT_EQ(delay, 3, "initial delay = (4-1-0)*1 = 3");
+    }
+    uint16_t total_delay_epoch0 = 3 * 3;
+
+    /* Advance to newest state (epoch 63 = total_states - 1).
+       All layers at state 3 (max-1), delay = (4-1-3)*1 = 0 per layer.
+       Total = 0. This is the MINIMUM total delay. */
+    for (uint32_t i = 0; i < ctr.total_states - 1; i++)
+        dw_counter_advance(&ctr);
+
+    for (uint32_t i = 0; i < ctr.n_layers; i++) {
+        uint16_t delay = dw_delay_for_state(&ctr.layers[i].config,
+                                             ctr.layers[i].current_state);
+        TEST_ASSERT_EQ(delay, 0, "newest delay = 0");
+        TEST_ASSERT_EQ(ctr.layers[i].current_state, 3, "all layers at max state");
+    }
+
+    /* Core security invariant: WITHIN each layer, a higher state index
+       always has a strictly lower delay. Newer states outpace older ones.
+       This is what makes DW invalidation work — the newest state confirms
+       at each layer before any older state can. */
+    for (uint32_t states = 4, s = 0; s < states - 1; s++) {
+        dw_layer_config_t cfg = { .step_blocks = 1, .max_states = states };
+        uint16_t d_older = dw_delay_for_state(&cfg, s);
+        uint16_t d_newer = dw_delay_for_state(&cfg, s + 1);
+        TEST_ASSERT(d_newer < d_older,
+                    "newer state has strictly lower delay within layer");
+    }
+
+    /* Also verify with larger step_blocks */
+    for (uint32_t s = 0; s < 3; s++) {
+        dw_layer_config_t cfg = { .step_blocks = 144, .max_states = 4 };
+        uint16_t d_older = dw_delay_for_state(&cfg, s);
+        uint16_t d_newer = dw_delay_for_state(&cfg, s + 1);
+        TEST_ASSERT(d_newer < d_older,
+                    "step=144: newer state still lower delay");
+    }
+
+    /* Verify odometer behavior: layer n_layers-1 is innermost (fastest).
+       After 1 advance from reset, layer 2 goes to state 1, others stay at 0. */
+    dw_counter_reset(&ctr);
+    dw_counter_advance(&ctr);
+
+    TEST_ASSERT_EQ(ctr.layers[0].current_state, 0, "layer 0 (outermost) at 0");
+    TEST_ASSERT_EQ(ctr.layers[1].current_state, 0, "layer 1 still at 0");
+    TEST_ASSERT_EQ(ctr.layers[2].current_state, 1, "layer 2 (innermost) advanced");
+
+    uint16_t delay_inner = dw_delay_for_state(&ctr.layers[2].config,
+                                               ctr.layers[2].current_state);
+    uint16_t delay_outer = dw_delay_for_state(&ctr.layers[0].config,
+                                               ctr.layers[0].current_state);
+
+    /* Layer 2 at state 1: delay = (4-1-1)*1 = 2
+       Layer 0 at state 0: delay = (4-1-0)*1 = 3
+       The faster-ticking inner layer has LOWER delay (newer state) */
+    TEST_ASSERT_EQ(delay_inner, 2, "inner layer delay after advance");
+    TEST_ASSERT_EQ(delay_outer, 3, "outer layer delay (unchanged)");
+    TEST_ASSERT(delay_inner < delay_outer,
+                "inner layer delay < outer layer delay");
+
+    /* Advance 3 more times (total 4): layer 2 rolls over to state 0,
+       layer 1 advances to state 1 */
+    for (int i = 0; i < 3; i++)
+        dw_counter_advance(&ctr);
+
+    TEST_ASSERT_EQ(ctr.layers[2].current_state, 0, "layer 2 rolled over");
+    TEST_ASSERT_EQ(ctr.layers[1].current_state, 1, "layer 1 advanced on rollover");
+    TEST_ASSERT_EQ(ctr.layers[0].current_state, 0, "layer 0 still at 0");
+
+    /* After rollover, both layer 0 and 1 have been used,
+       total delay is less than epoch 0 */
+    uint16_t total_after_rollover = 0;
+    for (uint32_t i = 0; i < ctr.n_layers; i++) {
+        total_after_rollover += dw_delay_for_state(&ctr.layers[i].config,
+                                                    ctr.layers[i].current_state);
+    }
+    TEST_ASSERT(total_after_rollover < total_delay_epoch0,
+                "total delay after 4 advances < initial");
+
+    return 1;
+}
+
+/* Test: Full rotation cycle as a pure unit test.
+   Create factory → advance to dying → PTLC turnover all 4 clients →
+   build cooperative close → create new factory in ladder →
+   evict expired → verify clean state. */
+int test_ladder_full_rotation_cycle(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    secp256k1_pubkey client_pks[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!secp256k1_keypair_pub(ctx, &client_pks[i], &client_kps[i])) return 0;
+    }
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid1[32];
+    memset(fake_txid1, 0xAA, 32);
+
+    /* Phase 1: Create first factory at block 0 */
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid1, 0, fund_spk, 34),
+                "create factory 1");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory");
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "f1 active");
+
+    /* Phase 2: Advance to DYING */
+    ladder_advance_block(&lad, 100);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 dying");
+    TEST_ASSERT(ladder_get_dying(&lad) != NULL, "dying factory found");
+    TEST_ASSERT(ladder_get_active(&lad) == NULL, "no active factory");
+
+    /* Phase 3: PTLC key turnover for all 4 clients */
+    secp256k1_pubkey all_pks[5];
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        all_pks[i + 1] = client_pks[i];
+    }
+
+    for (int c = 0; c < 4; c++) {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, all_pks, 5);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                        fake_txid1, all_kps, 5, &ka, NULL, &all_pks[c + 1]),
+                    "create pre-sig");
+
+        unsigned char sig[64];
+        TEST_ASSERT(adaptor_adapt(ctx, sig, presig, client_secs[c],
+                                    nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, sig, presig,
+                                            nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+                                                extracted),
+                    "record turnover");
+    }
+    TEST_ASSERT(ladder_can_close(&lad, 0), "can close factory 1");
+
+    /* Phase 4: Build cooperative close */
+    tx_output_t close_output;
+    close_output.amount_sats = 99500;
+    build_p2tr_script_pubkey(close_output.script_pubkey, &fund_tweaked);
+    close_output.script_pubkey_len = 34;
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1),
+                "build close tx");
+    TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
+
+    /* Phase 5: Create new factory (simulates funding with reclaimed UTXO) */
+    unsigned char fake_txid2[32];
+    memset(fake_txid2, 0xBB, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid2, 0, fund_spk, 34),
+                "create factory 2");
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories");
+
+    /* Factory 1 is still DYING, factory 2 is ACTIVE */
+    ladder_advance_block(&lad, 100);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 still dying");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
+
+    /* Phase 6: Advance past factory 1 expiry, evict */
+    ladder_advance_block(&lad, 130);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f1 expired");
+
+    size_t freed = ladder_evict_expired(&lad);
+    TEST_ASSERT_EQ(freed, 1, "evicted 1 factory");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory remaining");
+    TEST_ASSERT_EQ(lad.factories[0].factory_id, 1, "remaining is factory 2");
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "f2 still active");
+
+    /* Verify the active factory is functional */
+    TEST_ASSERT(ladder_get_active(&lad) != NULL, "active factory accessible");
+    TEST_ASSERT(ladder_get_dying(&lad) == NULL, "no dying factory");
+
+    tx_buf_free(&close_tx);
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: Fill ladder to capacity, evict, and reuse slots.
+   Proves: the ladder array compaction and slot reuse works
+   correctly under the LADDER_MAX_FACTORIES limit. */
+int test_ladder_evict_and_reuse_slot(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 10, 5);  /* short lifecycle for testing */
+
+    /* Fill all LADDER_MAX_FACTORIES (8) slots */
+    for (int i = 0; i < LADDER_MAX_FACTORIES; i++) {
+        unsigned char fake_txid[32];
+        memset(fake_txid, (unsigned char)(0xA0 + i), 32);
+        ladder_advance_block(&lad, (uint32_t)(i * 10));
+        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                           fake_txid, 0, fund_spk, 34),
+                    "create factory to fill slots");
+    }
+    TEST_ASSERT_EQ(lad.n_factories, LADDER_MAX_FACTORIES, "ladder full");
+
+    /* One more should fail */
+    unsigned char overflow_txid[32];
+    memset(overflow_txid, 0xFF, 32);
+    TEST_ASSERT(!ladder_create_factory(&lad, client_kps, 4, 100000,
+                                        overflow_txid, 0, fund_spk, 34),
+                "overflow rejected");
+
+    /* Advance past the first 6 factories' expiry (each at block i*10 + 10 + 5) */
+    ladder_advance_block(&lad, 65);
+
+    /* Count expired */
+    int expired_count = 0;
+    for (size_t i = 0; i < lad.n_factories; i++) {
+        if (lad.factories[i].cached_state == FACTORY_EXPIRED)
+            expired_count++;
+    }
+    TEST_ASSERT(expired_count >= 4, "at least 4 expired");
+
+    /* Evict expired */
+    size_t freed = ladder_evict_expired(&lad);
+    TEST_ASSERT(freed >= 4, "freed expired slots");
+    TEST_ASSERT(lad.n_factories <= 4, "compacted");
+
+    /* Now create a new factory in the freed slot */
+    unsigned char new_txid[32];
+    memset(new_txid, 0xEE, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       new_txid, 0, fund_spk, 34),
+                "create factory in freed slot");
+
+    /* Verify the new factory is ACTIVE and has correct ID */
+    ladder_factory_t *newest = &lad.factories[lad.n_factories - 1];
+    TEST_ASSERT(newest->is_initialized, "new factory initialized");
+    TEST_ASSERT_EQ(newest->cached_state, FACTORY_ACTIVE, "new factory active");
+    TEST_ASSERT(newest->factory_id >= LADDER_MAX_FACTORIES,
+                "new factory has fresh ID (not reused)");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Gap 6 (regtest): Funding UTXO double-spend rejected by consensus.
+   Proves: if someone spends the factory's funding UTXO away (cooperative close),
+   the kickoff transaction (which also spends that UTXO) is rejected by Bitcoin Core.
+   This is the last line of defense — even though no production code checks UTXO
+   liveness, Bitcoin consensus itself prevents double-spends. */
+int test_regtest_funding_double_spend_rejected(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_dbl_spend");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* Create keypairs */
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps,
+                                      fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    /* Derive bech32m address and fund */
+    char factory_addr[128];
+    TEST_ASSERT(derive_factory_address(&rt, ctx, &fund_tweaked,
+                                         factory_addr, sizeof(factory_addr)),
+                "derive address");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    /* Find the funding vout */
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    for (int v = 0; v < 3; v++) {
+        uint64_t amt;
+        unsigned char spk[256];
+        size_t spk_len;
+        if (regtest_get_tx_output(&rt, funding_txid_hex, (uint32_t)v,
+                                   &amt, spk, &spk_len)) {
+            if (spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+                found_vout = v;
+                fund_amount = amt;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find vout");
+    printf("  Funded: %s vout=%d amount=%lu sats\n",
+           funding_txid_hex, found_vout, (unsigned long)fund_amount);
+
+    /* Build the 5-of-5 keypair array */
+    secp256k1_keypair all_kps[5];
+    secp256k1_pubkey all_pks[5];
+    all_kps[0] = lsp_kp;
+    if (!secp256k1_keypair_pub(ctx, &all_pks[0], &lsp_kp)) return 0;
+    for (int i = 0; i < 4; i++) {
+        all_kps[i + 1] = client_kps[i];
+        if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
+    }
+
+    /* Init factory, build tree, sign all (creates kickoff tx) */
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    printf("  Factory tree built: %zu nodes\n", f.n_nodes);
+
+    /* Save kickoff tx hex before spending the UTXO away */
+    char *kickoff_hex = (char *)malloc(f.nodes[0].signed_tx.len * 2 + 1);
+    hex_encode(f.nodes[0].signed_tx.data, f.nodes[0].signed_tx.len, kickoff_hex);
+
+    /* Step 1: Spend the funding UTXO via cooperative close (double-spend) */
+    uint64_t close_fee = 500;
+    tx_output_t close_output;
+    close_output.amount_sats = fund_amount - close_fee;
+
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &all_pks[0])) {
+        free(kickoff_hex); return 0;
+    }
+    unsigned char lsp_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, lsp_ser, &lsp_xonly)) {
+        free(kickoff_hex); return 0;
+    }
+    unsigned char lsp_tweak[32];
+    sha256_tagged("TapTweak", lsp_ser, 32, lsp_tweak);
+    secp256k1_pubkey lsp_tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tweaked_full, &lsp_xonly, lsp_tweak)) {
+        free(kickoff_hex); return 0;
+    }
+    secp256k1_xonly_pubkey lsp_tweaked;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tweaked, NULL, &lsp_tweaked_full)) {
+        free(kickoff_hex); return 0;
+    }
+    build_p2tr_script_pubkey(close_output.script_pubkey, &lsp_tweaked);
+    close_output.script_pubkey_len = 34;
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+                                                  &close_output, 1),
+                "build cooperative close");
+
+    char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
+    hex_encode(close_tx.data, close_tx.len, close_hex);
+    char close_txid_hex[65];
+    int close_sent = regtest_send_raw_tx(&rt, close_hex, close_txid_hex);
+    free(close_hex);
+    TEST_ASSERT(close_sent, "broadcast cooperative close (spends funding UTXO)");
+    printf("  Cooperative close broadcast: %s\n", close_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, close_txid_hex) > 0,
+                "cooperative close confirmed");
+    printf("  Funding UTXO now spent by cooperative close\n");
+
+    /* Step 2: Try to broadcast kickoff (same UTXO) — must fail */
+    char kickoff_txid_hex[65];
+    int kickoff_sent = regtest_send_raw_tx(&rt, kickoff_hex, kickoff_txid_hex);
+    free(kickoff_hex);
+    TEST_ASSERT(!kickoff_sent,
+                "kickoff rejected: funding UTXO already spent (double-spend blocked)");
+    printf("  Kickoff correctly rejected — Bitcoin consensus prevents double-spend\n");
+
+    tx_buf_free(&close_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

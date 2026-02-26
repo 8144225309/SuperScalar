@@ -330,6 +330,13 @@ extern int test_ladder_evict_expired(void);
 extern int test_rotation_trigger_condition(void);
 extern int test_rotation_context_save_restore(void);
 
+/* Security Model Tests */
+extern int test_ladder_partial_departure_blocks_close(void);
+extern int test_ladder_restructure_fewer_clients(void);
+extern int test_dw_cross_layer_delay_ordering(void);
+extern int test_ladder_full_rotation_cycle(void);
+extern int test_ladder_evict_and_reuse_slot(void);
+
 /* JIT Channel Fallback (Gap #2) */
 extern int test_last_message_time_update(void);
 extern int test_offline_detection_flag(void);
@@ -397,6 +404,14 @@ extern int test_fee_estimator_null_fallback(void);
 extern int test_accept_timeout(void);
 extern int test_noise_nk_handshake(void);
 extern int test_noise_nk_wrong_pubkey(void);
+
+/* Security Model Gap Tests */
+extern int test_musig_nonce_pool_edge_cases(void);
+extern int test_wire_recv_truncated_header(void);
+extern int test_wire_recv_truncated_body(void);
+extern int test_wire_recv_zero_length_frame(void);
+extern int test_regtest_htlc_wrong_preimage_rejected(void);
+extern int test_regtest_funding_double_spend_rejected(void);
 
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
@@ -684,6 +699,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_trigger_condition);
     RUN_TEST(test_rotation_context_save_restore);
 
+    printf("\n=== Security Model Tests ===\n");
+    RUN_TEST(test_ladder_partial_departure_blocks_close);
+    RUN_TEST(test_ladder_restructure_fewer_clients);
+    RUN_TEST(test_dw_cross_layer_delay_ordering);
+    RUN_TEST(test_ladder_full_rotation_cycle);
+    RUN_TEST(test_ladder_evict_and_reuse_slot);
+
     printf("\n=== JIT Channel Fallback (Gap #2) ===\n");
     RUN_TEST(test_last_message_time_update);
     RUN_TEST(test_offline_detection_flag);
@@ -751,6 +773,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_accept_timeout);
     RUN_TEST(test_noise_nk_handshake);
     RUN_TEST(test_noise_nk_wrong_pubkey);
+
+    printf("\n=== Security Model Gap Tests ===\n");
+    RUN_TEST(test_musig_nonce_pool_edge_cases);
+    RUN_TEST(test_wire_recv_truncated_header);
+    RUN_TEST(test_wire_recv_truncated_body);
+    RUN_TEST(test_wire_recv_zero_length_frame);
 
     printf("\n=== Arity-1 Leaves ===\n");
     RUN_TEST(test_factory_build_tree_arity1);
@@ -825,6 +853,10 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_ptlc_no_coop_close);
     RUN_TEST(test_regtest_all_offline_recovery);
     RUN_TEST(test_regtest_tree_ordering);
+
+    printf("\n=== Security Model Gap Tests (Regtest) ===\n");
+    RUN_TEST(test_regtest_htlc_wrong_preimage_rejected);
+    RUN_TEST(test_regtest_funding_double_spend_rejected);
 
     printf("\n=== Regtest Fee Estimation ===\n");
     RUN_TEST(test_regtest_fee_estimation_parsing);

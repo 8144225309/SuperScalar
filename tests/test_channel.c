@@ -4250,3 +4250,229 @@ int test_channel_near_exhaustion(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Gap 3: Wrong HTLC preimage rejected by Bitcoin consensus.
+   Bypasses the application-layer hash check (channel_fulfill_htlc) and writes
+   a wrong preimage directly into h->payment_preimage. Builds the HTLC success
+   tx and broadcasts it to regtest. Bitcoin Core must reject it because the
+   tapscript contains OP_SHA256 <hash> OP_EQUALVERIFY and the wrong preimage
+   won't satisfy that opcode sequence. */
+int test_regtest_htlc_wrong_preimage_rejected(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_bad_pre");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    if (!regtest_fund_from_faucet(&rt, 0.01))
+        regtest_mine_for_balance(&rt, 0.002, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.002, "need funds");
+
+    /* 2-of-2 MuSig funding — same pattern as test_regtest_htlc_success */
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    secp256k1_pubkey pks[2] = { local_fund_pk, remote_fund_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 2);
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char ka_tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, ka_tweak);
+
+    musig_keyagg_t tmp_ka = ka;
+    secp256k1_pubkey ka_tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &ka_tweaked_pk, &tmp_ka.cache, ka_tweak)) return 0;
+    secp256k1_xonly_pubkey ka_tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &ka_tweaked_xonly, NULL, &ka_tweaked_pk)) return 0;
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &ka_tweaked_xonly)) return 0;
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"'); dstart++;
+        char *dend = strchr(dstart, '"');
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char chan_addr[128];
+    {
+        char *start = strchr(addr_result, '"'); start++;
+        char *end = strchr(start, '"');
+        size_t len = (size_t)(end - start);
+        memcpy(chan_addr, start, len);
+        chan_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, chan_addr, 0.001, funding_txid_hex), "fund");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find funding vout");
+
+    /* Set up channel with HTLC */
+    channel_t ch;
+    uint32_t csv_delay = 6;
+    fee_estimator_t _fe; fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    uint64_t usable = fund_amount - commit_fee;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+
+    TEST_ASSERT(channel_init(&ch, ctx, local_funding_secret,
+                               &local_fund_pk, &remote_fund_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34,
+                               local_amt, remote_amt, csv_delay),
+                "init channel");
+    ch.funder_is_local = 1;
+
+    unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
+    unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
+    unsigned char chan_revocation_sec[32] = { [0 ... 31] = 0xC3 };
+    channel_set_local_basepoints(&ch, chan_payment_sec, chan_delayed_sec, chan_revocation_sec);
+
+    unsigned char lsp_payment_sec[32] = { [0 ... 31] = 0xD1 };
+    unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
+    unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
+    secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec)) return 0;
+    channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
+
+    unsigned char chan_htlc_sec[32] = { [0 ... 31] = 0xC4 };
+    unsigned char lsp_htlc_sec[32] = { [0 ... 31] = 0xD4 };
+    channel_set_local_htlc_basepoint(&ch, chan_htlc_sec);
+    secp256k1_pubkey lsp_htlc_bp;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_htlc_bp, lsp_htlc_sec)) return 0;
+    channel_set_remote_htlc_basepoint(&ch, &lsp_htlc_bp);
+
+    /* Preimage and hash */
+    unsigned char real_preimage[32] = { [0 ... 31] = 0x42 };
+    unsigned char payment_hash[32];
+    sha256(real_preimage, 32, payment_hash);
+
+    uint64_t htlc_amount = 5000;
+    uint64_t htlc_id;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_RECEIVED, htlc_amount, payment_hash,
+                                   500000, &htlc_id),
+                "add received htlc");
+
+    /* Build and broadcast commitment */
+    tx_buf_t commit_unsigned;
+    tx_buf_init(&commit_unsigned, 512);
+    unsigned char commit_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &commit_unsigned, commit_txid),
+                "build commitment");
+
+    secp256k1_keypair remote_kp;
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
+    tx_buf_t commit_signed;
+    tx_buf_init(&commit_signed, 1024);
+    TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned, &remote_kp),
+                "sign commitment");
+
+    char *commit_hex = (char *)malloc(commit_signed.len * 2 + 1);
+    hex_encode(commit_signed.data, commit_signed.len, commit_hex);
+    char commit_txid_hex[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, commit_hex, commit_txid_hex), "broadcast commitment");
+    free(commit_hex);
+
+    regtest_mine_blocks(&rt, (int)csv_delay + 1, mine_addr);
+
+    /* Extract HTLC output info (output 2) */
+    size_t htlc_out_start = 47 + 43 + 43;
+    unsigned char htlc_spk[34];
+    memcpy(htlc_spk, commit_unsigned.data + htlc_out_start + 8 + 1, 34);
+
+    uint64_t htlc_out_amt = 0;
+    for (int i = 0; i < 8; i++)
+        htlc_out_amt |= ((uint64_t)commit_unsigned.data[htlc_out_start + i]) << (i * 8);
+
+    /* BYPASS application-layer check: write WRONG preimage directly */
+    unsigned char wrong_preimage[32] = { [0 ... 31] = 0xFF };
+    memcpy(ch.htlcs[0].payment_preimage, wrong_preimage, 32);
+
+    /* Build HTLC success tx with wrong preimage in witness */
+    tx_buf_t bad_success_tx;
+    tx_buf_init(&bad_success_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_success_tx(&ch, &bad_success_tx,
+                                                commit_txid, 2,
+                                                htlc_out_amt, htlc_spk, 34, 0),
+                "build bad success tx");
+
+    /* Broadcast — Bitcoin Core must reject (OP_SHA256 check fails) */
+    char *bad_hex = (char *)malloc(bad_success_tx.len * 2 + 1);
+    hex_encode(bad_success_tx.data, bad_success_tx.len, bad_hex);
+    char bad_txid_hex[65];
+    int bad_sent = regtest_send_raw_tx(&rt, bad_hex, bad_txid_hex);
+    free(bad_hex);
+    TEST_ASSERT(!bad_sent, "wrong preimage rejected by Bitcoin consensus");
+    printf("  Wrong preimage correctly rejected by OP_SHA256 check\n");
+
+    /* Verify correct preimage still works */
+    memcpy(ch.htlcs[0].payment_preimage, real_preimage, 32);
+    tx_buf_t good_success_tx;
+    tx_buf_init(&good_success_tx, 1024);
+    TEST_ASSERT(channel_build_htlc_success_tx(&ch, &good_success_tx,
+                                                commit_txid, 2,
+                                                htlc_out_amt, htlc_spk, 34, 0),
+                "build good success tx");
+
+    char *good_hex = (char *)malloc(good_success_tx.len * 2 + 1);
+    hex_encode(good_success_tx.data, good_success_tx.len, good_hex);
+    char good_txid_hex[65];
+    int good_sent = regtest_send_raw_tx(&rt, good_hex, good_txid_hex);
+    free(good_hex);
+    TEST_ASSERT(good_sent, "correct preimage accepted");
+    printf("  Correct preimage accepted: %s\n", good_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, good_txid_hex) > 0, "confirmed");
+
+    tx_buf_free(&commit_unsigned);
+    tx_buf_free(&commit_signed);
+    tx_buf_free(&bad_success_tx);
+    tx_buf_free(&good_success_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
