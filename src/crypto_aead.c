@@ -224,6 +224,10 @@ void poly1305_auth(unsigned char tag[16], const unsigned char *msg, size_t len,
 
 /* --- AEAD (RFC 7539 Section 2.8) --- */
 
+/* Stack buffer size for Poly1305 MAC construction.
+   Covers all messages under ~8 KB without malloc. */
+#define AEAD_STACK_BUF 8192
+
 /* Pad to 16-byte boundary: write zero bytes as needed */
 static void pad16(unsigned char *buf, size_t *pos, size_t data_len) {
     size_t rem = data_len % 16;
@@ -264,7 +268,9 @@ int aead_encrypt(unsigned char *ciphertext, unsigned char tag[16],
     mac_data_len += (16 - (pt_len % 16)) % 16;
     mac_data_len += 16; /* two 8-byte lengths */
 
-    unsigned char *mac_data = (unsigned char *)malloc(mac_data_len);
+    unsigned char stack_buf[AEAD_STACK_BUF];
+    unsigned char *mac_data = (mac_data_len <= AEAD_STACK_BUF)
+        ? stack_buf : (unsigned char *)malloc(mac_data_len);
     if (!mac_data) return 0;
 
     size_t pos = 0;
@@ -281,7 +287,7 @@ int aead_encrypt(unsigned char *ciphertext, unsigned char tag[16],
 
     poly1305_auth(tag, mac_data, pos, poly_key);
     secure_zero(poly_key, 64);
-    free(mac_data);
+    if (mac_data != stack_buf) free(mac_data);
     return 1;
 }
 
@@ -305,7 +311,9 @@ int aead_decrypt(unsigned char *plaintext,
     mac_data_len += (16 - (ct_len % 16)) % 16;
     mac_data_len += 16;
 
-    unsigned char *mac_data = (unsigned char *)malloc(mac_data_len);
+    unsigned char stack_buf[AEAD_STACK_BUF];
+    unsigned char *mac_data = (mac_data_len <= AEAD_STACK_BUF)
+        ? stack_buf : (unsigned char *)malloc(mac_data_len);
     if (!mac_data) return 0;
 
     size_t pos = 0;
@@ -323,7 +331,7 @@ int aead_decrypt(unsigned char *plaintext,
     unsigned char computed_tag[16];
     poly1305_auth(computed_tag, mac_data, pos, poly_key);
     secure_zero(poly_key, 64);
-    free(mac_data);
+    if (mac_data != stack_buf) free(mac_data);
 
     /* Constant-time comparison */
     unsigned char diff = 0;

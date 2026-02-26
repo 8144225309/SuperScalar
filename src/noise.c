@@ -33,14 +33,17 @@ void hmac_sha256(unsigned char out[32], const unsigned char *key, size_t key_len
         o_pad[i] = k_pad[i] ^ 0x5c;
     }
 
-    /* inner = SHA256(i_pad || data) */
+    /* inner = SHA256(i_pad || data)
+       Stack buffer covers all callers (max ~97 bytes data). */
     size_t inner_len = 64 + data_len;
-    unsigned char *inner_buf = (unsigned char *)malloc(inner_len);
+    unsigned char inner_stack[256];
+    unsigned char *inner_buf = (inner_len <= sizeof(inner_stack))
+        ? inner_stack : (unsigned char *)malloc(inner_len);
     memcpy(inner_buf, i_pad, 64);
     memcpy(inner_buf + 64, data, data_len);
     unsigned char inner_hash[32];
     sha256(inner_buf, inner_len, inner_hash);
-    free(inner_buf);
+    if (inner_buf != inner_stack) free(inner_buf);
 
     /* outer = SHA256(o_pad || inner_hash) */
     unsigned char outer_buf[64 + 32];
@@ -71,16 +74,19 @@ void hkdf_expand(unsigned char *okm, size_t okm_len,
     size_t off = 0;
 
     for (size_t i = 1; i <= n; i++) {
-        /* T(i) = HMAC-SHA256(PRK, T(i-1) || info || i) */
+        /* T(i) = HMAC-SHA256(PRK, T(i-1) || info || i)
+           Stack buffer covers all callers (max ~50 bytes input). */
         size_t input_len = t_len + info_len + 1;
-        unsigned char *input = (unsigned char *)malloc(input_len);
+        unsigned char input_stack[128];
+        unsigned char *input = (input_len <= sizeof(input_stack))
+            ? input_stack : (unsigned char *)malloc(input_len);
         if (t_len > 0)
             memcpy(input, t, t_len);
         memcpy(input + t_len, info, info_len);
         input[t_len + info_len] = (unsigned char)i;
 
         hmac_sha256(t, prk, 32, input, input_len);
-        free(input);
+        if (input != input_stack) free(input);
         t_len = 32;
 
         size_t chunk = okm_len - off;
