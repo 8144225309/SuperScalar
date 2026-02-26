@@ -13,6 +13,7 @@
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */
+#define CHANNEL_SECRETS_WARNING_THRESHOLD 240  /* trigger rotation before exhaustion */
 #define ANCHOR_OUTPUT_AMOUNT     240   /* P2A anchor for CPFP fee bumping (sats) */
 
 /* P2A (Pay-to-Anchor) scriptPubKey: OP_1 OP_PUSHBYTES_2 4e73 (anyone-can-spend) */
@@ -257,6 +258,9 @@ int channel_build_penalty_tx(const channel_t *ch,
                                uint64_t old_commitment_num,
                                const unsigned char *anchor_spk,
                                size_t anchor_spk_len);
+
+/* Returns 1 if commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD */
+int channel_near_exhaustion(const channel_t *ch);
 
 /* --- Cooperative close --- */
 

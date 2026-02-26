@@ -744,6 +744,11 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
     return channel_receive_revocation_flat(ch, commitment_num, secret32);
 }
 
+int channel_near_exhaustion(const channel_t *ch) {
+    if (!ch) return 0;
+    return ch->commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD;
+}
+
 int channel_build_penalty_tx(const channel_t *ch,
                                tx_buf_t *penalty_tx_out,
                                const unsigned char *commitment_txid,

@@ -120,6 +120,7 @@ extern int test_regtest_htlc_timeout(void);
 extern int test_factory_cooperative_close(void);
 extern int test_factory_cooperative_close_balances(void);
 extern int test_channel_cooperative_close(void);
+extern int test_channel_near_exhaustion(void);
 extern int test_regtest_factory_coop_close(void);
 extern int test_regtest_channel_coop_close(void);
 
@@ -548,6 +549,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_secure_zero_basic);
     RUN_TEST(test_wire_plaintext_refused_after_handshake);
     RUN_TEST(test_fd_table_grows_beyond_16);
+    RUN_TEST(test_channel_near_exhaustion);
 
     printf("\n=== Demo Polish (Phase 17) ===\n");
     RUN_TEST(test_create_invoice_wire);
