@@ -75,6 +75,9 @@ add_library(superscalar
     src/lsp.c
     src/client.c
     src/lsp_channels.c
+    src/lsp_bridge.c
+    src/lsp_rotation.c
+    src/lsp_demo.c
     src/report.c
     src/persist.c
     src/bridge.c
