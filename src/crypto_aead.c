@@ -1,4 +1,18 @@
-/* ChaCha20-Poly1305 AEAD per RFC 7539 */
+/*
+ * ChaCha20-Poly1305 AEAD per RFC 7539
+ *
+ * TECHNICAL DEBT — Custom crypto implementation
+ *
+ * This file contains hand-rolled ChaCha20 and Poly1305.  Both follow
+ * the RFC test vectors and use constant-time tag comparison, but a
+ * custom implementation is inherently riskier than a vetted library.
+ *
+ * Future: replace with libsodium crypto_aead_chacha20poly1305_ietf_*
+ * or OpenSSL EVP_AEAD, which benefit from side-channel hardening and
+ * hardware acceleration (AVX2/NEON).  The API surface is identical
+ * (key, nonce, aad, plaintext → ciphertext+tag) so migration is
+ * mechanical.
+ */
 #include "superscalar/crypto_aead.h"
 #include "superscalar/types.h"
 #include <string.h>

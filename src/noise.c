@@ -278,6 +278,24 @@ static void derive_keys(noise_state_t *ns, const unsigned char shared[32],
     secure_zero(key_resp, 32);
 }
 
+/*
+ * SECURITY NOTE — Noise NN pattern (no server authentication)
+ *
+ * The NN handshake provides forward-secret encryption but does NOT
+ * authenticate either party.  A network-level attacker can MITM the
+ * connection by intercepting both ephemeral key exchanges.
+ *
+ * Mitigations (deploy at least one):
+ *   1. Run over Tor hidden services (`.onion`) — Tor provides
+ *      authentication + encryption at the transport layer.
+ *   2. Pin the server's static key out-of-band and upgrade to the
+ *      NK or XX Noise pattern (future protocol change).
+ *   3. Use an authenticated tunnel (WireGuard, SSH port-forward).
+ *
+ * For the current PoC the NN pattern is acceptable because the
+ * factory protocol itself uses adaptor signatures that bind to
+ * long-lived on-chain keys, limiting what a MITM can achieve.
+ */
 int noise_handshake_initiator(noise_state_t *ns, int fd,
                                secp256k1_context *ctx) {
     /* Generate ephemeral keypair */

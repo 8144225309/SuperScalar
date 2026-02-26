@@ -70,7 +70,16 @@ int hex_decode(const char *hex, unsigned char *out, size_t out_len) {
     return (int)(hex_len / 2);
 }
 
-/* --- SHA-256 --- */
+/* --- SHA-256 ---
+ *
+ * TECHNICAL DEBT — Custom SHA-256 implementation
+ *
+ * Hand-rolled following FIPS 180-4.  Passes NIST test vectors and
+ * tagged-hash tests, but lacks hardware acceleration (SHA-NI/ARMv8).
+ *
+ * Future: replace with OpenSSL EVP_MD (SHA256) or libsodium
+ * crypto_hash_sha256 for performance and side-channel hardening.
+ */
 
 static const uint32_t sha256_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,

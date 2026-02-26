@@ -4216,3 +4216,47 @@ int test_regtest_htlc_timeout_race(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+int test_channel_near_exhaustion(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDD, 32);
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+
+    /* Fresh channel: commitment_number = 0 — not near exhaustion */
+    TEST_ASSERT(!channel_near_exhaustion(&ch), "fresh channel not exhausted");
+
+    /* Simulate advancing to just below threshold */
+    ch.commitment_number = CHANNEL_SECRETS_WARNING_THRESHOLD - 1;
+    TEST_ASSERT(!channel_near_exhaustion(&ch), "below threshold not exhausted");
+
+    /* At threshold */
+    ch.commitment_number = CHANNEL_SECRETS_WARNING_THRESHOLD;
+    TEST_ASSERT(channel_near_exhaustion(&ch), "at threshold is exhausted");
+
+    /* Above threshold */
+    ch.commitment_number = CHANNEL_MAX_SECRETS - 1;
+    TEST_ASSERT(channel_near_exhaustion(&ch), "at max is exhausted");
+
+    /* NULL channel */
+    TEST_ASSERT(!channel_near_exhaustion(NULL), "NULL channel not exhausted");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
