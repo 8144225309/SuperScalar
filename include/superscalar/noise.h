@@ -39,8 +39,9 @@ void wire_clear_encryption(int fd);
 noise_state_t *wire_get_encryption(int fd);
 
 /* Mark an fd as requiring encryption (called at handshake start).
-   After this, wire_send/wire_recv refuse plaintext on this fd. */
-void wire_mark_encryption_required(int fd);
+   After this, wire_send/wire_recv refuse plaintext on this fd.
+   Returns 1 on success, 0 on OOM (caller should close the fd). */
+int wire_mark_encryption_required(int fd);
 
 /* Check if an fd requires encryption. Returns 1 if required, 0 otherwise. */
 int wire_is_encryption_required(int fd);

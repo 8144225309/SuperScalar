@@ -137,15 +137,21 @@ static fd_noise_entry_t *fd_table = NULL;
 static int fd_table_cap = 0;
 static int fd_table_inited = 0;
 
-static void ensure_fd_table(void) {
+static int ensure_fd_table(void) {
     if (!fd_table_inited) {
         fd_table_cap = FD_TABLE_INITIAL_CAP;
         fd_table = (fd_noise_entry_t *)calloc((size_t)fd_table_cap,
                                                sizeof(fd_noise_entry_t));
+        if (!fd_table) {
+            fprintf(stderr, "noise: initial fd table alloc failed\n");
+            fd_table_cap = 0;
+            return 0;
+        }
         for (int i = 0; i < fd_table_cap; i++)
             fd_table[i].fd = -1;
         fd_table_inited = 1;
     }
+    return 1;
 }
 
 /* Double the table capacity */
@@ -164,15 +170,17 @@ static int grow_fd_table(void) {
 }
 
 int wire_set_encryption(int fd, const noise_state_t *ns) {
-    ensure_fd_table();
-    /* Find existing or free slot */
+    if (!ensure_fd_table()) return 0;
+    /* Find existing entry (active or placeholder from wire_mark_encryption_required) */
     int free_slot = -1;
     for (int i = 0; i < fd_table_cap; i++) {
-        if (fd_table[i].active && fd_table[i].fd == fd) {
+        if (fd_table[i].fd == fd) {
+            /* Reuse this slot — preserves requires_encryption flag */
             fd_table[i].state = *ns;
+            fd_table[i].active = 1;
             return 1;
         }
-        if (!fd_table[i].active && free_slot < 0)
+        if (!fd_table[i].active && fd_table[i].fd == -1 && free_slot < 0)
             free_slot = i;
     }
     if (free_slot < 0) {
@@ -189,7 +197,7 @@ int wire_set_encryption(int fd, const noise_state_t *ns) {
 }
 
 void wire_clear_encryption(int fd) {
-    ensure_fd_table();
+    if (!ensure_fd_table()) return;
     for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].fd == fd) {
             if (fd_table[i].active)
@@ -203,7 +211,7 @@ void wire_clear_encryption(int fd) {
 }
 
 noise_state_t *wire_get_encryption(int fd) {
-    ensure_fd_table();
+    if (!ensure_fd_table()) return NULL;
     for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].active && fd_table[i].fd == fd)
             return &fd_table[i].state;
@@ -211,13 +219,13 @@ noise_state_t *wire_get_encryption(int fd) {
     return NULL;
 }
 
-void wire_mark_encryption_required(int fd) {
-    ensure_fd_table();
+int wire_mark_encryption_required(int fd) {
+    if (!ensure_fd_table()) return 0;
     /* Mark in existing entry if present, otherwise allocate a slot */
     for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].fd == fd) {
             fd_table[i].requires_encryption = 1;
-            return;
+            return 1;
         }
     }
     /* No entry yet — create a placeholder (active=0 but flag set) */
@@ -225,23 +233,26 @@ void wire_mark_encryption_required(int fd) {
         if (!fd_table[i].active && fd_table[i].fd == -1) {
             fd_table[i].fd = fd;
             fd_table[i].requires_encryption = 1;
-            return;
+            return 1;
         }
     }
     /* Table full — grow and set */
-    if (grow_fd_table()) {
-        for (int i = 0; i < fd_table_cap; i++) {
-            if (fd_table[i].fd == -1) {
-                fd_table[i].fd = fd;
-                fd_table[i].requires_encryption = 1;
-                return;
-            }
+    if (!grow_fd_table()) {
+        fprintf(stderr, "noise: fd table grow failed, refusing connection\n");
+        return 0;
+    }
+    for (int i = 0; i < fd_table_cap; i++) {
+        if (fd_table[i].fd == -1) {
+            fd_table[i].fd = fd;
+            fd_table[i].requires_encryption = 1;
+            return 1;
         }
     }
+    return 0;
 }
 
 int wire_is_encryption_required(int fd) {
-    ensure_fd_table();
+    if (!ensure_fd_table()) return 1;  /* fail safe: require encryption */
     for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].fd == fd)
             return fd_table[i].requires_encryption;

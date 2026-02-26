@@ -2093,7 +2093,8 @@ int test_wire_plaintext_refused_after_handshake(void) {
                 "fd should not require encryption initially");
 
     /* Mark encryption required (simulates handshake start) */
-    wire_mark_encryption_required(sv[0]);
+    TEST_ASSERT(wire_mark_encryption_required(sv[0]),
+                "wire_mark_encryption_required should succeed");
     TEST_ASSERT(wire_is_encryption_required(sv[0]),
                 "fd should require encryption after mark");
 

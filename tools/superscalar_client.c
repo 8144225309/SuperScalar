@@ -1077,6 +1077,7 @@ static void usage(const char *prog) {
         "  --datadir PATH                    Bitcoin datadir (default: bitcoind default)\n"
         "  --rpcport PORT                    Bitcoin RPC port (default: network default)\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
+        "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -1102,6 +1103,7 @@ int main(int argc, char *argv[]) {
     int rpcport = 0;
     int fee_rate = 1000;
     int auto_accept_jit = 0;
+    int accept_risk = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1186,10 +1188,21 @@ int main(int argc, char *argv[]) {
 
         } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
             auto_accept_jit = 1;
+        } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
+            accept_risk = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
         }
+    }
+
+    /* Mainnet safety guard: refuse unless explicitly acknowledged */
+    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
+        fprintf(stderr,
+            "Error: mainnet operation refused.\n"
+            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
+            "If you understand this risk, pass --i-accept-the-risk\n");
+        return 1;
     }
 
     unsigned char seckey[32];

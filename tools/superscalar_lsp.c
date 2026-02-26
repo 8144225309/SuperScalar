@@ -78,6 +78,7 @@ static void usage(const char *prog) {
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
+        "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -454,6 +455,7 @@ int main(int argc, char *argv[]) {
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
+    int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -540,6 +542,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
+            accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -549,6 +553,15 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* Mainnet safety guard: refuse unless explicitly acknowledged */
+    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
+        fprintf(stderr,
+            "Error: mainnet operation refused.\n"
+            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
+            "If you understand this risk, pass --i-accept-the-risk\n");
+        return 1;
+    }
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg

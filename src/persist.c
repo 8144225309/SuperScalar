@@ -264,6 +264,10 @@ int persist_open(persist_t *p, const char *path) {
     /* Enable WAL mode for better concurrent performance */
     sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_busy_timeout(p->db, 5000);
+    /* FULL sync: WAL default NORMAL can lose data on OS crash */
+    sqlite3_exec(p->db, "PRAGMA synchronous=FULL;", NULL, NULL, NULL);
+    /* Enforce foreign key constraints */
+    sqlite3_exec(p->db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
 
     /* Create schema */
     char *errmsg = NULL;
@@ -288,17 +292,28 @@ void persist_close(persist_t *p) {
 
 int persist_begin(persist_t *p) {
     if (!p || !p->db) return 0;
-    return sqlite3_exec(p->db, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK;
+    if (sqlite3_exec(p->db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+        return 0;
+    p->in_transaction = 1;
+    return 1;
 }
 
 int persist_commit(persist_t *p) {
     if (!p || !p->db) return 0;
-    return sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+    int ok = (sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+    p->in_transaction = 0;
+    return ok;
 }
 
 int persist_rollback(persist_t *p) {
     if (!p || !p->db) return 0;
-    return sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK;
+    int ok = (sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+    p->in_transaction = 0;
+    return ok;
+}
+
+int persist_in_transaction(const persist_t *p) {
+    return p && p->in_transaction;
 }
 
 /* --- Factory --- */
@@ -306,6 +321,10 @@ int persist_rollback(persist_t *p) {
 int persist_save_factory(persist_t *p, const factory_t *f,
                           secp256k1_context *ctx, uint32_t factory_id) {
     if (!p || !p->db || !f || !ctx) return 0;
+
+    /* Use internal transaction if caller hasn't started one */
+    int own_txn = !p->in_transaction;
+    if (own_txn && !persist_begin(p)) return 0;
 
     /* Encode funding_txid as hex (display order = reversed internal) */
     unsigned char txid_display[32];
@@ -326,8 +345,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        if (own_txn) persist_rollback(p);
         return 0;
+    }
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)f->n_participants);
@@ -342,7 +363,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
-    if (!ok) return 0;
+    if (!ok) {
+        if (own_txn) persist_rollback(p);
+        return 0;
+    }
 
     /* Save participants */
     const char *pk_sql =
@@ -351,14 +375,19 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
     for (size_t i = 0; i < f->n_participants; i++) {
         sqlite3_stmt *pk_stmt;
-        if (sqlite3_prepare_v2(p->db, pk_sql, -1, &pk_stmt, NULL) != SQLITE_OK)
+        if (sqlite3_prepare_v2(p->db, pk_sql, -1, &pk_stmt, NULL) != SQLITE_OK) {
+            if (own_txn) persist_rollback(p);
             return 0;
+        }
 
         unsigned char pk_ser[33];
         size_t pk_len = 33;
         if (!secp256k1_ec_pubkey_serialize(ctx, pk_ser, &pk_len, &f->pubkeys[i],
-                                            SECP256K1_EC_COMPRESSED))
+                                            SECP256K1_EC_COMPRESSED)) {
+            sqlite3_finalize(pk_stmt);
+            if (own_txn) persist_rollback(p);
             return 0;
+        }
         char pk_hex[67];
         hex_encode(pk_ser, 33, pk_hex);
 
@@ -368,9 +397,13 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
         ok = (sqlite3_step(pk_stmt) == SQLITE_DONE);
         sqlite3_finalize(pk_stmt);
-        if (!ok) return 0;
+        if (!ok) {
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
     }
 
+    if (own_txn && !persist_commit(p)) return 0;
     return 1;
 }
 
@@ -1155,6 +1188,10 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id) {
     if (!p || !p->db || !f) return 0;
 
+    /* Use internal transaction if caller hasn't started one */
+    int own_txn = !p->in_transaction;
+    if (own_txn && !persist_begin(p)) return 0;
+
     const char *sql =
         "INSERT OR REPLACE INTO tree_nodes "
         "(factory_id, node_index, type, parent_index, parent_vout, "
@@ -1167,8 +1204,10 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         const factory_node_t *node = &f->nodes[i];
 
         sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            if (own_txn) persist_rollback(p);
             return 0;
+        }
 
         sqlite3_bind_int(stmt, 1, (int)factory_id);
         sqlite3_bind_int(stmt, 2, (int)i);
@@ -1246,9 +1285,13 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
 
         int ok = (sqlite3_step(stmt) == SQLITE_DONE);
         sqlite3_finalize(stmt);
-        if (!ok) return 0;
+        if (!ok) {
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
     }
 
+    if (own_txn && !persist_commit(p)) return 0;
     return 1;
 }
 

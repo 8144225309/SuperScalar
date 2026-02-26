@@ -1376,7 +1376,8 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
 /* --- Encrypted transport convenience (Phase 19) --- */
 
 int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
-    wire_mark_encryption_required(fd);
+    if (!wire_mark_encryption_required(fd))
+        return 0;
     noise_state_t ns;
     if (!noise_handshake_initiator(&ns, fd, ctx))
         return 0;
@@ -1389,7 +1390,8 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
 }
 
 int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
-    wire_mark_encryption_required(fd);
+    if (!wire_mark_encryption_required(fd))
+        return 0;
     noise_state_t ns;
     if (!noise_handshake_responder(&ns, fd, ctx))
         return 0;

@@ -10,6 +10,7 @@
 typedef struct {
     sqlite3 *db;
     char path[256];
+    int in_transaction;  /* nonzero if BEGIN has been issued */
 } persist_t;
 
 /* Open or create database at path. Creates schema if needed.
@@ -28,6 +29,9 @@ int persist_commit(persist_t *p);
 
 /* Rollback the current transaction. Returns 1 on success, 0 on error. */
 int persist_rollback(persist_t *p);
+
+/* Check if a transaction is currently active. */
+int persist_in_transaction(const persist_t *p);
 
 /* --- Factory persistence --- */
 
