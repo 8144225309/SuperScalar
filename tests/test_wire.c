@@ -1030,3 +1030,39 @@ int test_regtest_wire_factory_arity1(void) {
     TEST_ASSERT(all_children_ok, "all arity-1 clients");
     return 1;
 }
+
+/* --- Wire frame size limit (Phase 2: item 2.5) --- */
+
+int test_wire_oversized_frame_rejected(void) {
+    /* WIRE_MAX_FRAME_SIZE is 64KB.  Build a JSON payload that exceeds it. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    /* Build a JSON object with a huge string value (> 65536 bytes total frame) */
+    cJSON *big = cJSON_CreateObject();
+    size_t pad_len = WIRE_MAX_FRAME_SIZE + 100;
+    char *pad = (char *)malloc(pad_len + 1);
+    TEST_ASSERT(pad != NULL, "alloc pad");
+    memset(pad, 'A', pad_len);
+    pad[pad_len] = '\0';
+    cJSON_AddStringToObject(big, "data", pad);
+    free(pad);
+
+    /* wire_send should succeed (it writes regardless of receiver) */
+    int sent = wire_send(sv[0], MSG_HELLO, big);
+    cJSON_Delete(big);
+    /* Close writer to signal EOF */
+    wire_close(sv[0]);
+
+    /* wire_recv should reject because total frame exceeds WIRE_MAX_FRAME_SIZE */
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    int got = wire_recv(sv[1], &msg);
+    if (msg.json) cJSON_Delete(msg.json);
+    wire_close(sv[1]);
+
+    /* Either the send failed (because the JSON is too large to serialize into
+       a frame that fits in the 4-byte length), or the recv rejects it. */
+    TEST_ASSERT(sent == 0 || got == 0, "oversized frame rejected");
+    return 1;
+}

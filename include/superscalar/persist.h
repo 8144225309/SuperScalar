@@ -13,10 +13,18 @@ typedef struct {
     int in_transaction;  /* nonzero if BEGIN has been issued */
 } persist_t;
 
+/* Current schema version. Bump when adding migrations. */
+#define PERSIST_SCHEMA_VERSION 1
+
 /* Open or create database at path. Creates schema if needed.
+   Runs migrations if DB version < code version.
+   Rejects if DB version > code version (prevents old code on new DB).
    Pass NULL or ":memory:" for in-memory database.
    Returns 1 on success, 0 on error. */
 int persist_open(persist_t *p, const char *path);
+
+/* Get the current schema version from the database. Returns 0 if unknown. */
+int persist_schema_version(persist_t *p);
 
 /* Close database. */
 void persist_close(persist_t *p);
@@ -353,5 +361,17 @@ int persist_update_jit_balance(persist_t *p, uint32_t jit_id,
 
 /* Delete a JIT channel by ID. */
 int persist_delete_jit_channel(persist_t *p, uint32_t jit_id);
+
+/* --- Flat revocation secrets (Phase 2: item 2.8) --- */
+
+/* Save flat revocation secrets for a factory. */
+int persist_save_flat_secrets(persist_t *p, uint32_t factory_id,
+                               const unsigned char secrets[][32],
+                               size_t n_secrets);
+
+/* Load flat revocation secrets. Returns count loaded. */
+size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
+                                  unsigned char secrets_out[][32],
+                                  size_t max_secrets);
 
 #endif /* SUPERSCALAR_PERSIST_H */

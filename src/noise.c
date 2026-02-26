@@ -415,3 +415,167 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
     secure_zero(shared, 32);
     return 1;
 }
+
+/* --- NK pattern (server-authenticated) --- */
+
+/* Derive symmetric keys from two ECDH results (ee + es).
+   Combined: HKDF(salt="superscalar-nk-v1", ikm=shared_ee||shared_es) */
+static void derive_keys_nk(noise_state_t *ns,
+                             const unsigned char shared_ee[32],
+                             const unsigned char shared_es[32],
+                             int is_initiator) {
+    unsigned char combined[64];
+    memcpy(combined, shared_ee, 32);
+    memcpy(combined + 32, shared_es, 32);
+
+    unsigned char prk[32];
+    const char *salt = "superscalar-nk-v1";
+    hkdf_extract(prk, (const unsigned char *)salt, strlen(salt), combined, 64);
+
+    unsigned char key_init[32], key_resp[32];
+    const char *info_init = "initiator";
+    const char *info_resp = "responder";
+    hkdf_expand(key_init, 32, prk, (const unsigned char *)info_init, strlen(info_init));
+    hkdf_expand(key_resp, 32, prk, (const unsigned char *)info_resp, strlen(info_resp));
+
+    if (is_initiator) {
+        memcpy(ns->send_key, key_init, 32);
+        memcpy(ns->recv_key, key_resp, 32);
+    } else {
+        memcpy(ns->send_key, key_resp, 32);
+        memcpy(ns->recv_key, key_init, 32);
+    }
+    ns->send_nonce = 0;
+    ns->recv_nonce = 0;
+
+    secure_zero(prk, 32);
+    secure_zero(key_init, 32);
+    secure_zero(key_resp, 32);
+    secure_zero(combined, 64);
+}
+
+int noise_handshake_nk_initiator(noise_state_t *ns, int fd,
+                                  secp256k1_context *ctx,
+                                  const secp256k1_pubkey *server_pubkey) {
+    if (!ns || fd < 0 || !ctx || !server_pubkey) return 0;
+
+    /* Generate ephemeral keypair */
+    unsigned char eph_sec[32];
+    secp256k1_pubkey eph_pub;
+
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    if (fread(eph_sec, 1, 32, f) != 32) { fclose(f); return 0; }
+    fclose(f);
+
+    if (!secp256k1_ec_seckey_verify(ctx, eph_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &eph_pub, eph_sec)) return 0;
+
+    /* Send our ephemeral pubkey (33 bytes compressed) */
+    unsigned char pub_ser[33];
+    size_t pub_len = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
+                                        SECP256K1_EC_COMPRESSED)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+    if (!noise_write_all(fd, pub_ser, 33)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+
+    /* Receive responder's ephemeral pubkey */
+    unsigned char remote_ser[33];
+    if (!noise_read_all(fd, remote_ser, 33)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+    secp256k1_pubkey remote_eph;
+    if (!secp256k1_ec_pubkey_parse(ctx, &remote_eph, remote_ser, 33)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+
+    /* ee DH: initiator_ephemeral x responder_ephemeral */
+    unsigned char shared_ee[32];
+    if (!secp256k1_ecdh(ctx, shared_ee, &remote_eph, eph_sec, NULL, NULL)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+
+    /* es DH: initiator_ephemeral x server_static (authenticates server) */
+    unsigned char shared_es[32];
+    if (!secp256k1_ecdh(ctx, shared_es, server_pubkey, eph_sec, NULL, NULL)) {
+        secure_zero(eph_sec, 32);
+        secure_zero(shared_ee, 32);
+        return 0;
+    }
+
+    derive_keys_nk(ns, shared_ee, shared_es, 1);
+
+    secure_zero(eph_sec, 32);
+    secure_zero(shared_ee, 32);
+    secure_zero(shared_es, 32);
+    return 1;
+}
+
+int noise_handshake_nk_responder(noise_state_t *ns, int fd,
+                                  secp256k1_context *ctx,
+                                  const unsigned char *static_seckey32) {
+    if (!ns || fd < 0 || !ctx || !static_seckey32) return 0;
+
+    /* Receive initiator's ephemeral pubkey */
+    unsigned char remote_ser[33];
+    if (!noise_read_all(fd, remote_ser, 33)) return 0;
+
+    secp256k1_pubkey remote_eph;
+    if (!secp256k1_ec_pubkey_parse(ctx, &remote_eph, remote_ser, 33))
+        return 0;
+
+    /* Generate our ephemeral keypair */
+    unsigned char eph_sec[32];
+    secp256k1_pubkey eph_pub;
+
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    if (fread(eph_sec, 1, 32, f) != 32) { fclose(f); return 0; }
+    fclose(f);
+
+    if (!secp256k1_ec_seckey_verify(ctx, eph_sec)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &eph_pub, eph_sec)) return 0;
+
+    /* Send our ephemeral pubkey */
+    unsigned char pub_ser[33];
+    size_t pub_len = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
+                                        SECP256K1_EC_COMPRESSED)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+    if (!noise_write_all(fd, pub_ser, 33)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+
+    /* ee DH: responder_ephemeral x initiator_ephemeral */
+    unsigned char shared_ee[32];
+    if (!secp256k1_ecdh(ctx, shared_ee, &remote_eph, eph_sec, NULL, NULL)) {
+        secure_zero(eph_sec, 32);
+        return 0;
+    }
+
+    /* es DH: server_static x initiator_ephemeral */
+    unsigned char shared_es[32];
+    if (!secp256k1_ecdh(ctx, shared_es, &remote_eph, static_seckey32, NULL, NULL)) {
+        secure_zero(eph_sec, 32);
+        secure_zero(shared_ee, 32);
+        return 0;
+    }
+
+    derive_keys_nk(ns, shared_ee, shared_es, 0);
+
+    secure_zero(eph_sec, 32);
+    secure_zero(shared_ee, 32);
+    secure_zero(shared_es, 32);
+    return 1;
+}

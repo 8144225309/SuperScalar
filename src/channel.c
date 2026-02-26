@@ -744,6 +744,11 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
     return channel_receive_revocation_flat(ch, commitment_num, secret32);
 }
 
+void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb) {
+    if (!ch) return;
+    ch->fee_rate_sat_per_kvb = fee_rate_sat_per_kvb;
+}
+
 int channel_near_exhaustion(const channel_t *ch) {
     if (!ch) return 0;
     return ch->commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD;

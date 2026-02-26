@@ -1077,6 +1077,7 @@ static void usage(const char *prog) {
         "  --datadir PATH                    Bitcoin datadir (default: bitcoind default)\n"
         "  --rpcport PORT                    Bitcoin RPC port (default: network default)\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
+        "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help                            Show this help\n",
         prog);
@@ -1103,6 +1104,7 @@ int main(int argc, char *argv[]) {
     int rpcport = 0;
     int fee_rate = 1000;
     int auto_accept_jit = 0;
+    const char *lsp_pubkey_hex = NULL;
     int accept_risk = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
@@ -1188,6 +1190,8 @@ int main(int argc, char *argv[]) {
 
         } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
             auto_accept_jit = 1;
+        } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
+            lsp_pubkey_hex = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1259,6 +1263,28 @@ int main(int argc, char *argv[]) {
         memset(seckey, 0, 32);
         report_close(&rpt);
         return 1;
+    }
+
+    /* NK authentication: pin LSP static pubkey if provided */
+    if (lsp_pubkey_hex) {
+        unsigned char pk_buf[33];
+        if (hex_decode(lsp_pubkey_hex, pk_buf, 33) != 33) {
+            fprintf(stderr, "Error: --lsp-pubkey must be 33-byte compressed pubkey hex\n");
+            memset(seckey, 0, 32);
+            report_close(&rpt);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        secp256k1_pubkey lsp_pk;
+        if (!secp256k1_ec_pubkey_parse(ctx, &lsp_pk, pk_buf, 33)) {
+            fprintf(stderr, "Error: invalid --lsp-pubkey\n");
+            memset(seckey, 0, 32);
+            report_close(&rpt);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        client_set_lsp_pubkey(&lsp_pk);
+        printf("Client: NK authentication enabled (pinned LSP pubkey)\n");
     }
 
     /* Report: client pubkey */

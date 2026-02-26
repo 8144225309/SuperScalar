@@ -1402,3 +1402,33 @@ int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
     secure_zero(&ns, sizeof(ns));
     return 1;
 }
+
+int wire_noise_handshake_nk_initiator(int fd, secp256k1_context *ctx,
+                                        const secp256k1_pubkey *server_pubkey) {
+    if (!wire_mark_encryption_required(fd))
+        return 0;
+    noise_state_t ns;
+    if (!noise_handshake_nk_initiator(&ns, fd, ctx, server_pubkey))
+        return 0;
+    if (!wire_set_encryption(fd, &ns)) {
+        secure_zero(&ns, sizeof(ns));
+        return 0;
+    }
+    secure_zero(&ns, sizeof(ns));
+    return 1;
+}
+
+int wire_noise_handshake_nk_responder(int fd, secp256k1_context *ctx,
+                                        const unsigned char *static_seckey32) {
+    if (!wire_mark_encryption_required(fd))
+        return 0;
+    noise_state_t ns;
+    if (!noise_handshake_nk_responder(&ns, fd, ctx, static_seckey32))
+        return 0;
+    if (!wire_set_encryption(fd, &ns)) {
+        secure_zero(&ns, sizeof(ns));
+        return 0;
+    }
+    secure_zero(&ns, sizeof(ns));
+    return 1;
+}

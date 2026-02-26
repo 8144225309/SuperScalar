@@ -116,6 +116,14 @@ typedef struct {
     unsigned char shachain_seed[32];
     int has_shachain;
 
+    /* Flat revocation secrets (Phase 2: item 2.8).
+       ZmnSCPxj recommends flat secrets for multi-signer: each epoch gets
+       an independent random 32-byte secret. Storage: 256*32 = 8KB. */
+    #define FACTORY_MAX_EPOCHS 256
+    unsigned char revocation_secrets[FACTORY_MAX_EPOCHS][32];
+    size_t n_revocation_secrets;
+    int use_flat_secrets;  /* 1 = flat, 0 = shachain (legacy) */
+
     /* Per-leaf DW layers (for independent leaf advance) */
     dw_layer_t leaf_layers[8];    /* up to 8 leaf nodes (arity-1: 4, arity-2: 2) */
     int n_leaf_nodes;              /* number of leaf state nodes */
@@ -183,6 +191,16 @@ void factory_free(factory_t *f);
 
 /* Enable shachain-based L-output invalidation. Call before factory_build_tree. */
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32);
+
+/* Flat revocation secrets API (Phase 2: item 2.8).
+   Enable flat secrets mode. Generates n random 32-byte secrets.
+   Call before factory_build_tree. New factories should use this. */
+int factory_generate_flat_secrets(factory_t *f, size_t n_epochs);
+
+/* Set pre-loaded flat secrets (for persistence reload). */
+void factory_set_flat_secrets(factory_t *f,
+                               const unsigned char secrets[][32],
+                               size_t n_secrets);
 
 /* Get the revocation secret for a given epoch (for sharing with clients). */
 int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,

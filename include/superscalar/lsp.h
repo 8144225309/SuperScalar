@@ -27,6 +27,15 @@ typedef struct {
     /* Listen socket */
     int listen_fd;
     int port;
+
+    /* Accept timeout: max seconds to wait for each client connection.
+       0 = no timeout (block indefinitely, default). */
+    int accept_timeout_sec;
+
+    /* NK (server-authenticated) handshake. If use_nk=1, lsp_accept_clients
+       uses Noise NK with nk_seckey instead of NN. Default: 0 (NN). */
+    int use_nk;
+    unsigned char nk_seckey[32];
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

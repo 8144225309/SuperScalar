@@ -301,9 +301,10 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     jit->created_block = (cur_h > 0) ? (uint32_t)cur_h : 0;
 
     /* Initialize channel_t for the JIT channel */
-    fee_estimator_t jit_fe;
-    fee_init(&jit_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&jit_fe, 0);
+    fee_estimator_t jit_fe_default;
+    const fee_estimator_t *jit_fe = (const fee_estimator_t *)mgr->fee;
+    if (!jit_fe) { fee_init(&jit_fe_default, 1000); jit_fe = &jit_fe_default; }
+    uint64_t commit_fee = fee_for_commitment_tx(jit_fe, 0);
     uint64_t usable = actual_amount > commit_fee ? actual_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
     uint64_t remote_amount = usable - local_amount;
@@ -318,6 +319,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         return 0;
     }
     jit->channel.funder_is_local = 1;
+    if (jit_fe) channel_set_fee_rate(&jit->channel, jit_fe->fee_rate_sat_per_kvb);
 
     /* Generate random basepoints */
     if (!channel_generate_random_basepoints(&jit->channel)) {

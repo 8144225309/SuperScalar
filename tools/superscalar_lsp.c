@@ -76,6 +76,7 @@ static void usage(const char *prog) {
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
+        "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
@@ -468,6 +469,7 @@ int main(int argc, char *argv[]) {
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
+    int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
@@ -545,6 +547,13 @@ int main(int argc, char *argv[]) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
                 fprintf(stderr, "Error: --confirm-timeout must be positive\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--accept-timeout") == 0 && i + 1 < argc) {
+            accept_timeout_arg = atoi(argv[++i]);
+            if (accept_timeout_arg <= 0) {
+                fprintf(stderr, "Error: --accept-timeout must be positive\n");
                 return 1;
             }
         }
@@ -700,6 +709,7 @@ int main(int argc, char *argv[]) {
     /* Initialize fee estimator */
     fee_estimator_t fee_est;
     fee_init(&fee_est, fee_rate);
+    if (!is_regtest) fee_est.use_estimatesmartfee = 1;
     if (!is_regtest && fee_update_from_node(&fee_est, &rt, 6)) {
         printf("LSP: fee rate from estimatesmartfee(6): %llu sat/kvB\n",
                (unsigned long long)fee_est.fee_rate_sat_per_kvb);
@@ -736,6 +746,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             g_lsp = &lsp;
+            lsp.use_nk = 1;
+            memcpy(lsp.nk_seckey, lsp_seckey, 32);
 
             signal(SIGINT, sigint_handler);
             signal(SIGTERM, sigint_handler);
@@ -785,6 +797,8 @@ int main(int argc, char *argv[]) {
 
             /* Initialize channels from DB */
             lsp_channel_mgr_t mgr;
+            memset(&mgr, 0, sizeof(mgr));
+            mgr.fee = &fee_est;
             if (!lsp_channels_init_from_db(&mgr, ctx, &lsp.factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
@@ -796,10 +810,6 @@ int main(int argc, char *argv[]) {
             }
             mgr.persist = &db;
             mgr.confirm_timeout_secs = confirm_timeout_secs;
-
-            /* Set fee rate on all channels */
-            for (size_t c = 0; c < mgr.n_channels; c++)
-                mgr.entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
 
             /* Load persisted state: invoices, HTLC origins, request_id */
             mgr.next_request_id = persist_load_counter(&db, "next_request_id", 1);
@@ -1050,6 +1060,28 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     g_lsp = &lsp;
+    lsp.accept_timeout_sec = accept_timeout_arg;
+
+    /* Enable NK (server-authenticated) noise handshake */
+    lsp.use_nk = 1;
+    memcpy(lsp.nk_seckey, lsp_seckey, 32);
+    {
+        secp256k1_pubkey nk_pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &nk_pub, lsp_seckey)) {
+            fprintf(stderr, "LSP: failed to derive NK static pubkey\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        unsigned char nk_pub_ser[33];
+        size_t nk_pub_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, nk_pub_ser, &nk_pub_len, &nk_pub,
+                                       SECP256K1_EC_COMPRESSED);
+        char nk_hex[67];
+        hex_encode(nk_pub_ser, 33, nk_hex);
+        printf("LSP: NK static pubkey: %s\n", nk_hex);
+        printf("LSP: clients should use --lsp-pubkey %s\n", nk_hex);
+    }
 
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
@@ -1386,6 +1418,7 @@ int main(int argc, char *argv[]) {
         test_distrib || test_turnover || test_rotation || force_close) {
         /* Set fee policy before init (init preserves these across memset) */
         memset(&mgr, 0, sizeof(mgr));
+        mgr.fee = &fee_est;
         mgr.routing_fee_ppm = routing_fee_ppm;
         mgr.lsp_balance_pct = lsp_balance_pct;
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
@@ -2653,6 +2686,7 @@ int main(int argc, char *argv[]) {
         /* Initialize new channel manager + send CHANNEL_READY */
         lsp_channel_mgr_t mgr2;
         memset(&mgr2, 0, sizeof(mgr2));
+        mgr2.fee = &fee_est;
         mgr2.routing_fee_ppm = routing_fee_ppm;
         mgr2.lsp_balance_pct = lsp_balance_pct;
         if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {

@@ -383,6 +383,21 @@ extern int test_htlc_dust_amount_rejected(void);
 extern int test_htlc_reserve_enforcement(void);
 extern int test_factory_advance_past_exhaustion(void);
 
+/* Phase 2: Testnet Ready */
+extern int test_wire_oversized_frame_rejected(void);
+extern int test_cltv_delta_enforcement(void);
+extern int test_persist_schema_version(void);
+extern int test_persist_schema_future_reject(void);
+extern int test_persist_validate_factory_load(void);
+extern int test_persist_validate_channel_load(void);
+extern int test_factory_flat_secrets_round_trip(void);
+extern int test_factory_flat_secrets_persistence(void);
+extern int test_fee_estimator_wiring(void);
+extern int test_fee_estimator_null_fallback(void);
+extern int test_accept_timeout(void);
+extern int test_noise_nk_handshake(void);
+extern int test_noise_nk_wrong_pubkey(void);
+
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
 extern int test_factory_arity1_leaf_outputs(void);
@@ -721,6 +736,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_dust_amount_rejected);
     RUN_TEST(test_htlc_reserve_enforcement);
     RUN_TEST(test_factory_advance_past_exhaustion);
+
+    printf("\n=== Phase 2: Testnet Ready ===\n");
+    RUN_TEST(test_wire_oversized_frame_rejected);
+    RUN_TEST(test_cltv_delta_enforcement);
+    RUN_TEST(test_persist_schema_version);
+    RUN_TEST(test_persist_schema_future_reject);
+    RUN_TEST(test_persist_validate_factory_load);
+    RUN_TEST(test_persist_validate_channel_load);
+    RUN_TEST(test_factory_flat_secrets_round_trip);
+    RUN_TEST(test_factory_flat_secrets_persistence);
+    RUN_TEST(test_fee_estimator_wiring);
+    RUN_TEST(test_fee_estimator_null_fallback);
+    RUN_TEST(test_accept_timeout);
+    RUN_TEST(test_noise_nk_handshake);
+    RUN_TEST(test_noise_nk_wrong_pubkey);
 
     printf("\n=== Arity-1 Leaves ===\n");
     RUN_TEST(test_factory_build_tree_arity1);

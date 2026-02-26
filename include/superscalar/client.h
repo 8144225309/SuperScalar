@@ -106,4 +106,9 @@ int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
 
+/* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
+   If set (non-NULL), all future connections use Noise NK instead of NN.
+   If NULL (default), falls back to NN with no server authentication. */
+void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey);
+
 #endif /* SUPERSCALAR_CLIENT_H */

@@ -8,6 +8,11 @@
 #include <signal.h>
 #include <time.h>
 
+/* Safety margin for HTLC forwarding: outgoing cltv_expiry is reduced by this
+   delta so the LSP has time to claim on-chain if the factory needs a unilateral
+   close before the upstream HTLC expires. 40 blocks ~ 6.7 hours. */
+#define FACTORY_CLTV_DELTA 40
+
 /* Per-client channel entry managed by the LSP */
 typedef struct {
     channel_t channel;          /* Poon-Dryja channel (LSP=local, client=remote) */
@@ -55,6 +60,9 @@ typedef struct {
 
     /* Watchtower (Phase 18) */
     watchtower_t *watchtower;
+
+    /* Fee estimator (Phase 2) */
+    void *fee;      /* fee_estimator_t* or NULL — avoids header dependency */
 
     /* Persistence (Phase 23) */
     void *persist;  /* persist_t* or NULL — avoids header dependency */

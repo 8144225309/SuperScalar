@@ -181,10 +181,16 @@ static int add_node(
    If not: simple P2TR of LSP key. */
 static int build_l_stock_spk(const factory_t *f, unsigned char *spk_out34) {
     if (f->has_shachain) {
-        /* Get current epoch's shachain secret and compute SHA256 hash */
-        uint64_t sc_index = shachain_epoch_to_index(f->counter.current_epoch);
+        /* Get current epoch's revocation secret and compute SHA256 hash */
         unsigned char secret[32];
-        shachain_from_seed(f->shachain_seed, sc_index, secret);
+        if (f->use_flat_secrets) {
+            uint32_t epoch = f->counter.current_epoch;
+            if (epoch >= f->n_revocation_secrets) return 0;
+            memcpy(secret, f->revocation_secrets[epoch], 32);
+        } else {
+            uint64_t sc_index = shachain_epoch_to_index(f->counter.current_epoch);
+            shachain_from_seed(f->shachain_seed, sc_index, secret);
+        }
 
         unsigned char hash[32];
         sha256(secret, 32, hash);
@@ -1170,10 +1176,47 @@ void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {
     f->has_shachain = 1;
 }
 
+int factory_generate_flat_secrets(factory_t *f, size_t n_epochs) {
+    if (!f || n_epochs == 0 || n_epochs > FACTORY_MAX_EPOCHS) return 0;
+
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (!urandom) return 0;
+
+    for (size_t i = 0; i < n_epochs; i++) {
+        if (fread(f->revocation_secrets[i], 1, 32, urandom) != 32) {
+            fclose(urandom);
+            memset(f->revocation_secrets, 0, sizeof(f->revocation_secrets));
+            return 0;
+        }
+    }
+    fclose(urandom);
+
+    f->n_revocation_secrets = n_epochs;
+    f->use_flat_secrets = 1;
+    f->has_shachain = 1;  /* reuse shachain infrastructure for L-stock */
+    return 1;
+}
+
+void factory_set_flat_secrets(factory_t *f,
+                               const unsigned char secrets[][32],
+                               size_t n_secrets) {
+    if (!f || !secrets || n_secrets == 0) return;
+    if (n_secrets > FACTORY_MAX_EPOCHS) n_secrets = FACTORY_MAX_EPOCHS;
+    memcpy(f->revocation_secrets, secrets, n_secrets * 32);
+    f->n_revocation_secrets = n_secrets;
+    f->use_flat_secrets = 1;
+    f->has_shachain = 1;
+}
+
 int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
                                     unsigned char *secret_out32) {
     if (!f->has_shachain)
         return 0;
+    if (f->use_flat_secrets) {
+        if (epoch >= f->n_revocation_secrets) return 0;
+        memcpy(secret_out32, f->revocation_secrets[epoch], 32);
+        return 1;
+    }
     uint64_t sc_index = shachain_epoch_to_index(epoch);
     shachain_from_seed(f->shachain_seed, sc_index, secret_out32);
     return 1;
@@ -1188,10 +1231,15 @@ int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
     if (!f->has_shachain)
         return 0;
 
-    /* 1. Derive shachain secret for the given epoch */
-    uint64_t sc_index = shachain_epoch_to_index(epoch);
+    /* 1. Derive revocation secret for the given epoch */
     unsigned char secret[32];
-    shachain_from_seed(f->shachain_seed, sc_index, secret);
+    if (f->use_flat_secrets) {
+        if (epoch >= f->n_revocation_secrets) return 0;
+        memcpy(secret, f->revocation_secrets[epoch], 32);
+    } else {
+        uint64_t sc_index = shachain_epoch_to_index(epoch);
+        shachain_from_seed(f->shachain_seed, sc_index, secret);
+    }
 
     /* 2. Compute SHA256(secret) -> hashlock hash */
     unsigned char hash[32];

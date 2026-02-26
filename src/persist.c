@@ -1,5 +1,6 @@
 #include "superscalar/persist.h"
 #include "superscalar/wire.h"
+#include "superscalar/channel.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,6 +13,12 @@
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
+
+static const char *SCHEMA_VERSION_SQL =
+    "CREATE TABLE IF NOT EXISTS schema_version ("
+    "  version INTEGER NOT NULL,"
+    "  applied_at INTEGER DEFAULT (strftime('%s','now'))"
+    ");";
 
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS factories ("
@@ -244,6 +251,13 @@ static const char *SCHEMA_SQL =
     "  created_block INTEGER,"
     "  target_factory_id INTEGER DEFAULT 0,"
     "  funding_tx_hex TEXT"
+    ");"
+    /* Phase 2: Flat revocation secrets (item 2.8) */
+    "CREATE TABLE IF NOT EXISTS factory_revocation_secrets ("
+    "  factory_id INTEGER NOT NULL,"
+    "  epoch INTEGER NOT NULL,"
+    "  secret TEXT NOT NULL,"
+    "  PRIMARY KEY (factory_id, epoch)"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -269,8 +283,42 @@ int persist_open(persist_t *p, const char *path) {
     /* Enforce foreign key constraints */
     sqlite3_exec(p->db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
 
-    /* Create schema */
+    /* Create schema_version table first (always safe, idempotent) */
     char *errmsg = NULL;
+    rc = sqlite3_exec(p->db, SCHEMA_VERSION_SQL, NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "persist_open: schema_version table error: %s\n", errmsg);
+        sqlite3_free(errmsg);
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
+
+    /* Check existing DB version */
+    int db_version = 0;
+    {
+        sqlite3_stmt *vstmt;
+        if (sqlite3_prepare_v2(p->db,
+                "SELECT MAX(version) FROM schema_version;",
+                -1, &vstmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(vstmt) == SQLITE_ROW &&
+                sqlite3_column_type(vstmt, 0) != SQLITE_NULL) {
+                db_version = sqlite3_column_int(vstmt, 0);
+            }
+            sqlite3_finalize(vstmt);
+        }
+    }
+
+    /* Reject if DB version > code version (old code on new DB) */
+    if (db_version > PERSIST_SCHEMA_VERSION) {
+        fprintf(stderr, "persist_open: DB schema version %d > code version %d "
+                "(upgrade your binary)\n", db_version, PERSIST_SCHEMA_VERSION);
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
+
+    /* Create main schema (all IF NOT EXISTS, safe on existing DBs) */
     rc = sqlite3_exec(p->db, SCHEMA_SQL, NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "persist_open: schema error: %s\n", errmsg);
@@ -278,6 +326,19 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_close(p->db);
         p->db = NULL;
         return 0;
+    }
+
+    /* Run migrations from db_version+1 to PERSIST_SCHEMA_VERSION.
+       Currently version 1 is the baseline — no migrations yet.
+       Future migrations go here as: if (db_version < 2) { ... } */
+
+    /* Record the current version if not already present */
+    if (db_version < PERSIST_SCHEMA_VERSION) {
+        char vsql[128];
+        snprintf(vsql, sizeof(vsql),
+                 "INSERT INTO schema_version (version) VALUES (%d);",
+                 PERSIST_SCHEMA_VERSION);
+        sqlite3_exec(p->db, vsql, NULL, NULL, NULL);
     }
 
     return 1;
@@ -288,6 +349,24 @@ void persist_close(persist_t *p) {
         sqlite3_close(p->db);
         p->db = NULL;
     }
+}
+
+int persist_schema_version(persist_t *p) {
+    if (!p || !p->db) return 0;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT MAX(version) FROM schema_version;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    int version = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW &&
+        sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        version = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return version;
 }
 
 int persist_begin(persist_t *p) {
@@ -438,6 +517,32 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     int leaf_arity = sqlite3_column_int(stmt, 8);
     if (leaf_arity != 1) leaf_arity = 2;  /* default to arity-2 */
 
+    /* Data validation (Phase 2: item 2.6) */
+    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
+        fprintf(stderr, "persist_load_factory: invalid n_participants %zu\n",
+                n_participants);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (funding_amount == 0) {
+        fprintf(stderr, "persist_load_factory: funding_amount is 0\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (states_per_layer == 0) {
+        fprintf(stderr, "persist_load_factory: states_per_layer is 0\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (step_blocks == 0) {
+        fprintf(stderr, "persist_load_factory: step_blocks is 0\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    (void)cltv_timeout;
+    (void)fee_per_tx;
+
     unsigned char funding_txid[32];
     if (txid_hex)
         hex_decode(txid_hex, funding_txid, 32);
@@ -584,12 +689,26 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
         return 0;
     }
 
-    if (local_amount)
-        *local_amount = (uint64_t)sqlite3_column_int64(stmt, 0);
-    if (remote_amount)
-        *remote_amount = (uint64_t)sqlite3_column_int64(stmt, 1);
-    if (commitment_number)
-        *commitment_number = (uint64_t)sqlite3_column_int64(stmt, 2);
+    uint64_t la = (uint64_t)sqlite3_column_int64(stmt, 0);
+    uint64_t ra = (uint64_t)sqlite3_column_int64(stmt, 1);
+    uint64_t cn = (uint64_t)sqlite3_column_int64(stmt, 2);
+
+    /* Data validation (Phase 2: item 2.6) */
+    if (cn > CHANNEL_MAX_SECRETS) {
+        fprintf(stderr, "persist_load_channel_state: commitment_number %llu "
+                "exceeds max %d\n", (unsigned long long)cn, CHANNEL_MAX_SECRETS);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (la == 0 && ra == 0) {
+        fprintf(stderr, "persist_load_channel_state: total balance is 0\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    if (local_amount) *local_amount = la;
+    if (remote_amount) *remote_amount = ra;
+    if (commitment_number) *commitment_number = cn;
 
     sqlite3_finalize(stmt);
     return 1;
@@ -2363,4 +2482,71 @@ int persist_delete_jit_channel(persist_t *p, uint32_t jit_id) {
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+/* --- Flat revocation secrets (Phase 2: item 2.8) --- */
+
+int persist_save_flat_secrets(persist_t *p, uint32_t factory_id,
+                               const unsigned char secrets[][32],
+                               size_t n_secrets) {
+    if (!p || !p->db || !secrets || n_secrets == 0) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO factory_revocation_secrets "
+        "(factory_id, epoch, secret) VALUES (?, ?, ?);";
+
+    int own_txn = !p->in_transaction;
+    if (own_txn && !persist_begin(p)) return 0;
+
+    for (size_t i = 0; i < n_secrets; i++) {
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
+
+        char hex[65];
+        hex_encode(secrets[i], 32, hex);
+
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)i);
+        sqlite3_bind_text(stmt, 3, hex, -1, SQLITE_TRANSIENT);
+
+        int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        if (!ok) {
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
+    }
+
+    if (own_txn) return persist_commit(p);
+    return 1;
+}
+
+size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
+                                  unsigned char secrets_out[][32],
+                                  size_t max_secrets) {
+    if (!p || !p->db || !secrets_out || max_secrets == 0) return 0;
+
+    const char *sql =
+        "SELECT epoch, secret FROM factory_revocation_secrets "
+        "WHERE factory_id = ? ORDER BY epoch;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_secrets) {
+        int epoch = sqlite3_column_int(stmt, 0);
+        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (!hex || epoch < 0 || (size_t)epoch >= max_secrets) continue;
+        if (hex_decode(hex, secrets_out[epoch], 32) != 32) continue;
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }

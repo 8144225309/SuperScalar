@@ -259,6 +259,10 @@ int channel_build_penalty_tx(const channel_t *ch,
                                const unsigned char *anchor_spk,
                                size_t anchor_spk_len);
 
+/* Set the fee rate (sat/kvB) used for penalty/HTLC transactions.
+   Default is 1000 sat/kvB (1 sat/vB). */
+void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb);
+
 /* Returns 1 if commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD */
 int channel_near_exhaustion(const channel_t *ch);
 

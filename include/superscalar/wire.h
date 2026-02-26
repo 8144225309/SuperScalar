@@ -79,7 +79,7 @@
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
-#define WIRE_MAX_FRAME_SIZE     (1024 * 1024)   /* 1 MB */
+#define WIRE_MAX_FRAME_SIZE     (65536)         /* 64 KB */
 #define WIRE_DEFAULT_TIMEOUT_SEC 120
 
 /* --- Wire frame: [uint32 len][uint8 type][JSON payload] --- */
@@ -471,6 +471,14 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx);
    Call after wire_accept(), before any wire_send/wire_recv.
    Returns 1 on success, 0 on failure. */
 int wire_noise_handshake_responder(int fd, secp256k1_context *ctx);
+
+/* NK (server-authenticated) variants.
+   Initiator pins server's static pubkey; responder uses its static secret.
+   Returns 1 on success, 0 on failure (wrong server key = failure). */
+int wire_noise_handshake_nk_initiator(int fd, secp256k1_context *ctx,
+                                        const secp256k1_pubkey *server_pubkey);
+int wire_noise_handshake_nk_responder(int fd, secp256k1_context *ctx,
+                                        const unsigned char *static_seckey32);
 
 /* --- Wire message logging (Phase 22) --- */
 

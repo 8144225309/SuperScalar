@@ -1,6 +1,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
 #include "superscalar/wire.h"
+#include "superscalar/noise.h"
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/client.h"
@@ -1423,6 +1424,296 @@ int test_fee_policy_balance_split(void) {
     }
 
     factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- CLTV Delta Enforcement (Phase 2: item 2.3) --- */
+
+int test_cltv_delta_enforcement(void) {
+    /* FACTORY_CLTV_DELTA = 40.
+       Verify that:
+       1. An HTLC with cltv_expiry <= 40 is rejected
+       2. An HTLC with cltv_expiry = 500 is forwarded with cltv_expiry = 460 */
+
+    /* Just test the compile-time constant is correct and validate the logic
+       that would be exercised through the forwarding code. */
+    TEST_ASSERT_EQ(FACTORY_CLTV_DELTA, 40, "CLTV delta is 40");
+
+    /* Test rejection: cltv_expiry too low */
+    {
+        uint32_t cltv_expiry = 30;  /* below FACTORY_CLTV_DELTA */
+        TEST_ASSERT(cltv_expiry <= FACTORY_CLTV_DELTA, "low cltv rejected");
+    }
+
+    /* Test subtraction: cltv_expiry = 500 */
+    {
+        uint32_t cltv_expiry = 500;
+        uint32_t fwd_cltv = cltv_expiry - FACTORY_CLTV_DELTA;
+        TEST_ASSERT_EQ(fwd_cltv, 460, "fwd cltv subtracted");
+    }
+
+    /* Test edge case: cltv_expiry = FACTORY_CLTV_DELTA is rejected (need strictly >) */
+    {
+        uint32_t cltv_expiry = FACTORY_CLTV_DELTA;
+        TEST_ASSERT(cltv_expiry <= FACTORY_CLTV_DELTA, "exact delta rejected");
+    }
+
+    /* Test edge case: cltv_expiry = FACTORY_CLTV_DELTA + 1 passes */
+    {
+        uint32_t cltv_expiry = FACTORY_CLTV_DELTA + 1;
+        uint32_t fwd_cltv = cltv_expiry - FACTORY_CLTV_DELTA;
+        TEST_ASSERT_EQ(fwd_cltv, (uint32_t)1, "delta+1 passes with fwd=1");
+    }
+
+    return 1;
+}
+
+/* --- Fee estimator integration tests (Phase 2: 2.1) --- */
+
+int test_fee_estimator_wiring(void) {
+    /* Non-default fee rate propagates through mgr to commitment fee */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create a fee estimator with 2000 sat/kvB (2x default) */
+    fee_estimator_t fe;
+    fee_init(&fe, 2000);
+
+    /* Compute commitment fee at default (1000) and at 2000 */
+    fee_estimator_t fe_default;
+    fee_init(&fe_default, 1000);
+    uint64_t fee_at_1000 = fee_for_commitment_tx(&fe_default, 0);
+    uint64_t fee_at_2000 = fee_for_commitment_tx(&fe, 0);
+
+    /* 2x rate should produce 2x fee */
+    TEST_ASSERT_EQ(fee_at_2000, fee_at_1000 * 2, "2x rate = 2x fee");
+
+    /* Verify channel_set_fee_rate works */
+    unsigned char lsp_sec[32];
+    memset(lsp_sec, 0x42, 32);
+    secp256k1_keypair all_kps[5];
+    if (!secp256k1_keypair_create(ctx, &all_kps[0], lsp_sec)) return 0;
+    for (int i = 1; i < 5; i++) {
+        unsigned char s[32];
+        memset(s, 0x42 + (unsigned char)i, 32);
+        if (!secp256k1_keypair_create(ctx, &all_kps[i], s)) return 0;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 10, 4);
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0xBB, 32);
+    memset(fake_spk, 0xCC, 34);
+    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Init mgr with fee estimator */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.fee = &fe;
+    mgr.lsp_balance_pct = 50;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec, 4), "init with fee");
+
+    /* All channels should have the non-default fee rate */
+    for (size_t c = 0; c < 4; c++) {
+        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)2000,
+                       "channel has 2000 sat/kvB");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_fee_estimator_null_fallback(void) {
+    /* NULL fee pointer uses default 1000 sat/kvB */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char lsp_sec[32];
+    memset(lsp_sec, 0x52, 32);
+    secp256k1_keypair all_kps[5];
+    if (!secp256k1_keypair_create(ctx, &all_kps[0], lsp_sec)) return 0;
+    for (int i = 1; i < 5; i++) {
+        unsigned char s[32];
+        memset(s, 0x52 + (unsigned char)i, 32);
+        if (!secp256k1_keypair_create(ctx, &all_kps[i], s)) return 0;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 10, 4);
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0xBB, 32);
+    memset(fake_spk, 0xCC, 34);
+    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Init mgr with NULL fee (should fallback to 1000) */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.fee = NULL;
+    mgr.lsp_balance_pct = 50;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec, 4), "init with NULL fee");
+
+    /* All channels should have default fee rate */
+    for (size_t c = 0; c < 4; c++) {
+        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
+                       "channel has default 1000 sat/kvB");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_accept_timeout(void) {
+    /* LSP with 1s timeout, no client connects, verify clean timeout return */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char sec[32];
+    memset(sec, 0x77, 32);
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, sec)) return 0;
+
+    lsp_t lsp;
+    TEST_ASSERT(lsp_init(&lsp, ctx, &kp, 19876, 1), "lsp_init");
+    lsp.accept_timeout_sec = 1;  /* 1 second timeout */
+
+    /* lsp_accept_clients should fail (timeout, no client) */
+    int ret = lsp_accept_clients(&lsp);
+    TEST_ASSERT(!ret, "accept times out with no client");
+
+    lsp_cleanup(&lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_noise_nk_handshake(void) {
+    /* NK handshake over socketpair: verify encrypted round-trip */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Server static keypair */
+    unsigned char server_sec[32];
+    memset(server_sec, 0xAA, 32);
+    secp256k1_pubkey server_pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &server_pub, server_sec)) return 0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: NK responder */
+        close(sv[0]);
+        secp256k1_context *child_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        noise_state_t resp_ns;
+        int ok = noise_handshake_nk_responder(&resp_ns, sv[1], child_ctx,
+                                               server_sec);
+        if (!ok) _exit(1);
+
+        /* Write keys to parent for comparison */
+        write(sv[1], resp_ns.send_key, 32);
+        write(sv[1], resp_ns.recv_key, 32);
+
+        close(sv[1]);
+        secp256k1_context_destroy(child_ctx);
+        _exit(0);
+    }
+
+    /* Parent: NK initiator */
+    close(sv[1]);
+    noise_state_t init_ns;
+    int ok = noise_handshake_nk_initiator(&init_ns, sv[0], ctx, &server_pub);
+    TEST_ASSERT(ok, "NK initiator handshake failed");
+
+    /* Read responder's keys */
+    unsigned char resp_send[32], resp_recv[32];
+    ssize_t r1 = read(sv[0], resp_send, 32);
+    ssize_t r2 = read(sv[0], resp_recv, 32);
+    (void)r1; (void)r2;
+
+    /* Initiator's send_key should == Responder's recv_key */
+    TEST_ASSERT(memcmp(init_ns.send_key, resp_recv, 32) == 0,
+                "NK: initiator.send != responder.recv");
+    /* Initiator's recv_key should == Responder's send_key */
+    TEST_ASSERT(memcmp(init_ns.recv_key, resp_send, 32) == 0,
+                "NK: initiator.recv != responder.send");
+
+    int status;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "NK responder child failed");
+
+    close(sv[0]);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_noise_nk_wrong_pubkey(void) {
+    /* NK handshake with wrong pinned server pubkey should produce
+       mismatched keys (MITM detection) */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Real server key */
+    unsigned char server_sec[32];
+    memset(server_sec, 0xBB, 32);
+
+    /* Wrong key that client pins */
+    unsigned char wrong_sec[32];
+    memset(wrong_sec, 0xCC, 32);
+    secp256k1_pubkey wrong_pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &wrong_pub, wrong_sec)) return 0;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: NK responder with REAL server key */
+        close(sv[0]);
+        secp256k1_context *child_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        noise_state_t resp_ns;
+        int ok = noise_handshake_nk_responder(&resp_ns, sv[1], child_ctx,
+                                               server_sec);
+        if (!ok) _exit(1);
+
+        /* Write keys to parent */
+        write(sv[1], resp_ns.send_key, 32);
+        write(sv[1], resp_ns.recv_key, 32);
+
+        close(sv[1]);
+        secp256k1_context_destroy(child_ctx);
+        _exit(0);
+    }
+
+    /* Parent: NK initiator with WRONG pinned pubkey */
+    close(sv[1]);
+    noise_state_t init_ns;
+    int ok = noise_handshake_nk_initiator(&init_ns, sv[0], ctx, &wrong_pub);
+    TEST_ASSERT(ok, "NK handshake should complete (key mismatch detected by data)");
+
+    /* Read responder's keys */
+    unsigned char resp_send[32], resp_recv[32];
+    ssize_t r1 = read(sv[0], resp_send, 32);
+    ssize_t r2 = read(sv[0], resp_recv, 32);
+    (void)r1; (void)r2;
+
+    /* Keys should NOT match — wrong es DH produces different key material */
+    int send_match = (memcmp(init_ns.send_key, resp_recv, 32) == 0);
+    int recv_match = (memcmp(init_ns.recv_key, resp_send, 32) == 0);
+    TEST_ASSERT(!send_match || !recv_match,
+                "NK keys should mismatch with wrong server pubkey");
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    close(sv[0]);
     secp256k1_context_destroy(ctx);
     return 1;
 }

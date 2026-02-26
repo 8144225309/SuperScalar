@@ -27,6 +27,21 @@ int noise_handshake_initiator(noise_state_t *ns, int fd,
 int noise_handshake_responder(noise_state_t *ns, int fd,
                                secp256k1_context *ctx);
 
+/* Perform NK handshake as initiator (client side).
+   Like NN but client pins the server's static pubkey for authentication.
+   Additional es DH: client_ephemeral x server_static.
+   Returns 1 on success, 0 on failure (wrong server key = failure). */
+int noise_handshake_nk_initiator(noise_state_t *ns, int fd,
+                                  secp256k1_context *ctx,
+                                  const secp256k1_pubkey *server_pubkey);
+
+/* Perform NK handshake as responder (LSP side).
+   Like NN but uses a static secret key for the additional es DH.
+   Returns 1 on success, 0 on failure. */
+int noise_handshake_nk_responder(noise_state_t *ns, int fd,
+                                  secp256k1_context *ctx,
+                                  const unsigned char *static_seckey32);
+
 /* Register encryption state for an fd.
    After this, wire_send/wire_recv on this fd will encrypt/decrypt.
    Returns 1 on success, 0 if fd table is full. */

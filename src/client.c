@@ -16,6 +16,19 @@ extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 
+/* Optional NK server authentication pubkey (set via client_set_lsp_pubkey) */
+static secp256k1_pubkey g_nk_server_pubkey;
+static int g_nk_server_pubkey_set = 0;
+
+void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
+    if (pubkey) {
+        g_nk_server_pubkey = *pubkey;
+        g_nk_server_pubkey_set = 1;
+    } else {
+        g_nk_server_pubkey_set = 0;
+    }
+}
+
 /* Returns 1 if message is MSG_ERROR (and prints it), 0 otherwise */
 static int check_msg_error(const wire_msg_t *msg) {
     if (msg->msg_type == MSG_ERROR) {
@@ -42,7 +55,8 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const unsigned char *local_pay_sec32,
                                  const unsigned char *local_delay_sec32,
                                  const unsigned char *local_revoc_sec32,
-                                 const unsigned char *local_htlc_sec32) {
+                                 const unsigned char *local_htlc_sec32,
+                                 const fee_estimator_t *fee_est) {
     /* Map client index to leaf output (arity-aware) */
     size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
     size_t node_idx;
@@ -80,9 +94,10 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
 
     /* Commitment tx fee: must match lsp_channels_init so both sides agree. */
-    fee_estimator_t _fe;
-    fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_t _fe_default;
+    const fee_estimator_t *_fe = fee_est;
+    if (!_fe) { fee_init(&_fe_default, 1000); _fe = &_fe_default; }
+    uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
     uint64_t remote_amount = usable - local_amount;
@@ -650,7 +665,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (!client_init_channel(channel_out, ctx, factory_out, keypair, my_index,
                               &rot_lsp_pay_bp, &rot_lsp_delay_bp,
                               &rot_lsp_revoc_bp, &rot_lsp_htlc_bp,
-                              rot_bp_ps, rot_bp_ds, rot_bp_rs, rot_bp_hs)) {
+                              rot_bp_ps, rot_bp_ds, rot_bp_rs, rot_bp_hs, NULL)) {
         free(secnonces); free(nonce_entries); return 0;
     }
     memset(rot_bp_ps, 0, 32); memset(rot_bp_ds, 0, 32);
@@ -725,8 +740,15 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     wire_set_peer_label(fd, "lsp");
 
-    /* Encrypted transport handshake */
-    if (!wire_noise_handshake_initiator(fd, ctx)) {
+    /* Encrypted transport handshake (NK if server pubkey pinned, NN fallback) */
+    int hs_ok;
+    if (g_nk_server_pubkey_set) {
+        hs_ok = wire_noise_handshake_nk_initiator(fd, ctx, &g_nk_server_pubkey);
+    } else {
+        fprintf(stderr, "Client: WARNING — no --lsp-pubkey, using unauthenticated NN handshake\n");
+        hs_ok = wire_noise_handshake_initiator(fd, ctx);
+    }
+    if (!hs_ok) {
         fprintf(stderr, "Client: noise handshake failed\n");
         wire_close(fd);
         return 0;
@@ -1114,7 +1136,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         if (!client_init_channel(&channel, ctx, &factory, keypair, my_index,
                                   &lsp_pay_bp, &lsp_delay_bp,
                                   &lsp_revoc_bp, &lsp_htlc_bp,
-                                  bp_ps, bp_ds, bp_rs, bp_hs)) {
+                                  bp_ps, bp_ds, bp_rs, bp_hs, NULL)) {
             fprintf(stderr, "Client %u: channel init failed\n", my_index);
             goto fail;
         }
@@ -1282,8 +1304,13 @@ int client_run_reconnect(secp256k1_context *ctx,
     }
     wire_set_peer_label(fd, "lsp");
 
-    /* Encrypted transport handshake */
-    if (!wire_noise_handshake_initiator(fd, ctx)) {
+    /* Encrypted transport handshake (NK if server pubkey pinned) */
+    int reconn_hs_ok;
+    if (g_nk_server_pubkey_set)
+        reconn_hs_ok = wire_noise_handshake_nk_initiator(fd, ctx, &g_nk_server_pubkey);
+    else
+        reconn_hs_ok = wire_noise_handshake_initiator(fd, ctx);
+    if (!reconn_hs_ok) {
         fprintf(stderr, "Client reconnect: noise handshake failed\n");
         wire_close(fd);
         factory_free(&factory);
@@ -1363,7 +1390,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     if (!client_init_channel(&channel, ctx, &factory, keypair, my_index,
                               &reconn_lsp_pay_bp, &reconn_lsp_delay_bp,
                               &reconn_lsp_revoc_bp, &reconn_lsp_htlc_bp,
-                              local_secs[0], local_secs[1], local_secs[2], local_secs[3])) {
+                              local_secs[0], local_secs[1], local_secs[2], local_secs[3], NULL)) {
         fprintf(stderr, "Client reconnect: channel init failed\n");
         memset(local_secs, 0, sizeof(local_secs));
         wire_close(fd);

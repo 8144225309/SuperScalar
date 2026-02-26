@@ -1087,3 +1087,141 @@ int test_persist_dw_counter_with_leaves_4(void) {
     persist_close(&db);
     return 1;
 }
+
+/* --- Schema Versioning (Phase 2: item 2.2) --- */
+
+int test_persist_schema_version(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    /* Fresh DB should have version PERSIST_SCHEMA_VERSION (1) */
+    int ver = persist_schema_version(&db);
+    TEST_ASSERT_EQ(ver, PERSIST_SCHEMA_VERSION, "fresh db version");
+
+    persist_close(&db);
+    return 1;
+}
+
+int test_persist_schema_future_reject(void) {
+    /* Create a temporary file DB, inject future version, close, reopen → reject */
+    const char *tmp_path = "/tmp/test_schema_future.db";
+    unlink(tmp_path);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, tmp_path), "open tmp");
+
+    /* Inject a future version row */
+    int rc = sqlite3_exec(db.db,
+        "INSERT INTO schema_version (version) VALUES (999);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "inject future version");
+    persist_close(&db);
+
+    /* Reopen should fail: DB version 999 > code version */
+    persist_t db2;
+    int opened = persist_open(&db2, tmp_path);
+    TEST_ASSERT(opened == 0, "future version rejected");
+
+    unlink(tmp_path);
+    return 1;
+}
+
+/* --- Data Validation on Load (Phase 2: item 2.6) --- */
+
+int test_persist_validate_factory_load(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    secp256k1_context *ctx = test_ctx();
+
+    /* Insert invalid factory: n_participants = 1 (too low, need >= 2) */
+    int rc = sqlite3_exec(db.db,
+        "INSERT INTO factories (id, n_participants, funding_txid, funding_vout, "
+        "funding_amount, step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity) "
+        "VALUES (10, 1, '00', 0, 100000, 10, 8, 200, 500, 2);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert invalid factory");
+
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    int loaded = persist_load_factory(&db, 10, &f, ctx);
+    TEST_ASSERT(loaded == 0, "n_participants=1 rejected");
+
+    /* Insert factory with funding_amount = 0 */
+    rc = sqlite3_exec(db.db,
+        "INSERT OR REPLACE INTO factories (id, n_participants, funding_txid, "
+        "funding_vout, funding_amount, step_blocks, states_per_layer, "
+        "cltv_timeout, fee_per_tx, leaf_arity) "
+        "VALUES (11, 5, '00', 0, 0, 10, 8, 200, 500, 2);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert zero-amount factory");
+    loaded = persist_load_factory(&db, 11, &f, ctx);
+    TEST_ASSERT(loaded == 0, "funding_amount=0 rejected");
+
+    /* Insert factory with states_per_layer = 0 */
+    rc = sqlite3_exec(db.db,
+        "INSERT OR REPLACE INTO factories (id, n_participants, funding_txid, "
+        "funding_vout, funding_amount, step_blocks, states_per_layer, "
+        "cltv_timeout, fee_per_tx, leaf_arity) "
+        "VALUES (12, 5, '00', 0, 100000, 10, 0, 200, 500, 2);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert zero-states factory");
+    loaded = persist_load_factory(&db, 12, &f, ctx);
+    TEST_ASSERT(loaded == 0, "states_per_layer=0 rejected");
+
+    /* Insert factory with step_blocks = 0 */
+    rc = sqlite3_exec(db.db,
+        "INSERT OR REPLACE INTO factories (id, n_participants, funding_txid, "
+        "funding_vout, funding_amount, step_blocks, states_per_layer, "
+        "cltv_timeout, fee_per_tx, leaf_arity) "
+        "VALUES (13, 5, '00', 0, 100000, 0, 8, 200, 500, 2);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert zero-step factory");
+    loaded = persist_load_factory(&db, 13, &f, ctx);
+    TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
+
+    secp256k1_context_destroy(ctx);
+    persist_close(&db);
+    return 1;
+}
+
+int test_persist_validate_channel_load(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    /* Insert a channel with commitment_number exceeding CHANNEL_MAX_SECRETS */
+    int rc = sqlite3_exec(db.db,
+        "INSERT INTO channels (id, factory_id, slot, local_amount, remote_amount, "
+        "funding_amount, commitment_number) VALUES (100, 0, 0, 50000, 50000, "
+        "100000, 999);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert high cn channel");
+
+    uint64_t la, ra, cn;
+    int loaded = persist_load_channel_state(&db, 100, &la, &ra, &cn);
+    TEST_ASSERT(loaded == 0, "commitment_number>256 rejected");
+
+    /* Insert a channel with both balances zero */
+    rc = sqlite3_exec(db.db,
+        "INSERT INTO channels (id, factory_id, slot, local_amount, remote_amount, "
+        "funding_amount, commitment_number) VALUES (101, 0, 1, 0, 0, 100000, 0);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert zero-balance channel");
+    loaded = persist_load_channel_state(&db, 101, &la, &ra, &cn);
+    TEST_ASSERT(loaded == 0, "total balance=0 rejected");
+
+    /* Insert a valid channel — should pass */
+    rc = sqlite3_exec(db.db,
+        "INSERT INTO channels (id, factory_id, slot, local_amount, remote_amount, "
+        "funding_amount, commitment_number) VALUES (102, 0, 2, 50000, 50000, "
+        "100000, 5);",
+        NULL, NULL, NULL);
+    TEST_ASSERT(rc == SQLITE_OK, "insert valid channel");
+    loaded = persist_load_channel_state(&db, 102, &la, &ra, &cn);
+    TEST_ASSERT(loaded == 1, "valid channel loads");
+    TEST_ASSERT_EQ(la, (uint64_t)50000, "local amount");
+    TEST_ASSERT_EQ(ra, (uint64_t)50000, "remote amount");
+    TEST_ASSERT_EQ(cn, (uint64_t)5, "commitment number");
+
+    persist_close(&db);
+    return 1;
+}

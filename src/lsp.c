@@ -38,14 +38,35 @@ int lsp_accept_clients(lsp_t *lsp) {
     lsp->n_clients = 0;
 
     for (size_t i = 0; i < lsp->expected_clients; i++) {
+        /* Timeout: wait for incoming connection with select() */
+        if (lsp->accept_timeout_sec > 0) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(lsp->listen_fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = lsp->accept_timeout_sec;
+            tv.tv_usec = 0;
+            int sel = select(lsp->listen_fd + 1, &rfds, NULL, NULL, &tv);
+            if (sel <= 0) {
+                fprintf(stderr, "LSP: accept timeout waiting for client %zu (%ds)\n",
+                        i, lsp->accept_timeout_sec);
+                goto accept_fail;
+            }
+        }
+
         int fd = wire_accept(lsp->listen_fd);
         if (fd < 0) {
             fprintf(stderr, "LSP: accept failed for client %zu\n", i);
             goto accept_fail;
         }
 
-        /* Encrypted transport handshake */
-        if (!wire_noise_handshake_responder(fd, lsp->ctx)) {
+        /* Encrypted transport handshake (NK if configured, NN fallback) */
+        int hs_ok;
+        if (lsp->use_nk)
+            hs_ok = wire_noise_handshake_nk_responder(fd, lsp->ctx, lsp->nk_seckey);
+        else
+            hs_ok = wire_noise_handshake_responder(fd, lsp->ctx);
+        if (!hs_ok) {
             fprintf(stderr, "LSP: noise handshake failed for client %zu\n", i);
             wire_close(fd);
             goto accept_fail;
@@ -606,7 +627,12 @@ int lsp_accept_bridge(lsp_t *lsp) {
     }
 
     /* Encrypted transport handshake */
-    if (!wire_noise_handshake_responder(fd, lsp->ctx)) {
+    int bridge_hs_ok;
+    if (lsp->use_nk)
+        bridge_hs_ok = wire_noise_handshake_nk_responder(fd, lsp->ctx, lsp->nk_seckey);
+    else
+        bridge_hs_ok = wire_noise_handshake_responder(fd, lsp->ctx);
+    if (!bridge_hs_ok) {
         fprintf(stderr, "LSP: noise handshake failed for bridge\n");
         wire_close(fd);
         return 0;

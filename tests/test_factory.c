@@ -2,6 +2,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/shachain.h"
 #include "superscalar/regtest.h"
+#include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -2959,5 +2960,82 @@ int test_regtest_dw_exhaustion_close(void) {
     tx_buf_free(&close_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- Flat Revocation Secrets (Phase 2: item 2.8) --- */
+
+int test_factory_flat_secrets_round_trip(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 10, 8);
+
+    /* Generate 8 flat revocation secrets */
+    TEST_ASSERT(factory_generate_flat_secrets(&f, 8), "generate flat secrets");
+    TEST_ASSERT_EQ(f.use_flat_secrets, 1, "flat secrets enabled");
+    TEST_ASSERT_EQ(f.n_revocation_secrets, (size_t)8, "8 secrets generated");
+
+    /* Verify secret retrieval works */
+    unsigned char secret0[32], secret1[32];
+    TEST_ASSERT(factory_get_revocation_secret(&f, 0, secret0), "get secret 0");
+    TEST_ASSERT(factory_get_revocation_secret(&f, 1, secret1), "get secret 1");
+    TEST_ASSERT(memcmp(secret0, secret1, 32) != 0, "secrets differ");
+
+    /* Verify out-of-range epoch fails */
+    unsigned char bad[32];
+    TEST_ASSERT(factory_get_revocation_secret(&f, 8, bad) == 0, "epoch 8 OOB");
+
+    /* Build tree and verify L-stock SPK updates work with flat secrets */
+    factory_set_funding(&f, (const unsigned char[32]){0x01}, 0, 1000000,
+                        (const unsigned char[34]){0}, 34);
+    f.cltv_timeout = 200;
+    TEST_ASSERT(factory_build_tree(&f), "build tree with flat secrets");
+
+    /* Advance and verify burn tx still works */
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_advance(&f), "advance epoch 1");
+
+    /* Build burn tx for old epoch 0 */
+    tx_buf_t burn;
+    tx_buf_init(&burn, 256);
+    /* Use leaf state node's txid as dummy l_stock_txid */
+    TEST_ASSERT(factory_build_burn_tx(&f, &burn,
+                f.nodes[4].txid, 2, 1000, 0), "burn tx epoch 0");
+    TEST_ASSERT(burn.len > 0, "burn tx has data");
+    tx_buf_free(&burn);
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_flat_secrets_persistence(void) {
+    /* Test save/load round-trip for flat secrets via persist */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    /* Generate some secrets */
+    unsigned char secrets[4][32];
+    for (int i = 0; i < 4; i++)
+        memset(secrets[i], (unsigned char)(0x10 + i), 32);
+
+    TEST_ASSERT(persist_save_flat_secrets(&db, 0,
+        (const unsigned char (*)[32])secrets, 4), "save flat secrets");
+
+    unsigned char loaded[FACTORY_MAX_EPOCHS][32];
+    memset(loaded, 0, sizeof(loaded));
+    size_t count = persist_load_flat_secrets(&db, 0, loaded, FACTORY_MAX_EPOCHS);
+    TEST_ASSERT_EQ(count, (size_t)4, "loaded 4 secrets");
+
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(memcmp(secrets[i], loaded[i], 32) == 0, "secret matches");
+
+    persist_close(&db);
     return 1;
 }

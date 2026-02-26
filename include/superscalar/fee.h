@@ -9,6 +9,7 @@ struct regtest_t;  /* forward declaration */
 typedef struct {
     uint64_t fee_rate_sat_per_kvb;  /* sat/kilo-vbyte (matches Core's units) */
     int use_estimatesmartfee;        /* if 1, try bitcoin-cli estimatesmartfee */
+    uint64_t last_updated;           /* epoch seconds of last successful update */
 } fee_estimator_t;
 
 /* Initialize with a default fee rate (1000 sat/kvB = 1 sat/vB). */

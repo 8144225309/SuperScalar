@@ -99,9 +99,11 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     /* Preserve fee policy set before init (caller may configure these) */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
+    void *saved_fee = mgr->fee;
     memset(mgr, 0, sizeof(*mgr));
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
+    mgr->fee = saved_fee;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -139,10 +141,11 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
 
-        /* Commitment tx fee: base 154 vB (dynamic with HTLCs via fee module). */
-        fee_estimator_t _fe;
-        fee_init(&_fe, 1000);
-        uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+        /* Commitment tx fee: use manager's fee estimator if available */
+        fee_estimator_t _fe_default;
+        const fee_estimator_t *_fe = (const fee_estimator_t *)mgr->fee;
+        if (!_fe) { fee_init(&_fe_default, 1000); _fe = &_fe_default; }
+        uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
         uint16_t pct = mgr->lsp_balance_pct;
@@ -163,6 +166,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;  /* LSP is funder and local */
+        if (_fe) channel_set_fee_rate(&entry->channel, _fe->fee_rate_sat_per_kvb);
 
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {
@@ -195,9 +199,11 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     /* Preserve fee policy set before init (caller may configure these) */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
+    void *saved_fee2 = mgr->fee;
     memset(mgr, 0, sizeof(*mgr));
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
+    mgr->fee = saved_fee2;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -235,10 +241,11 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
 
-        /* Commitment tx fee */
-        fee_estimator_t _fe;
-        fee_init(&_fe, 1000);
-        uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+        /* Commitment tx fee: use manager's fee estimator if available */
+        fee_estimator_t _fe_default2;
+        const fee_estimator_t *_fe2 = (const fee_estimator_t *)mgr->fee;
+        if (!_fe2) { fee_init(&_fe_default2, 1000); _fe2 = &_fe_default2; }
+        uint64_t commit_fee = fee_for_commitment_tx(_fe2, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         uint16_t pct2 = mgr->lsp_balance_pct;
         if (pct2 == 0) pct2 = 50;
@@ -258,6 +265,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;
+        if (_fe2) channel_set_fee_rate(&entry->channel, _fe2->fee_rate_sat_per_kvb);
 
         /* Load basepoints from DB instead of generating random ones */
         unsigned char local_secrets[4][32];
@@ -636,10 +644,20 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (fwd_amount_sats == 0) return 0;
     }
 
+    /* CLTV delta enforcement: subtract safety margin for factory close.
+       Reject if incoming cltv_expiry is too low to leave room for the delta. */
+    uint32_t fwd_cltv_expiry = cltv_expiry;
+    if (fwd_cltv_expiry <= FACTORY_CLTV_DELTA) {
+        fprintf(stderr, "LSP: cltv_expiry %u too low (need > %d)\n",
+                cltv_expiry, FACTORY_CLTV_DELTA);
+        return 0;
+    }
+    fwd_cltv_expiry -= FACTORY_CLTV_DELTA;
+
     /* Add HTLC to destination's channel (offered from LSP) */
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
-                           payment_hash, cltv_expiry, &dest_htlc_id)) {
+                           payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
         fprintf(stderr, "LSP: forward add_htlc failed to client %zu\n", dest_idx);
         return 0;
     }
@@ -655,7 +673,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         persist_htlc.state = HTLC_STATE_ACTIVE;
         persist_htlc.amount_sats = fwd_amount_sats;
         memcpy(persist_htlc.payment_hash, payment_hash, 32);
-        persist_htlc.cltv_expiry = cltv_expiry;
+        persist_htlc.cltv_expiry = fwd_cltv_expiry;
         persist_save_htlc((persist_t *)mgr->persist,
                             (uint32_t)dest_idx, &persist_htlc);
     }
@@ -663,7 +681,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Forward ADD_HTLC to destination */
     {
         cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, fwd_amount_msat,
-                                                   payment_hash, cltv_expiry);
+                                                   payment_hash, fwd_cltv_expiry);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
             return 0;
@@ -1516,6 +1534,17 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             continue;
         }
         if (ret == 0) {
+            /* Periodic fee refresh (every 60s) */
+            if (mgr->fee && mgr->watchtower && mgr->watchtower->rt) {
+                fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
+                if (fe->use_estimatesmartfee) {
+                    uint64_t now = (uint64_t)time(NULL);
+                    if (now - fe->last_updated >= 60) {
+                        fee_update_from_node(fe, mgr->watchtower->rt, 6);
+                    }
+                }
+            }
+
             /* Timeout — run watchtower check if available */
             if (mgr->watchtower)
                 watchtower_check(mgr->watchtower);
@@ -1725,8 +1754,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (lsp->listen_fd >= 0 && FD_ISSET(lsp->listen_fd, &rfds)) {
             int new_fd = wire_accept(lsp->listen_fd);
             if (new_fd >= 0) {
-                /* Noise handshake */
-                if (!wire_noise_handshake_responder(new_fd, mgr->ctx)) {
+                /* Noise handshake (NK if LSP has static key set) */
+                int reconn_hs;
+                if (lsp->use_nk)
+                    reconn_hs = wire_noise_handshake_nk_responder(new_fd, mgr->ctx, lsp->nk_seckey);
+                else
+                    reconn_hs = wire_noise_handshake_responder(new_fd, mgr->ctx);
+                if (!reconn_hs) {
                     wire_close(new_fd);
                 } else {
                     /* Peek at first message to distinguish bridge vs client */

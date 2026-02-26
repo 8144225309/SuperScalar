@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 void fee_init(fee_estimator_t *fe, uint64_t default_rate_sat_per_kvb) {
     if (!fe) return;
@@ -40,6 +41,7 @@ int fee_update_from_node(fee_estimator_t *fe, void *rt_ptr, int target_blocks) {
     if (sat_per_kvb < 1000) sat_per_kvb = 1000;
 
     fe->fee_rate_sat_per_kvb = sat_per_kvb;
+    fe->last_updated = (uint64_t)time(NULL);
     cJSON_Delete(json);
     return 1;
 }
