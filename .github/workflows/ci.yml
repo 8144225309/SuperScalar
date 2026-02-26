@@ -32,3 +32,72 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: ctest --test-dir build -R unit_tests --output-on-failure
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    name: Static Analysis
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev cppcheck
+      - name: Configure (generate compile_commands.json)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+      - name: Build (needed for FetchContent headers)
+        run: cmake --build build --parallel
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance,portability \
+            --suppress=missingInclude \
+            --suppress=unusedFunction \
+            --project=build/compile_commands.json \
+            --error-exitcode=1 \
+            -i build/_deps \
+            2>&1
+
+  regtest-tests:
+    runs-on: ubuntu-latest
+    name: Regtest Integration
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Download Bitcoin Core 28.1
+        run: |
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+      - name: Configure regtest
+        run: |
+          mkdir -p ~/.bitcoin
+          cat > ~/.bitcoin/bitcoin.conf <<CONF
+          regtest=1
+          server=1
+          rpcuser=rpcuser
+          rpcpassword=rpcpass
+          fallbackfee=0.00001
+          [regtest]
+          rpcport=18443
+          CONF
+      - name: Start bitcoind
+        run: |
+          bitcoind -regtest -daemon
+          sleep 3
+          bitcoin-cli -regtest createwallet "test"
+          bitcoin-cli -regtest -generate 101 > /dev/null
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      - name: Regtest tests
+        run: |
+          cd build && ./test_superscalar --regtest
+      - name: Stop bitcoind
+        if: always()
+        run: bitcoin-cli -regtest stop 2>/dev/null || true
