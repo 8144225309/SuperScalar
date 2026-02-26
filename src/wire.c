@@ -265,7 +265,13 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
         return ok;
     }
 
-    /* Plaintext path (no encryption) */
+    /* Refuse plaintext if encryption was established on this fd */
+    if (wire_is_encryption_required(fd)) {
+        free(payload);
+        return 0;
+    }
+
+    /* Plaintext path (no encryption, no prior handshake) */
     uint32_t frame_len = pt_len;
     unsigned char header[5];
     header[0] = (unsigned char)(frame_len >> 24);
@@ -338,7 +344,11 @@ int wire_recv(int fd, wire_msg_t *msg) {
         return msg->json ? 1 : 0;
     }
 
-    /* Plaintext path */
+    /* Refuse plaintext if encryption was established on this fd */
+    if (wire_is_encryption_required(fd))
+        return 0;
+
+    /* Plaintext path (no encryption, no prior handshake) */
     unsigned char type_byte;
     if (!read_all(fd, &type_byte, 1)) return 0;
     msg->msg_type = type_byte;
@@ -1363,6 +1373,7 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
 /* --- Encrypted transport convenience (Phase 19) --- */
 
 int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
+    wire_mark_encryption_required(fd);
     noise_state_t ns;
     if (!noise_handshake_initiator(&ns, fd, ctx))
         return 0;
@@ -1375,6 +1386,7 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
 }
 
 int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
+    wire_mark_encryption_required(fd);
     noise_state_t ns;
     if (!noise_handshake_responder(&ns, fd, ctx))
         return 0;

@@ -2079,3 +2079,63 @@ int test_secure_zero_basic(void) {
 
     return 1;
 }
+
+/* Test: plaintext refused after handshake attempt on an fd */
+int test_wire_plaintext_refused_after_handshake(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    /* Before marking, plaintext should work */
+    TEST_ASSERT(!wire_is_encryption_required(sv[0]),
+                "fd should not require encryption initially");
+
+    /* Mark encryption required (simulates handshake start) */
+    wire_mark_encryption_required(sv[0]);
+    TEST_ASSERT(wire_is_encryption_required(sv[0]),
+                "fd should require encryption after mark");
+
+    /* wire_send should refuse plaintext on this fd */
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "test", "hello");
+    int ok = wire_send(sv[0], 1, msg);
+    TEST_ASSERT(ok == 0, "wire_send should refuse plaintext after handshake mark");
+    cJSON_Delete(msg);
+
+    /* Clear and verify the flag is reset */
+    wire_clear_encryption(sv[0]);
+    TEST_ASSERT(!wire_is_encryption_required(sv[0]),
+                "flag should be cleared after wire_clear_encryption");
+
+    close(sv[0]);
+    close(sv[1]);
+    return 1;
+}
+
+/* Test: fd table grows beyond initial 16 entries */
+int test_fd_table_grows_beyond_16(void) {
+    /* Register encryption for 20 different fds (exceeding initial cap of 16) */
+    noise_state_t ns;
+    memset(&ns, 0, sizeof(ns));
+    memset(ns.send_key, 0xAA, 32);
+    memset(ns.recv_key, 0xBB, 32);
+
+    /* Use high fd numbers to avoid collisions with real fds */
+    int base_fd = 1000;
+    for (int i = 0; i < 20; i++) {
+        TEST_ASSERT(wire_set_encryption(base_fd + i, &ns),
+                    "wire_set_encryption should succeed for all 20 fds");
+    }
+
+    /* Verify all 20 are retrievable */
+    for (int i = 0; i < 20; i++) {
+        noise_state_t *got = wire_get_encryption(base_fd + i);
+        TEST_ASSERT(got != NULL, "should retrieve encryption state");
+        TEST_ASSERT_MEM_EQ(got->send_key, ns.send_key, 32, "send_key match");
+    }
+
+    /* Clean up */
+    for (int i = 0; i < 20; i++)
+        wire_clear_encryption(base_fd + i);
+
+    return 1;
+}

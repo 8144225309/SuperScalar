@@ -38,6 +38,13 @@ void wire_clear_encryption(int fd);
 /* Look up noise state for an fd. Returns NULL if none registered. */
 noise_state_t *wire_get_encryption(int fd);
 
+/* Mark an fd as requiring encryption (called at handshake start).
+   After this, wire_send/wire_recv refuse plaintext on this fd. */
+void wire_mark_encryption_required(int fd);
+
+/* Check if an fd requires encryption. Returns 1 if required, 0 otherwise. */
+int wire_is_encryption_required(int fd);
+
 /* Crypto primitives used by handshake */
 void hmac_sha256(unsigned char out[32], const unsigned char *key, size_t key_len,
                  const unsigned char *data, size_t data_len);

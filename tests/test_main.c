@@ -199,6 +199,8 @@ extern int test_client_persist_reload(void);
 
 /* Security hardening */
 extern int test_secure_zero_basic(void);
+extern int test_wire_plaintext_refused_after_handshake(void);
+extern int test_fd_table_grows_beyond_16(void);
 
 /* Phase 17: Demo polish */
 extern int test_create_invoice_wire(void);
@@ -544,6 +546,8 @@ static void run_unit_tests(void) {
 
     printf("\n=== Security Hardening ===\n");
     RUN_TEST(test_secure_zero_basic);
+    RUN_TEST(test_wire_plaintext_refused_after_handshake);
+    RUN_TEST(test_fd_table_grows_beyond_16);
 
     printf("\n=== Demo Polish (Phase 17) ===\n");
     RUN_TEST(test_create_invoice_wire);

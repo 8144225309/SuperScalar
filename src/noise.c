@@ -112,33 +112,52 @@ static int noise_read_all(int fd, unsigned char *buf, size_t len) {
     return 1;
 }
 
-/* --- Per-fd encryption state table --- */
+/* --- Per-fd encryption state table (dynamically grown) --- */
 
-#define MAX_ENCRYPTED_FDS 16
+#define FD_TABLE_INITIAL_CAP 16
 
 typedef struct {
     int fd;
     noise_state_t state;
     int active;
+    int requires_encryption;  /* set once handshake is attempted */
 } fd_noise_entry_t;
 
-static fd_noise_entry_t fd_table[MAX_ENCRYPTED_FDS];
+static fd_noise_entry_t *fd_table = NULL;
+static int fd_table_cap = 0;
 static int fd_table_inited = 0;
 
 static void ensure_fd_table(void) {
     if (!fd_table_inited) {
-        memset(fd_table, 0, sizeof(fd_table));
-        for (int i = 0; i < MAX_ENCRYPTED_FDS; i++)
+        fd_table_cap = FD_TABLE_INITIAL_CAP;
+        fd_table = (fd_noise_entry_t *)calloc((size_t)fd_table_cap,
+                                               sizeof(fd_noise_entry_t));
+        for (int i = 0; i < fd_table_cap; i++)
             fd_table[i].fd = -1;
         fd_table_inited = 1;
     }
+}
+
+/* Double the table capacity */
+static int grow_fd_table(void) {
+    int new_cap = fd_table_cap * 2;
+    fd_noise_entry_t *new_table = (fd_noise_entry_t *)calloc((size_t)new_cap,
+                                                              sizeof(fd_noise_entry_t));
+    if (!new_table) return 0;
+    for (int i = 0; i < new_cap; i++)
+        new_table[i].fd = -1;
+    memcpy(new_table, fd_table, (size_t)fd_table_cap * sizeof(fd_noise_entry_t));
+    free(fd_table);
+    fd_table = new_table;
+    fd_table_cap = new_cap;
+    return 1;
 }
 
 int wire_set_encryption(int fd, const noise_state_t *ns) {
     ensure_fd_table();
     /* Find existing or free slot */
     int free_slot = -1;
-    for (int i = 0; i < MAX_ENCRYPTED_FDS; i++) {
+    for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].active && fd_table[i].fd == fd) {
             fd_table[i].state = *ns;
             return 1;
@@ -146,22 +165,27 @@ int wire_set_encryption(int fd, const noise_state_t *ns) {
         if (!fd_table[i].active && free_slot < 0)
             free_slot = i;
     }
-    if (free_slot >= 0) {
-        fd_table[free_slot].fd = fd;
-        fd_table[free_slot].state = *ns;
-        fd_table[free_slot].active = 1;
-        return 1;
+    if (free_slot < 0) {
+        free_slot = fd_table_cap;
+        if (!grow_fd_table()) {
+            fprintf(stderr, "noise: fd table grow failed\n");
+            return 0;
+        }
     }
-    fprintf(stderr, "noise: fd table full, cannot register fd %d\n", fd);
-    return 0;
+    fd_table[free_slot].fd = fd;
+    fd_table[free_slot].state = *ns;
+    fd_table[free_slot].active = 1;
+    return 1;
 }
 
 void wire_clear_encryption(int fd) {
     ensure_fd_table();
-    for (int i = 0; i < MAX_ENCRYPTED_FDS; i++) {
-        if (fd_table[i].active && fd_table[i].fd == fd) {
-            secure_zero(&fd_table[i].state, sizeof(noise_state_t));
+    for (int i = 0; i < fd_table_cap; i++) {
+        if (fd_table[i].fd == fd) {
+            if (fd_table[i].active)
+                secure_zero(&fd_table[i].state, sizeof(noise_state_t));
             fd_table[i].active = 0;
+            fd_table[i].requires_encryption = 0;
             fd_table[i].fd = -1;
             return;
         }
@@ -170,11 +194,49 @@ void wire_clear_encryption(int fd) {
 
 noise_state_t *wire_get_encryption(int fd) {
     ensure_fd_table();
-    for (int i = 0; i < MAX_ENCRYPTED_FDS; i++) {
+    for (int i = 0; i < fd_table_cap; i++) {
         if (fd_table[i].active && fd_table[i].fd == fd)
             return &fd_table[i].state;
     }
     return NULL;
+}
+
+void wire_mark_encryption_required(int fd) {
+    ensure_fd_table();
+    /* Mark in existing entry if present, otherwise allocate a slot */
+    for (int i = 0; i < fd_table_cap; i++) {
+        if (fd_table[i].fd == fd) {
+            fd_table[i].requires_encryption = 1;
+            return;
+        }
+    }
+    /* No entry yet — create a placeholder (active=0 but flag set) */
+    for (int i = 0; i < fd_table_cap; i++) {
+        if (!fd_table[i].active && fd_table[i].fd == -1) {
+            fd_table[i].fd = fd;
+            fd_table[i].requires_encryption = 1;
+            return;
+        }
+    }
+    /* Table full — grow and set */
+    if (grow_fd_table()) {
+        for (int i = 0; i < fd_table_cap; i++) {
+            if (fd_table[i].fd == -1) {
+                fd_table[i].fd = fd;
+                fd_table[i].requires_encryption = 1;
+                return;
+            }
+        }
+    }
+}
+
+int wire_is_encryption_required(int fd) {
+    ensure_fd_table();
+    for (int i = 0; i < fd_table_cap; i++) {
+        if (fd_table[i].fd == fd)
+            return fd_table[i].requires_encryption;
+    }
+    return 0;
 }
 
 /* --- Handshake --- */
