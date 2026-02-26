@@ -13,6 +13,16 @@ void bridge_init(bridge_t *br) {
     br->plugin_fd = -1;
     br->next_htlc_id = 1;
     br->next_request_id = 1;
+    br->use_nk = 0;
+}
+
+void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
+    if (pk) {
+        br->lsp_pubkey = *pk;
+        br->use_nk = 1;
+    } else {
+        br->use_nk = 0;
+    }
 }
 
 int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
@@ -23,11 +33,18 @@ int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
         return 0;
     }
 
-    /* Encrypted transport handshake (temporary context for ECDH) */
+    /* Encrypted transport handshake (NK if pubkey pinned, NN fallback) */
     {
         secp256k1_context *hs_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        int hs_ok = wire_noise_handshake_initiator(br->lsp_fd, hs_ctx);
+        int hs_ok;
+        if (br->use_nk) {
+            hs_ok = wire_noise_handshake_nk_initiator(br->lsp_fd, hs_ctx,
+                                                       &br->lsp_pubkey);
+        } else {
+            fprintf(stderr, "Bridge: WARNING — no --lsp-pubkey, using unauthenticated NN handshake\n");
+            hs_ok = wire_noise_handshake_initiator(br->lsp_fd, hs_ctx);
+        }
         secp256k1_context_destroy(hs_ctx);
         if (!hs_ok) {
             fprintf(stderr, "Bridge: noise handshake failed\n");

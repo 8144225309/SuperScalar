@@ -2,6 +2,7 @@
 #define SUPERSCALAR_BRIDGE_H
 
 #include "wire.h"
+#include <secp256k1.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -24,10 +25,18 @@ typedef struct {
 
     uint64_t next_htlc_id;              /* correlation ID for inbound HTLCs */
     uint64_t next_request_id;           /* correlation ID for outbound pays */
+
+    /* NK (server-authenticated) handshake support */
+    secp256k1_pubkey lsp_pubkey;        /* pinned LSP static pubkey */
+    int use_nk;                         /* 1 = use NK handshake, 0 = NN fallback */
 } bridge_t;
 
 /* Initialize bridge state. */
 void bridge_init(bridge_t *br);
+
+/* Pin LSP static pubkey for NK (server-authenticated) handshake.
+   If set, bridge_connect_lsp() uses NK mode instead of NN. */
+void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk);
 
 /* Connect bridge to LSP. Sends BRIDGE_HELLO, waits for BRIDGE_HELLO_ACK.
    Returns 1 on success. */

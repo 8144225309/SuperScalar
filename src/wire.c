@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -149,22 +150,76 @@ int wire_accept(int listen_fd) {
     return fd;
 }
 
-int wire_connect(const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+/* Global SOCKS5 proxy state (set via wire_set_proxy) */
+static char g_proxy_host[256] = {0};
+static int g_proxy_port = 0;
+static int g_proxy_set = 0;
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, host ? host : "127.0.0.1", &addr.sin_addr);
+void wire_set_proxy(const char *host, int port) {
+    if (host && port > 0) {
+        strncpy(g_proxy_host, host, sizeof(g_proxy_host) - 1);
+        g_proxy_host[sizeof(g_proxy_host) - 1] = '\0';
+        g_proxy_port = port;
+        g_proxy_set = 1;
+    } else {
+        g_proxy_set = 0;
+    }
+}
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+int wire_get_proxy(char *host_out, size_t host_len, int *port_out) {
+    if (!g_proxy_set) return 0;
+    if (host_out && host_len > 0) {
+        strncpy(host_out, g_proxy_host, host_len - 1);
+        host_out[host_len - 1] = '\0';
+    }
+    if (port_out) *port_out = g_proxy_port;
+    return 1;
+}
+
+/* Direct TCP connection via getaddrinfo (supports hostnames + IPv6) */
+int wire_connect_direct_internal(const char *host, int port) {
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host ? host : "127.0.0.1", port_str, &hints, &res) != 0)
+        return -1;
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+
+    if (connect(fd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
         close(fd);
+        freeaddrinfo(res);
         return -1;
     }
+    freeaddrinfo(res);
     wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
     return fd;
+}
+
+int wire_connect(const char *host, int port) {
+    const char *h = host ? host : "127.0.0.1";
+
+    /* Safety: refuse .onion without proxy (prevents DNS leak) */
+    size_t hlen = strlen(h);
+    if (hlen >= 6 && strcmp(h + hlen - 6, ".onion") == 0) {
+        if (!g_proxy_set) {
+            fprintf(stderr, "wire_connect: .onion address requires --tor-proxy (refusing to prevent DNS leak)\n");
+            return -1;
+        }
+        /* Route through SOCKS5 proxy */
+        return wire_connect_via_proxy(h, port, g_proxy_host, g_proxy_port);
+    }
+
+    /* If proxy is set, route all connections through it */
+    if (g_proxy_set)
+        return wire_connect_via_proxy(h, port, g_proxy_host, g_proxy_port);
+
+    return wire_connect_direct_internal(h, port);
 }
 
 void wire_close(int fd) {

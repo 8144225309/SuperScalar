@@ -47,6 +47,7 @@ typedef struct {
     uint64_t request_id;         /* outbound pay correlation (Phase 17) */
     size_t sender_idx;           /* originating client index (Phase 17) */
     uint64_t sender_htlc_id;    /* HTLC id on sender's channel (Phase 17) */
+    uint32_t cltv_expiry;       /* timelock for bridge HTLC timeout */
     int active;
 } htlc_origin_t;
 
@@ -208,6 +209,14 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
+
+/* Check bridge HTLC timeouts: fail back any HTLC whose cltv_expiry is
+   approaching (within FACTORY_CLTV_DELTA blocks of current height).
+   Fails the HTLC on both the bridge and the destination channel.
+   Called from the daemon loop timeout path. */
+void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
+                                               lsp_t *lsp,
+                                               uint32_t current_height);
 
 /* Check if an HTLC originated from the bridge. Returns bridge_htlc_id, 0 if not. */
 uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,

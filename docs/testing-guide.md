@@ -52,10 +52,10 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 235 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence |
-| Regtest integration | 23 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close |
-| Adversarial regtest | 8 | Yes | Fund safety under attack: breach penalties, HTLC edge cases, timeout recovery, DW exhaustion |
-| **Total** | **266** | | |
+| Unit tests | 271 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5 |
+| Regtest integration | 26 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP |
+| Adversarial regtest | 11 | Yes | Fund safety under attack: breach penalties, HTLC edge cases, timeout recovery, DW exhaustion, wrong preimage rejection, double-spend rejection |
+| **Total** | **308** | | |
 
 ---
 
@@ -68,12 +68,13 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 235/235 passed`
+Expected output: `Results: 271/271 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
 with HTLCs, penalty construction, wire protocol serialization, SQLite
-persistence, watchtower logic, and more.
+persistence, watchtower logic, CLN bridge messages, Tor SOCKS5 protocol,
+NK-authenticated Noise handshakes, and more.
 
 ---
 
@@ -98,7 +99,7 @@ cd build
 ./test_superscalar --regtest
 ```
 
-Expected output: `Results: 31/31 passed`
+Expected output: `Results: 37/37 passed`
 
 ### Step 3: Stop bitcoind
 
@@ -131,9 +132,10 @@ sleep 3
 
 ## Adversarial Tests: What Each One Proves
 
-These 8 tests are the most important from a security perspective. They run
-as part of `--regtest` (at the end, under the "Adversarial & Edge-Case Tests"
-header). Here's what each one does and why it matters:
+These 11 tests are the most important from a security perspective. They run
+as part of `--regtest` (under the "Adversarial & Edge-Case Tests" and
+"Security Model Gap Tests" headers). Here's what each one does and why it
+matters:
 
 ### 1. `test_regtest_dw_exhaustion_close`
 
@@ -249,6 +251,41 @@ enforces the tree structure.
 > exhausted` if the chain has mined too many blocks (regtest halves every
 > 150 blocks). This is normal — the test passes cleanly on a fresh chain.
 
+### 9. `test_regtest_watchtower_mempool_detection`
+
+**Question:** Can the watchtower detect a breach before the tx confirms?
+
+**What it does:** Broadcasts a revoked commitment, then runs the watchtower
+check before mining. The watchtower detects the breach in the mempool and
+builds a penalty tx.
+
+**Why it matters:** Early detection gives more time to react. A watchtower
+that only detects confirmed breaches is one block behind.
+
+### 10. `test_regtest_htlc_wrong_preimage_rejected`
+
+**Question:** Does the script-path HTLC success path reject a wrong preimage?
+
+**What it does:** Creates a channel with an HTLC, then broadcasts the
+commitment tx and attempts to spend the HTLC output with an incorrect
+preimage. Bitcoin consensus (`OP_SHA256 OP_EQUALVERIFY`) rejects the spend.
+
+**Why it matters:** HTLC security depends on the hash lock. If the wrong
+preimage could satisfy the script, anyone could steal in-flight payments.
+
+### 11. `test_regtest_funding_double_spend_rejected`
+
+**Question:** Can a cooperatively-closed factory be attacked by replaying
+the old factory tree?
+
+**What it does:** Creates a factory, cooperatively closes it (spending the
+funding UTXO), then attempts to broadcast the kickoff transaction from the
+old tree. Bitcoin consensus rejects the double-spend.
+
+**Why it matters:** After cooperative close, the factory tree transactions
+must be permanently invalid. If they weren't, the LSP or a client could
+reopen the old tree and claim funds twice.
+
 ---
 
 ## Running Demos
@@ -355,6 +392,16 @@ order — each test builds on concepts from the previous ones:
 | `tests/test_factory.c` | `test_factory_sign_tree` | Cooperative MuSig2 signing of tree |
 | `tests/test_factory.c` | `test_factory_advance` | DW state advance within factory |
 | `tests/test_factory.c` | `test_factory_coop_close` | Single-tx cooperative close |
+
+### Then bridge + Tor
+
+| File | Test | What you learn |
+|------|------|---------------|
+| `tests/test_bridge.c` | `test_bridge_msg_round_trip` | Bridge wire message serialization (all 8 MSG_BRIDGE_* types) |
+| `tests/test_bridge.c` | `test_lsp_inbound_via_bridge` | Invoice registry, origin tracking, fulfill back-propagation |
+| `tests/test_bridge.c` | `test_tor_socks5_mock` | SOCKS5 protocol bytes (greeting, CONNECT, tunnel echo) via mock server |
+| `tests/test_bridge.c` | `test_regtest_bridge_nk_handshake` | NK Noise handshake + encrypted messages over real TCP |
+| `tests/test_bridge.c` | `test_regtest_bridge_payment` | Full bridge payment: factory → register invoice → HTLC → fulfill → verify |
 
 ### Then the adversarial tests
 

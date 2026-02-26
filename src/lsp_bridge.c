@@ -48,6 +48,7 @@ void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
     htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
     memcpy(origin->payment_hash, payment_hash32, 32);
     origin->bridge_htlc_id = bridge_htlc_id;
+    origin->cltv_expiry = 0;
     origin->active = 1;
 
     if (mgr->persist)
@@ -120,8 +121,15 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 1;
         }
 
-        /* Track bridge origin for back-propagation */
+        /* Track bridge origin for back-propagation (with cltv for timeout) */
         lsp_channels_track_bridge_origin(mgr, payment_hash, htlc_id);
+        /* Store cltv_expiry and dest info for timeout cleanup */
+        if (mgr->n_htlc_origins > 0) {
+            htlc_origin_t *org = &mgr->htlc_origins[mgr->n_htlc_origins - 1];
+            org->cltv_expiry = cltv_expiry;
+            org->sender_idx = dest_idx;
+            org->sender_htlc_id = dest_htlc_id;
+        }
 
         /* Forward ADD_HTLC to destination client */
         cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
@@ -247,5 +255,49 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     default:
         fprintf(stderr, "LSP: unexpected bridge msg 0x%02x\n", msg->msg_type);
         return 0;
+    }
+}
+
+void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
+                                               lsp_t *lsp,
+                                               uint32_t current_height) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        htlc_origin_t *origin = &mgr->htlc_origins[i];
+        if (!origin->active) continue;
+        if (origin->bridge_htlc_id == 0) continue;
+        if (origin->cltv_expiry == 0) continue;
+
+        /* Fail back if current height is within FACTORY_CLTV_DELTA of expiry */
+        if (current_height + FACTORY_CLTV_DELTA >= origin->cltv_expiry) {
+            printf("LSP: bridge HTLC timeout — height %u approaching expiry %u\n",
+                   current_height, origin->cltv_expiry);
+
+            /* Fail HTLC on destination channel to free balance */
+            size_t dest_idx = origin->sender_idx;
+            uint64_t dest_htlc_id = origin->sender_htlc_id;
+            if (dest_idx < mgr->n_channels) {
+                channel_t *ch = &mgr->entries[dest_idx].channel;
+                channel_fail_htlc(ch, dest_htlc_id);
+                if (lsp && lsp->client_fds[dest_idx] >= 0) {
+                    cJSON *cf = wire_build_update_fail_htlc(dest_htlc_id,
+                        "htlc_timeout");
+                    wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_FAIL_HTLC, cf);
+                    cJSON_Delete(cf);
+                }
+            }
+
+            /* Send BRIDGE_FAIL_HTLC to bridge if connected */
+            if (mgr->bridge_fd >= 0) {
+                cJSON *fail = wire_build_bridge_fail_htlc(origin->payment_hash,
+                    "htlc_timeout", origin->bridge_htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+            }
+
+            origin->active = 0;
+            if (mgr->persist)
+                persist_deactivate_htlc_origin((persist_t *)mgr->persist,
+                                                origin->payment_hash);
+        }
     }
 }

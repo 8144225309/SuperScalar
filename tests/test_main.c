@@ -187,6 +187,15 @@ extern int test_bridge_unknown_hash(void);
 extern int test_lsp_bridge_accept(void);
 extern int test_lsp_inbound_via_bridge(void);
 extern int test_bridge_register_forward(void);
+extern int test_bridge_set_nk_pubkey(void);
+extern int test_bridge_htlc_timeout(void);
+extern int test_wire_connect_hostname(void);
+extern int test_wire_connect_onion_no_proxy(void);
+extern int test_tor_parse_proxy_arg(void);
+extern int test_tor_parse_proxy_arg_edge_cases(void);
+extern int test_tor_socks5_mock(void);
+extern int test_regtest_bridge_nk_handshake(void);
+extern int test_regtest_bridge_payment(void);
 
 /* Phase 15: Daemon mode */
 extern int test_register_invoice_wire(void);
@@ -569,6 +578,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_bridge_accept);
     RUN_TEST(test_lsp_inbound_via_bridge);
     RUN_TEST(test_bridge_register_forward);
+    RUN_TEST(test_bridge_set_nk_pubkey);
+    RUN_TEST(test_bridge_htlc_timeout);
+
+    printf("\n=== Wire Hostname + Tor ===\n");
+    RUN_TEST(test_wire_connect_hostname);
+    RUN_TEST(test_wire_connect_onion_no_proxy);
+    RUN_TEST(test_tor_parse_proxy_arg);
+    RUN_TEST(test_tor_parse_proxy_arg_edge_cases);
+    RUN_TEST(test_tor_socks5_mock);
 
     printf("\n=== Daemon Mode (Phase 15) ===\n");
     RUN_TEST(test_register_invoice_wire);
@@ -860,6 +878,10 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Regtest Fee Estimation ===\n");
     RUN_TEST(test_regtest_fee_estimation_parsing);
+
+    printf("\n=== Regtest Bridge (Phase 14) ===\n");
+    RUN_TEST(test_regtest_bridge_nk_handshake);
+    RUN_TEST(test_regtest_bridge_payment);
 
     regtest_faucet_health_report();
 }

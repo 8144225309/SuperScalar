@@ -87,6 +87,7 @@ add_library(superscalar
     src/noise.c
     src/keyfile.c
     src/jit_channel.c
+    src/tor.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)

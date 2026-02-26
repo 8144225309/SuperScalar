@@ -97,6 +97,23 @@ int wire_connect(const char *host, int port);
 void wire_close(int fd);
 int wire_set_timeout(int fd, int timeout_sec);
 
+/* SOCKS5 proxy support (for Tor .onion addresses) */
+
+/* Set global SOCKS5 proxy. When set, wire_connect() routes through it.
+   .onion addresses always require a proxy; clearnet uses proxy if set. */
+void wire_set_proxy(const char *host, int port);
+
+/* Get current proxy config. Returns 1 if proxy is set. */
+int wire_get_proxy(char *host_out, size_t host_len, int *port_out);
+
+/* Connect via SOCKS5 proxy (used internally by wire_connect when proxy set). */
+int wire_connect_via_proxy(const char *host, int port,
+                           const char *proxy_host, int proxy_port);
+
+/* Direct TCP connect (bypasses proxy). Used internally by tor.c to
+   connect to the SOCKS5 proxy itself. */
+int wire_connect_direct_internal(const char *host, int port);
+
 /* --- Framing --- */
 
 /* Send: writes [4-byte big-endian length][1-byte type][JSON bytes]. Returns 1 on success. */

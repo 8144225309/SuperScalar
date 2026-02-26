@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 266 tests (235 unit + 31 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 308 tests (271 unit + 37 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -44,7 +44,7 @@ cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null ||
 
 ## Tests
 
-235 unit + 31 regtest integration tests (including 8 adversarial/edge-case tests).
+271 unit + 37 regtest integration tests (including 10 adversarial/edge-case tests).
 
 See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
 
@@ -415,6 +415,8 @@ superscalar_client [OPTIONS]
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
 | `--datadir` | PATH | — | Bitcoin datadir |
 | `--rpcport` | PORT | — | Bitcoin RPC port |
+| `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
+| `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--auto-accept-jit` | — | off | Auto-accept JIT channel offers |
 
 ### superscalar_bridge
@@ -428,6 +430,8 @@ superscalar_bridge [OPTIONS]
 | `--lsp-host` | HOST | 127.0.0.1 | LSP host |
 | `--lsp-port` | PORT | 9735 | LSP port |
 | `--plugin-port` | PORT | 9736 | CLN plugin listen port |
+| `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
+| `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 
 ---
 
@@ -520,6 +524,8 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 CLN (lightningd)
   └── cln_plugin.py (htlc_accepted hook + superscalar-pay RPC)
         └── superscalar_bridge (port 9736 ← plugin, port 9735 → LSP)
+              │   ↑ NK-authenticated Noise handshake (--lsp-pubkey)
+              │   ↑ Optional Tor/SOCKS5 (--tor-proxy)
               └── superscalar_lsp (port 9735)
                     ├── client 1
                     ├── client 2
@@ -552,7 +558,8 @@ CLN (lightningd)
 | `watchtower` | watchtower.c | Breach detection + penalty broadcast (LSP + client-side, factory nodes) |
 | `keyfile` | keyfile.c | Encrypted keyfile storage |
 | `jit_channel` | jit_channel.c | JIT channel fallback for offline/low-balance clients |
-| `noise` | noise.c | Noise protocol encrypted transport |
+| `noise` | noise.c | Noise protocol encrypted transport (NN + NK patterns) |
+| `tor` | tor.c | SOCKS5 proxy client, Tor hidden service creation via control port |
 | `crypto_aead` | crypto_aead.c | AEAD encryption primitives |
 | `report` | report.c | JSON diagnostic report generation |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness |

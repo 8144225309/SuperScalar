@@ -9,6 +9,7 @@
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/dw_state.h"
+#include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
@@ -79,6 +80,10 @@ static void usage(const char *prog) {
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
+        "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
+        "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
+        "  --tor-password PASS   Tor control auth password (default: empty)\n"
+        "  --onion               Create Tor hidden service on startup\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
@@ -473,6 +478,10 @@ int main(int argc, char *argv[]) {
     uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
+    const char *tor_proxy_arg = NULL;
+    const char *tor_control_arg = NULL;
+    const char *tor_password = NULL;
+    int tor_onion = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -566,6 +575,14 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc)
+            tor_proxy_arg = argv[++i];
+        else if (strcmp(argv[i], "--tor-control") == 0 && i + 1 < argc)
+            tor_control_arg = argv[++i];
+        else if (strcmp(argv[i], "--tor-password") == 0 && i + 1 < argc)
+            tor_password = argv[++i];
+        else if (strcmp(argv[i], "--onion") == 0)
+            tor_onion = 1;
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -642,6 +659,47 @@ int main(int argc, char *argv[]) {
 
         /* Wire message logging (Phase 22) */
         wire_set_log_callback(lsp_wire_log_cb, &db);
+    }
+
+    /* Tor SOCKS5 proxy setup */
+    if (tor_proxy_arg) {
+        char proxy_host[256];
+        int proxy_port;
+        if (!tor_parse_proxy_arg(tor_proxy_arg, proxy_host, sizeof(proxy_host),
+                                  &proxy_port)) {
+            fprintf(stderr, "Error: invalid --tor-proxy format (use HOST:PORT)\n");
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        wire_set_proxy(proxy_host, proxy_port);
+        printf("LSP: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
+    }
+
+    /* Tor hidden service (ephemeral, via control port) */
+    int tor_control_fd = -1;
+    if (tor_onion) {
+        const char *ctrl_arg = tor_control_arg ? tor_control_arg : "127.0.0.1:9051";
+        char ctrl_host[256];
+        int ctrl_port;
+        if (!tor_parse_proxy_arg(ctrl_arg, ctrl_host, sizeof(ctrl_host),
+                                  &ctrl_port)) {
+            fprintf(stderr, "Error: invalid --tor-control format (use HOST:PORT)\n");
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        char onion_addr[128];
+        tor_control_fd = tor_create_hidden_service(ctrl_host, ctrl_port,
+            tor_password ? tor_password : "", port, port,
+            onion_addr, sizeof(onion_addr));
+        if (tor_control_fd < 0) {
+            fprintf(stderr, "Error: failed to create Tor hidden service\n");
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        printf("LSP: reachable at %s:%d\n", onion_addr, port);
     }
 
     /* Create LSP keypair */
@@ -2867,6 +2925,8 @@ int main(int argc, char *argv[]) {
     jit_channels_cleanup(&mgr);
     if (use_db)
         persist_close(&db);
+    if (tor_control_fd >= 0)
+        close(tor_control_fd);
     lsp_cleanup(&lsp);
     memset(lsp_seckey, 0, 32);
     secp256k1_context_destroy(ctx);

@@ -11,6 +11,7 @@
 #include "superscalar/fee.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
+#include "superscalar/tor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1078,6 +1079,7 @@ static void usage(const char *prog) {
         "  --rpcport PORT                    Bitcoin RPC port (default: network default)\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
+        "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help                            Show this help\n",
         prog);
@@ -1105,6 +1107,7 @@ int main(int argc, char *argv[]) {
     int fee_rate = 1000;
     int auto_accept_jit = 0;
     const char *lsp_pubkey_hex = NULL;
+    const char *tor_proxy_arg = NULL;
     int accept_risk = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
@@ -1192,6 +1195,8 @@ int main(int argc, char *argv[]) {
             auto_accept_jit = 1;
         } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
             lsp_pubkey_hex = argv[++i];
+        } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
+            tor_proxy_arg = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1207,6 +1212,19 @@ int main(int argc, char *argv[]) {
             "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
             "If you understand this risk, pass --i-accept-the-risk\n");
         return 1;
+    }
+
+    /* Tor SOCKS5 proxy setup */
+    if (tor_proxy_arg) {
+        char proxy_host[256];
+        int proxy_port;
+        if (!tor_parse_proxy_arg(tor_proxy_arg, proxy_host, sizeof(proxy_host),
+                                  &proxy_port)) {
+            fprintf(stderr, "Error: invalid --tor-proxy format (use HOST:PORT)\n");
+            return 1;
+        }
+        wire_set_proxy(proxy_host, proxy_port);
+        printf("Client: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
     }
 
     unsigned char seckey[32];

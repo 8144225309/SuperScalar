@@ -1755,6 +1755,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);
 
+            /* Check bridge HTLC timeouts */
+            if (mgr->bridge_fd >= 0 && mgr->watchtower && mgr->watchtower->rt) {
+                int bh = regtest_get_block_height(mgr->watchtower->rt);
+                if (bh > 0)
+                    lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
+            }
+
             continue;
         }
 
@@ -1780,6 +1787,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             cJSON *ack = wire_build_bridge_hello_ack();
                             wire_send(new_fd, MSG_BRIDGE_HELLO_ACK, ack);
                             cJSON_Delete(ack);
+                            if (lsp->bridge_fd >= 0)
+                                wire_close(lsp->bridge_fd);
                             lsp->bridge_fd = new_fd;
                             mgr->bridge_fd = new_fd;
                             printf("LSP: bridge connected in daemon loop (fd=%d)\n", new_fd);
