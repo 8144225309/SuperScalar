@@ -232,8 +232,25 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     } else {
         int jit_timeout = mgr->confirm_timeout_secs > 0 ?
                           mgr->confirm_timeout_secs : 7200;
-        if (regtest_wait_for_confirmation(rt, fund_txid_hex, jit_timeout) < 1) {
-            fprintf(stderr, "LSP JIT: funding not confirmed\n");
+        int confirmed = 0;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (regtest_wait_for_confirmation(rt, fund_txid_hex, jit_timeout) >= 1) {
+                confirmed = 1;
+                break;
+            }
+            /* Check if tx is still in mempool — if so, keep waiting */
+            if (regtest_is_in_mempool(rt, fund_txid_hex)) {
+                fprintf(stderr, "LSP JIT: funding still in mempool, "
+                        "extending wait (attempt %d)\n", attempt + 1);
+                continue;
+            }
+            /* Tx dropped from mempool — cannot recover here */
+            fprintf(stderr, "LSP JIT: funding tx %s dropped from mempool\n",
+                    fund_txid_hex);
+            break;
+        }
+        if (!confirmed) {
+            fprintf(stderr, "LSP JIT: funding not confirmed after retries\n");
             memset(lsp_seckey, 0, 32);
             return 0;
         }

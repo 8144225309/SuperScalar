@@ -68,6 +68,7 @@ int regtest_init_network(regtest_t *rt, const char *network) {
     strncpy(rt->rpcuser, "rpcuser", sizeof(rt->rpcuser) - 1);
     strncpy(rt->rpcpassword, "rpcpass", sizeof(rt->rpcpassword) - 1);
     strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
+    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 1000;
 
     /* Build verification command using rt->cli_path (not hardcoded) */
     char cmd[512];
@@ -109,6 +110,7 @@ int regtest_init_full(regtest_t *rt, const char *network,
     if (datadir)
         strncpy(rt->datadir, datadir, sizeof(rt->datadir) - 1);
     rt->rpcport = rpcport;
+    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 1000;
 
     /* Verify connection using build_cli_prefix for consistency */
     char prefix[512];
@@ -301,8 +303,8 @@ int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     int height = atoi(result);
     free(result);
 
-    int scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 200;
-    for (int i = 0; i < scan_depth && i <= height; i++) {
+    int depth = rt->scan_depth > 0 ? rt->scan_depth : 20;
+    for (int i = 0; i < depth && i <= height; i++) {
         snprintf(params, sizeof(params), "%d", height - i);
         char *hash_result = regtest_exec(rt, "getblockhash", params);
         if (!hash_result) continue;
@@ -430,8 +432,8 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
     int height = atoi(result);
     free(result);
 
-    int scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 200;
-    for (int i = 0; i < scan_depth && i <= height; i++) {
+    int depth = rt->scan_depth > 0 ? rt->scan_depth : 20;
+    for (int i = 0; i < depth && i <= height; i++) {
         snprintf(params, sizeof(params), "%d", height - i);
         char *hash_result = regtest_exec(rt, "getblockhash", params);
         if (!hash_result) continue;

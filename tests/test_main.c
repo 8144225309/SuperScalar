@@ -283,7 +283,9 @@ extern int test_regtest_dw_exhaustion_close(void);
 extern int test_regtest_htlc_timeout_race(void);
 extern int test_regtest_penalty_with_htlcs(void);
 extern int test_regtest_multi_htlc_unilateral(void);
+extern int test_regtest_watchtower_mempool_detection(void);
 extern int test_regtest_watchtower_late_detection(void);
+extern int test_regtest_fee_estimation_parsing(void);
 extern int test_regtest_ptlc_no_coop_close(void);
 extern int test_regtest_all_offline_recovery(void);
 extern int test_regtest_tree_ordering(void);
@@ -395,6 +397,7 @@ extern int test_factory_arity1_min_funding_reject(void);
 extern int test_factory_arity1_input_amounts_consistent(void);
 extern int test_factory_arity1_split_round_leaf_advance(void);
 extern int test_persist_dw_counter_with_leaves_4(void);
+extern int test_persist_file_reopen_round_trip(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -735,6 +738,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_arity1_input_amounts_consistent);
     RUN_TEST(test_factory_arity1_split_round_leaf_advance);
     RUN_TEST(test_persist_dw_counter_with_leaves_4);
+    RUN_TEST(test_persist_file_reopen_round_trip);
 }
 
 extern int regtest_init_faucet(void);
@@ -786,10 +790,14 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_htlc_timeout_race);
     RUN_TEST(test_regtest_penalty_with_htlcs);
     RUN_TEST(test_regtest_multi_htlc_unilateral);
+    RUN_TEST(test_regtest_watchtower_mempool_detection);
     RUN_TEST(test_regtest_watchtower_late_detection);
     RUN_TEST(test_regtest_ptlc_no_coop_close);
     RUN_TEST(test_regtest_all_offline_recovery);
     RUN_TEST(test_regtest_tree_ordering);
+
+    printf("\n=== Regtest Fee Estimation ===\n");
+    RUN_TEST(test_regtest_fee_estimation_parsing);
 
     regtest_faucet_health_report();
 }

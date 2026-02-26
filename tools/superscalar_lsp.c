@@ -357,28 +357,43 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
                 /* Mine the required blocks */
                 regtest_mine_blocks(rt, (int)required_depth, mine_addr);
             } else {
-                /* Poll for blocks on signet/testnet */
+                /* Poll for blocks on signet/testnet with timeout */
                 int start_height = regtest_get_block_height(rt);
                 int target_height = start_height + (int)required_depth;
+                int waited = 0;
                 while (regtest_get_block_height(rt) < target_height) {
+                    if (waited >= confirm_timeout) {
+                        fprintf(stderr, "force-close: node %zu BIP68 wait "
+                                "timed out after %ds (height %d / %d)\n",
+                                i, waited, regtest_get_block_height(rt),
+                                target_height);
+                        free(tx_hex);
+                        return 0;
+                    }
                     sleep(10);
-                    printf("    height: %d / %d\n",
-                           regtest_get_block_height(rt), target_height);
+                    waited += 10;
+                    printf("    height: %d / %d (%ds/%ds)\n",
+                           regtest_get_block_height(rt), target_height,
+                           waited, confirm_timeout);
                 }
             }
         }
 
         /* Try to broadcast — may need retries if BIP68 not yet satisfied */
         int ok = 0;
-        for (int attempt = 0; attempt < 60; attempt++) {
+        int bcast_waited = 0;
+        int bcast_limit = is_regtest ? 60 : confirm_timeout;
+        for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
             ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
             if (ok) break;
             if (attempt == 0)
                 printf("  node[%zu] broadcast pending (waiting for BIP68)...\n", i);
             if (is_regtest) {
                 regtest_mine_blocks(rt, 1, mine_addr);
+                bcast_waited++;
             } else {
                 sleep(15);
+                bcast_waited += 15;
             }
         }
 

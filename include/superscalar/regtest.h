@@ -15,6 +15,7 @@ typedef struct {
     char wallet[64];
     char network[16];  /* "regtest", "signet", "testnet", "mainnet" */
     int  rpcport;      /* 0 = use network default */
+    int  scan_depth;   /* block scan depth for tx lookups (0 = use default) */
 } regtest_t;
 
 int   regtest_init(regtest_t *rt);

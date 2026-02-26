@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -934,6 +935,88 @@ int test_lsp_recovery_round_trip(void) {
 
     secp256k1_context_destroy(ctx);
     persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: File-based persist close/reopen round-trip ---- */
+
+int test_persist_file_reopen_round_trip(void) {
+    const char *path = "/tmp/test_persist_reopen.db";
+    unlink(path);  /* ensure clean slate */
+
+    /* Phase 1: open file-based DB, save data, close */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "open file db");
+
+        secp256k1_context *ctx = test_ctx();
+        secp256k1_pubkey pk_local, pk_remote;
+        if (!secp256k1_ec_pubkey_create(ctx, &pk_local, seckeys[0])) return 0;
+        if (!secp256k1_ec_pubkey_create(ctx, &pk_remote, seckeys[1])) return 0;
+
+        unsigned char fake_txid[32] = {0};
+        fake_txid[0] = 0xDD;
+        unsigned char fake_spk[34];
+        memset(fake_spk, 0xAA, 34);
+
+        channel_t ch;
+        TEST_ASSERT(channel_init(&ch, ctx, seckeys[0], &pk_local, &pk_remote,
+                                  fake_txid, 1, 100000, fake_spk, 34,
+                                  45000, 55000, 144), "channel_init");
+        ch.commitment_number = 7;
+
+        TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "save channel");
+
+        /* Also save a counter and an HTLC */
+        TEST_ASSERT(persist_save_counter(&db, "test_counter", 42), "save counter");
+
+        htlc_t h = {0};
+        h.direction = HTLC_OFFERED;
+        h.state = HTLC_STATE_ACTIVE;
+        h.amount_sats = 3000;
+        memset(h.payment_hash, 0xBE, 32);
+        h.cltv_expiry = 500;
+        h.id = 0;
+        TEST_ASSERT(persist_save_htlc(&db, 0, &h), "save htlc");
+
+        secp256k1_context_destroy(ctx);
+        persist_close(&db);
+    }
+
+    /* Phase 2: reopen from file, verify all data survived */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "reopen file db");
+
+        /* Verify channel state */
+        uint64_t local, remote, commit;
+        TEST_ASSERT(persist_load_channel_state(&db, 0, &local, &remote, &commit),
+                    "load channel after reopen");
+        TEST_ASSERT_EQ(local, 45000, "local_amount after reopen");
+        TEST_ASSERT_EQ(remote, 55000, "remote_amount after reopen");
+        TEST_ASSERT_EQ(commit, 7, "commitment_number after reopen");
+
+        /* Verify counter */
+        uint64_t val = persist_load_counter(&db, "test_counter", 0);
+        TEST_ASSERT_EQ(val, 42, "counter after reopen");
+
+        /* Verify HTLC */
+        htlc_t loaded[16];
+        size_t count = persist_load_htlcs(&db, 0, loaded, 16);
+        TEST_ASSERT_EQ(count, 1, "htlc count after reopen");
+        TEST_ASSERT_EQ(loaded[0].amount_sats, 3000, "htlc amount after reopen");
+        TEST_ASSERT_EQ(loaded[0].cltv_expiry, 500, "htlc cltv after reopen");
+        {
+            unsigned char expected[32];
+            memset(expected, 0xBE, 32);
+            TEST_ASSERT(memcmp(loaded[0].payment_hash, expected, 32) == 0,
+                        "htlc hash after reopen");
+        }
+
+        persist_close(&db);
+    }
+
+    unlink(path);  /* cleanup */
     return 1;
 }
 

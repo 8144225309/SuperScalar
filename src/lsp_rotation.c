@@ -217,10 +217,26 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (mgr->rot_is_regtest) {
         regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
     } else {
+        int rot_timeout = mgr->confirm_timeout_secs > 0 ?
+                          mgr->confirm_timeout_secs : 7200;
         printf("LSP rotate: waiting for close TX confirmation...\n");
-        int conf = regtest_wait_for_confirmation(rt, rc_txid, 7200);
-        if (conf < 1) {
-            fprintf(stderr, "LSP rotate: close TX not confirmed\n");
+        int confirmed = 0;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
+                confirmed = 1;
+                break;
+            }
+            if (regtest_is_in_mempool(rt, rc_txid)) {
+                fprintf(stderr, "LSP rotate: close TX still in mempool, "
+                        "extending wait (attempt %d)\n", attempt + 1);
+                continue;
+            }
+            fprintf(stderr, "LSP rotate: close TX %s dropped from mempool\n",
+                    rc_txid);
+            break;
+        }
+        if (!confirmed) {
+            fprintf(stderr, "LSP rotate: close TX not confirmed after retries\n");
             return 0;
         }
     }
@@ -255,9 +271,26 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (mgr->rot_is_regtest) {
         regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
     } else {
+        int rot_timeout = mgr->confirm_timeout_secs > 0 ?
+                          mgr->confirm_timeout_secs : 7200;
         printf("LSP rotate: waiting for funding confirmation...\n");
-        if (regtest_wait_for_confirmation(rt, fund_txid_hex, 7200) < 1) {
-            fprintf(stderr, "LSP rotate: funding not confirmed\n");
+        int confirmed = 0;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (regtest_wait_for_confirmation(rt, fund_txid_hex, rot_timeout) >= 1) {
+                confirmed = 1;
+                break;
+            }
+            if (regtest_is_in_mempool(rt, fund_txid_hex)) {
+                fprintf(stderr, "LSP rotate: funding TX still in mempool, "
+                        "extending wait (attempt %d)\n", attempt + 1);
+                continue;
+            }
+            fprintf(stderr, "LSP rotate: funding TX %s dropped from mempool\n",
+                    fund_txid_hex);
+            break;
+        }
+        if (!confirmed) {
+            fprintf(stderr, "LSP rotate: funding not confirmed after retries\n");
             return 0;
         }
     }
