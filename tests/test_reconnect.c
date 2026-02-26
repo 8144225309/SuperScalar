@@ -5,6 +5,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
+#include "superscalar/types.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2045,5 +2046,36 @@ int test_multi_factory_ladder_monitor(void) {
 
     ladder_free(&lad);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: secure_zero actually zeroes memory */
+int test_secure_zero_basic(void) {
+    unsigned char buf[32];
+    memset(buf, 0xFF, 32);
+
+    /* Verify non-zero */
+    int nonzero = 0;
+    for (int i = 0; i < 32; i++) nonzero |= buf[i];
+    TEST_ASSERT(nonzero != 0, "buffer should be non-zero before secure_zero");
+
+    secure_zero(buf, 32);
+
+    /* Verify all zero */
+    int sum = 0;
+    for (int i = 0; i < 32; i++) sum |= buf[i];
+    TEST_ASSERT(sum == 0, "buffer should be all-zero after secure_zero");
+
+    /* Test with odd sizes */
+    unsigned char small[7];
+    memset(small, 0xAB, 7);
+    secure_zero(small, 7);
+    sum = 0;
+    for (int i = 0; i < 7; i++) sum |= small[i];
+    TEST_ASSERT(sum == 0, "small buffer should be all-zero after secure_zero");
+
+    /* Test zero-length (should not crash) */
+    secure_zero(buf, 0);
+
     return 1;
 }

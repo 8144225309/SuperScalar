@@ -1,5 +1,6 @@
 /* ChaCha20-Poly1305 AEAD per RFC 7539 */
 #include "superscalar/crypto_aead.h"
+#include "superscalar/types.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -279,6 +280,7 @@ int aead_encrypt(unsigned char *ciphertext, unsigned char tag[16],
     store64_le(mac_data + pos, (uint64_t)pt_len);  pos += 8;
 
     poly1305_auth(tag, mac_data, pos, poly_key);
+    secure_zero(poly_key, 64);
     free(mac_data);
     return 1;
 }
@@ -320,6 +322,7 @@ int aead_decrypt(unsigned char *plaintext,
 
     unsigned char computed_tag[16];
     poly1305_auth(computed_tag, mac_data, pos, poly_key);
+    secure_zero(poly_key, 64);
     free(mac_data);
 
     /* Constant-time comparison */

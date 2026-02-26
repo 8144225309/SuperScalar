@@ -1,4 +1,5 @@
 #include "superscalar/keyfile.h"
+#include "superscalar/types.h"
 #include <secp256k1_extrakeys.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,7 +31,7 @@ static void derive_key(unsigned char *key_out32, const char *passphrase) {
     hkdf_extract(prk, salt, sizeof(salt) - 1,
                  (const unsigned char *)passphrase, strlen(passphrase));
     hkdf_expand(key_out32, 32, prk, info, sizeof(info) - 1);
-    memset(prk, 0, 32);
+    secure_zero(prk, 32);
 }
 
 int keyfile_save(const char *path, const unsigned char *seckey32,
@@ -47,7 +48,7 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
     if (urand) {
         if (fread(nonce, 1, 12, urand) != 12) {
             fclose(urand);
-            memset(enc_key, 0, 32);
+            secure_zero(enc_key, 32);
             return 0;
         }
         fclose(urand);
@@ -64,7 +65,7 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
     /* Write: [nonce 12][ciphertext 32][tag 16] = 60 bytes */
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        memset(enc_key, 0, 32);
+        secure_zero(enc_key, 32);
         return 0;
     }
 
@@ -74,7 +75,7 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
     written += fwrite(tag, 1, 16, fp);
     fclose(fp);
 
-    memset(enc_key, 0, 32);
+    secure_zero(enc_key, 32);
     return (written == KEYFILE_SIZE) ? 1 : 0;
 }
 
@@ -104,7 +105,7 @@ int keyfile_load(const char *path, unsigned char *seckey32_out,
     int ok = aead_decrypt(seckey32_out, ciphertext, 32, tag,
                            NULL, 0, enc_key, nonce);
 
-    memset(enc_key, 0, 32);
+    secure_zero(enc_key, 32);
     return ok ? 1 : 0;
 }
 
@@ -133,11 +134,11 @@ int keyfile_generate(const char *path, unsigned char *seckey32_out,
 
     /* Save to file */
     if (!keyfile_save(path, seckey, passphrase)) {
-        memset(seckey, 0, 32);
+        secure_zero(seckey, 32);
         return 0;
     }
 
     memcpy(seckey32_out, seckey, 32);
-    memset(seckey, 0, 32);
+    secure_zero(seckey, 32);
     return 1;
 }

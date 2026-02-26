@@ -1,5 +1,6 @@
 /* ECDH handshake + HMAC-SHA256/HKDF + per-fd encryption state */
 #include "superscalar/noise.h"
+#include "superscalar/types.h"
 #include <secp256k1_ecdh.h>
 #include <string.h>
 #include <stdio.h>
@@ -159,7 +160,7 @@ void wire_clear_encryption(int fd) {
     ensure_fd_table();
     for (int i = 0; i < MAX_ENCRYPTED_FDS; i++) {
         if (fd_table[i].active && fd_table[i].fd == fd) {
-            memset(&fd_table[i].state, 0, sizeof(noise_state_t));
+            secure_zero(&fd_table[i].state, sizeof(noise_state_t));
             fd_table[i].active = 0;
             fd_table[i].fd = -1;
             return;
@@ -204,9 +205,9 @@ static void derive_keys(noise_state_t *ns, const unsigned char shared[32],
     ns->send_nonce = 0;
     ns->recv_nonce = 0;
 
-    memset(prk, 0, 32);
-    memset(key_init, 0, 32);
-    memset(key_resp, 0, 32);
+    secure_zero(prk, 32);
+    secure_zero(key_init, 32);
+    secure_zero(key_resp, 32);
 }
 
 int noise_handshake_initiator(noise_state_t *ns, int fd,
@@ -229,38 +230,38 @@ int noise_handshake_initiator(noise_state_t *ns, int fd,
     size_t pub_len = 33;
     if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
                                         SECP256K1_EC_COMPRESSED)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
     if (!noise_write_all(fd, pub_ser, 33)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
 
     /* Receive responder's ephemeral pubkey */
     unsigned char remote_ser[33];
     if (!noise_read_all(fd, remote_ser, 33)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
     secp256k1_pubkey remote_pub;
     if (!secp256k1_ec_pubkey_parse(ctx, &remote_pub, remote_ser, 33)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
 
     /* ECDH */
     unsigned char shared[32];
     if (!secp256k1_ecdh(ctx, shared, &remote_pub, eph_sec, NULL, NULL)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
 
     /* Derive symmetric keys */
     derive_keys(ns, shared, 1);
 
-    memset(eph_sec, 0, 32);
-    memset(shared, 0, 32);
+    secure_zero(eph_sec, 32);
+    secure_zero(shared, 32);
     return 1;
 }
 
@@ -291,25 +292,25 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
     size_t pub_len = 33;
     if (!secp256k1_ec_pubkey_serialize(ctx, pub_ser, &pub_len, &eph_pub,
                                         SECP256K1_EC_COMPRESSED)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
     if (!noise_write_all(fd, pub_ser, 33)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
 
     /* ECDH */
     unsigned char shared[32];
     if (!secp256k1_ecdh(ctx, shared, &remote_pub, eph_sec, NULL, NULL)) {
-        memset(eph_sec, 0, 32);
+        secure_zero(eph_sec, 32);
         return 0;
     }
 
     /* Derive symmetric keys (is_initiator=0, so keys swapped) */
     derive_keys(ns, shared, 0);
 
-    memset(eph_sec, 0, 32);
-    memset(shared, 0, 32);
+    secure_zero(eph_sec, 32);
+    secure_zero(shared, 32);
     return 1;
 }

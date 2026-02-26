@@ -25,4 +25,7 @@ void tx_buf_free(tx_buf_t *buf);
 void tx_buf_reset(tx_buf_t *buf);
 void tx_buf_ensure(tx_buf_t *buf, size_t additional);
 
+/* Zero sensitive memory in a way the compiler cannot optimize away. */
+void secure_zero(void *ptr, size_t len);
+
 #endif /* SUPERSCALAR_TYPES_H */
