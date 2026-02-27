@@ -1152,6 +1152,11 @@ int main(int argc, char *argv[]) {
     }
     printf("LSP: all %d clients connected\n", n_clients);
 
+    /* Disable socket timeout during ceremony — on-chain funding confirmation
+       can take 10+ minutes on signet/testnet */
+    for (size_t i = 0; i < lsp.n_clients; i++)
+        wire_set_timeout(lsp.client_fds[i], 0);
+
     /* Set peer labels for wire logging (Phase 22) */
     for (size_t i = 0; i < lsp.n_clients; i++) {
         char label[32];
@@ -1755,6 +1760,10 @@ int main(int argc, char *argv[]) {
         if (daemon_mode) {
             printf("LSP: channels ready, entering daemon mode...\n");
             fflush(stdout);
+
+            /* Restore default socket timeout for daemon mode health checks */
+            for (size_t i = 0; i < lsp.n_clients; i++)
+                wire_set_timeout(lsp.client_fds[i], WIRE_DEFAULT_TIMEOUT_SEC);
 
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
