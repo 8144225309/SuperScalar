@@ -108,6 +108,21 @@ typedef struct {
        Greedy (profitable):  routing_fee_ppm=1000, lsp_balance_pct=60 (example) */
     uint64_t routing_fee_ppm;      /* routing fee in parts-per-million (0 = free) */
     uint16_t lsp_balance_pct;      /* LSP's share of channel capacity (0-100, default 50) */
+
+    /* Placement + Economics */
+    placement_mode_t placement_mode;   /* CLI: --placement-mode */
+    economic_mode_t  economic_mode;    /* CLI: --economic-mode */
+    uint16_t default_profit_bps;       /* CLI: --default-profit-bps */
+
+    /* Funding reserve tracking (Phase 6) */
+    uint64_t available_balance_sats;     /* wallet balance */
+    uint64_t locked_in_factories_sats;   /* capital in active factories */
+    uint64_t reserved_for_fees_sats;     /* fee reserve */
+
+    /* Profit settlement (Phase 7) */
+    uint64_t accumulated_fees_sats;       /* total routing fees since last settlement */
+    uint32_t last_settlement_block;       /* block height of last settlement */
+    uint32_t settlement_interval_blocks;  /* blocks between settlements (default: 144) */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -169,6 +184,16 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Returns 1 on clean shutdown. */
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
+
+/* Settle accumulated routing fee profits to clients per their profit_share_bps.
+   Shifts balance from LSP-local to client-remote via channel_update().
+   Returns number of channels settled (0 if nothing to settle). */
+int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory);
+
+/* Calculate unsettled profit share for a client (for cooperative close). */
+uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
+                                       const factory_t *factory,
+                                       size_t client_idx);
 
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 

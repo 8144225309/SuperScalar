@@ -1418,6 +1418,52 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
     return mgr->n_channels + 1;
 }
 
+int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory) {
+    if (!mgr || !factory) return 0;
+    if (mgr->economic_mode != ECON_PROFIT_SHARED) return 0;
+    if (mgr->accumulated_fees_sats == 0) return 0;
+
+    int settled = 0;
+    for (size_t i = 0; i < mgr->n_channels; i++) {
+        /* Client participant index = i + 1 (0 = LSP) */
+        uint32_t pidx = (uint32_t)(i + 1);
+        if (pidx >= factory->n_participants) continue;
+
+        uint16_t bps = factory->profiles[pidx].profit_share_bps;
+        if (bps == 0) continue;
+
+        uint64_t share = (mgr->accumulated_fees_sats * bps) / 10000;
+        if (share == 0) continue;
+
+        /* Shift balance from LSP-local to client-remote */
+        channel_t *ch = &mgr->entries[i].channel;
+        if (ch->local_amount >= share) {
+            ch->local_amount -= share;
+            ch->remote_amount += share;
+            settled++;
+        }
+    }
+
+    if (settled > 0)
+        mgr->accumulated_fees_sats = 0;
+
+    return settled;
+}
+
+uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
+                                       const factory_t *factory,
+                                       size_t client_idx) {
+    if (!mgr || !factory) return 0;
+    if (mgr->economic_mode != ECON_PROFIT_SHARED) return 0;
+    if (mgr->accumulated_fees_sats == 0) return 0;
+
+    uint32_t pidx = (uint32_t)(client_idx + 1);
+    if (pidx >= factory->n_participants) return 0;
+
+    uint16_t bps = factory->profiles[pidx].profit_share_bps;
+    return (mgr->accumulated_fees_sats * bps) / 10000;
+}
+
 int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   size_t expected_msgs) {
     if (!mgr || !lsp) return 0;

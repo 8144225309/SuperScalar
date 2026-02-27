@@ -76,6 +76,12 @@
 #define MSG_LEAF_ADVANCE_PSIG    0x59 /* Client -> LSP: partial sig for leaf node */
 #define MSG_LEAF_ADVANCE_DONE    0x5A /* LSP -> Subtree clients: leaf advance complete */
 
+/* Path-scoped signing (subtree re-sign on leaf exhaustion) */
+#define MSG_PATH_NONCE_BUNDLE   0x60  /* Client -> LSP: nonces for path nodes */
+#define MSG_PATH_ALL_NONCES     0x61  /* LSP -> Clients: aggregated path nonces */
+#define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
+#define MSG_PATH_SIGN_DONE      0x63  /* LSP -> Clients: path signing complete */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -448,6 +454,31 @@ cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
 int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
                              uint64_t *local_balance, uint64_t *remote_balance);
+
+/* --- Epoch Reset message builders (Phase 5) --- */
+
+/* LSP -> All: EPOCH_RESET_PROPOSE with LSP's nonce bundle for all nodes. */
+cJSON *wire_build_epoch_reset_propose(const wire_bundle_entry_t *nonce_entries,
+                                       size_t n_entries);
+
+int wire_parse_epoch_reset_propose(const cJSON *json,
+                                    wire_bundle_entry_t *entries_out,
+                                    size_t max_entries, size_t *n_entries_out);
+
+/* Client -> LSP: EPOCH_RESET_PSIG with client's nonce + psig bundles. */
+cJSON *wire_build_epoch_reset_psig(const wire_bundle_entry_t *nonce_entries,
+                                    size_t n_nonces,
+                                    const wire_bundle_entry_t *psig_entries,
+                                    size_t n_psigs);
+
+int wire_parse_epoch_reset_psig(const cJSON *json,
+                                 wire_bundle_entry_t *nonce_entries_out,
+                                 size_t max_nonces, size_t *n_nonces_out,
+                                 wire_bundle_entry_t *psig_entries_out,
+                                 size_t max_psigs, size_t *n_psigs_out);
+
+/* LSP -> All: EPOCH_RESET_DONE confirmation. */
+cJSON *wire_build_epoch_reset_done(void);
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 

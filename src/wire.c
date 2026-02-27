@@ -98,6 +98,10 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0x50: return "LSP_REVOKE_AND_ACK";
     case 0x51: return "JIT_OFFER";
+    case 0x60: return "PATH_NONCE_BUNDLE";
+    case 0x61: return "PATH_ALL_NONCES";
+    case 0x62: return "PATH_PSIG_BUNDLE";
+    case 0x63: return "PATH_SIGN_DONE";
     case 0x52: return "JIT_ACCEPT";
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
@@ -524,6 +528,22 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     cJSON_AddNumberToObject(j, "cltv_timeout", f->cltv_timeout);
     cJSON_AddNumberToObject(j, "fee_per_tx", (double)f->fee_per_tx);
     cJSON_AddNumberToObject(j, "leaf_arity", (double)f->leaf_arity);
+    cJSON_AddNumberToObject(j, "placement_mode", (double)f->placement_mode);
+    cJSON_AddNumberToObject(j, "economic_mode", (double)f->economic_mode);
+
+    /* Participant profiles */
+    cJSON *profiles = cJSON_CreateArray();
+    for (size_t i = 0; i < f->n_participants; i++) {
+        const participant_profile_t *p = &f->profiles[i];
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "idx", p->participant_idx);
+        cJSON_AddNumberToObject(item, "contribution", (double)p->contribution_sats);
+        cJSON_AddNumberToObject(item, "profit_bps", p->profit_share_bps);
+        cJSON_AddNumberToObject(item, "uptime", (double)p->uptime_score);
+        cJSON_AddNumberToObject(item, "tz_bucket", p->timezone_bucket);
+        cJSON_AddItemToArray(profiles, item);
+    }
+    cJSON_AddItemToObject(j, "profiles", profiles);
     return j;
 }
 
@@ -1350,6 +1370,73 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
     *local_balance = (uint64_t)lb->valuedouble;
     *remote_balance = (uint64_t)rb->valuedouble;
     return 1;
+}
+
+/* --- Epoch Reset messages (Phase 5) --- */
+
+cJSON *wire_build_epoch_reset_propose(const wire_bundle_entry_t *nonce_entries,
+                                       size_t n_entries) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "nonces");
+    for (size_t i = 0; i < n_entries; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "node_idx", nonce_entries[i].node_idx);
+        cJSON_AddNumberToObject(e, "signer_slot", nonce_entries[i].signer_slot);
+        wire_json_add_hex(e, "data", nonce_entries[i].data, 66);
+        cJSON_AddItemToArray(arr, e);
+    }
+    return j;
+}
+
+int wire_parse_epoch_reset_propose(const cJSON *json,
+                                    wire_bundle_entry_t *entries_out,
+                                    size_t max_entries, size_t *n_entries_out) {
+    cJSON *arr = cJSON_GetObjectItem(json, "nonces");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    *n_entries_out = wire_parse_bundle(arr, entries_out, max_entries, 66);
+    return 1;
+}
+
+cJSON *wire_build_epoch_reset_psig(const wire_bundle_entry_t *nonce_entries,
+                                    size_t n_nonces,
+                                    const wire_bundle_entry_t *psig_entries,
+                                    size_t n_psigs) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON *narr = cJSON_AddArrayToObject(j, "nonces");
+    for (size_t i = 0; i < n_nonces; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "node_idx", nonce_entries[i].node_idx);
+        cJSON_AddNumberToObject(e, "signer_slot", nonce_entries[i].signer_slot);
+        wire_json_add_hex(e, "data", nonce_entries[i].data, 66);
+        cJSON_AddItemToArray(narr, e);
+    }
+    cJSON *parr = cJSON_AddArrayToObject(j, "psigs");
+    for (size_t i = 0; i < n_psigs; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "node_idx", psig_entries[i].node_idx);
+        cJSON_AddNumberToObject(e, "signer_slot", psig_entries[i].signer_slot);
+        wire_json_add_hex(e, "data", psig_entries[i].data, 32);
+        cJSON_AddItemToArray(parr, e);
+    }
+    return j;
+}
+
+int wire_parse_epoch_reset_psig(const cJSON *json,
+                                 wire_bundle_entry_t *nonce_entries_out,
+                                 size_t max_nonces, size_t *n_nonces_out,
+                                 wire_bundle_entry_t *psig_entries_out,
+                                 size_t max_psigs, size_t *n_psigs_out) {
+    cJSON *narr = cJSON_GetObjectItem(json, "nonces");
+    cJSON *parr = cJSON_GetObjectItem(json, "psigs");
+    if (!narr || !cJSON_IsArray(narr) || !parr || !cJSON_IsArray(parr))
+        return 0;
+    *n_nonces_out = wire_parse_bundle(narr, nonce_entries_out, max_nonces, 66);
+    *n_psigs_out = wire_parse_bundle(parr, psig_entries_out, max_psigs, 32);
+    return 1;
+}
+
+cJSON *wire_build_epoch_reset_done(void) {
+    return cJSON_CreateObject();
 }
 
 /* --- Per-Leaf Advance messages (Upgrade 2) --- */

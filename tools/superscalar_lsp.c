@@ -80,6 +80,9 @@ static void usage(const char *prog) {
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
+        "  --placement-mode M  Client placement: sequential, altruistic, greedy (default: sequential)\n"
+        "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
+        "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
         "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
@@ -478,6 +481,9 @@ int main(int argc, char *argv[]) {
     uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
+    int placement_mode_arg = 0;      /* 0=sequential, 1=altruistic, 2=greedy */
+    int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
+    uint16_t default_profit_bps = 0; /* per-client profit share bps */
     const char *tor_proxy_arg = NULL;
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
@@ -583,6 +589,26 @@ int main(int argc, char *argv[]) {
             tor_password = argv[++i];
         else if (strcmp(argv[i], "--onion") == 0)
             tor_onion = 1;
+        else if (strcmp(argv[i], "--placement-mode") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "sequential") == 0) placement_mode_arg = 0;
+            else if (strcmp(argv[i], "altruistic") == 0) placement_mode_arg = 1;
+            else if (strcmp(argv[i], "greedy") == 0) placement_mode_arg = 2;
+            else { fprintf(stderr, "Error: unknown --placement-mode '%s'\n", argv[i]); return 1; }
+        }
+        else if (strcmp(argv[i], "--economic-mode") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "lsp-takes-all") == 0) economic_mode_arg = 0;
+            else if (strcmp(argv[i], "profit-shared") == 0) economic_mode_arg = 1;
+            else { fprintf(stderr, "Error: unknown --economic-mode '%s'\n", argv[i]); return 1; }
+        }
+        else if (strcmp(argv[i], "--default-profit-bps") == 0 && i + 1 < argc) {
+            default_profit_bps = (uint16_t)atoi(argv[++i]);
+            if (default_profit_bps > 10000) {
+                fprintf(stderr, "Error: --default-profit-bps must be 0-10000\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -1359,6 +1385,24 @@ int main(int argc, char *argv[]) {
            cltv_timeout, regtest_get_block_height(&rt));
     if (leaf_arity == 1)
         lsp.factory.leaf_arity = FACTORY_ARITY_1;
+    lsp.factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    lsp.factory.economic_mode = (economic_mode_t)economic_mode_arg;
+
+    /* Populate default profiles from CLI config */
+    for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
+        lsp.factory.profiles[pi].participant_idx = (uint32_t)pi;
+        if (pi == 0) {
+            /* LSP gets remainder of profit share */
+            lsp.factory.profiles[pi].profit_share_bps =
+                (uint16_t)(10000 - (uint32_t)default_profit_bps * (uint32_t)n_clients);
+        } else {
+            lsp.factory.profiles[pi].profit_share_bps = default_profit_bps;
+        }
+        lsp.factory.profiles[pi].contribution_sats = funding_sats / (uint64_t)(1 + n_clients);
+        lsp.factory.profiles[pi].uptime_score = 1.0f;
+        lsp.factory.profiles[pi].timezone_bucket = 0;
+    }
+
     printf("LSP: starting factory creation ceremony...\n");
     if (!lsp_run_factory_creation(&lsp,
                                    funding_txid, funding_vout,
@@ -1484,6 +1528,9 @@ int main(int argc, char *argv[]) {
         mgr.fee = &fee_est;
         mgr.routing_fee_ppm = routing_fee_ppm;
         mgr.lsp_balance_pct = lsp_balance_pct;
+        mgr.placement_mode = (placement_mode_t)placement_mode_arg;
+        mgr.economic_mode = (economic_mode_t)economic_mode_arg;
+        mgr.default_profit_bps = default_profit_bps;
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);

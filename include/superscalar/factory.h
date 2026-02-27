@@ -23,6 +23,28 @@ typedef enum {
     FACTORY_ARITY_1 = 1,    /* 1 client per leaf (2-of-2), 14 nodes, 3 DW layers */
 } factory_arity_t;
 
+/* Client placement strategies for tree construction */
+typedef enum {
+    PLACEMENT_SEQUENTIAL = 0,  /* current: [1,2,3,...,N] */
+    PLACEMENT_ALTRUISTIC = 1,  /* highest balance closest to root (lower exit cost) */
+    PLACEMENT_GREEDY     = 2,  /* lowest uptime deepest in tree (LSP-favorable) */
+} placement_mode_t;
+
+/* Economic fee distribution model */
+typedef enum {
+    ECON_LSP_TAKES_ALL  = 0,  /* LSP keeps all routing fees (current behavior) */
+    ECON_PROFIT_SHARED  = 1,  /* fees redistributed per profit_share_bps */
+} economic_mode_t;
+
+/* Per-participant profile for placement and economics */
+typedef struct {
+    uint32_t participant_idx;     /* 0=LSP, 1..N=clients */
+    uint64_t contribution_sats;   /* capital contributed */
+    uint16_t profit_share_bps;    /* basis points (0-10000) */
+    float    uptime_score;        /* 0.0-1.0 historical uptime */
+    uint8_t  timezone_bucket;     /* 0-23 hour of peak activity */
+} participant_profile_t;
+
 typedef enum { NODE_KICKOFF, NODE_STATE } factory_node_type_t;
 
 /* Factory lifecycle states (Phase 8) */
@@ -137,6 +159,11 @@ typedef struct {
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
     uint32_t dying_blocks;         /* duration of dying period (default: 432 = 3*144) */
+
+    /* Placement + Economics */
+    placement_mode_t placement_mode;  /* client ordering strategy */
+    economic_mode_t  economic_mode;   /* fee distribution model */
+    participant_profile_t profiles[FACTORY_MAX_SIGNERS];
 } factory_t;
 
 int factory_init(factory_t *f, secp256k1_context *ctx,
@@ -166,6 +193,11 @@ int factory_advance(factory_t *f);
 /* Reset DW counter to epoch 0, rebuild all unsigned txs, re-sign.
    Reclaims all N^2 states. Requires all signers to participate. */
 int factory_reset_epoch(factory_t *f);
+
+/* Reset DW counter to epoch 0, rebuild all unsigned txs, but do NOT sign.
+   Use for distributed signing: call this, then use factory_sessions_*()
+   to exchange nonces and partial sigs with participants. */
+int factory_reset_epoch_unsigned(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
    Rebuilds + re-signs only the affected state node.
@@ -255,6 +287,29 @@ int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
 
 /* Complete signing: aggregate partial sigs, finalize witness for all nodes. */
 int factory_sessions_complete(factory_t *f);
+
+/* Count how many nodes a participant signs on. */
+size_t factory_count_nodes_for_participant(const factory_t *f,
+                                            uint32_t participant_idx);
+
+/* --- Path-scoped signing API --- */
+
+/* Initialize signing sessions for nodes on path from leaf to root only. */
+int factory_sessions_init_path(factory_t *f, int leaf_node_idx);
+
+/* Finalize sessions (sighash + aggnonce) for path nodes only. */
+int factory_sessions_finalize_path(factory_t *f, int leaf_node_idx);
+
+/* Aggregate partial sigs + finalize witness for path nodes only. */
+int factory_sessions_complete_path(factory_t *f, int leaf_node_idx);
+
+/* Rebuild unsigned txs for path nodes only (after DW advance). */
+int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx);
+
+/* Advance leaf DW counter. If leaf exhausted, advance root layer and
+   rebuild+resign only the affected path. Returns leaf_node_idx on success,
+   -1 on error, -2 if fully exhausted (need epoch reset). */
+int factory_advance_and_rebuild_path(factory_t *f, int leaf_side);
 
 /* --- Tree navigation helpers --- */
 

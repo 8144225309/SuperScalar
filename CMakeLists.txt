@@ -88,6 +88,7 @@ add_library(superscalar
     src/keyfile.c
     src/jit_channel.c
     src/tor.c
+    src/ceremony.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -121,6 +122,7 @@ add_executable(test_superscalar
     tests/test_client_watchtower.c
     tests/test_cpfp.c
     tests/test_jit.c
+    tests/test_ceremony.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

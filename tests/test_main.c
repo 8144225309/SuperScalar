@@ -467,6 +467,44 @@ extern int test_factory_arity1_split_round_leaf_advance(void);
 extern int test_persist_dw_counter_with_leaves_4(void);
 extern int test_persist_file_reopen_round_trip(void);
 
+/* Placement + Economics tests */
+extern int test_placement_sequential(void);
+extern int test_placement_altruistic(void);
+extern int test_placement_greedy(void);
+extern int test_placement_profiles_wire_round_trip(void);
+extern int test_economic_mode_validation(void);
+
+/* Nonce Pool Integration tests */
+extern int test_nonce_pool_factory_creation(void);
+extern int test_nonce_pool_exhaustion(void);
+extern int test_factory_count_nodes_for_participant(void);
+
+/* Subtree-Scoped Signing tests */
+extern int test_factory_sessions_init_path(void);
+extern int test_factory_rebuild_path_unsigned(void);
+extern int test_factory_sign_path(void);
+extern int test_factory_advance_and_rebuild_path(void);
+
+/* Ceremony State Machine tests */
+extern int test_ceremony_all_respond(void);
+extern int test_ceremony_one_timeout(void);
+extern int test_ceremony_below_minimum(void);
+extern int test_ceremony_state_transitions(void);
+
+/* Distributed State Advances tests */
+extern int test_distributed_epoch_reset(void);
+extern int test_arity2_leaf_advance(void);
+
+/* Production Hardening tests */
+extern int test_distribution_tx_has_anchor(void);
+extern int test_ceremony_retry_excludes_timeout(void);
+extern int test_funding_reserve_check(void);
+
+/* Profit Settlement tests */
+extern int test_profit_settlement_calculation(void);
+extern int test_settlement_trigger_at_interval(void);
+extern int test_on_close_includes_unsettled(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -871,6 +909,44 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_arity1_split_round_leaf_advance);
     RUN_TEST(test_persist_dw_counter_with_leaves_4);
     RUN_TEST(test_persist_file_reopen_round_trip);
+
+    printf("\n=== Placement + Economics ===\n");
+    RUN_TEST(test_placement_sequential);
+    RUN_TEST(test_placement_altruistic);
+    RUN_TEST(test_placement_greedy);
+    RUN_TEST(test_placement_profiles_wire_round_trip);
+    RUN_TEST(test_economic_mode_validation);
+
+    printf("\n=== Nonce Pool Integration ===\n");
+    RUN_TEST(test_nonce_pool_factory_creation);
+    RUN_TEST(test_nonce_pool_exhaustion);
+    RUN_TEST(test_factory_count_nodes_for_participant);
+
+    printf("\n=== Subtree-Scoped Signing ===\n");
+    RUN_TEST(test_factory_sessions_init_path);
+    RUN_TEST(test_factory_rebuild_path_unsigned);
+    RUN_TEST(test_factory_sign_path);
+    RUN_TEST(test_factory_advance_and_rebuild_path);
+
+    printf("\n=== Ceremony State Machine ===\n");
+    RUN_TEST(test_ceremony_all_respond);
+    RUN_TEST(test_ceremony_one_timeout);
+    RUN_TEST(test_ceremony_below_minimum);
+    RUN_TEST(test_ceremony_state_transitions);
+
+    printf("\n=== Distributed State Advances ===\n");
+    RUN_TEST(test_distributed_epoch_reset);
+    RUN_TEST(test_arity2_leaf_advance);
+
+    printf("\n=== Production Hardening ===\n");
+    RUN_TEST(test_distribution_tx_has_anchor);
+    RUN_TEST(test_ceremony_retry_excludes_timeout);
+    RUN_TEST(test_funding_reserve_check);
+
+    printf("\n=== Profit Settlement ===\n");
+    RUN_TEST(test_profit_settlement_calculation);
+    RUN_TEST(test_settlement_trigger_at_interval);
+    RUN_TEST(test_on_close_includes_unsettled);
 }
 
 extern int regtest_init_faucet(void);

@@ -2148,6 +2148,109 @@ int test_regtest_lsp_restart_recovery(void) {
     return lsp_ok && all_children_ok;
 }
 
+/* Phase 7: Profit settlement calculation */
+int test_profit_settlement_calculation(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+
+    /* Set up 3 channels with known balances */
+    mgr.n_channels = 3;
+    for (size_t i = 0; i < 3; i++) {
+        mgr.entries[i].channel.local_amount = 50000;
+        mgr.entries[i].channel.remote_amount = 50000;
+        mgr.entries[i].ready = 1;
+    }
+
+    /* Build a minimal factory with profit-shared economics */
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    f.economic_mode = ECON_PROFIT_SHARED;
+    f.n_participants = 4; /* LSP + 3 clients */
+    /* LSP gets 40%, each client gets 20% = 2000 bps */
+    f.profiles[0].profit_share_bps = 4000;
+    f.profiles[1].profit_share_bps = 2000;
+    f.profiles[2].profit_share_bps = 2000;
+    f.profiles[3].profit_share_bps = 2000;
+
+    /* Accumulate 10000 sats in fees */
+    mgr.accumulated_fees_sats = 10000;
+    mgr.economic_mode = ECON_PROFIT_SHARED;
+
+    int settled = lsp_channels_settle_profits(&mgr, &f);
+    TEST_ASSERT(settled > 0, "settlement happened");
+
+    /* Each client should receive 2000 bps of 10000 = 2000 sats */
+    for (size_t i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ(mgr.entries[i].channel.remote_amount, 52000,
+                        "client remote_amount increased by share");
+        TEST_ASSERT_EQ(mgr.entries[i].channel.local_amount, 48000,
+                        "LSP local_amount decreased by share");
+    }
+
+    TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
+    return 1;
+}
+
+int test_settlement_trigger_at_interval(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.entries[0].channel.local_amount = 50000;
+    mgr.entries[0].channel.remote_amount = 50000;
+    mgr.entries[1].channel.local_amount = 50000;
+    mgr.entries[1].channel.remote_amount = 50000;
+
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    f.n_participants = 3;
+    f.profiles[0].profit_share_bps = 5000;
+    f.profiles[1].profit_share_bps = 2500;
+    f.profiles[2].profit_share_bps = 2500;
+
+    /* LSP-takes-all mode: no settlement */
+    mgr.economic_mode = ECON_LSP_TAKES_ALL;
+    mgr.accumulated_fees_sats = 5000;
+    f.economic_mode = ECON_LSP_TAKES_ALL;
+    int settled = lsp_channels_settle_profits(&mgr, &f);
+    TEST_ASSERT_EQ(settled, 0, "no settlement in LSP-takes-all mode");
+    TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 5000, "fees unchanged");
+
+    /* Profit-shared but zero fees: no settlement */
+    mgr.economic_mode = ECON_PROFIT_SHARED;
+    mgr.accumulated_fees_sats = 0;
+    f.economic_mode = ECON_PROFIT_SHARED;
+    settled = lsp_channels_settle_profits(&mgr, &f);
+    TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
+
+    return 1;
+}
+
+int test_on_close_includes_unsettled(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.accumulated_fees_sats = 8000;
+    mgr.economic_mode = ECON_PROFIT_SHARED;
+
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    f.economic_mode = ECON_PROFIT_SHARED;
+    f.n_participants = 3;
+    f.profiles[0].profit_share_bps = 4000; /* LSP */
+    f.profiles[1].profit_share_bps = 3000; /* client 0 */
+    f.profiles[2].profit_share_bps = 3000; /* client 1 */
+
+    /* Client 0: 3000 bps of 8000 = 2400 sats */
+    uint64_t share0 = lsp_channels_unsettled_share(&mgr, &f, 0);
+    TEST_ASSERT_EQ(share0, 2400, "client 0 unsettled share");
+
+    /* Client 1: 3000 bps of 8000 = 2400 sats */
+    uint64_t share1 = lsp_channels_unsettled_share(&mgr, &f, 1);
+    TEST_ASSERT_EQ(share1, 2400, "client 1 unsettled share");
+
+    return 1;
+}
+
 /* ---- Test: Double crash/recovery + cooperative close on regtest ---- */
 
 int test_regtest_crash_double_recovery(void) {

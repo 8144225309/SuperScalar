@@ -461,11 +461,43 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     cJSON *arity_item = cJSON_GetObjectItem(pj, "leaf_arity");
     int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
 
+    /* Parse placement + economic mode (optional, backward-compatible) */
+    cJSON *rpm_item = cJSON_GetObjectItem(pj, "placement_mode");
+    int rot_placement = (rpm_item && cJSON_IsNumber(rpm_item)) ? (int)rpm_item->valuedouble : 0;
+    cJSON *rem_item = cJSON_GetObjectItem(pj, "economic_mode");
+    int rot_econ = (rem_item && cJSON_IsNumber(rem_item)) ? (int)rem_item->valuedouble : 0;
+
+    /* Parse participant profiles (optional) */
+    participant_profile_t rot_profiles[FACTORY_MAX_SIGNERS];
+    memset(rot_profiles, 0, sizeof(rot_profiles));
+    cJSON *rprof_arr = cJSON_GetObjectItem(pj, "profiles");
+    if (rprof_arr && cJSON_IsArray(rprof_arr)) {
+        int n_prof = cJSON_GetArraySize(rprof_arr);
+        for (int rpi = 0; rpi < n_prof && rpi < FACTORY_MAX_SIGNERS; rpi++) {
+            cJSON *rpe = cJSON_GetArrayItem(rprof_arr, rpi);
+            if (!rpe) continue;
+            cJSON *rv;
+            rv = cJSON_GetObjectItem(rpe, "idx");
+            if (rv && cJSON_IsNumber(rv)) rot_profiles[rpi].participant_idx = (uint32_t)rv->valuedouble;
+            rv = cJSON_GetObjectItem(rpe, "contribution");
+            if (rv && cJSON_IsNumber(rv)) rot_profiles[rpi].contribution_sats = (uint64_t)rv->valuedouble;
+            rv = cJSON_GetObjectItem(rpe, "profit_bps");
+            if (rv && cJSON_IsNumber(rv)) rot_profiles[rpi].profit_share_bps = (uint16_t)rv->valuedouble;
+            rv = cJSON_GetObjectItem(rpe, "uptime");
+            if (rv && cJSON_IsNumber(rv)) rot_profiles[rpi].uptime_score = (float)rv->valuedouble;
+            rv = cJSON_GetObjectItem(rpe, "tz_bucket");
+            if (rv && cJSON_IsNumber(rv)) rot_profiles[rpi].timezone_bucket = (uint8_t)rv->valuedouble;
+        }
+    }
+
     /* Build factory locally */
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory_out->cltv_timeout = cltv_timeout;
     factory_out->fee_per_tx = fee_per_tx;
+    factory_out->placement_mode = (placement_mode_t)rot_placement;
+    factory_out->economic_mode = (economic_mode_t)rot_econ;
+    memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
     if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
@@ -850,6 +882,35 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint64_t fee_per_tx = (uint64_t)cJSON_GetObjectItem(msg.json, "fee_per_tx")->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
     int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
+
+    /* Parse placement + economic mode (optional, backward-compatible) */
+    cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
+    int placement_mode = (pm_item && cJSON_IsNumber(pm_item)) ? (int)pm_item->valuedouble : 0;
+    cJSON *em_item = cJSON_GetObjectItem(msg.json, "economic_mode");
+    int economic_mode = (em_item && cJSON_IsNumber(em_item)) ? (int)em_item->valuedouble : 0;
+
+    /* Parse participant profiles (optional) */
+    participant_profile_t profiles[FACTORY_MAX_SIGNERS];
+    memset(profiles, 0, sizeof(profiles));
+    cJSON *prof_arr = cJSON_GetObjectItem(msg.json, "profiles");
+    if (prof_arr && cJSON_IsArray(prof_arr)) {
+        int n_prof = cJSON_GetArraySize(prof_arr);
+        for (int pi = 0; pi < n_prof && pi < FACTORY_MAX_SIGNERS; pi++) {
+            cJSON *pe = cJSON_GetArrayItem(prof_arr, pi);
+            if (!pe) continue;
+            cJSON *v;
+            v = cJSON_GetObjectItem(pe, "idx");
+            if (v && cJSON_IsNumber(v)) profiles[pi].participant_idx = (uint32_t)v->valuedouble;
+            v = cJSON_GetObjectItem(pe, "contribution");
+            if (v && cJSON_IsNumber(v)) profiles[pi].contribution_sats = (uint64_t)v->valuedouble;
+            v = cJSON_GetObjectItem(pe, "profit_bps");
+            if (v && cJSON_IsNumber(v)) profiles[pi].profit_share_bps = (uint16_t)v->valuedouble;
+            v = cJSON_GetObjectItem(pe, "uptime");
+            if (v && cJSON_IsNumber(v)) profiles[pi].uptime_score = (float)v->valuedouble;
+            v = cJSON_GetObjectItem(pe, "tz_bucket");
+            if (v && cJSON_IsNumber(v)) profiles[pi].timezone_bucket = (uint8_t)v->valuedouble;
+        }
+    }
     cJSON_Delete(msg.json);
 
     /* Build factory locally */
@@ -858,6 +919,9 @@ int client_run_with_channels(secp256k1_context *ctx,
                               step_blocks, states_per_layer);
     factory.cltv_timeout = cltv_timeout;
     factory.fee_per_tx = fee_per_tx;
+    factory.placement_mode = (placement_mode_t)placement_mode;
+    factory.economic_mode = (economic_mode_t)economic_mode;
+    memcpy(factory.profiles, profiles, sizeof(profiles));
     if (leaf_arity == 1)
         factory_set_arity(&factory, FACTORY_ARITY_1);
     factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
@@ -878,25 +942,30 @@ int client_run_with_channels(secp256k1_context *ctx,
         return 0;
     }
 
-    /* Generate nonces */
+    /* Generate nonces via pool */
     unsigned char my_seckey[32];
     secp256k1_keypair_sec(ctx, my_seckey, keypair);
 
-    size_t my_node_count = 0;
-    for (size_t i = 0; i < factory.n_nodes; i++) {
-        if (factory_find_signer_slot(&factory, i, my_index) >= 0)
-            my_node_count++;
-    }
+    size_t my_node_count = factory_count_nodes_for_participant(&factory, my_index);
 
-    secp256k1_musig_secnonce *my_secnonces =
-        (secp256k1_musig_secnonce *)calloc(my_node_count,
-                                            sizeof(secp256k1_musig_secnonce));
+    /* Pre-generate nonce pool */
+    musig_nonce_pool_t my_pool;
+    if (!musig_nonce_pool_generate(ctx, &my_pool, my_node_count,
+                                    my_seckey, &my_pubkey, NULL)) {
+        fprintf(stderr, "Client: nonce pool generation failed\n");
+        memset(my_seckey, 0, 32);
+        factory_free(&factory);
+        wire_close(fd);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+
+    secp256k1_musig_secnonce *my_secnonce_ptrs[FACTORY_MAX_NODES];
     wire_bundle_entry_t *nonce_entries =
         (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
 
-    if (my_node_count > 0 && (!my_secnonces || !nonce_entries)) {
+    if (my_node_count > 0 && !nonce_entries) {
         fprintf(stderr, "Client: alloc failed\n");
-        free(my_secnonces);
         free(nonce_entries);
         factory_free(&factory);
         wire_close(fd);
@@ -908,13 +977,13 @@ int client_run_with_channels(secp256k1_context *ctx,
         int slot = factory_find_signer_slot(&factory, i, my_index);
         if (slot < 0) continue;
 
+        secp256k1_musig_secnonce *sec;
         secp256k1_musig_pubnonce pubnonce;
-        if (!musig_generate_nonce(ctx, &my_secnonces[nonce_count], &pubnonce,
-                                   my_seckey, &my_pubkey,
-                                   &factory.nodes[i].keyagg.cache)) {
-            fprintf(stderr, "Client: nonce gen failed node %zu\n", i);
+        if (!musig_nonce_pool_next(&my_pool, &sec, &pubnonce)) {
+            fprintf(stderr, "Client: nonce pool exhausted at node %zu\n", i);
             goto fail;
         }
+        my_secnonce_ptrs[nonce_count] = sec;
 
         unsigned char nonce_ser[66];
         musig_pubnonce_serialize(ctx, nonce_ser, &pubnonce);
@@ -925,7 +994,6 @@ int client_run_with_channels(secp256k1_context *ctx,
         nonce_entries[nonce_count].data_len = 66;
         nonce_count++;
     }
-    memset(my_seckey, 0, 32);
 
     /* Send NONCE_BUNDLE */
     {
@@ -990,13 +1058,13 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
         size_t psig_count = 0;
 
-        size_t secnonce_idx = 0;
+        size_t psig_nonce_idx = 0;
         for (size_t i = 0; i < factory.n_nodes; i++) {
             int slot = factory_find_signer_slot(&factory, i, my_index);
             if (slot < 0) continue;
 
             secp256k1_musig_partial_sig psig;
-            if (!musig_create_partial_sig(ctx, &psig, &my_secnonces[secnonce_idx],
+            if (!musig_create_partial_sig(ctx, &psig, my_secnonce_ptrs[psig_nonce_idx],
                                            keypair, &factory.nodes[i].signing_session)) {
                 fprintf(stderr, "Client: partial sig failed node %zu\n", i);
                 free(psig_entries);
@@ -1011,7 +1079,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             memcpy(psig_entries[psig_count].data, psig_ser, 32);
             psig_entries[psig_count].data_len = 32;
             psig_count++;
-            secnonce_idx++;
+            psig_nonce_idx++;
         }
 
         cJSON *bundle = wire_build_psig_bundle(psig_entries, psig_count);
@@ -1236,15 +1304,12 @@ int client_run_with_channels(secp256k1_context *ctx,
     printf("Client %u: cooperative close complete!\n", my_index);
 
 done:
-    free(my_secnonces);
     free(nonce_entries);
     factory_free(&factory);
     wire_close(fd);
     return 1;
 
 fail:
-    memset(my_secnonces, 0, my_node_count * sizeof(secp256k1_musig_secnonce));
-    free(my_secnonces);
     free(nonce_entries);
     factory_free(&factory);
     wire_close(fd);

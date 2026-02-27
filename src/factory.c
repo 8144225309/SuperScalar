@@ -5,6 +5,36 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* --- Placement sort context (passed via global for qsort) --- */
+static const factory_t *g_sort_factory = NULL;
+
+/* Altruistic: highest contribution_sats first (descending) */
+static int cmp_balance_desc(const void *a, const void *b) {
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+    uint64_t ba = g_sort_factory->profiles[ia].contribution_sats;
+    uint64_t bb = g_sort_factory->profiles[ib].contribution_sats;
+    if (ba > bb) return -1;
+    if (ba < bb) return 1;
+    return 0;
+}
+
+/* Greedy: lowest uptime first (ascending), then lowest contribution (ascending) */
+static int cmp_uptime_asc(const void *a, const void *b) {
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+    float ua = g_sort_factory->profiles[ia].uptime_score;
+    float ub = g_sort_factory->profiles[ib].uptime_score;
+    if (ua < ub) return -1;
+    if (ua > ub) return 1;
+    /* Secondary: lowest contribution first */
+    uint64_t ba = g_sort_factory->profiles[ia].contribution_sats;
+    uint64_t bb = g_sort_factory->profiles[ib].contribution_sats;
+    if (ba < bb) return -1;
+    if (ba > bb) return 1;
+    return 0;
+}
+
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 extern void sha256_tagged(const char *, const unsigned char *, size_t,
                            unsigned char *);
@@ -740,6 +770,17 @@ int factory_build_tree(factory_t *f) {
     for (size_t i = 0; i < n_clients; i++)
         clients[i] = (uint32_t)(i + 1);
 
+    /* Apply placement strategy */
+    if (f->placement_mode == PLACEMENT_ALTRUISTIC && n_clients > 1) {
+        g_sort_factory = f;
+        qsort(clients, n_clients, sizeof(uint32_t), cmp_balance_desc);
+        g_sort_factory = NULL;
+    } else if (f->placement_mode == PLACEMENT_GREEDY && n_clients > 1) {
+        g_sort_factory = f;
+        qsort(clients, n_clients, sizeof(uint32_t), cmp_uptime_asc);
+        g_sort_factory = NULL;
+    }
+
     /* Build the tree recursively */
     f->n_nodes = 0;
     int leaf_counter = 0;
@@ -830,6 +871,143 @@ int factory_sessions_complete(factory_t *f) {
         node->is_signed = 1;
     }
     return 1;
+}
+
+size_t factory_count_nodes_for_participant(const factory_t *f,
+                                            uint32_t participant_idx) {
+    size_t count = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        for (size_t s = 0; s < f->nodes[i].n_signers; s++) {
+            if (f->nodes[i].signer_indices[s] == participant_idx) {
+                count++;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+/* --- Path-scoped signing implementation --- */
+
+int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
+    int path[FACTORY_MAX_NODES];
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    if (n == 0) return 0;
+
+    for (size_t i = 0; i < n; i++) {
+        factory_node_t *node = &f->nodes[path[i]];
+        if (!node->is_built) return 0;
+        musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+        node->partial_sigs_received = 0;
+    }
+    return 1;
+}
+
+int factory_sessions_finalize_path(factory_t *f, int leaf_node_idx) {
+    int path[FACTORY_MAX_NODES];
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    if (n == 0) return 0;
+
+    for (size_t i = 0; i < n; i++) {
+        factory_node_t *node = &f->nodes[path[i]];
+
+        unsigned char sighash[32];
+        if (!compute_node_sighash(f, node, sighash))
+            return 0;
+
+        const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+        if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
+                                            sighash, mr, NULL))
+            return 0;
+    }
+    return 1;
+}
+
+int factory_sessions_complete_path(factory_t *f, int leaf_node_idx) {
+    int path[FACTORY_MAX_NODES];
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    if (n == 0) return 0;
+
+    for (size_t i = 0; i < n; i++) {
+        factory_node_t *node = &f->nodes[path[i]];
+
+        if (node->partial_sigs_received != (int)node->n_signers)
+            return 0;
+
+        unsigned char sig[64];
+        if (!musig_aggregate_partial_sigs(f->ctx, sig, &node->signing_session,
+                                           node->partial_sigs, node->n_signers))
+            return 0;
+
+        if (!finalize_signed_tx(&node->signed_tx,
+                                 node->unsigned_tx.data, node->unsigned_tx.len,
+                                 sig))
+            return 0;
+
+        node->is_signed = 1;
+    }
+    return 1;
+}
+
+int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx) {
+    int path[FACTORY_MAX_NODES];
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    if (n == 0) return 0;
+
+    /* Rebuild unsigned txs for path nodes only (root-first order) */
+    for (size_t i = 0; i < n; i++) {
+        factory_node_t *node = &f->nodes[path[i]];
+
+        /* Determine input */
+        const unsigned char *input_txid;
+        uint32_t input_vout;
+
+        if (node->parent_index < 0) {
+            input_txid = f->funding_txid;
+            input_vout = f->funding_vout;
+        } else {
+            factory_node_t *parent = &f->nodes[node->parent_index];
+            input_txid = parent->txid;
+            input_vout = node->parent_vout;
+        }
+
+        node->nsequence = node_nsequence(f, node);
+
+        unsigned char display_txid[32];
+        tx_buf_t utx;
+        tx_buf_init(&utx, 256);
+        if (!build_unsigned_tx(&utx, display_txid,
+                                input_txid, input_vout,
+                                node->nsequence,
+                                node->outputs, node->n_outputs)) {
+            tx_buf_free(&utx);
+            return 0;
+        }
+
+        /* Update node */
+        tx_buf_free(&node->unsigned_tx);
+        node->unsigned_tx = utx;
+        node->is_signed = 0;
+
+        /* Convert display-order txid to internal byte order */
+        memcpy(node->txid, display_txid, 32);
+        reverse_bytes(node->txid, 32);
+    }
+    return 1;
+}
+
+int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
+    int ret = factory_advance_leaf_unsigned(f, leaf_side);
+    if (ret == 0) return -2;  /* fully exhausted */
+    if (ret < 0) {
+        /* Leaf exhausted, root layer advanced — rebuild path */
+        int leaf_state_idx = (int)f->leaf_node_indices[leaf_side];
+        if (!factory_rebuild_path_unsigned(f, leaf_state_idx))
+            return -1;
+        return leaf_state_idx;
+    }
+    /* Normal advance, only leaf node changed */
+    return (int)f->leaf_node_indices[leaf_side];
 }
 
 int factory_sign_all(factory_t *f) {
@@ -938,6 +1116,19 @@ int factory_reset_epoch(factory_t *f) {
     if (!build_all_unsigned_txs(f))
         return 0;
     return factory_sign_all(f);
+}
+
+int factory_reset_epoch_unsigned(factory_t *f) {
+    dw_counter_reset(&f->counter);
+
+    /* Reset per-leaf layers too */
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+    f->per_leaf_enabled = 0;
+
+    if (!update_l_stock_outputs(f))
+        return 0;
+    return build_all_unsigned_txs(f);
 }
 
 /* Rebuild unsigned tx for a single node. */
@@ -1461,6 +1652,24 @@ int factory_build_distribution_tx(
     size_t n_outputs,
     uint32_t nlocktime)
 {
+    /* Build augmented output array with P2A anchor appended.
+       Anchor cost deducted from first output (LSP's share). */
+    tx_output_t aug_outputs[FACTORY_MAX_OUTPUTS + 1];
+    size_t aug_n = n_outputs;
+    if (n_outputs > FACTORY_MAX_OUTPUTS) return 0;
+
+    for (size_t i = 0; i < n_outputs; i++)
+        aug_outputs[i] = outputs[i];
+
+    /* Add P2A anchor output for CPFP fee bumping */
+    if (aug_outputs[0].amount_sats > ANCHOR_OUTPUT_AMOUNT) {
+        aug_outputs[0].amount_sats -= ANCHOR_OUTPUT_AMOUNT;
+        memcpy(aug_outputs[aug_n].script_pubkey, P2A_SPK, P2A_SPK_LEN);
+        aug_outputs[aug_n].script_pubkey_len = P2A_SPK_LEN;
+        aug_outputs[aug_n].amount_sats = ANCHOR_OUTPUT_AMOUNT;
+        aug_n++;
+    }
+
     /* Build unsigned tx with nLockTime spending the funding UTXO.
        nSequence = 0xFFFFFFFE to enable nLockTime. */
     tx_buf_t unsigned_tx;
@@ -1472,7 +1681,7 @@ int factory_build_distribution_tx(
                                           txid_out32 ? display_txid : NULL,
                                           f->funding_txid, f->funding_vout,
                                           0xFFFFFFFEu, nlocktime,
-                                          outputs, n_outputs)) {
+                                          aug_outputs, aug_n)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }

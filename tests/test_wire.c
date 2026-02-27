@@ -1127,3 +1127,116 @@ int test_wire_recv_zero_length_frame(void) {
     TEST_ASSERT(got == 0, "zero-length frame rejected");
     return 1;
 }
+
+/* ---- Placement profiles wire round-trip ---- */
+
+int test_placement_profiles_wire_round_trip(void) {
+    /* Build a factory with placement + profiles, serialize, parse, verify */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create minimal factory for serialization */
+    secp256k1_keypair kps[5];
+    unsigned char sks[5][32] = {
+        { [0 ... 31] = 0x10 }, { [0 ... 31] = 0x21 },
+        { [0 ... 31] = 0x32 }, { [0 ... 31] = 0x43 },
+        { [0 ... 31] = 0x54 },
+    };
+    for (int i = 0; i < 5; i++) {
+        int ok = secp256k1_keypair_create(ctx, &kps[i], sks[i]);
+        (void)ok;
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    unsigned char fund_spk[34];
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    build_p2tr_script_pubkey(fund_spk, &ka.agg_pubkey);
+
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+
+    /* Set placement and profiles */
+    f.placement_mode = PLACEMENT_ALTRUISTIC;
+    f.economic_mode = ECON_PROFIT_SHARED;
+    f.profiles[0].participant_idx = 0;
+    f.profiles[0].contribution_sats = 50000;
+    f.profiles[0].profit_share_bps = 4000;
+    f.profiles[0].uptime_score = 1.0f;
+    f.profiles[0].timezone_bucket = 12;
+    f.profiles[1].participant_idx = 1;
+    f.profiles[1].contribution_sats = 20000;
+    f.profiles[1].profit_share_bps = 2000;
+    f.profiles[1].uptime_score = 0.8f;
+    f.profiles[1].timezone_bucket = 5;
+    f.profiles[2].participant_idx = 2;
+    f.profiles[2].contribution_sats = 15000;
+    f.profiles[2].profit_share_bps = 1500;
+    f.profiles[2].uptime_score = 0.6f;
+    f.profiles[2].timezone_bucket = 18;
+    f.profiles[3].participant_idx = 3;
+    f.profiles[3].contribution_sats = 10000;
+    f.profiles[3].profit_share_bps = 1500;
+    f.profiles[3].uptime_score = 0.4f;
+    f.profiles[3].timezone_bucket = 0;
+    f.profiles[4].participant_idx = 4;
+    f.profiles[4].contribution_sats = 5000;
+    f.profiles[4].profit_share_bps = 1000;
+    f.profiles[4].uptime_score = 0.2f;
+    f.profiles[4].timezone_bucket = 23;
+
+    /* Serialize */
+    cJSON *j = wire_build_factory_propose(&f);
+    TEST_ASSERT(j != NULL, "serialize propose");
+
+    /* Parse back placement_mode */
+    cJSON *pm = cJSON_GetObjectItem(j, "placement_mode");
+    TEST_ASSERT(pm && cJSON_IsNumber(pm), "has placement_mode");
+    TEST_ASSERT_EQ((int)pm->valuedouble, PLACEMENT_ALTRUISTIC, "placement_mode = altruistic");
+
+    /* Parse back economic_mode */
+    cJSON *em = cJSON_GetObjectItem(j, "economic_mode");
+    TEST_ASSERT(em && cJSON_IsNumber(em), "has economic_mode");
+    TEST_ASSERT_EQ((int)em->valuedouble, ECON_PROFIT_SHARED, "economic_mode = profit-shared");
+
+    /* Parse back profiles */
+    cJSON *parr = cJSON_GetObjectItem(j, "profiles");
+    TEST_ASSERT(parr && cJSON_IsArray(parr), "has profiles array");
+    TEST_ASSERT_EQ(cJSON_GetArraySize(parr), 5, "5 profiles");
+
+    /* Verify profile 0 */
+    cJSON *p0 = cJSON_GetArrayItem(parr, 0);
+    TEST_ASSERT(p0 != NULL, "profile 0 exists");
+    cJSON *v;
+    v = cJSON_GetObjectItem(p0, "idx");
+    TEST_ASSERT_EQ((int)v->valuedouble, 0, "profile 0 idx");
+    v = cJSON_GetObjectItem(p0, "contribution");
+    TEST_ASSERT_EQ((long)v->valuedouble, 50000, "profile 0 contribution");
+    v = cJSON_GetObjectItem(p0, "profit_bps");
+    TEST_ASSERT_EQ((int)v->valuedouble, 4000, "profile 0 bps");
+    v = cJSON_GetObjectItem(p0, "tz_bucket");
+    TEST_ASSERT_EQ((int)v->valuedouble, 12, "profile 0 tz_bucket");
+
+    /* Verify profile 4 */
+    cJSON *p4 = cJSON_GetArrayItem(parr, 4);
+    TEST_ASSERT(p4 != NULL, "profile 4 exists");
+    v = cJSON_GetObjectItem(p4, "idx");
+    TEST_ASSERT_EQ((int)v->valuedouble, 4, "profile 4 idx");
+    v = cJSON_GetObjectItem(p4, "contribution");
+    TEST_ASSERT_EQ((long)v->valuedouble, 5000, "profile 4 contribution");
+    v = cJSON_GetObjectItem(p4, "profit_bps");
+    TEST_ASSERT_EQ((int)v->valuedouble, 1000, "profile 4 bps");
+    v = cJSON_GetObjectItem(p4, "tz_bucket");
+    TEST_ASSERT_EQ((int)v->valuedouble, 23, "profile 4 tz_bucket");
+
+    cJSON_Delete(j);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
