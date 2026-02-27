@@ -17,6 +17,9 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <cJSON.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 /* Test macros (same as test_main.c) */
 #define TEST_ASSERT(cond, msg) do { \
@@ -893,5 +896,183 @@ int test_jit_funding_confirmation_transition(void) {
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "should be active after manual open");
 
     jit_channels_cleanup(&mgr);
+    return 1;
+}
+
+/* --- Regtest: daemon loop JIT trigger on factory expiry --- */
+
+typedef struct {
+    int fd;
+    secp256k1_context *ctx;
+    unsigned char seckey[32];
+} jit_client_ctx_t;
+
+static void *jit_client_handler(void *arg) {
+    jit_client_ctx_t *c = (jit_client_ctx_t *)arg;
+    wire_msg_t msg;
+
+    /* 1. Receive JIT_OFFER */
+    if (!wire_recv(c->fd, &msg) || msg.msg_type != MSG_JIT_OFFER) return NULL;
+    cJSON_Delete(msg.json);
+
+    /* 2. Send JIT_ACCEPT with our pubkey */
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_create(c->ctx, &pk, c->seckey)) return NULL;
+    cJSON *acc = wire_build_jit_accept(0, c->ctx, &pk);
+    wire_send(c->fd, MSG_JIT_ACCEPT, acc);
+    cJSON_Delete(acc);
+
+    /* 3. Receive BASEPOINTS, send ours back */
+    if (!wire_recv(c->fd, &msg) || msg.msg_type != MSG_CHANNEL_BASEPOINTS) return NULL;
+    cJSON_Delete(msg.json);
+
+    unsigned char sk[32];
+    secp256k1_pubkey bps[6];
+    for (int i = 0; i < 6; i++) {
+        memset(sk, 0x10 + i, 32);
+        sk[31] = (unsigned char)(i + 1);
+        if (!secp256k1_ec_pubkey_create(c->ctx, &bps[i], sk)) return NULL;
+    }
+    cJSON *bpm = wire_build_channel_basepoints(
+        JIT_CHANNEL_ID_BASE, c->ctx,
+        &bps[0], &bps[1], &bps[2], &bps[3], &bps[4], &bps[5]);
+    wire_send(c->fd, MSG_CHANNEL_BASEPOINTS, bpm);
+    cJSON_Delete(bpm);
+
+    /* 4. Receive NONCES, send matching count of fake nonces */
+    if (!wire_recv(c->fd, &msg) || msg.msg_type != MSG_CHANNEL_NONCES) return NULL;
+    uint32_t ch_id;
+    unsigned char recv_nonces[256][66];
+    size_t nonce_count = 0;
+    wire_parse_channel_nonces(msg.json, &ch_id, recv_nonces, 256, &nonce_count);
+    cJSON_Delete(msg.json);
+
+    unsigned char (*fake_nonces)[66] = calloc(nonce_count, 66);
+    for (size_t i = 0; i < nonce_count; i++)
+        memset(fake_nonces[i], 0x42 + (unsigned char)(i & 0xFF), 66);
+
+    cJSON *nm = wire_build_channel_nonces(JIT_CHANNEL_ID_BASE,
+                                            (const unsigned char (*)[66])fake_nonces,
+                                            nonce_count);
+    wire_send(c->fd, MSG_CHANNEL_NONCES, nm);
+    cJSON_Delete(nm);
+    free(fake_nonces);
+
+    /* 5. Receive JIT_READY */
+    if (!wire_recv(c->fd, &msg) || msg.msg_type != MSG_JIT_READY) return NULL;
+    cJSON_Delete(msg.json);
+
+    return (void *)1;
+}
+
+int test_regtest_jit_daemon_trigger(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Connect to regtest */
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_jit_trigger");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_fund_from_faucet(&rt, 10.0);
+
+    /* Create minimal factory with short lifecycle */
+    int base_height = regtest_get_block_height(&rt);
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    factory_set_lifecycle(&f, (uint32_t)base_height, 5, 5);
+
+    /* Verify state transitions */
+    TEST_ASSERT(factory_get_state(&f, (uint32_t)base_height) == FACTORY_ACTIVE,
+                "should be ACTIVE at creation");
+
+    regtest_mine_blocks(&rt, 5, mine_addr);
+    int h2 = regtest_get_block_height(&rt);
+    TEST_ASSERT(factory_get_state(&f, (uint32_t)h2) == FACTORY_DYING,
+                "should be DYING after active_blocks");
+
+    regtest_mine_blocks(&rt, 5, mine_addr);
+    int h3 = regtest_get_block_height(&rt);
+    TEST_ASSERT(factory_get_state(&f, (uint32_t)h3) == FACTORY_EXPIRED,
+                "should be EXPIRED after dying_blocks");
+
+    /* Set up watchtower with regtest connection */
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    wt.rt = &rt;
+    wt.n_channels = 2; /* factory channels + JIT slots */
+
+    /* Set up lsp_channel_mgr_t */
+    unsigned char lsp_seckey[32];
+    memset(lsp_seckey, 0x01, 32);
+    lsp_seckey[31] = 0x01;
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 1;
+    mgr.watchtower = &wt;
+    memcpy(mgr.rot_lsp_seckey, lsp_seckey, 32);
+    mgr.rot_is_regtest = 1;
+    snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr), "%s", mine_addr);
+    snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr), "%s", mine_addr);
+    mgr.rot_funding_sats = 50000;
+    jit_channels_init(&mgr);
+
+    /* Set up lsp_t with factory */
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    lsp.factory = f;
+
+    /* Verify daemon loop JIT trigger conditions */
+    int h = regtest_get_block_height(mgr.watchtower->rt);
+    factory_state_t fs = factory_get_state(&lsp.factory, (uint32_t)h);
+    TEST_ASSERT(fs == FACTORY_EXPIRED, "daemon should detect factory EXPIRED");
+    TEST_ASSERT(mgr.jit_enabled, "JIT should be enabled");
+    TEST_ASSERT(!jit_channel_is_active(&mgr, 0), "no active JIT for client 0");
+
+    /* Create socketpair for client wire protocol */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp.client_fds[0] = sv[0];
+
+    /* Start client thread to handle JIT protocol */
+    jit_client_ctx_t client_args;
+    client_args.fd = sv[1];
+    client_args.ctx = ctx;
+    memset(client_args.seckey, 0x02, 32);
+    client_args.seckey[31] = 0x02;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, jit_client_handler, &client_args);
+
+    /* Call jit_channel_create — same as daemon loop would at line 1891 */
+    int ok = jit_channel_create(&mgr, &lsp, 0, 50000, "factory_expired");
+    TEST_ASSERT(ok, "jit_channel_create should succeed");
+
+    /* Verify JIT channel is active */
+    TEST_ASSERT(jit_channel_is_active(&mgr, 0), "JIT should be active after create");
+    TEST_ASSERT_EQ((long)mgr.n_jit_channels, 1, "should have 1 JIT channel");
+
+    jit_channel_t *jit = jit_channel_find(&mgr, 0);
+    TEST_ASSERT(jit != NULL, "should find JIT for client 0");
+    TEST_ASSERT(jit->state == JIT_STATE_OPEN, "JIT state should be OPEN");
+    TEST_ASSERT(jit->funding_amount > 0, "funding_amount should be set");
+
+    void *thread_ret;
+    pthread_join(tid, &thread_ret);
+    TEST_ASSERT(thread_ret != NULL, "client thread should succeed");
+
+    /* Cleanup */
+    jit_channels_cleanup(&mgr);
+    close(sv[0]);
+    close(sv[1]);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

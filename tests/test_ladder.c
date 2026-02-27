@@ -1212,18 +1212,28 @@ int test_regtest_ptlc_no_coop_close(void) {
     int conf = regtest_get_confirmations(&rt, dist_txid_hex);
     TEST_ASSERT(conf > 0, "distribution tx confirmed");
 
-    /* Verify each client output amount matches expected */
-    for (int i = 0; i < 5; i++) {
+    /* Verify each output amount (5 participant + 1 P2A anchor = 6 outputs).
+       factory_build_distribution_tx() appends a P2A anchor (240 sats)
+       and deducts anchor cost from output[0]. */
+    for (int i = 0; i < 6; i++) {
         uint64_t out_amt;
         unsigned char out_spk[64];
         size_t out_spk_len;
         int got = regtest_get_tx_output(&rt, dist_txid_hex, (uint32_t)i,
                                           &out_amt, out_spk, &out_spk_len);
         TEST_ASSERT(got, "get distribution output");
-        uint64_t expected = per_output + (i == 4 ? remainder : 0);
-        TEST_ASSERT(out_amt == expected, "output amount matches");
+        if (i == 5) {
+            /* P2A anchor output */
+            TEST_ASSERT(out_amt == 240, "P2A anchor amount");
+        } else if (i == 0) {
+            /* Output[0] has anchor cost deducted */
+            TEST_ASSERT(out_amt == per_output - 240, "output[0] amount (anchor deducted)");
+        } else {
+            uint64_t expected = per_output + (i == 4 ? remainder : 0);
+            TEST_ASSERT(out_amt == expected, "output amount matches");
+        }
     }
-    printf("  All 5 participants receive correct distribution amounts.\n");
+    printf("  All 5 participants + P2A anchor receive correct distribution amounts.\n");
     printf("  PTLC turnover + no coop close → distribution fallback works!\n");
 
     tx_buf_free(&dist_tx);
@@ -1364,9 +1374,10 @@ int test_regtest_all_offline_recovery(void) {
     int dist_conf = regtest_get_confirmations(&rt, dist_txid_hex);
     TEST_ASSERT(dist_conf > 0, "distribution tx confirmed");
 
-    /* Verify: distribution tx has 5 outputs (1 LSP + 4 clients) */
+    /* Verify: distribution tx has 6 outputs (5 participant + 1 P2A anchor).
+       factory_build_distribution_tx() appends P2A anchor and deducts 240 from output[0]. */
     int output_count = 0;
-    for (int v = 0; v < 6; v++) {
+    for (int v = 0; v < 7; v++) {
         uint64_t amt;
         unsigned char spk[64];
         size_t spk_len;
@@ -1374,23 +1385,32 @@ int test_regtest_all_offline_recovery(void) {
                                     &amt, spk, &spk_len))
             output_count++;
     }
-    TEST_ASSERT(output_count == 5, "distribution tx has 5 outputs");
+    TEST_ASSERT(output_count == 6, "distribution tx has 6 outputs (5 + P2A anchor)");
 
-    /* Verify: each output >= expected balance (P2TR to participant keys) */
-    for (int i = 0; i < 5; i++) {
+    /* Verify: participant outputs have correct amounts, P2A anchor = 240 */
+    for (int i = 0; i < 6; i++) {
         uint64_t out_amt;
         unsigned char out_spk[64];
         size_t out_spk_len;
         TEST_ASSERT(regtest_get_tx_output(&rt, dist_txid_hex, (uint32_t)i,
                                             &out_amt, out_spk, &out_spk_len),
                     "get output");
-        TEST_ASSERT(out_amt >= per_output, "output amount sufficient");
-        /* Verify output is P2TR (0x5120 prefix) */
-        TEST_ASSERT(out_spk_len == 34 && out_spk[0] == 0x51 && out_spk[1] == 0x20,
-                    "output is P2TR");
+        if (i == 5) {
+            /* P2A anchor output */
+            TEST_ASSERT(out_amt == 240, "P2A anchor amount");
+        } else if (i == 0) {
+            /* Output[0] has anchor cost deducted */
+            TEST_ASSERT(out_amt >= per_output - 240, "output[0] amount (anchor deducted)");
+            TEST_ASSERT(out_spk_len == 34 && out_spk[0] == 0x51 && out_spk[1] == 0x20,
+                        "output is P2TR");
+        } else {
+            TEST_ASSERT(out_amt >= per_output, "output amount sufficient");
+            TEST_ASSERT(out_spk_len == 34 && out_spk[0] == 0x51 && out_spk[1] == 0x20,
+                        "output is P2TR");
+        }
     }
 
-    printf("  All offline recovery complete: 5 P2TR outputs, client funds preserved.\n");
+    printf("  All offline recovery complete: 5 P2TR + 1 P2A anchor, client funds preserved.\n");
 
     tx_buf_free(&dist_tx);
     factory_free(&f);

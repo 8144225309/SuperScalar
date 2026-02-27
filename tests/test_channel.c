@@ -846,40 +846,34 @@ int test_regtest_channel_unilateral(void) {
     printf("  Factory funded: %s vout=%d amount=%lu sats\n",
            funding_txid_hex, found_vout, (unsigned long)fund_amount);
 
-    /* Build factory tree, advance to max state (all delays = 0) */
+    /* Build factory tree, then advance to max state (all delays = 0).
+       factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    /* Broadcast factory tree */
-    size_t broadcast_groups[][2] = {
-        {0, 1}, {1, 2}, {2, 4}, {4, 6},
-    };
-    char txid_hexes[6][65];
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
 
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-            TEST_ASSERT(sent, "broadcast factory node");
-        }
+    /* Broadcast factory tree sequentially: one tx per mine */
+    char txid_hexes[6][65];
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
+        TEST_ASSERT(sent, "broadcast factory node");
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
     printf("  Factory tree confirmed on-chain\n");
 
-    /* Get leaf state tx (node 4) channel A output (vout 0) info */
-    factory_node_t *leaf = &f.nodes[4];
+    /* Get leaf state tx (node 3 = state_left) channel A output (vout 0) info */
+    factory_node_t *leaf = &f.nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
 
@@ -2450,37 +2444,30 @@ int test_regtest_channel_coop_close(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    /* Broadcast factory tree */
-    size_t broadcast_groups[][2] = {
-        {0, 1}, {1, 2}, {2, 4}, {4, 6},
-    };
-    char txid_hexes[6][65];
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
 
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-            TEST_ASSERT(sent, "broadcast factory node");
-        }
+    /* Broadcast factory tree sequentially: one tx per mine */
+    char txid_hexes[6][65];
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
+        TEST_ASSERT(sent, "broadcast factory node");
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
     printf("  Factory tree confirmed on-chain\n");
 
-    /* Set up channel from leaf state_left (node 4) output 0 */
-    factory_node_t *leaf = &f.nodes[4];
+    /* Set up channel from leaf state_left (node 3) output 0 */
+    factory_node_t *leaf = &f.nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];
@@ -3054,37 +3041,30 @@ int test_regtest_channel_penalty(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    /* Broadcast factory tree */
-    size_t broadcast_groups[][2] = {
-        {0, 1}, {1, 2}, {2, 4}, {4, 6},
-    };
-    char txid_hexes[6][65];
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
 
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-            TEST_ASSERT(sent, "broadcast factory node");
-        }
+    /* Broadcast factory tree sequentially: one tx per mine */
+    char txid_hexes[6][65];
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
+        TEST_ASSERT(sent, "broadcast factory node");
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
     printf("  Factory tree confirmed on-chain\n");
 
-    /* Set up channel from leaf state_left (node 4) output 0 */
-    factory_node_t *leaf = &f.nodes[4];
+    /* Set up channel from leaf state_left (node 3) output 0 */
+    factory_node_t *leaf = &f.nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];
@@ -3687,35 +3667,29 @@ int test_regtest_penalty_with_htlcs(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    /* Broadcast factory tree */
-    size_t broadcast_groups[][2] = {
-        {0, 1}, {1, 2}, {2, 4}, {4, 6},
-    };
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+
+    /* Broadcast factory tree sequentially: one tx per mine */
     char txid_hexes[6][65];
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-            int bsent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-            TEST_ASSERT(bsent, "broadcast factory node");
-        }
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int bsent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
+        TEST_ASSERT(bsent, "broadcast factory node");
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
 
-    /* Set up cheater + honest channels on leaf state_left (node 4) output 0 */
-    factory_node_t *leaf = &f.nodes[4];
+    /* Set up cheater + honest channels on leaf state_left (node 3) output 0 */
+    factory_node_t *leaf = &f.nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];

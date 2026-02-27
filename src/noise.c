@@ -156,16 +156,17 @@ static int ensure_fd_table(void) {
 
 /* Double the table capacity */
 static int grow_fd_table(void) {
-    int new_cap = fd_table_cap * 2;
-    fd_noise_entry_t *new_table = (fd_noise_entry_t *)calloc((size_t)new_cap,
+    if (fd_table_cap <= 0 || fd_table_cap > (1 << 20)) return 0;
+    size_t new_cap = (size_t)fd_table_cap * 2;
+    fd_noise_entry_t *new_table = (fd_noise_entry_t *)calloc(new_cap,
                                                               sizeof(fd_noise_entry_t));
     if (!new_table) return 0;
-    for (int i = 0; i < new_cap; i++)
+    for (size_t i = 0; i < new_cap; i++)
         new_table[i].fd = -1;
     memcpy(new_table, fd_table, (size_t)fd_table_cap * sizeof(fd_noise_entry_t));
     free(fd_table);
     fd_table = new_table;
-    fd_table_cap = new_cap;
+    fd_table_cap = (int)new_cap;
     return 1;
 }
 

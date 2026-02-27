@@ -453,13 +453,10 @@ int test_regtest_factory_tree(void) {
     printf("  Factory vout=%d, amount=%lu sats\n", found_vout,
            (unsigned long)fund_amount);
 
-    /* Init factory and advance to newest state (all delays = 0) */
+    /* Init factory, build tree, then advance to newest state (all delays = 0).
+       factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
-
-    /* Advance counter to max epoch: both layers at state 3, delay = 0 */
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
@@ -469,50 +466,39 @@ int test_regtest_factory_tree(void) {
 
     printf("  Tree built: %zu nodes\n", f.n_nodes);
 
-    /* Broadcast order:
-       0: kickoff_root  -> mine 1 block
-       1: state_root    -> mine 1 block (nseq=0)
-       2,3: kickoff_left, kickoff_right -> mine 1 block
-       4,5: state_left, state_right -> mine 1 block
-    */
-    size_t broadcast_groups[][2] = {
-        {0, 1},   /* kickoff_root */
-        {1, 2},   /* state_root */
-        {2, 4},   /* kickoff_left + kickoff_right */
-        {4, 6},   /* state_left + state_right */
-    };
+    /* Advance counter to max epoch: both layers at state 3, delay = 0 */
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
 
+    /* Broadcast all 6 nodes sequentially, mining 1 block after each.
+       Tree layout: 0=kickoff_root, 1=state_root,
+       2=kickoff_left, 3=state_left(leaf), 4=kickoff_right, 5=state_right(leaf).
+       Each node needs its parent confirmed (BIP-68 nSequence=0 → 1 conf). */
     char txid_hexes[6][65];
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
 
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
+        int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
 
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-
-            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-
-            if (!sent) {
-                printf("  FAIL: broadcast node %zu failed\n", i);
-                factory_free(&f);
-                secp256k1_context_destroy(ctx);
-                return 0;
-            }
-            printf("  Broadcast node %zu: %s\n", i, txid_hexes[i]);
+        if (!sent) {
+            printf("  FAIL: broadcast node %zu failed\n", i);
+            factory_free(&f);
+            secp256k1_context_destroy(ctx);
+            return 0;
         }
-
+        printf("  Broadcast node %zu: %s\n", i, txid_hexes[i]);
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
 
-    /* Verify leaf state tx outputs exist on chain via gettxout.
+    /* Verify leaf state tx (nodes 3 and 5) outputs exist on chain via gettxout.
        If leaf outputs are confirmed, the entire ancestor chain is too. */
-    for (int leaf = 4; leaf <= 5; leaf++) {
+    int leaf_indices[] = {3, 5};  /* state_left, state_right */
+    for (int li = 0; li < 2; li++) {
+        int leaf = leaf_indices[li];
         char gettxout_params[256];
-        /* Check vout 0 of each leaf state tx */
         snprintf(gettxout_params, sizeof(gettxout_params),
                  "\"%s\" 0", txid_hexes[leaf]);
         char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
@@ -1224,52 +1210,49 @@ int test_regtest_burn_tx(void) {
     printf("  Factory funded: %s vout=%d amount=%lu sats\n",
            funding_txid_hex, found_vout, (unsigned long)fund_amount);
 
-    /* Init factory WITH shachain, advance to max state (all delays = 0) */
+    /* Init factory WITH shachain, build tree, then advance to max state (all delays = 0).
+       factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
     factory_set_shachain_seed(&f, test_shachain_seed);
-
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
 
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+
     printf("  Tree built: %zu nodes, L-stock has shachain burn path\n", f.n_nodes);
 
-    /* Broadcast all 6 nodes in groups */
-    size_t broadcast_groups[][2] = {
-        {0, 1}, {1, 2}, {2, 4}, {4, 6},
-    };
+    /* Broadcast all 6 nodes sequentially, mining 1 block after each.
+       Tree: 0=kickoff_root, 1=state_root, 2=kickoff_left, 3=state_left(leaf),
+       4=kickoff_right, 5=state_right(leaf). */
     char txid_hexes[6][65];
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
 
-    for (int g = 0; g < 4; g++) {
-        size_t start = broadcast_groups[g][0];
-        size_t end = broadcast_groups[g][1];
+        int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+        free(tx_hex);
 
-        for (size_t i = start; i < end; i++) {
-            factory_node_t *node = &f.nodes[i];
-            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
-
-            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
-            free(tx_hex);
-
-            if (!sent) {
-                printf("  FAIL: broadcast node %zu failed\n", i);
-                factory_free(&f);
-                secp256k1_context_destroy(ctx);
-                return 0;
-            }
-            printf("  Broadcast node %zu: %s\n", i, txid_hexes[i]);
+        if (!sent) {
+            printf("  FAIL: broadcast node %zu failed\n", i);
+            factory_free(&f);
+            secp256k1_context_destroy(ctx);
+            return 0;
         }
+        printf("  Broadcast node %zu: %s\n", i, txid_hexes[i]);
         regtest_mine_blocks(&rt, 1, mine_addr);
     }
 
-    /* Verify leaf outputs are confirmed */
-    for (int leaf = 4; leaf <= 5; leaf++) {
+    /* Verify leaf state outputs (nodes 3, 5) are confirmed */
+    int leaf_indices[] = {3, 5};
+    for (int li = 0; li < 2; li++) {
+        int leaf = leaf_indices[li];
         char gettxout_params[256];
         snprintf(gettxout_params, sizeof(gettxout_params),
                  "\"%s\" 2", txid_hexes[leaf]);  /* vout 2 = L-stock */
@@ -1290,15 +1273,15 @@ int test_regtest_burn_tx(void) {
     }
     printf("  All factory txs confirmed, L-stock outputs on-chain\n");
 
-    /* Now build and broadcast the burn tx for state_left (node 4) L-stock */
+    /* Now build and broadcast the burn tx for state_left (node 3) L-stock */
     tx_buf_t burn_tx;
     tx_buf_init(&burn_tx, 256);
 
-    /* f.nodes[4].txid is internal byte order, which is what factory_build_burn_tx wants */
-    uint64_t l_stock_amount = f.nodes[4].outputs[2].amount_sats;
+    /* f.nodes[3].txid is internal byte order, which is what factory_build_burn_tx wants */
+    uint64_t l_stock_amount = f.nodes[3].outputs[2].amount_sats;
     printf("  L-stock amount: %lu sats\n", (unsigned long)l_stock_amount);
 
-    TEST_ASSERT(factory_build_burn_tx(&f, &burn_tx, f.nodes[4].txid, 2,
+    TEST_ASSERT(factory_build_burn_tx(&f, &burn_tx, f.nodes[3].txid, 2,
                                         l_stock_amount, f.counter.current_epoch),
                 "build burn tx");
     TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
@@ -1327,7 +1310,7 @@ int test_regtest_burn_tx(void) {
     {
         char gettxout_params[256];
         snprintf(gettxout_params, sizeof(gettxout_params),
-                 "\"%s\" 2", txid_hexes[4]);
+                 "\"%s\" 2", txid_hexes[3]);
         char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
         /* gettxout returns null/empty for spent outputs */
         int is_spent = (txout == NULL || strcmp(txout, "") == 0 ||
@@ -2990,18 +2973,22 @@ int test_regtest_tree_ordering(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+
     printf("  Tree built: %zu nodes\n", f.n_nodes);
 
-    /* Try broadcasting state_left (node 4) FIRST — parent not on-chain */
+    /* Try broadcasting state_left (node 3) FIRST — parent not on-chain.
+       Tree: 0=kickoff_root, 1=state_root, 2=kickoff_left, 3=state_left(leaf),
+       4=kickoff_right, 5=state_right(leaf). */
     {
-        factory_node_t *leaf_node = &f.nodes[4];
+        factory_node_t *leaf_node = &f.nodes[3];
         char *tx_hex = (char *)malloc(leaf_node->signed_tx.len * 2 + 1);
         hex_encode(leaf_node->signed_tx.data, leaf_node->signed_tx.len, tx_hex);
         char bad_txid[65];
@@ -3011,8 +2998,8 @@ int test_regtest_tree_ordering(void) {
         printf("  Leaf broadcast correctly rejected (parent missing)\n");
     }
 
-    /* Broadcast in correct order: kickoff_root(0) → state_root(1) → kickoff_left(2) → state_left(4) */
-    size_t ordered_nodes[] = { 0, 1, 2, 4 };
+    /* Broadcast in correct order: kickoff_root(0) → state_root(1) → kickoff_left(2) → state_left(3) */
+    size_t ordered_nodes[] = { 0, 1, 2, 3 };
     char ordered_txids[6][65];
 
     for (int step = 0; step < 4; step++) {
@@ -3034,10 +3021,10 @@ int test_regtest_tree_ordering(void) {
         TEST_ASSERT(conf > 0, "ordered node confirmed");
     }
 
-    /* Verify leaf output exists on-chain */
+    /* Verify leaf output exists on-chain (node 3 = state_left) */
     char gettxout_params[256];
     snprintf(gettxout_params, sizeof(gettxout_params),
-             "\"%s\" 0", ordered_txids[4]);
+             "\"%s\" 0", ordered_txids[3]);
     char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
     TEST_ASSERT(txout != NULL, "leaf output exists");
 

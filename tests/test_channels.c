@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -1615,8 +1616,9 @@ int test_noise_nk_handshake(void) {
         if (!ok) _exit(1);
 
         /* Write keys to parent for comparison */
-        write(sv[1], resp_ns.send_key, 32);
-        write(sv[1], resp_ns.recv_key, 32);
+        ssize_t w1 = write(sv[1], resp_ns.send_key, 32);
+        ssize_t w2 = write(sv[1], resp_ns.recv_key, 32);
+        if (w1 != 32 || w2 != 32) _exit(2);
 
         close(sv[1]);
         secp256k1_context_destroy(child_ctx);
@@ -1631,8 +1633,9 @@ int test_noise_nk_handshake(void) {
 
     /* Read responder's keys */
     unsigned char resp_send[32], resp_recv[32];
-    read(sv[0], resp_send, 32);
-    read(sv[0], resp_recv, 32);
+    ssize_t r1 = read(sv[0], resp_send, 32);
+    ssize_t r2 = read(sv[0], resp_recv, 32);
+    TEST_ASSERT(r1 == 32 && r2 == 32, "failed to read responder keys");
 
     /* Initiator's send_key == Responder's recv_key */
     TEST_ASSERT(memcmp(init_ns.send_key, resp_recv, 32) == 0,
@@ -1684,8 +1687,9 @@ int test_noise_nk_wrong_pubkey(void) {
         if (!ok) _exit(1);
 
         /* Write keys to parent */
-        write(sv[1], resp_ns.send_key, 32);
-        write(sv[1], resp_ns.recv_key, 32);
+        ssize_t w1 = write(sv[1], resp_ns.send_key, 32);
+        ssize_t w2 = write(sv[1], resp_ns.recv_key, 32);
+        if (w1 != 32 || w2 != 32) _exit(2);
 
         close(sv[1]);
         secp256k1_context_destroy(child_ctx);
@@ -1700,8 +1704,9 @@ int test_noise_nk_wrong_pubkey(void) {
 
     /* Read responder's keys */
     unsigned char resp_send[32], resp_recv[32];
-    read(sv[0], resp_send, 32);
-    read(sv[0], resp_recv, 32);
+    ssize_t r1 = read(sv[0], resp_send, 32);
+    ssize_t r2 = read(sv[0], resp_recv, 32);
+    TEST_ASSERT(r1 == 32 && r2 == 32, "failed to read responder keys");
 
     /* Keys must NOT match — wrong pinned key means es DH diverges */
     TEST_ASSERT(memcmp(init_ns.send_key, resp_recv, 32) != 0,
@@ -3031,5 +3036,77 @@ int test_regtest_tcp_reconnect(void) {
 
     secp256k1_context_destroy(ctx);
     TEST_ASSERT(lsp_ok, "TCP reconnect over real network");
+    return 1;
+}
+
+/* --- CLI command parsing (Step 4) --- */
+
+int test_cli_command_parsing(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 4;
+    mgr.bridge_fd = -1;
+    /* Set up some channel state for status command */
+    mgr.entries[0].channel.local_amount = 50000;
+    mgr.entries[0].channel.remote_amount = 50000;
+    mgr.entries[1].channel.local_amount = 30000;
+    mgr.entries[1].channel.remote_amount = 70000;
+
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds[0] = -1;
+    lsp.client_fds[1] = -1;
+    lsp.client_fds[2] = -1;
+    lsp.client_fds[3] = -1;
+
+    volatile sig_atomic_t shutdown_flag = 0;
+
+    /* Test "help" — should be recognized */
+    int ok = lsp_channels_handle_cli_line(&mgr, &lsp, "help", &shutdown_flag);
+    TEST_ASSERT(ok, "help should be recognized");
+
+    /* Test "status" — should be recognized */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "status", &shutdown_flag);
+    TEST_ASSERT(ok, "status should be recognized");
+
+    /* Test "close" — should set shutdown flag */
+    shutdown_flag = 0;
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "close", &shutdown_flag);
+    TEST_ASSERT(ok, "close should be recognized");
+    TEST_ASSERT(shutdown_flag == 1, "close should set shutdown flag");
+
+    /* Test "rotate" — should be recognized (will fail but not crash) */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rotate", &shutdown_flag);
+    TEST_ASSERT(ok, "rotate should be recognized");
+
+    /* Test "pay" with invalid args — should be recognized */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 0 1 1000", &shutdown_flag);
+    TEST_ASSERT(ok, "pay should be recognized");
+
+    /* Test "pay" self-payment rejection */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 0 0 1000", &shutdown_flag);
+    TEST_ASSERT(ok, "pay self should be recognized (prints error)");
+
+    /* Test "pay" out-of-range index */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 99 0 1000", &shutdown_flag);
+    TEST_ASSERT(ok, "pay out-of-range should be recognized");
+
+    /* Test "pay" bad args */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay badargs", &shutdown_flag);
+    TEST_ASSERT(ok, "pay bad args should be recognized");
+
+    /* Test unknown command — should return 0 */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "foobar", &shutdown_flag);
+    TEST_ASSERT(!ok, "unknown command should return 0");
+
+    /* Test empty string — should return 1 (no-op) */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "", &shutdown_flag);
+    TEST_ASSERT(ok, "empty string should be recognized (no-op)");
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }

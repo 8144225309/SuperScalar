@@ -197,11 +197,13 @@ extern int test_tor_parse_proxy_arg_edge_cases(void);
 extern int test_tor_socks5_mock(void);
 extern int test_regtest_bridge_nk_handshake(void);
 extern int test_regtest_bridge_payment(void);
+extern int test_regtest_jit_daemon_trigger(void);
 
 /* Phase 15: Daemon mode */
 extern int test_register_invoice_wire(void);
 extern int test_daemon_event_loop(void);
 extern int test_client_daemon_autofulfill(void);
+extern int test_cli_command_parsing(void);
 
 /* Phase 16: Reconnection */
 extern int test_reconnect_wire(void);
@@ -667,6 +669,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_register_invoice_wire);
     RUN_TEST(test_daemon_event_loop);
     RUN_TEST(test_client_daemon_autofulfill);
+    RUN_TEST(test_cli_command_parsing);
 
     printf("\n=== Reconnection (Phase 16) ===\n");
     RUN_TEST(test_reconnect_wire);
@@ -1034,6 +1037,9 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Bridge (Phase 14) ===\n");
     RUN_TEST(test_regtest_bridge_nk_handshake);
     RUN_TEST(test_regtest_bridge_payment);
+
+    printf("\n=== Regtest JIT Trigger ===\n");
+    RUN_TEST(test_regtest_jit_daemon_trigger);
 
     regtest_faucet_health_report();
 }

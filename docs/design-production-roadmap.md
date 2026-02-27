@@ -127,7 +127,7 @@ Helper functions in `lsp_rotation.c`:
 
 Daemon loop behavior:
 1. Factory transitions ACTIVE → DYING: first rotation attempt
-2. If fails: retry after 10 blocks, then 20, then 40 (exponential backoff)
+2. If fails: retry after 20 blocks, then 40 (delay = base * 2^retries, exponential backoff)
 3. After 3 failures: broadcast distribution TX as fallback (fund recovery)
 4. Retry state preserved across successful rotations (save/restore in lsp_channels_init)
 

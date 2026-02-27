@@ -280,7 +280,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         actual_amount = funding_amount;
     }
 
-    strncpy(jit->funding_txid_hex, fund_txid_hex, 64);
+    memcpy(jit->funding_txid_hex, fund_txid_hex, 64);
     jit->funding_txid_hex[64] = '\0';
     jit->funding_vout = fund_vout;
     jit->funding_amount = actual_amount;

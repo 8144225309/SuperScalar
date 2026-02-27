@@ -75,6 +75,7 @@ static void usage(const char *prog) {
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
+        "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
@@ -84,6 +85,7 @@ static void usage(const char *prog) {
         "  --placement-mode M  Client placement: sequential, altruistic, greedy (default: sequential)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
+        "  --settlement-interval N Blocks between profit settlements (default: 144)\n"
         "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
@@ -476,6 +478,7 @@ int main(int argc, char *argv[]) {
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int no_jit = 0;
+    int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
@@ -486,6 +489,7 @@ int main(int argc, char *argv[]) {
     int placement_mode_arg = 0;      /* 0=sequential, 1=altruistic, 2=greedy */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
+    uint32_t settlement_interval = 144; /* blocks between profit settlements */
     const char *tor_proxy_arg = NULL;
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
@@ -558,6 +562,13 @@ int main(int argc, char *argv[]) {
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--no-jit") == 0)
             no_jit = 1;
+        else if (strcmp(argv[i], "--states-per-layer") == 0 && i + 1 < argc) {
+            states_per_layer = atoi(argv[++i]);
+            if (states_per_layer < 2 || states_per_layer > 256) {
+                fprintf(stderr, "Error: --states-per-layer must be 2-256\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc)
             leaf_arity = atoi(argv[++i]);
         else if (strcmp(argv[i], "--force-close") == 0)
@@ -613,6 +624,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--settlement-interval") == 0 && i + 1 < argc)
+            settlement_interval = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -1028,7 +1041,7 @@ int main(int argc, char *argv[]) {
                              "%s", rma);
             }
             mgr.rot_step_blocks = step_blocks;
-            mgr.rot_states_per_layer = 4;
+            mgr.rot_states_per_layer = states_per_layer;
             mgr.rot_leaf_arity = leaf_arity;
             mgr.rot_is_regtest = is_regtest;
             mgr.rot_funding_sats = funding_sats;
@@ -1536,6 +1549,7 @@ int main(int argc, char *argv[]) {
         mgr.placement_mode = (placement_mode_t)placement_mode_arg;
         mgr.economic_mode = (economic_mode_t)economic_mode_arg;
         mgr.default_profit_bps = default_profit_bps;
+        mgr.settlement_interval_blocks = settlement_interval;
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -1678,7 +1692,7 @@ int main(int argc, char *argv[]) {
         snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr), "%s", fund_addr);
         snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr), "%s", mine_addr);
         mgr.rot_step_blocks = step_blocks;
-        mgr.rot_states_per_layer = 4;
+        mgr.rot_states_per_layer = states_per_layer;
         mgr.rot_leaf_arity = leaf_arity;
         mgr.rot_is_regtest = is_regtest;
         mgr.rot_funding_sats = funding_sats;
@@ -2809,6 +2823,7 @@ int main(int argc, char *argv[]) {
         mgr2.fee = &fee_est;
         mgr2.routing_fee_ppm = routing_fee_ppm;
         mgr2.lsp_balance_pct = lsp_balance_pct;
+        mgr2.settlement_interval_blocks = settlement_interval;
         if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
