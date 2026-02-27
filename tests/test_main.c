@@ -311,6 +311,11 @@ extern int test_persist_basepoints(void);
 /* LSP Recovery */
 extern int test_lsp_recovery_round_trip(void);
 
+/* Persistence Stress */
+extern int test_persist_crash_stress(void);
+extern int test_persist_crash_dw_state(void);
+extern int test_regtest_crash_double_recovery(void);
+
 /* Client Watchtower (Bidirectional Revocation) */
 extern int test_client_watchtower_init(void);
 extern int test_bidirectional_revocation(void);
@@ -691,6 +696,10 @@ static void run_unit_tests(void) {
     printf("\n=== LSP Recovery ===\n");
     RUN_TEST(test_lsp_recovery_round_trip);
 
+    printf("\n=== Persistence Stress ===\n");
+    RUN_TEST(test_persist_crash_stress);
+    RUN_TEST(test_persist_crash_dw_state);
+
     printf("\n=== Client Watchtower ===\n");
     RUN_TEST(test_client_watchtower_init);
     RUN_TEST(test_bidirectional_revocation);
@@ -860,6 +869,7 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);
+    RUN_TEST(test_regtest_crash_double_recovery);
 
     printf("\n=== Regtest CPFP Anchor (P2A) ===\n");
     RUN_TEST(test_regtest_cpfp_penalty_bump);

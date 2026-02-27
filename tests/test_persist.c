@@ -3,6 +3,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
 #include "superscalar/lsp_channels.h"
+#include "superscalar/dw_state.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1223,5 +1224,620 @@ int test_persist_validate_channel_load(void) {
     TEST_ASSERT_EQ(cn, (uint64_t)5, "commitment number");
 
     persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: Crash stress — 4 cycles of persist/crash/recover on file-based DB ---- */
+
+int test_persist_crash_stress(void) {
+    const char *path = "/tmp/test_crash_stress.db";
+    unlink(path);
+
+    secp256k1_context *ctx = test_ctx();
+
+    /* Create factory with 5 participants (LSP + 4 clients) */
+    unsigned char extra_sec3[32], extra_sec4[32];
+    memset(extra_sec3, 0x33, 32);
+    memset(extra_sec4, 0x44, 32);
+    secp256k1_pubkey pks[5];
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[0], seckeys[0])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[1], seckeys[1])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[2], seckeys[2])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[3], extra_sec3)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
+
+    factory_t f;
+    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    f.cltv_timeout = 200;
+    f.fee_per_tx = 500;
+
+    /* Compute funding SPK */
+    musig_keyagg_t ka;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 3), "keyagg");
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char twk[32];
+    sha256_tagged("TapTweak", internal_ser, 32, twk);
+    musig_keyagg_t kac = ka;
+    secp256k1_pubkey tpk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &kac.cache, twk)) return 0;
+    secp256k1_xonly_pubkey txo;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &txo);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAB, 32);
+    factory_set_funding(&f, fake_txid, 0, 200000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Initialize channels */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init channels");
+
+    /* Simulate basepoint exchange */
+    for (size_t c = 0; c < 4; c++) {
+        channel_t *ch = &mgr.entries[c].channel;
+        secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc;
+        unsigned char rs[32];
+        memset(rs, 0x60 + (unsigned char)c, 32);
+        if (!secp256k1_ec_pubkey_create(ctx, &rpay, rs)) return 0;
+        rs[0]++;
+        if (!secp256k1_ec_pubkey_create(ctx, &rdelay, rs)) return 0;
+        rs[0]++;
+        if (!secp256k1_ec_pubkey_create(ctx, &rrevoc, rs)) return 0;
+        rs[0]++;
+        if (!secp256k1_ec_pubkey_create(ctx, &rhtlc, rs)) return 0;
+        channel_set_remote_basepoints(ch, &rpay, &rdelay, &rrevoc);
+        channel_set_remote_htlc_basepoint(ch, &rhtlc);
+    }
+
+    /* ===== Cycle 1: Fresh state ===== */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c1 open");
+        TEST_ASSERT(persist_begin(&db), "c1 begin");
+        TEST_ASSERT(persist_save_factory(&db, &f, ctx, 0), "c1 save factory");
+        for (size_t c = 0; c < 4; c++) {
+            TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
+                                               (uint32_t)c), "c1 save ch");
+            TEST_ASSERT(persist_save_basepoints(&db, (uint32_t)c,
+                                                  &mgr.entries[c].channel),
+                        "c1 save bp");
+            const channel_t *ch = &mgr.entries[c].channel;
+            TEST_ASSERT(persist_update_channel_balance(&db, (uint32_t)c,
+                            ch->local_amount, ch->remote_amount,
+                            ch->commitment_number), "c1 update bal");
+        }
+        TEST_ASSERT(persist_commit(&db), "c1 commit");
+        persist_close(&db);
+    }
+
+    /* Save original state for comparison */
+    uint64_t orig_local[4], orig_remote[4], orig_cn[4];
+    unsigned char orig_bp_pay[4][32], orig_bp_delay[4][32];
+    unsigned char orig_bp_revoc[4][32], orig_bp_htlc[4][32];
+    for (size_t c = 0; c < 4; c++) {
+        const channel_t *ch = &mgr.entries[c].channel;
+        orig_local[c] = ch->local_amount;
+        orig_remote[c] = ch->remote_amount;
+        orig_cn[c] = ch->commitment_number;
+        memcpy(orig_bp_pay[c], ch->local_payment_basepoint_secret, 32);
+        memcpy(orig_bp_delay[c], ch->local_delayed_payment_basepoint_secret, 32);
+        memcpy(orig_bp_revoc[c], ch->local_revocation_basepoint_secret, 32);
+        memcpy(orig_bp_htlc[c], ch->local_htlc_basepoint_secret, 32);
+    }
+
+    /* Zero everything */
+    memset(&mgr, 0, sizeof(mgr));
+    memset(&f, 0, sizeof(f));
+
+    /* Recover cycle 1 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c1 reopen");
+        factory_t rec_f;
+        memset(&rec_f, 0, sizeof(rec_f));
+        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c1 load factory");
+        TEST_ASSERT_EQ(rec_f.n_participants, 5, "c1 n_participants");
+
+        lsp_channel_mgr_t rec_mgr;
+        memset(&rec_mgr, 0, sizeof(rec_mgr));
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                                seckeys[0], 4, &db),
+                    "c1 init from db");
+        TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "c1 n_channels");
+
+        for (size_t c = 0; c < 4; c++) {
+            const channel_t *rec = &rec_mgr.entries[c].channel;
+            TEST_ASSERT_EQ(rec->local_amount, orig_local[c], "c1 local");
+            TEST_ASSERT_EQ(rec->remote_amount, orig_remote[c], "c1 remote");
+            TEST_ASSERT_EQ(rec->commitment_number, orig_cn[c], "c1 cn");
+            TEST_ASSERT(memcmp(rec->local_payment_basepoint_secret,
+                               orig_bp_pay[c], 32) == 0, "c1 pay secret");
+            TEST_ASSERT(memcmp(rec->local_delayed_payment_basepoint_secret,
+                               orig_bp_delay[c], 32) == 0, "c1 delay secret");
+            TEST_ASSERT(memcmp(rec->local_revocation_basepoint_secret,
+                               orig_bp_revoc[c], 32) == 0, "c1 revoc secret");
+            TEST_ASSERT(memcmp(rec->local_htlc_basepoint_secret,
+                               orig_bp_htlc[c], 32) == 0, "c1 htlc secret");
+        }
+
+        /* Copy recovered state into mgr/f for next cycle */
+        memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        memcpy(&f, &rec_f, sizeof(f));
+        persist_close(&db);
+    }
+
+    /* ===== Cycle 2: Payments + active HTLCs ===== */
+    mgr.entries[0].channel.local_amount += 5000;
+    mgr.entries[0].channel.remote_amount -= 5000;
+    mgr.entries[0].channel.commitment_number = 2;
+    mgr.entries[1].channel.local_amount -= 3000;
+    mgr.entries[1].channel.remote_amount += 3000;
+    mgr.entries[1].channel.commitment_number = 1;
+
+    /* Add active HTLCs */
+    {
+        htlc_t h0 = {0};
+        h0.direction = HTLC_OFFERED; h0.state = HTLC_STATE_ACTIVE;
+        h0.id = 1; h0.amount_sats = 2500; h0.cltv_expiry = 600;
+        memset(h0.payment_hash, 0xAA, 32);
+        mgr.entries[0].channel.htlcs[mgr.entries[0].channel.n_htlcs++] = h0;
+
+        htlc_t h1 = {0};
+        h1.direction = HTLC_RECEIVED; h1.state = HTLC_STATE_ACTIVE;
+        h1.id = 2; h1.amount_sats = 4000; h1.cltv_expiry = 700;
+        memset(h1.payment_hash, 0xBB, 32);
+        mgr.entries[1].channel.htlcs[mgr.entries[1].channel.n_htlcs++] = h1;
+
+        htlc_t h2 = {0};
+        h2.direction = HTLC_OFFERED; h2.state = HTLC_STATE_ACTIVE;
+        h2.id = 3; h2.amount_sats = 1500; h2.cltv_expiry = 800;
+        memset(h2.payment_hash, 0xCC, 32);
+        mgr.entries[2].channel.htlcs[mgr.entries[2].channel.n_htlcs++] = h2;
+
+        /* Fulfilled HTLC on ch0 — should be filtered on recovery */
+        htlc_t hf = {0};
+        hf.direction = HTLC_OFFERED; hf.state = HTLC_STATE_FULFILLED;
+        hf.id = 99; hf.amount_sats = 1000; hf.cltv_expiry = 500;
+        memset(hf.payment_hash, 0xFF, 32);
+        mgr.entries[0].channel.htlcs[mgr.entries[0].channel.n_htlcs++] = hf;
+    }
+
+    /* Save expected state */
+    uint64_t c2_local[4], c2_remote[4], c2_cn[4];
+    for (size_t c = 0; c < 4; c++) {
+        c2_local[c] = mgr.entries[c].channel.local_amount;
+        c2_remote[c] = mgr.entries[c].channel.remote_amount;
+        c2_cn[c] = mgr.entries[c].channel.commitment_number;
+    }
+
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c2 open");
+        TEST_ASSERT(persist_begin(&db), "c2 begin");
+        for (size_t c = 0; c < 4; c++) {
+            const channel_t *ch = &mgr.entries[c].channel;
+            TEST_ASSERT(persist_update_channel_balance(&db, (uint32_t)c,
+                            ch->local_amount, ch->remote_amount,
+                            ch->commitment_number), "c2 update bal");
+        }
+        /* Save HTLCs: 3 active + 1 fulfilled */
+        for (size_t c = 0; c < 3; c++) {
+            for (size_t h = 0; h < mgr.entries[c].channel.n_htlcs; h++) {
+                TEST_ASSERT(persist_save_htlc(&db, (uint32_t)c,
+                                &mgr.entries[c].channel.htlcs[h]), "c2 save htlc");
+            }
+        }
+        TEST_ASSERT(persist_commit(&db), "c2 commit");
+        persist_close(&db);
+    }
+
+    memset(&mgr, 0, sizeof(mgr));
+    memset(&f, 0, sizeof(f));
+
+    /* Recover cycle 2 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c2 reopen");
+        factory_t rec_f;
+        memset(&rec_f, 0, sizeof(rec_f));
+        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c2 load factory");
+
+        lsp_channel_mgr_t rec_mgr;
+        memset(&rec_mgr, 0, sizeof(rec_mgr));
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                                seckeys[0], 4, &db),
+                    "c2 init from db");
+        TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "c2 n_channels");
+
+        for (size_t c = 0; c < 4; c++) {
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.local_amount,
+                           c2_local[c], "c2 local");
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.remote_amount,
+                           c2_remote[c], "c2 remote");
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.commitment_number,
+                           c2_cn[c], "c2 cn");
+        }
+
+        /* ch0: 1 active HTLC (fulfilled filtered out) */
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.n_htlcs, 1, "c2 ch0 htlc count");
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.htlcs[0].id, 1, "c2 ch0 htlc id");
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.htlcs[0].amount_sats, 2500, "c2 ch0 htlc amt");
+        {
+            unsigned char exp[32]; memset(exp, 0xAA, 32);
+            TEST_ASSERT(memcmp(rec_mgr.entries[0].channel.htlcs[0].payment_hash,
+                               exp, 32) == 0, "c2 ch0 htlc hash");
+        }
+        /* ch1: 1 active HTLC */
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.n_htlcs, 1, "c2 ch1 htlc count");
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.htlcs[0].id, 2, "c2 ch1 htlc id");
+        /* ch2: 1 active HTLC */
+        TEST_ASSERT_EQ(rec_mgr.entries[2].channel.n_htlcs, 1, "c2 ch2 htlc count");
+        TEST_ASSERT_EQ(rec_mgr.entries[2].channel.htlcs[0].id, 3, "c2 ch2 htlc id");
+        /* ch3: 0 HTLCs */
+        TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 0, "c2 ch3 htlc count");
+
+        memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        memcpy(&f, &rec_f, sizeof(f));
+        persist_close(&db);
+    }
+
+    /* ===== Cycle 3: HTLC resolution + new HTLCs ===== */
+    mgr.entries[0].channel.local_amount += 2500;
+    mgr.entries[0].channel.remote_amount -= 2500;
+    mgr.entries[0].channel.commitment_number = 4;
+
+    /* ch3: add 2 new active HTLCs */
+    {
+        htlc_t h10 = {0};
+        h10.direction = HTLC_OFFERED; h10.state = HTLC_STATE_ACTIVE;
+        h10.id = 10; h10.amount_sats = 8000; h10.cltv_expiry = 900;
+        memset(h10.payment_hash, 0xD0, 32);
+        mgr.entries[3].channel.htlcs[mgr.entries[3].channel.n_htlcs++] = h10;
+
+        htlc_t h11 = {0};
+        h11.direction = HTLC_RECEIVED; h11.state = HTLC_STATE_ACTIVE;
+        h11.id = 11; h11.amount_sats = 6000; h11.cltv_expiry = 950;
+        memset(h11.payment_hash, 0xD1, 32);
+        mgr.entries[3].channel.htlcs[mgr.entries[3].channel.n_htlcs++] = h11;
+    }
+
+    /* Remove resolved HTLCs from local state */
+    mgr.entries[0].channel.n_htlcs = 0;
+    mgr.entries[1].channel.n_htlcs = 0;
+
+    uint64_t c3_local[4], c3_remote[4], c3_cn[4];
+    for (size_t c = 0; c < 4; c++) {
+        c3_local[c] = mgr.entries[c].channel.local_amount;
+        c3_remote[c] = mgr.entries[c].channel.remote_amount;
+        c3_cn[c] = mgr.entries[c].channel.commitment_number;
+    }
+
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c3 open");
+        TEST_ASSERT(persist_begin(&db), "c3 begin");
+        for (size_t c = 0; c < 4; c++) {
+            const channel_t *ch = &mgr.entries[c].channel;
+            TEST_ASSERT(persist_update_channel_balance(&db, (uint32_t)c,
+                            ch->local_amount, ch->remote_amount,
+                            ch->commitment_number), "c3 update bal");
+        }
+        /* Delete resolved HTLCs */
+        TEST_ASSERT(persist_delete_htlc(&db, 0, 1), "c3 del htlc 0/1");
+        TEST_ASSERT(persist_delete_htlc(&db, 1, 2), "c3 del htlc 1/2");
+        /* Save new HTLCs on ch3 */
+        for (size_t h = 0; h < mgr.entries[3].channel.n_htlcs; h++) {
+            TEST_ASSERT(persist_save_htlc(&db, 3,
+                            &mgr.entries[3].channel.htlcs[h]), "c3 save htlc");
+        }
+        TEST_ASSERT(persist_commit(&db), "c3 commit");
+        persist_close(&db);
+    }
+
+    memset(&mgr, 0, sizeof(mgr));
+    memset(&f, 0, sizeof(f));
+
+    /* Recover cycle 3 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c3 reopen");
+        factory_t rec_f;
+        memset(&rec_f, 0, sizeof(rec_f));
+        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c3 load factory");
+
+        lsp_channel_mgr_t rec_mgr;
+        memset(&rec_mgr, 0, sizeof(rec_mgr));
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                                seckeys[0], 4, &db),
+                    "c3 init from db");
+
+        for (size_t c = 0; c < 4; c++) {
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.local_amount,
+                           c3_local[c], "c3 local");
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.remote_amount,
+                           c3_remote[c], "c3 remote");
+            TEST_ASSERT_EQ(rec_mgr.entries[c].channel.commitment_number,
+                           c3_cn[c], "c3 cn");
+        }
+
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.n_htlcs, 0, "c3 ch0 0 htlcs");
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.n_htlcs, 0, "c3 ch1 0 htlcs");
+        TEST_ASSERT_EQ(rec_mgr.entries[2].channel.n_htlcs, 1, "c3 ch2 1 htlc");
+        TEST_ASSERT_EQ(rec_mgr.entries[2].channel.htlcs[0].id, 3, "c3 ch2 htlc id");
+        TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 2, "c3 ch3 2 htlcs");
+        TEST_ASSERT_EQ(rec_mgr.entries[3].channel.htlcs[0].id, 10, "c3 ch3 htlc0 id");
+        TEST_ASSERT_EQ(rec_mgr.entries[3].channel.htlcs[1].id, 11, "c3 ch3 htlc1 id");
+
+        memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        memcpy(&f, &rec_f, sizeof(f));
+        persist_close(&db);
+    }
+
+    /* ===== Cycle 4: Extreme values ===== */
+    uint64_t commit_fee = f.fee_per_tx;
+    mgr.entries[0].channel.local_amount = 0;
+    mgr.entries[0].channel.remote_amount = f.funding_amount_sats / 4 - commit_fee;
+    mgr.entries[0].channel.commitment_number = 200;
+    mgr.entries[1].channel.local_amount = f.funding_amount_sats / 4 - commit_fee;
+    mgr.entries[1].channel.remote_amount = 0;
+    mgr.entries[1].channel.commitment_number = 255;
+
+    /* Add 8 active HTLCs on ch2 */
+    mgr.entries[2].channel.n_htlcs = 0;  /* clear old HTLC */
+    for (int i = 0; i < 8; i++) {
+        htlc_t h = {0};
+        h.direction = (i % 2 == 0) ? HTLC_OFFERED : HTLC_RECEIVED;
+        h.state = HTLC_STATE_ACTIVE;
+        h.id = (uint64_t)(100 + i);
+        h.amount_sats = (uint64_t)(1000 + i * 500);
+        h.cltv_expiry = (uint32_t)(1000 + i * 10);
+        memset(h.payment_hash, 0xE0 + (unsigned char)i, 32);
+        mgr.entries[2].channel.htlcs[mgr.entries[2].channel.n_htlcs++] = h;
+    }
+
+    uint64_t c4_local[4], c4_remote[4], c4_cn[4];
+    for (size_t c = 0; c < 4; c++) {
+        c4_local[c] = mgr.entries[c].channel.local_amount;
+        c4_remote[c] = mgr.entries[c].channel.remote_amount;
+        c4_cn[c] = mgr.entries[c].channel.commitment_number;
+    }
+
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c4 open");
+        TEST_ASSERT(persist_begin(&db), "c4 begin");
+        for (size_t c = 0; c < 4; c++) {
+            const channel_t *ch = &mgr.entries[c].channel;
+            TEST_ASSERT(persist_update_channel_balance(&db, (uint32_t)c,
+                            ch->local_amount, ch->remote_amount,
+                            ch->commitment_number), "c4 update bal");
+        }
+        /* Delete old ch2 HTLC (id=3 from cycle 2) */
+        persist_delete_htlc(&db, 2, 3);
+        /* Save 8 new HTLCs on ch2 */
+        for (size_t h = 0; h < 8; h++) {
+            TEST_ASSERT(persist_save_htlc(&db, 2,
+                            &mgr.entries[2].channel.htlcs[h]), "c4 save htlc");
+        }
+        TEST_ASSERT(persist_commit(&db), "c4 commit");
+        persist_close(&db);
+    }
+
+    memset(&mgr, 0, sizeof(mgr));
+    memset(&f, 0, sizeof(f));
+
+    /* Recover cycle 4 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "c4 reopen");
+        factory_t rec_f;
+        memset(&rec_f, 0, sizeof(rec_f));
+        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c4 load factory");
+
+        lsp_channel_mgr_t rec_mgr;
+        memset(&rec_mgr, 0, sizeof(rec_mgr));
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+                                                seckeys[0], 4, &db),
+                    "c4 init from db");
+
+        /* Verify extreme balances */
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.local_amount, c4_local[0], "c4 ch0 local=0");
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.remote_amount, c4_remote[0], "c4 ch0 remote");
+        TEST_ASSERT_EQ(rec_mgr.entries[0].channel.commitment_number, c4_cn[0], "c4 ch0 cn");
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.local_amount, c4_local[1], "c4 ch1 local");
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.remote_amount, c4_remote[1], "c4 ch1 remote=0");
+        TEST_ASSERT_EQ(rec_mgr.entries[1].channel.commitment_number, c4_cn[1], "c4 ch1 cn");
+
+        /* Verify 8 HTLCs on ch2 */
+        TEST_ASSERT_EQ(rec_mgr.entries[2].channel.n_htlcs, 8, "c4 ch2 8 htlcs");
+        for (int i = 0; i < 8; i++) {
+            const htlc_t *h = &rec_mgr.entries[2].channel.htlcs[i];
+            TEST_ASSERT_EQ(h->id, (uint64_t)(100 + i), "c4 ch2 htlc id");
+            TEST_ASSERT_EQ(h->amount_sats, (uint64_t)(1000 + i * 500), "c4 ch2 htlc amt");
+            TEST_ASSERT_EQ(h->cltv_expiry, (uint32_t)(1000 + i * 10), "c4 ch2 htlc cltv");
+            htlc_direction_t exp_dir = (i % 2 == 0) ? HTLC_OFFERED : HTLC_RECEIVED;
+            TEST_ASSERT_EQ(h->direction, exp_dir, "c4 ch2 htlc dir");
+            unsigned char exp_hash[32];
+            memset(exp_hash, 0xE0 + (unsigned char)i, 32);
+            TEST_ASSERT(memcmp(h->payment_hash, exp_hash, 32) == 0, "c4 ch2 htlc hash");
+        }
+
+        /* ch3 still has 2 HTLCs from cycle 3 */
+        TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 2, "c4 ch3 2 htlcs");
+
+        persist_close(&db);
+    }
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* ---- Test: DW counter state survives crash/recovery ---- */
+
+int test_persist_crash_dw_state(void) {
+    const char *path = "/tmp/test_crash_dw.db";
+    unlink(path);
+
+    /* Create factory to get proper DW counter */
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey pks[5];
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[0], seckeys[0])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[1], seckeys[1])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[2], seckeys[2])) return 0;
+    unsigned char s3[32], s4[32];
+    memset(s3, 0x33, 32); memset(s4, 0x44, 32);
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[3], s3)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
+
+    factory_t f;
+    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+
+    /* Advance DW counter 5 times */
+    for (int i = 0; i < 5; i++) {
+        TEST_ASSERT(dw_counter_advance(&f.counter), "advance counter");
+    }
+
+    uint32_t epoch_after5 = f.counter.current_epoch;
+    uint32_t layers_after5[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f.counter.n_layers; i++) {
+        layers_after5[i] = f.counter.layers[i].current_state;
+    }
+
+    /* Enable per-leaf mode and set leaf states */
+    f.per_leaf_enabled = 1;
+    f.n_leaf_nodes = 2;
+    f.leaf_layers[0].current_state = 2;
+    f.leaf_layers[1].current_state = 1;
+
+    /* ===== Persist cycle 1 ===== */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "dw c1 open");
+
+        uint32_t layer_states[DW_MAX_LAYERS];
+        for (uint32_t i = 0; i < f.counter.n_layers; i++)
+            layer_states[i] = f.counter.layers[i].current_state;
+
+        uint32_t leaf_states[8];
+        for (int i = 0; i < f.n_leaf_nodes; i++)
+            leaf_states[i] = f.leaf_layers[i].current_state;
+
+        TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0,
+                        f.counter.current_epoch, f.counter.n_layers,
+                        layer_states, f.per_leaf_enabled,
+                        leaf_states, f.n_leaf_nodes), "dw c1 save");
+        persist_close(&db);
+    }
+
+    /* Save expected n_layers for verification */
+    uint32_t saved_n_layers = f.counter.n_layers;
+
+    /* Zero factory DW state */
+    memset(&f.counter, 0, sizeof(f.counter));
+    f.per_leaf_enabled = 0;
+    memset(f.leaf_layers, 0, sizeof(f.leaf_layers));
+    f.n_leaf_nodes = 0;
+
+    /* Recover cycle 1 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "dw c1 reopen");
+
+        uint32_t epoch, n_layers;
+        uint32_t loaded_layers[DW_MAX_LAYERS];
+        int per_leaf;
+        uint32_t loaded_leaves[8];
+        int n_leaves;
+
+        TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0,
+                        &epoch, &n_layers, loaded_layers, DW_MAX_LAYERS,
+                        &per_leaf, loaded_leaves, &n_leaves, 8), "dw c1 load");
+
+        TEST_ASSERT_EQ(epoch, epoch_after5, "dw c1 epoch");
+        TEST_ASSERT_EQ(n_layers, saved_n_layers, "dw c1 n_layers");
+        for (uint32_t i = 0; i < saved_n_layers; i++) {
+            TEST_ASSERT_EQ(loaded_layers[i], layers_after5[i], "dw c1 layer state");
+        }
+        TEST_ASSERT_EQ(per_leaf, 1, "dw c1 per_leaf enabled");
+        TEST_ASSERT_EQ(n_leaves, 2, "dw c1 n_leaf_nodes");
+        TEST_ASSERT_EQ(loaded_leaves[0], 2, "dw c1 leaf 0");
+        TEST_ASSERT_EQ(loaded_leaves[1], 1, "dw c1 leaf 1");
+
+        persist_close(&db);
+    }
+
+    /* ===== Persist cycle 2: advance more, re-persist ===== */
+    dw_counter_init(&f.counter, saved_n_layers, 10, 4);
+    for (int i = 0; i < 5; i++) dw_counter_advance(&f.counter);
+    /* Advance 3 more times */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(dw_counter_advance(&f.counter), "advance counter more");
+    }
+
+    uint32_t epoch_after8 = f.counter.current_epoch;
+    uint32_t layers_after8[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f.counter.n_layers; i++) {
+        layers_after8[i] = f.counter.layers[i].current_state;
+    }
+
+    f.per_leaf_enabled = 1;
+    f.n_leaf_nodes = 2;
+    f.leaf_layers[0].current_state = 3;
+    f.leaf_layers[1].current_state = 1;
+
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "dw c2 open");
+
+        uint32_t layer_states[DW_MAX_LAYERS];
+        for (uint32_t i = 0; i < f.counter.n_layers; i++)
+            layer_states[i] = f.counter.layers[i].current_state;
+
+        uint32_t leaf_states[8];
+        for (int i = 0; i < f.n_leaf_nodes; i++)
+            leaf_states[i] = f.leaf_layers[i].current_state;
+
+        TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0,
+                        f.counter.current_epoch, f.counter.n_layers,
+                        layer_states, f.per_leaf_enabled,
+                        leaf_states, f.n_leaf_nodes), "dw c2 save");
+        persist_close(&db);
+    }
+
+    memset(&f.counter, 0, sizeof(f.counter));
+
+    /* Recover cycle 2 */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "dw c2 reopen");
+
+        uint32_t epoch, n_layers;
+        uint32_t loaded_layers[DW_MAX_LAYERS];
+        int per_leaf;
+        uint32_t loaded_leaves[8];
+        int n_leaves;
+
+        TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0,
+                        &epoch, &n_layers, loaded_layers, DW_MAX_LAYERS,
+                        &per_leaf, loaded_leaves, &n_leaves, 8), "dw c2 load");
+
+        TEST_ASSERT_EQ(epoch, epoch_after8, "dw c2 epoch");
+        for (uint32_t i = 0; i < saved_n_layers; i++) {
+            TEST_ASSERT_EQ(loaded_layers[i], layers_after8[i], "dw c2 layer state");
+        }
+        TEST_ASSERT_EQ(per_leaf, 1, "dw c2 per_leaf");
+        TEST_ASSERT_EQ(loaded_leaves[0], 3, "dw c2 leaf 0");
+        TEST_ASSERT_EQ(loaded_leaves[1], 1, "dw c2 leaf 1");
+
+        persist_close(&db);
+    }
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
     return 1;
 }
