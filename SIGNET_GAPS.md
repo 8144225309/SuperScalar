@@ -11,49 +11,22 @@
   (superscalar_client.c:1301-1319). Unit tests exist in test_reconnect.c.
 
 ### GAP-2: No LSP factory/channel recovery on restart
-- **Status**: CONFIRMED — REAL GAP
-- **Evidence**: LSP loads invoices, counters, HTLC origins, and JIT channels from DB
-  (superscalar_lsp.c:964-1091), but never calls `persist_load_factory()` or
-  `persist_load_channel_state()`. Factory and channels are rebuilt from scratch
-  via ceremony on every startup. If LSP crashes mid-session, persisted factory
-  and channel state is orphaned — not reloaded.
-- **Impact**: LSP crash = clients must redo full ceremony. On signet with real
-  funding, the old factory's on-chain UTXOs become stranded until CLTV timeout.
-- **Comparison**: LND stores full channel state in channeldb (bbolt) and recovers
-  all channels on restart. CLN uses a HSM + sqlite combo that replays from last
-  known state. LDK delegates to `Persist` trait — implementer must guarantee
-  atomicity. All three recover channels without re-ceremony.
-- **Fix**: Add `persist_load_factory()` + `persist_load_channel_state()` path at
-  LSP startup when DB has existing state. Skip ceremony, go straight to daemon mode.
+- **Status**: CLOSED (commit 2692f44)
+- **Resolution**: LSP startup now calls `persist_load_factory()` and
+  `persist_load_channel_state()` when DB has existing state. Skips ceremony,
+  goes straight to daemon mode. Clients reconnect via MSG_RECONNECT.
+  Verified by `test_regtest_lsp_crash_recovery` and orchestrator scenario.
 
 ### GAP-3: Client auto-accepts all HTLCs (PoC)
-- **Status**: CONFIRMED — REAL GAP
-- **Evidence**: superscalar_client.c:580 — "Auto-accept (PoC)". Client receives
-  MSG_JIT_OFFER and immediately sends MSG_JIT_ACCEPT without any validation.
-  Any LSP (or MITM) can trigger JIT channel creation with arbitrary amounts.
-- **Impact**: On signet, a rogue LSP could open unwanted channels consuming client
-  funds. Not a direct theft vector (client still signs), but enables griefing.
-- **Comparison**: LND requires explicit invoice creation before accepting HTLCs.
-  CLN uses `autoclean` plugin with configurable acceptance policies. LDK has
-  `ChannelManager::accept_inbound_channel()` that requires explicit opt-in.
-- **Fix**: Add `--auto-accept-jit` flag (off by default). Without it, prompt user
-  or reject. For daemon mode, accept only if matching a registered invoice.
-- **Severity downgrade**: This is a JIT offer acceptance, not HTLC fulfillment.
-  Client still controls signing. Moving to Tier 2.
+- **Status**: CLOSED (commit 2692f44, `--auto-accept-jit` flag)
+- **Resolution**: JIT offers now require explicit `--auto-accept-jit` flag.
+  Without it, JIT offers are rejected. Client still controls signing.
 
 ### GAP-4: No graceful close on disconnect
-- **Status**: PARTIALLY FALSE — DOWNGRADED
-- **Evidence**: Client DOES have a retry loop (superscalar_client.c:1301-1319) —
-  on disconnect, it sleeps 5s and reconnects from persisted state. The "break"
-  at line 334 exits the daemon callback, not the program. The outer loop catches
-  it and reconnects.
-- **What IS missing**: No cooperative close attempt before disconnect. No in-flight
-  HTLC cleanup. If an HTLC was mid-fulfillment when TCP drops, it's orphaned
-  until timeout.
-- **Comparison**: LND sends `channel_reestablish` on reconnect and replays
-  unacked HTLCs. CLN does the same per BOLT 2. Both handle mid-flight HTLCs.
-- **Severity**: Tier 2, not Tier 1. The reconnect loop prevents fund loss.
-  Orphaned HTLCs resolve via timeout (inconvenient, not catastrophic).
+- **Status**: CLOSED (commit 2692f44 + 6ae7acb)
+- **Resolution**: Reconnect loop with state persistence handles disconnects.
+  In-flight HTLCs are replayed on reconnection. Verified by
+  `test_regtest_tcp_reconnect` (real TCP, SIGKILL, state verified).
 
 ## Tier 2 — Embarrassing on public network
 
@@ -81,15 +54,9 @@
 - **Severity**: Low for signet. Firewall-level mitigation is standard practice.
 
 ### GAP-7: Hardcoded confirmation timeouts
-- **Status**: CONFIRMED — REAL BUT MINOR
-- **Evidence**: `regtest_wait_for_confirmation()` called with 3600s (1hr) for
-  tree broadcast (line 396) and 7200s (2hr) for funding confirmation. These are
-  hardcoded per call site, not configurable via CLI args.
-- **Impact**: Signet blocks average 10 min. 2hr = ~12 blocks, which is usually
-  fine. Could be tight during signet disruptions.
-- **Comparison**: LND uses configurable `--bitcoin.timelockdelta`. CLN has
-  `--watchtime-blocks`. Both express timeouts in blocks, not seconds.
-- **Fix**: Add `--confirm-timeout` CLI arg. Low effort, low urgency.
+- **Status**: CLOSED (commit 2692f44, `--confirm-timeout` flag)
+- **Resolution**: `--confirm-timeout` CLI arg now configurable. Default:
+  3600s (regtest), 7200s (non-regtest). Overridable per deployment.
 
 ### GAP-8: Failed broadcasts silently ignored
 - **Status**: FALSE — REMOVED
@@ -100,10 +67,10 @@
   persisted, and reported.
 
 ### GAP-3b: Client auto-accept JIT (moved from Tier 1)
-- **See GAP-3 above** — reclassified as Tier 2.
+- **See GAP-3 above** — CLOSED.
 
 ### GAP-4b: No in-flight HTLC replay on reconnect
-- **See GAP-4 above** — the reconnect works, but unacked HTLCs aren't replayed.
+- **See GAP-4 above** — CLOSED.
 
 ## Tier 3 — Polish
 

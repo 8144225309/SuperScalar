@@ -5,7 +5,7 @@ What works today, what's missing, and concrete ideas for making SuperScalar easi
 ## What Works Today
 
 ### Automated Testing
-- **314 tests** (275 unit + 39 regtest), all passing
+- **360 tests** (319 unit + 41 regtest), all passing
 - Unit tests run in ~2 seconds with no external dependencies
 - Regtest tests run real Bitcoin transactions against Bitcoin Core
 - CI runs on every push: Linux, macOS, sanitizers, static analysis, regtest
@@ -28,25 +28,21 @@ What works today, what's missing, and concrete ideas for making SuperScalar easi
 - Encrypted transport (Noise NN + NK)
 - Tor hidden service support
 - JIT channel fallback
-- Client placement optimization (altruistic/greedy)
+- Client placement optimization (inward/outward)
 - Profit-sharing economics
 
 ## What's Missing: Demo Gaps
 
-### 1. No Interactive Payment CLI
+### 1. ~~No Interactive Payment CLI~~ — IMPLEMENTED
 
-**Problem:** Once a factory is running in daemon mode, there's no way to trigger individual payments from the command line. The `--demo` flag runs a scripted sequence and exits. In daemon mode, payments only happen via the bridge (external Lightning payments) or not at all.
+> **Update:** The `--cli` flag on `superscalar_lsp` enables an interactive
+> stdin-based CLI in daemon mode. Commands: `pay <from> <to> <amount>`,
+> `status`, `rotate`, `close`, `help`. This resolves the core gap.
 
-**What would help:**
-- A simple CLI command to send a payment between factory clients:
-  ```bash
-  ./superscalar_pay --lsp-host 127.0.0.1 --lsp-port 9735 \
-    --from 1 --to 2 --amount 1000
-  ```
-- Or a UNIX socket / REST API on the LSP that accepts payment requests
-- Even a basic stdin prompt in the LSP daemon: "type `pay 1 2 1000` to send"
+~~**Problem:** Once a factory is running in daemon mode, there's no way to trigger individual payments from the command line.~~
 
-**Effort:** Medium. The `lsp_channels_initiate_payment()` function already exists — it just needs a trigger mechanism beyond the scripted demo.
+The remaining wish-list items (UNIX socket API, external CLI tool) are
+polish on top of the working `--cli` implementation.
 
 ### 2. No Real Client-Initiated Payments
 
@@ -158,7 +154,7 @@ If you want to help improve the demo experience:
 
 For the test infrastructure:
 
-1. **The test suite is solid** — 314 tests with adversarial scenarios, sanitizer builds, and CI. No urgent gaps.
+1. **The test suite is solid** — 360 tests with adversarial scenarios, sanitizer builds, and CI. No urgent gaps.
 2. **Fuzz testing would help** — wire protocol parsing, transaction serialization, and persistence loading are good targets.
 3. **Property-based testing** — the DW state machine and MuSig2 signing are good candidates for QuickCheck-style random input testing.
 4. **Coverage measurement** — `gcov` / `lcov` integration in CMake would show which code paths lack tests.

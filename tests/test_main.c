@@ -474,8 +474,8 @@ extern int test_persist_file_reopen_round_trip(void);
 
 /* Placement + Economics tests */
 extern int test_placement_sequential(void);
-extern int test_placement_altruistic(void);
-extern int test_placement_greedy(void);
+extern int test_placement_inward(void);
+extern int test_placement_outward(void);
 extern int test_placement_profiles_wire_round_trip(void);
 extern int test_economic_mode_validation(void);
 
@@ -924,8 +924,8 @@ static void run_unit_tests(void) {
 
     printf("\n=== Placement + Economics ===\n");
     RUN_TEST(test_placement_sequential);
-    RUN_TEST(test_placement_altruistic);
-    RUN_TEST(test_placement_greedy);
+    RUN_TEST(test_placement_inward);
+    RUN_TEST(test_placement_outward);
     RUN_TEST(test_placement_profiles_wire_round_trip);
     RUN_TEST(test_economic_mode_validation);
 

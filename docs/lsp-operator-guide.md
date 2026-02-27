@@ -5,7 +5,7 @@ How to deploy and run a SuperScalar LSP node. Covers regtest, signet, and testne
 ## Prerequisites
 
 - Built `superscalar_lsp` binary (see main [README](../README.md#build))
-- Bitcoin Core 25+ (`bitcoind` and `bitcoin-cli`)
+- Bitcoin Core 28.1+ (`bitcoind` and `bitcoin-cli`)
 - SQLite3 (system package, used for persistence)
 - A funded wallet on your target network
 
@@ -153,7 +153,7 @@ Press **Ctrl+C**. The LSP will:
 |------|---------|-------------|
 | `--routing-fee-ppm` | 0 | Routing fee in parts-per-million (0 = free forwarding) |
 | `--lsp-balance-pct` | 50 | LSP's share of each channel capacity (0-100) |
-| `--placement-mode` | sequential | Client tree placement: `sequential` / `altruistic` / `greedy` |
+| `--placement-mode` | sequential | Client tree placement: `sequential` / `inward` / `outward` |
 | `--economic-mode` | lsp-takes-all | Fee model: `lsp-takes-all` / `profit-shared` |
 | `--default-profit-bps` | 0 | Default profit share per client (basis points, 0-10000) |
 
@@ -186,14 +186,54 @@ Press **Ctrl+C**. The LSP will:
 
 ### Placement Modes Explained
 
-- **sequential**: Clients are placed in the tree in connection order (1, 2, 3, 4). Simple, predictable.
-- **altruistic**: Clients with the highest balance are placed closest to the root. This minimizes exit cost for large-balance clients.
-- **greedy**: Clients with the lowest uptime score are placed at the deepest leaves. This minimizes LSP exposure to unreliable clients.
+- **sequential**: Connection order. Simple, predictable — good default.
+- **inward**: High-balance clients near root. Reduces exit costs for clients with the most at stake.
+- **outward**: Low-uptime clients at leaves. Reduces operator exposure at the edges of the tree.
 
 ### Economic Modes Explained
 
-- **lsp-takes-all**: The LSP keeps 100% of routing fees. Simple, no settlement overhead.
-- **profit-shared**: Routing fees are redistributed to clients based on their `profit_share_bps`. Settlement happens periodically via Decker-Wattenhofer state advances.
+- **lsp-takes-all**: The LSP keeps 100% of routing fees. Simple, no settlement overhead — a good starting point.
+- **profit-shared**: Routing fees are redistributed to clients based on their `profit_share_bps`. Settlement happens periodically via Decker-Wattenhofer state advances. Incentivizes client participation.
+
+### Advanced Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cli` | off | Interactive CLI in daemon mode (pay/status/rotate/close/help) |
+| `--step-blocks` | 10 | DW step blocks (nSequence decrement per state) |
+| `--states-per-layer` | 4 | DW states per layer (2-256) |
+| `--settlement-interval` | 144 | Blocks between profit settlements |
+| `--payments` | 0 | Number of HTLC payments to process |
+| `--cltv-timeout` | auto | Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest) |
+| `--regtest` | off | Shorthand for `--network regtest` |
+| `--i-accept-the-risk` | off | Allow mainnet operation (prototype — funds at risk!) |
+| `--help` | — | Show help and exit |
+
+### Testing & Debug Flags
+
+These flags run after the `--demo` payment sequence to test specific protocol features:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--breach-test` | off | Broadcast revoked commitment, trigger watchtower penalty |
+| `--cheat-daemon` | off | Broadcast revoked commitment and sleep (clients detect) |
+| `--test-expiry` | off | Mine past CLTV, recover via timeout script path |
+| `--test-distrib` | off | Broadcast pre-signed distribution TX (nLockTime fallback) |
+| `--test-turnover` | off | PTLC key turnover, close with extracted keys |
+| `--test-rotation` | off | Full factory rotation lifecycle |
+| `--force-close` | off | Broadcast factory tree on-chain, wait for confirmations |
+
+### Interactive CLI
+
+When `--cli` is enabled in daemon mode, the LSP reads commands from stdin:
+
+| Command | Description |
+|---------|-------------|
+| `pay <from> <to> <amount>` | Send a payment between factory clients |
+| `status` | Print channel balances, factory state, ladder info |
+| `rotate` | Trigger manual factory rotation |
+| `close` | Initiate cooperative close and shutdown |
+| `help` | Show available commands |
 
 ## 6. Crash Recovery
 

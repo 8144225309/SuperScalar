@@ -26,8 +26,8 @@ typedef enum {
 /* Client placement strategies for tree construction */
 typedef enum {
     PLACEMENT_SEQUENTIAL = 0,  /* current: [1,2,3,...,N] */
-    PLACEMENT_ALTRUISTIC = 1,  /* highest balance closest to root (lower exit cost) */
-    PLACEMENT_GREEDY     = 2,  /* lowest uptime deepest in tree (LSP-favorable) */
+    PLACEMENT_INWARD     = 1,  /* highest balance closest to root (lower exit cost) */
+    PLACEMENT_OUTWARD    = 2,  /* lowest uptime at leaves (reduces operator exposure) */
 } placement_mode_t;
 
 /* Economic fee distribution model */

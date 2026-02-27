@@ -80,9 +80,9 @@ static void usage(const char *prog) {
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
-        "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free/altruistic)\n"
+        "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
-        "  --placement-mode M  Client placement: sequential, altruistic, greedy (default: sequential)\n"
+        "  --placement-mode M  Client placement: sequential, inward, outward (default: sequential)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
         "  --settlement-interval N Blocks between profit settlements (default: 144)\n"
@@ -483,10 +483,10 @@ int main(int argc, char *argv[]) {
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
-    uint64_t routing_fee_ppm = 0;    /* 0 = altruistic (no routing fee) */
+    uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
-    int placement_mode_arg = 0;      /* 0=sequential, 1=altruistic, 2=greedy */
+    int placement_mode_arg = 0;      /* 0=sequential, 1=inward, 2=outward */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
@@ -607,9 +607,9 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--placement-mode") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "sequential") == 0) placement_mode_arg = 0;
-            else if (strcmp(argv[i], "altruistic") == 0) placement_mode_arg = 1;
-            else if (strcmp(argv[i], "greedy") == 0) placement_mode_arg = 2;
-            else { fprintf(stderr, "Error: unknown --placement-mode '%s'\n", argv[i]); return 1; }
+            else if (strcmp(argv[i], "inward") == 0) placement_mode_arg = 1;
+            else if (strcmp(argv[i], "outward") == 0) placement_mode_arg = 2;
+            else { fprintf(stderr, "Error: unknown --placement-mode '%s' (options: sequential, inward, outward)\n", argv[i]); return 1; }
         }
         else if (strcmp(argv[i], "--economic-mode") == 0 && i + 1 < argc) {
             i++;

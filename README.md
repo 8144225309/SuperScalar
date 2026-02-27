@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 314 tests (275 unit + 39 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 360 tests (319 unit + 41 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -44,7 +44,7 @@ cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null ||
 
 ## Tests
 
-275 unit + 39 regtest integration tests (including 11 adversarial/edge-case tests).
+319 unit + 41 regtest integration tests (including 11 adversarial/edge-case tests).
 
 See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
 
@@ -394,7 +394,7 @@ superscalar_lsp [OPTIONS]
 | `--force-close` | — | off | Broadcast factory tree on-chain, wait for confirmations |
 | `--routing-fee-ppm` | N | 0 | Routing fee in parts-per-million (0 = free) |
 | `--lsp-balance-pct` | N | 50 | LSP's share of channel capacity (0-100) |
-| `--placement-mode` | MODE | sequential | Client placement: sequential / altruistic / greedy |
+| `--placement-mode` | MODE | sequential | Client placement: sequential / inward / outward |
 | `--economic-mode` | MODE | lsp-takes-all | Fee model: lsp-takes-all / profit-shared |
 | `--default-profit-bps` | N | 0 | Default profit share per client (basis points) |
 | `--no-jit` | — | off | Disable JIT channel fallback |
@@ -402,6 +402,19 @@ superscalar_lsp [OPTIONS]
 | `--accept-timeout` | SECS | 0 | Max seconds to wait for each client to connect |
 | `--active-blocks` | N | 20/4320 | Factory active period in blocks |
 | `--dying-blocks` | N | 10/432 | Factory dying period in blocks |
+| `--cli` | — | off | Interactive CLI in daemon mode (pay/status/rotate/close) |
+| `--step-blocks` | N | 10 | DW step blocks (nSequence decrement per state) |
+| `--states-per-layer` | N | 4 | DW states per layer (2-256) |
+| `--settlement-interval` | N | 144 | Blocks between profit settlements |
+| `--payments` | N | 0 | Number of HTLC payments to process |
+| `--cltv-timeout` | N | auto | Factory CLTV timeout (absolute block height) |
+| `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor |
+| `--tor-control` | HOST:PORT | — | Tor control port for hidden service |
+| `--tor-password` | PASS | — | Tor control auth password |
+| `--onion` | — | off | Create Tor hidden service on startup |
+| `--regtest` | — | off | Shorthand for --network regtest |
+| `--i-accept-the-risk` | — | off | Allow mainnet (prototype — funds at risk!) |
+| `--help` | — | — | Show help and exit |
 
 ### superscalar_client
 
@@ -525,7 +538,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-49 message types over TCP with length-prefixed JSON framing:
+53 message types over TCP with length-prefixed JSON framing:
 
 | Category | Messages |
 |----------|----------|
@@ -539,7 +552,9 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 | Invoice | CREATE_INVOICE, INVOICE_CREATED, REGISTER_INVOICE |
 | PTLC | PTLC_PRESIG, PTLC_ADAPTED_SIG, PTLC_COMPLETE |
 | Epoch/Leaf | EPOCH_RESET_PROPOSE/PSIG/DONE, LEAF_ADVANCE_PROPOSE/PSIG/DONE |
+| Path Signing | PATH_NONCE_BUNDLE, PATH_ALL_NONCES, PATH_PSIG_BUNDLE, PATH_SIGN_DONE |
 | JIT | JIT_OFFER, JIT_ACCEPT, JIT_READY, JIT_MIGRATE |
+| Error | ERROR |
 
 ### Connection Topology (with CLN Bridge)
 
@@ -571,11 +586,11 @@ CLN (lightningd)
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
-| `wire` | wire.c | TCP transport, JSON framing, 49 message types |
+| `wire` | wire.c | TCP transport, JSON framing, 53 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
 | `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |
-| `persist` | persist.c | SQLite3: 19 tables for full state persistence |
+| `persist` | persist.c | SQLite3: 27 tables for full state persistence |
 | `bridge` | bridge.c | CLN bridge daemon |
 | `fee` | fee.c | Configurable fee estimation |
 | `watchtower` | watchtower.c | Breach detection + penalty broadcast (LSP + client-side, factory nodes) |

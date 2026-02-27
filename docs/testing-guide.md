@@ -18,7 +18,7 @@ brew install cmake
 # (SQLite3 ships with Xcode command line tools)
 ```
 
-For **regtest integration tests** you also need Bitcoin Core (25+):
+For **regtest integration tests** you also need Bitcoin Core (28.1+):
 
 ```bash
 # Download from https://bitcoincore.org/en/download/
@@ -52,9 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 275 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement |
-| Regtest integration | 39 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery |
-| **Total** | **314** | | |
+| Unit tests | 319 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement |
+| Regtest integration | 41 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery, TCP reconnection |
+| **Total** | **360** | | |
 
 ---
 
@@ -67,7 +67,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 275/275 passed`
+Expected output: `Results: 319/319 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
@@ -99,7 +99,7 @@ cd build
 ./test_superscalar --regtest
 ```
 
-Expected output: `Results: 39/39 passed`
+Expected output: `Results: 41/41 passed`
 
 ### Step 3: Stop bitcoind
 
@@ -137,12 +137,13 @@ sleep 3
 | Suite | Tests | What's Tested |
 |-------|-------|---------------|
 | DW State Machine | 8 | nSequence odometer: layer init, delay calculation, advance, exhaustion |
-| MuSig2 | 6 | Key aggregation, sign/verify, wrong message rejection, taproot signing |
+| MuSig2 | 4 | Key aggregation, sign/verify, wrong message rejection, taproot signing |
 | MuSig2 Split-Round | 6 | Split-round protocol, nonce pools, partial sig verification, 5-of-5 |
 | Transaction Builder | 5 | P2TR output scripts, unsigned tx serialization, witness finalization, varint |
 | Tapscript | 6 | Leaf hashing, tree tweaking, control blocks, sighash, CLTV timeout scripts |
 | Shachain | 2 | Shachain generation, derivation property |
 | Adaptor Signatures | 3 | Adaptor round-trip, invalid pre-sig, taproot adaptor |
+| PTLC Key Turnover | 3 | PTLC key extraction via adaptor sigs, multi-client turnover |
 
 ### Factory
 
@@ -156,7 +157,7 @@ sleep 3
 | Arity-1 Hardening | 6 | CLTV ordering, min funding rejection, input amounts, split-round, persistence |
 | Tree Navigation | 6 | Path-to-root, subtree clients, leaf lookup, variable-N, timeout spend |
 | Epoch/Leaf | 8 | Counter reset, epoch reset, left/right leaf advance, independence, exhaustion |
-| Placement + Economics | 5 | Sequential/altruistic/greedy placement, profile wire round-trip, bps validation |
+| Placement + Economics | 5 | Sequential/inward/outward placement, profile wire round-trip, bps validation |
 | Nonce Pool Integration | 3 | Pool-based factory creation, exhaustion handling, participant node counts |
 | Subtree-Scoped Signing | 4 | Path session init, path rebuild, path signing, advance+rebuild path |
 
@@ -176,7 +177,7 @@ sleep 3
 | Wire Protocol | 7 | Pubkey-only factory, framing, crypto serialization, nonce/psig bundles, close unsigned, distributed signing |
 | Wire Hardening | 4 | Oversized frame rejection, CLTV delta, truncated header/body, zero-length frame |
 | Wire Hostname + Tor | 5 | Hostname connect, .onion rejection without proxy, proxy arg parsing, SOCKS5 mock |
-| CLN Bridge | 10 | Message round-trip, hello handshake, invoice registry, inbound/outbound flow, unknown hash, forward registration, NK pubkey, HTLC timeout |
+| CLN Bridge | 11 | Message round-trip, hello handshake, invoice registry, inbound/outbound flow, unknown hash, forward registration, NK pubkey, HTLC timeout |
 | Encrypted Transport | 5 | ChaCha20-Poly1305, HMAC-SHA256, Noise handshake, encrypted wire, tamper rejection |
 
 ### Persistence & Recovery
@@ -219,9 +220,31 @@ sleep 3
 | Partial Close | 7 | Cooperative/uncooperative clients, thresholds, 3of4/2of4 rotation, preserves distribution tx |
 | Continuous Ladder | 3 | Evict expired, rotation trigger, context save/restore |
 | Demo Polish | 3 | Invoice wire, preimage fulfills, balance reporting |
-| Daemon Mode | 3 | Invoice registration, daemon event loop, client auto-fulfill |
+| Daemon Mode | 4 | Invoice registration, daemon event loop, client auto-fulfill, feature wiring |
 | Reconnection | 4 | Wire format, pubkey matching, nonce re-exchange, persist+reload |
 | Network Mode | 3 | Regtest init, mode flag, block height |
+
+### Additional Suites
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Cooperative Epoch Reset + Per-Leaf Advance | 8 | Counter reset, epoch reset, left/right leaf advance, independence, exhaustion |
+| Basepoint Exchange | 2 | Channel basepoint wire round-trip, multi-client exchange |
+| Random Basepoints | 2 | Random basepoint generation, uniqueness |
+| LSP Recovery | 1 | Factory + channel reload from DB after crash |
+| Rotation Retry with Backoff | 3 | Retry timing, success resets, default config |
+| Signet Interop | 3 | Signet network init, fee estimation, confirmation polling |
+| Demo Protections | 3 | Safe defaults, error guards, regtest-only flags |
+| Factory Rotation | 3 | PTLC turnover, close + recreate, payment in new factory |
+| Daemon Feature Wiring | 3 | Watchtower wiring, fee estimator, settlement trigger |
+| Security Model Tests | 5 | Threat model validation, access control, key isolation |
+| Security Model Gap Tests | 4 | Noise FD overflow, cooperative close timeout, persist atomicity |
+| Dust/Reserve Validation | 3 | Dust limit enforcement, reserve checks, edge amounts |
+| Watchtower Wiring | 2 | Watchtower registration in factory lifecycle |
+| HTLC Timeout Enforcement | 3 | CLTV expiry, timeout path, success vs timeout precedence |
+| Encrypted Keyfile | 3 | Encrypt, decrypt, wrong-passphrase rejection |
+| Edge Cases + Failure Modes | 10 | Boundary conditions, error paths, malformed input handling |
+| Phase 2: Testnet Ready | 13 | End-to-end testnet integration, multi-step scenarios |
 
 ---
 
@@ -312,6 +335,24 @@ ASAN_OPTIONS=detect_leaks=0 ./test_superscalar --regtest
 
 This enables AddressSanitizer and UndefinedBehaviorSanitizer. Any memory
 error or UB will cause an immediate abort with a stack trace.
+
+---
+
+## CI (Continuous Integration)
+
+GitHub Actions runs on every push and pull request with a 3-platform matrix:
+
+| Runner | What it builds/tests |
+|--------|---------------------|
+| Linux (Ubuntu) | Full build + unit tests + regtest integration |
+| macOS | Full build + unit tests + regtest integration |
+| Linux + Sanitizers | ASan + UBSan build + unit tests (no regtest — sanitizer overhead) |
+
+Additionally:
+- **cppcheck** static analysis runs on every push (zero warnings enforced)
+- All platforms compile with `-Wall -Wextra -Werror` — zero warnings is a hard gate
+
+CI config is in `.github/workflows/`. A failing CI check blocks merges.
 
 ---
 

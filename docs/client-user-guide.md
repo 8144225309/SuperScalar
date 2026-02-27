@@ -189,6 +189,10 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--lsp-pubkey` | none | LSP static pubkey for NK authentication (33-byte hex) |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor connections |
 | `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--send` | — | Send payment: `DEST:AMOUNT:PREIMAGE_HEX` (can repeat) |
+| `--recv` | — | Receive payment: `PREIMAGE_HEX` (can repeat) |
+| `--channels` | off | Expect channel phase (when LSP uses `--payments`) |
+| `--report` | — | Write diagnostic JSON report to PATH |
 
 ## 9. Troubleshooting
 

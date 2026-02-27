@@ -11,7 +11,7 @@ Step-by-step instructions for running every SuperScalar demo scenario. Covers au
    cd ..
    ```
 
-2. Have `bitcoind` and `bitcoin-cli` in your PATH (Bitcoin Core 25+).
+2. Have `bitcoind` and `bitcoin-cli` in your PATH (Bitcoin Core 28.1+).
 
 3. All demos below assume you're in the project root directory.
 
@@ -210,19 +210,19 @@ cd build
 
 # Client 1
 ./superscalar_client --seckey 2222222222222222222222222222222222222222222222222222222222222222 \
-  --port 9735 --network regtest --daemon
+  --host 127.0.0.1 --port 9735 --network regtest --daemon
 
 # Client 2
 ./superscalar_client --seckey 3333333333333333333333333333333333333333333333333333333333333333 \
-  --port 9735 --network regtest --daemon
+  --host 127.0.0.1 --port 9735 --network regtest --daemon
 
 # Client 3
 ./superscalar_client --seckey 4444444444444444444444444444444444444444444444444444444444444444 \
-  --port 9735 --network regtest --daemon
+  --host 127.0.0.1 --port 9735 --network regtest --daemon
 
 # Client 4
 ./superscalar_client --seckey 5555555555555555555555555555555555555555555555555555555555555555 \
-  --port 9735 --network regtest --daemon
+  --host 127.0.0.1 --port 9735 --network regtest --daemon
 ```
 
 Once all 4 clients connect, the factory ceremony starts automatically.
@@ -248,13 +248,33 @@ python3 tools/test_orchestrator.py --scenario all_watch          # All clients d
 python3 tools/test_orchestrator.py --scenario partial_watch --k 2  # 2 of 4 detect
 python3 tools/test_orchestrator.py --scenario nobody_home        # No clients detect
 python3 tools/test_orchestrator.py --scenario late_arrival       # Clients restart after breach
-python3 tools/test_orchestrator.py --scenario cooperative_close  # Clean shutdown
-python3 tools/test_orchestrator.py --scenario timeout_expiry     # LSP reclaims via CLTV
-python3 tools/test_orchestrator.py --scenario factory_breach     # Old factory tree broadcast
 python3 tools/test_orchestrator.py --scenario all                # Run everything
 ```
 
-The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail.
+### Lifecycle Scenarios
+
+```bash
+python3 tools/test_orchestrator.py --scenario cooperative_close    # Clean SIGTERM shutdown, close TX confirmed
+python3 tools/test_orchestrator.py --scenario timeout_expiry       # All vanish; LSP reclaims via CLTV
+python3 tools/test_orchestrator.py --scenario timeout_recovery     # Clients vanish → LSP timeout reclaim
+python3 tools/test_orchestrator.py --scenario jit_lifecycle        # Late client triggers JIT channel create + fund + route
+python3 tools/test_orchestrator.py --scenario factory_rotation     # DYING trigger → PTLC turnover → new factory
+python3 tools/test_orchestrator.py --scenario full_lifecycle       # Factory → payments → watchtower → cooperative close
+```
+
+### Failure & Recovery Scenarios
+
+```bash
+python3 tools/test_orchestrator.py --scenario factory_breach       # LSP broadcasts old factory tree; clients detect
+python3 tools/test_orchestrator.py --scenario ladder_breach        # Breach in DYING factory; ACTIVE factory unaffected
+python3 tools/test_orchestrator.py --scenario turnover_abort       # PTLC turnover aborted midway; client reconnects
+python3 tools/test_orchestrator.py --scenario lsp_crash_recovery   # LSP SIGKILL + restart; clients reconnect
+python3 tools/test_orchestrator.py --scenario client_crash_htlc    # Client crashes during payment; HTLC resolves after restart
+python3 tools/test_orchestrator.py --scenario mass_departure_jit   # Mass client departure triggers JIT fallback
+python3 tools/test_orchestrator.py --scenario watchtower_late_arrival  # Clients restart after breach, detect before CSV
+```
+
+The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail. 17 scenarios total.
 
 ---
 

@@ -1163,7 +1163,7 @@ int test_placement_profiles_wire_round_trip(void) {
     factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
 
     /* Set placement and profiles */
-    f.placement_mode = PLACEMENT_ALTRUISTIC;
+    f.placement_mode = PLACEMENT_INWARD;
     f.economic_mode = ECON_PROFIT_SHARED;
     f.profiles[0].participant_idx = 0;
     f.profiles[0].contribution_sats = 50000;
@@ -1198,7 +1198,7 @@ int test_placement_profiles_wire_round_trip(void) {
     /* Parse back placement_mode */
     cJSON *pm = cJSON_GetObjectItem(j, "placement_mode");
     TEST_ASSERT(pm && cJSON_IsNumber(pm), "has placement_mode");
-    TEST_ASSERT_EQ((int)pm->valuedouble, PLACEMENT_ALTRUISTIC, "placement_mode = altruistic");
+    TEST_ASSERT_EQ((int)pm->valuedouble, PLACEMENT_INWARD, "placement_mode = inward");
 
     /* Parse back economic_mode */
     cJSON *em = cJSON_GetObjectItem(j, "economic_mode");

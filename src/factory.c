@@ -8,7 +8,7 @@
 /* --- Placement sort context (passed via global for qsort) --- */
 static const factory_t *g_sort_factory = NULL;
 
-/* Altruistic: highest contribution_sats first (descending) */
+/* Inward: highest contribution_sats first (descending) */
 static int cmp_balance_desc(const void *a, const void *b) {
     uint32_t ia = *(const uint32_t *)a;
     uint32_t ib = *(const uint32_t *)b;
@@ -19,7 +19,7 @@ static int cmp_balance_desc(const void *a, const void *b) {
     return 0;
 }
 
-/* Greedy: lowest uptime first (ascending), then lowest contribution (ascending) */
+/* Outward: lowest uptime first (ascending), then lowest contribution (ascending) */
 static int cmp_uptime_asc(const void *a, const void *b) {
     uint32_t ia = *(const uint32_t *)a;
     uint32_t ib = *(const uint32_t *)b;
@@ -771,11 +771,11 @@ int factory_build_tree(factory_t *f) {
         clients[i] = (uint32_t)(i + 1);
 
     /* Apply placement strategy */
-    if (f->placement_mode == PLACEMENT_ALTRUISTIC && n_clients > 1) {
+    if (f->placement_mode == PLACEMENT_INWARD && n_clients > 1) {
         g_sort_factory = f;
         qsort(clients, n_clients, sizeof(uint32_t), cmp_balance_desc);
         g_sort_factory = NULL;
-    } else if (f->placement_mode == PLACEMENT_GREEDY && n_clients > 1) {
+    } else if (f->placement_mode == PLACEMENT_OUTWARD && n_clients > 1) {
         g_sort_factory = f;
         qsort(clients, n_clients, sizeof(uint32_t), cmp_uptime_asc);
         g_sort_factory = NULL;
@@ -1656,7 +1656,7 @@ int factory_build_distribution_tx(
        Anchor cost deducted from first output (LSP's share). */
     tx_output_t aug_outputs[FACTORY_MAX_OUTPUTS + 1];
     size_t aug_n = n_outputs;
-    if (n_outputs > FACTORY_MAX_OUTPUTS) return 0;
+    if (n_outputs == 0 || n_outputs > FACTORY_MAX_OUTPUTS) return 0;
 
     for (size_t i = 0; i < n_outputs; i++)
         aug_outputs[i] = outputs[i];

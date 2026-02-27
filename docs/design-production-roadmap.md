@@ -5,7 +5,7 @@
 
 ## Current State (2026-02-27)
 
-317 tests (277 unit + 40 regtest), all passing. The cryptographic protocol
+360 tests (319 unit + 41 regtest), all passing. The cryptographic protocol
 is correct. The factory lifecycle works end-to-end on regtest with real
 Bitcoin transactions. TCP reconnection proven over real network. Rotation
 retry with backoff prevents fund lockup. Interactive CLI enables daemon-mode
@@ -26,7 +26,7 @@ Before planning, we traced every claim to source code. Results:
 | 5 | Bridge persistence doesn't exist | **WRONG** | persist_save_invoice() and persist_save_htlc_origin() exist and are called (persist.h:256-283) |
 | 6 | Dynamic client entry unsupported | **Correct** | Factory n_participants fixed at creation; no add-participant API |
 | 7 | Offline detection never tested | **WRONG** | test_last_message_time_update and test_offline_detection_flag exist (test_jit.c:42-79) |
-| 8 | JIT never tested with daemon trigger | **Correct** | JIT wire messages tested; daemon→factory_expired→JIT_create path untested |
+| 8 | JIT never tested with daemon trigger | ~~Correct~~ **FIXED** | JIT daemon trigger tested via orchestrator `jit_lifecycle` scenario |
 | 9 | No soak/long-running test | **Correct** | All tests complete in ≤500ms; no multi-second test exists |
 | 10 | Waiting room needs new factory | **Correct** | MuSig2 aggregation immutable after creation; tree cannot add signers |
 
@@ -63,8 +63,8 @@ Tested with real Bitcoin transactions and/or real TCP between processes:
 | ~~PTLC rotation failure → factory stuck~~ | ~~High~~ | **FIXED** — retry with exponential backoff + dist TX fallback |
 | ~~TCP reconnection never integration-tested~~ | ~~High~~ | **FIXED** — test_regtest_tcp_reconnect (real TCP, SIGKILL, Noise NN) |
 | ~~No interactive CLI~~ | ~~Low~~ | **FIXED** — `--cli` flag, pay/status/rotate/close in daemon loop |
+| ~~JIT daemon trigger path untested~~ | ~~Medium~~ | **FIXED** — orchestrator `jit_lifecycle` scenario exercises daemon→factory_expired→JIT path |
 | Dynamic client entry impossible | Medium | Factory tree immutable; new clients must wait for next factory |
-| JIT daemon trigger path untested | Medium | Wire messages tested; daemon loop's JIT creation never exercised |
 | No soak/stress test | Medium | Longest test is 500ms; no multi-minute or multi-hour runs |
 | Daemon loop integration test | Medium | Each feature unit-tested; never tested together in daemon context |
 | No external API/RPC | Low | Wire protocol + SQLite + CLI only; no JSON-RPC or socket interface |
@@ -162,10 +162,11 @@ watchtower ran and fee estimator polled.
 Creates factory with --active-blocks=20, mines 21 blocks, verifies daemon
 loop triggers rotation automatically, runs payment in new factory.
 
-**4. JIT daemon trigger test** (1 day)
+### ✓ Item 4: JIT daemon trigger test
 
-Mines past active + dying blocks, verifies daemon loop triggers JIT channel
-creation, runs a payment over the JIT channel.
+Orchestrator `jit_lifecycle` scenario: mines past active + dying blocks,
+verifies daemon loop triggers JIT channel creation, runs a payment over
+the JIT channel.
 
 ### Tier 3: Dynamic Participation (New Feature)
 

@@ -1,5 +1,10 @@
 # SuperScalar: Test Coverage & Signet Readiness Analysis
 
+> **Point-in-time audit from 2026-02-24.** The test suite has grown from
+> 255 to 360 tests (319 unit + 41 regtest) since this document was written.
+> Several gaps identified below have been closed. See
+> [SIGNET_GAPS.md](../SIGNET_GAPS.md) for current gap status.
+
 **Date:** 2026-02-24
 **Build:** 255/255 tests passing (232 unit + 23 regtest)
 **Commit:** 1e4e6e6 (post musig_pubkey_agg API fix)

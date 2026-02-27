@@ -1370,7 +1370,7 @@ int test_fee_policy_balance_split(void) {
         }
     }
 
-    /* Test 2: Greedy LSP with 70% share */
+    /* Test 2: Revenue-focused LSP with 70% share */
     {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));

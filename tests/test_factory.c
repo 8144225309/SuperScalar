@@ -3651,7 +3651,7 @@ int test_placement_sequential(void) {
     return 1;
 }
 
-int test_placement_altruistic(void) {
+int test_placement_inward(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     if (!make_keypairs(ctx, kps)) return 0;
@@ -3666,7 +3666,7 @@ int test_placement_altruistic(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 2, 4);
-    f.placement_mode = PLACEMENT_ALTRUISTIC;
+    f.placement_mode = PLACEMENT_INWARD;
 
     /* Client 4 has highest balance, client 1 has lowest */
     f.profiles[0].participant_idx = 0;
@@ -3681,9 +3681,9 @@ int test_placement_altruistic(void) {
     f.profiles[4].contribution_sats = 20000;  /* highest client */
 
     factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree altruistic");
+    TEST_ASSERT(factory_build_tree(&f), "build tree inward");
 
-    /* Altruistic: highest balance clients go to root (left subtree = closer to root).
+    /* Inward: highest balance clients go to root (left subtree = closer to root).
        Sorted desc: [4(20k), 2(15k), 3(10k), 1(5k)]
        Left leaf gets [4,2], Right leaf gets [3,1] */
 
@@ -3693,7 +3693,7 @@ int test_placement_altruistic(void) {
         if (f.nodes[3].signer_indices[s] == 4) left_has_c4 = 1;
         if (f.nodes[3].signer_indices[s] == 2) left_has_c2 = 1;
     }
-    TEST_ASSERT(left_has_c4 && left_has_c2, "altruistic: high-balance clients at left leaf");
+    TEST_ASSERT(left_has_c4 && left_has_c2, "inward: high-balance clients at left leaf");
 
     /* Right leaf (node 5): should have lowest-balance clients */
     int right_has_c3 = 0, right_has_c1 = 0;
@@ -3701,17 +3701,17 @@ int test_placement_altruistic(void) {
         if (f.nodes[5].signer_indices[s] == 3) right_has_c3 = 1;
         if (f.nodes[5].signer_indices[s] == 1) right_has_c1 = 1;
     }
-    TEST_ASSERT(right_has_c3 && right_has_c1, "altruistic: low-balance clients at right leaf");
+    TEST_ASSERT(right_has_c3 && right_has_c1, "inward: low-balance clients at right leaf");
 
     /* Verify tree still signs correctly */
-    TEST_ASSERT(factory_sign_all(&f), "altruistic tree signs");
+    TEST_ASSERT(factory_sign_all(&f), "inward tree signs");
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
 
-int test_placement_greedy(void) {
+int test_placement_outward(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     if (!make_keypairs(ctx, kps)) return 0;
@@ -3726,7 +3726,7 @@ int test_placement_greedy(void) {
 
     factory_t f;
     factory_init(&f, ctx, kps, 5, 2, 4);
-    f.placement_mode = PLACEMENT_GREEDY;
+    f.placement_mode = PLACEMENT_OUTWARD;
 
     /* Client 1 has lowest uptime, client 4 has highest */
     f.profiles[0].participant_idx = 0;
@@ -3745,9 +3745,9 @@ int test_placement_greedy(void) {
     f.profiles[4].contribution_sats = 10000;
 
     factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree greedy");
+    TEST_ASSERT(factory_build_tree(&f), "build tree outward");
 
-    /* Greedy: lowest uptime first (deepest = rightmost in DFS).
+    /* Outward: lowest uptime first (deepest = rightmost in DFS).
        Sorted asc by uptime: [3(0.1), 1(0.3), 2(0.9), 4(0.95)]
        Left leaf gets [3,1] (lowest uptime), Right leaf gets [2,4] (highest uptime) */
 
@@ -3757,7 +3757,7 @@ int test_placement_greedy(void) {
         if (f.nodes[3].signer_indices[s] == 3) left_has_c3 = 1;
         if (f.nodes[3].signer_indices[s] == 1) left_has_c1 = 1;
     }
-    TEST_ASSERT(left_has_c3 && left_has_c1, "greedy: low-uptime clients at left leaf");
+    TEST_ASSERT(left_has_c3 && left_has_c1, "outward: low-uptime clients at left leaf");
 
     /* Right leaf (node 5): highest-uptime clients */
     int right_has_c2 = 0, right_has_c4 = 0;
@@ -3765,10 +3765,10 @@ int test_placement_greedy(void) {
         if (f.nodes[5].signer_indices[s] == 2) right_has_c2 = 1;
         if (f.nodes[5].signer_indices[s] == 4) right_has_c4 = 1;
     }
-    TEST_ASSERT(right_has_c2 && right_has_c4, "greedy: high-uptime clients at right leaf");
+    TEST_ASSERT(right_has_c2 && right_has_c4, "outward: high-uptime clients at right leaf");
 
     /* Verify tree still signs correctly */
-    TEST_ASSERT(factory_sign_all(&f), "greedy tree signs");
+    TEST_ASSERT(factory_sign_all(&f), "outward tree signs");
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);
