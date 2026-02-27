@@ -428,6 +428,12 @@ extern int test_wire_recv_zero_length_frame(void);
 extern int test_regtest_htlc_wrong_preimage_rejected(void);
 extern int test_regtest_funding_double_spend_rejected(void);
 
+/* Variable-N tree tests */
+extern int test_factory_build_tree_n3(void);
+extern int test_factory_build_tree_n7(void);
+extern int test_factory_build_tree_n9(void);
+extern int test_factory_build_tree_n16(void);
+
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
 extern int test_factory_arity1_leaf_outputs(void);
@@ -807,6 +813,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_recv_truncated_header);
     RUN_TEST(test_wire_recv_truncated_body);
     RUN_TEST(test_wire_recv_zero_length_frame);
+
+    printf("\n=== Variable-N Tree ===\n");
+    RUN_TEST(test_factory_build_tree_n3);
+    RUN_TEST(test_factory_build_tree_n7);
+    RUN_TEST(test_factory_build_tree_n9);
+    RUN_TEST(test_factory_build_tree_n16);
 
     printf("\n=== Arity-1 Leaves ===\n");
     RUN_TEST(test_factory_build_tree_arity1);

@@ -362,6 +362,10 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
                                     prev_amount, node->nsequence);
 }
 
+/* Forward declarations for helpers used in init/set_arity */
+static int compute_tree_depth(size_t n_clients, factory_arity_t arity);
+static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
+
 /* ---- Public API ---- */
 
 int factory_init(factory_t *f, secp256k1_context *ctx,
@@ -380,13 +384,15 @@ int factory_init(factory_t *f, secp256k1_context *ctx,
             return 0;
     }
 
-    /* Default arity-2: 2 DW layers, 2 leaf nodes */
+    /* Default arity-2: compute layers/leaves from n_participants */
     f->leaf_arity = FACTORY_ARITY_2;
-    f->n_leaf_nodes = 2;
-    dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
+    size_t nc = (n_participants > 1) ? n_participants - 1 : 1;
+    int n_leaves = compute_leaf_count(nc, FACTORY_ARITY_2);
+    int n_layers = compute_tree_depth(nc, FACTORY_ARITY_2) + 1;
+    f->n_leaf_nodes = n_leaves;
+    dw_counter_init(&f->counter, n_layers, step_blocks, states_per_layer);
 
-    /* Per-leaf layers mirror global layer 1 initially */
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < n_leaves; i++)
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
     return 1;
@@ -406,22 +412,27 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
         f->pubkeys[i] = pubkeys[i];
     /* keypairs left zeroed — signing requires split-round API */
 
-    /* Default arity-2: 2 DW layers, 2 leaf nodes */
+    /* Default arity-2: compute layers/leaves from n_participants */
     f->leaf_arity = FACTORY_ARITY_2;
-    f->n_leaf_nodes = 2;
-    dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
+    size_t nc = (n_participants > 1) ? n_participants - 1 : 1;
+    int n_leaves = compute_leaf_count(nc, FACTORY_ARITY_2);
+    int n_layers = compute_tree_depth(nc, FACTORY_ARITY_2) + 1;
+    f->n_leaf_nodes = n_leaves;
+    dw_counter_init(&f->counter, n_layers, step_blocks, states_per_layer);
 
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < n_leaves; i++)
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
     f->leaf_arity = arity;
-    int n_layers = (arity == FACTORY_ARITY_1) ? 3 : 2;
+    size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
+    int n_leaves = compute_leaf_count(nc, arity);
+    int n_layers = compute_tree_depth(nc, arity) + 1;
+    f->n_leaf_nodes = n_leaves;
     dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
-    f->n_leaf_nodes = (arity == FACTORY_ARITY_1) ? 4 : 2;
-    for (int i = 0; i < f->n_leaf_nodes; i++)
+    for (int i = 0; i < n_leaves; i++)
         dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
     f->per_leaf_enabled = 0;
 }
@@ -477,275 +488,268 @@ static int setup_single_leaf_outputs(
     return 1;
 }
 
-static int factory_build_tree_arity2(factory_t *f) {
-    /* Participant indices: LSP=0, A=1, B=2, C=3, D=4 */
-    uint32_t all[] = {0, 1, 2, 3, 4};
-    uint32_t left_set[] = {0, 1, 2};       /* L, A, B */
-    uint32_t right_set[] = {0, 3, 4};      /* L, C, D */
+/* ---- Generalized N-participant tree builder ---- */
 
-    /* ---- Phase 1: Setup nodes (top-down order) ---- */
-    /* Staggered CLTVs: leaves expire first, root last.
-       TIMEOUT_STEP_BLOCKS between levels. */
 #define TIMEOUT_STEP_BLOCKS 5
-    uint32_t cltv = f->cltv_timeout;
-    uint32_t step = TIMEOUT_STEP_BLOCKS;
-    uint32_t root_cltv = cltv;                           /* longest */
-    uint32_t mid_cltv  = (cltv > step) ? cltv - step : 0;
-    uint32_t leaf_cltv = (cltv > 2*step) ? cltv - 2*step : 0;
 
-    int kr  = add_node(f, NODE_KICKOFF, all, 5,        -1, 0, -1, 0);          /* no timeout */
-    int sr  = add_node(f, NODE_STATE,   all, 5,        kr, 0,  0, root_cltv);  /* longest */
-    int kl  = add_node(f, NODE_KICKOFF, left_set, 3,   sr, 0, -1, mid_cltv);   /* mid */
-    int kri = add_node(f, NODE_KICKOFF, right_set, 3,  sr, 1, -1, mid_cltv);   /* mid */
-    int sl  = add_node(f, NODE_STATE,   left_set, 3,   kl, 0,  1, leaf_cltv);  /* shortest */
-    int sri = add_node(f, NODE_STATE,   right_set, 3, kri, 0,  1, leaf_cltv);  /* shortest */
+/* Compute tree depth (number of binary splits above the leaves).
+   n_clients = n_participants - 1 (excluding LSP).
+   Arity-2: each leaf holds 2 clients → ceil(log2(ceil(n_clients/2))) splits.
+   Arity-1: each leaf holds 1 client → ceil(log2(n_clients)) splits.
+   Returns 0 for a single leaf (1 or 2 clients depending on arity). */
+static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
+    size_t n_leaves;
+    if (arity == FACTORY_ARITY_1)
+        n_leaves = n_clients;
+    else
+        n_leaves = (n_clients + 1) / 2;  /* ceil(n_clients / 2) */
 
-    if (kr < 0 || sr < 0 || kl < 0 || kri < 0 || sl < 0 || sri < 0)
-        return 0;
-
-    /* Record leaf node indices */
-    f->leaf_node_indices[0] = (size_t)sl;
-    f->leaf_node_indices[1] = (size_t)sri;
-
-    /* ---- Phase 2: Setup outputs and amounts ---- */
-    uint64_t fee = f->fee_per_tx;
-    uint64_t kr_out = f->funding_amount_sats - fee;
-    uint64_t sr_per_child = (kr_out - fee) / 2;
-    uint64_t kl_out = sr_per_child - fee;
-    uint64_t kri_out = sr_per_child - fee;
-
-    /* kickoff_root -> 1 output: state_root */
-    f->nodes[kr].n_outputs = 1;
-    f->nodes[kr].outputs[0].amount_sats = kr_out;
-    memcpy(f->nodes[kr].outputs[0].script_pubkey, f->nodes[sr].spending_spk, 34);
-    f->nodes[kr].outputs[0].script_pubkey_len = 34;
-    f->nodes[kr].input_amount = f->funding_amount_sats;
-
-    /* state_root -> 2 outputs: kickoff_left, kickoff_right */
-    f->nodes[sr].n_outputs = 2;
-    f->nodes[sr].outputs[0].amount_sats = sr_per_child;
-    memcpy(f->nodes[sr].outputs[0].script_pubkey, f->nodes[kl].spending_spk, 34);
-    f->nodes[sr].outputs[0].script_pubkey_len = 34;
-    f->nodes[sr].outputs[1].amount_sats = sr_per_child;
-    memcpy(f->nodes[sr].outputs[1].script_pubkey, f->nodes[kri].spending_spk, 34);
-    f->nodes[sr].outputs[1].script_pubkey_len = 34;
-    f->nodes[sr].input_amount = kr_out;
-
-    /* kickoff_left -> 1 output: state_left */
-    f->nodes[kl].n_outputs = 1;
-    f->nodes[kl].outputs[0].amount_sats = kl_out;
-    memcpy(f->nodes[kl].outputs[0].script_pubkey, f->nodes[sl].spending_spk, 34);
-    f->nodes[kl].outputs[0].script_pubkey_len = 34;
-    f->nodes[kl].input_amount = sr_per_child;
-
-    /* kickoff_right -> 1 output: state_right */
-    f->nodes[kri].n_outputs = 1;
-    f->nodes[kri].outputs[0].amount_sats = kri_out;
-    memcpy(f->nodes[kri].outputs[0].script_pubkey, f->nodes[sri].spending_spk, 34);
-    f->nodes[kri].outputs[0].script_pubkey_len = 34;
-    f->nodes[kri].input_amount = sr_per_child;
-
-    /* state_left -> 3 leaf outputs: chan_A, chan_B, L_stock */
-    f->nodes[sl].input_amount = kl_out;
-    if (!setup_leaf_outputs(f, &f->nodes[sl], 1, 2, kl_out))
-        return 0;
-
-    /* state_right -> 3 leaf outputs: chan_C, chan_D, L_stock */
-    f->nodes[sri].input_amount = kri_out;
-    if (!setup_leaf_outputs(f, &f->nodes[sri], 3, 4, kri_out))
-        return 0;
-
-    /* ---- Phase 3: Build unsigned txs top-down ---- */
-    return build_all_unsigned_txs(f);
+    if (n_leaves <= 1) return 0;
+    int depth = 0;
+    size_t v = n_leaves - 1;
+    while (v > 0) { depth++; v >>= 1; }
+    return depth;
 }
 
-static int factory_build_tree_arity1(factory_t *f) {
-    /*
-     * Arity-1 tree (14 nodes, 3 DW layers):
-     *   kickoff_root[0] (5-of-5) → state_root[1] (5-of-5, DW L0)
-     *     ├─ kickoff_left[2] (3-of-3) → state_left[4] (3-of-3, DW L1)
-     *     │    ├─ kickoff_A[6] (2-of-2) → state_A[10] (2-of-2, DW L2) → [chan_A, L_stock]
-     *     │    └─ kickoff_B[7] (2-of-2) → state_B[11] (2-of-2, DW L2) → [chan_B, L_stock]
-     *     └─ kickoff_right[3] (3-of-3) → state_right[5] (3-of-3, DW L1)
-     *          ├─ kickoff_C[8] (2-of-2) → state_C[12] (2-of-2, DW L2) → [chan_C, L_stock]
-     *          └─ kickoff_D[9] (2-of-2) → state_D[13] (2-of-2, DW L2) → [chan_D, L_stock]
-     */
+/* Compute number of leaf nodes.
+   Arity-2: ceil(n_clients / 2).  Arity-1: n_clients. */
+static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
+    if (arity == FACTORY_ARITY_1)
+        return (int)n_clients;
+    return (int)((n_clients + 1) / 2);
+}
 
-    /* Minimum funding validation: from funding to each leaf output, there are
-       6 fee deductions along the path (kr,sr,kl/kri,sl/sri,ka-kd,sa-sd).
-       Each leaf output = (funding - 14*fee) / 8 (integer math, worst case).
-       Each leaf needs at least 2*dust (channel + L-stock) = 2*546 = 1092 sats.
-       So: (funding - 14*fee) / 8 >= 1092 ⟹ funding >= 14*fee + 8*1092. */
-    uint64_t min_funding = 14 * f->fee_per_tx + 8 * 1092;
-    if (f->funding_amount_sats < min_funding) {
-        fprintf(stderr, "factory_build_tree_arity1: funding %lu sats below minimum %lu\n",
-                (unsigned long)f->funding_amount_sats, (unsigned long)min_funding);
-        return 0;
-    }
+/* Compute total tree nodes: each logical node = kickoff + state pair.
+   Internal nodes = 2 * (total_logical - leaves) pairs, leaf nodes = leaves pairs.
+   total_logical = 2*n_leaves - 1 (full binary tree with padding).
+   Actually: total_nodes = 2 * (2*n_leaves - 1) for full binary,
+   but we use actual recursion count. For the general case with
+   unbalanced splits we just let build_subtree count. This is used
+   only for validation. */
+static int compute_total_nodes_upper_bound(size_t n_clients, factory_arity_t arity) {
+    int n_leaves = compute_leaf_count(n_clients, arity);
+    /* Full binary tree: 2*n_leaves - 1 logical nodes, each = kickoff+state pair */
+    return 2 * (2 * n_leaves - 1);
+}
 
-    uint32_t all[] = {0, 1, 2, 3, 4};
-    uint32_t left_set[] = {0, 1, 2};       /* L, A, B */
-    uint32_t right_set[] = {0, 3, 4};      /* L, C, D */
-    uint32_t set_a[] = {0, 1};             /* L, A */
-    uint32_t set_b[] = {0, 2};             /* L, B */
-    uint32_t set_c[] = {0, 3};             /* L, C */
-    uint32_t set_d[] = {0, 4};             /* L, D */
+/* Recursive subtree builder.
+   client_indices: array of 1-based participant indices for clients in this subtree.
+   n_clients: number of clients in this subtree.
+   parent_state_idx: index of the parent state node (-1 for root kickoff's parent).
+   parent_vout: which output of parent this subtree's kickoff spends.
+   depth: 0 = root level, increases going down.
+   max_depth: total depth of the tree (for DW layer assignment).
+   input_amount: sats budget from parent output for this subtree's kickoff.
+   leaf_counter: running counter of leaves found (for leaf_node_indices). */
+static int build_subtree(
+    factory_t *f,
+    const uint32_t *client_indices,
+    size_t n_clients,
+    int parent_state_idx,
+    uint32_t parent_vout,
+    int depth,
+    int max_depth,
+    uint64_t input_amount,
+    int *leaf_counter
+) {
+    if (n_clients == 0) return 0;
 
-    /* Staggered CLTVs: 5 tiers with TIMEOUT_STEP_BLOCKS between each position.
-       Root has longest timeout, leaves have shortest. Each child must have a
-       strictly shorter CLTV than its parent to ensure bottom-up timeout ordering.
-       Positions: sr > kl/kri > sl/sri > ka-kd > sa-sd */
+    /* Build signer set: {0 (LSP)} ∪ all client_indices in this subtree */
+    uint32_t signers[FACTORY_MAX_SIGNERS];
+    size_t n_signers = 0;
+    signers[n_signers++] = 0;  /* LSP always signs */
+    for (size_t i = 0; i < n_clients; i++)
+        signers[n_signers++] = client_indices[i];
+
+    /* Compute CLTVs from depth.
+       Root kickoff gets cltv=0 (no timeout). Root state gets longest CLTV.
+       Each subsequent level gets progressively shorter CLTVs.
+       ko_cltv = base - (2*depth - 1) * step   (for depth > 0)
+       st_cltv = base - (2*depth) * step */
     uint32_t cltv = f->cltv_timeout;
     uint32_t step = TIMEOUT_STEP_BLOCKS;
-    uint32_t root_cltv      = cltv;
-    uint32_t mid_ko_cltv    = (cltv > step)   ? cltv - step   : 0;  /* level-1 kickoffs */
-    uint32_t mid_st_cltv    = (cltv > 2*step) ? cltv - 2*step : 0;  /* level-1 states */
-    uint32_t leaf_ko_cltv   = (cltv > 3*step) ? cltv - 3*step : 0;  /* level-2 kickoffs */
-    uint32_t leaf_st_cltv   = (cltv > 4*step) ? cltv - 4*step : 0;  /* level-2 states */
+    uint32_t ko_cltv, st_cltv;
 
-    /* Level 0: root (5-of-5) */
-    int kr  = add_node(f, NODE_KICKOFF, all, 5,         -1, 0, -1, 0);
-    int sr  = add_node(f, NODE_STATE,   all, 5,         kr, 0,  0, root_cltv);
-
-    /* Level 1: mid (3-of-3) */
-    int kl  = add_node(f, NODE_KICKOFF, left_set, 3,    sr, 0, -1, mid_ko_cltv);
-    int kri = add_node(f, NODE_KICKOFF, right_set, 3,   sr, 1, -1, mid_ko_cltv);
-    int sl  = add_node(f, NODE_STATE,   left_set, 3,    kl, 0,  1, mid_st_cltv);
-    int sri = add_node(f, NODE_STATE,   right_set, 3,  kri, 0,  1, mid_st_cltv);
-
-    /* Level 2: per-client (2-of-2) */
-    int ka  = add_node(f, NODE_KICKOFF, set_a, 2,       sl, 0, -1, leaf_ko_cltv);
-    int kb  = add_node(f, NODE_KICKOFF, set_b, 2,       sl, 1, -1, leaf_ko_cltv);
-    int kc  = add_node(f, NODE_KICKOFF, set_c, 2,      sri, 0, -1, leaf_ko_cltv);
-    int kd  = add_node(f, NODE_KICKOFF, set_d, 2,      sri, 1, -1, leaf_ko_cltv);
-    int sa  = add_node(f, NODE_STATE,   set_a, 2,       ka, 0,  2, leaf_st_cltv);
-    int sb  = add_node(f, NODE_STATE,   set_b, 2,       kb, 0,  2, leaf_st_cltv);
-    int sc  = add_node(f, NODE_STATE,   set_c, 2,       kc, 0,  2, leaf_st_cltv);
-    int sd  = add_node(f, NODE_STATE,   set_d, 2,       kd, 0,  2, leaf_st_cltv);
-
-    if (kr < 0 || sr < 0 || kl < 0 || kri < 0 || sl < 0 || sri < 0 ||
-        ka < 0 || kb < 0 || kc < 0 || kd < 0 ||
-        sa < 0 || sb < 0 || sc < 0 || sd < 0)
-        return 0;
-
-    /* Record leaf node indices: A=0, B=1, C=2, D=3 */
-    f->leaf_node_indices[0] = (size_t)sa;
-    f->leaf_node_indices[1] = (size_t)sb;
-    f->leaf_node_indices[2] = (size_t)sc;
-    f->leaf_node_indices[3] = (size_t)sd;
-
-    /* ---- Outputs and amounts ---- */
-    uint64_t fee = f->fee_per_tx;
-
-    /* Level 0 amounts */
-    uint64_t kr_out = f->funding_amount_sats - fee;
-    uint64_t sr_per_child = (kr_out - fee) / 2;
-
-    /* Level 1 amounts */
-    uint64_t kl_out = sr_per_child - fee;
-    uint64_t kri_out = sr_per_child - fee;
-    uint64_t sl_per_child = (kl_out - fee) / 2;
-    uint64_t sri_per_child = (kri_out - fee) / 2;
-
-    /* Level 2 amounts */
-    uint64_t ka_out = sl_per_child - fee;
-    uint64_t kb_out = sl_per_child - fee;
-    uint64_t kc_out = sri_per_child - fee;
-    uint64_t kd_out = sri_per_child - fee;
-
-    /* kickoff_root → state_root */
-    f->nodes[kr].n_outputs = 1;
-    f->nodes[kr].outputs[0].amount_sats = kr_out;
-    memcpy(f->nodes[kr].outputs[0].script_pubkey, f->nodes[sr].spending_spk, 34);
-    f->nodes[kr].outputs[0].script_pubkey_len = 34;
-    f->nodes[kr].input_amount = f->funding_amount_sats;
-
-    /* state_root → kickoff_left, kickoff_right */
-    f->nodes[sr].n_outputs = 2;
-    f->nodes[sr].outputs[0].amount_sats = sr_per_child;
-    memcpy(f->nodes[sr].outputs[0].script_pubkey, f->nodes[kl].spending_spk, 34);
-    f->nodes[sr].outputs[0].script_pubkey_len = 34;
-    f->nodes[sr].outputs[1].amount_sats = sr_per_child;
-    memcpy(f->nodes[sr].outputs[1].script_pubkey, f->nodes[kri].spending_spk, 34);
-    f->nodes[sr].outputs[1].script_pubkey_len = 34;
-    f->nodes[sr].input_amount = kr_out;
-
-    /* kickoff_left → state_left */
-    f->nodes[kl].n_outputs = 1;
-    f->nodes[kl].outputs[0].amount_sats = kl_out;
-    memcpy(f->nodes[kl].outputs[0].script_pubkey, f->nodes[sl].spending_spk, 34);
-    f->nodes[kl].outputs[0].script_pubkey_len = 34;
-    f->nodes[kl].input_amount = sr_per_child;
-
-    /* kickoff_right → state_right */
-    f->nodes[kri].n_outputs = 1;
-    f->nodes[kri].outputs[0].amount_sats = kri_out;
-    memcpy(f->nodes[kri].outputs[0].script_pubkey, f->nodes[sri].spending_spk, 34);
-    f->nodes[kri].outputs[0].script_pubkey_len = 34;
-    f->nodes[kri].input_amount = sr_per_child;
-
-    /* state_left → 2 child outputs: kickoff_A, kickoff_B */
-    f->nodes[sl].n_outputs = 2;
-    f->nodes[sl].outputs[0].amount_sats = sl_per_child;
-    memcpy(f->nodes[sl].outputs[0].script_pubkey, f->nodes[ka].spending_spk, 34);
-    f->nodes[sl].outputs[0].script_pubkey_len = 34;
-    f->nodes[sl].outputs[1].amount_sats = sl_per_child;
-    memcpy(f->nodes[sl].outputs[1].script_pubkey, f->nodes[kb].spending_spk, 34);
-    f->nodes[sl].outputs[1].script_pubkey_len = 34;
-    f->nodes[sl].input_amount = kl_out;
-
-    /* state_right → 2 child outputs: kickoff_C, kickoff_D */
-    f->nodes[sri].n_outputs = 2;
-    f->nodes[sri].outputs[0].amount_sats = sri_per_child;
-    memcpy(f->nodes[sri].outputs[0].script_pubkey, f->nodes[kc].spending_spk, 34);
-    f->nodes[sri].outputs[0].script_pubkey_len = 34;
-    f->nodes[sri].outputs[1].amount_sats = sri_per_child;
-    memcpy(f->nodes[sri].outputs[1].script_pubkey, f->nodes[kd].spending_spk, 34);
-    f->nodes[sri].outputs[1].script_pubkey_len = 34;
-    f->nodes[sri].input_amount = kri_out;
-
-    /* Per-client kickoff → state nodes.
-       Left-side (A,B) parents are state_left → input_amount = sl_per_child.
-       Right-side (C,D) parents are state_right → input_amount = sri_per_child. */
-    struct { int ko; int st; uint64_t ko_out; uint64_t parent_per_child; } leaf_pairs[] = {
-        { ka, sa, ka_out, sl_per_child },
-        { kb, sb, kb_out, sl_per_child },
-        { kc, sc, kc_out, sri_per_child },
-        { kd, sd, kd_out, sri_per_child },
-    };
-    uint32_t client_indices[] = { 1, 2, 3, 4 };
-
-    for (int i = 0; i < 4; i++) {
-        int ko = leaf_pairs[i].ko;
-        int st = leaf_pairs[i].st;
-        uint64_t ko_out = leaf_pairs[i].ko_out;
-
-        f->nodes[ko].n_outputs = 1;
-        f->nodes[ko].outputs[0].amount_sats = ko_out;
-        memcpy(f->nodes[ko].outputs[0].script_pubkey, f->nodes[st].spending_spk, 34);
-        f->nodes[ko].outputs[0].script_pubkey_len = 34;
-        f->nodes[ko].input_amount = leaf_pairs[i].parent_per_child;
-
-        f->nodes[st].input_amount = ko_out;
-        if (!setup_single_leaf_outputs(f, &f->nodes[st], client_indices[i], ko_out))
-            return 0;
+    if (depth == 0) {
+        ko_cltv = 0;  /* root kickoff has no timeout */
+        st_cltv = cltv;  /* root state gets longest CLTV */
+    } else {
+        uint32_t ko_offset = (uint32_t)(2 * depth - 1) * step;
+        uint32_t st_offset = (uint32_t)(2 * depth) * step;
+        ko_cltv = (cltv > ko_offset) ? cltv - ko_offset : 0;
+        st_cltv = (cltv > st_offset) ? cltv - st_offset : 0;
     }
 
-    /* ---- Build unsigned txs top-down ---- */
-    return build_all_unsigned_txs(f);
+    /* DW layer index for state nodes: depth maps to layer.
+       Kickoff nodes get dw_layer_index = -1. */
+    int dw_layer = depth;
+    if (dw_layer >= (int)f->counter.n_layers)
+        dw_layer = (int)f->counter.n_layers - 1;
+
+    /* Add kickoff node */
+    int ko_idx = add_node(f, NODE_KICKOFF, signers, n_signers,
+                          parent_state_idx, parent_vout, -1, ko_cltv);
+    if (ko_idx < 0) return 0;
+
+    /* Add state node */
+    int st_idx = add_node(f, NODE_STATE, signers, n_signers,
+                          ko_idx, 0, dw_layer, st_cltv);
+    if (st_idx < 0) return 0;
+
+    /* Wire kickoff → state output */
+    uint64_t fee = f->fee_per_tx;
+    uint64_t ko_out_amount = input_amount - fee;
+
+    f->nodes[ko_idx].n_outputs = 1;
+    f->nodes[ko_idx].outputs[0].amount_sats = ko_out_amount;
+    memcpy(f->nodes[ko_idx].outputs[0].script_pubkey,
+           f->nodes[st_idx].spending_spk, 34);
+    f->nodes[ko_idx].outputs[0].script_pubkey_len = 34;
+    f->nodes[ko_idx].input_amount = input_amount;
+
+    /* Determine if this is a leaf */
+    int is_leaf;
+    if (f->leaf_arity == FACTORY_ARITY_1)
+        is_leaf = (n_clients <= 1);
+    else
+        is_leaf = (n_clients <= 2);
+
+    if (is_leaf) {
+        /* Leaf node: set up channel outputs */
+        f->nodes[st_idx].input_amount = ko_out_amount;
+
+        if (n_clients == 1) {
+            if (!setup_single_leaf_outputs(f, &f->nodes[st_idx],
+                                           client_indices[0], ko_out_amount))
+                return 0;
+        } else {
+            /* n_clients == 2 (arity-2 leaf) */
+            if (!setup_leaf_outputs(f, &f->nodes[st_idx],
+                                    client_indices[0], client_indices[1],
+                                    ko_out_amount))
+                return 0;
+        }
+
+        /* Record leaf index */
+        if (*leaf_counter >= FACTORY_MAX_LEAVES) return 0;
+        f->leaf_node_indices[*leaf_counter] = (size_t)st_idx;
+        (*leaf_counter)++;
+    } else {
+        /* Internal node: split clients in half, recurse */
+        size_t left_n, right_n;
+        if (f->leaf_arity == FACTORY_ARITY_1) {
+            left_n = n_clients / 2;
+            right_n = n_clients - left_n;
+        } else {
+            /* Arity-2: split in pairs. Left gets floor(n/2) clients rounded
+               to even, right gets the rest. Actually: split into two groups
+               that will each become subtrees. Each leaf holds 2 clients,
+               so split to balance leaf count. */
+            size_t left_leaves = compute_leaf_count(n_clients, f->leaf_arity) / 2;
+            left_n = left_leaves * 2;
+            if (left_n > n_clients) left_n = n_clients;
+            right_n = n_clients - left_n;
+        }
+
+        /* State node gets 2 outputs for left and right children */
+        uint64_t state_budget = ko_out_amount - fee;
+        uint64_t left_budget = state_budget / 2;
+        uint64_t right_budget = state_budget - left_budget;
+
+        f->nodes[st_idx].input_amount = ko_out_amount;
+        f->nodes[st_idx].n_outputs = 2;
+        /* Outputs will be filled after children are created (need their spk) */
+
+        /* Recurse left */
+        size_t saved_n_nodes = f->n_nodes;
+        if (!build_subtree(f, client_indices, left_n,
+                           st_idx, 0, depth + 1, max_depth,
+                           left_budget, leaf_counter))
+            return 0;
+
+        /* The left child's kickoff is the first node added */
+        int left_ko_idx = (int)saved_n_nodes;
+
+        /* Recurse right */
+        saved_n_nodes = f->n_nodes;
+        if (!build_subtree(f, client_indices + left_n, right_n,
+                           st_idx, 1, depth + 1, max_depth,
+                           right_budget, leaf_counter))
+            return 0;
+
+        int right_ko_idx = (int)saved_n_nodes;
+
+        /* Now wire state outputs to children's spending_spks */
+        f->nodes[st_idx].outputs[0].amount_sats = left_budget;
+        memcpy(f->nodes[st_idx].outputs[0].script_pubkey,
+               f->nodes[left_ko_idx].spending_spk, 34);
+        f->nodes[st_idx].outputs[0].script_pubkey_len = 34;
+
+        f->nodes[st_idx].outputs[1].amount_sats = right_budget;
+        memcpy(f->nodes[st_idx].outputs[1].script_pubkey,
+               f->nodes[right_ko_idx].spending_spk, 34);
+        f->nodes[st_idx].outputs[1].script_pubkey_len = 34;
+    }
+
+    return 1;
 }
 
 int factory_build_tree(factory_t *f) {
-    if (f->n_participants != 5) return 0;  /* 4 clients + 1 LSP */
+    size_t n_clients = f->n_participants - 1;
+
+    /* Validate participant count */
+    if (f->n_participants < 3 || f->n_participants > FACTORY_MAX_SIGNERS)
+        return 0;
+
+    /* Arity-2 needs at least 2 clients */
+    if (f->leaf_arity == FACTORY_ARITY_2 && n_clients < 2)
+        return 0;
 
     /* Override fee_per_tx from fee estimator if available */
     if (f->fee) {
         f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
     }
 
-    if (f->leaf_arity == FACTORY_ARITY_1)
-        return factory_build_tree_arity1(f);
-    return factory_build_tree_arity2(f);
+    /* Compute tree metrics */
+    int tree_depth = compute_tree_depth(n_clients, f->leaf_arity);
+    int n_leaves = compute_leaf_count(n_clients, f->leaf_arity);
+    int n_dw_layers = tree_depth + 1;
+    int total_nodes_ub = compute_total_nodes_upper_bound(n_clients, f->leaf_arity);
+
+    if (total_nodes_ub > FACTORY_MAX_NODES) return 0;
+    if (n_leaves > FACTORY_MAX_LEAVES) return 0;
+    if (n_dw_layers > DW_MAX_LAYERS) return 0;
+
+    /* Reinitialize DW counter with correct layer count */
+    dw_counter_init(&f->counter, n_dw_layers, f->step_blocks, f->states_per_layer);
+    f->n_leaf_nodes = n_leaves;
+    for (int i = 0; i < n_leaves; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+
+    /* Minimum funding validation */
+    uint64_t min_funding = (uint64_t)total_nodes_ub * f->fee_per_tx +
+                           (uint64_t)n_leaves * 1092;
+    if (f->funding_amount_sats < min_funding) {
+        fprintf(stderr, "factory_build_tree: funding %lu sats below minimum %lu\n",
+                (unsigned long)f->funding_amount_sats, (unsigned long)min_funding);
+        return 0;
+    }
+
+    /* Build client index array [1, 2, ..., n_clients] */
+    uint32_t clients[FACTORY_MAX_SIGNERS];
+    for (size_t i = 0; i < n_clients; i++)
+        clients[i] = (uint32_t)(i + 1);
+
+    /* Build the tree recursively */
+    f->n_nodes = 0;
+    int leaf_counter = 0;
+    if (!build_subtree(f, clients, n_clients,
+                       -1, 0, 0, tree_depth,
+                       f->funding_amount_sats, &leaf_counter))
+        return 0;
+
+    /* Build all unsigned transactions top-down */
+    return build_all_unsigned_txs(f);
 }
 
 /* --- Split-round signing API --- */

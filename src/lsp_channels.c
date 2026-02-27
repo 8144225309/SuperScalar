@@ -78,13 +78,10 @@ static void client_to_leaf(size_t client_idx, const factory_t *factory,
         *vout_out = 0;
     } else {
         /* Arity-2: 2 clients share a leaf node */
-        if (client_idx < 2) {
-            *node_idx_out = factory->leaf_node_indices[0];
-            *vout_out = (uint32_t)client_idx;
-        } else {
-            *node_idx_out = factory->leaf_node_indices[1];
-            *vout_out = (uint32_t)(client_idx - 2);
-        }
+        size_t leaf_idx = client_idx / 2;
+        *node_idx_out = (leaf_idx < (size_t)factory->n_leaf_nodes)
+            ? factory->leaf_node_indices[leaf_idx] : 0;
+        *vout_out = (uint32_t)(client_idx % 2);
     }
 }
 

@@ -66,13 +66,10 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
         node_idx = factory->leaf_node_indices[client_idx];
         vout = 0;
     } else {
-        if (client_idx < 2) {
-            node_idx = factory->leaf_node_indices[0];
-            vout = (uint32_t)client_idx;
-        } else {
-            node_idx = factory->leaf_node_indices[1];
-            vout = (uint32_t)(client_idx - 2);
-        }
+        size_t leaf_idx = client_idx / 2;
+        if (leaf_idx >= (size_t)factory->n_leaf_nodes) return 0;
+        node_idx = factory->leaf_node_indices[leaf_idx];
+        vout = (uint32_t)(client_idx % 2);
     }
 
     const factory_node_t *state_node = &factory->nodes[node_idx];
@@ -811,13 +808,16 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     cJSON_Delete(msg.json);
 
-    /* Receive FACTORY_PROPOSE */
+    /* Receive FACTORY_PROPOSE — disable timeout since LSP may be waiting for
+       on-chain funding confirmation (up to ~10 min on signet/testnet) */
+    wire_set_timeout(fd, 0);
     if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
         fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);
         return 0;
     }
+    wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
 
     /* Parse proposal */
     {

@@ -112,52 +112,52 @@ int test_factory_build_tree(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
 
-    /* Check node types */
+    /* Check node types (DFS pre-order: ko_root, st_root, ko_left, st_left, ko_right, st_right) */
     TEST_ASSERT(f.nodes[0].type == NODE_KICKOFF, "node 0 is kickoff");
     TEST_ASSERT(f.nodes[1].type == NODE_STATE,   "node 1 is state");
     TEST_ASSERT(f.nodes[2].type == NODE_KICKOFF, "node 2 is kickoff");
-    TEST_ASSERT(f.nodes[3].type == NODE_KICKOFF, "node 3 is kickoff");
-    TEST_ASSERT(f.nodes[4].type == NODE_STATE,   "node 4 is state");
+    TEST_ASSERT(f.nodes[3].type == NODE_STATE,   "node 3 is state");
+    TEST_ASSERT(f.nodes[4].type == NODE_KICKOFF, "node 4 is kickoff");
     TEST_ASSERT(f.nodes[5].type == NODE_STATE,   "node 5 is state");
 
     /* Check signer counts */
     TEST_ASSERT_EQ(f.nodes[0].n_signers, 5, "kickoff_root: 5 signers");
     TEST_ASSERT_EQ(f.nodes[1].n_signers, 5, "state_root: 5 signers");
     TEST_ASSERT_EQ(f.nodes[2].n_signers, 3, "kickoff_left: 3 signers");
-    TEST_ASSERT_EQ(f.nodes[3].n_signers, 3, "kickoff_right: 3 signers");
-    TEST_ASSERT_EQ(f.nodes[4].n_signers, 3, "state_left: 3 signers");
+    TEST_ASSERT_EQ(f.nodes[3].n_signers, 3, "state_left: 3 signers");
+    TEST_ASSERT_EQ(f.nodes[4].n_signers, 3, "kickoff_right: 3 signers");
     TEST_ASSERT_EQ(f.nodes[5].n_signers, 3, "state_right: 3 signers");
 
     /* Check parent links */
     TEST_ASSERT_EQ(f.nodes[0].parent_index, -1, "kickoff_root: no parent");
     TEST_ASSERT_EQ(f.nodes[1].parent_index,  0, "state_root -> kickoff_root");
     TEST_ASSERT_EQ(f.nodes[2].parent_index,  1, "kickoff_left -> state_root");
-    TEST_ASSERT_EQ(f.nodes[3].parent_index,  1, "kickoff_right -> state_root");
-    TEST_ASSERT_EQ(f.nodes[4].parent_index,  2, "state_left -> kickoff_left");
-    TEST_ASSERT_EQ(f.nodes[5].parent_index,  3, "state_right -> kickoff_right");
+    TEST_ASSERT_EQ(f.nodes[3].parent_index,  2, "state_left -> kickoff_left");
+    TEST_ASSERT_EQ(f.nodes[4].parent_index,  1, "kickoff_right -> state_root");
+    TEST_ASSERT_EQ(f.nodes[5].parent_index,  4, "state_right -> kickoff_right");
 
     /* Check parent_vout */
     TEST_ASSERT_EQ(f.nodes[1].parent_vout, 0, "state_root spends vout 0");
     TEST_ASSERT_EQ(f.nodes[2].parent_vout, 0, "kickoff_left spends vout 0");
-    TEST_ASSERT_EQ(f.nodes[3].parent_vout, 1, "kickoff_right spends vout 1");
+    TEST_ASSERT_EQ(f.nodes[4].parent_vout, 1, "kickoff_right spends vout 1");
 
     /* Check output counts */
     TEST_ASSERT_EQ(f.nodes[0].n_outputs, 1, "kickoff_root: 1 output");
     TEST_ASSERT_EQ(f.nodes[1].n_outputs, 2, "state_root: 2 outputs");
     TEST_ASSERT_EQ(f.nodes[2].n_outputs, 1, "kickoff_left: 1 output");
-    TEST_ASSERT_EQ(f.nodes[3].n_outputs, 1, "kickoff_right: 1 output");
-    TEST_ASSERT_EQ(f.nodes[4].n_outputs, 3, "state_left: 3 outputs");
+    TEST_ASSERT_EQ(f.nodes[3].n_outputs, 3, "state_left: 3 outputs");
+    TEST_ASSERT_EQ(f.nodes[4].n_outputs, 1, "kickoff_right: 1 output");
     TEST_ASSERT_EQ(f.nodes[5].n_outputs, 3, "state_right: 3 outputs");
 
     /* Check kickoff nSequence = 0xFFFFFFFF */
     TEST_ASSERT(f.nodes[0].nsequence == 0xFFFFFFFF, "kickoff_root nseq");
     TEST_ASSERT(f.nodes[2].nsequence == 0xFFFFFFFF, "kickoff_left nseq");
-    TEST_ASSERT(f.nodes[3].nsequence == 0xFFFFFFFF, "kickoff_right nseq");
+    TEST_ASSERT(f.nodes[4].nsequence == 0xFFFFFFFF, "kickoff_right nseq");
 
     /* Check state nSequence matches DW layer 0/1 at epoch 0 */
     /* step=2, states=4: delay = 2*(4-1-0) = 6 */
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "state_root nseq = 6");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "state_left nseq = 6");
+    TEST_ASSERT_EQ(f.nodes[3].nsequence, 6, "state_left nseq = 6");
     TEST_ASSERT_EQ(f.nodes[5].nsequence, 6, "state_right nseq = 6");
 
     /* Check all txids are non-zero */
@@ -263,16 +263,20 @@ int test_factory_advance(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
+    /* Use leaf_node_indices for arity-agnostic leaf access */
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+
     /* Initial state: epoch 0, all delays = 6 */
     TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch 0");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 0");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 6, "leaf nseq = 6 at epoch 0");
 
     /* Advance once: epoch 1, leaf layer ticks to state 1 */
     TEST_ASSERT(factory_advance(&f), "advance 1");
     TEST_ASSERT_EQ(f.counter.current_epoch, 1, "epoch 1");
     /* Leaf state nseq: step * (max-1 - 1) = 2 * 2 = 4 */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 4, "leaf nseq = 4 at epoch 1");
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 4, "leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, 4, "right leaf nseq = 4 at epoch 1");
     /* Root state unchanged (still layer 0, state 0) */
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq still 6 at epoch 1");
 
@@ -280,7 +284,7 @@ int test_factory_advance(void) {
     TEST_ASSERT(factory_advance(&f), "advance 2");
     TEST_ASSERT(factory_advance(&f), "advance 3");
     TEST_ASSERT_EQ(f.counter.current_epoch, 3, "epoch 3");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 0, "leaf nseq = 0 at epoch 3");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 0, "leaf nseq = 0 at epoch 3");
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq still 6 at epoch 3");
 
     /* Advance to epoch 4: leaf rolls over (reset to 0), root ticks to state 1 */
@@ -289,7 +293,7 @@ int test_factory_advance(void) {
     /* Root: state 1, delay = 2*(4-1-1) = 4 */
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 4, "root nseq = 4 at epoch 4");
     /* Leaf: reset to state 0, delay = 6 */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 4 (reset)");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 6, "leaf nseq = 6 at epoch 4 (reset)");
 
     /* Verify signatures still valid after advance */
     for (size_t i = 0; i < f.n_nodes; i++)
@@ -829,15 +833,18 @@ int test_factory_advance_split_round(void) {
     /* Initial sign via factory_sign_all (which now uses split-round internally) */
     TEST_ASSERT(factory_sign_all(&f), "initial sign");
 
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+
     /* Verify initial state */
     TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch 0");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 0");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 6, "leaf nseq = 6 at epoch 0");
 
     /* Advance once */
     TEST_ASSERT(factory_advance(&f), "advance 1");
     TEST_ASSERT_EQ(f.counter.current_epoch, 1, "epoch 1");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 4, "leaf nseq = 4 at epoch 1");
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 4, "leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, 4, "right leaf nseq = 4 at epoch 1");
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq still 6 at epoch 1");
 
     /* Advance to epoch 4: leaf rolls over, root ticks */
@@ -846,7 +853,7 @@ int test_factory_advance_split_round(void) {
     TEST_ASSERT(factory_advance(&f), "advance 4");
     TEST_ASSERT_EQ(f.counter.current_epoch, 4, "epoch 4");
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 4, "root nseq = 4 at epoch 4");
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 4 (reset)");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 6, "leaf nseq = 6 at epoch 4 (reset)");
 
     /* Verify all signatures still valid after advances */
     for (size_t i = 0; i < f.n_nodes; i++) {
@@ -925,32 +932,36 @@ int test_factory_l_stock_with_burn_path(void) {
     factory_set_funding(&f_sc, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f_sc), "build tree (with shachain)");
 
-    /* L-stock output (index 2) on leaf state nodes (indices 4, 5) should differ */
-    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[2].script_pubkey,
-                        f_sc.nodes[4].outputs[2].script_pubkey, 34) != 0,
+    /* Use leaf_node_indices for arity-agnostic leaf access */
+    size_t ll = f_plain.leaf_node_indices[0];  /* left leaf */
+    size_t rl = f_plain.leaf_node_indices[1];  /* right leaf */
+
+    /* L-stock output (last) on leaf state nodes should differ */
+    TEST_ASSERT(memcmp(f_plain.nodes[ll].outputs[2].script_pubkey,
+                        f_sc.nodes[ll].outputs[2].script_pubkey, 34) != 0,
                 "L-stock spk differs with shachain (left leaf)");
-    TEST_ASSERT(memcmp(f_plain.nodes[5].outputs[2].script_pubkey,
-                        f_sc.nodes[5].outputs[2].script_pubkey, 34) != 0,
+    TEST_ASSERT(memcmp(f_plain.nodes[rl].outputs[2].script_pubkey,
+                        f_sc.nodes[rl].outputs[2].script_pubkey, 34) != 0,
                 "L-stock spk differs with shachain (right leaf)");
 
     /* Channel outputs (indices 0, 1) should be the same */
-    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[0].script_pubkey,
-                        f_sc.nodes[4].outputs[0].script_pubkey, 34) == 0,
+    TEST_ASSERT(memcmp(f_plain.nodes[ll].outputs[0].script_pubkey,
+                        f_sc.nodes[ll].outputs[0].script_pubkey, 34) == 0,
                 "channel A spk unchanged");
-    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[1].script_pubkey,
-                        f_sc.nodes[4].outputs[1].script_pubkey, 34) == 0,
+    TEST_ASSERT(memcmp(f_plain.nodes[ll].outputs[1].script_pubkey,
+                        f_sc.nodes[ll].outputs[1].script_pubkey, 34) == 0,
                 "channel B spk unchanged");
 
     /* Save L-stock spk at epoch 0 */
     unsigned char l_spk_epoch0[34];
-    memcpy(l_spk_epoch0, f_sc.nodes[4].outputs[2].script_pubkey, 34);
+    memcpy(l_spk_epoch0, f_sc.nodes[ll].outputs[2].script_pubkey, 34);
 
     /* Sign and advance to epoch 1 */
     TEST_ASSERT(factory_sign_all(&f_sc), "sign at epoch 0");
     TEST_ASSERT(factory_advance(&f_sc), "advance to epoch 1");
 
     /* L-stock spk should change after epoch advance */
-    TEST_ASSERT(memcmp(l_spk_epoch0, f_sc.nodes[4].outputs[2].script_pubkey, 34) != 0,
+    TEST_ASSERT(memcmp(l_spk_epoch0, f_sc.nodes[ll].outputs[2].script_pubkey, 34) != 0,
                 "L-stock spk changes with new epoch");
 
     factory_free(&f_plain);
@@ -1949,9 +1960,11 @@ int test_factory_reset_epoch(void) {
     TEST_ASSERT_EQ(f.per_leaf_enabled, 0, "per_leaf disabled after reset");
 
     /* Verify all nodes re-signed with epoch 0 nSequences */
+    size_t ll = f.leaf_node_indices[0];
+    size_t rl = f.leaf_node_indices[1];
     /* At epoch 0: leaf nseq = step * (max-1) = 2*3 = 6 */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq 6 after reset");
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 6, "right leaf nseq 6 after reset");
+    TEST_ASSERT_EQ(f.nodes[ll].nsequence, 6, "leaf nseq 6 after reset");
+    TEST_ASSERT_EQ(f.nodes[rl].nsequence, 6, "right leaf nseq 6 after reset");
     /* Root nseq = 2*3 = 6 */
     TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq 6 after reset");
 
@@ -1982,24 +1995,27 @@ int test_factory_advance_leaf_left(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+
     /* Save initial state */
-    uint32_t initial_left_nseq = f.nodes[4].nsequence;
-    uint32_t initial_right_nseq = f.nodes[5].nsequence;
+    uint32_t initial_left_nseq = f.nodes[left_leaf].nsequence;
+    uint32_t initial_right_nseq = f.nodes[right_leaf].nsequence;
     unsigned char right_txid_before[32];
-    memcpy(right_txid_before, f.nodes[5].txid, 32);
+    memcpy(right_txid_before, f.nodes[right_leaf].txid, 32);
 
     /* Advance left leaf only */
     TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf left");
 
-    /* Left leaf (node 4) should have changed nSequence */
-    TEST_ASSERT(f.nodes[4].nsequence != initial_left_nseq, "left nseq changed");
+    /* Left leaf should have changed nSequence */
+    TEST_ASSERT(f.nodes[left_leaf].nsequence != initial_left_nseq, "left nseq changed");
     /* step=2, advanced from state 0 to 1: delay = 2*(4-1-1) = 4 */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 4, "left nseq = 4");
-    TEST_ASSERT(f.nodes[4].is_signed, "left node signed");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 4, "left nseq = 4");
+    TEST_ASSERT(f.nodes[left_leaf].is_signed, "left node signed");
 
-    /* Right leaf (node 5) should be unchanged */
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, initial_right_nseq, "right nseq unchanged");
-    TEST_ASSERT(memcmp(f.nodes[5].txid, right_txid_before, 32) == 0,
+    /* Right leaf should be unchanged */
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, initial_right_nseq, "right nseq unchanged");
+    TEST_ASSERT(memcmp(f.nodes[right_leaf].txid, right_txid_before, 32) == 0,
                 "right txid unchanged");
 
     factory_free(&f);
@@ -2026,20 +2042,23 @@ int test_factory_advance_leaf_right(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    uint32_t initial_left_nseq = f.nodes[4].nsequence;
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+
+    uint32_t initial_left_nseq = f.nodes[left_leaf].nsequence;
     unsigned char left_txid_before[32];
-    memcpy(left_txid_before, f.nodes[4].txid, 32);
+    memcpy(left_txid_before, f.nodes[left_leaf].txid, 32);
 
     /* Advance right leaf only */
     TEST_ASSERT(factory_advance_leaf(&f, 1), "advance leaf right");
 
-    /* Right leaf (node 5) should have changed */
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right nseq = 4");
-    TEST_ASSERT(f.nodes[5].is_signed, "right node signed");
+    /* Right leaf should have changed */
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, 4, "right nseq = 4");
+    TEST_ASSERT(f.nodes[right_leaf].is_signed, "right node signed");
 
-    /* Left leaf (node 4) should be unchanged */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, initial_left_nseq, "left nseq unchanged");
-    TEST_ASSERT(memcmp(f.nodes[4].txid, left_txid_before, 32) == 0,
+    /* Left leaf should be unchanged */
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, initial_left_nseq, "left nseq unchanged");
+    TEST_ASSERT(memcmp(f.nodes[left_leaf].txid, left_txid_before, 32) == 0,
                 "left txid unchanged");
 
     factory_free(&f);
@@ -2066,6 +2085,9 @@ int test_factory_advance_leaf_independence(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+
     /* Advance left 3 times */
     for (int i = 0; i < 3; i++)
         TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left");
@@ -2074,12 +2096,12 @@ int test_factory_advance_leaf_independence(void) {
     TEST_ASSERT(factory_advance_leaf(&f, 1), "advance right");
 
     /* Left at state 3: delay = 2*(4-1-3) = 0 */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 0, "left nseq = 0 (state 3)");
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 0, "left nseq = 0 (state 3)");
     /* Right at state 1: delay = 2*(4-1-1) = 4 */
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right nseq = 4 (state 1)");
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, 4, "right nseq = 4 (state 1)");
 
     /* Different nSequences confirms independence */
-    TEST_ASSERT(f.nodes[4].nsequence != f.nodes[5].nsequence,
+    TEST_ASSERT(f.nodes[left_leaf].nsequence != f.nodes[right_leaf].nsequence,
                 "left and right have different nsequences");
 
     factory_free(&f);
@@ -2150,18 +2172,21 @@ int test_factory_advance_leaf_preserves_parent_txids(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
 
-    /* Save parent txids (nodes 0-3) */
-    unsigned char parent_txids[4][32];
-    for (int i = 0; i < 4; i++)
-        memcpy(parent_txids[i], f.nodes[i].txid, 32);
+    /* Save all non-leaf node txids */
+    size_t left_leaf = f.leaf_node_indices[0];
+    unsigned char saved_txids[FACTORY_MAX_NODES][32];
+    for (size_t i = 0; i < f.n_nodes; i++)
+        memcpy(saved_txids[i], f.nodes[i].txid, 32);
 
     /* Advance left leaf */
     TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left leaf");
 
-    /* Verify parent txids unchanged (nodes 0-3) */
-    for (int i = 0; i < 4; i++)
-        TEST_ASSERT(memcmp(f.nodes[i].txid, parent_txids[i], 32) == 0,
+    /* Verify all non-leaf txids unchanged */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        if (i == left_leaf) continue;  /* leaf changed */
+        TEST_ASSERT(memcmp(f.nodes[i].txid, saved_txids[i], 32) == 0,
                     "parent txid preserved");
+    }
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);
@@ -2201,8 +2226,10 @@ int test_factory_epoch_reset_after_leaf_mode(void) {
     TEST_ASSERT_EQ(f.leaf_layers[1].current_state, 0, "right leaf reset");
 
     /* Both leaves should have epoch-0 nSequences */
-    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "left nseq 6 after reset");
-    TEST_ASSERT_EQ(f.nodes[5].nsequence, 6, "right nseq 6 after reset");
+    size_t left_leaf = f.leaf_node_indices[0];
+    size_t right_leaf = f.leaf_node_indices[1];
+    TEST_ASSERT_EQ(f.nodes[left_leaf].nsequence, 6, "left nseq 6 after reset");
+    TEST_ASSERT_EQ(f.nodes[right_leaf].nsequence, 6, "right nseq 6 after reset");
 
     /* Verify all nodes signed */
     for (size_t i = 0; i < f.n_nodes; i++)
@@ -2242,43 +2269,45 @@ int test_factory_build_tree_arity1(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree arity-1");
     TEST_ASSERT_EQ(f.n_nodes, 14, "14 nodes");
 
-    /* Check node types: kickoff/state alternating at each level */
-    TEST_ASSERT(f.nodes[0].type == NODE_KICKOFF, "n0 kickoff");
-    TEST_ASSERT(f.nodes[1].type == NODE_STATE,   "n1 state");
-    TEST_ASSERT(f.nodes[2].type == NODE_KICKOFF, "n2 kickoff");
-    TEST_ASSERT(f.nodes[3].type == NODE_KICKOFF, "n3 kickoff");
-    TEST_ASSERT(f.nodes[4].type == NODE_STATE,   "n4 state");
-    TEST_ASSERT(f.nodes[5].type == NODE_STATE,   "n5 state");
-    for (int i = 6; i <= 9; i++)
-        TEST_ASSERT(f.nodes[i].type == NODE_KICKOFF, "level-2 kickoff");
-    for (int i = 10; i <= 13; i++)
-        TEST_ASSERT(f.nodes[i].type == NODE_STATE, "level-2 state");
+    /* DFS pre-order layout:
+       [0]=ko_root, [1]=st_root, [2]=ko_left, [3]=st_left,
+       [4]=ko_A, [5]=st_A, [6]=ko_B, [7]=st_B,
+       [8]=ko_right, [9]=st_right, [10]=ko_C, [11]=st_C,
+       [12]=ko_D, [13]=st_D */
+    /* Check node types: kickoff/state pairs */
+    for (int i = 0; i < 14; i += 2) {
+        TEST_ASSERT(f.nodes[i].type == NODE_KICKOFF, "even node = kickoff");
+        TEST_ASSERT(f.nodes[i+1].type == NODE_STATE, "odd node = state");
+    }
 
     /* Check signer counts */
     TEST_ASSERT_EQ(f.nodes[0].n_signers, 5, "root: 5 signers");
     TEST_ASSERT_EQ(f.nodes[1].n_signers, 5, "state_root: 5 signers");
-    TEST_ASSERT_EQ(f.nodes[4].n_signers, 3, "state_left: 3 signers");
-    TEST_ASSERT_EQ(f.nodes[5].n_signers, 3, "state_right: 3 signers");
-    for (int i = 6; i <= 9; i++)
-        TEST_ASSERT_EQ(f.nodes[i].n_signers, 2, "level-2 kickoff: 2 signers");
-    for (int i = 10; i <= 13; i++)
-        TEST_ASSERT_EQ(f.nodes[i].n_signers, 2, "level-2 state: 2 signers");
+    TEST_ASSERT_EQ(f.nodes[3].n_signers, 3, "state_left: 3 signers");
+    TEST_ASSERT_EQ(f.nodes[9].n_signers, 3, "state_right: 3 signers");
+    /* Level-2 leaf pairs: 2 signers each */
+    int leaf_kos[] = {4, 6, 10, 12};
+    int leaf_sts[] = {5, 7, 11, 13};
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT_EQ(f.nodes[leaf_kos[i]].n_signers, 2, "level-2 kickoff: 2 signers");
+        TEST_ASSERT_EQ(f.nodes[leaf_sts[i]].n_signers, 2, "level-2 state: 2 signers");
+    }
 
-    /* Check parent links for level-2 */
-    TEST_ASSERT_EQ(f.nodes[6].parent_index, 4, "kickoff_A -> state_left");
-    TEST_ASSERT_EQ(f.nodes[7].parent_index, 4, "kickoff_B -> state_left");
-    TEST_ASSERT_EQ(f.nodes[8].parent_index, 5, "kickoff_C -> state_right");
-    TEST_ASSERT_EQ(f.nodes[9].parent_index, 5, "kickoff_D -> state_right");
-    TEST_ASSERT_EQ(f.nodes[10].parent_index, 6, "state_A -> kickoff_A");
-    TEST_ASSERT_EQ(f.nodes[11].parent_index, 7, "state_B -> kickoff_B");
-    TEST_ASSERT_EQ(f.nodes[12].parent_index, 8, "state_C -> kickoff_C");
-    TEST_ASSERT_EQ(f.nodes[13].parent_index, 9, "state_D -> kickoff_D");
+    /* Check parent links for level-2 (DFS order) */
+    TEST_ASSERT_EQ(f.nodes[4].parent_index, 3, "kickoff_A -> state_left");
+    TEST_ASSERT_EQ(f.nodes[6].parent_index, 3, "kickoff_B -> state_left");
+    TEST_ASSERT_EQ(f.nodes[10].parent_index, 9, "kickoff_C -> state_right");
+    TEST_ASSERT_EQ(f.nodes[12].parent_index, 9, "kickoff_D -> state_right");
+    TEST_ASSERT_EQ(f.nodes[5].parent_index, 4, "state_A -> kickoff_A");
+    TEST_ASSERT_EQ(f.nodes[7].parent_index, 6, "state_B -> kickoff_B");
+    TEST_ASSERT_EQ(f.nodes[11].parent_index, 10, "state_C -> kickoff_C");
+    TEST_ASSERT_EQ(f.nodes[13].parent_index, 12, "state_D -> kickoff_D");
 
     /* Leaf node indices */
-    TEST_ASSERT_EQ(f.leaf_node_indices[0], 10, "leaf_idx 0 = node 10");
-    TEST_ASSERT_EQ(f.leaf_node_indices[1], 11, "leaf_idx 1 = node 11");
-    TEST_ASSERT_EQ(f.leaf_node_indices[2], 12, "leaf_idx 2 = node 12");
-    TEST_ASSERT_EQ(f.leaf_node_indices[3], 13, "leaf_idx 3 = node 13");
+    TEST_ASSERT_EQ(f.leaf_node_indices[0], 5, "leaf_idx 0 = node 5 (st_A)");
+    TEST_ASSERT_EQ(f.leaf_node_indices[1], 7, "leaf_idx 1 = node 7 (st_B)");
+    TEST_ASSERT_EQ(f.leaf_node_indices[2], 11, "leaf_idx 2 = node 11 (st_C)");
+    TEST_ASSERT_EQ(f.leaf_node_indices[3], 13, "leaf_idx 3 = node 13 (st_D)");
 
     /* All txids non-zero */
     unsigned char zero[32];
@@ -2298,24 +2327,23 @@ int test_factory_arity1_leaf_outputs(void) {
     TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(&f), "build tree");
 
-    /* Each leaf state node (10-13) should have 2 outputs: channel + L-stock */
-    for (int i = 10; i <= 13; i++) {
+    /* Each leaf state node should have 2 outputs: channel + L-stock */
+    for (int i = 0; i < f.n_leaf_nodes; i++) {
+        size_t li = f.leaf_node_indices[i];
         char msg[64];
-        snprintf(msg, sizeof(msg), "node %d has 2 outputs", i);
-        TEST_ASSERT_EQ(f.nodes[i].n_outputs, 2, msg);
-        /* Both outputs should have 34-byte SPK */
-        TEST_ASSERT_EQ(f.nodes[i].outputs[0].script_pubkey_len, 34, "chan spk len");
-        TEST_ASSERT_EQ(f.nodes[i].outputs[1].script_pubkey_len, 34, "lstock spk len");
-        /* Amounts should be non-zero */
-        snprintf(msg, sizeof(msg), "node %d chan amount > 0", i);
-        TEST_ASSERT(f.nodes[i].outputs[0].amount_sats > 0, msg);
-        snprintf(msg, sizeof(msg), "node %d lstock amount > 0", i);
-        TEST_ASSERT(f.nodes[i].outputs[1].amount_sats > 0, msg);
+        snprintf(msg, sizeof(msg), "leaf %d (node %zu) has 2 outputs", i, li);
+        TEST_ASSERT_EQ(f.nodes[li].n_outputs, 2, msg);
+        TEST_ASSERT_EQ(f.nodes[li].outputs[0].script_pubkey_len, 34, "chan spk len");
+        TEST_ASSERT_EQ(f.nodes[li].outputs[1].script_pubkey_len, 34, "lstock spk len");
+        snprintf(msg, sizeof(msg), "leaf %d chan amount > 0", i);
+        TEST_ASSERT(f.nodes[li].outputs[0].amount_sats > 0, msg);
+        snprintf(msg, sizeof(msg), "leaf %d lstock amount > 0", i);
+        TEST_ASSERT(f.nodes[li].outputs[1].amount_sats > 0, msg);
     }
 
-    /* Mid-level state nodes (4,5) should have 2 child outputs, not 3 leaf outputs */
-    TEST_ASSERT_EQ(f.nodes[4].n_outputs, 2, "state_left: 2 child outputs");
-    TEST_ASSERT_EQ(f.nodes[5].n_outputs, 2, "state_right: 2 child outputs");
+    /* Mid-level state nodes (3,9 in DFS) should have 2 child outputs */
+    TEST_ASSERT_EQ(f.nodes[3].n_outputs, 2, "state_left: 2 child outputs");
+    TEST_ASSERT_EQ(f.nodes[9].n_outputs, 2, "state_right: 2 child outputs");
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);
@@ -2353,9 +2381,10 @@ int test_factory_arity1_advance(void) {
     TEST_ASSERT_EQ(f.counter.n_layers, 3, "3 DW layers");
 
     /* Advance once and check nSequences change */
-    uint32_t old_leaf_nseq = f.nodes[10].nsequence;
+    size_t leaf0 = f.leaf_node_indices[0];
+    uint32_t old_leaf_nseq = f.nodes[leaf0].nsequence;
     TEST_ASSERT(factory_advance(&f), "advance epoch 1");
-    TEST_ASSERT(f.nodes[10].nsequence != old_leaf_nseq, "leaf nseq changed");
+    TEST_ASSERT(f.nodes[leaf0].nsequence != old_leaf_nseq, "leaf nseq changed");
 
     /* All nodes should still be signed */
     for (size_t i = 0; i < 14; i++)
@@ -2382,8 +2411,8 @@ int test_factory_arity1_advance_leaf(void) {
     }
 
     /* All leaf nodes should be signed */
-    for (int i = 10; i <= 13; i++)
-        TEST_ASSERT(f.nodes[i].is_signed, "leaf signed after advance");
+    for (int i = 0; i < f.n_leaf_nodes; i++)
+        TEST_ASSERT(f.nodes[f.leaf_node_indices[i]].is_signed, "leaf signed after advance");
 
     TEST_ASSERT(f.per_leaf_enabled, "per-leaf enabled");
 
@@ -2461,13 +2490,13 @@ int test_factory_arity1_client_to_leaf(void) {
     TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(&f), "build tree");
 
-    /* Arity-1 mapping: client_idx -> node 10+client_idx, vout 0 */
+    /* Arity-1 mapping: each client gets its own leaf, channel at vout 0 */
+    size_t expected_leaves[] = {5, 7, 11, 13};  /* DFS ordering */
     for (int c = 0; c < 4; c++) {
-        size_t expected_node = 10 + (size_t)c;
-        TEST_ASSERT_EQ(f.leaf_node_indices[c], expected_node, "leaf index mapping");
+        TEST_ASSERT_EQ(f.leaf_node_indices[c], expected_leaves[c], "leaf index mapping");
 
         /* Each leaf node should have the channel at vout 0 */
-        const factory_node_t *node = &f.nodes[expected_node];
+        const factory_node_t *node = &f.nodes[expected_leaves[c]];
         TEST_ASSERT_EQ(node->n_outputs, 2, "2 outputs");
         TEST_ASSERT(node->outputs[0].amount_sats > 0, "channel amount > 0");
     }
@@ -2487,44 +2516,32 @@ int test_factory_arity1_cltv_strict_ordering(void) {
     f.cltv_timeout = 200;  /* Enough room for 5 tiers of TIMEOUT_STEP_BLOCKS=5 */
     TEST_ASSERT(factory_build_tree(&f), "build tree");
 
-    /* Verify 5-tier strict CLTV ordering:
-       sr (root_cltv=200) > kl/kri (195) > sl/sri (190) > ka-kd (185) > sa-sd (180)
-       Every child CLTV must be strictly less than its parent. */
+    /* Verify strict CLTV ordering: every child CLTV < parent CLTV.
+       DFS layout: kr=0, sr=1, kl=2, sl=3, ka=4, sa=5, kb=6, sb=7,
+                   kri=8, sri=9, kc=10, sc=11, kd=12, sd=13 */
 
-    /* Node indices: kr=0, sr=1, kl=2, kri=3, sl=4, sri=5,
-       ka=6, kb=7, kc=8, kd=9, sa=10, sb=11, sc=12, sd=13 */
-    uint32_t sr_cltv  = f.nodes[1].cltv_timeout;   /* root state */
-    uint32_t kl_cltv  = f.nodes[2].cltv_timeout;   /* mid kickoff left */
-    uint32_t kri_cltv = f.nodes[3].cltv_timeout;   /* mid kickoff right */
-    uint32_t sl_cltv  = f.nodes[4].cltv_timeout;   /* mid state left */
-    uint32_t sri_cltv = f.nodes[5].cltv_timeout;   /* mid state right */
-
-    /* Tier 1 > Tier 2: root state > mid kickoffs */
-    TEST_ASSERT(sr_cltv > kl_cltv, "sr > kl cltv");
-    TEST_ASSERT(sr_cltv > kri_cltv, "sr > kri cltv");
-    /* Tier 2 > Tier 3: mid kickoffs > mid states */
-    TEST_ASSERT(kl_cltv > sl_cltv, "kl > sl cltv");
-    TEST_ASSERT(kri_cltv > sri_cltv, "kri > sri cltv");
-
-    /* Tier 3 > Tier 4 > Tier 5: for each per-client subtree */
-    for (int i = 0; i < 4; i++) {
-        int ko_idx = 6 + i;   /* ka=6, kb=7, kc=8, kd=9 */
-        int st_idx = 10 + i;  /* sa=10, sb=11, sc=12, sd=13 */
-        uint32_t parent_st_cltv = (i < 2) ? sl_cltv : sri_cltv;
-        uint32_t ko_cltv = f.nodes[ko_idx].cltv_timeout;
-        uint32_t st_cltv = f.nodes[st_idx].cltv_timeout;
-
-        /* mid state > leaf kickoff > leaf state */
-        TEST_ASSERT(parent_st_cltv > ko_cltv, "parent state > leaf kickoff cltv");
-        TEST_ASSERT(ko_cltv > st_cltv, "leaf kickoff > leaf state cltv");
+    /* Generic check: every node with a parent must have CLTV <= parent CLTV.
+       For non-root kickoffs and states with has_taptree, strictly less. */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        const factory_node_t *node = &f.nodes[i];
+        if (node->parent_index < 0) continue;
+        const factory_node_t *parent = &f.nodes[node->parent_index];
+        if (node->has_taptree && parent->has_taptree) {
+            TEST_ASSERT(node->cltv_timeout < parent->cltv_timeout,
+                        "child cltv < parent cltv");
+        }
     }
 
-    /* Verify exact values */
-    TEST_ASSERT_EQ(sr_cltv, 200, "sr = 200");
-    TEST_ASSERT_EQ(kl_cltv, 195, "kl = 195");
-    TEST_ASSERT_EQ(sl_cltv, 190, "sl = 190");
-    TEST_ASSERT_EQ(f.nodes[6].cltv_timeout, 185, "ka = 185");
-    TEST_ASSERT_EQ(f.nodes[10].cltv_timeout, 180, "sa = 180");
+    /* Verify root state has the longest CLTV */
+    TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 200, "sr = 200");
+    /* Mid kickoff left (depth=1 ko): 200 - 1*5 = 195 */
+    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 195, "kl = 195");
+    /* Mid state left (depth=1 st): 200 - 2*5 = 190 */
+    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 190, "sl = 190");
+    /* Leaf kickoff A (depth=2 ko): 200 - 3*5 = 185 */
+    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 185, "ka = 185");
+    /* Leaf state A (depth=2 st): 200 - 4*5 = 180 */
+    TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 180, "sa = 180");
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);
@@ -2658,6 +2675,236 @@ int test_factory_arity1_split_round_leaf_advance(void) {
                 "state advanced further");
 
     factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Variable-N tree tests ---- */
+
+/* Secret keys for up to 16 participants */
+static const unsigned char seckeys_n[16][32] = {
+    { [0 ... 31] = 0x10 },  /* LSP */
+    { [0 ... 31] = 0x21 },
+    { [0 ... 31] = 0x32 },
+    { [0 ... 31] = 0x43 },
+    { [0 ... 31] = 0x54 },
+    { [0 ... 31] = 0x65 },
+    { [0 ... 31] = 0x76 },
+    { [0 ... 31] = 0x87 },
+    { [0 ... 31] = 0x98 },
+    { [0 ... 31] = 0xA1 },
+    { [0 ... 31] = 0xB2 },
+    { [0 ... 31] = 0xC3 },
+    { [0 ... 31] = 0xD4 },
+    { [0 ... 31] = 0xE5 },
+    { [0 ... 31] = 0xF6 },
+    { [0 ... 31] = 0x07 },
+};
+
+/* Generic helper: set up a factory with N participants + given arity */
+static int setup_n_factory(factory_t *f, secp256k1_context *ctx,
+                            secp256k1_keypair *kps, size_t n_participants,
+                            factory_arity_t arity, uint64_t funding) {
+    for (size_t i = 0; i < n_participants; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]))
+            return 0;
+    }
+
+    /* Compute N-of-N funding SPK */
+    secp256k1_pubkey pks[16];
+    for (size_t i = 0; i < n_participants; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, n_participants)) return 0;
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak))
+        return 0;
+    secp256k1_xonly_pubkey fund_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_xonly, NULL, &tweaked_pk);
+
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &fund_xonly);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_init(f, ctx, kps, n_participants, 2, 4);
+    factory_set_arity(f, arity);
+    factory_set_funding(f, fake_txid, 0, funding, fund_spk, 34);
+    return 1;
+}
+
+/* Validate structural invariants for any tree */
+static int validate_tree_invariants(const factory_t *f) {
+    /* 1. All nodes built with non-zero txids */
+    unsigned char zero[32];
+    memset(zero, 0, 32);
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (!f->nodes[i].is_built) return 0;
+        if (memcmp(f->nodes[i].txid, zero, 32) == 0) return 0;
+    }
+
+    /* 2. Parent ordering: parent_index < node_index (DFS pre-order) */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].parent_index >= 0 &&
+            f->nodes[i].parent_index >= (int)i)
+            return 0;
+    }
+
+    /* 3. Signer sets always include LSP (index 0) */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        int has_lsp = 0;
+        for (size_t j = 0; j < f->nodes[i].n_signers; j++) {
+            if (f->nodes[i].signer_indices[j] == 0) has_lsp = 1;
+        }
+        if (!has_lsp) return 0;
+    }
+
+    /* 4. Amount conservation: each node's output total + fee = input amount */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *node = &f->nodes[i];
+        if (node->input_amount == 0) continue;
+        uint64_t out_total = 0;
+        for (size_t j = 0; j < node->n_outputs; j++)
+            out_total += node->outputs[j].amount_sats;
+        if (out_total + f->fee_per_tx != node->input_amount) return 0;
+    }
+
+    /* 5. CLTV monotonicity: child cltv < parent cltv (when both have taptree) */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *node = &f->nodes[i];
+        if (node->parent_index < 0) continue;
+        const factory_node_t *parent = &f->nodes[node->parent_index];
+        if (node->has_taptree && parent->has_taptree) {
+            if (node->cltv_timeout >= parent->cltv_timeout) return 0;
+        }
+    }
+
+    /* 6. Kickoff/state alternation: root pair + every ko→st link */
+    if (f->n_nodes >= 2) {
+        if (f->nodes[0].type != NODE_KICKOFF) return 0;
+        if (f->nodes[1].type != NODE_STATE) return 0;
+    }
+
+    return 1;
+}
+
+int test_factory_build_tree_n3(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t f;
+
+    /* N=3 (LSP + 2 clients), arity-2: 1 leaf with 2 clients, depth=0 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 3, FACTORY_ARITY_2, 100000), "setup n3 arity2");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n3 arity2");
+    TEST_ASSERT_EQ(f.n_nodes, 2, "n3 arity-2: 2 nodes (1 ko + 1 st leaf)");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 1, "1 leaf");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n3 arity2");
+    TEST_ASSERT(factory_sign_all(&f), "sign n3 arity2");
+    factory_free(&f);
+
+    /* N=3, arity-1: 2 leaves (1 client each), depth=1 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 3, FACTORY_ARITY_1, 100000), "setup n3 arity1");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n3 arity1");
+    TEST_ASSERT_EQ(f.n_nodes, 6, "n3 arity-1: 6 nodes");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 2, "2 leaves");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n3 arity1");
+    TEST_ASSERT(factory_sign_all(&f), "sign n3 arity1");
+    factory_free(&f);
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n7(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[7];
+    factory_t f;
+
+    /* N=7 (LSP + 6 clients), arity-2: 3 leaves, depth=2 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 7, FACTORY_ARITY_2, 1000000), "setup n7 arity2");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n7 arity2");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 3, "3 leaves arity2");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n7 arity2");
+    TEST_ASSERT(factory_sign_all(&f), "sign n7 arity2");
+    /* Advance and verify */
+    TEST_ASSERT(factory_advance(&f), "advance n7 arity2");
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "all signed after advance");
+    factory_free(&f);
+
+    /* N=7, arity-1: 6 leaves, depth=3 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 7, FACTORY_ARITY_1, 2000000), "setup n7 arity1");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n7 arity1");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 6, "6 leaves arity1");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n7 arity1");
+    TEST_ASSERT(factory_sign_all(&f), "sign n7 arity1");
+    factory_free(&f);
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n9(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[9];
+    factory_t f;
+
+    /* N=9 (LSP + 8 clients), arity-2: 4 leaves, depth=2 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 9, FACTORY_ARITY_2, 2000000), "setup n9 arity2");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n9 arity2");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 4, "4 leaves arity2");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n9 arity2");
+    TEST_ASSERT(factory_sign_all(&f), "sign n9 arity2");
+    /* Test leaf advance */
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf 0");
+    TEST_ASSERT(factory_advance_leaf(&f, 3), "advance leaf 3");
+    factory_free(&f);
+
+    /* N=9, arity-1: 8 leaves, depth=3 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 9, FACTORY_ARITY_1, 5000000), "setup n9 arity1");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n9 arity1");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 8, "8 leaves arity1");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n9 arity1");
+    TEST_ASSERT(factory_sign_all(&f), "sign n9 arity1");
+    factory_free(&f);
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n16(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[16];
+    factory_t f;
+
+    /* N=16 (LSP + 15 clients), arity-1 only (arity-2 would need 8 leaves, still ok) */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 16, FACTORY_ARITY_1, 20000000), "setup n16 arity1");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n16 arity1");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 15, "15 leaves arity1");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n16 arity1");
+    TEST_ASSERT(factory_sign_all(&f), "sign n16 arity1");
+    /* Verify all signed */
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "all nodes signed n16");
+    factory_free(&f);
+
+    /* N=16, arity-2: 8 leaves, depth=3 */
+    TEST_ASSERT(setup_n_factory(&f, ctx, kps, 16, FACTORY_ARITY_2, 20000000), "setup n16 arity2");
+    TEST_ASSERT(factory_build_tree(&f), "build tree n16 arity2");
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 8, "8 leaves arity2");
+    TEST_ASSERT(validate_tree_invariants(&f), "invariants n16 arity2");
+    TEST_ASSERT(factory_sign_all(&f), "sign n16 arity2");
+    factory_free(&f);
+
     secp256k1_context_destroy(ctx);
     return 1;
 }

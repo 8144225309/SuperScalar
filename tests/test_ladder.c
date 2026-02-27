@@ -1548,44 +1548,35 @@ int test_ladder_restructure_fewer_clients(void) {
     ladder_advance_block(&lad, 100);
     TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "factory dying");
 
-    /* Attempt to create new factory with only 2 clients — must fail
-       because factory_build_tree requires exactly 5 participants */
+    /* With generalized N, factories can be created with 2+ clients (arity-2).
+       Only LSP+1 (2 participants) should fail for arity-2 (needs >=2 clients). */
     unsigned char fake_txid2[32];
     memset(fake_txid2, 0xBB, 32);
+
+    /* Attempt with 1 client (2 participants) — fails (arity-2 needs >= 2 clients) */
+    int result_1 = ladder_create_factory(&lad, client_kps, 1, 100000,
+                                          fake_txid2, 0, fund_spk, 34);
+    TEST_ASSERT(!result_1, "2 participants (LSP+1) fails gracefully");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
+
+    /* Attempt with 2 clients (3 participants) — succeeds with generalized N */
     secp256k1_keypair online_kps[2];
     online_kps[0] = client_kps[0];
     online_kps[1] = client_kps[1];
 
     int result_2 = ladder_create_factory(&lad, online_kps, 2, 100000,
                                           fake_txid2, 0, fund_spk, 34);
-    TEST_ASSERT(!result_2, "3 participants (LSP+2) fails gracefully");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
+    TEST_ASSERT(result_2, "3 participants (LSP+2) succeeds");
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories after LSP+2");
 
-    /* Attempt with 3 clients (4 participants) — also fails */
-    secp256k1_keypair three_kps[3];
-    three_kps[0] = client_kps[0];
-    three_kps[1] = client_kps[1];
-    three_kps[2] = client_kps[2];
-
-    int result_3 = ladder_create_factory(&lad, three_kps, 3, 100000,
-                                          fake_txid2, 0, fund_spk, 34);
-    TEST_ASSERT(!result_3, "4 participants (LSP+3) fails gracefully");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
-
-    /* Attempt with 1 client (2 participants) — also fails */
-    int result_1 = ladder_create_factory(&lad, client_kps, 1, 100000,
-                                          fake_txid2, 0, fund_spk, 34);
-    TEST_ASSERT(!result_1, "2 participants (LSP+1) fails gracefully");
-
-    /* Create new factory with the full 4 clients — this is the only
-       valid path for rotation. All clients must participate. */
+    /* Create another with full 4 clients */
     unsigned char fake_txid3[32];
     memset(fake_txid3, 0xCC, 32);
     TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
                                        fake_txid3, 0, fund_spk, 34),
                 "full 4 clients (5 participants) works");
-    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories after successful create");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE,
+    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories total");
+    TEST_ASSERT_EQ(lad.factories[2].cached_state, FACTORY_ACTIVE,
                    "new factory is ACTIVE");
 
     ladder_free(&lad);

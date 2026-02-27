@@ -276,19 +276,20 @@ int test_factory_tree_with_timeout(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree with timeout");
     TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
 
-    /* All non-root nodes should have taptree (staggered CLTVs) */
+    /* All non-root nodes should have taptree (staggered CLTVs).
+       DFS order: ko_root[0], st_root[1], ko_left[2], st_left[3], ko_right[4], st_right[5] */
     TEST_ASSERT(f.nodes[0].has_taptree == 0, "kickoff_root no taptree");
     TEST_ASSERT(f.nodes[1].has_taptree == 1, "state_root has taptree");
     TEST_ASSERT(f.nodes[2].has_taptree == 1, "kickoff_left has taptree");
-    TEST_ASSERT(f.nodes[3].has_taptree == 1, "kickoff_right has taptree");
-    TEST_ASSERT(f.nodes[4].has_taptree == 1, "state_left has taptree");
+    TEST_ASSERT(f.nodes[3].has_taptree == 1, "state_left has taptree");
+    TEST_ASSERT(f.nodes[4].has_taptree == 1, "kickoff_right has taptree");
     TEST_ASSERT(f.nodes[5].has_taptree == 1, "state_right has taptree");
 
-    /* Verify per-node staggered CLTV values */
+    /* Verify per-node staggered CLTV values (DFS order) */
     TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root cltv = 1000 (root)");
-    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid)");
-    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 995, "kickoff_right cltv = 995 (mid)");
-    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
+    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid ko)");
+    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
+    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 995, "kickoff_right cltv = 995 (mid ko)");
     TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990, "state_right cltv = 990 (leaf)");
 
     /* Build factory WITHOUT cltv_timeout for comparison */
@@ -303,7 +304,7 @@ int test_factory_tree_with_timeout(void) {
                 "state_root spk differs with taptree");
     TEST_ASSERT(memcmp(f.nodes[2].spending_spk, f2.nodes[2].spending_spk, 34) != 0,
                 "kickoff_left spk differs with taptree");
-    TEST_ASSERT(memcmp(f.nodes[4].spending_spk, f2.nodes[4].spending_spk, 34) != 0,
+    TEST_ASSERT(memcmp(f.nodes[3].spending_spk, f2.nodes[3].spending_spk, 34) != 0,
                 "state_left spk differs with taptree");
 
     /* spending_spk of kickoff_root should be SAME (no taptree on either) */
@@ -772,19 +773,19 @@ int test_multi_level_timeout_unit(void) {
         TEST_ASSERT(found, "OP_CLTV in script");
     }
 
-    /* Verify CLTV ordering: leaf < mid < root */
-    TEST_ASSERT(f.nodes[4].cltv_timeout < f.nodes[2].cltv_timeout,
-                "leaf cltv < mid cltv");
-    TEST_ASSERT(f.nodes[5].cltv_timeout < f.nodes[3].cltv_timeout,
-                "leaf cltv < mid cltv (right)");
+    /* Verify CLTV ordering: leaf < mid ko < root (DFS order) */
+    TEST_ASSERT(f.nodes[3].cltv_timeout < f.nodes[2].cltv_timeout,
+                "state_left cltv < kickoff_left cltv");
+    TEST_ASSERT(f.nodes[5].cltv_timeout < f.nodes[4].cltv_timeout,
+                "state_right cltv < kickoff_right cltv");
     TEST_ASSERT(f.nodes[2].cltv_timeout < f.nodes[1].cltv_timeout,
                 "mid cltv < root cltv");
 
-    /* Verify exact values: step=5 */
+    /* Verify exact values: step=5, DFS order */
     TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root = base");
     TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995,  "kickoff_left = base-5");
-    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 995,  "kickoff_right = base-5");
-    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 990,  "state_left = base-10");
+    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 990,  "state_left = base-10");
+    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 995,  "kickoff_right = base-5");
     TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990,  "state_right = base-10");
 
     /* All 6 txs should sign and verify via key-path */

@@ -11,9 +11,10 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
-#define FACTORY_MAX_NODES   32
+#define FACTORY_MAX_NODES   64
 #define FACTORY_MAX_OUTPUTS  8
 #define FACTORY_MAX_SIGNERS 16
+#define FACTORY_MAX_LEAVES  16
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
@@ -125,9 +126,10 @@ typedef struct {
     int use_flat_secrets;  /* 1 = flat, 0 = shachain (legacy) */
 
     /* Per-leaf DW layers (for independent leaf advance) */
-    dw_layer_t leaf_layers[8];    /* up to 8 leaf nodes (arity-1: 4, arity-2: 2) */
+    dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
     int n_leaf_nodes;              /* number of leaf state nodes */
-    size_t leaf_node_indices[8];   /* maps leaf_idx → node index in nodes[] */
+    size_t leaf_node_indices[FACTORY_MAX_LEAVES];
+
     int per_leaf_enabled;          /* activated after first leaf advance */
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
