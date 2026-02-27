@@ -439,6 +439,8 @@ extern int test_factory_path_to_root(void);
 extern int test_factory_subtree_clients(void);
 extern int test_factory_find_leaf_for_client(void);
 extern int test_factory_nav_variable_n(void);
+extern int test_factory_timeout_spend_tx(void);
+extern int test_factory_timeout_spend_mid_node(void);
 
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
@@ -825,6 +827,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_subtree_clients);
     RUN_TEST(test_factory_find_leaf_for_client);
     RUN_TEST(test_factory_nav_variable_n);
+    RUN_TEST(test_factory_timeout_spend_tx);
+    RUN_TEST(test_factory_timeout_spend_mid_node);
 
     printf("\n=== Variable-N Tree ===\n");
     RUN_TEST(test_factory_build_tree_n3);

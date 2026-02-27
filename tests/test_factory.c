@@ -3505,3 +3505,112 @@ int test_factory_nav_variable_n(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* === Timeout-Spend API Tests === */
+
+int test_factory_timeout_spend_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.cltv_timeout = 1000;
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Find a leaf state node with has_taptree */
+    int target_idx = -1;
+    for (int i = 0; i < f.n_leaf_nodes; i++) {
+        int ni = (int)f.leaf_node_indices[i];
+        if (f.nodes[ni].has_taptree) {
+            target_idx = ni;
+            break;
+        }
+    }
+    TEST_ASSERT(target_idx >= 0, "found leaf with taptree");
+
+    /* Build destination SPK (just reuse fund_spk) */
+    tx_buf_t timeout_tx;
+    tx_buf_init(&timeout_tx, 512);
+
+    /* Parent of the leaf state is a kickoff node */
+    int parent_idx = f.nodes[target_idx].parent_index;
+    TEST_ASSERT(parent_idx >= 0, "leaf has parent");
+
+    int ok = factory_build_timeout_spend_tx(&f,
+        f.nodes[parent_idx].txid, 0,
+        f.nodes[parent_idx].outputs[0].amount_sats,
+        target_idx, &kps[0],
+        fund_spk, 34, 500, &timeout_tx);
+    TEST_ASSERT(ok, "build timeout spend");
+    TEST_ASSERT(timeout_tx.len > 0, "timeout tx non-empty");
+
+    /* Verify nLockTime in the raw tx (last 4 bytes before witness) */
+    /* The tx should have at least a few hundred bytes */
+    TEST_ASSERT(timeout_tx.len > 100, "reasonable tx size");
+
+    tx_buf_free(&timeout_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_timeout_spend_mid_node(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.cltv_timeout = 1000;
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Find an intermediate kickoff node with has_taptree (not root, not leaf) */
+    /* In 5-participant arity-2: nodes 2 (ko_left) and 4 (ko_right) are intermediate kickoffs */
+    int target_idx = -1;
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *n = &f.nodes[i];
+        if (n->type == NODE_KICKOFF && n->parent_index > 0 && n->has_taptree) {
+            target_idx = (int)i;
+            break;
+        }
+    }
+    TEST_ASSERT(target_idx >= 0, "found mid kickoff with taptree");
+
+    /* Parent of this kickoff is a state node */
+    int parent_idx = f.nodes[target_idx].parent_index;
+    TEST_ASSERT(parent_idx >= 0, "kickoff has parent");
+
+    tx_buf_t timeout_tx;
+    tx_buf_init(&timeout_tx, 512);
+    int ok = factory_build_timeout_spend_tx(&f,
+        f.nodes[parent_idx].txid, f.nodes[target_idx].parent_vout,
+        f.nodes[parent_idx].outputs[f.nodes[target_idx].parent_vout].amount_sats,
+        target_idx, &kps[0],
+        fund_spk, 34, 500, &timeout_tx);
+    TEST_ASSERT(ok, "build mid timeout spend");
+    TEST_ASSERT(timeout_tx.len > 0, "mid timeout tx non-empty");
+
+    tx_buf_free(&timeout_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

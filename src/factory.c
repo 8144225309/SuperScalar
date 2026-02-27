@@ -1563,6 +1563,79 @@ int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx) {
     return -1;
 }
 
+int factory_build_timeout_spend_tx(
+    const factory_t *f,
+    const unsigned char *parent_txid,
+    uint32_t parent_vout,
+    uint64_t spend_amount,
+    int target_node_idx,
+    const secp256k1_keypair *lsp_keypair,
+    const unsigned char *dest_spk,
+    size_t dest_spk_len,
+    uint64_t fee_sats,
+    tx_buf_t *signed_tx_out)
+{
+    if (!f || !parent_txid || !lsp_keypair || !dest_spk || !signed_tx_out)
+        return 0;
+    if (target_node_idx < 0 || (size_t)target_node_idx >= f->n_nodes)
+        return 0;
+
+    const factory_node_t *target = &f->nodes[target_node_idx];
+    if (!target->has_taptree)
+        return 0;
+    if (fee_sats >= spend_amount)
+        return 0;
+
+    /* Build output */
+    tx_output_t tout;
+    tout.amount_sats = spend_amount - fee_sats;
+    memcpy(tout.script_pubkey, dest_spk, dest_spk_len);
+    tout.script_pubkey_len = dest_spk_len;
+
+    /* Build unsigned tx with locktime = CLTV timeout */
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    if (!build_unsigned_tx_with_locktime(&utx, NULL,
+            parent_txid, parent_vout, 0xFFFFFFFEu,
+            target->cltv_timeout, &tout, 1)) {
+        tx_buf_free(&utx);
+        return 0;
+    }
+
+    /* Compute tapscript sighash */
+    unsigned char sighash[32];
+    compute_tapscript_sighash(sighash, utx.data, utx.len, 0,
+        target->spending_spk, target->spending_spk_len,
+        spend_amount, 0xFFFFFFFEu, &target->timeout_leaf);
+
+    /* Sign with LSP keypair (single signer, NOT MuSig) */
+    unsigned char sig[64], aux[32];
+    memset(aux, 0, 32);
+    if (!secp256k1_schnorrsig_sign32(f->ctx, sig, sighash,
+                                       lsp_keypair, aux)) {
+        tx_buf_free(&utx);
+        return 0;
+    }
+
+    /* Build control block */
+    unsigned char cb[65];
+    size_t cb_len;
+    tapscript_build_control_block(cb, &cb_len,
+        target->output_parity,
+        &target->keyagg.agg_pubkey, f->ctx);
+
+    /* Finalize script-path tx */
+    if (!finalize_script_path_tx(signed_tx_out, utx.data, utx.len, sig,
+            target->timeout_leaf.script, target->timeout_leaf.script_len,
+            cb, cb_len)) {
+        tx_buf_free(&utx);
+        return 0;
+    }
+
+    tx_buf_free(&utx);
+    return 1;
+}
+
 void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);

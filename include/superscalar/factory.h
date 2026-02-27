@@ -272,6 +272,22 @@ size_t factory_get_subtree_clients(const factory_t *f, int node_idx,
    Returns leaf state node index, or -1 if not found. */
 int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx);
 
+/* Build a signed timeout script-path spend for a factory node.
+   Spends parent_txid:parent_vout via target_node's CLTV timeout leaf.
+   LSP signs alone: <cltv> OP_CLTV OP_DROP <LSP_key> OP_CHECKSIG.
+   Returns 1 on success. */
+int factory_build_timeout_spend_tx(
+    const factory_t *f,
+    const unsigned char *parent_txid,   /* 32 bytes, internal order */
+    uint32_t parent_vout,
+    uint64_t spend_amount,              /* sats on the output being spent */
+    int target_node_idx,                /* node whose spending_spk is the output */
+    const secp256k1_keypair *lsp_keypair,
+    const unsigned char *dest_spk,      /* destination P2TR scriptPubKey */
+    size_t dest_spk_len,
+    uint64_t fee_sats,
+    tx_buf_t *signed_tx_out);
+
 /* --- Factory lifecycle (Phase 8) --- */
 
 void factory_set_lifecycle(factory_t *f, uint32_t created_block,
