@@ -1511,6 +1511,58 @@ int factory_build_distribution_tx(
     return 1;
 }
 
+/* --- Tree navigation helpers --- */
+
+size_t factory_collect_path_to_root(const factory_t *f, int start_idx,
+                                     int *path_out, size_t max_path) {
+    if (!f || start_idx < 0 || (size_t)start_idx >= f->n_nodes || max_path == 0)
+        return 0;
+
+    /* Walk parent chain, storing in reverse order */
+    int tmp[FACTORY_MAX_NODES];
+    size_t count = 0;
+    int idx = start_idx;
+    while (idx >= 0 && count < FACTORY_MAX_NODES) {
+        tmp[count++] = idx;
+        idx = f->nodes[idx].parent_index;
+    }
+
+    /* Reverse into path_out (root-first) */
+    size_t written = count < max_path ? count : max_path;
+    for (size_t i = 0; i < written; i++)
+        path_out[i] = tmp[count - 1 - i];
+    return written;
+}
+
+size_t factory_get_subtree_clients(const factory_t *f, int node_idx,
+                                    uint32_t *clients_out, size_t max_clients) {
+    if (!f || node_idx < 0 || (size_t)node_idx >= f->n_nodes)
+        return 0;
+
+    const factory_node_t *node = &f->nodes[node_idx];
+    size_t count = 0;
+    for (size_t i = 0; i < node->n_signers && count < max_clients; i++) {
+        if (node->signer_indices[i] != 0)  /* skip LSP */
+            clients_out[count++] = node->signer_indices[i];
+    }
+    return count;
+}
+
+int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx) {
+    if (!f || client_idx == 0)
+        return -1;
+
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        const factory_node_t *node = &f->nodes[ni];
+        for (size_t s = 0; s < node->n_signers; s++) {
+            if (node->signer_indices[s] == client_idx)
+                return (int)ni;
+        }
+    }
+    return -1;
+}
+
 void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);

@@ -434,6 +434,12 @@ extern int test_factory_build_tree_n7(void);
 extern int test_factory_build_tree_n9(void);
 extern int test_factory_build_tree_n16(void);
 
+/* Tree navigation */
+extern int test_factory_path_to_root(void);
+extern int test_factory_subtree_clients(void);
+extern int test_factory_find_leaf_for_client(void);
+extern int test_factory_nav_variable_n(void);
+
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
 extern int test_factory_arity1_leaf_outputs(void);
@@ -813,6 +819,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_recv_truncated_header);
     RUN_TEST(test_wire_recv_truncated_body);
     RUN_TEST(test_wire_recv_zero_length_frame);
+
+    printf("\n=== Tree Navigation ===\n");
+    RUN_TEST(test_factory_path_to_root);
+    RUN_TEST(test_factory_subtree_clients);
+    RUN_TEST(test_factory_find_leaf_for_client);
+    RUN_TEST(test_factory_nav_variable_n);
 
     printf("\n=== Variable-N Tree ===\n");
     RUN_TEST(test_factory_build_tree_n3);

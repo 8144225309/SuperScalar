@@ -256,6 +256,22 @@ int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
 /* Complete signing: aggregate partial sigs, finalize witness for all nodes. */
 int factory_sessions_complete(factory_t *f);
 
+/* --- Tree navigation helpers --- */
+
+/* Collect node indices from start_idx up to root (node 0), stored root-first.
+   Returns count written. Caller provides path_out[max_path]. */
+size_t factory_collect_path_to_root(const factory_t *f, int start_idx,
+                                     int *path_out, size_t max_path);
+
+/* Get client participant indices in a node's signer set (excluding LSP=0).
+   Returns count written. */
+size_t factory_get_subtree_clients(const factory_t *f, int node_idx,
+                                    uint32_t *clients_out, size_t max_clients);
+
+/* Find the leaf state node index for a client participant index.
+   Returns leaf state node index, or -1 if not found. */
+int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx);
+
 /* --- Factory lifecycle (Phase 8) --- */
 
 void factory_set_lifecycle(factory_t *f, uint32_t created_block,

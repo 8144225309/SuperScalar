@@ -3286,3 +3286,222 @@ int test_factory_flat_secrets_persistence(void) {
     persist_close(&db);
     return 1;
 }
+
+/* === Tree Navigation Helper Tests === */
+
+/* test_factory_path_to_root — 5-participant arity-2: verify path from
+   leaf[0] state to root is root-first order */
+int test_factory_path_to_root(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Tree: 0=ko_root, 1=st_root, 2=ko_left, 3=st_left, 4=ko_right, 5=st_right
+       leaf[0] = node 3 (st_left), path: 3 -> 2 -> 1 -> 0, root-first: [0,1,2,3] */
+    int path[16];
+    size_t count = factory_collect_path_to_root(&f, 3, path, 16);
+    TEST_ASSERT_EQ(count, 4, "path length 4");
+    TEST_ASSERT_EQ(path[0], 0, "path[0] = root kickoff (0)");
+    TEST_ASSERT_EQ(path[1], 1, "path[1] = root state (1)");
+    TEST_ASSERT_EQ(path[2], 2, "path[2] = left kickoff (2)");
+    TEST_ASSERT_EQ(path[3], 3, "path[3] = left state (3)");
+
+    /* Right leaf (node 5): path should be [0,1,4,5] */
+    count = factory_collect_path_to_root(&f, 5, path, 16);
+    TEST_ASSERT_EQ(count, 4, "right path length 4");
+    TEST_ASSERT_EQ(path[0], 0, "right path[0] = 0");
+    TEST_ASSERT_EQ(path[1], 1, "right path[1] = 1");
+    TEST_ASSERT_EQ(path[2], 4, "right path[2] = 4");
+    TEST_ASSERT_EQ(path[3], 5, "right path[3] = 5");
+
+    /* Root node itself: path should be [0] */
+    count = factory_collect_path_to_root(&f, 0, path, 16);
+    TEST_ASSERT_EQ(count, 1, "root path length 1");
+    TEST_ASSERT_EQ(path[0], 0, "root path[0] = 0");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_factory_subtree_clients — root returns all clients, subtrees return subsets */
+int test_factory_subtree_clients(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    uint32_t clients[16];
+
+    /* Root (node 0 or 1): all 5 signers, 4 clients */
+    size_t n = factory_get_subtree_clients(&f, 0, clients, 16);
+    TEST_ASSERT_EQ(n, 4, "root: 4 clients");
+    /* Clients should be 1,2,3,4 */
+    int found[5] = {0};
+    for (size_t i = 0; i < n; i++) {
+        TEST_ASSERT(clients[i] >= 1 && clients[i] <= 4, "valid client idx");
+        found[clients[i]] = 1;
+    }
+    for (int i = 1; i <= 4; i++)
+        TEST_ASSERT(found[i], "found client");
+
+    /* Left subtree (node 3 = st_left): 3 signers (LSP+2 clients), 2 clients */
+    n = factory_get_subtree_clients(&f, 3, clients, 16);
+    TEST_ASSERT_EQ(n, 2, "left leaf: 2 clients");
+
+    /* Right subtree (node 5 = st_right): 3 signers, 2 clients */
+    n = factory_get_subtree_clients(&f, 5, clients, 16);
+    TEST_ASSERT_EQ(n, 2, "right leaf: 2 clients");
+
+    /* Left and right clients should be disjoint */
+    uint32_t left_clients[4], right_clients[4];
+    factory_get_subtree_clients(&f, 3, left_clients, 4);
+    factory_get_subtree_clients(&f, 5, right_clients, 4);
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            TEST_ASSERT(left_clients[i] != right_clients[j], "disjoint");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_factory_find_leaf_for_client — each client maps to correct leaf */
+int test_factory_find_leaf_for_client(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Each client 1-4 should find a leaf */
+    for (uint32_t c = 1; c <= 4; c++) {
+        int leaf = factory_find_leaf_for_client(&f, c);
+        TEST_ASSERT(leaf >= 0, "found leaf for client");
+        /* Leaf should be a state node (3 or 5 in arity-2 with 5 participants) */
+        TEST_ASSERT(f.nodes[leaf].type == NODE_STATE, "leaf is state node");
+    }
+
+    /* LSP (client_idx=0) should return -1 */
+    TEST_ASSERT_EQ(factory_find_leaf_for_client(&f, 0), -1, "LSP returns -1");
+
+    /* Non-existent client returns -1 */
+    TEST_ASSERT_EQ(factory_find_leaf_for_client(&f, 99), -1, "invalid returns -1");
+
+    /* Clients 1,2 should share one leaf; 3,4 should share another */
+    int leaf1 = factory_find_leaf_for_client(&f, 1);
+    int leaf2 = factory_find_leaf_for_client(&f, 2);
+    int leaf3 = factory_find_leaf_for_client(&f, 3);
+    int leaf4 = factory_find_leaf_for_client(&f, 4);
+    TEST_ASSERT_EQ(leaf1, leaf2, "clients 1,2 same leaf");
+    TEST_ASSERT_EQ(leaf3, leaf4, "clients 3,4 same leaf");
+    TEST_ASSERT(leaf1 != leaf3, "different leaves for different pairs");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_factory_nav_variable_n — test navigation with N=3,7,9 participants */
+int test_factory_nav_variable_n(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    int test_ns[] = {3, 7, 9};
+    for (int t = 0; t < 3; t++) {
+        int n = test_ns[t];
+        secp256k1_keypair kps[FACTORY_MAX_SIGNERS];
+        for (int i = 0; i < n; i++) {
+            unsigned char sec[32];
+            memset(sec, (unsigned char)(0x10 + i), 32);
+            if (!secp256k1_keypair_create(ctx, &kps[i], sec)) return 0;
+        }
+
+        /* Compute funding spk */
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        for (int i = 0; i < n; i++)
+            if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, (size_t)n);
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return 0;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        musig_keyagg_t tmp = ka;
+        secp256k1_pubkey tw_pk;
+        if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &tmp.cache, tweak)) return 0;
+        secp256k1_xonly_pubkey tw_xo;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_pk)) return 0;
+        unsigned char fund_spk[34];
+        build_p2tr_script_pubkey(fund_spk, &tw_xo);
+
+        unsigned char fake_txid[32];
+        memset(fake_txid, 0xAA, 32);
+
+        factory_t f;
+        factory_init(&f, ctx, kps, (size_t)n, 2, 4);
+        factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+        TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+        /* Every client should find a leaf */
+        for (uint32_t c = 1; c < (uint32_t)n; c++) {
+            int leaf = factory_find_leaf_for_client(&f, c);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "n=%d client %u finds leaf", n, c);
+            TEST_ASSERT(leaf >= 0, msg);
+        }
+
+        /* Root subtree clients should be all n-1 clients */
+        uint32_t clients[FACTORY_MAX_SIGNERS];
+        size_t nc = factory_get_subtree_clients(&f, 0, clients, FACTORY_MAX_SIGNERS);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "n=%d root has %d clients", n, n - 1);
+        TEST_ASSERT_EQ(nc, (size_t)(n - 1), msg);
+
+        /* Path from any leaf to root should include root (node 0) */
+        if (f.n_leaf_nodes > 0) {
+            int leaf_idx = (int)f.leaf_node_indices[0];
+            int path[FACTORY_MAX_NODES];
+            size_t plen = factory_collect_path_to_root(&f, leaf_idx, path, FACTORY_MAX_NODES);
+            TEST_ASSERT(plen >= 1, "path non-empty");
+            TEST_ASSERT_EQ(path[0], 0, "path starts at root");
+        }
+
+        factory_free(&f);
+    }
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
