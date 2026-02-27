@@ -2031,3 +2031,147 @@ int test_regtest_funding_double_spend_rejected(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* === Partial Rotation Tests === */
+
+/* test_ladder_get_cooperative_clients — depart 2 of 4, verify list */
+int test_ladder_get_cooperative_clients(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Depart clients 1 and 3 (indices 1,3 in 1-based participant idx) */
+    unsigned char fake_key[32];
+    memset(fake_key, 0x11, 32);
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    memset(fake_key, 0x33, 32);
+    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+
+    uint32_t coop[8];
+    size_t n = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    TEST_ASSERT_EQ(n, 2, "2 cooperative");
+    /* Should be clients 1 and 3 */
+    int found1 = 0, found3 = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (coop[i] == 1) found1 = 1;
+        if (coop[i] == 3) found3 = 1;
+    }
+    TEST_ASSERT(found1, "found client 1");
+    TEST_ASSERT(found3, "found client 3");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_ladder_get_uncooperative_clients — same setup, verify complement */
+int test_ladder_get_uncooperative_clients(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Depart clients 1 and 3 */
+    unsigned char fake_key[32];
+    memset(fake_key, 0x11, 32);
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    memset(fake_key, 0x33, 32);
+    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+
+    uint32_t uncoop[8];
+    size_t n = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    TEST_ASSERT_EQ(n, 2, "2 uncooperative");
+    /* Should be clients 2 and 4 */
+    int found2 = 0, found4 = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (uncoop[i] == 2) found2 = 1;
+        if (uncoop[i] == 4) found4 = 1;
+    }
+    TEST_ASSERT(found2, "found client 2");
+    TEST_ASSERT(found4, "found client 4");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_ladder_can_partial_close_thresholds — 0/4=no, 1/4=no, 2/4=yes, 4/4=yes */
+int test_ladder_can_partial_close_thresholds(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    unsigned char fake_key[32];
+    memset(fake_key, 0xFF, 32);
+
+    /* 0 departed: no */
+    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "0/4: no partial close");
+
+    /* 1 departed: no */
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "1/4: no partial close");
+
+    /* 2 departed: yes */
+    ladder_record_key_turnover(&lad, 0, 2, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "2/4: partial close OK");
+
+    /* 3 departed: yes */
+    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "3/4: partial close OK");
+
+    /* 4 departed (all): yes (but full close would also work) */
+    ladder_record_key_turnover(&lad, 0, 4, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "4/4: partial close OK");
+    TEST_ASSERT(ladder_can_close(&lad, 0), "4/4: full close also OK");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -216,7 +216,8 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
                                  size_t n_departed,
                                  uint32_t created_block,
                                  uint32_t active_blocks,
-                                 uint32_t dying_blocks);
+                                 uint32_t dying_blocks,
+                                 int partial_rotation);
 
 /* --- DW counter state (Phase 23) --- */
 

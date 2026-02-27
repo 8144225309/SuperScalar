@@ -153,6 +153,7 @@ static const char *SCHEMA_SQL =
     "  created_block INTEGER,"
     "  active_blocks INTEGER,"
     "  dying_blocks INTEGER,"
+    "  partial_rotation INTEGER DEFAULT 0,"
     "  updated_at INTEGER"
     ");"
     /* Phase 23: Persistence Hardening */
@@ -1496,14 +1497,15 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
                                  size_t n_departed,
                                  uint32_t created_block,
                                  uint32_t active_blocks,
-                                 uint32_t dying_blocks) {
+                                 uint32_t dying_blocks,
+                                 int partial_rotation) {
     if (!p || !p->db) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO ladder_factories "
         "(factory_id, state, is_funded, is_initialized, n_departed, "
-        " created_block, active_blocks, dying_blocks, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " created_block, active_blocks, dying_blocks, partial_rotation, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -1517,7 +1519,8 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
     sqlite3_bind_int(stmt, 6, (int)created_block);
     sqlite3_bind_int(stmt, 7, (int)active_blocks);
     sqlite3_bind_int(stmt, 8, (int)dying_blocks);
-    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int(stmt, 9, partial_rotation);
+    sqlite3_bind_int64(stmt, 10, (sqlite3_int64)time(NULL));
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);

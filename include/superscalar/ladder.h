@@ -19,6 +19,8 @@ typedef struct {
     int client_departed[FACTORY_MAX_SIGNERS];     /* 1 if PTLC complete */
     unsigned char extracted_keys[FACTORY_MAX_SIGNERS][32]; /* revealed scalars */
     size_t n_departed;
+
+    int partial_rotation_done;   /* 1 = old factory retired via partial rotation */
 } ladder_factory_t;
 
 typedef struct {
@@ -77,6 +79,20 @@ int ladder_can_close(const ladder_t *lad, uint32_t factory_id);
 int ladder_build_close(ladder_t *lad, uint32_t factory_id,
                        tx_buf_t *close_tx_out,
                        const tx_output_t *outputs, size_t n_outputs);
+
+/* Get client indices that completed PTLC key turnover (departed).
+   Returns count written. */
+size_t ladder_get_cooperative_clients(const ladder_t *lad, uint32_t factory_id,
+                                      uint32_t *clients_out, size_t max);
+
+/* Get client indices that did NOT complete turnover.
+   Returns count written. */
+size_t ladder_get_uncooperative_clients(const ladder_t *lad, uint32_t factory_id,
+                                         uint32_t *clients_out, size_t max);
+
+/* Check if enough clients departed for a valid new factory (>= 2 clients).
+   Returns 1 if partial rotation is viable. */
+int ladder_can_partial_close(const ladder_t *lad, uint32_t factory_id);
 
 /* Remove all EXPIRED factories from the ladder array, compacting slots.
    Returns number of slots freed. */

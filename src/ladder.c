@@ -210,6 +210,53 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
     return ok;
 }
 
+size_t ladder_get_cooperative_clients(const ladder_t *lad, uint32_t factory_id,
+                                      uint32_t *clients_out, size_t max) {
+    if (!lad || !clients_out) return 0;
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        if (lad->factories[i].factory_id == factory_id) {
+            const ladder_factory_t *lf = &lad->factories[i];
+            size_t count = 0;
+            for (size_t j = 1; j < lf->factory.n_participants && count < max; j++) {
+                if (lf->client_departed[j])
+                    clients_out[count++] = (uint32_t)j;
+            }
+            return count;
+        }
+    }
+    return 0;
+}
+
+size_t ladder_get_uncooperative_clients(const ladder_t *lad, uint32_t factory_id,
+                                         uint32_t *clients_out, size_t max) {
+    if (!lad || !clients_out) return 0;
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        if (lad->factories[i].factory_id == factory_id) {
+            const ladder_factory_t *lf = &lad->factories[i];
+            size_t count = 0;
+            for (size_t j = 1; j < lf->factory.n_participants && count < max; j++) {
+                if (!lf->client_departed[j])
+                    clients_out[count++] = (uint32_t)j;
+            }
+            return count;
+        }
+    }
+    return 0;
+}
+
+int ladder_can_partial_close(const ladder_t *lad, uint32_t factory_id) {
+    if (!lad) return 0;
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        if (lad->factories[i].factory_id == factory_id) {
+            const ladder_factory_t *lf = &lad->factories[i];
+            /* Need >= 2 departed clients for a valid new factory
+               (LSP + 2 clients = 3 participants minimum) */
+            return lf->n_departed >= 2 ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
 size_t ladder_evict_expired(ladder_t *lad)
 {
     if (!lad) return 0;

@@ -1611,7 +1611,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->n_departed,
                                         lf->factory.created_block,
                                         lf->factory.active_blocks,
-                                        lf->factory.dying_blocks);
+                                        lf->factory.dying_blocks,
+                                        lf->partial_rotation_done);
                                 }
                                 /* Auto-broadcast distribution TX on EXPIRED */
                                 if (lf->cached_state == FACTORY_EXPIRED &&

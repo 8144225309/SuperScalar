@@ -352,6 +352,11 @@ extern int test_dw_cross_layer_delay_ordering(void);
 extern int test_ladder_full_rotation_cycle(void);
 extern int test_ladder_evict_and_reuse_slot(void);
 
+/* Partial Close */
+extern int test_ladder_get_cooperative_clients(void);
+extern int test_ladder_get_uncooperative_clients(void);
+extern int test_ladder_can_partial_close_thresholds(void);
+
 /* JIT Channel Fallback (Gap #2) */
 extern int test_last_message_time_update(void);
 extern int test_offline_detection_flag(void);
@@ -747,6 +752,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_dw_cross_layer_delay_ordering);
     RUN_TEST(test_ladder_full_rotation_cycle);
     RUN_TEST(test_ladder_evict_and_reuse_slot);
+
+    printf("\n=== Partial Close ===\n");
+    RUN_TEST(test_ladder_get_cooperative_clients);
+    RUN_TEST(test_ladder_get_uncooperative_clients);
+    RUN_TEST(test_ladder_can_partial_close_thresholds);
 
     printf("\n=== JIT Channel Fallback (Gap #2) ===\n");
     RUN_TEST(test_last_message_time_update);

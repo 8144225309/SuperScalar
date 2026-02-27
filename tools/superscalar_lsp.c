@@ -1454,7 +1454,7 @@ int main(int argc, char *argv[]) {
                 /* Save ladder factory state (Tier 2) */
                 persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
                     lsp.factory.created_block, lsp.factory.active_blocks,
-                    lsp.factory.dying_blocks);
+                    lsp.factory.dying_blocks, 0);
             }
             if (init_ok)
                 persist_commit(&db);
