@@ -514,6 +514,7 @@ extern int test_rotation_retry_defaults(void);
 extern int test_profit_settlement_calculation(void);
 extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
+extern int test_fee_accumulation_and_settlement(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -963,6 +964,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_profit_settlement_calculation);
     RUN_TEST(test_settlement_trigger_at_interval);
     RUN_TEST(test_on_close_includes_unsettled);
+    RUN_TEST(test_fee_accumulation_and_settlement);
 }
 
 extern int regtest_init_faucet(void);

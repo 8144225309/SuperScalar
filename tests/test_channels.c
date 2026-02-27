@@ -3110,3 +3110,81 @@ int test_cli_command_parsing(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Step 6: Verify fee accumulation + settlement end-to-end.
+   Simulates the routing fee deduction logic (lsp_channels.c:644-655)
+   and verifies accumulated_fees_sats feeds into settle_profits(). */
+int test_fee_accumulation_and_settlement(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.economic_mode = ECON_PROFIT_SHARED;
+    mgr.routing_fee_ppm = 1000; /* 0.1% = 1000 ppm */
+    mgr.settlement_interval_blocks = 144;
+    mgr.last_settlement_block = 100;
+
+    /* 2 channels, each with 100k sats balance */
+    mgr.n_channels = 2;
+    for (size_t i = 0; i < 2; i++) {
+        mgr.entries[i].channel.local_amount = 100000;
+        mgr.entries[i].channel.remote_amount = 100000;
+        mgr.entries[i].ready = 1;
+    }
+
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    f.economic_mode = ECON_PROFIT_SHARED;
+    f.n_participants = 3; /* LSP + 2 clients */
+    f.profiles[0].profit_share_bps = 5000; /* LSP: 50% */
+    f.profiles[1].profit_share_bps = 2500; /* Client 0: 25% */
+    f.profiles[2].profit_share_bps = 2500; /* Client 1: 25% */
+
+    /* Simulate 3 routed payments using the same formula as production code */
+    uint64_t payments_msat[] = { 1000000, 500000, 2000000 }; /* 1000, 500, 2000 sats */
+    uint64_t total_fee_sats = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t amount_msat = payments_msat[i];
+        uint64_t fee_msat = (amount_msat * mgr.routing_fee_ppm + 999999) / 1000000;
+        uint64_t fee_sats = (fee_msat + 999) / 1000;
+        mgr.accumulated_fees_sats += fee_sats;
+        total_fee_sats += fee_sats;
+    }
+
+    /* Verify fees accumulated (1000 ppm of 1000+500+2000 sats = ~3.5 sats) */
+    TEST_ASSERT(mgr.accumulated_fees_sats > 0, "fees accumulated");
+    TEST_ASSERT_EQ(mgr.accumulated_fees_sats, total_fee_sats,
+                   "accumulated matches sum of individual fees");
+
+    /* Verify settlement interval gate: too early (block 200, need 100+144=244) */
+    uint32_t current_height = 200;
+    int should_settle = (mgr.accumulated_fees_sats > 0 &&
+                         mgr.settlement_interval_blocks > 0 &&
+                         current_height - mgr.last_settlement_block >=
+                             mgr.settlement_interval_blocks);
+    TEST_ASSERT(!should_settle, "settlement not triggered before interval");
+
+    /* At interval boundary (block 244) */
+    current_height = 244;
+    should_settle = (mgr.accumulated_fees_sats > 0 &&
+                     mgr.settlement_interval_blocks > 0 &&
+                     current_height - mgr.last_settlement_block >=
+                         mgr.settlement_interval_blocks);
+    TEST_ASSERT(should_settle, "settlement triggered at interval");
+
+    /* Settle profits */
+    uint64_t pre_local_0 = mgr.entries[0].channel.local_amount;
+    uint64_t pre_remote_0 = mgr.entries[0].channel.remote_amount;
+    int settled = lsp_channels_settle_profits(&mgr, &f);
+    TEST_ASSERT(settled > 0, "settlement happened");
+    TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
+
+    /* Each client gets 2500 bps (25%) of accumulated fees */
+    uint64_t expected_share = (total_fee_sats * 2500) / 10000;
+    TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
+                   pre_remote_0 + expected_share,
+                   "client 0 received profit share");
+    TEST_ASSERT_EQ(mgr.entries[0].channel.local_amount,
+                   pre_local_0 - expected_share,
+                   "LSP local decreased by share");
+
+    return 1;
+}
