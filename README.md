@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 312 tests (273 unit + 39 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 314 tests (275 unit + 39 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -44,7 +44,7 @@ cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null ||
 
 ## Tests
 
-271 unit + 38 regtest integration tests (including 10 adversarial/edge-case tests).
+275 unit + 39 regtest integration tests (including 11 adversarial/edge-case tests).
 
 See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
 
@@ -392,6 +392,16 @@ superscalar_lsp [OPTIONS]
 | `--test-turnover` | — | off | PTLC key turnover, close with extracted keys |
 | `--test-rotation` | — | off | Full factory rotation lifecycle |
 | `--force-close` | — | off | Broadcast factory tree on-chain, wait for confirmations |
+| `--routing-fee-ppm` | N | 0 | Routing fee in parts-per-million (0 = free) |
+| `--lsp-balance-pct` | N | 50 | LSP's share of channel capacity (0-100) |
+| `--placement-mode` | MODE | sequential | Client placement: sequential / altruistic / greedy |
+| `--economic-mode` | MODE | lsp-takes-all | Fee model: lsp-takes-all / profit-shared |
+| `--default-profit-bps` | N | 0 | Default profit share per client (basis points) |
+| `--no-jit` | — | off | Disable JIT channel fallback |
+| `--jit-amount` | SATS | auto | Per-client JIT channel funding amount |
+| `--accept-timeout` | SECS | 0 | Max seconds to wait for each client to connect |
+| `--active-blocks` | N | 20/4320 | Factory active period in blocks |
+| `--dying-blocks` | N | 10/432 | Factory dying period in blocks |
 
 ### superscalar_client
 
@@ -432,6 +442,19 @@ superscalar_bridge [OPTIONS]
 | `--plugin-port` | PORT | 9736 | CLN plugin listen port |
 | `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
 | `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
+
+---
+
+## Documentation
+
+| Guide | Audience | What It Covers |
+|-------|----------|----------------|
+| [LSP Operator Guide](docs/lsp-operator-guide.md) | LSP operators | Full deployment: Bitcoin Core setup, key management, all CLI flags, economics config, crash recovery, CLN bridge, monitoring |
+| [Client User Guide](docs/client-user-guide.md) | End users | Connecting to an LSP, receiving payments, watchtower security, Tor, reconnection, troubleshooting |
+| [Demo Walkthrough](docs/demo-walkthrough.md) | Everyone | Step-by-step for every demo: automated (one-command), manual (subcommands), fully manual (individual binaries), test orchestrator |
+| [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
+| [Deployment & Coordination](docs/deployment-coordination.md) | Operators + Users | Multi-machine deployment, Tor setup, Lightning bridge, factory lifecycle, monitoring, security checklist |
+| [Improving the Demo](docs/improving-the-demo.md) | Contributors | What works, what's missing, prioritized ideas for better demos and testing, where to contribute |
 
 ---
 
@@ -562,6 +585,7 @@ CLN (lightningd)
 | `tor` | tor.c | SOCKS5 proxy client, Tor hidden service creation via control port |
 | `crypto_aead` | crypto_aead.c | AEAD encryption primitives |
 | `report` | report.c | JSON diagnostic report generation |
+| `ceremony` | ceremony.c | Factory creation ceremony: parallel client collection, timeout handling, quorum |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
