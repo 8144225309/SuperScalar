@@ -2,6 +2,7 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/lsp_channels.h"
+#include "superscalar/lsp_channels_internal.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -2356,5 +2357,99 @@ int test_partial_rotation_preserves_distribution_tx(void) {
 
     ladder_free(&lad);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Rotation retry: should_retry returns correct actions based on state. */
+int test_rotation_retry_backoff(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.rot_max_retries = 3;
+    mgr.rot_retry_base_delay = 10;
+
+    /* Not attempted → no action */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 100), 0,
+                   "no action before attempt");
+
+    /* First attempt failed at block 100 */
+    mgr.rot_attempted_mask |= (1u << 0);
+    lsp_rotation_record_failure(&mgr, 0, 100);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[0], 1, "count after first failure");
+    TEST_ASSERT_EQ(mgr.rot_last_attempt_block[0], 100, "block recorded");
+
+    /* Too early (block 105, need 100+10*2^1=120) */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 105), 0,
+                   "too early for retry");
+
+    /* Exactly at delay (block 120) — retry */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 120), 1,
+                   "retry at delay boundary");
+
+    /* Second failure at block 120 */
+    lsp_rotation_record_failure(&mgr, 0, 120);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[0], 2, "count after second failure");
+
+    /* Delay doubles: need 120 + 10*2^2 = 160 */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 150), 0,
+                   "too early for second retry");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 160), 1,
+                   "second retry at doubled delay");
+
+    /* Third failure → exhausted (count=3 >= max=3) */
+    lsp_rotation_record_failure(&mgr, 0, 160);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[0], 3, "count after third failure");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 999), -1,
+                   "exhausted → fallback");
+
+    /* After sentinel (count > max) → no action */
+    mgr.rot_retry_count[0] = 4;
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 999), 0,
+                   "past sentinel → no action");
+
+    return 1;
+}
+
+/* Rotation retry: success resets all state. */
+int test_rotation_retry_success_resets(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.rot_max_retries = 3;
+    mgr.rot_retry_base_delay = 10;
+
+    /* Simulate 2 failures then success */
+    mgr.rot_attempted_mask |= (1u << 2);
+    lsp_rotation_record_failure(&mgr, 2, 50);
+    lsp_rotation_record_failure(&mgr, 2, 80);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[2], 2, "count = 2 before success");
+
+    lsp_rotation_record_success(&mgr, 2);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[2], 0, "count reset on success");
+    TEST_ASSERT_EQ(mgr.rot_last_attempt_block[2], 0, "block reset on success");
+
+    return 1;
+}
+
+/* Rotation retry: default values used when fields are 0. */
+int test_rotation_retry_defaults(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    /* rot_max_retries = 0 → default 3, rot_retry_base_delay = 0 → default 10 */
+
+    mgr.rot_attempted_mask |= (1u << 1);
+    lsp_rotation_record_failure(&mgr, 1, 200);
+
+    /* Default delay: 10 * 2^1 = 20 blocks */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 215), 0,
+                   "default delay not elapsed");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 220), 1,
+                   "default delay elapsed");
+
+    /* Exhaust at default max 3 */
+    lsp_rotation_record_failure(&mgr, 1, 220);
+    lsp_rotation_record_failure(&mgr, 1, 280);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[1], 3, "count at default max");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 999), -1,
+                   "fallback at default max");
+
     return 1;
 }

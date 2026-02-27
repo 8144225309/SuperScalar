@@ -91,6 +91,12 @@ typedef struct {
     int rot_auto_rotate;           /* 1 = auto-rotate enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
+    /* Rotation retry with backoff */
+    uint8_t  rot_retry_count[8];        /* per-factory failure count (indexed by factory_id % 8) */
+    uint32_t rot_last_attempt_block[8]; /* block height of last failed attempt */
+    uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
+    uint32_t rot_retry_base_delay;      /* 0 = default (10 blocks); doubles per retry */
+
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
     size_t n_jit_channels;
@@ -99,6 +105,9 @@ typedef struct {
 
     /* Factory arity (Upgrade 2) */
     int leaf_arity;                /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
+
+    /* Interactive CLI in daemon loop */
+    int cli_enabled;               /* 1 = stdin commands (pay/status/rotate/close) */
 
     /* Configurable confirmation timeout */
     int confirm_timeout_secs;      /* 0 = use default (3600 regtest, 7200 non-regtest) */

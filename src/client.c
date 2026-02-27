@@ -1401,36 +1401,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         cJSON_Delete(reconn);
     }
 
-    /* 6. Recv MSG_RECONNECT_ACK */
-    {
-        wire_msg_t msg;
-        if (!wire_recv(fd, &msg) || msg.msg_type != MSG_RECONNECT_ACK) {
-            fprintf(stderr, "Client reconnect: expected RECONNECT_ACK, got 0x%02x\n",
-                    msg.msg_type);
-            if (msg.json) cJSON_Delete(msg.json);
-            wire_close(fd);
-            factory_free(&factory);
-            return 0;
-        }
-
-        uint32_t ack_channel_id;
-        uint64_t ack_local, ack_remote, ack_commit;
-        if (!wire_parse_reconnect_ack(msg.json, &ack_channel_id,
-                                        &ack_local, &ack_remote, &ack_commit)) {
-            fprintf(stderr, "Client reconnect: failed to parse RECONNECT_ACK\n");
-            cJSON_Delete(msg.json);
-            wire_close(fd);
-            factory_free(&factory);
-            return 0;
-        }
-        cJSON_Delete(msg.json);
-
-        printf("Client %u: reconnected (channel=%u, commit=%llu)\n",
-               my_index, ack_channel_id,
-               (unsigned long long)ack_commit);
-    }
-
-    /* 7. Load basepoints from persistence */
+    /* 6. Load basepoints from persistence */
     unsigned char local_secs[4][32];
     unsigned char remote_bps[4][33];
     if (!persist_load_basepoints(db, client_idx, local_secs, remote_bps)) {
@@ -1464,7 +1435,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     }
     memset(local_secs, 0, sizeof(local_secs));
 
-    /* 8. Overwrite channel state with persisted values */
+    /* 7. Overwrite channel state with persisted values */
     if (local_amount > 0 || remote_amount > 0) {
         channel.local_amount = local_amount;
         channel.remote_amount = remote_amount;
@@ -1477,7 +1448,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             channel_generate_local_pcs(&channel, cn);
     }
 
-    /* 9. Init nonce pool + exchange nonces */
+    /* 8. Nonce exchange — LSP sends CHANNEL_NONCES before RECONNECT_ACK */
     /* Receive LSP's pubnonces */
     {
         wire_msg_t msg;
@@ -1548,6 +1519,35 @@ int client_run_reconnect(secp256k1_context *ctx,
 
     printf("Client %u: nonce re-exchange complete (%zu nonces)\n",
            my_index, channel.remote_nonce_count);
+
+    /* 9. Recv MSG_RECONNECT_ACK (sent by LSP after nonce exchange) */
+    {
+        wire_msg_t msg;
+        if (!wire_recv(fd, &msg) || msg.msg_type != MSG_RECONNECT_ACK) {
+            fprintf(stderr, "Client reconnect: expected RECONNECT_ACK, got 0x%02x\n",
+                    msg.msg_type);
+            if (msg.json) cJSON_Delete(msg.json);
+            wire_close(fd);
+            factory_free(&factory);
+            return 0;
+        }
+
+        uint32_t ack_channel_id;
+        uint64_t ack_local, ack_remote, ack_commit;
+        if (!wire_parse_reconnect_ack(msg.json, &ack_channel_id,
+                                        &ack_local, &ack_remote, &ack_commit)) {
+            fprintf(stderr, "Client reconnect: failed to parse RECONNECT_ACK\n");
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            factory_free(&factory);
+            return 0;
+        }
+        cJSON_Delete(msg.json);
+
+        printf("Client %u: reconnected (channel=%u, commit=%llu)\n",
+               my_index, ack_channel_id,
+               (unsigned long long)ack_commit);
+    }
 
     /* 10. Call channel callback */
     int cb_ret = 0;

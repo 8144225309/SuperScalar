@@ -22,6 +22,42 @@ extern void hex_encode(const unsigned char *, size_t, char *);
 extern int hex_decode(const char *, unsigned char *, size_t);
 extern void reverse_bytes(unsigned char *, size_t);
 
+/* --- Rotation retry helpers --- */
+
+int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
+                              uint32_t factory_id, uint32_t cur_height) {
+    if (!(mgr->rot_attempted_mask & (1u << factory_id)))
+        return 0;  /* never attempted */
+    uint32_t idx = factory_id % 8;
+    uint32_t retries = mgr->rot_retry_count[idx];
+    uint32_t max_ret = mgr->rot_max_retries > 0 ? mgr->rot_max_retries : 3;
+    if (retries > max_ret)
+        return 0;   /* fallback already done */
+    if (retries >= max_ret)
+        return -1;  /* exhausted — time for fallback */
+    /* Exponential backoff: base * 2^retries blocks */
+    uint32_t base = mgr->rot_retry_base_delay > 0 ? mgr->rot_retry_base_delay : 10;
+    uint32_t delay = base * (1u << retries);
+    if (cur_height >= mgr->rot_last_attempt_block[idx] + delay)
+        return 1;   /* enough blocks elapsed — retry now */
+    return 0;        /* waiting for backoff */
+}
+
+void lsp_rotation_record_failure(lsp_channel_mgr_t *mgr,
+                                 uint32_t factory_id, uint32_t cur_height) {
+    uint32_t idx = factory_id % 8;
+    mgr->rot_retry_count[idx]++;
+    mgr->rot_last_attempt_block[idx] = cur_height;
+}
+
+void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
+    uint32_t idx = factory_id % 8;
+    mgr->rot_retry_count[idx] = 0;
+    mgr->rot_last_attempt_block[idx] = 0;
+}
+
+/* --- Factory rotation --- */
+
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp || !mgr->ladder) return 0;
 
@@ -480,6 +516,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     uint64_t saved_funding_sats = mgr->rot_funding_sats;
     int saved_auto_rotate = mgr->rot_auto_rotate;
     uint32_t saved_attempted_mask = mgr->rot_attempted_mask;
+    uint8_t  saved_retry_count[8];
+    uint32_t saved_last_attempt_block[8];
+    uint32_t saved_max_retries = mgr->rot_max_retries;
+    uint32_t saved_retry_base_delay = mgr->rot_retry_base_delay;
+    memcpy(saved_retry_count, mgr->rot_retry_count, sizeof(saved_retry_count));
+    memcpy(saved_last_attempt_block, mgr->rot_last_attempt_block,
+           sizeof(saved_last_attempt_block));
 
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
@@ -507,6 +550,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->rot_funding_sats = saved_funding_sats;
     mgr->rot_auto_rotate = saved_auto_rotate;
     mgr->rot_attempted_mask = saved_attempted_mask;
+    memcpy(mgr->rot_retry_count, saved_retry_count, sizeof(saved_retry_count));
+    memcpy(mgr->rot_last_attempt_block, saved_last_attempt_block,
+           sizeof(saved_last_attempt_block));
+    mgr->rot_max_retries = saved_max_retries;
+    mgr->rot_retry_base_delay = saved_retry_base_delay;
     mgr->jit_channels = saved_jit;
     mgr->n_jit_channels = saved_n_jit;
     mgr->jit_enabled = saved_jit_enabled;

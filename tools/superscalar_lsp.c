@@ -49,6 +49,7 @@ static void usage(const char *prog) {
         "  --seckey HEX        LSP secret key (32-byte hex, default: deterministic)\n"
         "  --payments N        Number of HTLC payments to process (default 0)\n"
         "  --daemon            Run as long-lived daemon (Ctrl+C for graceful close)\n"
+        "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
@@ -448,6 +449,7 @@ int main(int argc, char *argv[]) {
     int n_clients = 4;
     int n_payments = 0;
     int daemon_mode = 0;
+    int cli_mode = 0;
     int demo_mode = 0;
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
@@ -506,6 +508,8 @@ int main(int argc, char *argv[]) {
             report_path = argv[++i];
         else if (strcmp(argv[i], "--daemon") == 0)
             daemon_mode = 1;
+        else if (strcmp(argv[i], "--cli") == 0)
+            cli_mode = 1;
         else if (strcmp(argv[i], "--demo") == 0)
             demo_mode = 1;
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
@@ -1030,6 +1034,7 @@ int main(int argc, char *argv[]) {
             mgr.rot_funding_sats = funding_sats;
             mgr.rot_auto_rotate = 1;
             mgr.rot_attempted_mask = 0;
+            mgr.cli_enabled = cli_mode;
 
             /* JIT Channel Fallback */
             jit_channels_init(&mgr);
@@ -1679,6 +1684,7 @@ int main(int argc, char *argv[]) {
         mgr.rot_funding_sats = funding_sats;
         mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
         mgr.rot_attempted_mask = 0;
+        mgr.cli_enabled = cli_mode;
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(&mgr);
