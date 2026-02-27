@@ -16,7 +16,7 @@ Point-in-time snapshot from 2026-02-27 at commit `5366261`.
 | Regtest integration (`--regtest`) | 41 | 41/41 PASS |
 | **Total automated** | **360** | **360/360 PASS** |
 
-### Orchestrator Scenarios (17/17 PASS)
+### Orchestrator Scenarios (20/20 PASS)
 
 Multi-process adversarial tests using real Bitcoin Core regtest. Each scenario
 launches separate LSP + client processes, creates a real factory on-chain, and
@@ -41,6 +41,9 @@ exercises a specific failure or lifecycle path.
 | `client_crash_htlc` | Client crashes during payment, LSP continues operating | PASS |
 | `mass_departure_jit` | 3/4 clients vanish, remaining client still functional | PASS |
 | `watchtower_late_arrival` | Breach confirmed while offline, clients detect on restart | PASS |
+| `routing_fee` | Factory with routing fees; verify fee deduction in balances | PASS |
+| `cli_payments` | Interactive CLI; pipe pay/status/close to LSP stdin | PASS |
+| `profit_shared` | Profit-shared economics; fees accumulated + settled | PASS |
 
 ### LSP Test Flags (4/4 PASS)
 
@@ -136,7 +139,7 @@ this gap — but only if it's actually runnable.
 | Watchtower (late detection) | Y | Y | Y | - | No |
 | CPFP penalty bump | Y | Y | - | - | No |
 | Routing fee (ppm = 0, default) | Y | Y | Y | - | No |
-| Routing fee (ppm > 0) | Y | - | - | - | **YES** |
+| Routing fee (ppm > 0) | Y | - | Y | - | No |
 | LSP balance % = 50 (default) | Y | Y | Y | - | No |
 | LSP balance % != 50 | Y | - | - | - | Low |
 
@@ -174,8 +177,8 @@ this gap — but only if it's actually runnable.
 | Noise NN handshake | Y | - | - | - | Low |
 | Noise NK handshake | Y | Y | Y | - | No |
 | Encrypted keyfile (AES-256-GCM) | Y | - | - | - | Low |
-| Tor hidden service (`--onion`) | - | - | - | - | **YES** |
-| Tor proxy (`--tor-proxy`) | - | - | - | - | **YES** |
+| Tor hidden service (`--onion`) | - | - | - | - | Low |
+| Tor proxy (`--tor-proxy`) | Y | - | - | - | Low |
 
 ### CLN Bridge
 
@@ -196,13 +199,13 @@ this gap — but only if it's actually runnable.
 | Placement: inward | Y | - | - | - | Low |
 | Placement: outward | Y | - | - | - | Low |
 | Economic: lsp-takes-all (default) | Y | Y | Y | - | No |
-| Economic: profit-shared | Y | - | - | - | **YES** |
+| Economic: profit-shared | Y | - | Y | - | No |
 | Arity: 2 (default, paired leaves) | Y | Y | Y | - | No |
 | Arity: 1 (single client per leaf) | Y | Y | - | - | Low |
 | Large factory (N = 8, 12, 16) | Y | - | - | - | Low |
 | Daemon mode | - | Y | Y | - | No |
 | Demo mode | - | Y | Y | Y | No |
-| Interactive CLI (`--cli`) | - | - | - | - | **YES** |
+| Interactive CLI (`--cli`) | - | - | Y | - | No |
 | Settlement interval tuning | Y | - | - | - | Low |
 
 ---
@@ -212,50 +215,20 @@ this gap — but only if it's actually runnable.
 These features have no end-to-end coverage. They either lack integration tests
 entirely or have only unit-level math tests with no multi-process verification.
 
-### 1. Interactive CLI (`--cli`)
+### 1. Interactive CLI (`--cli`) — CLOSED
 
-**Status:** Implemented and documented, but zero automated tests.
+**Status:** Orchestrator scenario `cli_payments` pipes `status`, `pay`, and
+`close` commands to LSP stdin and verifies each is processed.
 
-**What exists:** The `--cli` flag enables an interactive stdin command parser in
-daemon mode. Commands: `pay <from> <to> <amount>`, `status`, `rotate`, `close`,
-`help`.
+### 2. Routing Fees (ppm > 0) — CLOSED
 
-**What's missing:** No test exercises the parser. The orchestrator could pipe
-commands to LSP stdin via a subprocess stdin handle.
+**Status:** Orchestrator scenario `routing_fee` starts LSP with
+`--routing-fee-ppm 100` and verifies fee deduction evidence in logs/report.
 
-**Effort:** Low. Add a `scenario_cli_payments` to the orchestrator that:
-1. Starts LSP with `--daemon --cli`
-2. After factory creation, writes `pay 1 2 1000\n` to LSP stdin
-3. Writes `status\n` and checks output
-4. Writes `close\n` and waits for exit
+### 3. Profit-Shared Economics — CLOSED
 
-### 2. Routing Fees (ppm > 0)
-
-**Status:** Unit-tested fee calculation math. No end-to-end payment with actual
-fee deduction.
-
-**What's missing:** An orchestrator scenario that starts the LSP with
-`--routing-fee-ppm 100` and verifies that after a payment, channel balances
-reflect the fee deduction.
-
-**Effort:** Low. Add `--routing-fee-ppm 100` to the `cooperative_close` scenario
-and verify balance asymmetry in the LSP report.
-
-### 3. Profit-Shared Economics
-
-**Status:** Unit tests verify settlement calculations, epoch-based fee
-accumulation, and per-client basis-point distributions.
-
-**What's missing:** No multi-process demo showing a full cycle: factory creation
-→ payments → fee accumulation → settlement trigger → balance redistribution.
-
-**Effort:** Medium. New orchestrator scenario:
-```
---daemon --economic-mode profit-shared --default-profit-bps 5000
---settlement-interval 5 --active-blocks 20
-```
-Run payments, mine 5 blocks to trigger settlement, verify client balances
-increased by their share.
+**Status:** Orchestrator scenario `profit_shared` runs LSP in profit-shared
+mode with short settlement interval and verifies settlement/fee evidence.
 
 ### 4. Signet / Testnet
 
@@ -273,21 +246,11 @@ different timing constants, real block waiting). The orchestrator supports
 **Effort:** Medium. The orchestrator already supports `--network signet`. The
 blockers are: (a) signet wallet must be pre-funded, (b) runs take 30+ minutes.
 
-### 5. Tor Integration
+### 5. Tor Integration — PARTIALLY CLOSED
 
-**Status:** Code exists for `--onion` (create Tor hidden service), `--tor-proxy`
-(SOCKS5 proxy), and `--tor-control` (Tor control port for dynamic onion
-creation). Completely untested.
-
-**What's missing:** Everything. No unit tests, no integration tests, no manual
-verification.
-
-**Effort:** High. Needs a Docker container with:
-- Tor daemon (control port enabled)
-- Bitcoin Core (regtest)
-- SuperScalar binaries
-- Test that creates an onion service, connects a client through it, runs a
-  payment
+**Status:** Unit tests exist for `tor_parse_proxy_arg()` (normal + edge cases)
+and a SOCKS5 mock server test in `test_bridge.c`. Full integration (Tor daemon
++ hidden service creation + routed payment) still needs a Docker container.
 
 ### 6. Multi-Hop Lightning
 
@@ -320,43 +283,29 @@ through real TCP/Noise connections.
 | Encrypted keyfile | Low | AES-256-GCM tested; the file I/O wrapper is trivial |
 | Partial rotation (2/4) | Low | 3/4 is tested in regtest; 2/4 uses the same code path with different threshold |
 | Path-scoped signing | Medium | Optimizes signing for subtree-only re-signing; unit-tested but not exercised in real factories |
+| Tor proxy (SOCKS5) | Low | tor_parse_proxy_arg + SOCKS5 mock tested in test_bridge.c |
+| Tor hidden service | Medium | tor_create_hidden_service untested; needs live Tor daemon |
 
 ---
 
-## Orchestrator Improvements
+## Orchestrator Improvements — COMPLETED
 
-### Auto-Fund Wallet (Priority 1)
+### Auto-Fund Wallet — DONE
 
-The orchestrator requires a pre-funded regtest environment. If the
-`superscalar_lsp` wallet doesn't exist or has insufficient balance, the LSP
-exits with code 1 and no useful error appears in the orchestrator output.
+`Orchestrator.__init__` now auto-funds both `orchestrator` and
+`superscalar_lsp` wallets when running on regtest. No manual wallet setup
+required.
 
-**Fix:** Add to `Orchestrator.__init__` (when regtest):
-```python
-if self.is_regtest:
-    self.chain.ensure_wallet("superscalar_lsp")
-    balance = self.chain.get_balance("superscalar_lsp")
-    if balance < 0.01:
-        addr, _ = self.chain.get_address("superscalar_lsp")
-        self.chain.mine_blocks(101, addr)
-```
+### Demo Script RPC Auth — DONE
 
-### Demo Script RPC Auth (Priority 2)
+All three demo scripts (`demo.sh`, `run_demo.sh`, `manual_demo.sh`) now accept
+`RPCUSER` and `RPCPASSWORD` environment variables. When set, these are injected
+into all `bitcoin-cli` calls and forwarded to LSP/client invocations.
 
-`demo.sh`, `run_demo.sh`, and `manual_demo.sh` assume default Bitcoin Core
-cookie authentication. Environments with explicit `rpcuser`/`rpcpassword`
-(like our WSL setup) fail at the `bitcoin-cli -regtest getblockchaininfo`
-check.
+### CRLF Line Endings — DONE
 
-**Fix:** Accept `--rpcuser` / `--rpcpassword` arguments in demo scripts and
-pass them to both `bitcoin-cli` calls and LSP/client invocations.
-
-### CRLF Line Endings
-
-Scripts written on Windows get CRLF line endings. Running them in WSL with
-`bash script.sh` produces `$'\r': command not found` errors. Either:
-- Add `.gitattributes` with `*.sh text eol=lf`
-- Or run `sed 's/\r$//'` before execution (current workaround)
+`.gitattributes` enforces LF line endings for `*.sh`, `*.py`, `*.yml`, `*.yaml`,
+`*.json`, `*.md`, `*.c`, and `*.h` files.
 
 ---
 
@@ -417,54 +366,57 @@ The SQLite persistence layer stores everything needed for crash recovery:
 - Crash recovery (LSP and client restart with persistent DB)
 - Encrypted transport (Noise NK with pinned server pubkey)
 - Bridge to CLN (inbound + outbound Lightning payments)
+- Profit-shared economics (orchestrator scenario with settlement verification)
+- Interactive CLI (orchestrator scenario piping stdin commands)
+- Routing fee deduction (orchestrator scenario with ppm > 0)
 
 ### Partially Proven (unit-tested logic, not full e2e)
 
-- Profit-shared economics (fee accumulation + settlement math works)
 - Placement optimization (inward/outward sort functions work)
 - Large factories (N=16 tree construction works)
 - Arity-1 trees (single client per leaf, 3 DW layers)
 - Epoch reset (cooperative DW counter reset)
 - Path-scoped signing (subtree-only re-signing optimization)
+- Tor SOCKS5 proxy (unit-tested parse + mock; no live Tor daemon)
 
 ### Not Yet Tested
 
 - Signet/testnet operation (real block timing, real faucet funding)
-- Tor hidden services (onion address creation, SOCKS5 proxy routing)
+- Tor hidden services (onion address creation via control port)
 - Multi-hop Lightning routing (beyond single bridge hop)
-- Interactive CLI in production (stdin command parser)
 
 ---
 
 ## Recommended Next Steps (Priority Order)
 
-### Immediate (< 1 day each)
+### Completed
 
-1. **Add `.gitattributes`** — `*.sh text eol=lf` to prevent CRLF issues
-2. **Orchestrator auto-fund** — `mine_blocks(101)` in init, eliminate manual setup
-3. **Routing fee e2e test** — add `--routing-fee-ppm 100` to orchestrator scenario
-4. **CLI stdin test** — orchestrator scenario that pipes commands to `--cli`
+1. ~~**Add `.gitattributes`**~~ — DONE
+2. ~~**Orchestrator auto-fund**~~ — DONE
+3. ~~**Routing fee e2e test**~~ — DONE (`routing_fee` scenario)
+4. ~~**CLI stdin test**~~ — DONE (`cli_payments` scenario)
+5. ~~**Demo script RPC auth**~~ — DONE (env var support in all 3 scripts)
+6. ~~**Profit-shared scenario**~~ — DONE (`profit_shared` scenario)
+7. ~~**Docker image**~~ — DONE (Dockerfile + docker-compose.yml + entrypoint)
+8. ~~**Tor unit tests**~~ — DONE (parse_proxy_arg + SOCKS5 mock in test_bridge.c)
 
 ### Short-term (1-3 days each)
 
-5. **Demo script RPC auth** — accept `--rpcuser`/`--rpcpassword` in all demo scripts
-6. **Profit-shared scenario** — new orchestrator scenario with real settlements
-7. **Signet smoke test** — slow CI job running `cooperative_close` on signet
-8. **Docker image** — Dockerfile for one-command demo without build dependencies
+1. **Signet smoke test** — slow CI job running `cooperative_close` on signet
 
 ### Medium-term (1-2 weeks each)
 
-9. **Fuzz testing** — wire protocol parsing, transaction serialization, persist loading
-10. **Coverage measurement** — `gcov`/`lcov` integration, identify untested code paths
-11. **Bridge end-to-end** — `test_bridge_regtest.sh` with real CLN nodes (CLN binaries required)
-12. **Property-based testing** — DW state machine and MuSig2 signing with random inputs
+2. **Fuzz testing** — wire protocol parsing, transaction serialization, persist loading
+3. **Coverage measurement** — `gcov`/`lcov` integration, identify untested code paths
+4. **Bridge end-to-end** — `test_bridge_regtest.sh` with real CLN nodes (CLN binaries required)
+5. **Property-based testing** — DW state machine and MuSig2 signing with random inputs
 
 ### Long-term (1+ month)
 
-13. **Tor integration testing** — Docker container with Tor daemon + full scenario
-14. **Multi-hop routing** — protocol-level work for cross-LSP payments
-15. **Pre-built release binaries** — CI workflow for Linux/macOS/Windows artifacts
-16. **Signet long-running test** — factory that lives through multiple rotation cycles
+6. **Tor full integration** — Docker container with Tor daemon + hidden service test
+7. **Multi-hop routing** — protocol-level work for cross-LSP payments
+8. **Pre-built release binaries** — CI workflow for Linux/macOS/Windows artifacts
+9. **Signet long-running test** — factory that lives through multiple rotation cycles
 
 ---
 
@@ -474,10 +426,9 @@ The SQLite persistence layer stores everything needed for crash recovery:
 |-------|------|------:|---------|
 | Unit | `test_superscalar --unit` | 319 | ~2 seconds |
 | Regtest | `test_superscalar --regtest` | 41 | ~60 seconds |
-| Orchestrator | `test_orchestrator.py --scenario all` | 17 | ~15 minutes |
+| Orchestrator | `test_orchestrator.py --scenario all` | 20 | ~18 minutes |
 | LSP flags | Manual (rotation, distrib, turnover, force-close) | 4 | ~5 minutes |
 | Demo scripts | `run_demo.sh --basic/--breach/--rotation` | 3 | ~3 minutes |
 | CI | GitHub Actions (Linux + macOS + sanitizers + cppcheck) | 4 jobs | ~5 minutes |
-| **Total** | | **384+** | **~25 minutes** |
-
-All 384 tests pass as of commit `5366261`.
+| Docker | `docker run superscalar unit/test/demo` | 3 modes | varies |
+| **Total** | | **387+** | **~28 minutes** |

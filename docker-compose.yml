@@ -1,0 +1,4 @@
+services:
+  superscalar:
+    build: .
+    command: demo

@@ -1,0 +1,9 @@
+# Enforce LF line endings for scripts and config
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf

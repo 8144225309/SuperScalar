@@ -81,6 +81,11 @@ AMOUNT=100000
 NETWORK="regtest"
 CLI_ARGS="-regtest"
 
+# RPC authentication (optional — falls back to cookie auth)
+if [ -n "$RPCUSER" ]; then
+    CLI_ARGS="$CLI_ARGS -rpcuser=$RPCUSER -rpcpassword=${RPCPASSWORD:-}"
+fi
+
 LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
 LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
@@ -234,9 +239,13 @@ run_lsp_clients() {
     local label="$2"
     local lsp_pid c1_pid c2_pid c3_pid c4_pid
 
+    LSP_RPC=""
+    if [ -n "$RPCUSER" ]; then
+        LSP_RPC="--rpcuser $RPCUSER --rpcpassword ${RPCPASSWORD:-}"
+    fi
     step "Starting LSP: $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT $lsp_flags"
     $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
-        --seckey $LSP_SECKEY $lsp_flags &
+        --seckey $LSP_SECKEY $lsp_flags $LSP_RPC &
     lsp_pid=$!
     PIDS+=($lsp_pid)
     sleep 2
@@ -274,9 +283,13 @@ run_client_breach() {
     local lsp_pid c_pids=()
 
     # Start LSP with --cheat-daemon (demo + breach + sleep, no LSP watchtower)
+    LSP_RPC=""
+    if [ -n "$RPCUSER" ]; then
+        LSP_RPC="--rpcuser $RPCUSER --rpcpassword ${RPCPASSWORD:-}"
+    fi
     step "Starting LSP with --cheat-daemon..."
     $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
-        --seckey $LSP_SECKEY --demo --cheat-daemon &
+        --seckey $LSP_SECKEY --demo --cheat-daemon $LSP_RPC &
     lsp_pid=$!
     PIDS+=($lsp_pid)
     sleep 2

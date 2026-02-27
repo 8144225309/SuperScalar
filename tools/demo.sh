@@ -28,6 +28,12 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
 PORT=9735
 
+# RPC authentication (optional — falls back to cookie auth)
+RPC_ARGS=""
+if [ -n "$RPCUSER" ]; then
+    RPC_ARGS="-rpcuser=$RPCUSER -rpcpassword=${RPCPASSWORD:-}"
+fi
+
 # LSP key (deterministic for demo — secp256k1 generator key)
 LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
 LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -69,7 +75,7 @@ if [ ! -f "$LSP_BIN" ] || [ ! -f "$CLIENT_BIN" ]; then
 fi
 
 # Check bitcoind
-if ! bitcoin-cli -regtest getblockchaininfo >/dev/null 2>&1; then
+if ! bitcoin-cli -regtest $RPC_ARGS getblockchaininfo >/dev/null 2>&1; then
     echo "ERROR: bitcoind not running with -regtest"
     exit 1
 fi
@@ -88,7 +94,11 @@ echo "    - Run a scripted payment sequence"
 echo "    - Cooperatively close the factory"
 echo ""
 
-$LSP_BIN --regtest --port $PORT --clients 4 --amount 100000 --seckey $LSP_SECKEY --demo &
+LSP_RPC=""
+if [ -n "$RPCUSER" ]; then
+    LSP_RPC="--rpcuser $RPCUSER --rpcpassword ${RPCPASSWORD:-}"
+fi
+$LSP_BIN --regtest --port $PORT --clients 4 --amount 100000 --seckey $LSP_SECKEY --demo $LSP_RPC &
 LSP_PID=$!
 sleep 2
 

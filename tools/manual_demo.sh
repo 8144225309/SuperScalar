@@ -36,6 +36,11 @@ AMOUNT=100000
 NETWORK="regtest"
 CLI_ARGS="-regtest"
 
+# RPC authentication (optional — falls back to cookie auth)
+if [ -n "$RPCUSER" ]; then
+    CLI_ARGS="$CLI_ARGS -rpcuser=$RPCUSER -rpcpassword=${RPCPASSWORD:-}"
+fi
+
 LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
 LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
@@ -116,8 +121,12 @@ cmd_start_lsp() {
         exit 1
     fi
 
+    LSP_RPC=""
+    if [ -n "$RPCUSER" ]; then
+        LSP_RPC="--rpcuser $RPCUSER --rpcpassword ${RPCPASSWORD:-}"
+    fi
     $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
-        --seckey $LSP_SECKEY --db "$LSP_DB" --daemon &
+        --seckey $LSP_SECKEY --db "$LSP_DB" --daemon $LSP_RPC &
     LSP_PID=$!
     echo "$LSP_PID" > "$LSP_PID_FILE"
     ok "LSP started (PID $LSP_PID, DB: $LSP_DB)"
