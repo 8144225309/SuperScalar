@@ -1,4 +1,4 @@
-# SuperScalar Testing Guide
+# Testing Guide
 
 How to build, run, and understand the full test suite.
 
@@ -18,7 +18,7 @@ brew install cmake
 # (SQLite3 ships with Xcode command line tools)
 ```
 
-For **regtest integration tests** you also need Bitcoin Core (28.x+):
+For **regtest integration tests** you also need Bitcoin Core (25+):
 
 ```bash
 # Download from https://bitcoincore.org/en/download/
@@ -52,10 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 273 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5 |
-| Regtest integration | 28 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery |
-| Adversarial regtest | 11 | Yes | Fund safety under attack: breach penalties, HTLC edge cases, timeout recovery, DW exhaustion, wrong preimage rejection, double-spend rejection |
-| **Total** | **312** | | |
+| Unit tests | 275 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement |
+| Regtest integration | 39 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery |
+| **Total** | **314** | | |
 
 ---
 
@@ -68,13 +67,14 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 273/273 passed`
+Expected output: `Results: 275/275 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
 with HTLCs, penalty construction, wire protocol serialization, SQLite
 persistence, watchtower logic, CLN bridge messages, Tor SOCKS5 protocol,
-NK-authenticated Noise handshakes, and more.
+NK-authenticated Noise handshakes, client placement strategies, ceremony
+state machines, distributed state advances, and profit settlement.
 
 ---
 
@@ -130,215 +130,170 @@ sleep 3
 
 ---
 
+## Unit Test Suites
+
+### Core Crypto
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| DW State Machine | 8 | nSequence odometer: layer init, delay calculation, advance, exhaustion |
+| MuSig2 | 6 | Key aggregation, sign/verify, wrong message rejection, taproot signing |
+| MuSig2 Split-Round | 6 | Split-round protocol, nonce pools, partial sig verification, 5-of-5 |
+| Transaction Builder | 5 | P2TR output scripts, unsigned tx serialization, witness finalization, varint |
+| Tapscript | 6 | Leaf hashing, tree tweaking, control blocks, sighash, CLTV timeout scripts |
+| Shachain | 2 | Shachain generation, derivation property |
+| Adaptor Signatures | 3 | Adaptor round-trip, invalid pre-sig, taproot adaptor |
+
+### Factory
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Factory Tree | 3 | Build tree, sign all nodes, advance state |
+| Factory Split-Round | 3 | Step-by-step split-round, pool-based signing, advance with split-round |
+| Factory Shachain | 3 | L-output burn path, burn tx construction, advance with shachain |
+| Variable-N Tree | 4 | Tree construction for N=3, 7, 9, 16 clients |
+| Arity-1 Leaves | 8 | Per-client leaves: build, outputs, sign, advance, independence, coop close |
+| Arity-1 Hardening | 6 | CLTV ordering, min funding rejection, input amounts, split-round, persistence |
+| Tree Navigation | 6 | Path-to-root, subtree clients, leaf lookup, variable-N, timeout spend |
+| Epoch/Leaf | 8 | Counter reset, epoch reset, left/right leaf advance, independence, exhaustion |
+| Placement + Economics | 5 | Sequential/altruistic/greedy placement, profile wire round-trip, bps validation |
+| Nonce Pool Integration | 3 | Pool-based factory creation, exhaustion handling, participant node counts |
+| Subtree-Scoped Signing | 4 | Path session init, path rebuild, path signing, advance+rebuild path |
+
+### Channels
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Channel (Poon-Dryja) | 6 | Key derivation, commitment tx, signing, update, revocation, penalty |
+| HTLC | 9 | Offered/received scripts, control blocks, add/fulfill/fail, commitment tx with HTLCs, success/timeout spend, penalty sweep |
+| Cooperative Close | 3 | Factory close, close with balances, channel close |
+| Channel Operations | 4 | Wire message round-trip, LSP channel init, fee policy, channel framing |
+
+### Wire Protocol & Networking
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Wire Protocol | 7 | Pubkey-only factory, framing, crypto serialization, nonce/psig bundles, close unsigned, distributed signing |
+| Wire Hardening | 4 | Oversized frame rejection, CLTV delta, truncated header/body, zero-length frame |
+| Wire Hostname + Tor | 5 | Hostname connect, .onion rejection without proxy, proxy arg parsing, SOCKS5 mock |
+| CLN Bridge | 10 | Message round-trip, hello handshake, invoice registry, inbound/outbound flow, unknown hash, forward registration, NK pubkey, HTLC timeout |
+| Encrypted Transport | 5 | ChaCha20-Poly1305, HMAC-SHA256, Noise handshake, encrypted wire, tamper rejection |
+
+### Persistence & Recovery
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Persistence | 8 | Open/close, channel round-trip, revocation, HTLC save/load/delete, factory, nonce pool, multi-channel |
+| Persistence Hardening | 6 | DW counter, departed clients, invoice, HTLC origin, client invoice, counter round-trip |
+| Schema Validation | 4 | Version check, future version rejection, factory load validation, channel load validation |
+| Persistence Stress | 2 | Crash stress (10 cycles with HTLC mutations), DW state crash recovery |
+
+### Security & Watchtower
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Security Hardening | 5 | Secure zero, plaintext rejection, nonce stability, FD table growth, channel near-exhaustion |
+| Watchtower + Fees | 7 | Fee init, penalty tx fee, factory tx fee, null estimator, watch+check, old commitment persistence, raw tx API |
+| Client Watchtower | 7 | Init, bidirectional revocation, revoked commitment watch, LSP revoke-and-ack wire, factory node watch, combined entries, HTLC penalty |
+| CPFP Anchor | 5 | Penalty anchor, HTLC penalty anchor, pending tracking, fee update, anchor init |
+| CPFP Audit | 4 | Sign-complete check, witness offset, retry bump, pending persistence |
+
+### Production Hardening
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Ceremony State Machine | 4 | Parallel client collection, timeout handling, quorum check, state transitions |
+| Distributed Advances | 2 | Distributed epoch reset, arity-2 leaf advance (3-signer ceremony) |
+| Production Hardening | 3 | Distribution TX P2A anchor, ceremony retry with exclusion, funding reserve check |
+| Profit Settlement | 3 | Settlement calculation, trigger conditions, unsettled share on close |
+
+### JIT Channels, Lifecycle, Demos
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| JIT Channel | 19 | Wire round-trips, channel init/find, ID collision, routing, fallback, persistence, migrate lifecycle, state conversion |
+| JIT Hardening | 8 | Watchtower registration/revocation/cleanup, persist reload, multiple channels/indices, funding confirmation |
+| Factory Lifecycle | 4 | States, queries, distribution tx, distribution tx default |
+| Ladder Manager | 4 | Create factories, state transitions, key turnover+close, overlapping |
+| Ladder Hardening | 5 | Partial departure, restructure, DW cross-layer delay, full rotation, evict and reuse |
+| Partial Close | 7 | Cooperative/uncooperative clients, thresholds, 3of4/2of4 rotation, preserves distribution tx |
+| Continuous Ladder | 3 | Evict expired, rotation trigger, context save/restore |
+| Demo Polish | 3 | Invoice wire, preimage fulfills, balance reporting |
+| Daemon Mode | 3 | Invoice registration, daemon event loop, client auto-fulfill |
+| Reconnection | 4 | Wire format, pubkey matching, nonce re-exchange, persist+reload |
+| Network Mode | 3 | Regtest init, mode flag, block height |
+
+---
+
 ## Adversarial Tests: What Each One Proves
 
-These 11 tests are the most important from a security perspective. They run
-as part of `--regtest` (under the "Adversarial & Edge-Case Tests" and
-"Security Model Gap Tests" headers). Here's what each one does and why it
-matters:
+These 11 tests run as part of `--regtest` and are the most important from a security perspective.
 
 ### 1. `test_regtest_dw_exhaustion_close`
 
-**Question:** What happens when the Decker-Wattenhofer state machine runs
-out of states?
+**Question:** What happens when the DW state machine runs out of states?
 
-**What it does:** Creates a factory, burns through all DW states (15 advances
-with the default 2-layer x 4-state counter), confirms that the 16th advance
-is refused, then cooperatively closes the factory anyway.
-
-**Why it matters:** A factory that can't advance is stuck, but it must not
-lose funds. This proves the factory degrades gracefully and cooperative close
-still works even when DW is exhausted.
+Burns through all 15 DW advances, confirms the 16th is refused, then cooperatively closes. Proves the factory degrades gracefully without losing funds.
 
 ### 2. `test_regtest_htlc_timeout_race`
 
-**Question:** If both a preimage reveal and a timeout happen at the same
-block height, who wins?
+**Question:** If both a preimage reveal and a timeout are possible, who wins?
 
-**What it does:** Creates a channel with an HTLC, mines to the exact CLTV
-expiry height, then tries to broadcast both the success tx (with preimage)
-and the timeout tx. Only one can spend the HTLC output.
-
-**Why it matters:** This is a protocol correctness edge case. The success
-path must win because the payer already released the preimage — allowing
-the timeout would steal funds. The test proves the success tx confirms and
-the timeout tx is rejected.
+Creates an HTLC, mines to exact CLTV expiry, broadcasts both success and timeout. The success path must win — allowing timeout would steal funds from the recipient.
 
 ### 3. `test_regtest_penalty_with_htlcs`
 
-**Question:** Can the watchtower punish a breach that happened during an
-active payment?
+**Question:** Can the watchtower penalize a breach during an active payment?
 
-**What it does:** Sets up a channel, adds an HTLC (so the commitment has
-3 outputs: to_local, to_remote, and HTLC), advances to the next state, then
-broadcasts the revoked commitment. The watchtower must build and broadcast
-TWO penalty transactions: one sweeping to_local and one sweeping the HTLC.
-
-**Why it matters:** Most breach tests only cover 2-output commitments. In
-practice, breaches can happen when HTLCs are in flight. If the watchtower
-can't sweep HTLC outputs, the cheater keeps those funds.
+Broadcasts a revoked commitment with 3 outputs (to_local + to_remote + HTLC). Watchtower must sweep both to_local AND the HTLC output with separate penalty transactions.
 
 ### 4. `test_regtest_multi_htlc_unilateral`
 
-**Question:** When a commitment tx with multiple HTLCs is broadcast, can
-each HTLC be resolved independently?
+**Question:** Can multiple concurrent HTLCs be resolved independently?
 
-**What it does:** Creates a channel with 2 HTLCs (one received, one offered),
-broadcasts the commitment tx, resolves HTLC #1 via the preimage success
-path, mines past the CLTV timeout, then resolves HTLC #2 via the timeout
-path.
-
-**Why it matters:** Real channels carry multiple concurrent payments. This
-proves that each HTLC output is independently spendable and the two
-resolution paths (success vs timeout) don't interfere with each other.
+Creates 2 HTLCs, broadcasts commitment, resolves one via preimage and the other via timeout. Proves HTLC outputs are independently spendable.
 
 ### 5. `test_regtest_watchtower_late_detection`
 
-**Question:** What if the watchtower wasn't running when the breach happened?
+**Question:** What if the watchtower missed the breach when it happened?
 
-**What it does:** Creates a channel, revokes commitment #0, broadcasts the
-revoked commitment, mines 3 blocks so it's fully confirmed — all BEFORE
-the watchtower checks. Then the watchtower scans the chain, detects the
-breach, and broadcasts a penalty tx.
-
-**Why it matters:** A watchtower that only works if it sees the breach in
-real-time is useless. This proves late detection works — the watchtower
-can come online hours later and still punish.
+Broadcasts revoked commitment, mines 3 blocks, THEN runs the watchtower check. Watchtower detects it in the chain and still broadcasts a penalty.
 
 ### 6. `test_regtest_ptlc_no_coop_close`
 
-**Question:** What if the LSP gets all client keys via PTLC turnover and
-then disappears?
+**Question:** What if the LSP extracts all keys and then disappears?
 
-**What it does:** Creates a full factory (LSP + 4 clients), performs PTLC
-key turnover (the LSP extracts all client private keys via adaptor sigs),
-then the LSP refuses to cooperatively close. After mining past the CLTV
-timeout, the pre-signed distribution tx is broadcast as a fallback.
-
-**Why it matters:** PTLC turnover is the most trust-sensitive operation in
-the protocol. Even after the LSP has every client's key, the nLockTime
-fallback guarantees clients get their funds back. No trust required.
+Performs PTLC key turnover, LSP refuses to close cooperatively. After CLTV timeout, the distribution TX confirms. Proves clients get funds back even when the LSP has all keys.
 
 ### 7. `test_regtest_all_offline_recovery`
 
-**Question:** What if every client disappears and never comes back?
+**Question:** What if all clients disappear forever?
 
-**What it does:** Creates a full factory, then does nothing — all clients
-are "offline." After mining past the CLTV timeout, the distribution tx is
-broadcast. Verifies that the tx has N+1 outputs (one per participant) and
-each output is P2TR to the correct key.
-
-**Why it matters:** The worst-case scenario for a channel factory is total
-client abandonment. This proves the LSP can recover its own funds AND that
-client funds are preserved (the LSP can't steal them because outputs are
-locked to client keys).
+Creates factory, all clients are offline. After CLTV timeout, distribution TX recovers all funds with correct per-participant outputs.
 
 ### 8. `test_regtest_tree_ordering`
 
-**Question:** Can someone skip intermediate tree nodes and broadcast a leaf
-directly?
+**Question:** Can someone skip tree nodes and broadcast a leaf directly?
 
-**What it does:** Builds the full 6-node factory tree, then broadcasts
-each node in the correct order (root to leaf), mining between each to
-satisfy nSequence. Verifies all 6 transactions confirm in sequence.
-
-**Why it matters:** The factory tree enforces a broadcast order — each
-node's input is the previous node's output. Skipping a node is impossible
-because the input doesn't exist on-chain. This test verifies consensus
-enforces the tree structure.
-
-> **Note:** This test runs last and may print `SKIP: regtest subsidy
-> exhausted` if the chain has mined too many blocks (regtest halves every
-> 150 blocks). This is normal — the test passes cleanly on a fresh chain.
+Broadcasts all 6 factory tree nodes in correct order, each with proper nSequence delay. All confirm. Proves consensus enforces the tree structure.
 
 ### 9. `test_regtest_watchtower_mempool_detection`
 
-**Question:** Can the watchtower detect a breach before the tx confirms?
+**Question:** Can breaches be detected before confirmation?
 
-**What it does:** Broadcasts a revoked commitment, then runs the watchtower
-check before mining. The watchtower detects the breach in the mempool and
-builds a penalty tx.
-
-**Why it matters:** Early detection gives more time to react. A watchtower
-that only detects confirmed breaches is one block behind.
+Broadcasts revoked commitment, runs watchtower before mining. Watchtower detects the breach in the mempool.
 
 ### 10. `test_regtest_htlc_wrong_preimage_rejected`
 
-**Question:** Does the script-path HTLC success path reject a wrong preimage?
+**Question:** Does the HTLC script reject the wrong preimage?
 
-**What it does:** Creates a channel with an HTLC, then broadcasts the
-commitment tx and attempts to spend the HTLC output with an incorrect
-preimage. Bitcoin consensus (`OP_SHA256 OP_EQUALVERIFY`) rejects the spend.
-
-**Why it matters:** HTLC security depends on the hash lock. If the wrong
-preimage could satisfy the script, anyone could steal in-flight payments.
+Attempts to spend an HTLC with an incorrect preimage. Bitcoin consensus (`OP_SHA256 OP_EQUALVERIFY`) rejects the spend.
 
 ### 11. `test_regtest_funding_double_spend_rejected`
 
-**Question:** Can a cooperatively-closed factory be attacked by replaying
-the old factory tree?
+**Question:** Can old factory tree txs be replayed after cooperative close?
 
-**What it does:** Creates a factory, cooperatively closes it (spending the
-funding UTXO), then attempts to broadcast the kickoff transaction from the
-old tree. Bitcoin consensus rejects the double-spend.
-
-**Why it matters:** After cooperative close, the factory tree transactions
-must be permanently invalid. If they weren't, the LSP or a client could
-reopen the old tree and claim funds twice.
-
----
-
-## Running Demos
-
-The demo scripts are the easiest way to see SuperScalar in action without
-reading test code. They start bitcoind, fund a wallet, launch the LSP + 4
-clients, and run through scenarios with colored output.
-
-```bash
-cd SuperScalar
-
-# Basic: factory + payments + cooperative close (~30 seconds)
-bash tools/run_demo.sh --basic
-
-# Breach: + watchtower detects breach, broadcasts penalty (~60 seconds)
-bash tools/run_demo.sh --breach
-
-# Rotation: + PTLC turnover + factory ladder rotation (~2 minutes)
-bash tools/run_demo.sh --rotation
-
-# All three in sequence
-bash tools/run_demo.sh --all
-```
-
-The demo runner handles all pre-flight checks and cleanup. If bitcoind
-isn't running, it starts one.
-
----
-
-## Test Orchestrator
-
-The orchestrator (`tools/test_orchestrator.py`) runs multi-process scenarios
-where the LSP and clients are separate OS processes communicating over TCP.
-This tests the wire protocol, process crash recovery, and multi-party
-failure modes.
-
-```bash
-# List available scenarios
-python3 tools/test_orchestrator.py --list
-
-# Run specific scenarios
-python3 tools/test_orchestrator.py --scenario all_watch          # All 4 clients detect breach
-python3 tools/test_orchestrator.py --scenario partial_watch --k 2  # 2 of 4 detect
-python3 tools/test_orchestrator.py --scenario nobody_home        # No clients, breach undetected
-python3 tools/test_orchestrator.py --scenario late_arrival       # Clients restart after breach
-python3 tools/test_orchestrator.py --scenario cooperative_close  # Clean shutdown
-python3 tools/test_orchestrator.py --scenario timeout_expiry     # LSP reclaims via CLTV
-python3 tools/test_orchestrator.py --scenario factory_breach     # Old factory tree broadcast
-python3 tools/test_orchestrator.py --scenario all                # Run all scenarios
-```
-
-Requirements: a built `build/` directory with `superscalar_lsp` and
-`superscalar_client` binaries, plus `bitcoind -regtest` running.
+Closes factory cooperatively (spending the funding UTXO), then broadcasts old kickoff tx. Bitcoin consensus rejects the double-spend.
 
 ---
 
@@ -351,7 +306,6 @@ cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
 make -j$(nproc)
 
-# Run with leak detector suppressed (known codebase-wide leaks in test cleanup)
 ASAN_OPTIONS=detect_leaks=0 ./test_superscalar --unit
 ASAN_OPTIONS=detect_leaks=0 ./test_superscalar --regtest
 ```
@@ -361,53 +315,99 @@ error or UB will cause an immediate abort with a stack trace.
 
 ---
 
-## Reading the Test Code
+## Writing New Tests
 
-If you want to understand the protocol by reading tests, here's a suggested
-order — each test builds on concepts from the previous ones:
+### Unit Test Pattern
 
-### Start here (foundations)
+Tests live in `tests/test_*.c` and are registered in `tests/test_main.c`.
 
-| File | Test | What you learn |
-|------|------|---------------|
-| `tests/test_dw.c` | `test_dw_advance` | How the DW state machine works (nSequence odometer) |
-| `tests/test_musig.c` | `test_musig_sign_verify` | MuSig2 key aggregation and signing |
-| `tests/test_tx.c` | `test_build_p2tr_tx` | How transactions are built and signed |
-| `tests/test_tapscript.c` | `test_timeout_tapscript` | CLTV timeout script-path construction |
+```c
+// In tests/test_yourmodule.c
+#include "superscalar/yourmodule.h"
+#include <stdio.h>
+#include <string.h>
 
-### Then channels
+#define TEST_ASSERT(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        return 0; \
+    } \
+} while(0)
 
-| File | Test | What you learn |
-|------|------|---------------|
-| `tests/test_channel.c` | `test_build_commitment_tx` | Poon-Dryja commitment structure |
-| `tests/test_channel.c` | `test_channel_penalty_tx` | Revocation and penalty sweeps |
-| `tests/test_channel.c` | `test_htlc_success_tx` | HTLC resolution via preimage |
-| `tests/test_channel.c` | `test_htlc_timeout_tx` | HTLC resolution via timeout |
+#define TEST_ASSERT_EQ(a, b, msg) do { \
+    if ((a) != (b)) { \
+        printf("  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
+               __func__, __LINE__, msg, (long)(a), (long)(b)); \
+        return 0; \
+    } \
+} while(0)
 
-### Then factory
+int test_your_feature(void) {
+    your_struct_t s;
+    memset(&s, 0, sizeof(s));
 
-| File | Test | What you learn |
-|------|------|---------------|
-| `tests/test_factory.c` | `test_factory_build_tree` | 6-node timeout-sig-tree structure |
-| `tests/test_factory.c` | `test_factory_sign_tree` | Cooperative MuSig2 signing of tree |
-| `tests/test_factory.c` | `test_factory_advance` | DW state advance within factory |
-| `tests/test_factory.c` | `test_factory_coop_close` | Single-tx cooperative close |
+    int result = your_function(&s, 42);
 
-### Then bridge + Tor
+    TEST_ASSERT(result == 1, "should succeed");
+    TEST_ASSERT_EQ(s.field, 42, "field set correctly");
 
-| File | Test | What you learn |
-|------|------|---------------|
-| `tests/test_bridge.c` | `test_bridge_msg_round_trip` | Bridge wire message serialization (all 8 MSG_BRIDGE_* types) |
-| `tests/test_bridge.c` | `test_lsp_inbound_via_bridge` | Invoice registry, origin tracking, fulfill back-propagation |
-| `tests/test_bridge.c` | `test_tor_socks5_mock` | SOCKS5 protocol bytes (greeting, CONNECT, tunnel echo) via mock server |
-| `tests/test_bridge.c` | `test_regtest_bridge_nk_handshake` | NK Noise handshake + encrypted messages over real TCP |
-| `tests/test_bridge.c` | `test_regtest_bridge_payment` | Full bridge payment: factory → register invoice → HTLC → fulfill → verify |
+    return 1;  // 1 = pass, 0 = fail
+}
+```
 
-### Then the adversarial tests
+Register in `test_main.c`:
 
-Read these after you understand channels and factories. They're in
-`tests/test_channel.c`, `tests/test_factory.c`, `tests/test_ladder.c`,
-and `tests/test_regtest.c` — grep for `Adversarial Test` to find them.
+```c
+// Add extern declaration near the top
+extern int test_your_feature(void);
+
+// Add to run_unit_tests()
+printf("\n=== Your Module ===\n");
+RUN_TEST(test_your_feature);
+```
+
+Add the source file to `CMakeLists.txt`:
+
+```cmake
+add_executable(test_superscalar
+    ...existing files...
+    tests/test_yourmodule.c
+)
+```
+
+### Regtest Test Pattern
+
+Regtest tests use the `regtest_t` helper struct:
+
+```c
+int test_regtest_your_scenario(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) return 0;
+
+    // Fund, build, sign, broadcast, mine, verify
+    // ...
+
+    regtest_cleanup(&rt);
+    return 1;
+}
+```
+
+Register in `test_main.c` inside `run_regtest_tests()`.
+
+---
+
+## Running Demos
+
+See [demo-walkthrough.md](demo-walkthrough.md) for a full walkthrough of every demo scenario.
+
+Quick version:
+
+```bash
+bash tools/run_demo.sh --basic       # Factory + payments + close (~30s)
+bash tools/run_demo.sh --breach      # + watchtower penalty (~60s)
+bash tools/run_demo.sh --rotation    # + factory rotation (~2min)
+bash tools/run_demo.sh --all         # All scenarios
+```
 
 ---
 
