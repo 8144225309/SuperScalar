@@ -347,6 +347,7 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
 }
 
 int wire_recv(int fd, wire_msg_t *msg) {
+    msg->json = NULL;
     unsigned char header[4];
     if (!read_all(fd, header, 4)) return 0;
 
