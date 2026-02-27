@@ -316,6 +316,9 @@ extern int test_persist_crash_stress(void);
 extern int test_persist_crash_dw_state(void);
 extern int test_regtest_crash_double_recovery(void);
 
+/* TCP Reconnection Integration */
+extern int test_regtest_tcp_reconnect(void);
+
 /* Client Watchtower (Bidirectional Revocation) */
 extern int test_client_watchtower_init(void);
 extern int test_bidirectional_revocation(void);
@@ -499,6 +502,11 @@ extern int test_arity2_leaf_advance(void);
 extern int test_distribution_tx_has_anchor(void);
 extern int test_ceremony_retry_excludes_timeout(void);
 extern int test_funding_reserve_check(void);
+
+/* Rotation Retry with Backoff tests */
+extern int test_rotation_retry_backoff(void);
+extern int test_rotation_retry_success_resets(void);
+extern int test_rotation_retry_defaults(void);
 
 /* Profit Settlement tests */
 extern int test_profit_settlement_calculation(void);
@@ -943,6 +951,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ceremony_retry_excludes_timeout);
     RUN_TEST(test_funding_reserve_check);
 
+    printf("\n=== Rotation Retry with Backoff ===\n");
+    RUN_TEST(test_rotation_retry_backoff);
+    RUN_TEST(test_rotation_retry_success_resets);
+    RUN_TEST(test_rotation_retry_defaults);
+
     printf("\n=== Profit Settlement ===\n");
     RUN_TEST(test_profit_settlement_calculation);
     RUN_TEST(test_settlement_trigger_at_interval);
@@ -992,6 +1005,9 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);
     RUN_TEST(test_regtest_crash_double_recovery);
+
+    printf("\n=== Regtest TCP Reconnection ===\n");
+    RUN_TEST(test_regtest_tcp_reconnect);
 
     printf("\n=== Regtest CPFP Anchor (P2A) ===\n");
     RUN_TEST(test_regtest_cpfp_penalty_bump);

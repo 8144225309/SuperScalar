@@ -2713,3 +2713,323 @@ int test_regtest_crash_double_recovery(void) {
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
 }
+
+/* ---- TCP Reconnection Integration Test ----
+   Proves that a client can disconnect (process kill = real TCP close)
+   and reconnect over real TCP with MSG_RECONNECT protocol.
+   This is the single most important gap identified in the production roadmap. */
+
+int test_regtest_tcp_reconnect(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: regtest not available\n");
+        return 0;
+    }
+    if (!regtest_create_wallet(&rt, "test_tcp_reconn")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_tcp_reconn\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_tcp_reconn", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "balance for funding");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    unsigned char preimage[32] = { [0 ... 31] = 0x77 };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    int port = 19600 + (getpid() % 1000);
+
+    payment_test_data_t sender_data, payee_data, idle_data;
+    memcpy(sender_data.payment_hash, payment_hash, 32);
+    memset(sender_data.preimage, 0, 32);
+    sender_data.is_sender = 1;
+    sender_data.payment_done = 0;
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+    payee_data.is_sender = 0;
+    payee_data.payment_done = 0;
+    memset(&idle_data, 0, sizeof(idle_data));
+
+    /* Fork 4 client processes */
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (unsigned)(c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
+                _exit(1);
+            void *cb_data;
+            if (c == 0) cb_data = &sender_data;
+            else if (c == 1) cb_data = &payee_data;
+            else cb_data = &idle_data;
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", port,
+                                               payment_client_cb, cb_data);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    /* Parent: run LSP — factory creation + channels + one payment */
+    lsp_t lsp;
+    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    int lsp_ok = 1;
+
+    if (!lsp_accept_clients(&lsp)) {
+        fprintf(stderr, "LSP: accept clients failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_run_factory_creation(&lsp, funding_txid, funding_vout,
+                                             funding_amount, fund_spk, 34,
+                                             10, 4, 0)) {
+        fprintf(stderr, "LSP: factory creation failed\n");
+        lsp_ok = 0;
+    }
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+        fprintf(stderr, "LSP: channel init failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        fprintf(stderr, "LSP: basepoint exchange failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        fprintf(stderr, "LSP: send channel_ready failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Process one payment: ADD_HTLC from sender + FULFILL from payee */
+    if (lsp_ok && !lsp_channels_run_event_loop(&ch_mgr, &lsp, 2)) {
+        fprintf(stderr, "LSP: event loop failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Record client B channel state before disconnect */
+    uint64_t pre_local = ch_mgr.entries[1].channel.local_amount;
+    uint64_t pre_remote = ch_mgr.entries[1].channel.remote_amount;
+    uint64_t pre_commit = ch_mgr.entries[1].channel.commitment_number;
+    printf("LSP: pre-reconnect B: local=%llu remote=%llu commit=%llu\n",
+           (unsigned long long)pre_local, (unsigned long long)pre_remote,
+           (unsigned long long)pre_commit);
+
+    /* === KILL CLIENT B — real TCP close via SIGKILL === */
+    if (lsp_ok) {
+        printf("LSP: === KILLING CLIENT B (pid %d) ===\n", child_pids[1]);
+        kill(child_pids[1], SIGKILL);
+        int wst;
+        waitpid(child_pids[1], &wst, 0);
+        child_pids[1] = -1;
+
+        if (lsp.client_fds[1] >= 0) {
+            wire_close(lsp.client_fds[1]);
+            lsp.client_fds[1] = -1;
+        }
+        ch_mgr.entries[1].offline_detected = 1;
+        printf("LSP: client B killed, fd closed\n");
+    }
+
+    /* === Fork new client B that reconnects over real TCP === */
+    pid_t reconn_pid = -1;
+    if (lsp_ok) {
+        reconn_pid = fork();
+        if (reconn_pid == 0) {
+            /* Reconnect child */
+            usleep(200000);
+            secp256k1_context *rc = test_ctx();
+            secp256k1_keypair rk;
+            if (!secp256k1_keypair_create(rc, &rk, seckeys[2])) _exit(10);
+            secp256k1_pubkey rp;
+            secp256k1_keypair_pub(rc, &rp, &rk);
+
+            int rfd = wire_connect("127.0.0.1", port);
+            if (rfd < 0) _exit(11);
+            if (!wire_noise_handshake_initiator(rfd, rc)) { wire_close(rfd); _exit(12); }
+
+            cJSON *rm = wire_build_reconnect(rc, &rp, pre_commit);
+            if (!wire_send(rfd, MSG_RECONNECT, rm)) { cJSON_Delete(rm); wire_close(rfd); _exit(13); }
+            cJSON_Delete(rm);
+
+            /* Recv CHANNEL_NONCES */
+            wire_msg_t nm;
+            if (!wire_recv(rfd, &nm) || nm.msg_type != MSG_CHANNEL_NONCES) {
+                if (nm.json) cJSON_Delete(nm.json);
+                wire_close(rfd); _exit(14);
+            }
+            uint32_t nch;
+            unsigned char ln[MUSIG_NONCE_POOL_MAX][66];
+            size_t lnc;
+            if (!wire_parse_channel_nonces(nm.json, &nch, ln, MUSIG_NONCE_POOL_MAX, &lnc)) {
+                cJSON_Delete(nm.json); wire_close(rfd); _exit(15);
+            }
+            cJSON_Delete(nm.json);
+
+            /* Generate + send client nonces */
+            unsigned char cn[MUSIG_NONCE_POOL_MAX][66];
+            for (size_t i = 0; i < lnc; i++) {
+                secp256k1_musig_secnonce sn; secp256k1_musig_pubnonce pn;
+                musig_keyagg_t nk; secp256k1_pubkey np[2] = {pks[0], rp};
+                musig_aggregate_keys(rc, &nk, np, 2);
+                musig_generate_nonce(rc, &sn, &pn, seckeys[2], &rp, &nk.cache);
+                musig_pubnonce_serialize(rc, cn[i], &pn);
+            }
+            cJSON *nr = wire_build_channel_nonces(1, (const unsigned char (*)[66])cn, lnc);
+            if (!wire_send(rfd, MSG_CHANNEL_NONCES, nr)) { cJSON_Delete(nr); wire_close(rfd); _exit(16); }
+            cJSON_Delete(nr);
+
+            /* Recv RECONNECT_ACK */
+            wire_msg_t am;
+            if (!wire_recv(rfd, &am) || am.msg_type != MSG_RECONNECT_ACK) {
+                if (am.json) cJSON_Delete(am.json);
+                wire_close(rfd); _exit(17);
+            }
+            uint32_t aci; uint64_t al, ar, ac;
+            if (!wire_parse_reconnect_ack(am.json, &aci, &al, &ar, &ac)) {
+                cJSON_Delete(am.json); wire_close(rfd); _exit(18);
+            }
+            cJSON_Delete(am.json);
+            printf("Reconnect child: ACK ok (ch=%u commit=%llu)\n", aci, (unsigned long long)ac);
+            if (aci != 1) _exit(19);
+
+            wire_close(rfd);
+            secp256k1_context_destroy(rc);
+            _exit(0);
+        }
+    }
+
+    /* Parent: accept and handle reconnection */
+    if (lsp_ok && reconn_pid > 0) {
+        int nfd = wire_accept(lsp.listen_fd);
+        if (nfd < 0) { fprintf(stderr, "LSP: accept reconnect failed\n"); lsp_ok = 0; }
+
+        if (lsp_ok && !wire_noise_handshake_responder(nfd, ctx)) {
+            fprintf(stderr, "LSP: reconnect noise hs failed\n"); wire_close(nfd); lsp_ok = 0;
+        }
+
+        if (lsp_ok && !lsp_channels_handle_reconnect(&ch_mgr, &lsp, nfd)) {
+            fprintf(stderr, "LSP: handle_reconnect failed\n"); lsp_ok = 0;
+        }
+
+        if (lsp_ok) {
+            TEST_ASSERT(lsp.client_fds[1] >= 0, "client B fd reconnected");
+            TEST_ASSERT_EQ((long)ch_mgr.entries[1].channel.local_amount,
+                            (long)pre_local, "local preserved");
+            TEST_ASSERT_EQ((long)ch_mgr.entries[1].channel.remote_amount,
+                            (long)pre_remote, "remote preserved");
+            TEST_ASSERT_EQ((long)ch_mgr.entries[1].channel.commitment_number,
+                            (long)pre_commit, "commit preserved");
+            TEST_ASSERT_EQ(ch_mgr.entries[1].offline_detected, 0,
+                            "offline cleared");
+            printf("LSP: client B reconnected over real TCP — state verified!\n");
+        }
+    }
+
+    /* Wait for reconnect child */
+    if (reconn_pid > 0) {
+        int rs;
+        waitpid(reconn_pid, &rs, 0);
+        if (!WIFEXITED(rs) || WEXITSTATUS(rs) != 0) {
+            fprintf(stderr, "Reconnect child failed (exit %d)\n",
+                    WIFEXITED(rs) ? WEXITSTATUS(rs) : -1);
+            lsp_ok = 0;
+        }
+    }
+
+    lsp_cleanup(&lsp);
+
+    /* Kill remaining children (blocked on close ceremony) */
+    for (int c = 0; c < 4; c++) {
+        if (child_pids[c] <= 0) continue;
+        kill(child_pids[c], SIGKILL);
+        int s; waitpid(child_pids[c], &s, 0);
+    }
+
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(lsp_ok, "TCP reconnect over real network");
+    return 1;
+}
