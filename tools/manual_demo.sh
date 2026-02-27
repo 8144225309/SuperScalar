@@ -36,6 +36,9 @@ AMOUNT=100000
 NETWORK="regtest"
 CLI_ARGS="-regtest"
 
+LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
+LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
 CLIENT_KEYS=(
     "2222222222222222222222222222222222222222222222222222222222222222"
     "3333333333333333333333333333333333333333333333333333333333333333"
@@ -114,7 +117,7 @@ cmd_start_lsp() {
     fi
 
     $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
-        --db "$LSP_DB" --daemon &
+        --seckey $LSP_SECKEY --db "$LSP_DB" --daemon &
     LSP_PID=$!
     echo "$LSP_PID" > "$LSP_PID_FILE"
     ok "LSP started (PID $LSP_PID, DB: $LSP_DB)"
@@ -138,7 +141,8 @@ cmd_start_clients() {
         fi
 
         $CLIENT_BIN --seckey "${CLIENT_KEYS[$i]}" --port $PORT \
-            --network $NETWORK --db "$CLIENT_DB" --daemon &
+            --network $NETWORK --db "$CLIENT_DB" --daemon \
+            --lsp-pubkey $LSP_PUBKEY &
         C_PID=$!
         echo "$C_PID" > "$CLIENT_PID_FILE"
         ok "Client $i started (PID $C_PID, DB: $CLIENT_DB)"

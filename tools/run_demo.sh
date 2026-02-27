@@ -81,6 +81,9 @@ AMOUNT=100000
 NETWORK="regtest"
 CLI_ARGS="-regtest"
 
+LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
+LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
 CLIENT1_KEY="2222222222222222222222222222222222222222222222222222222222222222"
 CLIENT2_KEY="3333333333333333333333333333333333333333333333333333333333333333"
 CLIENT3_KEY="4444444444444444444444444444444444444444444444444444444444444444"
@@ -232,19 +235,20 @@ run_lsp_clients() {
     local lsp_pid c1_pid c2_pid c3_pid c4_pid
 
     step "Starting LSP: $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT $lsp_flags"
-    $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT $lsp_flags &
+    $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
+        --seckey $LSP_SECKEY $lsp_flags &
     lsp_pid=$!
     PIDS+=($lsp_pid)
     sleep 2
 
     step "Starting 4 clients..."
-    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --network $NETWORK --daemon &
+    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
     c1_pid=$!; PIDS+=($c1_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --network $NETWORK --daemon &
+    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
     c2_pid=$!; PIDS+=($c2_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --network $NETWORK --daemon &
+    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
     c3_pid=$!; PIDS+=($c3_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --network $NETWORK --daemon &
+    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
     c4_pid=$!; PIDS+=($c4_pid)
 
     wait_for_pid "$lsp_pid" "$label"
@@ -272,7 +276,7 @@ run_client_breach() {
     # Start LSP with --cheat-daemon (demo + breach + sleep, no LSP watchtower)
     step "Starting LSP with --cheat-daemon..."
     $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
-        --demo --cheat-daemon &
+        --seckey $LSP_SECKEY --demo --cheat-daemon &
     lsp_pid=$!
     PIDS+=($lsp_pid)
     sleep 2
@@ -284,7 +288,7 @@ run_client_breach() {
         local logfile="$log_dir/client_${i}.log"
         > "$logfile"  # truncate
         $CLIENT_BIN --seckey ${!keyvar} --port $PORT --network $NETWORK \
-            --daemon > "$logfile" 2>&1 &
+            --lsp-pubkey $LSP_PUBKEY --daemon > "$logfile" 2>&1 &
         c_pids+=($!)
         PIDS+=(${c_pids[-1]})
         sleep 0.3

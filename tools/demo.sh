@@ -28,6 +28,10 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
 PORT=9735
 
+# LSP key (deterministic for demo — secp256k1 generator key)
+LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
+LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
 # Client secret keys (deterministic for demo)
 CLIENT1_KEY="2222222222222222222222222222222222222222222222222222222222222222"
 CLIENT2_KEY="3333333333333333333333333333333333333333333333333333333333333333"
@@ -84,24 +88,24 @@ echo "    - Run a scripted payment sequence"
 echo "    - Cooperatively close the factory"
 echo ""
 
-$LSP_BIN --regtest --port $PORT --clients 4 --amount 100000 --demo &
+$LSP_BIN --regtest --port $PORT --clients 4 --amount 100000 --seckey $LSP_SECKEY --demo &
 LSP_PID=$!
 sleep 2
 
 echo "  Starting 4 clients in daemon mode..."
-$CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --daemon &
+$CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --daemon --lsp-pubkey $LSP_PUBKEY &
 C1_PID=$!
 sleep 0.5
 
-$CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --daemon &
+$CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --daemon --lsp-pubkey $LSP_PUBKEY &
 C2_PID=$!
 sleep 0.5
 
-$CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --daemon &
+$CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --daemon --lsp-pubkey $LSP_PUBKEY &
 C3_PID=$!
 sleep 0.5
 
-$CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --daemon &
+$CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --daemon --lsp-pubkey $LSP_PUBKEY &
 C4_PID=$!
 
 echo ""

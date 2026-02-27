@@ -38,6 +38,9 @@ TEST_DIR = "/tmp/superscalar_test"
 
 # Demo client keys: 0x22 repeated for client 0, 0x33 for 1, 0x44 for 2, 0x55 for 3
 CLIENT_KEY_FILLS = [0x22, 0x33, 0x44, 0x55]
+# Deterministic LSP key for regtest (secp256k1 generator key "01")
+LSP_SECKEY = "0000000000000000000000000000000000000000000000000000000000000001"
+LSP_PUBKEY = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 DEFAULT_PORT = 9745
 DEFAULT_AMOUNT = 100000
 DEFAULT_N_CLIENTS = 4
@@ -283,7 +286,9 @@ class Orchestrator:
             "--rpcuser", self.rpcuser,
             "--rpcpassword", self.rpcpassword,
         ]
-        if not self.is_regtest:
+        if self.is_regtest:
+            cmd.extend(["--seckey", LSP_SECKEY])
+        else:
             lsp_keyfile = os.path.join(self.test_dir, "lsp.key")
             cmd.extend(["--keyfile", lsp_keyfile, "--passphrase", "orchestrator"])
         if extra_flags:
@@ -308,7 +313,8 @@ class Orchestrator:
             "--fee-rate", "1000",
         ]
         if self.is_regtest:
-            cmd.extend(["--seckey", client_seckey(index)])
+            cmd.extend(["--seckey", client_seckey(index),
+                         "--lsp-pubkey", LSP_PUBKEY])
         else:
             cmd.extend(["--keyfile", self._client_keyfile(index),
                          "--passphrase", "orchestrator"])
