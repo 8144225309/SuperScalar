@@ -26,7 +26,7 @@ extern void reverse_bytes(unsigned char *, size_t);
 
 int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
                               uint32_t factory_id, uint32_t cur_height) {
-    if (!(mgr->rot_attempted_mask & (1u << factory_id)))
+    if (!(mgr->rot_attempted_mask & (1u << (factory_id & 31))))
         return 0;  /* never attempted */
     uint32_t idx = factory_id % 8;
     uint32_t retries = mgr->rot_retry_count[idx];
@@ -35,9 +35,10 @@ int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
         return 0;   /* fallback already done */
     if (retries >= max_ret)
         return -1;  /* exhausted — time for fallback */
-    /* Exponential backoff: base * 2^retries blocks */
+    /* Exponential backoff: base * 2^retries blocks (clamped to prevent overflow) */
     uint32_t base = mgr->rot_retry_base_delay > 0 ? mgr->rot_retry_base_delay : 10;
-    uint32_t delay = base * (1u << retries);
+    uint32_t shift = retries < 30 ? retries : 30;
+    uint32_t delay = base * (1u << shift);
     if (cur_height >= mgr->rot_last_attempt_block[idx] + delay)
         return 1;   /* enough blocks elapsed — retry now */
     return 0;        /* waiting for backoff */

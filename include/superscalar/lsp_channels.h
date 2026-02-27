@@ -91,7 +91,7 @@ typedef struct {
     int rot_auto_rotate;           /* 1 = auto-rotate enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
-    /* Rotation retry with backoff */
+    /* Rotation retry with backoff (reset on first attempt to avoid aliasing) */
     uint8_t  rot_retry_count[8];        /* per-factory failure count (indexed by factory_id % 8) */
     uint32_t rot_last_attempt_block[8]; /* block height of last failed attempt */
     uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
@@ -193,6 +193,12 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Returns 1 on clean shutdown. */
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
+
+/* Handle a single CLI command line (extracted for testability).
+   Returns 1 if command was recognized, 0 otherwise. */
+int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
+                                  const char *line,
+                                  volatile sig_atomic_t *shutdown_flag);
 
 /* Settle accumulated routing fee profits to clients per their profit_share_bps.
    Shifts balance from LSP-local to client-remote via channel_update().

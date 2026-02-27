@@ -223,7 +223,11 @@ int tor_create_hidden_service(const char *control_host, int control_port,
         }
 
         if (strncmp(line, "250-ServiceID=", 14) == 0) {
-            strncpy(service_id, line + 14, sizeof(service_id) - 1);
+            size_t id_len = strlen(line + 14);
+            if (id_len >= sizeof(service_id))
+                id_len = sizeof(service_id) - 1;
+            memcpy(service_id, line + 14, id_len);
+            service_id[id_len] = '\0';
         } else if (strncmp(line, "250 ", 4) == 0) {
             break;
         } else if (strncmp(line, "5", 1) == 0) {

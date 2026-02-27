@@ -536,19 +536,20 @@ int test_regtest_timeout_spend(void) {
     uint32_t cltv_timeout = (uint32_t)current_height + 10;
     printf("  Current height=%d, cltv_timeout=%u\n", current_height, cltv_timeout);
 
-    /* Init factory with timeout, advance to max state (all delays = 0) */
+    /* Init factory with timeout, build tree, then advance to max state (all delays = 0).
+       factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t f;
     factory_init(&f, ctx, kps, 5, 1, 4);
     f.cltv_timeout = cltv_timeout;
-
-    for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
 
     factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
 
     TEST_ASSERT(factory_build_tree(&f), "build tree");
     TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    for (int i = 0; i < 15; i++)
+        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
     printf("  Tree built: %zu nodes, kickoff_left has_taptree=%d\n",
            f.n_nodes, f.nodes[2].has_taptree);
 

@@ -14,6 +14,7 @@
 #include <time.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <unistd.h>
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
@@ -649,6 +650,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fwd_amount_msat = amount_msat - fee_msat;
         fwd_amount_sats = fwd_amount_msat / 1000;
         if (fwd_amount_sats == 0) return 0;
+        /* Track accumulated fees for profit settlement */
+        uint64_t fee_sats = (fee_msat + 999) / 1000;
+        mgr->accumulated_fees_sats += fee_sats;
     }
 
     /* CLTV delta enforcement: subtract safety margin for factory close. */
@@ -1537,6 +1541,85 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* Factory rotation moved to lsp_rotation.c */
 
+int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
+                                  const char *line,
+                                  volatile sig_atomic_t *shutdown_flag) {
+    lsp_t *lsp = (lsp_t *)lsp_ptr;
+    size_t len = strlen(line);
+
+    if (strncmp(line, "pay ", 4) == 0) {
+        unsigned int from, to;
+        unsigned long long amt;
+        if (sscanf(line + 4, "%u %u %llu", &from, &to, &amt) == 3) {
+            if (from >= mgr->n_channels || to >= mgr->n_channels) {
+                printf("CLI: invalid client index (max %zu)\n",
+                       mgr->n_channels - 1);
+            } else if (from == to) {
+                printf("CLI: cannot pay self\n");
+            } else {
+                printf("CLI: pay %u \xe2\x86\x92 %u (%llu sats)\n", from, to, amt);
+                fflush(stdout);
+                if (lsp_channels_initiate_payment(mgr, lsp,
+                        (size_t)from, (size_t)to, (uint64_t)amt))
+                    printf("CLI: payment succeeded\n");
+                else
+                    printf("CLI: payment FAILED\n");
+            }
+        } else {
+            printf("CLI: usage: pay <from> <to> <amount>\n");
+        }
+    } else if (strcmp(line, "status") == 0) {
+        printf("--- Factory Status ---\n");
+        printf("  Channels: %zu\n", mgr->n_channels);
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            channel_t *ch = &mgr->entries[c].channel;
+            printf("  Channel %zu: local=%llu remote=%llu cn=%llu fd=%d%s\n",
+                   c,
+                   (unsigned long long)ch->local_amount,
+                   (unsigned long long)ch->remote_amount,
+                   (unsigned long long)ch->commitment_number,
+                   lsp->client_fds[c],
+                   mgr->entries[c].offline_detected ? " [offline]" : "");
+        }
+        if (mgr->watchtower && mgr->watchtower->rt) {
+            int h = regtest_get_block_height(mgr->watchtower->rt);
+            factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
+            const char *fs_names[] = {"ACTIVE","DYING","EXPIRED"};
+            int fsi = (int)fs;
+            printf("  Factory state: %s (height=%d)\n",
+                   (fsi >= 0 && fsi <= 2) ? fs_names[fsi] : "?", h);
+        }
+        if (mgr->ladder) {
+            ladder_t *lad = (ladder_t *)mgr->ladder;
+            printf("  Ladder factories: %zu\n", lad->n_factories);
+        }
+        printf("---\n");
+    } else if (strcmp(line, "rotate") == 0) {
+        printf("CLI: forcing rotation\n");
+        fflush(stdout);
+        if (lsp_channels_rotate_factory(mgr, lsp))
+            printf("CLI: rotation succeeded\n");
+        else
+            printf("CLI: rotation FAILED\n");
+    } else if (strcmp(line, "close") == 0) {
+        printf("CLI: triggering shutdown (cooperative close)\n");
+        fflush(stdout);
+        *((volatile sig_atomic_t *)shutdown_flag) = 1;
+    } else if (strcmp(line, "help") == 0) {
+        printf("Commands:\n");
+        printf("  pay <from> <to> <amount>  Send payment between clients\n");
+        printf("  status                    Show factory and channel state\n");
+        printf("  rotate                    Force factory rotation\n");
+        printf("  close                     Cooperative close and shutdown\n");
+        printf("  help                      Show this help\n");
+    } else if (len > 0) {
+        printf("CLI: unknown command '%s' (type 'help')\n", line);
+        fflush(stdout);
+        return 0;
+    }
+    fflush(stdout);
+    return 1;
+}
 
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag) {
@@ -1544,6 +1627,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     printf("LSP: daemon loop started (Ctrl+C to stop)\n");
     fflush(stdout);
+
+    /* Initialize profit settlement baseline height */
+    if (mgr->last_settlement_block == 0 &&
+        mgr->watchtower && mgr->watchtower->rt) {
+        int h = regtest_get_block_height(mgr->watchtower->rt);
+        if (h > 0)
+            mgr->last_settlement_block = (uint32_t)h;
+    }
 
     while (!(*shutdown_flag)) {
         fd_set rfds;
@@ -1615,6 +1706,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         if (n_failed > 0) {
                             printf("LSP: auto-failed %d expired HTLCs on channel %zu "
                                    "(height=%d)\n", n_failed, c, height);
+                        }
+                    }
+                    /* Profit settlement check */
+                    if (mgr->economic_mode == ECON_PROFIT_SHARED &&
+                        mgr->accumulated_fees_sats > 0 &&
+                        mgr->settlement_interval_blocks > 0 &&
+                        (uint32_t)height - mgr->last_settlement_block >=
+                            mgr->settlement_interval_blocks) {
+                        int settled = lsp_channels_settle_profits(
+                            mgr, &lsp->factory);
+                        if (settled > 0) {
+                            mgr->last_settlement_block = (uint32_t)height;
+                            printf("LSP: settled profits to %d channels "
+                                   "(height=%d)\n", settled, height);
+                            fflush(stdout);
                         }
                     }
                     /* Factory lifecycle monitoring */
@@ -1693,11 +1799,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      lf->cached_state == FACTORY_EXPIRED)) {
                                     /* First attempt: ACTIVE → DYING transition */
                                     if (old_states[fi] == FACTORY_ACTIVE &&
-                                        !(mgr->rot_attempted_mask & (1u << lf->factory_id))) {
+                                        !(mgr->rot_attempted_mask & (1u << (lf->factory_id & 31)))) {
                                         printf("LSP: factory %u DYING — starting auto-rotation\n",
                                                lf->factory_id);
                                         fflush(stdout);
-                                        mgr->rot_attempted_mask |= (1u << lf->factory_id);
+                                        mgr->rot_attempted_mask |= (1u << (lf->factory_id & 31));
+                                        /* Reset retry state — prevent aliasing from old factory */
+                                        uint32_t ridx = lf->factory_id % 8;
+                                        mgr->rot_retry_count[ridx] = 0;
+                                        mgr->rot_last_attempt_block[ridx] = 0;
                                         int ok = lsp_channels_rotate_factory(mgr, lsp);
                                         if (ok) {
                                             printf("LSP: auto-rotation complete — new factory active\n");
@@ -1929,82 +2039,17 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Handle stdin CLI commands */
         if (mgr->cli_enabled && FD_ISSET(STDIN_FILENO, &rfds)) {
             char line[256];
-            if (fgets(line, sizeof(line), stdin)) {
+            if (!fgets(line, sizeof(line), stdin)) {
+                /* EOF or error — disable CLI to prevent spin loop */
+                mgr->cli_enabled = 0;
+            } else {
                 /* Strip trailing newline */
                 size_t len = strlen(line);
                 while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                     line[--len] = '\0';
 
-                if (strncmp(line, "pay ", 4) == 0) {
-                    unsigned int from, to;
-                    unsigned long long amt;
-                    if (sscanf(line + 4, "%u %u %llu", &from, &to, &amt) == 3) {
-                        if (from >= mgr->n_channels || to >= mgr->n_channels) {
-                            printf("CLI: invalid client index (max %zu)\n",
-                                   mgr->n_channels - 1);
-                        } else if (from == to) {
-                            printf("CLI: cannot pay self\n");
-                        } else {
-                            printf("CLI: pay %u → %u (%llu sats)\n", from, to, amt);
-                            fflush(stdout);
-                            if (lsp_channels_initiate_payment(mgr, lsp,
-                                    (size_t)from, (size_t)to, (uint64_t)amt))
-                                printf("CLI: payment succeeded\n");
-                            else
-                                printf("CLI: payment FAILED\n");
-                        }
-                    } else {
-                        printf("CLI: usage: pay <from> <to> <amount>\n");
-                    }
-                } else if (strcmp(line, "status") == 0) {
-                    printf("--- Factory Status ---\n");
-                    printf("  Channels: %zu\n", mgr->n_channels);
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        channel_t *ch = &mgr->entries[c].channel;
-                        printf("  Channel %zu: local=%llu remote=%llu cn=%llu fd=%d%s\n",
-                               c,
-                               (unsigned long long)ch->local_amount,
-                               (unsigned long long)ch->remote_amount,
-                               (unsigned long long)ch->commitment_number,
-                               lsp->client_fds[c],
-                               mgr->entries[c].offline_detected ? " [offline]" : "");
-                    }
-                    if (mgr->watchtower && mgr->watchtower->rt) {
-                        int h = regtest_get_block_height(mgr->watchtower->rt);
-                        factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
-                        const char *fs_names[] = {"ACTIVE","DYING","EXPIRED"};
-                        int fsi = (int)fs;
-                        printf("  Factory state: %s (height=%d)\n",
-                               (fsi >= 0 && fsi <= 2) ? fs_names[fsi] : "?", h);
-                    }
-                    if (mgr->ladder) {
-                        ladder_t *lad = (ladder_t *)mgr->ladder;
-                        printf("  Ladder factories: %zu\n", lad->n_factories);
-                    }
-                    printf("---\n");
-                } else if (strcmp(line, "rotate") == 0) {
-                    printf("CLI: forcing rotation\n");
-                    fflush(stdout);
-                    if (lsp_channels_rotate_factory(mgr, lsp))
-                        printf("CLI: rotation succeeded\n");
-                    else
-                        printf("CLI: rotation FAILED\n");
-                } else if (strcmp(line, "close") == 0) {
-                    printf("CLI: triggering shutdown (cooperative close)\n");
-                    fflush(stdout);
-                    *((volatile sig_atomic_t *)shutdown_flag) = 1;
-                } else if (strcmp(line, "help") == 0) {
-                    printf("Commands:\n");
-                    printf("  pay <from> <to> <amount>  Send payment between clients\n");
-                    printf("  status                    Show factory and channel state\n");
-                    printf("  rotate                    Force factory rotation\n");
-                    printf("  close                     Cooperative close and shutdown\n");
-                    printf("  help                      Show this help\n");
-                } else if (len > 0) {
-                    printf("CLI: unknown command '%s' (type 'help')\n", line);
-                }
-                fflush(stdout);
-            }
+                lsp_channels_handle_cli_line(mgr, lsp, line, shutdown_flag);
+            } /* else fgets succeeded */
         }
 
         /* Handle bridge messages */
