@@ -146,101 +146,120 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: client %zu key extracted via wire PTLC\n", ci + 1);
     }
 
-    /* Check if all online clients departed */
-    if (!ladder_can_close(lad, dying_id)) {
-        fprintf(stderr, "LSP rotate: not all clients departed, cannot close factory %u\n",
-                dying_id);
-        return 0;
-    }
-
-    /* --- Phase B: Cooperative close of dying factory --- */
-    printf("LSP rotate: Phase B — cooperative close of factory %u\n", dying_id);
-
-    tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
-    /* Close TX: 1 P2TR key-path input (~68 vB overhead) + n_total P2TR outputs (~43 vB each) */
-    size_t close_vsize = 68 + 43 * n_total;
-    uint64_t close_fee = fee_estimate(fe, close_vsize);
-    if (close_fee == 0) {
-        /* Floor: 1 sat/vB */
-        close_fee = close_vsize;
-        fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
-                "using 1 sat/vB floor (%llu sats)\n",
-                (unsigned long long)close_fee);
-    }
-    size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,
-                                                        rot_outputs, close_fee);
-    if (n_close == 0) {
-        /* Fallback: equal split */
-        uint64_t per = (lsp->factory.funding_amount_sats - close_fee) / n_total;
-        for (size_t ti = 0; ti < n_total; ti++) {
-            rot_outputs[ti].amount_sats = per;
-            memcpy(rot_outputs[ti].script_pubkey, mgr->rot_fund_spk, 34);
-            rot_outputs[ti].script_pubkey_len = 34;
+    /* Check if all online clients departed (full close) or partial */
+    int full_close = ladder_can_close(lad, dying_id);
+    int partial = 0;
+    if (!full_close) {
+        partial = ladder_can_partial_close(lad, dying_id);
+        if (!partial) {
+            fprintf(stderr, "LSP rotate: < 2 clients departed, cannot rotate\n");
+            return 0;
         }
-        rot_outputs[n_total - 1].amount_sats =
-            lsp->factory.funding_amount_sats - close_fee - per * (n_total - 1);
-        n_close = n_total;
+        printf("LSP rotate: partial — %zu/%zu clients cooperative\n",
+               dying->n_departed, dying->factory.n_participants - 1);
     }
 
-    tx_buf_t rot_close_tx;
-    tx_buf_init(&rot_close_tx, 512);
-    if (!ladder_build_close(lad, dying_id, &rot_close_tx, rot_outputs, n_close)) {
-        fprintf(stderr, "LSP rotate: ladder_build_close failed\n");
-        tx_buf_free(&rot_close_tx);
-        return 0;
-    }
-
-    char *rc_hex = malloc(rot_close_tx.len * 2 + 1);
-    hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
-    char rc_txid[65];
+    /* --- Phase B: Cooperative close OR partial retirement --- */
     regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
     if (!rt) {
-        free(rc_hex);
-        tx_buf_free(&rot_close_tx);
         fprintf(stderr, "LSP rotate: no regtest connection\n");
         return 0;
     }
-    int rc_sent = regtest_send_raw_tx(rt, rc_hex, rc_txid);
-    if (mgr->persist) {
-        persist_log_broadcast((persist_t *)mgr->persist,
-                              rc_sent ? rc_txid : "?", "rotation_close",
-                              rc_hex, rc_sent ? "ok" : "failed");
-    }
-    free(rc_hex);
-    tx_buf_free(&rot_close_tx);
 
-    if (!rc_sent) {
-        fprintf(stderr, "LSP rotate: close TX broadcast failed\n");
-        return 0;
-    }
+    if (full_close) {
+        /* Full cooperative close of dying factory */
+        printf("LSP rotate: Phase B — cooperative close of factory %u\n", dying_id);
 
-    if (mgr->rot_is_regtest) {
-        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
-    } else {
-        int rot_timeout = mgr->confirm_timeout_secs > 0 ?
-                          mgr->confirm_timeout_secs : 7200;
-        printf("LSP rotate: waiting for close TX confirmation...\n");
-        int confirmed = 0;
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
-                confirmed = 1;
-                break;
-            }
-            if (regtest_is_in_mempool(rt, rc_txid)) {
-                fprintf(stderr, "LSP rotate: close TX still in mempool, "
-                        "extending wait (attempt %d)\n", attempt + 1);
-                continue;
-            }
-            fprintf(stderr, "LSP rotate: close TX %s dropped from mempool\n",
-                    rc_txid);
-            break;
+        tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
+        size_t close_vsize = 68 + 43 * n_total;
+        uint64_t close_fee = fee_estimate(fe, close_vsize);
+        if (close_fee == 0) {
+            close_fee = close_vsize;
+            fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
+                    "using 1 sat/vB floor (%llu sats)\n",
+                    (unsigned long long)close_fee);
         }
-        if (!confirmed) {
-            fprintf(stderr, "LSP rotate: close TX not confirmed after retries\n");
+        size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,
+                                                            rot_outputs, close_fee);
+        if (n_close == 0) {
+            uint64_t per = (lsp->factory.funding_amount_sats - close_fee) / n_total;
+            for (size_t ti = 0; ti < n_total; ti++) {
+                rot_outputs[ti].amount_sats = per;
+                memcpy(rot_outputs[ti].script_pubkey, mgr->rot_fund_spk, 34);
+                rot_outputs[ti].script_pubkey_len = 34;
+            }
+            rot_outputs[n_total - 1].amount_sats =
+                lsp->factory.funding_amount_sats - close_fee - per * (n_total - 1);
+            n_close = n_total;
+        }
+
+        tx_buf_t rot_close_tx;
+        tx_buf_init(&rot_close_tx, 512);
+        if (!ladder_build_close(lad, dying_id, &rot_close_tx, rot_outputs, n_close)) {
+            fprintf(stderr, "LSP rotate: ladder_build_close failed\n");
+            tx_buf_free(&rot_close_tx);
             return 0;
         }
+
+        char *rc_hex = malloc(rot_close_tx.len * 2 + 1);
+        hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
+        char rc_txid[65];
+        int rc_sent = regtest_send_raw_tx(rt, rc_hex, rc_txid);
+        if (mgr->persist) {
+            persist_log_broadcast((persist_t *)mgr->persist,
+                                  rc_sent ? rc_txid : "?", "rotation_close",
+                                  rc_hex, rc_sent ? "ok" : "failed");
+        }
+        free(rc_hex);
+        tx_buf_free(&rot_close_tx);
+
+        if (!rc_sent) {
+            fprintf(stderr, "LSP rotate: close TX broadcast failed\n");
+            return 0;
+        }
+
+        if (mgr->rot_is_regtest) {
+            regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        } else {
+            int rot_timeout = mgr->confirm_timeout_secs > 0 ?
+                              mgr->confirm_timeout_secs : 7200;
+            printf("LSP rotate: waiting for close TX confirmation...\n");
+            int confirmed = 0;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
+                    confirmed = 1;
+                    break;
+                }
+                if (regtest_is_in_mempool(rt, rc_txid)) {
+                    fprintf(stderr, "LSP rotate: close TX still in mempool, "
+                            "extending wait (attempt %d)\n", attempt + 1);
+                    continue;
+                }
+                fprintf(stderr, "LSP rotate: close TX %s dropped from mempool\n",
+                        rc_txid);
+                break;
+            }
+            if (!confirmed) {
+                fprintf(stderr, "LSP rotate: close TX not confirmed after retries\n");
+                return 0;
+            }
+        }
+        printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
+    } else {
+        /* Partial rotation: skip cooperative close, old factory expires naturally.
+           The distribution TX (nLockTime) protects all participants. */
+        printf("LSP rotate: Phase B — partial retirement of factory %u "
+               "(distribution TX on expiry)\n", dying_id);
+        dying->partial_rotation_done = 1;
+        if (mgr->persist) {
+            const char *st = "dying";
+            persist_save_ladder_factory((persist_t *)mgr->persist,
+                dying_id, st, dying->is_funded, dying->is_initialized,
+                dying->n_departed, dying->factory.created_block,
+                dying->factory.active_blocks, dying->factory.dying_blocks,
+                dying->partial_rotation_done);
+        }
     }
-    printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
 
     /* --- Phase C: Create new factory --- */
     printf("LSP rotate: Phase C — creating new factory\n");
@@ -319,6 +338,32 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: funded %llu sats, txid: %s, vout=%u\n",
            (unsigned long long)fund_amount, fund_txid_hex, fund_vout);
 
+    /* For partial rotation: remap client arrays to cooperative subset */
+    int saved_client_fds[LSP_MAX_CLIENTS];
+    secp256k1_pubkey saved_client_pks[LSP_MAX_CLIENTS];
+    size_t n_coop = 0;
+
+    memset(saved_client_fds, -1, sizeof(saved_client_fds));
+    memset(saved_client_pks, 0, sizeof(saved_client_pks));
+
+    if (partial) {
+        memcpy(saved_client_fds, lsp->client_fds, sizeof(saved_client_fds));
+        memcpy(saved_client_pks, lsp->client_pubkeys, sizeof(saved_client_pks));
+
+        uint32_t coop[FACTORY_MAX_SIGNERS];
+        n_coop = ladder_get_cooperative_clients(lad, dying_id,
+                                                 coop, FACTORY_MAX_SIGNERS);
+
+        /* Remap to contiguous indices 0..n_coop-1 */
+        for (size_t i = 0; i < n_coop; i++) {
+            lsp->client_fds[i] = saved_client_fds[coop[i] - 1];
+            lsp->client_pubkeys[i] = saved_client_pks[coop[i] - 1];
+        }
+        lsp->n_clients = n_coop;
+        printf("LSP rotate: remapped %zu cooperative clients for new factory\n",
+               n_coop);
+    }
+
     /* Free old factory, but preserve arity for new factory */
     factory_arity_t saved_arity = (factory_arity_t)mgr->rot_leaf_arity;
     factory_free(&lsp->factory);
@@ -391,6 +436,18 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         } else {
             persist_commit(db);
         }
+    }
+
+    /* Close fds for uncooperative clients (partial rotation only) */
+    if (partial) {
+        uint32_t uncoop[FACTORY_MAX_SIGNERS];
+        size_t n_uncoop = ladder_get_uncooperative_clients(lad, dying_id,
+                                                            uncoop, FACTORY_MAX_SIGNERS);
+        for (size_t i = 0; i < n_uncoop; i++) {
+            int fd = saved_client_fds[uncoop[i] - 1];
+            if (fd >= 0) wire_close(fd);
+        }
+        printf("LSP rotate: closed %zu uncooperative client connections\n", n_uncoop);
     }
 
     /* --- Phase D: Reinitialize channels --- */

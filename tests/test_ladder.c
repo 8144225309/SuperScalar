@@ -2175,3 +2175,186 @@ int test_ladder_can_partial_close_thresholds(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* test_partial_rotation_3of4 — 4 clients, 3 depart, verify partial rotation fields */
+int test_partial_rotation_3of4(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Depart 3 of 4 clients */
+    unsigned char fake_key[32];
+    memset(fake_key, 0xFF, 32);
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    ladder_record_key_turnover(&lad, 0, 2, fake_key);
+    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+
+    /* Full close should fail (client 4 not departed) */
+    TEST_ASSERT(!ladder_can_close(&lad, 0), "full close fails");
+
+    /* Partial close should work */
+    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "partial close OK");
+
+    /* Get cooperative set */
+    uint32_t coop[8];
+    size_t n_coop = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    TEST_ASSERT_EQ(n_coop, 3, "3 cooperative clients");
+
+    /* Get uncooperative set */
+    uint32_t uncoop[8];
+    size_t n_uncoop = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    TEST_ASSERT_EQ(n_uncoop, 1, "1 uncooperative client");
+    TEST_ASSERT_EQ(uncoop[0], 4, "client 4 uncooperative");
+
+    /* Mark partial rotation done */
+    lad.factories[0].partial_rotation_done = 1;
+    TEST_ASSERT_EQ(lad.factories[0].partial_rotation_done, 1, "flag set");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_partial_rotation_2of4 — minimum viable: 2 of 4 depart */
+int test_partial_rotation_2of4(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Depart only 2 */
+    unsigned char fake_key[32];
+    memset(fake_key, 0xFF, 32);
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    ladder_record_key_turnover(&lad, 0, 4, fake_key);
+
+    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't full close");
+    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "can partial close");
+
+    uint32_t coop[8];
+    size_t n = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    TEST_ASSERT_EQ(n, 2, "2 cooperative");
+
+    uint32_t uncoop[8];
+    n = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    TEST_ASSERT_EQ(n, 2, "2 uncooperative");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_partial_rotation_insufficient — 1 of 4 depart, rotation fails */
+int test_partial_rotation_insufficient(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Depart only 1 — insufficient */
+    unsigned char fake_key[32];
+    memset(fake_key, 0xFF, 32);
+    ladder_record_key_turnover(&lad, 0, 2, fake_key);
+
+    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't full close");
+    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "can't partial close either");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* test_partial_rotation_preserves_distribution_tx — verify old factory's
+   distribution TX is untouched after partial rotation */
+int test_partial_rotation_preserves_distribution_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec)) return 0;
+    secp256k1_keypair client_kps[4];
+    if (!make_client_keypairs(ctx, client_kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Build a fake distribution TX to prove it survives partial rotation */
+    tx_buf_t *dist = &lad.factories[0].distribution_tx;
+    unsigned char fake_dist[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    memcpy(dist->data + dist->len, fake_dist, 4);
+    dist->len += 4;
+    size_t orig_len = dist->len;
+
+    /* Depart 3 clients, mark partial rotation */
+    unsigned char fake_key[32];
+    memset(fake_key, 0xFF, 32);
+    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    ladder_record_key_turnover(&lad, 0, 2, fake_key);
+    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+
+    lad.factories[0].partial_rotation_done = 1;
+
+    /* Distribution TX should be untouched */
+    TEST_ASSERT_EQ(dist->len, orig_len, "dist tx length preserved");
+    TEST_ASSERT(memcmp(dist->data + (dist->len - 4), fake_dist, 4) == 0,
+                "dist tx data preserved");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

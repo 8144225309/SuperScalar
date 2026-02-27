@@ -356,6 +356,10 @@ extern int test_ladder_evict_and_reuse_slot(void);
 extern int test_ladder_get_cooperative_clients(void);
 extern int test_ladder_get_uncooperative_clients(void);
 extern int test_ladder_can_partial_close_thresholds(void);
+extern int test_partial_rotation_3of4(void);
+extern int test_partial_rotation_2of4(void);
+extern int test_partial_rotation_insufficient(void);
+extern int test_partial_rotation_preserves_distribution_tx(void);
 
 /* JIT Channel Fallback (Gap #2) */
 extern int test_last_message_time_update(void);
@@ -757,6 +761,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_get_cooperative_clients);
     RUN_TEST(test_ladder_get_uncooperative_clients);
     RUN_TEST(test_ladder_can_partial_close_thresholds);
+    RUN_TEST(test_partial_rotation_3of4);
+    RUN_TEST(test_partial_rotation_2of4);
+    RUN_TEST(test_partial_rotation_insufficient);
+    RUN_TEST(test_partial_rotation_preserves_distribution_tx);
 
     printf("\n=== JIT Channel Fallback (Gap #2) ===\n");
     RUN_TEST(test_last_message_time_update);
