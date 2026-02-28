@@ -29,6 +29,7 @@ import time
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
 LIGHTNING_CLI = "lightning-cli"
+LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 pending_htlcs = {}   # payment_hash -> rpc_id for resolving
@@ -39,6 +40,15 @@ lock = threading.Lock()
 cln_lock = threading.Lock()  # serializes writes to CLN stdout
 
 
+def cli_cmd(*args):
+    """Build a lightning-cli command with proper --lightning-dir."""
+    cmd = [LIGHTNING_CLI]
+    if LIGHTNING_DIR:
+        cmd.extend(["--lightning-dir", LIGHTNING_DIR])
+    cmd.extend(args)
+    return cmd
+
+
 def log(msg):
     """Write to CLN's log via stderr."""
     sys.stderr.write(f"superscalar: {msg}\n")
@@ -46,9 +56,10 @@ def log(msg):
 
 
 def send_to_cln(response):
-    """Send JSON-RPC response to CLN (thread-safe)."""
+    """Send JSON-RPC response to CLN (thread-safe).
+    CLN v25+ uses \\n\\n as message delimiter."""
     with cln_lock:
-        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.write(json.dumps(response) + "\n\n")
         sys.stdout.flush()
 
 
@@ -213,15 +224,15 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
     """Create a CLN invoice with a known preimage and send BOLT11 back to bridge."""
     label = f"superscalar-{payment_hash[:16]}-{int(time.time())}"
     try:
-        cmd = [
-            LIGHTNING_CLI, "invoice",
+        cmd = cli_cmd(
+            "invoice",
             str(amount_msat),
             label,
             "SuperScalar factory payment",
             "3600",    # expiry seconds
             "null",    # fallbacks
             preimage_hex
-        ]
+        )
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             inv_result = json.loads(result.stdout)
@@ -256,7 +267,7 @@ def _do_pay(bolt11, request_id):
     """Execute lightning-cli pay in a subprocess and report result to bridge."""
     try:
         result = subprocess.run(
-            [LIGHTNING_CLI, "pay", bolt11],
+            cli_cmd("pay", bolt11),
             capture_output=True, text=True, timeout=600
         )
         if result.returncode == 0:
@@ -336,12 +347,28 @@ def handle_htlc_accepted(rpc_id, params):
         })
 
 
-def main():
-    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, next_request_id
-
-    # CLN plugin initialization: read getmanifest
+def read_requests():
+    """Read JSON-RPC requests from CLN stdin.
+    CLN v25+ uses \\n\\n as message delimiter; messages may span lines."""
+    buf = ""
     for line in sys.stdin:
-        request = json.loads(line)
+        if line.strip() == "":
+            # Empty line = message boundary
+            if buf.strip():
+                yield json.loads(buf)
+                buf = ""
+        else:
+            buf += line
+    # Handle any remaining buffer at EOF
+    if buf.strip():
+        yield json.loads(buf)
+
+
+def main():
+    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, next_request_id
+
+    # CLN plugin main loop: read JSON-RPC requests
+    for request in read_requests():
         method = request.get("method", "")
 
         if method == "getmanifest":
@@ -390,6 +417,11 @@ def main():
             BRIDGE_PORT = int(config.get("superscalar-bridge-port", BRIDGE_PORT))
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
 
+            # Capture lightning-dir from CLN's configuration so we can
+            # pass it to lightning-cli subprocess calls
+            cln_config = request.get("params", {}).get("configuration", {})
+            LIGHTNING_DIR = cln_config.get("lightning-dir")
+
             connected = connect_bridge()
             # Always start bridge_reader — it reconnects on disconnect
             t = threading.Thread(target=bridge_reader, daemon=True)
@@ -401,7 +433,7 @@ def main():
                 "result": {}
             })
             log(f"Plugin initialized (bridge={'connected' if connected else 'disconnected'}, "
-                f"cli={LIGHTNING_CLI})")
+                f"cli={LIGHTNING_CLI}, dir={LIGHTNING_DIR})")
 
         elif method == "htlc_accepted":
             handle_htlc_accepted(request["id"], request.get("params", {}))
@@ -414,7 +446,7 @@ def main():
             def _pay_and_respond(bolt11_str, rpc_id_val):
                 try:
                     result = subprocess.run(
-                        [LIGHTNING_CLI, "pay", bolt11_str],
+                        cli_cmd("pay", bolt11_str),
                         capture_output=True, text=True, timeout=600
                     )
                     if result.returncode == 0:
