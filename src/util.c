@@ -14,6 +14,7 @@ void secure_zero(void *ptr, size_t len) {
 
 void tx_buf_init(tx_buf_t *buf, size_t initial_cap) {
     buf->data = (unsigned char *)malloc(initial_cap);
+    if (!buf->data) { buf->len = 0; buf->cap = 0; return; }
     buf->len = 0;
     buf->cap = initial_cap;
 }
@@ -34,7 +35,9 @@ void tx_buf_ensure(tx_buf_t *buf, size_t additional) {
         size_t new_cap = buf->cap * 2;
         if (new_cap < buf->len + additional)
             new_cap = buf->len + additional;
-        buf->data = (unsigned char *)realloc(buf->data, new_cap);
+        unsigned char *new_data = (unsigned char *)realloc(buf->data, new_cap);
+        if (!new_data) return;
+        buf->data = new_data;
         buf->cap = new_cap;
     }
 }
@@ -189,6 +192,7 @@ void sha256_tagged(const char *tag, const unsigned char *data, size_t data_len,
 
     size_t total = 64 + data_len;
     unsigned char *buf = (unsigned char *)malloc(total);
+    if (!buf) { memset(out32, 0, 32); return; }
     memcpy(buf, tag_hash, 32);
     memcpy(buf + 32, tag_hash, 32);
     memcpy(buf + 64, data, data_len);

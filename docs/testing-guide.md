@@ -52,9 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 319 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement |
+| Unit tests | 337 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, property-based tests |
 | Regtest integration | 41 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| **Total** | **360** | | |
+| **Total** | **378** | | |
 
 ---
 
@@ -67,7 +67,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 319/319 passed`
+Expected output: `Results: 337/337 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
@@ -340,16 +340,19 @@ error or UB will cause an immediate abort with a stack trace.
 
 ## CI (Continuous Integration)
 
-GitHub Actions runs on every push and pull request with a 3-platform matrix:
+GitHub Actions runs on every push and pull request:
 
 | Runner | What it builds/tests |
 |--------|---------------------|
-| Linux (Ubuntu) | Full build + unit tests + regtest integration |
-| macOS | Full build + unit tests + regtest integration |
-| Linux + Sanitizers | ASan + UBSan build + unit tests (no regtest — sanitizer overhead) |
+| Linux (Ubuntu) | Full build + unit tests |
+| macOS | Full build + unit tests |
+| Linux + Sanitizers | ASan + UBSan build + unit tests |
+| Static Analysis | cppcheck (zero warnings enforced) |
+| Regtest Integration | Real Bitcoin Core 28.1 + regtest tests |
+| Coverage | gcov/lcov instrumented build + HTML report artifact |
+| Fuzz Testing | 5 libFuzzer targets, 5 minutes each |
 
 Additionally:
-- **cppcheck** static analysis runs on every push (zero warnings enforced)
 - All platforms compile with `-Wall -Wextra -Werror` — zero warnings is a hard gate
 
 CI config is in `.github/workflows/`. A failing CI check blocks merges.

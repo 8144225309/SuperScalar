@@ -2,7 +2,7 @@
 
 Point-in-time snapshot from 2026-02-27 at commit `7b3c064`.
 
-**Current state:** 319 unit + 41 regtest + 20 orchestrator = 380 tests, all green.
+**Current state:** 337 unit + 41 regtest + 20 orchestrator = 398 tests, all green.
 CI green on Linux + macOS + sanitizers + cppcheck + regtest integration.
 
 This document covers the next 9 items on the roadmap, each with context,
@@ -773,7 +773,7 @@ superscalar_client \
 
 For reviewers evaluating this project:
 
-1. **380 tests pass** (319 unit + 41 regtest + 20 orchestrator), covering
+1. **398 tests pass** (337 unit + 41 regtest + 20 orchestrator), covering
    factory creation, payments, breach detection, crash recovery, rotation,
    JIT channels, and cooperative close with real Bitcoin transactions.
 

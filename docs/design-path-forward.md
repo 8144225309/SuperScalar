@@ -12,9 +12,9 @@ Point-in-time snapshot from 2026-02-27 at commit `5366261`.
 
 | Suite | Count | Result |
 |-------|------:|--------|
-| Unit tests (`--unit`) | 319 | 319/319 PASS |
+| Unit tests (`--unit`) | 337 | 337/337 PASS |
 | Regtest integration (`--regtest`) | 41 | 41/41 PASS |
-| **Total automated** | **360** | **360/360 PASS** |
+| **Total automated** | **378** | **378/378 PASS** |
 
 ### Orchestrator Scenarios (20/20 PASS)
 
@@ -404,19 +404,20 @@ The SQLite persistence layer stores everything needed for crash recovery:
 
 1. **Signet smoke test** — slow CI job running `cooperative_close` on signet
 
-### Medium-term (1-2 weeks each)
+### Completed
 
-2. **Fuzz testing** — wire protocol parsing, transaction serialization, persist loading
-3. **Coverage measurement** — `gcov`/`lcov` integration, identify untested code paths
-4. **Bridge end-to-end** — `test_bridge_regtest.sh` with real CLN nodes (CLN binaries required)
-5. **Property-based testing** — DW state machine and MuSig2 signing with random inputs
+2. ~~**Fuzz testing**~~ — DONE (5 libFuzzer harnesses + CI job)
+3. ~~**Coverage measurement**~~ — DONE (`ENABLE_COVERAGE` cmake option + CI artifact)
+4. ~~**Bridge end-to-end**~~ — DONE (CI regtest job with Bitcoin Core)
+5. ~~**Property-based testing**~~ — DONE (10 property tests with random inputs)
+6. ~~**Tor full integration**~~ — DONE (`--tor-only`, `--bind`, `--tor-password-file` + 5 unit tests)
+7. ~~**Bridge reliability**~~ — DONE (heartbeat, reconnect, stale detection)
 
 ### Long-term (1+ month)
 
-6. **Tor full integration** — Docker container with Tor daemon + hidden service test
-7. **Multi-hop routing** — protocol-level work for cross-LSP payments
-8. **Pre-built release binaries** — CI workflow for Linux/macOS/Windows artifacts
-9. **Signet long-running test** — factory that lives through multiple rotation cycles
+8. **Multi-hop routing** — protocol-level work for cross-LSP payments
+9. **Pre-built release binaries** — CI workflow for Linux/macOS/Windows artifacts
+10. **Signet long-running test** — factory that lives through multiple rotation cycles
 
 ---
 
@@ -424,11 +425,11 @@ The SQLite persistence layer stores everything needed for crash recovery:
 
 | Layer | Tool | Count | Runtime |
 |-------|------|------:|---------|
-| Unit | `test_superscalar --unit` | 319 | ~2 seconds |
+| Unit | `test_superscalar --unit` | 337 | ~2 seconds |
 | Regtest | `test_superscalar --regtest` | 41 | ~60 seconds |
 | Orchestrator | `test_orchestrator.py --scenario all` | 20 | ~18 minutes |
 | LSP flags | Manual (rotation, distrib, turnover, force-close) | 4 | ~5 minutes |
 | Demo scripts | `run_demo.sh --basic/--breach/--rotation` | 3 | ~3 minutes |
-| CI | GitHub Actions (Linux + macOS + sanitizers + cppcheck) | 4 jobs | ~5 minutes |
+| CI | GitHub Actions (Linux + macOS + sanitizers + cppcheck + regtest + coverage + fuzz) | 7 jobs | ~10 minutes |
 | Docker | `docker run superscalar unit/test/demo` | 3 modes | varies |
 | **Total** | | **387+** | **~28 minutes** |

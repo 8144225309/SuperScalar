@@ -1,6 +1,6 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 360 tests (319 unit + 41 regtest). Signet-ready. Not production-ready.
+> **Status: Functional Prototype** — builds, passes 378 tests (337 unit + 41 regtest). Signet-ready. Not production-ready.
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -42,9 +42,17 @@ cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null ||
 - [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) — MuSig2, Schnorr, adaptor signatures
 - [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing
 
+**Optional build flags:**
+
+```bash
+cmake .. -DENABLE_SANITIZERS=ON   # AddressSanitizer + UBSan (debug builds)
+cmake .. -DENABLE_COVERAGE=ON     # gcov instrumentation for lcov reports
+CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
+```
+
 ## Tests
 
-319 unit + 41 regtest integration tests (including 11 adversarial/edge-case tests).
+337 unit + 41 regtest integration tests (including 11 adversarial/edge-case tests).
 
 See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
 
@@ -412,6 +420,9 @@ superscalar_lsp [OPTIONS]
 | `--tor-control` | HOST:PORT | — | Tor control port for hidden service |
 | `--tor-password` | PASS | — | Tor control auth password |
 | `--onion` | — | off | Create Tor hidden service on startup |
+| `--tor-only` | — | off | Refuse all non-.onion outbound connections |
+| `--bind` | ADDRESS | 0.0.0.0 | Restrict listen address (auto `127.0.0.1` with `--onion`) |
+| `--tor-password-file` | PATH | — | Read Tor control password from file (avoids argv exposure) |
 | `--regtest` | — | off | Shorthand for --network regtest |
 | `--i-accept-the-risk` | — | off | Allow mainnet (prototype — funds at risk!) |
 | `--help` | — | — | Show help and exit |
@@ -440,6 +451,7 @@ superscalar_client [OPTIONS]
 | `--rpcport` | PORT | — | Bitcoin RPC port |
 | `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
 | `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
+| `--tor-only` | — | off | Refuse all non-.onion outbound connections |
 | `--auto-accept-jit` | — | off | Auto-accept JIT channel offers |
 
 ### superscalar_bridge

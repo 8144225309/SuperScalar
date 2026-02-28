@@ -5,7 +5,7 @@ What works today, what's missing, and concrete ideas for making SuperScalar easi
 ## What Works Today
 
 ### Automated Testing
-- **360 tests** (319 unit + 41 regtest), all passing
+- **378 tests** (337 unit + 41 regtest), all passing
 - Unit tests run in ~2 seconds with no external dependencies
 - Regtest tests run real Bitcoin transactions against Bitcoin Core
 - CI runs on every push: Linux, macOS, sanitizers, static analysis, regtest
@@ -154,10 +154,10 @@ If you want to help improve the demo experience:
 
 For the test infrastructure:
 
-1. **The test suite is solid** — 360 tests with adversarial scenarios, sanitizer builds, and CI. No urgent gaps.
-2. **Fuzz testing would help** — wire protocol parsing, transaction serialization, and persistence loading are good targets.
-3. **Property-based testing** — the DW state machine and MuSig2 signing are good candidates for QuickCheck-style random input testing.
-4. **Coverage measurement** — `gcov` / `lcov` integration in CMake would show which code paths lack tests.
+1. **The test suite is solid** — 378 tests with adversarial scenarios, sanitizer builds, and CI. No urgent gaps.
+2. ~~**Fuzz testing**~~ — DONE. 5 libFuzzer harnesses (wire, JSON, sighash, persist, hex) with CI integration.
+3. ~~**Property-based testing**~~ — DONE. 10 property tests with deterministic random inputs.
+4. ~~**Coverage measurement**~~ — DONE. `cmake -DENABLE_COVERAGE=ON` generates lcov HTML reports.
 
 ## Running the Existing Demos
 

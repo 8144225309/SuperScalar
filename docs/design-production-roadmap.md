@@ -5,7 +5,7 @@
 
 ## Current State (2026-02-27)
 
-360 tests (319 unit + 41 regtest), all passing. The cryptographic protocol
+378 tests (337 unit + 41 regtest), all passing. The cryptographic protocol
 is correct. The factory lifecycle works end-to-end on regtest with real
 Bitcoin transactions. TCP reconnection proven over real network. Rotation
 retry with backoff prevents fund lockup. Interactive CLI enables daemon-mode
