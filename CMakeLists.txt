@@ -61,12 +61,18 @@ FetchContent_MakeAvailable(secp256k1-zkp)
 # --- cJSON for parsing bitcoin-cli output ---
 set(CJSON_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ENABLE_CJSON_TEST OFF CACHE BOOL "" FORCE)
+# Prevent cJSON from building its own AFL fuzz targets (conflicts with our ENABLE_FUZZING)
+set(ENABLE_FUZZING_saved ${ENABLE_FUZZING})
+set(ENABLE_FUZZING OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(cjson
     GIT_REPOSITORY https://github.com/DaveGamble/cJSON.git
     GIT_TAG        v1.7.18
 )
 FetchContent_MakeAvailable(cjson)
+
+# Restore our ENABLE_FUZZING after cJSON is configured
+set(ENABLE_FUZZING ${ENABLE_FUZZING_saved} CACHE BOOL "" FORCE)
 
 # --- SQLite3 (system library) ---
 find_package(SQLite3 REQUIRED)
