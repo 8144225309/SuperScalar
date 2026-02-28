@@ -120,10 +120,12 @@ jobs:
       - name: Generate coverage report
         run: |
           cd build
-          lcov --capture --directory . --output-file coverage.info --ignore-errors mismatch
+          lcov --capture --directory . --output-file coverage.info \
+               --ignore-errors mismatch --ignore-errors unused
           lcov --remove coverage.info '*/build/_deps/*' '/usr/*' '*/tests/*' \
-               --output-file filtered.info
-          genhtml filtered.info --output-directory coverage_report/
+               --output-file filtered.info --ignore-errors unused
+          genhtml filtered.info --output-directory coverage_report/ \
+               --ignore-errors unused
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
