@@ -452,6 +452,13 @@ int wire_recv(int fd, wire_msg_t *msg) {
     return msg->json ? 1 : 0;
 }
 
+int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec) {
+    wire_set_timeout(fd, timeout_sec);
+    int ok = wire_recv(fd, msg);
+    wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+    return ok;
+}
+
 /* --- Crypto JSON helpers --- */
 
 void wire_json_add_hex(cJSON *obj, const char *key,

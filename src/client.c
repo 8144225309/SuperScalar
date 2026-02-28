@@ -842,14 +842,12 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* Receive FACTORY_PROPOSE — disable timeout since LSP may be waiting for
        on-chain funding confirmation (up to ~10 min on signet/testnet) */
-    wire_set_timeout(fd, 0);
-    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
+    if (!wire_recv_timeout(fd, &msg, 0) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
         fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);
         return 0;
     }
-    wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
 
     /* Parse proposal */
     {

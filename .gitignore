@@ -16,3 +16,4 @@ compile_commands.json
 tools/.env
 __pycache__/
 run_*.sh
+docs/plan-*.md
