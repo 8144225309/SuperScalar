@@ -191,6 +191,8 @@ if(ENABLE_FUZZING)
         fuzz/fuzz_tx_sighash.c
         fuzz/fuzz_persist_load.c
         fuzz/fuzz_hex_decode.c
+        fuzz/fuzz_noise_handshake.c
+        fuzz/fuzz_aead_decrypt.c
     )
     foreach(fuzz_src ${FUZZ_SOURCES})
         get_filename_component(fuzz_name ${fuzz_src} NAME_WE)

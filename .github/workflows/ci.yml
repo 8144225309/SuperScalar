@@ -146,12 +146,14 @@ jobs:
           CC=clang cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FUZZING=ON \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build --parallel --target fuzz_wire_recv fuzz_wire_parse_json \
-            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode
+            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode \
+            fuzz_noise_handshake fuzz_aead_decrypt
       - name: Run fuzz (5 min each)
         run: |
           cd build
           for target in fuzz_wire_recv fuzz_wire_parse_json fuzz_tx_sighash \
-                        fuzz_persist_load fuzz_hex_decode; do
+                        fuzz_persist_load fuzz_hex_decode \
+                        fuzz_noise_handshake fuzz_aead_decrypt; do
               mkdir -p corpus/$target
               timeout 300 ./$target corpus/$target/ -max_total_time=300 || true
           done

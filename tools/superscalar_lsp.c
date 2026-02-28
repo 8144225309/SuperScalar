@@ -79,6 +79,7 @@ static void usage(const char *prog) {
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
+        "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
@@ -92,7 +93,7 @@ static void usage(const char *prog) {
         "  --onion               Create Tor hidden service on startup\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help              Show this help\n",
-        prog, LSP_MAX_CLIENTS);
+        prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
 }
 
 /* Derive bech32m address from tweaked xonly pubkey via bitcoin-cli descriptors */
@@ -483,6 +484,7 @@ int main(int argc, char *argv[]) {
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
+    int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
@@ -580,6 +582,13 @@ int main(int argc, char *argv[]) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
                 fprintf(stderr, "Error: --confirm-timeout must be positive\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--max-connections") == 0 && i + 1 < argc) {
+            max_connections_arg = atoi(argv[++i]);
+            if (max_connections_arg < 1 || max_connections_arg > LSP_MAX_CLIENTS) {
+                fprintf(stderr, "Error: --max-connections must be 1..%d\n", LSP_MAX_CLIENTS);
                 return 1;
             }
         }
@@ -1212,6 +1221,8 @@ int main(int argc, char *argv[]) {
     }
     g_lsp = &lsp;
     lsp.accept_timeout_sec = accept_timeout_arg;
+    if (max_connections_arg > 0)
+        lsp.max_connections = max_connections_arg;
 
     /* Enable NK (server-authenticated) noise handshake */
     lsp.use_nk = 1;

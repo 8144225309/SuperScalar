@@ -19,6 +19,7 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
         return 0;
     lsp->port = port;
     lsp->expected_clients = expected_clients;
+    lsp->max_connections = LSP_MAX_CLIENTS;
     lsp->listen_fd = -1;
     lsp->bridge_fd = -1;
 
@@ -28,6 +29,12 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
 }
 
 int lsp_accept_clients(lsp_t *lsp) {
+    if ((int)lsp->expected_clients > lsp->max_connections) {
+        fprintf(stderr, "ERROR: --clients %d exceeds --max-connections %d\n",
+                (int)lsp->expected_clients, lsp->max_connections);
+        return 0;
+    }
+
     if (lsp->listen_fd < 0) {
         lsp->listen_fd = wire_listen(NULL, lsp->port);
         if (lsp->listen_fd < 0) {

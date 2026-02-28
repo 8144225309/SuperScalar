@@ -32,6 +32,10 @@ typedef struct {
        0 = no timeout (block indefinitely, default). */
     int accept_timeout_sec;
 
+    /* Maximum connections the LSP will accept.
+       Defaults to LSP_MAX_CLIENTS; --max-connections overrides. */
+    int max_connections;
+
     /* NK (server-authenticated) handshake. If use_nk=1, lsp_accept_clients
        uses Noise NK with nk_seckey instead of NN. Default: 0 (NN). */
     int use_nk;
