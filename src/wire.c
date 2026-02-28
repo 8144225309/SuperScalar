@@ -159,6 +159,17 @@ static char g_proxy_host[256] = {0};
 static int g_proxy_port = 0;
 static int g_proxy_set = 0;
 
+/* Tor-only mode: refuse all clearnet connections */
+static int g_tor_only = 0;
+
+void wire_set_tor_only(int enable) {
+    g_tor_only = enable;
+}
+
+int wire_get_tor_only(void) {
+    return g_tor_only;
+}
+
 void wire_set_proxy(const char *host, int port) {
     if (host && port > 0) {
         strncpy(g_proxy_host, host, sizeof(g_proxy_host) - 1);
@@ -207,10 +218,18 @@ int wire_connect_direct_internal(const char *host, int port) {
 
 int wire_connect(const char *host, int port) {
     const char *h = host ? host : "127.0.0.1";
+    size_t hlen = strlen(h);
+    int is_onion = (hlen >= 6 && strcmp(h + hlen - 6, ".onion") == 0);
+
+    /* Tor-only mode: refuse clearnet connections */
+    if (g_tor_only && !is_onion) {
+        fprintf(stderr, "wire_connect: --tor-only refuses clearnet "
+                        "connection to %s:%d\n", h, port);
+        return -1;
+    }
 
     /* Safety: refuse .onion without proxy (prevents DNS leak) */
-    size_t hlen = strlen(h);
-    if (hlen >= 6 && strcmp(h + hlen - 6, ".onion") == 0) {
+    if (is_onion) {
         if (!g_proxy_set) {
             fprintf(stderr, "wire_connect: .onion address requires --tor-proxy (refusing to prevent DNS leak)\n");
             return -1;

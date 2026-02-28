@@ -112,6 +112,11 @@ void wire_set_proxy(const char *host, int port);
 /* Get current proxy config. Returns 1 if proxy is set. */
 int wire_get_proxy(char *host_out, size_t host_len, int *port_out);
 
+/* Tor-only mode: refuse all clearnet (non-.onion) connections.
+   Requires a SOCKS5 proxy to be set via wire_set_proxy(). */
+void wire_set_tor_only(int enable);
+int wire_get_tor_only(void);
+
 /* Connect via SOCKS5 proxy (used internally by wire_connect when proxy set). */
 int wire_connect_via_proxy(const char *host, int port,
                            const char *proxy_host, int proxy_port);

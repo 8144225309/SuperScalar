@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <time.h>
 
 void bridge_init(bridge_t *br) {
     memset(br, 0, sizeof(*br));
@@ -14,6 +15,11 @@ void bridge_init(bridge_t *br) {
     br->next_htlc_id = 1;
     br->next_request_id = 1;
     br->use_nk = 0;
+    br->heartbeat_interval = 30;
+    br->last_lsp_activity = time(NULL);
+    br->reconnect_attempts = 0;
+    memset(br->lsp_host, 0, sizeof(br->lsp_host));
+    br->lsp_port = 0;
 }
 
 void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
@@ -26,6 +32,15 @@ void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
 }
 
 int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
+    /* Save host/port for reconnection */
+    if (lsp_host) {
+        strncpy(br->lsp_host, lsp_host, sizeof(br->lsp_host) - 1);
+        br->lsp_host[sizeof(br->lsp_host) - 1] = '\0';
+    } else {
+        strncpy(br->lsp_host, "127.0.0.1", sizeof(br->lsp_host) - 1);
+    }
+    br->lsp_port = lsp_port;
+
     br->lsp_fd = wire_connect(lsp_host, lsp_port);
     if (br->lsp_fd < 0) {
         fprintf(stderr, "Bridge: failed to connect to LSP at %s:%d\n",
@@ -73,6 +88,8 @@ int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
     }
     cJSON_Delete(msg.json);
 
+    br->last_lsp_activity = time(NULL);
+    br->reconnect_attempts = 0;
     printf("Bridge: connected to LSP\n");
     return 1;
 }
@@ -334,13 +351,31 @@ int bridge_run(bridge_t *br) {
             if (br->plugin_listen_fd > max_fd) max_fd = br->plugin_listen_fd;
         }
 
-        struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+        /* Use heartbeat interval as select timeout (or 60s if no heartbeat) */
+        int timeout_sec = (br->heartbeat_interval > 0) ? br->heartbeat_interval : 60;
+        struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
         int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) {
             perror("Bridge: select");
             return 0;
         }
-        if (ret == 0) continue;  /* timeout, loop again */
+
+        /* Heartbeat: check for stale LSP connection on timeout */
+        if (ret == 0) {
+            if (bridge_is_stale(br)) {
+                fprintf(stderr, "Bridge: LSP connection stale, sending ping\n");
+                cJSON *ping = wire_build_bridge_hello();
+                if (!wire_send(br->lsp_fd, MSG_BRIDGE_HELLO, ping)) {
+                    cJSON_Delete(ping);
+                    fprintf(stderr, "Bridge: ping failed, attempting reconnect\n");
+                    if (!bridge_reconnect_lsp(br))
+                        return 0;
+                } else {
+                    cJSON_Delete(ping);
+                }
+            }
+            continue;
+        }
 
         /* Accept pending plugin connection */
         if (br->plugin_listen_fd >= 0 && br->plugin_fd < 0 &&
@@ -353,8 +388,12 @@ int bridge_run(bridge_t *br) {
             wire_msg_t msg;
             if (!wire_recv(br->lsp_fd, &msg)) {
                 fprintf(stderr, "Bridge: LSP connection lost\n");
+                /* Attempt reconnect */
+                if (bridge_reconnect_lsp(br))
+                    continue;
                 return 0;
             }
+            br->last_lsp_activity = time(NULL);
             if (!bridge_handle_lsp_msg(br, &msg)) {
                 cJSON_Delete(msg.json);
                 return 0;
@@ -378,6 +417,30 @@ int bridge_run(bridge_t *br) {
             free(line);
         }
     }
+}
+
+void bridge_set_heartbeat(bridge_t *br, int interval_sec) {
+    br->heartbeat_interval = interval_sec > 0 ? interval_sec : 30;
+}
+
+int bridge_is_stale(const bridge_t *br) {
+    if (br->heartbeat_interval <= 0 || br->lsp_fd < 0)
+        return 0;
+    return (time(NULL) - br->last_lsp_activity) > br->heartbeat_interval;
+}
+
+int bridge_reconnect_lsp(bridge_t *br) {
+    /* Close existing connection */
+    if (br->lsp_fd >= 0) {
+        wire_close(br->lsp_fd);
+        br->lsp_fd = -1;
+    }
+
+    br->reconnect_attempts++;
+    fprintf(stderr, "Bridge: reconnecting to LSP %s:%d (attempt %d)\n",
+            br->lsp_host, br->lsp_port, br->reconnect_attempts);
+
+    return bridge_connect_lsp(br, br->lsp_host, br->lsp_port);
 }
 
 void bridge_cleanup(bridge_t *br) {

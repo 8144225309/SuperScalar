@@ -5,6 +5,7 @@
 #include <secp256k1.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 
 #define BRIDGE_MAX_PENDING 32
 
@@ -29,6 +30,15 @@ typedef struct {
     /* NK (server-authenticated) handshake support */
     secp256k1_pubkey lsp_pubkey;        /* pinned LSP static pubkey */
     int use_nk;                         /* 1 = use NK handshake, 0 = NN fallback */
+
+    /* Heartbeat (bridge reliability) */
+    time_t last_lsp_activity;           /* timestamp of last message from LSP */
+    int heartbeat_interval;             /* seconds between pings (default 30) */
+
+    /* Reconnection state */
+    char lsp_host[256];                 /* saved for reconnect */
+    int lsp_port;                       /* saved for reconnect */
+    int reconnect_attempts;             /* consecutive failed attempts */
 } bridge_t;
 
 /* Initialize bridge state. */
@@ -75,6 +85,16 @@ uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32);
 /* Find and remove a pending HTLC by payment_hash. Returns htlc_id, or -1. */
 int bridge_resolve_pending(bridge_t *br, const unsigned char *payment_hash32,
                              uint64_t *htlc_id_out);
+
+/* Set heartbeat interval in seconds (default 30). */
+void bridge_set_heartbeat(bridge_t *br, int interval_sec);
+
+/* Check if LSP connection is stale (no activity within heartbeat_interval).
+   Returns 1 if stale, 0 if healthy. */
+int bridge_is_stale(const bridge_t *br);
+
+/* Attempt to reconnect to LSP. Returns 1 on success. */
+int bridge_reconnect_lsp(bridge_t *br);
 
 /* Cleanup */
 void bridge_cleanup(bridge_t *br);

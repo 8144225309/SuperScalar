@@ -102,3 +102,54 @@ jobs:
       - name: Stop bitcoind
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
+
+  coverage:
+    runs-on: ubuntu-latest
+    name: Coverage
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev lcov
+      - name: Build with coverage
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      - name: Run tests
+        run: cd build && ctest --output-on-failure --timeout 180
+      - name: Generate coverage report
+        run: |
+          cd build
+          lcov --capture --directory . --output-file coverage.info --ignore-errors mismatch
+          lcov --remove coverage.info '*/build/_deps/*' '/usr/*' '*/tests/*' \
+               --output-file filtered.info
+          genhtml filtered.info --output-directory coverage_report/
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: build/coverage_report/
+
+  fuzz:
+    runs-on: ubuntu-latest
+    name: Fuzz Testing
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev clang
+      - name: Build fuzz targets
+        run: |
+          CC=clang cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FUZZING=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel --target fuzz_wire_recv fuzz_wire_parse_json \
+            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode
+      - name: Run fuzz (5 min each)
+        run: |
+          cd build
+          for target in fuzz_wire_recv fuzz_wire_parse_json fuzz_tx_sighash \
+                        fuzz_persist_load fuzz_hex_decode; do
+              mkdir -p corpus/$target
+              timeout 300 ./$target corpus/$target/ -max_total_time=300 || true
+          done

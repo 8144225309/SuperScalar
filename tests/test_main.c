@@ -516,6 +516,30 @@ extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
 extern int test_fee_accumulation_and_settlement(void);
 
+/* Property-Based Tests (Roadmap Item #5) */
+extern int test_prop_hex_roundtrip(void);
+extern int test_prop_shachain_uniqueness(void);
+extern int test_prop_wire_msg_roundtrip(void);
+extern int test_prop_varint_roundtrip(void);
+extern int test_prop_channel_balance_conservation(void);
+extern int test_prop_musig_sign_verify(void);
+extern int test_prop_wire_commitment_roundtrip(void);
+extern int test_prop_wire_bridge_roundtrip(void);
+extern int test_prop_persist_factory_roundtrip(void);
+extern int test_prop_wire_register_roundtrip(void);
+
+/* Tor Safety Tests (Roadmap Item #6) */
+extern int test_tor_only_refuses_clearnet(void);
+extern int test_tor_only_allows_onion(void);
+extern int test_tor_only_requires_proxy(void);
+extern int test_bind_localhost(void);
+extern int test_tor_password_file(void);
+
+/* Bridge Reliability Tests (Roadmap Item #7) */
+extern int test_bridge_heartbeat_stale(void);
+extern int test_bridge_reconnect(void);
+extern int test_bridge_heartbeat_config(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -965,6 +989,30 @@ static void run_unit_tests(void) {
     RUN_TEST(test_settlement_trigger_at_interval);
     RUN_TEST(test_on_close_includes_unsettled);
     RUN_TEST(test_fee_accumulation_and_settlement);
+
+    printf("\n=== Property-Based Tests ===\n");
+    RUN_TEST(test_prop_hex_roundtrip);
+    RUN_TEST(test_prop_shachain_uniqueness);
+    RUN_TEST(test_prop_wire_msg_roundtrip);
+    RUN_TEST(test_prop_varint_roundtrip);
+    RUN_TEST(test_prop_channel_balance_conservation);
+    RUN_TEST(test_prop_musig_sign_verify);
+    RUN_TEST(test_prop_wire_commitment_roundtrip);
+    RUN_TEST(test_prop_wire_bridge_roundtrip);
+    RUN_TEST(test_prop_persist_factory_roundtrip);
+    RUN_TEST(test_prop_wire_register_roundtrip);
+
+    printf("\n=== Tor Safety ===\n");
+    RUN_TEST(test_tor_only_refuses_clearnet);
+    RUN_TEST(test_tor_only_allows_onion);
+    RUN_TEST(test_tor_only_requires_proxy);
+    RUN_TEST(test_bind_localhost);
+    RUN_TEST(test_tor_password_file);
+
+    printf("\n=== Bridge Reliability ===\n");
+    RUN_TEST(test_bridge_heartbeat_stale);
+    RUN_TEST(test_bridge_reconnect);
+    RUN_TEST(test_bridge_heartbeat_config);
 }
 
 extern int regtest_init_faucet(void);

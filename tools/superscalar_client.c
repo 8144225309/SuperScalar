@@ -1108,6 +1108,7 @@ int main(int argc, char *argv[]) {
     int auto_accept_jit = 0;
     const char *lsp_pubkey_hex = NULL;
     const char *tor_proxy_arg = NULL;
+    int tor_only = 0;
     int accept_risk = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
@@ -1197,6 +1198,8 @@ int main(int argc, char *argv[]) {
             lsp_pubkey_hex = argv[++i];
         } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
             tor_proxy_arg = argv[++i];
+        } else if (strcmp(argv[i], "--tor-only") == 0) {
+            tor_only = 1;
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1225,6 +1228,16 @@ int main(int argc, char *argv[]) {
         }
         wire_set_proxy(proxy_host, proxy_port);
         printf("Client: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
+    }
+
+    /* --tor-only mode */
+    if (tor_only) {
+        if (!tor_proxy_arg) {
+            fprintf(stderr, "Error: --tor-only requires --tor-proxy\n");
+            return 1;
+        }
+        wire_set_tor_only(1);
+        printf("Client: Tor-only mode enabled (clearnet connections refused)\n");
     }
 
     unsigned char seckey[32];

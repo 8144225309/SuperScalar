@@ -494,6 +494,9 @@ int main(int argc, char *argv[]) {
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
     int tor_onion = 0;
+    char *tor_password_file = NULL;
+    int tor_only = 0;
+    const char *bind_addr = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -604,6 +607,12 @@ int main(int argc, char *argv[]) {
             tor_password = argv[++i];
         else if (strcmp(argv[i], "--onion") == 0)
             tor_onion = 1;
+        else if (strcmp(argv[i], "--tor-only") == 0)
+            tor_only = 1;
+        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
+            bind_addr = argv[++i];
+        else if (strcmp(argv[i], "--tor-password-file") == 0 && i + 1 < argc)
+            tor_password_file = argv[++i];
         else if (strcmp(argv[i], "--placement-mode") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "sequential") == 0) placement_mode_arg = 0;
@@ -717,6 +726,46 @@ int main(int argc, char *argv[]) {
         }
         wire_set_proxy(proxy_host, proxy_port);
         printf("LSP: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
+    }
+
+    /* --tor-only mode: refuse all clearnet connections */
+    if (tor_only) {
+        if (!tor_proxy_arg) {
+            fprintf(stderr, "Error: --tor-only requires --tor-proxy\n");
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        wire_set_tor_only(1);
+        printf("LSP: Tor-only mode enabled (clearnet connections refused)\n");
+    }
+
+    /* --tor-password-file: read password from file */
+    char tor_password_buf[256];
+    if (tor_password_file) {
+        FILE *pf = fopen(tor_password_file, "r");
+        if (!pf) {
+            fprintf(stderr, "Error: cannot read %s\n", tor_password_file);
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        if (!fgets(tor_password_buf, sizeof(tor_password_buf), pf)) {
+            fclose(pf);
+            fprintf(stderr, "Error: empty password file %s\n", tor_password_file);
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        tor_password_buf[strcspn(tor_password_buf, "\r\n")] = '\0';
+        fclose(pf);
+        tor_password = tor_password_buf;
+    }
+
+    /* --bind or auto-bind for --onion */
+    if (!bind_addr && tor_onion) {
+        bind_addr = "127.0.0.1";
+        printf("LSP: --onion defaults to --bind 127.0.0.1\n");
     }
 
     /* Tor hidden service (ephemeral, via control port) */
@@ -854,7 +903,7 @@ int main(int argc, char *argv[]) {
             signal(SIGTERM, sigint_handler);
 
             /* Open listen socket for reconnections */
-            lsp.listen_fd = wire_listen(NULL, lsp.port);
+            lsp.listen_fd = wire_listen(bind_addr, lsp.port);
             if (lsp.listen_fd < 0) {
                 fprintf(stderr, "LSP recovery: listen failed on port %d\n", port);
                 persist_close(&db);

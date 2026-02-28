@@ -24,6 +24,19 @@ if(ENABLE_SANITIZERS)
         -fsanitize=address,undefined)
 endif()
 
+# --- Coverage (opt-in, mutually exclusive with sanitizers) ---
+option(ENABLE_COVERAGE "Enable gcov coverage instrumentation" OFF)
+if(ENABLE_COVERAGE)
+    if(ENABLE_SANITIZERS)
+        message(WARNING "ENABLE_COVERAGE and ENABLE_SANITIZERS are mutually exclusive; coverage may produce unreliable results.")
+    endif()
+    add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
+    add_link_options(--coverage)
+endif()
+
+# --- Fuzzing (opt-in, requires clang with libFuzzer) ---
+option(ENABLE_FUZZING "Build fuzz targets with libFuzzer" OFF)
+
 # --- Static linking (eliminates LD_LIBRARY_PATH hacks) ---
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
@@ -123,6 +136,7 @@ add_executable(test_superscalar
     tests/test_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
+    tests/test_property.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
@@ -158,4 +172,27 @@ target_include_directories(superscalar_bridge PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_bridge PRIVATE superscalar project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_bridge PRIVATE project_sanitizers)
+endif()
+
+# --- Fuzz targets (libFuzzer + ASan + UBSan) ---
+if(ENABLE_FUZZING)
+    set(FUZZ_SOURCES
+        fuzz/fuzz_wire_recv.c
+        fuzz/fuzz_wire_parse_json.c
+        fuzz/fuzz_tx_sighash.c
+        fuzz/fuzz_persist_load.c
+        fuzz/fuzz_hex_decode.c
+    )
+    foreach(fuzz_src ${FUZZ_SOURCES})
+        get_filename_component(fuzz_name ${fuzz_src} NAME_WE)
+        add_executable(${fuzz_name} ${fuzz_src})
+        target_include_directories(${fuzz_name} PRIVATE include)
+        target_include_directories(${fuzz_name} PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+        target_include_directories(${fuzz_name} PRIVATE ${cjson_SOURCE_DIR})
+        target_link_libraries(${fuzz_name} superscalar secp256k1 cjson SQLite::SQLite3)
+        target_compile_options(${fuzz_name} PRIVATE
+            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+        target_link_options(${fuzz_name} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+    endforeach()
 endif()

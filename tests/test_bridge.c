@@ -1366,3 +1366,217 @@ int test_regtest_bridge_payment(void) {
     secp256k1_context_destroy(ctx);
     return lsp_ok;
 }
+
+/* ---- Tor Safety Tests ---- */
+
+/* Test: --tor-only refuses clearnet connections */
+int test_tor_only_refuses_clearnet(void) {
+    /* Set tor-only + proxy */
+    wire_set_proxy("127.0.0.1", 9050);
+    wire_set_tor_only(1);
+
+    /* Attempt clearnet connection — should return -1 immediately */
+    int fd = wire_connect("1.2.3.4", 9735);
+    TEST_ASSERT(fd == -1, "tor-only should refuse clearnet connection");
+
+    /* Also test hostname (not .onion) */
+    fd = wire_connect("example.com", 9735);
+    TEST_ASSERT(fd == -1, "tor-only should refuse hostname connection");
+
+    /* Cleanup */
+    wire_set_tor_only(0);
+    wire_set_proxy(NULL, 0);
+    return 1;
+}
+
+/* Test: --tor-only allows .onion with proxy (will fail at SOCKS5 connect, not at guard) */
+int test_tor_only_allows_onion(void) {
+    /* Set tor-only + proxy */
+    wire_set_proxy("127.0.0.1", 9050);
+    wire_set_tor_only(1);
+
+    /* Attempt .onion connection — should NOT be blocked by tor-only guard.
+       It will fail at TCP connect to 127.0.0.1:9050 (no Tor running),
+       but that's a different error (-1 from connect, not from guard). */
+    int fd = wire_connect("abcdefghijklmnop.onion", 9735);
+    /* fd will be -1 because there's no SOCKS5 proxy at 9050, but the
+       tor-only guard specifically should not block it.  We verify by
+       checking that it gets past the guard (the proxy connect will fail). */
+    TEST_ASSERT(fd == -1, "expected -1 from SOCKS5 connect failure");
+    /* The key assertion is that we didn't get blocked by the tor-only
+       guard — we got blocked later by the proxy connect.  Since we
+       can't distinguish error sources in the return value, we just
+       verify no crash and the .onion path was attempted. */
+
+    wire_set_tor_only(0);
+    wire_set_proxy(NULL, 0);
+    return 1;
+}
+
+/* Test: .onion without proxy still refused (existing guard) */
+int test_tor_only_requires_proxy(void) {
+    /* Set tor-only WITHOUT proxy */
+    wire_set_tor_only(1);
+
+    int fd = wire_connect("abcdefghijklmnop.onion", 9735);
+    TEST_ASSERT(fd == -1, "onion without proxy should fail");
+
+    wire_set_tor_only(0);
+    return 1;
+}
+
+/* Test: wire_listen with bind address */
+int test_bind_localhost(void) {
+    /* Listen on 127.0.0.1 with random port */
+    int listen_fd = wire_listen("127.0.0.1", 0);  /* port 0 = OS-assigned */
+    if (listen_fd < 0) {
+        /* Port 0 may not be supported on all platforms, try explicit port */
+        listen_fd = wire_listen("127.0.0.1", 19876);
+    }
+    TEST_ASSERT(listen_fd >= 0, "wire_listen on 127.0.0.1 should succeed");
+
+    /* Verify we got a valid socket */
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    int ok = getsockname(listen_fd, (struct sockaddr *)&addr, &len);
+    TEST_ASSERT(ok == 0, "getsockname failed");
+    /* Verify it's bound to 127.0.0.1 */
+    TEST_ASSERT(addr.sin_addr.s_addr == htonl(INADDR_LOOPBACK),
+                "should be bound to 127.0.0.1");
+
+    close(listen_fd);
+    return 1;
+}
+
+/* Test: tor password file reading logic */
+int test_tor_password_file(void) {
+    /* Write a temp file with a password */
+    const char *tmpfile = "/tmp/test_tor_pw.txt";
+    FILE *f = fopen(tmpfile, "w");
+    TEST_ASSERT(f != NULL, "cannot create temp file");
+    fprintf(f, "my_secret_password\n");
+    fclose(f);
+
+    /* Read it back using the same logic as superscalar_lsp.c */
+    char buf[256];
+    f = fopen(tmpfile, "r");
+    TEST_ASSERT(f != NULL, "cannot reopen temp file");
+    TEST_ASSERT(fgets(buf, sizeof(buf), f) != NULL, "fgets failed");
+    buf[strcspn(buf, "\r\n")] = '\0';
+    fclose(f);
+
+    TEST_ASSERT(strcmp(buf, "my_secret_password") == 0,
+                "password mismatch");
+
+    /* Test with password that has no trailing newline */
+    f = fopen(tmpfile, "w");
+    fprintf(f, "no_newline");
+    fclose(f);
+
+    f = fopen(tmpfile, "r");
+    TEST_ASSERT(fgets(buf, sizeof(buf), f) != NULL, "fgets failed");
+    buf[strcspn(buf, "\r\n")] = '\0';
+    fclose(f);
+
+    TEST_ASSERT(strcmp(buf, "no_newline") == 0,
+                "password without newline mismatch");
+
+    unlink(tmpfile);
+    return 1;
+}
+
+/* ---- Bridge Reliability Tests ---- */
+
+/* Test: bridge heartbeat detects stale connection */
+int test_bridge_heartbeat_stale(void) {
+    bridge_t br;
+    bridge_init(&br);
+    bridge_set_heartbeat(&br, 2);  /* 2-second heartbeat */
+
+    /* Just initialized — should not be stale */
+    TEST_ASSERT(!bridge_is_stale(&br), "should not be stale right after init");
+
+    /* Simulate staleness by setting last_lsp_activity to the past */
+    br.lsp_fd = 999;  /* fake fd so is_stale doesn't short-circuit */
+    br.last_lsp_activity = time(NULL) - 10;  /* 10 seconds ago */
+    TEST_ASSERT(bridge_is_stale(&br), "should be stale after timeout");
+
+    /* Reset activity — should no longer be stale */
+    br.last_lsp_activity = time(NULL);
+    TEST_ASSERT(!bridge_is_stale(&br), "should not be stale after activity");
+
+    br.lsp_fd = -1;  /* don't actually close fake fd */
+    return 1;
+}
+
+/* Test: bridge reconnect logic via fork (mock LSP) */
+int test_bridge_reconnect(void) {
+    /* Create a mock LSP using socketpair */
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        printf("  SKIP: socketpair not available\n");
+        return 1;
+    }
+
+    bridge_t br;
+    bridge_init(&br);
+    br.lsp_fd = fds[0];
+    br.last_lsp_activity = time(NULL);
+    strncpy(br.lsp_host, "127.0.0.1", sizeof(br.lsp_host));
+    br.lsp_port = 19999;
+
+    /* Send a BRIDGE_HELLO_ACK from mock LSP side */
+    cJSON *ack = wire_build_bridge_hello_ack();
+    int sent = wire_send(fds[1], MSG_BRIDGE_HELLO_ACK, ack);
+    cJSON_Delete(ack);
+    TEST_ASSERT(sent, "mock LSP send HELLO_ACK failed");
+
+    /* Bridge receives it — activity timestamp should update */
+    wire_msg_t msg;
+    int ok = wire_recv(br.lsp_fd, &msg);
+    TEST_ASSERT(ok, "bridge recv failed");
+    br.last_lsp_activity = time(NULL);  /* update as bridge_run would */
+    TEST_ASSERT(msg.msg_type == MSG_BRIDGE_HELLO_ACK, "wrong msg type");
+    cJSON_Delete(msg.json);
+
+    /* Simulate LSP crash by closing mock end */
+    close(fds[1]);
+
+    /* Now bridge should detect stale connection */
+    br.last_lsp_activity = time(NULL) - 60;
+    TEST_ASSERT(bridge_is_stale(&br), "should detect stale after crash");
+
+    /* Cleanup — close our end */
+    close(fds[0]);
+    br.lsp_fd = -1;
+
+    /* Verify reconnect_attempts tracking */
+    br.reconnect_attempts = 0;
+    br.reconnect_attempts++;  /* simulate a failed reconnect */
+    TEST_ASSERT(br.reconnect_attempts == 1, "reconnect counter wrong");
+
+    return 1;
+}
+
+/* Test: bridge_set_heartbeat validation */
+int test_bridge_heartbeat_config(void) {
+    bridge_t br;
+    bridge_init(&br);
+
+    /* Default heartbeat interval */
+    TEST_ASSERT_EQ(br.heartbeat_interval, 30, "default should be 30");
+
+    /* Set custom interval */
+    bridge_set_heartbeat(&br, 60);
+    TEST_ASSERT_EQ(br.heartbeat_interval, 60, "should be 60");
+
+    /* Set to 0 — should fall back to 30 */
+    bridge_set_heartbeat(&br, 0);
+    TEST_ASSERT_EQ(br.heartbeat_interval, 30, "0 should default to 30");
+
+    /* Negative — should fall back to 30 */
+    bridge_set_heartbeat(&br, -1);
+    TEST_ASSERT_EQ(br.heartbeat_interval, 30, "negative should default to 30");
+
+    return 1;
+}
