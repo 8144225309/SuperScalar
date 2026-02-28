@@ -234,6 +234,9 @@ extern int test_regtest_get_raw_tx_api(void);
 /* Phase 19: Encrypted Transport */
 extern int test_chacha20_poly1305_rfc7539(void);
 extern int test_hmac_sha256_rfc4231(void);
+extern int test_hkdf_sha256_rfc5869(void);
+extern int test_chacha20_block_rfc7539(void);
+extern int test_poly1305_rfc7539(void);
 extern int test_noise_handshake(void);
 extern int test_encrypted_wire_round_trip(void);
 extern int test_encrypted_tamper_reject(void);
@@ -726,6 +729,9 @@ static void run_unit_tests(void) {
     printf("\n=== Encrypted Transport (Phase 19) ===\n");
     RUN_TEST(test_chacha20_poly1305_rfc7539);
     RUN_TEST(test_hmac_sha256_rfc4231);
+    RUN_TEST(test_hkdf_sha256_rfc5869);
+    RUN_TEST(test_chacha20_block_rfc7539);
+    RUN_TEST(test_poly1305_rfc7539);
     RUN_TEST(test_noise_handshake);
     RUN_TEST(test_encrypted_wire_round_trip);
     RUN_TEST(test_encrypted_tamper_reject);
