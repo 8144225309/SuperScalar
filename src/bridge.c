@@ -194,9 +194,10 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
                                               &htlc_id))
             return 0;
 
-        /* Forward to plugin */
+        /* Forward to plugin (include payment_hash for correlation) */
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "htlc_resolve");
+        wire_json_add_hex(j, "payment_hash", payment_hash, 32);
         cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
         cJSON_AddStringToObject(j, "result", "fulfill");
         wire_json_add_hex(j, "preimage", preimage, 32);
@@ -215,6 +216,7 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
 
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "htlc_resolve");
+        wire_json_add_hex(j, "payment_hash", payment_hash, 32);
         cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
         cJSON_AddStringToObject(j, "result", "fail");
         cJSON_AddStringToObject(j, "reason", reason);
