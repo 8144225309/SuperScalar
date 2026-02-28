@@ -580,7 +580,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_CLOSE_NONCE) {
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_NONCE) {
                     fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     close_nonce_cer.clients[c] = CLIENT_ERROR;
@@ -676,7 +676,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_CLOSE_PSIG) {
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_PSIG) {
                     fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     close_psig_cer.clients[c] = CLIENT_ERROR;

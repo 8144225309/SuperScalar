@@ -361,7 +361,7 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
         /* Receive client's basepoints */
         wire_msg_t bp_resp;
-        if (!wire_recv(lsp->client_fds[c], &bp_resp) ||
+        if (!wire_recv_timeout(lsp->client_fds[c], &bp_resp, 30) ||
             bp_resp.msg_type != MSG_CHANNEL_BASEPOINTS) {
             fprintf(stderr, "LSP: expected CHANNEL_BASEPOINTS from client %zu, got 0x%02x\n",
                     c, bp_resp.msg_type);
@@ -441,7 +441,7 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         /* Wait for client's nonces */
         {
             wire_msg_t nonce_resp;
-            if (!wire_recv(lsp->client_fds[c], &nonce_resp) ||
+            if (!wire_recv_timeout(lsp->client_fds[c], &nonce_resp, 30) ||
                 nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
                 fprintf(stderr, "LSP: expected CHANNEL_NONCES from client %zu\n", c);
                 if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
@@ -539,7 +539,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from sender */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv(lsp->client_fds[sender_idx], &ack_msg) ||
+        if (!wire_recv_timeout(lsp->client_fds[sender_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from sender %zu\n", sender_idx);
@@ -719,7 +719,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from dest */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv(lsp->client_fds[dest_idx], &ack_msg) ||
+        if (!wire_recv_timeout(lsp->client_fds[dest_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from dest %zu\n", dest_idx);
@@ -827,7 +827,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
     /* Step 5: Wait for LEAF_ADVANCE_PSIG from client */
     wire_msg_t psig_msg;
-    if (!wire_recv(lsp->client_fds[leaf_side], &psig_msg) ||
+    if (!wire_recv_timeout(lsp->client_fds[leaf_side], &psig_msg, 30) ||
         psig_msg.msg_type != MSG_LEAF_ADVANCE_PSIG) {
         fprintf(stderr, "LSP: expected LEAF_ADVANCE_PSIG from client %d, got 0x%02x\n",
                 leaf_side, psig_msg.msg_type);
@@ -989,7 +989,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv(lsp->client_fds[client_idx], &ack_msg) ||
+        if (!wire_recv_timeout(lsp->client_fds[client_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             return 0;
@@ -1087,7 +1087,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             /* Wait for REVOKE_AND_ACK */
             wire_msg_t ack_msg;
-            if (wire_recv(lsp->client_fds[s], &ack_msg) &&
+            if (wire_recv_timeout(lsp->client_fds[s], &ack_msg, 30) &&
                 ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
@@ -1309,7 +1309,7 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Recv client's nonces */
     {
         wire_msg_t nonce_resp;
-        if (!wire_recv(new_fd, &nonce_resp) ||
+        if (!wire_recv_timeout(new_fd, &nonce_resp, 30) ||
             nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
             fprintf(stderr, "LSP reconnect: expected CHANNEL_NONCES from client\n");
             if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
@@ -1363,7 +1363,7 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
 
     /* Read MSG_RECONNECT */
     wire_msg_t msg;
-    if (!wire_recv(new_fd, &msg) || msg.msg_type != MSG_RECONNECT) {
+    if (!wire_recv_timeout(new_fd, &msg, 10) || msg.msg_type != MSG_RECONNECT) {
         fprintf(stderr, "LSP reconnect: expected MSG_RECONNECT, got 0x%02x\n",
                 msg.msg_type);
         if (msg.json) cJSON_Delete(msg.json);
@@ -2004,7 +2004,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 } else {
                     /* Peek at first message to distinguish bridge vs client */
                     wire_msg_t peek;
-                    if (wire_recv(new_fd, &peek)) {
+                    if (wire_recv_timeout(new_fd, &peek, 10)) {
                         if (peek.msg_type == MSG_BRIDGE_HELLO) {
                             /* Bridge connection */
                             cJSON_Delete(peek.json);

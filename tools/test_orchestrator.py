@@ -48,10 +48,12 @@ DEFAULT_NETWORK = "regtest"
 
 # Per-network timing constants
 TIMING = {
-    "regtest": {"factory_timeout": 30, "breach_wait": 10, "lsp_timeout": 90,
-                "coop_wait": 15, "stagger": 0.3, "lsp_bind": 2.0},
-    "signet":  {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
-                "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
+    "regtest":  {"factory_timeout": 30, "breach_wait": 10, "lsp_timeout": 90,
+                 "coop_wait": 15, "stagger": 0.3, "lsp_bind": 2.0},
+    "signet":   {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
+                 "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
+    "testnet4": {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
+                 "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
 }
 
 def client_seckey(index):

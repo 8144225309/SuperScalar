@@ -133,6 +133,10 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json);
 /* Recv: reads one frame. Caller must cJSON_Delete(msg->json). Returns 1 on success, 0 on EOF/error. */
 int wire_recv(int fd, wire_msg_t *msg);
 
+/* Recv with per-call timeout: sets SO_RCVTIMEO to timeout_sec before recv,
+   restores WIRE_DEFAULT_TIMEOUT_SEC after. Use timeout_sec=0 for infinite wait. */
+int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec);
+
 /* --- Crypto JSON helpers --- */
 
 /* Encode binary as hex string and add to JSON object */

@@ -68,8 +68,8 @@ Real Bitcoin Core transactions:
 
 1. **Watchtower capacity overflow** — global limit of WATCHTOWER_MAX_WATCH = 64 entries (src/noise.c:116). Returns 0 when full (no silent drop), but an attacker broadcasting many old states could exhaust the table. Not 16 as originally stated.
 2. **[RETRACTED] HTLC forwarding races** — the LSP event loop is single-threaded (select() in lsp_channels.c:2037-2243). Messages are processed sequentially, one at a time. Concurrent ADD/FULFILL/FAIL races are architecturally impossible. Not a real concern.
-3. **Cooperative close blocking** — if one client doesn't send CLOSE_NONCE, wire_recv() in lsp.c:430 blocks indefinitely with no timeout. Cleanup sends ERROR to other clients (lsp_abort_ceremony) but does NOT close sockets. Funds are not lost but the LSP hangs.
-4. **Database transaction isolation** — CONFIRMED. Multi-step saves (factory + participants in persist.c:289-357, tree nodes in persist.c:1117-1215) are NOT wrapped in BEGIN/COMMIT transactions. WAL mode is set but doesn't help with multi-statement atomicity. Crash mid-save leaves inconsistent state.
+3. **[FIXED] Cooperative close blocking** — wire_recv() calls in the close ceremony and throughout lsp_channels.c now use wire_recv_timeout() with appropriate per-call timeouts (30s for ceremony, 10s for reconnect/peek). The LSP no longer hangs on vanished clients.
+4. **[RETRACTED] Database transaction isolation** — on audit, persist_save_factory() and persist_save_tree_nodes() already use BEGIN IMMEDIATE/COMMIT/ROLLBACK via the own_txn pattern (persist_begin/persist_commit/persist_rollback). Multi-step saves are atomic. Not a real concern.
 
 ### High (DoS / crash vectors)
 
@@ -102,14 +102,14 @@ Real Bitcoin Core transactions:
 
 ### Gaps to close
 
-| Gap | Effort | Risk | Verified |
-|-----|--------|------|----------|
-| run_demo.sh hardcoded to regtest (line 84: `NETWORK="regtest"`), needs --signet flag | 1-2 hours | Low | Yes — no --network flag exists |
-| Cooperative close blocks indefinitely on missing CLOSE_NONCE (lsp.c:430) — needs timeout on wire_recv | 2-3 hours | Medium | Yes — blocking call, no timeout |
-| No mempool stuck-tx detection/auto-bump in payment critical paths (manual tools exist in signet_diagnose.sh but aren't integrated) | 6-8 hours | Medium | Yes — manual only |
-| Logging doesn't distinguish "in mempool waiting for signet block" from "not broadcast" | 2-3 hours | Low | Yes — regtest.c:514 is generic |
-| Noise FD table full = plaintext fallback with no warning to callers | 1-2 hours | Medium | Yes — silent degradation |
-| persist.c multi-step saves need BEGIN/COMMIT transaction wrapping | 3-4 hours | Medium | Yes — confirmed no transactions |
+| Gap | Effort | Risk | Status |
+|-----|--------|------|--------|
+| run_demo.sh hardcoded to regtest (line 84: `NETWORK="regtest"`), needs --signet flag | 1-2 hours | Low | Open |
+| ~~Cooperative close blocks indefinitely on missing CLOSE_NONCE~~ | ~~2-3 hours~~ | ~~Medium~~ | **FIXED** — wire_recv_timeout() added |
+| No mempool stuck-tx detection/auto-bump in payment critical paths | 6-8 hours | Medium | Open |
+| Logging doesn't distinguish "in mempool waiting for signet block" from "not broadcast" | 2-3 hours | Low | Open |
+| Noise FD table full = plaintext fallback with no warning to callers | 1-2 hours | Medium | Open |
+| ~~persist.c multi-step saves need BEGIN/COMMIT transaction wrapping~~ | ~~3-4 hours~~ | ~~Medium~~ | **Already done** — own_txn pattern exists |
 
 ### [REMOVED] Items that turned out to be non-issues
 
@@ -117,13 +117,14 @@ Real Bitcoin Core transactions:
 - ~~Wire protocol assumes well-formed JSON~~ — actually well-validated with null checks throughout
 - ~~HTLC forwarding race conditions~~ — single-threaded select loop, impossible
 - ~~No signet validation script~~ — signet_setup.sh already handles this
+- ~~Database transaction isolation~~ — persist_save_factory/persist_save_tree_nodes already use BEGIN/COMMIT
+- ~~Cooperative close timeout~~ — wire_recv_timeout() wrapper added with 30s per-call timeouts
 
 ### Revised Estimate
 
-The prototype is closer to signet-ready than initially assessed (~90%). The signet infrastructure already exists and is substantial. Key remaining work:
+The prototype is ~95% signet-ready. Key remaining work:
 
-- **Must fix:** Cooperative close timeout (blocking wire_recv)
-- **Should fix:** persist.c transaction wrapping, noise FD overflow handling
-- **Nice to have:** run_demo.sh --signet flag, better mempool logging
+- **Should fix:** Noise FD overflow handling
+- **Nice to have:** run_demo.sh --signet flag, better mempool logging, stuck-tx auto-bump
 
-Estimated effort to signet-deployable: **~1 week** of focused work, not 2-4 weeks as originally stated.
+Estimated effort to signet-deployable: **~2-3 days** of focused work.

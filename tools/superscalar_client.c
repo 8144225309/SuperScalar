@@ -1068,7 +1068,7 @@ static void usage(const char *prog) {
         "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH                     Write diagnostic JSON report to PATH\n"
         "  --db PATH                         SQLite database for persistence (default: none)\n"
-        "  --network MODE                    Network: regtest, signet, testnet, mainnet (default: regtest)\n"
+        "  --network MODE                    Network: regtest, signet, testnet, testnet4, mainnet (default: regtest)\n"
         "  --regtest                         Shorthand for --network regtest\n"
         "  --keyfile PATH                    Load/save secret key from encrypted file\n"
         "  --passphrase PASS                 Passphrase for keyfile (default: empty)\n"
