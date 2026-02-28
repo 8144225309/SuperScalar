@@ -206,7 +206,7 @@ Press **Ctrl+C**. The LSP will:
 | `--payments` | 0 | Number of HTLC payments to process |
 | `--cltv-timeout` | auto | Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest) |
 | `--regtest` | off | Shorthand for `--network regtest` |
-| `--i-accept-the-risk` | off | Allow mainnet operation (prototype — funds at risk!) |
+| `--i-accept-the-risk` | off | Required for mainnet operation |
 | `--help` | — | Show help and exit |
 
 ### Testing & Debug Flags

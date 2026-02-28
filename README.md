@@ -1,8 +1,8 @@
 # SuperScalar
 
-> **Status: Functional Prototype** — builds, passes 378 tests (337 unit + 41 regtest). Signet-ready. Not production-ready.
+> 378 tests (337 unit + 41 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
-First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
+Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
 A Bitcoin channel factory protocol combining:
 
@@ -10,6 +10,18 @@ A Bitcoin channel factory protocol combining:
 - **Timeout-sig-trees** — N-of-N MuSig2 key-path with CLTV timeout script-path fallback
 - **Poon-Dryja channels** — standard Lightning channels at leaf outputs with HTLCs
 - **LSP + N clients** — the LSP participates in every branch; no consensus changes required
+
+## Features
+
+| Area | What's Implemented |
+|------|--------------------|
+| **Cryptography** | MuSig2 (key agg, 2-round signing, nonce pools), Schnorr adaptor signatures, PTLC key turnover, shachain revocation |
+| **Transport** | Noise NK encrypted handshake, length-prefixed JSON wire protocol (53 message types), Tor hidden services + SOCKS5 |
+| **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
+| **Wire Protocol** | Factory lifecycle, channel ops, HTLCs, PTLC rotation, JIT channels, bridge relay, reconnection |
+| **Security** | Client + LSP watchtowers, breach detection + penalty broadcast, encrypted keyfiles, Noise-authenticated connections |
+| **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes) |
+| **Testing** | 337 unit + 41 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -52,9 +64,9 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-337 unit + 41 regtest integration tests (including 11 adversarial/edge-case tests).
+378 tests (337 unit + 41 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
-See [docs/testing-guide.md](docs/testing-guide.md) for a detailed walkthrough.
+See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
 ```bash
 cd build
@@ -407,6 +419,7 @@ superscalar_lsp [OPTIONS]
 | `--default-profit-bps` | N | 0 | Default profit share per client (basis points) |
 | `--no-jit` | — | off | Disable JIT channel fallback |
 | `--jit-amount` | SATS | auto | Per-client JIT channel funding amount |
+| `--max-connections` | N | clients | Max inbound connections to accept (1..LSP_MAX_CLIENTS) |
 | `--accept-timeout` | SECS | 0 | Max seconds to wait for each client to connect |
 | `--active-blocks` | N | 20/4320 | Factory active period in blocks |
 | `--dying-blocks` | N | 10/432 | Factory dying period in blocks |
@@ -424,7 +437,7 @@ superscalar_lsp [OPTIONS]
 | `--bind` | ADDRESS | 0.0.0.0 | Restrict listen address (auto `127.0.0.1` with `--onion`) |
 | `--tor-password-file` | PATH | — | Read Tor control password from file (avoids argv exposure) |
 | `--regtest` | — | off | Shorthand for --network regtest |
-| `--i-accept-the-risk` | — | off | Allow mainnet (prototype — funds at risk!) |
+| `--i-accept-the-risk` | — | off | Required for mainnet operation |
 | `--help` | — | — | Show help and exit |
 
 ### superscalar_client
@@ -479,7 +492,6 @@ superscalar_bridge [OPTIONS]
 | [Demo Walkthrough](docs/demo-walkthrough.md) | Everyone | Step-by-step for every demo: automated (one-command), manual (subcommands), fully manual (individual binaries), test orchestrator |
 | [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
 | [Deployment & Coordination](docs/deployment-coordination.md) | Operators + Users | Multi-machine deployment, Tor setup, Lightning bridge, factory lifecycle, monitoring, security checklist |
-| [Improving the Demo](docs/improving-the-demo.md) | Contributors | What works, what's missing, prioritized ideas for better demos and testing, where to contribute |
 
 ---
 
