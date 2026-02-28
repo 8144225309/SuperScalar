@@ -149,15 +149,17 @@ int test_bridge_msg_round_trip(void) {
 
     /* BRIDGE_REGISTER */
     {
-        cJSON *j = wire_build_bridge_register(hash, 50000, 2);
+        cJSON *j = wire_build_bridge_register(hash, preimage, 50000, 2);
         TEST_ASSERT(j != NULL, "build bridge_register");
 
         unsigned char ph[32];
+        unsigned char pi2[32];
         uint64_t am;
         size_t dc;
-        TEST_ASSERT(wire_parse_bridge_register(j, ph, &am, &dc),
+        TEST_ASSERT(wire_parse_bridge_register(j, ph, pi2, &am, &dc),
                      "parse bridge_register");
         TEST_ASSERT_MEM_EQ(ph, hash, 32, "register payment_hash");
+        TEST_ASSERT_MEM_EQ(pi2, preimage, 32, "register preimage");
         TEST_ASSERT_EQ(am, 50000, "register amount_msat");
         TEST_ASSERT_EQ(dc, 2, "register dest_client");
         cJSON_Delete(j);
@@ -207,14 +209,17 @@ int test_bridge_invoice_registry(void) {
     mgr.bridge_fd = -1;
 
     unsigned char hash1[32], hash2[32], hash3[32];
+    unsigned char pre1[32], pre2[32];
     memset(hash1, 0x11, 32);
     memset(hash2, 0x22, 32);
     memset(hash3, 0x33, 32);
+    memset(pre1, 0xA1, 32);
+    memset(pre2, 0xA2, 32);
 
     /* Register invoices */
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash1, 0, 10000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash1, pre1, 0, 10000),
                  "register invoice 1");
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, 2, 20000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, pre2, 2, 20000),
                  "register invoice 2");
     TEST_ASSERT_EQ(mgr.n_invoices, 2, "n_invoices");
 
@@ -420,8 +425,10 @@ int test_bridge_register_forward(void) {
 
     /* Build a REGISTER message as the LSP would send */
     unsigned char hash[32];
+    unsigned char pre[32];
     memset(hash, 0x55, 32);
-    cJSON *reg = wire_build_bridge_register(hash, 75000, 3);
+    memset(pre, 0x66, 32);
+    cJSON *reg = wire_build_bridge_register(hash, pre, 75000, 3);
     TEST_ASSERT(reg != NULL, "build register");
 
     wire_msg_t msg;
@@ -461,6 +468,12 @@ int test_bridge_register_forward(void) {
                  "payment_hash hex");
     TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "payment_hash matches");
 
+    /* Verify preimage hex round-trips */
+    unsigned char parsed_pre[32];
+    TEST_ASSERT(wire_json_get_hex(fwd, "preimage", parsed_pre, 32) == 32,
+                 "preimage hex");
+    TEST_ASSERT_MEM_EQ(parsed_pre, pre, 32, "preimage matches");
+
     cJSON_Delete(fwd);
     close(sv[0]);
     close(sv[1]);
@@ -483,7 +496,7 @@ int test_lsp_inbound_via_bridge(void) {
     sha256(preimage, 32, payment_hash);
 
     /* Register invoice: this payment_hash goes to client 1 */
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, 1, 100000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, preimage, 1, 100000),
                  "register invoice");
 
     /* Verify lookup works */
@@ -1251,7 +1264,7 @@ int test_regtest_bridge_payment(void) {
             ch_mgr.bridge_fd = sv[0];
 
             /* Register invoice: payment_hash → client 0 */
-            lsp_channels_register_invoice(&ch_mgr, payment_hash, 0, 5000000);
+            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage, 0, 5000000);
 
             /* Write BRIDGE_ADD_HTLC from bridge side (sv[1]) */
             cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000, 600, 1);
@@ -1576,5 +1589,135 @@ int test_bridge_heartbeat_config(void) {
     bridge_set_heartbeat(&br, -1);
     TEST_ASSERT_EQ(br.heartbeat_interval, 30, "negative should default to 30");
 
+    return 1;
+}
+
+/* ---- Test: INVOICE_BOLT11 wire round-trip over socketpair ---- */
+
+int test_bridge_invoice_bolt11_round_trip(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    unsigned char hash[32];
+    memset(hash, 0xDD, 32);
+    const char *bolt11 = "lnbc100n1ptest...fake_bolt11_string_for_testing";
+
+    /* Build and send */
+    cJSON *j = wire_build_invoice_bolt11(hash, bolt11);
+    TEST_ASSERT(j != NULL, "build invoice_bolt11");
+    TEST_ASSERT(wire_send(sv[0], MSG_INVOICE_BOLT11, j), "send invoice_bolt11");
+    cJSON_Delete(j);
+
+    /* Receive and parse */
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(sv[1], &msg), "recv invoice_bolt11");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_INVOICE_BOLT11, "msg type");
+
+    unsigned char parsed_hash[32];
+    char parsed_bolt11[2048];
+    TEST_ASSERT(wire_parse_invoice_bolt11(msg.json, parsed_hash,
+                    parsed_bolt11, sizeof(parsed_bolt11)),
+                "parse invoice_bolt11");
+    TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "payment_hash matches");
+    TEST_ASSERT(strcmp(parsed_bolt11, bolt11) == 0, "bolt11 matches");
+
+    cJSON_Delete(msg.json);
+    close(sv[0]);
+    close(sv[1]);
+    return 1;
+}
+
+/* ---- Test: bridge_handle_plugin_msg dispatches invoice_bolt11 ---- */
+
+int test_bridge_bolt11_plugin_to_lsp(void) {
+    int lsp_sv[2];  /* lsp_sv[0]=bridge lsp_fd, lsp_sv[1]=LSP side */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+
+    bridge_t br;
+    bridge_init(&br);
+    br.lsp_fd = lsp_sv[0];
+
+    /* Simulate plugin sending invoice_bolt11 JSON */
+    unsigned char hash[32];
+    memset(hash, 0xEE, 32);
+    char hash_hex[65];
+    hex_encode(hash, 32, hash_hex);
+
+    char line[4096];
+    snprintf(line, sizeof(line),
+        "{\"method\":\"invoice_bolt11\","
+        "\"payment_hash\":\"%s\","
+        "\"bolt11\":\"lnbc500n1ptest_bolt11\"}",
+        hash_hex);
+
+    TEST_ASSERT(bridge_handle_plugin_msg(&br, line), "handle invoice_bolt11");
+
+    /* Read MSG_INVOICE_BOLT11 from LSP side */
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(lsp_sv[1], &msg), "recv from LSP side");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_INVOICE_BOLT11, "msg type");
+
+    unsigned char recv_hash[32];
+    char recv_bolt11[2048];
+    TEST_ASSERT(wire_parse_invoice_bolt11(msg.json, recv_hash,
+                    recv_bolt11, sizeof(recv_bolt11)),
+                "parse bolt11");
+    TEST_ASSERT_MEM_EQ(recv_hash, hash, 32, "hash matches");
+    TEST_ASSERT(strcmp(recv_bolt11, "lnbc500n1ptest_bolt11") == 0,
+                "bolt11 matches");
+
+    cJSON_Delete(msg.json);
+    close(lsp_sv[0]);
+    close(lsp_sv[1]);
+    return 1;
+}
+
+/* ---- Test: bridge_handle_lsp_msg passes preimage in BRIDGE_REGISTER ---- */
+
+int test_bridge_preimage_passthrough(void) {
+    int plugin_sv[2];  /* plugin_sv[0]=plugin side, plugin_sv[1]=bridge plugin_fd */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, plugin_sv) == 0, "socketpair");
+
+    bridge_t br;
+    bridge_init(&br);
+    br.plugin_fd = plugin_sv[1];
+
+    /* Build BRIDGE_REGISTER with preimage */
+    unsigned char hash[32], pre[32];
+    memset(hash, 0x77, 32);
+    memset(pre, 0x88, 32);
+
+    cJSON *reg = wire_build_bridge_register(hash, pre, 42000, 1);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_REGISTER;
+    msg.json = reg;
+
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "handle register");
+    cJSON_Delete(reg);
+
+    /* Read JSON from plugin side */
+    char buf[4096];
+    ssize_t n = read(plugin_sv[0], buf, sizeof(buf) - 1);
+    TEST_ASSERT(n > 0, "read plugin output");
+    buf[n] = '\0';
+
+    cJSON *fwd = cJSON_Parse(buf);
+    TEST_ASSERT(fwd != NULL, "parse forwarded JSON");
+
+    /* Verify preimage is present */
+    unsigned char parsed_pre[32];
+    TEST_ASSERT(wire_json_get_hex(fwd, "preimage", parsed_pre, 32) == 32,
+                 "preimage in JSON");
+    TEST_ASSERT_MEM_EQ(parsed_pre, pre, 32, "preimage matches");
+
+    /* Verify payment_hash */
+    unsigned char parsed_hash[32];
+    TEST_ASSERT(wire_json_get_hex(fwd, "payment_hash", parsed_hash, 32) == 32,
+                 "payment_hash in JSON");
+    TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "hash matches");
+
+    cJSON_Delete(fwd);
+    close(plugin_sv[0]);
+    close(plugin_sv[1]);
     return 1;
 }

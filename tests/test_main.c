@@ -190,6 +190,9 @@ extern int test_lsp_inbound_via_bridge(void);
 extern int test_bridge_register_forward(void);
 extern int test_bridge_set_nk_pubkey(void);
 extern int test_bridge_htlc_timeout(void);
+extern int test_bridge_invoice_bolt11_round_trip(void);
+extern int test_bridge_bolt11_plugin_to_lsp(void);
+extern int test_bridge_preimage_passthrough(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -685,6 +688,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_register_forward);
     RUN_TEST(test_bridge_set_nk_pubkey);
     RUN_TEST(test_bridge_htlc_timeout);
+    RUN_TEST(test_bridge_invoice_bolt11_round_trip);
+    RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
+    RUN_TEST(test_bridge_preimage_passthrough);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

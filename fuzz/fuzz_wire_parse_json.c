@@ -100,9 +100,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* register_invoice */
     {
         unsigned char payment_hash[32];
+        unsigned char preimage[32];
         uint64_t amount_msat;
         size_t dest_client;
-        wire_parse_register_invoice(json, payment_hash, &amount_msat,
+        wire_parse_register_invoice(json, payment_hash, preimage, &amount_msat,
                                       &dest_client);
     }
 

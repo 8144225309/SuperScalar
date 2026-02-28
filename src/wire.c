@@ -80,6 +80,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x36: return "CLOSE_REQUEST";
     case 0x37: return "CHANNEL_NONCES";
     case 0x38: return "REGISTER_INVOICE";
+    case 0x39: return "INVOICE_BOLT11";
     case 0x40: return "BRIDGE_HELLO";
     case 0x41: return "BRIDGE_HELLO_ACK";
     case 0x42: return "BRIDGE_ADD_HTLC";
@@ -920,9 +921,11 @@ cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
 }
 
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
+                                    const unsigned char *preimage32,
                                     uint64_t amount_msat, size_t dest_client) {
     cJSON *j = cJSON_CreateObject();
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    wire_json_add_hex(j, "preimage", preimage32, 32);
     cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
     cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
     return j;
@@ -931,9 +934,11 @@ cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
 /* --- Register invoice (Phase 15) --- */
 
 cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
+                                     const unsigned char *preimage32,
                                      uint64_t amount_msat, size_t dest_client) {
     cJSON *j = cJSON_CreateObject();
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    wire_json_add_hex(j, "preimage", preimage32, 32);
     cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
     cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
     return j;
@@ -941,12 +946,15 @@ cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
 
 int wire_parse_register_invoice(const cJSON *json,
                                   unsigned char *payment_hash32,
+                                  unsigned char *preimage32,
                                   uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
     if (!am || !cJSON_IsNumber(am) || !dc || !cJSON_IsNumber(dc))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
         return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     *dest_client = (size_t)dc->valuedouble;
@@ -1042,6 +1050,7 @@ int wire_parse_bridge_pay_result(const cJSON *json,
 
 int wire_parse_bridge_register(const cJSON *json,
                                  unsigned char *payment_hash32,
+                                 unsigned char *preimage32,
                                  uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
@@ -1049,8 +1058,35 @@ int wire_parse_bridge_register(const cJSON *json,
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
+    if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+        return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     *dest_client = (size_t)dc->valuedouble;
+    return 1;
+}
+
+/* --- Invoice BOLT11 (CLN bridge integration) --- */
+
+cJSON *wire_build_invoice_bolt11(const unsigned char *payment_hash32,
+                                   const char *bolt11) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddStringToObject(j, "bolt11", bolt11);
+    return j;
+}
+
+int wire_parse_invoice_bolt11(const cJSON *json,
+                                unsigned char *payment_hash32,
+                                char *bolt11, size_t bolt11_len) {
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    cJSON *b = cJSON_GetObjectItem(json, "bolt11");
+    if (!b || !cJSON_IsString(b))
+        return 0;
+    if (bolt11 && bolt11_len > 0) {
+        strncpy(bolt11, b->valuestring, bolt11_len - 1);
+        bolt11[bolt11_len - 1] = '\0';
+    }
     return 1;
 }
 

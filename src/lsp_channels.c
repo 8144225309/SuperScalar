@@ -1162,20 +1162,21 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     case MSG_REGISTER_INVOICE: {
         unsigned char payment_hash[32];
+        unsigned char preimage[32];
         uint64_t amount_msat;
         size_t dest_client;
-        if (!wire_parse_register_invoice(msg->json, payment_hash,
+        if (!wire_parse_register_invoice(msg->json, payment_hash, preimage,
                                            &amount_msat, &dest_client))
             return 0;
-        if (!lsp_channels_register_invoice(mgr, payment_hash,
+        if (!lsp_channels_register_invoice(mgr, payment_hash, preimage,
                                              dest_client, amount_msat)) {
             fprintf(stderr, "LSP: register_invoice failed\n");
             return 0;
         }
         /* Also forward to bridge if connected */
         if (mgr->bridge_fd >= 0) {
-            cJSON *reg = wire_build_bridge_register(payment_hash, amount_msat,
-                                                      dest_client);
+            cJSON *reg = wire_build_bridge_register(payment_hash, preimage,
+                                                      amount_msat, dest_client);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
             cJSON_Delete(reg);
         }

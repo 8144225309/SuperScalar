@@ -53,11 +53,11 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Handle MSG_REGISTER_INVOICE that arrives before INVOICE_CREATED */
         if (msg->msg_type == MSG_REGISTER_INVOICE) {
-            unsigned char ph[32];
+            unsigned char ph[32], pre[32];
             uint64_t am;
             size_t dc;
-            if (wire_parse_register_invoice(msg->json, ph, &am, &dc))
-                lsp_channels_register_invoice(mgr, ph, dc, am);
+            if (wire_parse_register_invoice(msg->json, ph, pre, &am, &dc))
+                lsp_channels_register_invoice(mgr, ph, pre, dc, am);
             cJSON_Delete(msg->json);
             msg->json = NULL;
             continue;
@@ -119,11 +119,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             wire_msg_t drain_msg;
             if (!wire_recv(lsp->client_fds[to_client], &drain_msg)) break;
             if (drain_msg.msg_type == MSG_REGISTER_INVOICE) {
-                unsigned char ph[32];
+                unsigned char ph[32], pre[32];
                 uint64_t am;
                 size_t dc;
-                if (wire_parse_register_invoice(drain_msg.json, ph, &am, &dc))
-                    lsp_channels_register_invoice(mgr, ph, dc, am);
+                if (wire_parse_register_invoice(drain_msg.json, ph, pre, &am, &dc))
+                    lsp_channels_register_invoice(mgr, ph, pre, dc, am);
             }
             cJSON_Delete(drain_msg.json);
             FD_ZERO(&rfds);

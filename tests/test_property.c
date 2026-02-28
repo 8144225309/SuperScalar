@@ -478,23 +478,26 @@ int test_prop_persist_factory_roundtrip(void) {
 int test_prop_wire_register_roundtrip(void) {
     unsigned int seed = 42;
     for (int trial = 0; trial < 500; trial++) {
-        unsigned char hash[32];
-        for (int i = 0; i < 32; i++)
+        unsigned char hash[32], pre[32];
+        for (int i = 0; i < 32; i++) {
             hash[i] = (unsigned char)(rand_r(&seed) & 0xff);
+            pre[i] = (unsigned char)(rand_r(&seed) & 0xff);
+        }
         uint64_t amount = 1 + ((uint64_t)rand_r(&seed) % 100000000);
         size_t dest = rand_r(&seed) % 16;
 
-        cJSON *json = wire_build_register_invoice(hash, amount, dest);
+        cJSON *json = wire_build_register_invoice(hash, pre, amount, dest);
         TEST_ASSERT(json != NULL, "build returned NULL");
 
-        unsigned char p_hash[32];
+        unsigned char p_hash[32], p_pre[32];
         uint64_t p_amount;
         size_t p_dest;
-        int ok = wire_parse_register_invoice(json, p_hash, &p_amount, &p_dest);
+        int ok = wire_parse_register_invoice(json, p_hash, p_pre, &p_amount, &p_dest);
         cJSON_Delete(json);
 
         TEST_ASSERT(ok, "parse failed");
         TEST_ASSERT_MEM_EQ(hash, p_hash, 32, "hash mismatch");
+        TEST_ASSERT_MEM_EQ(pre, p_pre, 32, "preimage mismatch");
         TEST_ASSERT(p_amount == amount, "amount mismatch");
         TEST_ASSERT(p_dest == dest, "dest mismatch");
     }

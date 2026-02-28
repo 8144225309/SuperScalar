@@ -4,9 +4,13 @@ SuperScalar CLN Plugin
 
 Bridges Core Lightning to the SuperScalar bridge daemon via TCP.
 Handles:
-  - htlc_accepted hook: forwards inbound HTLCs to bridge
+  - htlc_accepted hook: selectively forwards factory HTLCs to bridge
+  - invoice_registered from bridge: creates CLN invoice with known preimage
   - superscalar-pay RPC: convenience wrapper for lightning-cli pay
   - pay_request from bridge: calls lightning-cli pay for outbound LN payments
+
+Non-factory HTLCs pass through to CLN's normal handling, so traditional
+Lightning channels continue to work unaffected.
 
 Usage:
   lightningd --plugin=/path/to/cln_plugin.py \
@@ -28,6 +32,7 @@ LIGHTNING_CLI = "lightning-cli"
 bridge_sock = None
 pending_htlcs = {}   # htlc_id -> rpc_id for resolving
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
+registered_invoices = set()   # payment_hash hex strings for factory clients
 next_request_id = 1
 next_htlc_id = 1
 lock = threading.Lock()
@@ -130,14 +135,35 @@ def handle_bridge_msg(msg):
             })
         else:
             reason = msg.get("reason", "unknown")
-            send_to_cln({
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "result": "fail",
-                    "failure_message": reason
-                }
-            })
+            # If bridge rejects with unknown_payment_hash, let CLN handle it
+            if reason == "unknown_payment_hash":
+                send_to_cln({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {"result": "continue"}
+                })
+            else:
+                send_to_cln({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {
+                        "result": "fail",
+                        "failure_message": reason
+                    }
+                })
+
+    elif method == "invoice_registered":
+        # Bridge forwarded a registered invoice — create CLN invoice with
+        # the known preimage so external LN nodes can pay it
+        payment_hash = msg.get("payment_hash", "")
+        preimage_hex = msg.get("preimage", "")
+        amount_msat = int(msg.get("amount_msat", 0))
+        t = threading.Thread(
+            target=_create_cln_invoice,
+            args=(payment_hash, preimage_hex, amount_msat),
+            daemon=True
+        )
+        t.start()
 
     elif method == "pay_request":
         bolt11 = msg.get("bolt11", "")
@@ -169,6 +195,38 @@ def handle_bridge_msg(msg):
                 })
         else:
             log(f"No pending pay for request_id {request_id}")
+
+
+def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
+    """Create a CLN invoice with a known preimage and send BOLT11 back to bridge."""
+    label = f"superscalar-{payment_hash[:16]}-{int(time.time())}"
+    try:
+        cmd = [
+            LIGHTNING_CLI, "invoice",
+            str(amount_msat),
+            label,
+            "SuperScalar factory payment",
+            "3600",    # expiry seconds
+            "null",    # fallbacks
+            preimage_hex
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            inv_result = json.loads(result.stdout)
+            bolt11 = inv_result.get("bolt11", "")
+            with lock:
+                registered_invoices.add(payment_hash)
+            log(f"Created CLN invoice for {payment_hash[:16]}...")
+            # Send BOLT11 back to bridge for forwarding to client
+            send_to_bridge({
+                "method": "invoice_bolt11",
+                "payment_hash": payment_hash,
+                "bolt11": bolt11
+            })
+        else:
+            log(f"CLN invoice creation failed: {result.stderr[:200]}")
+    except Exception as e:
+        log(f"CLN invoice exception: {e}")
 
 
 def _do_pay(bolt11, request_id):
@@ -207,12 +265,26 @@ def _do_pay(bolt11, request_id):
 
 
 def handle_htlc_accepted(rpc_id, params):
-    """Handle the htlc_accepted hook from CLN."""
-    onion = params.get("onion", {})
+    """Handle the htlc_accepted hook from CLN.
+    Only forwards HTLCs for registered factory invoices to the bridge.
+    All other HTLCs are passed through to CLN's normal handling."""
     htlc = params.get("htlc", {})
     payment_hash = htlc.get("payment_hash", "")
     amount_msat = int(htlc.get("amount_msat", "0msat").replace("msat", ""))
     cltv_expiry = htlc.get("cltv_expiry", 0)
+
+    # Check if this HTLC is for a registered factory invoice
+    with lock:
+        is_ours = payment_hash in registered_invoices
+
+    if not is_ours:
+        # Not a factory payment — let CLN handle it normally
+        send_to_cln({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {"result": "continue"}
+        })
+        return
 
     # Assign local htlc_id (monotonic to avoid collisions after pops)
     global next_htlc_id
@@ -230,7 +302,9 @@ def handle_htlc_accepted(rpc_id, params):
     })
 
     if not ok:
-        # Bridge not connected, continue normally
+        # Bridge not connected — let CLN handle it (maybe CLN has the invoice)
+        with lock:
+            pending_htlcs.pop(htlc_id, None)
         send_to_cln({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -280,7 +354,7 @@ def main():
                         }
                     ],
                     "hooks": [
-                        {"name": "htlc_accepted"}
+                        {"name": "htlc_accepted", "before": ["keysend"]}
                     ],
                     "subscriptions": []
                 }

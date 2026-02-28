@@ -38,21 +38,25 @@
 /* Test 1: MSG_REGISTER_INVOICE wire message round-trip */
 int test_register_invoice_wire(void) {
     unsigned char payment_hash[32];
+    unsigned char preimage[32];
     memset(payment_hash, 0xAB, 32);
+    memset(preimage, 0xCD, 32);
     uint64_t amount_msat = 50000000;
     size_t dest_client = 2;
 
     /* Build */
-    cJSON *msg = wire_build_register_invoice(payment_hash, amount_msat, dest_client);
+    cJSON *msg = wire_build_register_invoice(payment_hash, preimage, amount_msat, dest_client);
     TEST_ASSERT(msg != NULL, "build returned NULL");
 
     /* Parse */
     unsigned char parsed_hash[32];
+    unsigned char parsed_preimage[32];
     uint64_t parsed_amount;
     size_t parsed_dest;
-    int ok = wire_parse_register_invoice(msg, parsed_hash, &parsed_amount, &parsed_dest);
+    int ok = wire_parse_register_invoice(msg, parsed_hash, parsed_preimage, &parsed_amount, &parsed_dest);
     TEST_ASSERT(ok, "parse failed");
     TEST_ASSERT_MEM_EQ(parsed_hash, payment_hash, 32, "payment_hash mismatch");
+    TEST_ASSERT_MEM_EQ(parsed_preimage, preimage, 32, "preimage mismatch");
     TEST_ASSERT_EQ(parsed_amount, amount_msat, "amount_msat mismatch");
     TEST_ASSERT_EQ(parsed_dest, dest_client, "dest_client mismatch");
 

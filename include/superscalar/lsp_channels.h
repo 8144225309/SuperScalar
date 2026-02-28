@@ -32,6 +32,7 @@ typedef struct {
 
 typedef struct {
     unsigned char payment_hash[32];
+    unsigned char preimage[32];
     size_t dest_client;
     uint64_t amount_msat;
     uint64_t bridge_htlc_id;     /* correlation ID for bridge response */
@@ -233,6 +234,7 @@ void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
 /* Register an invoice (payment_hash → dest_client) for bridge inbound routing. */
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
+                                    const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat);
 
 /* Look up invoice by payment_hash. Returns dest_client index, or -1. */

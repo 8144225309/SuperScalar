@@ -11,12 +11,14 @@ void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd) {
 
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
+                                    const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat) {
     if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) return 0;
     if (dest_client >= mgr->n_channels) return 0;
 
     invoice_entry_t *inv = &mgr->invoices[mgr->n_invoices++];
     memcpy(inv->payment_hash, payment_hash32, 32);
+    memcpy(inv->preimage, preimage32, 32);
     inv->dest_client = dest_client;
     inv->amount_msat = amount_msat;
     inv->bridge_htlc_id = 0;
@@ -250,6 +252,29 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             break;
         }
         return 1;
+    }
+
+    case MSG_INVOICE_BOLT11: {
+        /* BOLT11 invoice created by CLN plugin — forward to dest client */
+        unsigned char payment_hash[32];
+        char bolt11[2048];
+        if (!wire_parse_invoice_bolt11(msg->json, payment_hash, bolt11,
+                                         sizeof(bolt11)))
+            return 0;
+
+        /* Look up dest_client via invoice registry */
+        size_t dest_idx;
+        if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
+            fprintf(stderr, "LSP: INVOICE_BOLT11 for unknown hash\n");
+            return 0;
+        }
+
+        /* Forward to client */
+        cJSON *fwd = wire_build_invoice_bolt11(payment_hash, bolt11);
+        int ok = wire_send(lsp->client_fds[dest_idx], MSG_INVOICE_BOLT11, fwd);
+        cJSON_Delete(fwd);
+        printf("LSP: forwarded BOLT11 to client %zu\n", dest_idx);
+        return ok;
     }
 
     default:

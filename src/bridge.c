@@ -242,15 +242,17 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
 
     case MSG_BRIDGE_REGISTER: {
         unsigned char payment_hash[32];
+        unsigned char preimage[32];
         uint64_t amount_msat;
         size_t dest_client;
-        if (!wire_parse_bridge_register(msg->json, payment_hash,
+        if (!wire_parse_bridge_register(msg->json, payment_hash, preimage,
                                           &amount_msat, &dest_client))
             return 0;
 
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "invoice_registered");
         wire_json_add_hex(j, "payment_hash", payment_hash, 32);
+        wire_json_add_hex(j, "preimage", preimage, 32);
         cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
         cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
         int ok = bridge_send_plugin_json(br, j);
@@ -324,6 +326,25 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         cJSON *msg = wire_build_bridge_pay_result(request_id, success,
                                                     success ? preimage : NULL);
         int ok = wire_send(br->lsp_fd, MSG_BRIDGE_PAY_RESULT, msg);
+        cJSON_Delete(msg);
+        cJSON_Delete(json);
+        return ok;
+    }
+
+    if (strcmp(method->valuestring, "invoice_bolt11") == 0) {
+        unsigned char payment_hash[32];
+        if (wire_json_get_hex(json, "payment_hash", payment_hash, 32) != 32) {
+            cJSON_Delete(json);
+            return 0;
+        }
+        cJSON *b11 = cJSON_GetObjectItem(json, "bolt11");
+        if (!b11 || !cJSON_IsString(b11)) {
+            cJSON_Delete(json);
+            return 0;
+        }
+
+        cJSON *msg = wire_build_invoice_bolt11(payment_hash, b11->valuestring);
+        int ok = wire_send(br->lsp_fd, MSG_INVOICE_BOLT11, msg);
         cJSON_Delete(msg);
         cJSON_Delete(json);
         return ok;

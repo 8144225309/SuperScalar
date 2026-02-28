@@ -30,6 +30,7 @@
 #define MSG_CLOSE_REQUEST      0x36
 #define MSG_CHANNEL_NONCES     0x37   /* batch of pubnonces for channel signing */
 #define MSG_REGISTER_INVOICE   0x38   /* Client → LSP: register payment hash for inbound */
+#define MSG_INVOICE_BOLT11     0x39   /* LSP → Client: BOLT11 string from CLN */
 
 /* Bridge messages (Phase 14) */
 #define MSG_BRIDGE_HELLO        0x40  /* Bridge → LSP: identify as bridge */
@@ -267,12 +268,14 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 unsigned char pubnonces_out[][66],
                                 size_t max_nonces, size_t *count_out);
 
-/* Client → LSP: REGISTER_INVOICE {payment_hash, amount_msat, dest_client} */
+/* Client → LSP: REGISTER_INVOICE {payment_hash, preimage, amount_msat, dest_client} */
 cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
+                                     const unsigned char *preimage32,
                                      uint64_t amount_msat, size_t dest_client);
 
 int wire_parse_register_invoice(const cJSON *json,
                                   unsigned char *payment_hash32,
+                                  unsigned char *preimage32,
                                   uint64_t *amount_msat, size_t *dest_client);
 
 /* --- Bridge message builders (Phase 14) --- */
@@ -306,8 +309,9 @@ cJSON *wire_build_bridge_send_pay(const char *bolt11,
 cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
                                       const unsigned char *preimage32);
 
-/* LSP → Bridge: BRIDGE_REGISTER {payment_hash, amount_msat, dest_client} */
+/* LSP → Bridge: BRIDGE_REGISTER {payment_hash, preimage, amount_msat, dest_client} */
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
+                                    const unsigned char *preimage32,
                                     uint64_t amount_msat, size_t dest_client);
 
 /* --- Bridge message parsers (Phase 14) --- */
@@ -338,7 +342,16 @@ int wire_parse_bridge_pay_result(const cJSON *json,
 
 int wire_parse_bridge_register(const cJSON *json,
                                  unsigned char *payment_hash32,
+                                 unsigned char *preimage32,
                                  uint64_t *amount_msat, size_t *dest_client);
+
+/* LSP → Client: INVOICE_BOLT11 {payment_hash, bolt11} */
+cJSON *wire_build_invoice_bolt11(const unsigned char *payment_hash32,
+                                   const char *bolt11);
+
+int wire_parse_invoice_bolt11(const cJSON *json,
+                                unsigned char *payment_hash32,
+                                char *bolt11, size_t bolt11_len);
 
 /* --- Reconnection messages (Phase 16) --- */
 

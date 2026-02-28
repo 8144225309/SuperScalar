@@ -560,11 +560,29 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 /* Also register with LSP so it knows to route to us */
                 uint32_t client_idx = my_index - 1;
                 cJSON *reg = wire_build_register_invoice(inv->payment_hash,
+                                                           inv->preimage,
                                                            inv_amount_msat,
                                                            (size_t)client_idx);
                 wire_send(fd, MSG_REGISTER_INVOICE, reg);
                 cJSON_Delete(reg);
             }
+            break;
+        }
+
+        case MSG_INVOICE_BOLT11: {
+            /* LSP forwarded a BOLT11 invoice string from CLN */
+            unsigned char bolt11_hash[32];
+            char bolt11_str[2048];
+            if (!wire_parse_invoice_bolt11(msg.json, bolt11_hash,
+                                             bolt11_str, sizeof(bolt11_str))) {
+                fprintf(stderr, "Client %u: bad INVOICE_BOLT11\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+
+            printf("Client %u: BOLT11 invoice ready:\n%s\n",
+                   my_index, bolt11_str);
             break;
         }
 
