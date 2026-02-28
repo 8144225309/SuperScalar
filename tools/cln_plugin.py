@@ -30,12 +30,13 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
 LIGHTNING_CLI = "lightning-cli"
 bridge_sock = None
-pending_htlcs = {}   # htlc_id -> rpc_id for resolving
+# Keyed by payment_hash (hex string) — immune to htlc_id counter desync
+pending_htlcs = {}   # payment_hash -> rpc_id for resolving
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
 next_request_id = 1
-next_htlc_id = 1
 lock = threading.Lock()
+cln_lock = threading.Lock()  # serializes writes to CLN stdout
 
 
 def log(msg):
@@ -45,19 +46,23 @@ def log(msg):
 
 
 def send_to_cln(response):
-    """Send JSON-RPC response to CLN."""
-    sys.stdout.write(json.dumps(response) + "\n")
-    sys.stdout.flush()
+    """Send JSON-RPC response to CLN (thread-safe)."""
+    with cln_lock:
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
 
 
 def send_to_bridge(msg):
-    """Send newline-delimited JSON to bridge."""
+    """Send newline-delimited JSON to bridge (thread-safe)."""
     global bridge_sock
-    if bridge_sock is None:
+    with lock:
+        sock = bridge_sock
+    if sock is None:
         return False
     try:
         data = json.dumps(msg) + "\n"
-        bridge_sock.sendall(data.encode())
+        with lock:
+            sock.sendall(data.encode())
         return True
     except Exception as e:
         log(f"send_to_bridge error: {e}")
@@ -68,7 +73,9 @@ def connect_bridge():
     """Connect to the SuperScalar bridge daemon."""
     global bridge_sock
     try:
-        bridge_sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT))
+        sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT))
+        with lock:
+            bridge_sock = sock
         log(f"Connected to bridge at {BRIDGE_HOST}:{BRIDGE_PORT}")
         return True
     except Exception as e:
@@ -84,9 +91,11 @@ def bridge_reader():
         buf = b""
         while True:
             try:
-                if bridge_sock is None:
+                with lock:
+                    sock = bridge_sock
+                if sock is None:
                     break
-                data = bridge_sock.recv(4096)
+                data = sock.recv(4096)
                 if not data:
                     log("Bridge connection closed")
                     break
@@ -100,7 +109,8 @@ def bridge_reader():
                 break
 
         # Connection lost — attempt reconnect
-        bridge_sock = None
+        with lock:
+            bridge_sock = None
         log("Bridge disconnected, will retry in 5s...")
         time.sleep(5)
         while not connect_bridge():
@@ -114,13 +124,15 @@ def handle_bridge_msg(msg):
     method = msg.get("method", "")
 
     if method == "htlc_resolve":
-        htlc_id = msg.get("htlc_id")
+        payment_hash = msg.get("payment_hash", "")
         result = msg.get("result")
         with lock:
-            rpc_id = pending_htlcs.pop(htlc_id, None)
+            rpc_id = pending_htlcs.pop(payment_hash, None)
+            # Clean up resolved invoice from registry
+            registered_invoices.discard(payment_hash)
 
         if rpc_id is None:
-            log(f"No pending HTLC for id {htlc_id}")
+            log(f"No pending HTLC for hash {payment_hash[:16]}...")
             return
 
         if result == "fulfill":
@@ -143,13 +155,13 @@ def handle_bridge_msg(msg):
                     "result": {"result": "continue"}
                 })
             else:
+                # Use bare "fail" — CLN defaults to temporary_node_failure.
+                # Passing a human-readable reason string would violate the
+                # CLN protocol which expects hex-encoded wire failure bytes.
                 send_to_cln({
                     "jsonrpc": "2.0",
                     "id": rpc_id,
-                    "result": {
-                        "result": "fail",
-                        "failure_message": reason
-                    }
+                    "result": {"result": "fail"}
                 })
 
     elif method == "invoice_registered":
@@ -225,8 +237,19 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             })
         else:
             log(f"CLN invoice creation failed: {result.stderr[:200]}")
+            # Notify bridge of failure so client doesn't wait forever
+            send_to_bridge({
+                "method": "invoice_bolt11",
+                "payment_hash": payment_hash,
+                "bolt11": ""
+            })
     except Exception as e:
         log(f"CLN invoice exception: {e}")
+        send_to_bridge({
+            "method": "invoice_bolt11",
+            "payment_hash": payment_hash,
+            "bolt11": ""
+        })
 
 
 def _do_pay(bolt11, request_id):
@@ -270,7 +293,9 @@ def handle_htlc_accepted(rpc_id, params):
     All other HTLCs are passed through to CLN's normal handling."""
     htlc = params.get("htlc", {})
     payment_hash = htlc.get("payment_hash", "")
-    amount_msat = int(htlc.get("amount_msat", "0msat").replace("msat", ""))
+    # CLN may send amount_msat as int or string "Nmsat" depending on version
+    raw_amt = htlc.get("amount_msat", 0)
+    amount_msat = int(str(raw_amt).replace("msat", ""))
     cltv_expiry = htlc.get("cltv_expiry", 0)
 
     # Check if this HTLC is for a registered factory invoice
@@ -286,25 +311,24 @@ def handle_htlc_accepted(rpc_id, params):
         })
         return
 
-    # Assign local htlc_id (monotonic to avoid collisions after pops)
-    global next_htlc_id
+    # Register pending HTLC keyed by payment_hash (no counter desync risk)
     with lock:
-        htlc_id = next_htlc_id
-        next_htlc_id += 1
-        pending_htlcs[htlc_id] = rpc_id
+        if payment_hash in pending_htlcs:
+            # Duplicate HTLC for same hash (MPP or retry) — let CLN handle
+            log(f"Duplicate HTLC for {payment_hash[:16]}..., passing to CLN")
+        pending_htlcs[payment_hash] = rpc_id
 
     ok = send_to_bridge({
         "method": "htlc_accepted",
         "payment_hash": payment_hash,
         "amount_msat": amount_msat,
-        "cltv_expiry": cltv_expiry,
-        "htlc_id": htlc_id
+        "cltv_expiry": cltv_expiry
     })
 
     if not ok:
         # Bridge not connected — let CLN handle it (maybe CLN has the invoice)
         with lock:
-            pending_htlcs.pop(htlc_id, None)
+            pending_htlcs.pop(payment_hash, None)
         send_to_cln({
             "jsonrpc": "2.0",
             "id": rpc_id,

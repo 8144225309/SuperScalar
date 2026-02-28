@@ -1070,8 +1070,9 @@ int wire_parse_bridge_register(const cJSON *json,
 cJSON *wire_build_invoice_bolt11(const unsigned char *payment_hash32,
                                    const char *bolt11) {
     cJSON *j = cJSON_CreateObject();
-    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
-    cJSON_AddStringToObject(j, "bolt11", bolt11);
+    if (payment_hash32)
+        wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddStringToObject(j, "bolt11", bolt11 ? bolt11 : "");
     return j;
 }
 
