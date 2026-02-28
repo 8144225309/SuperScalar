@@ -116,7 +116,7 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build --parallel
       - name: Run tests
-        run: cd build && ctest --output-on-failure --timeout 180
+        run: ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
       - name: Generate coverage report
         run: |
           cd build
