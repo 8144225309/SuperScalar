@@ -17,7 +17,7 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \

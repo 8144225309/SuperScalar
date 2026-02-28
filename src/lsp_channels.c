@@ -17,7 +17,7 @@
 #include <signal.h>
 #include <unistd.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 /* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
 

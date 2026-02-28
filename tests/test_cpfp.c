@@ -19,9 +19,7 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 
 #define TEST_ASSERT(cond, msg) do { \

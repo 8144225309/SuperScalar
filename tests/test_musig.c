@@ -1,4 +1,5 @@
 #include "superscalar/musig.h"
+#include "superscalar/sha256.h"
 #include <secp256k1_musig.h>
 #include <stdio.h>
 #include <string.h>
@@ -143,7 +144,6 @@ int test_musig_taproot_sign(void) {
     unsigned char internal_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &keyagg2.agg_pubkey)) return 0;
 
-    extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
@@ -179,8 +179,6 @@ static const unsigned char test_seckey5[32] = {
     0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
     0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
 };
-
-extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
 
 /* Helper: compute taproot-tweaked xonly pubkey for verification */
 static int compute_tweaked_xonly(

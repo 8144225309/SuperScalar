@@ -3,8 +3,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 static int fill_random(unsigned char *buf, size_t len) {
     FILE *f = fopen("/dev/urandom", "rb");

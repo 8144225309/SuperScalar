@@ -14,9 +14,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -1314,7 +1312,6 @@ int test_htlc_fulfill_before_timeout(void) {
     /* Add HTLC with cltv_expiry = 200 */
     unsigned char preimage[32], hash[32];
     memset(preimage, 0x77, 32);
-    extern void sha256(const unsigned char *, size_t, unsigned char *);
     sha256(preimage, 32, hash);
 
     uint64_t htlc_id;

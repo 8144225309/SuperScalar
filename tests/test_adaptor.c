@@ -6,12 +6,10 @@
 #include <string.h>
 #include <stdlib.h>
 
-extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
+#include "superscalar/sha256.h"
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \

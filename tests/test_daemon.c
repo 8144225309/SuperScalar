@@ -11,7 +11,7 @@
 #include <sys/wait.h>
 #include <pthread.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \

@@ -1,6 +1,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
+#include "superscalar/sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -586,8 +587,6 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     if (pk_count != n_participants) return 0;
 
     /* Compute funding SPK from aggregate key of all participants */
-    extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                               unsigned char *);
     musig_keyagg_t ka;
     if (!musig_aggregate_keys(ctx, &ka, pubkeys, n_participants))
         return 0;

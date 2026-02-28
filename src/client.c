@@ -14,7 +14,7 @@
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
-extern void sha256(const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 /* Optional NK server authentication pubkey (set via client_set_lsp_pubkey) */
 static secp256k1_pubkey g_nk_server_pubkey;

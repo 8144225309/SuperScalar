@@ -1,7 +1,7 @@
 #include "superscalar/shachain.h"
 #include <string.h>
 
-extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
+#include "superscalar/sha256.h"
 
 #define SHACHAIN_MAX_INDEX ((UINT64_C(1) << SHACHAIN_INDEX_BITS) - 1)
 

@@ -3,10 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
-extern void sha256_double(const unsigned char *data, size_t len, unsigned char *out32);
-extern void sha256_tagged(const char *tag, const unsigned char *data, size_t data_len,
-                           unsigned char *out32);
+#include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *data, size_t len);
 
 /* Encode locktime as minimal CScriptNum (little-endian, with sign bit handling).

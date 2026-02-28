@@ -8,8 +8,7 @@
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
-extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
-extern void sha256_double(const unsigned char *data, size_t len, unsigned char *out32);
+#include "superscalar/sha256.h"
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \

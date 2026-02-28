@@ -11,9 +11,7 @@
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -638,7 +636,6 @@ int test_persist_basepoints(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &remote_pk, seckeys[1])) return 0;
 
     /* Build funding SPK */
-    extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
     secp256k1_pubkey pks[2] = { local_pk, remote_pk };
     musig_keyagg_t ka;
     TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 2), "keyagg");
@@ -748,8 +745,6 @@ int test_lsp_recovery_round_trip(void) {
     f.fee_per_tx = 500;
 
     /* Set funding (need valid funding for channel init) */
-    extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                               unsigned char *);
     musig_keyagg_t ka;
     TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 3), "keyagg");
     unsigned char internal_ser[32];

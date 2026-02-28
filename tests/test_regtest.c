@@ -6,6 +6,7 @@
 #include "superscalar/watchtower.h"
 #include "superscalar/fee.h"
 #include "superscalar/channel.h"
+#include "superscalar/sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -63,7 +64,6 @@ static int setup_factory(
     unsigned char internal_key[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, internal_key, &keyagg->agg_pubkey)) return 0;
 
-    extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_key, 32, tweak);
 

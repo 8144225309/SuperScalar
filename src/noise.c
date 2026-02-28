@@ -6,54 +6,15 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-
-/* --- HMAC-SHA256 (RFC 2104) --- */
+/* --- HMAC-SHA256 (OpenSSL) --- */
 
 void hmac_sha256(unsigned char out[32], const unsigned char *key, size_t key_len,
                  const unsigned char *data, size_t data_len) {
-    unsigned char k_pad[64];
-    unsigned char i_pad[64];
-    unsigned char o_pad[64];
-
-    /* If key > 64 bytes, hash it first */
-    unsigned char key_hash[32];
-    if (key_len > 64) {
-        sha256(key, key_len, key_hash);
-        key = key_hash;
-        key_len = 32;
-    }
-
-    memset(k_pad, 0, 64);
-    memcpy(k_pad, key, key_len);
-
-    for (int i = 0; i < 64; i++) {
-        i_pad[i] = k_pad[i] ^ 0x36;
-        o_pad[i] = k_pad[i] ^ 0x5c;
-    }
-
-    /* inner = SHA256(i_pad || data)
-       Stack buffer covers all callers (max ~97 bytes data). */
-    size_t inner_len = 64 + data_len;
-    unsigned char inner_stack[256];
-    unsigned char *inner_buf = (inner_len <= sizeof(inner_stack))
-        ? inner_stack : (unsigned char *)malloc(inner_len);
-    memcpy(inner_buf, i_pad, 64);
-    memcpy(inner_buf + 64, data, data_len);
-    unsigned char inner_hash[32];
-    sha256(inner_buf, inner_len, inner_hash);
-    if (inner_buf != inner_stack) free(inner_buf);
-
-    /* outer = SHA256(o_pad || inner_hash) */
-    unsigned char outer_buf[64 + 32];
-    memcpy(outer_buf, o_pad, 64);
-    memcpy(outer_buf + 64, inner_hash, 32);
-    sha256(outer_buf, 96, out);
-
-    secure_zero(k_pad, 64);
-    secure_zero(i_pad, 64);
-    secure_zero(o_pad, 64);
+    unsigned int md_len = 32;
+    HMAC(EVP_sha256(), key, (int)key_len, data, data_len, out, &md_len);
 }
 
 /* --- HKDF (RFC 5869) --- */

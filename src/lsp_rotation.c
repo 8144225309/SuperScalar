@@ -16,8 +16,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 extern void hex_encode(const unsigned char *, size_t, char *);
 extern int hex_decode(const char *, unsigned char *, size_t);
 extern void reverse_bytes(unsigned char *, size_t);

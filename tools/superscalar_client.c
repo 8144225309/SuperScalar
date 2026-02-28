@@ -31,7 +31,7 @@ static void sigint_handler(int sig) {
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
-extern void sha256(const unsigned char *, size_t, unsigned char *);
+#include "superscalar/sha256.h"
 
 #define MAX_ACTIONS 16
 

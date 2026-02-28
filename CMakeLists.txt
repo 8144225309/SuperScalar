@@ -77,6 +77,9 @@ set(ENABLE_FUZZING ${ENABLE_FUZZING_saved} CACHE BOOL "" FORCE)
 # --- SQLite3 (system library) ---
 find_package(SQLite3 REQUIRED)
 
+# --- OpenSSL (libcrypto for SHA-256 / HMAC) ---
+find_package(OpenSSL REQUIRED)
+
 # --- Main library ---
 add_library(superscalar
     src/dw_state.c
@@ -113,7 +116,7 @@ target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar PRIVATE ${cjson_SOURCE_DIR})
 target_include_directories(superscalar PUBLIC ${SQLite3_INCLUDE_DIRS})
-target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3)
+target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto)
 target_link_libraries(superscalar PRIVATE project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar PRIVATE project_sanitizers)

@@ -35,9 +35,7 @@ static int cmp_uptime_asc(const void *a, const void *b) {
     return 0;
 }
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *, size_t);
 
 /* ---- Internal helpers ---- */

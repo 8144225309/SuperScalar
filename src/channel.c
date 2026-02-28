@@ -5,9 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-extern void sha256(const unsigned char *, size_t, unsigned char *);
-extern void sha256_tagged(const char *, const unsigned char *, size_t,
-                           unsigned char *);
+#include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *, size_t);
 
 /* ---- Key derivation (BOLT #3) ---- */
