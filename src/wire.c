@@ -464,6 +464,7 @@ int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec) {
 void wire_json_add_hex(cJSON *obj, const char *key,
                        const unsigned char *data, size_t len) {
     char *hex = (char *)malloc(len * 2 + 1);
+    if (!hex) return;
     hex_encode(data, len, hex);
     cJSON_AddStringToObject(obj, key, hex);
     free(hex);

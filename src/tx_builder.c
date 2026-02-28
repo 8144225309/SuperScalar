@@ -154,6 +154,7 @@ int compute_taproot_sighash(
     /* scriptpubkeys hash: varint(len) || scriptpubkey */
     size_t spk_ser_len = 1 + prev_spk_len;
     unsigned char *spk_ser = (unsigned char *)malloc(spk_ser_len);
+    if (!spk_ser) return 0;
     spk_ser[0] = (unsigned char)prev_spk_len;
     memcpy(spk_ser + 1, prev_scriptpubkey, prev_spk_len);
     unsigned char sha_scriptpubkeys[32];

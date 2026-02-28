@@ -239,6 +239,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
 
         char *rc_hex = malloc(rot_close_tx.len * 2 + 1);
+        if (!rc_hex) {
+            fprintf(stderr, "LSP rotate: malloc failed for close TX hex\n");
+            tx_buf_free(&rot_close_tx);
+            return 0;
+        }
         hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
         char rc_txid[65];
         int rc_sent = regtest_send_raw_tx(rt, rc_hex, rc_txid);

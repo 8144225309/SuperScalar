@@ -126,6 +126,7 @@ void tapscript_compute_leaf_hash(tapscript_leaf_t *leaf) {
     size_t data_len = 1 + 1 + leaf->script_len;  /* leaf_version + varint + script */
     /* For scripts up to 252 bytes, compact_size is 1 byte */
     unsigned char *data = (unsigned char *)malloc(data_len);
+    if (!data) { memset(leaf->leaf_hash, 0, 32); return; }
 
     data[0] = TAPSCRIPT_LEAF_VERSION;  /* 0xc0 */
     data[1] = (unsigned char)leaf->script_len;  /* compact_size (< 253) */
