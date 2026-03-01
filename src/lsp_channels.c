@@ -1786,6 +1786,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         if (n_failed > 0) {
                             printf("LSP: auto-failed %d expired HTLCs on channel %zu "
                                    "(height=%d)\n", n_failed, c, height);
+                            /* Delete failed HTLCs from persistence */
+                            if (mgr->persist) {
+                                for (size_t h = 0; h < ch->n_htlcs; h++) {
+                                    if (ch->htlcs[h].state == HTLC_STATE_FAILED)
+                                        persist_delete_htlc((persist_t *)mgr->persist,
+                                                            (uint32_t)c, ch->htlcs[h].id);
+                                }
+                            }
                         }
                     }
                     /* Profit settlement check */
