@@ -94,6 +94,7 @@ void sha256_tagged(const char *tag, const unsigned char *data, size_t data_len,
     sha256((const unsigned char *)tag, strlen(tag), tag_hash);
 
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) { memset(out32, 0, 32); return; }
     EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
     EVP_DigestUpdate(ctx, tag_hash, 32);
     EVP_DigestUpdate(ctx, tag_hash, 32);
