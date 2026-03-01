@@ -399,6 +399,88 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
+int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                          size_t client_idx, uint64_t amount_msat) {
+    if (!mgr || !lsp) return 0;
+    if (client_idx >= mgr->n_channels) return 0;
+
+    /* 1. Send MSG_CREATE_INVOICE to target client */
+    {
+        cJSON *inv_req = wire_build_create_invoice(amount_msat);
+        if (!wire_send(lsp->client_fds[client_idx], MSG_CREATE_INVOICE, inv_req)) {
+            cJSON_Delete(inv_req);
+            fprintf(stderr, "LSP: send CREATE_INVOICE failed\n");
+            return 0;
+        }
+        cJSON_Delete(inv_req);
+    }
+
+    /* 2. Wait for MSG_INVOICE_CREATED from client */
+    unsigned char payment_hash[32];
+    {
+        wire_msg_t inv_resp;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[client_idx],
+                            MSG_INVOICE_CREATED, &inv_resp, 10)) {
+            fprintf(stderr, "LSP: timeout waiting for INVOICE_CREATED\n");
+            return 0;
+        }
+        uint64_t resp_amount;
+        if (!wire_parse_invoice_created(inv_resp.json, payment_hash, &resp_amount)) {
+            cJSON_Delete(inv_resp.json);
+            fprintf(stderr, "LSP: bad INVOICE_CREATED\n");
+            return 0;
+        }
+        cJSON_Delete(inv_resp.json);
+    }
+
+    /* 3. Drain any pending MSG_REGISTER_INVOICE from client */
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[client_idx], &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+        while (select(lsp->client_fds[client_idx] + 1, &rfds, NULL, NULL, &tv) > 0) {
+            wire_msg_t drain_msg;
+            if (!wire_recv(lsp->client_fds[client_idx], &drain_msg)) break;
+            if (drain_msg.msg_type == MSG_REGISTER_INVOICE) {
+                unsigned char ph[32], pre[32];
+                uint64_t am;
+                size_t dc;
+                if (wire_parse_register_invoice(drain_msg.json, ph, pre, &am, &dc))
+                    lsp_channels_register_invoice(mgr, ph, pre, dc, am);
+            }
+            cJSON_Delete(drain_msg.json);
+            FD_ZERO(&rfds);
+            FD_SET(lsp->client_fds[client_idx], &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;
+        }
+    }
+
+    /* 4. Forward the just-registered invoice to bridge */
+    if (mgr->bridge_fd >= 0) {
+        /* Find the invoice entry to get preimage and amount */
+        for (size_t i = 0; i < mgr->n_invoices; i++) {
+            if (!mgr->invoices[i].active) continue;
+            if (memcmp(mgr->invoices[i].payment_hash, payment_hash, 32) == 0) {
+                cJSON *reg = wire_build_bridge_register(
+                    payment_hash, mgr->invoices[i].preimage,
+                    mgr->invoices[i].amount_msat, mgr->invoices[i].dest_client);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
+                cJSON_Delete(reg);
+                printf("LSP: forwarded external invoice to bridge (client %zu, %llu msat)\n",
+                       client_idx, (unsigned long long)amount_msat);
+                return 1;
+            }
+        }
+        fprintf(stderr, "LSP: invoice registered but not found for bridge forward\n");
+        return 0;
+    }
+
+    fprintf(stderr, "LSP: no bridge connected for external invoice\n");
+    return 0;
+}
+
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 

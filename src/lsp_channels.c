@@ -1606,9 +1606,32 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("CLI: triggering shutdown (cooperative close)\n");
         fflush(stdout);
         *((volatile sig_atomic_t *)shutdown_flag) = 1;
+    } else if (strncmp(line, "invoice ", 8) == 0) {
+        unsigned int client;
+        unsigned long long amt;
+        if (sscanf(line + 8, "%u %llu", &client, &amt) == 2) {
+            if (client >= mgr->n_channels) {
+                printf("CLI: invalid client index (max %zu)\n",
+                       mgr->n_channels - 1);
+            } else if (mgr->bridge_fd < 0) {
+                printf("CLI: no bridge connected\n");
+            } else {
+                printf("CLI: creating external invoice for client %u (%llu msat)\n",
+                       client, amt);
+                fflush(stdout);
+                if (lsp_channels_create_external_invoice(mgr, lsp,
+                        (size_t)client, (uint64_t)amt))
+                    printf("CLI: external invoice created\n");
+                else
+                    printf("CLI: external invoice FAILED\n");
+            }
+        } else {
+            printf("CLI: usage: invoice <client> <amount_msat>\n");
+        }
     } else if (strcmp(line, "help") == 0) {
         printf("Commands:\n");
         printf("  pay <from> <to> <amount>  Send payment between clients\n");
+        printf("  invoice <client> <msat>   Create external invoice for LN receive\n");
         printf("  status                    Show factory and channel state\n");
         printf("  rotate                    Force factory rotation\n");
         printf("  close                     Cooperative close and shutdown\n");

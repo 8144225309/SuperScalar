@@ -277,6 +277,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     size_t from_client, size_t to_client,
                                     uint64_t amount_sats);
 
+/* Create an external invoice so a client can receive from the LN via bridge.
+   Sends MSG_CREATE_INVOICE, waits for MSG_INVOICE_CREATED, drains
+   MSG_REGISTER_INVOICE, and forwards MSG_BRIDGE_REGISTER to bridge.
+   Returns 1 on success. */
+int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                          size_t client_idx, uint64_t amount_msat);
+
 /* Run a scripted demo sequence of payments after channels are ready.
    Returns 1 on success. */
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp);
