@@ -127,6 +127,7 @@ typedef struct {
     /* Auto-rebalance (Signet/Testnet4 deployment) */
     int auto_rebalance;             /* 1 = enabled, check on periodic timeout */
     uint32_t last_rebalance_block;  /* block height of last auto-rebalance */
+    uint16_t rebalance_threshold_pct; /* imbalance threshold 0-100 (default 80) */
 
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
@@ -292,8 +293,20 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Returns 1 on success. */
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
-/* Check all channels for imbalance (>80% on one side) and rebalance.
+/* Check all channels for imbalance (>threshold% on one side) and rebalance.
    Returns number of rebalance operations performed. */
 int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Rebalance entry: from → to, amount_sats */
+typedef struct {
+    size_t from;
+    size_t to;
+    uint64_t amount_sats;
+} rebalance_entry_t;
+
+/* Execute a batch of rebalance transfers.
+   Returns number of successful transfers. */
+int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                   const rebalance_entry_t *entries, size_t n_entries);
 
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

@@ -481,13 +481,6 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 0;
 }
 
-/* Rebalance entry: from → to, amount_sats */
-typedef struct {
-    size_t from;
-    size_t to;
-    uint64_t amount_sats;
-} rebalance_entry_t;
-
 int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    const rebalance_entry_t *entries, size_t n_entries) {
     if (!mgr || !lsp || !entries || n_entries == 0) return 0;
@@ -515,15 +508,17 @@ int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
     int rebalanced = 0;
+    uint16_t threshold = mgr->rebalance_threshold_pct;
+    if (threshold == 0 || threshold > 99) threshold = 80; /* default 80% */
 
     for (size_t c = 0; c < mgr->n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
         uint64_t total = ch->local_amount + ch->remote_amount;
         if (total == 0) continue;
 
-        /* Check if channel is imbalanced (>80% on one side) */
+        /* Check if channel is imbalanced (exceeds threshold on one side) */
         uint64_t pct_local = (ch->local_amount * 100) / total;
-        if (pct_local > 80) {
+        if (pct_local > threshold) {
             /* LSP-heavy: move balance to a light channel */
             uint64_t excess = ch->local_amount - (total / 2);
             /* Find lightest LSP-side channel to receive */

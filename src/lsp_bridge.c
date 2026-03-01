@@ -102,8 +102,12 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
             if (is_keysend) {
                 /* Keysend: register ephemeral invoice with sender's preimage */
-                if (ks_dest >= mgr->n_channels)
-                    ks_dest = 0;  /* default to client 0 */
+                if (ks_dest >= mgr->n_channels) {
+                    fprintf(stderr, "LSP: keysend dest_client %zu out of range "
+                            "(max %zu), defaulting to 0\n",
+                            ks_dest, mgr->n_channels - 1);
+                    ks_dest = 0;
+                }
                 if (!lsp_channels_register_invoice(mgr, payment_hash,
                         ks_preimage, ks_dest, amount_msat)) {
                     cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,

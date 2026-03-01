@@ -31,7 +31,7 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
 LIGHTNING_CLI = "lightning-cli"
 LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
-KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend payments
+KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via plugin option)
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 pending_htlcs = {}   # payment_hash -> rpc_id for resolving
@@ -477,7 +477,7 @@ def read_requests():
 
 
 def main():
-    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR
+    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT
 
     # CLN plugin main loop: read JSON-RPC requests
     for request in read_requests():
@@ -507,6 +507,12 @@ def main():
                             "type": "string",
                             "default": "lightning-cli",
                             "description": "Path to lightning-cli binary"
+                        },
+                        {
+                            "name": "superscalar-keysend-client",
+                            "type": "int",
+                            "default": 0,
+                            "description": "Default factory client index for keysend payments"
                         }
                     ],
                     "rpcmethods": [
@@ -528,6 +534,8 @@ def main():
             BRIDGE_HOST = config.get("superscalar-bridge-host", BRIDGE_HOST)
             BRIDGE_PORT = int(config.get("superscalar-bridge-port", BRIDGE_PORT))
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
+            KEYSEND_DEFAULT_CLIENT = int(config.get("superscalar-keysend-client",
+                                                      KEYSEND_DEFAULT_CLIENT))
 
             # Capture lightning-dir from CLN's configuration so we can
             # pass it to lightning-cli subprocess calls

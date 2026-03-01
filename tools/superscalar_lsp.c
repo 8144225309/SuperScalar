@@ -500,6 +500,7 @@ int main(int argc, char *argv[]) {
     int tor_only = 0;
     const char *bind_addr = NULL;
     int auto_rebalance = 0;
+    int rebalance_threshold = 80;  /* default 80% imbalance threshold */
     int dynamic_fees = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -648,6 +649,13 @@ int main(int argc, char *argv[]) {
             settlement_interval = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--auto-rebalance") == 0)
             auto_rebalance = 1;
+        else if (strcmp(argv[i], "--rebalance-threshold") == 0 && i + 1 < argc) {
+            rebalance_threshold = atoi(argv[++i]);
+            if (rebalance_threshold < 51 || rebalance_threshold > 99) {
+                fprintf(stderr, "Error: --rebalance-threshold must be 51-99\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--dynamic-fees") == 0)
             dynamic_fees = 1;
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
@@ -1113,6 +1121,7 @@ int main(int argc, char *argv[]) {
             mgr.rot_attempted_mask = 0;
             mgr.cli_enabled = cli_mode;
             mgr.auto_rebalance = auto_rebalance;
+            mgr.rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
             /* JIT Channel Fallback */
             jit_channels_init(&mgr);
@@ -1767,6 +1776,7 @@ int main(int argc, char *argv[]) {
         mgr.rot_attempted_mask = 0;
         mgr.cli_enabled = cli_mode;
         mgr.auto_rebalance = auto_rebalance;
+        mgr.rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(&mgr);
