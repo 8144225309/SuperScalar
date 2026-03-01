@@ -35,7 +35,6 @@ bridge_sock = None
 pending_htlcs = {}   # payment_hash -> rpc_id for resolving
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
-next_request_id = 1
 lock = threading.Lock()
 cln_lock = threading.Lock()  # serializes writes to CLN stdout
 
@@ -127,6 +126,18 @@ def bridge_reader():
         while not connect_bridge():
             log("Bridge reconnect failed, retrying in 5s...")
             time.sleep(5)
+        # Clean up orphaned HTLCs from the old connection — send "continue"
+        # so CLN retries or resolves them via its own invoice DB
+        with lock:
+            orphans = dict(pending_htlcs)
+            pending_htlcs.clear()
+        for ph, rid in orphans.items():
+            log(f"Orphaned HTLC {ph[:16]}... — returning continue")
+            send_to_cln({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {"result": "continue"}
+            })
         log("Bridge reconnected")
 
 
@@ -327,6 +338,12 @@ def handle_htlc_accepted(rpc_id, params):
         if payment_hash in pending_htlcs:
             # Duplicate HTLC for same hash (MPP or retry) — let CLN handle
             log(f"Duplicate HTLC for {payment_hash[:16]}..., passing to CLN")
+            send_to_cln({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {"result": "continue"}
+            })
+            return
         pending_htlcs[payment_hash] = rpc_id
 
     ok = send_to_bridge({
@@ -365,7 +382,7 @@ def read_requests():
 
 
 def main():
-    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, next_request_id
+    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR
 
     # CLN plugin main loop: read JSON-RPC requests
     for request in read_requests():

@@ -49,6 +49,9 @@ LSP_DB="$TMPDIR/lsp.db"
 # Cleanup on exit
 cleanup() {
     echo "=== Cleaning up ==="
+    # Kill FIFO holder
+    kill "${FIFO_HOLDER_PID:-}" 2>/dev/null || true
+
     # Kill background processes
     for pid in "${PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
@@ -131,11 +134,17 @@ for bin in "$LSP_BIN" "$CLIENT_BIN" "$BRIDGE_BIN"; do
 done
 echo "All binaries present"
 
-# --- Step 4: Start LSP ---
+# --- Step 4: Start LSP with FIFO for CLI commands ---
 echo ""
-echo "--- Step 4: Starting LSP daemon ---"
+echo "--- Step 4: Starting LSP daemon (with CLI) ---"
+LSP_FIFO="$TMPDIR/lsp_cmd"
+mkfifo "$LSP_FIFO"
+sleep infinity > "$LSP_FIFO" &
+FIFO_HOLDER_PID=$!
+
 $LSP_BIN \
     --daemon \
+    --cli \
     --network regtest \
     --port 9735 \
     --seckey "$LSP_SECKEY" \
@@ -145,11 +154,11 @@ $LSP_BIN \
     --rpcuser rpcuser \
     --rpcpassword rpcpass \
     --amount 100000 \
-    > "$TMPDIR/lsp.log" 2>&1 &
+    < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
 sleep 2
-echo "LSP: started (pid=$LSP_PID)"
+echo "LSP: started (pid=$LSP_PID, fifo=$LSP_FIFO)"
 
 # Get LSP pubkey (derive from seckey)
 LSP_PUBKEY=$(python3 -c "
@@ -223,23 +232,9 @@ else:
 "
 sleep 2
 
-# --- Step 8: Register invoice on factory client 0 ---
+# --- Step 8: Verify infrastructure ---
 echo ""
-echo "--- Step 8: Testing payment flow ---"
-
-# Generate a test payment hash/preimage
-PREIMAGE="0000000000000000000000000000000000000000000000000000000000000099"
-PAYMENT_HASH=$(echo -n "$PREIMAGE" | python3 -c "
-import hashlib, sys
-data = bytes.fromhex(sys.stdin.read().strip())
-print(hashlib.sha256(data).hexdigest())
-")
-echo "Payment hash: $PAYMENT_HASH"
-echo "Preimage:     $PREIMAGE"
-
-# Use client 0 to register invoice with LSP
-# This is done via the --send scripted action or direct wire message
-# For now, check that all components are running:
+echo "--- Step 8: Verifying infrastructure ---"
 FAIL=0
 
 echo ""
@@ -304,9 +299,9 @@ echo ""
 echo "=== PASS: CLN Bridge Integration Infrastructure ==="
 echo "All components running, bridge connected, factory created."
 
-# --- Step 8: Start second CLN node (sender) ---
+# --- Step 8b: Start second CLN node (sender) ---
 echo ""
-echo "--- Step 8: Starting second CLN node (sender) ---"
+echo "--- Step 8b: Starting second CLN node (sender) ---"
 CLN2_DIR="$TMPDIR/cln2"
 mkdir -p "$CLN2_DIR"
 
@@ -375,62 +370,45 @@ if [ "$CHAN_STATE" != "NORMAL" ]; then
 fi
 echo "Channel Node 2 → Node 1: open"
 
-# --- Step 10: Register SuperScalar invoice ---
+# --- Step 10: Create external invoice via LSP CLI ---
 echo ""
-echo "--- Step 10: Registering invoice ---"
+echo "--- Step 10: Creating external invoice (client 0, 10000 msat) ---"
+echo "invoice 0 10000" > "$LSP_FIFO"
+sleep 2
+echo "Invoice command sent to LSP"
 
-# Compute payment hash from known preimage
-PREIMAGE_HASH=$(echo -n "$PREIMAGE" | python3 -c "
-import hashlib, sys
-data = bytes.fromhex(sys.stdin.read().strip())
-print(hashlib.sha256(data).hexdigest())
-")
-echo "Payment hash: $PREIMAGE_HASH"
-
-# Register the invoice via the CLN plugin RPC
-# The plugin exposes a 'superscalar-register' method
-lightning-cli --lightning-dir="$CLN_DIR" superscalar-register \
-    "$PREIMAGE_HASH" 10000 0 2>/dev/null || {
-    echo "WARNING: superscalar-register RPC not available"
-    echo "Attempting direct bridge registration via wire protocol..."
-}
-echo "Invoice registered (hash=$PREIMAGE_HASH, client=0, amount=10000 msat)"
-
-# --- Step 11: Send payment from Node 2 ---
+# --- Step 11: Wait for BOLT11 invoice to appear in CLN1 ---
 echo ""
-echo "--- Step 11: Sending payment ---"
-
-# Get the short_channel_id for the route
-SCID=$(lightning-cli --lightning-dir="$CLN2_DIR" listpeerchannels | \
-    python3 -c "
-import json,sys
+echo "--- Step 11: Waiting for BOLT11 invoice on CLN1 ---"
+BOLT11=""
+for attempt in $(seq 1 30); do
+    BOLT11=$(lightning-cli --lightning-dir="$CLN_DIR" listinvoices | python3 -c "
+import json, sys
 data = json.load(sys.stdin)
-for ch in data.get('channels', []):
-    scid = ch.get('short_channel_id')
-    if scid:
-        print(scid)
+for inv in data.get('invoices', []):
+    label = inv.get('label', '')
+    if label.startswith('superscalar-') and inv.get('status') == 'unpaid':
+        print(inv.get('bolt11', ''))
         sys.exit(0)
 print('')
-")
+" 2>/dev/null)
+    if [ -n "$BOLT11" ]; then
+        echo "Found BOLT11 invoice (attempt $attempt)"
+        break
+    fi
+    sleep 1
+done
 
-if [ -z "$SCID" ]; then
-    echo "FAIL: No short_channel_id found"
+if [ -z "$BOLT11" ]; then
+    echo "FAIL: No superscalar-* invoice appeared on CLN1 within 30s"
     FAIL=1
 else
-    echo "Route: Node 2 --[$SCID]--> Node 1"
+    echo "BOLT11: ${BOLT11:0:40}..."
 
-    # Use sendpay with explicit route
-    lightning-cli --lightning-dir="$CLN2_DIR" sendpay \
-        "[{\"id\":\"$CLN_ID\",\"channel\":\"$SCID\",\"delay\":20,\"amount_msat\":10000}]" \
-        "$PREIMAGE_HASH" 2>/dev/null
-
-    # Wait for the result
-    echo "Waiting for payment settlement (timeout: 30s)..."
-    RESULT=$(lightning-cli --lightning-dir="$CLN2_DIR" waitsendpay "$PREIMAGE_HASH" 30 2>&1) || true
-
-    # --- Step 12: Verify ---
+    # --- Step 12: Pay from CLN2 and verify ---
     echo ""
-    echo "--- Step 12: Verifying payment result ---"
+    echo "--- Step 12: Paying invoice from CLN2 ---"
+    RESULT=$(lightning-cli --lightning-dir="$CLN2_DIR" pay "$BOLT11" 2>&1) || true
 
     SUCCESS=$(echo "$RESULT" | python3 -c "
 import json, sys
@@ -449,13 +427,6 @@ except:
         FAIL=1
     fi
 fi
-
-# Update cleanup to also stop CLN2
-cleanup_cln2() {
-    lightning-cli --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
-}
-# Note: cleanup_cln2 is called as part of the main cleanup trap since
-# CLN2_DIR is under $TMPDIR which gets removed
 
 if [ "$FAIL" -ne 0 ]; then
     echo ""
