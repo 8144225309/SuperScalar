@@ -84,8 +84,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t amount_msat, htlc_id;
         uint32_t cltv_expiry;
         if (!wire_parse_bridge_add_htlc(msg->json, payment_hash,
-                                          &amount_msat, &cltv_expiry, &htlc_id))
+                                          &amount_msat, &cltv_expiry, &htlc_id)) {
+            fprintf(stderr, "LSP: bridge ADD_HTLC parse failed\n");
             return 0;
+        }
+        printf("LSP: bridge ADD_HTLC received (%llu msat, cltv=%u, htlc_id=%llu)\n",
+               (unsigned long long)amount_msat, cltv_expiry,
+               (unsigned long long)htlc_id);
 
         /* Look up invoice to find dest_client */
         size_t dest_idx;
@@ -100,7 +105,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         uint64_t amount_sats = amount_msat / 1000;
-        if (amount_sats == 0) return 0;
+        if (amount_sats == 0) {
+            printf("LSP: bridge HTLC zero sats (amount_msat=%llu)\n",
+                   (unsigned long long)amount_msat);
+            return 0;
+        }
 
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
@@ -120,6 +129,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 "insufficient_funds", htlc_id);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
             cJSON_Delete(fail);
+            printf("LSP: bridge HTLC add failed (client %zu, %llu sats, "
+                   "local=%llu remote=%llu)\n",
+                   dest_idx, (unsigned long long)amount_sats,
+                   (unsigned long long)dest_ch->local_amount,
+                   (unsigned long long)dest_ch->remote_amount);
             return 1;
         }
 
@@ -276,6 +290,15 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("LSP: forwarded BOLT11 to client %zu\n", dest_idx);
         return ok;
     }
+
+    case MSG_BRIDGE_HELLO:
+        /* Bridge heartbeat ping — send ACK back, no-op otherwise */
+        {
+            cJSON *ack = wire_build_bridge_hello_ack();
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_HELLO_ACK, ack);
+            cJSON_Delete(ack);
+        }
+        return 1;
 
     default:
         fprintf(stderr, "LSP: unexpected bridge msg 0x%02x\n", msg->msg_type);
