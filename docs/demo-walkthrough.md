@@ -304,6 +304,138 @@ Example:
 
 ---
 
+## Bridge Integration Demo (CLN + SuperScalar)
+
+This demo shows the full CLN bridge pipeline: a factory client registers an invoice, the bridge creates a BOLT11 via CLN, an external Lightning node pays it, and the payment flows through the bridge into the factory.
+
+### Prerequisites
+
+- Everything from the basic demo prerequisites
+- CLN v24.11+ installed (`lightningd`, `lightning-cli`)
+- Python 3.8+ (for the CLN plugin)
+- Two funded CLN nodes (or use the regtest setup below for a single-node test)
+
+### Terminal 1: bitcoind
+
+```bash
+bitcoind -regtest -daemon -txindex=1 -fallbackfee=0.00001 \
+  -rpcuser=rpcuser -rpcpassword=rpcpass
+
+# Create and fund wallet
+bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass \
+  createwallet superscalar_lsp
+
+ADDR=$(bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass \
+  -rpcwallet=superscalar_lsp getnewaddress)
+
+bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass \
+  generatetoaddress 101 "$ADDR"
+```
+
+### Terminal 2: LSP (Daemon Mode)
+
+```bash
+cd build
+./superscalar_lsp --network regtest --port 9735 --clients 4 --amount 100000 \
+  --daemon --db /tmp/lsp.db
+```
+
+Note the LSP pubkey printed at startup — you'll need it for the bridge.
+
+### Terminals 3-6: Clients
+
+```bash
+cd build
+
+# Client 1
+./superscalar_client --seckey 2222222222222222222222222222222222222222222222222222222222222222 \
+  --host 127.0.0.1 --port 9735 --network regtest --daemon --db /tmp/client0.db
+
+# Client 2
+./superscalar_client --seckey 3333333333333333333333333333333333333333333333333333333333333333 \
+  --host 127.0.0.1 --port 9735 --network regtest --daemon --db /tmp/client1.db
+
+# Client 3
+./superscalar_client --seckey 4444444444444444444444444444444444444444444444444444444444444444 \
+  --host 127.0.0.1 --port 9735 --network regtest --daemon --db /tmp/client2.db
+
+# Client 4
+./superscalar_client --seckey 5555555555555555555555555555555555555555555555555555555555555555 \
+  --host 127.0.0.1 --port 9735 --network regtest --daemon --db /tmp/client3.db
+```
+
+Wait for "Factory ceremony complete" in the LSP terminal.
+
+### Terminal 7: Bridge
+
+```bash
+cd build
+./superscalar_bridge \
+  --lsp-host 127.0.0.1 \
+  --lsp-port 9735 \
+  --plugin-port 9736 \
+  --lsp-pubkey <LSP_PUBKEY_FROM_TERMINAL_2>
+```
+
+You should see "Bridge: connected to LSP" and "Bridge: listening for plugin on port 9736".
+
+### Terminal 8: CLN with Plugin
+
+```bash
+lightningd --network=regtest \
+  --lightning-dir=/tmp/cln-superscalar \
+  --plugin=/path/to/tools/cln_plugin.py \
+  --superscalar-bridge-host=127.0.0.1 \
+  --superscalar-bridge-port=9736 \
+  --superscalar-lightning-cli=lightning-cli
+```
+
+### What to Expect
+
+1. **Client registers invoice** — Client 1 sends `MSG_REGISTER_INVOICE` to the LSP
+2. **Bridge forwards** — LSP sends `MSG_BRIDGE_REGISTER` to bridge → plugin
+3. **CLN creates BOLT11** — Plugin calls `lightning-cli invoice` and returns the BOLT11 string
+4. **Client receives BOLT11** — The BOLT11 flows back: plugin → bridge → LSP → client
+5. **External payment** — Another LN node (or `lightning-cli pay`) pays the BOLT11
+6. **HTLC flows in** — CLN's `htlc_accepted` fires → plugin → bridge → LSP → client channel
+7. **Client fulfills** — Client reveals preimage → LSP → bridge → plugin resolves the CLN HTLC
+8. **Payment complete** — Client's channel balance increases by the payment amount
+
+### Verify the Pipeline
+
+```bash
+# Check CLN received the payment
+lightning-cli listinvoices
+
+# Check factory channel balances
+sqlite3 -header -column /tmp/lsp.db \
+  "SELECT channel_id, local_amount, remote_amount FROM channels"
+
+# Check bridge is connected
+lightning-cli plugin list | grep cln_plugin
+```
+
+### Teardown
+
+```bash
+# Stop CLN
+lightning-cli stop
+
+# Stop bridge (Ctrl+C in terminal 7)
+
+# Stop clients (Ctrl+C in terminals 3-6)
+
+# Stop LSP (Ctrl+C in terminal 2 — triggers cooperative close)
+
+# Stop bitcoind
+bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
+
+# Clean up temp files
+rm -rf /tmp/lsp.db /tmp/client*.db /tmp/cln-superscalar
+```
+
+---
+
 ## Web Dashboard
 
 ### Demo Mode (No Running Processes Needed)

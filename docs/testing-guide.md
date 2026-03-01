@@ -53,8 +53,8 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
 | Unit tests | 337 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, property-based tests |
-| Regtest integration | 41 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| **Total** | **378** | | |
+| Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
+| **Total** | **379** | | |
 
 ---
 
@@ -99,7 +99,7 @@ cd build
 ./test_superscalar --regtest
 ```
 
-Expected output: `Results: 41/41 passed`
+Expected output: `Results: 42/42 passed`
 
 ### Step 3: Stop bitcoind
 
@@ -177,7 +177,7 @@ sleep 3
 | Wire Protocol | 7 | Pubkey-only factory, framing, crypto serialization, nonce/psig bundles, close unsigned, distributed signing |
 | Wire Hardening | 4 | Oversized frame rejection, CLTV delta, truncated header/body, zero-length frame |
 | Wire Hostname + Tor | 5 | Hostname connect, .onion rejection without proxy, proxy arg parsing, SOCKS5 mock |
-| CLN Bridge | 11 | Message round-trip, hello handshake, invoice registry, inbound/outbound flow, unknown hash, forward registration, NK pubkey, HTLC timeout |
+| CLN Bridge | 14 | Message round-trip, hello handshake, invoice registry, inbound/outbound flow, unknown hash, forward registration, NK pubkey, HTLC timeout, BOLT11 round-trip, plugin→LSP BOLT11, preimage passthrough |
 | Encrypted Transport | 5 | ChaCha20-Poly1305, HMAC-SHA256, Noise handshake, encrypted wire, tamper rejection |
 
 ### Persistence & Recovery
@@ -317,6 +317,75 @@ Attempts to spend an HTLC with an incorrect preimage. Bitcoin consensus (`OP_SHA
 **Question:** Can old factory tree txs be replayed after cooperative close?
 
 Closes factory cooperatively (spending the funding UTXO), then broadcasts old kickoff tx. Bitcoin consensus rejects the double-spend.
+
+---
+
+## Bridge Integration Tests
+
+The CLN bridge has dedicated tests across all three tiers: unit, reliability, and regtest integration.
+
+### Running Bridge Tests Only
+
+```bash
+# Unit tests only (filter by name)
+./test_superscalar --unit 2>&1 | grep -A1 "test_bridge\|Bridge"
+
+# Regtest bridge tests
+./test_superscalar --regtest 2>&1 | grep -A1 "bridge"
+```
+
+### Unit Tests (14 tests)
+
+| Test | What It Verifies |
+|------|-----------------|
+| `test_bridge_msg_round_trip` | Build/parse cycle for all bridge wire message types |
+| `test_bridge_hello_handshake` | HELLO → HELLO_ACK handshake over socketpair |
+| `test_bridge_invoice_registry` | Register invoice, lookup by payment_hash, verify preimage stored |
+| `test_bridge_inbound_flow` | BRIDGE_ADD_HTLC → channel ADD_HTLC → FULFILL → BRIDGE_FULFILL pipeline |
+| `test_bridge_outbound_flow` | Client-initiated outbound payment via BRIDGE_SEND_PAY → PAY_RESULT |
+| `test_bridge_unknown_hash` | ADD_HTLC with unregistered payment_hash returns BRIDGE_FAIL_HTLC |
+| `test_bridge_register_forward` | LSP forwards BRIDGE_REGISTER to bridge_fd when connected |
+| `test_bridge_set_nk_pubkey` | NK pubkey pinning for authenticated Noise handshake |
+| `test_bridge_htlc_timeout` | HTLC timeout enforcement when block height approaches CLTV expiry |
+| `test_bridge_invoice_bolt11_round_trip` | INVOICE_BOLT11 wire message build → send → recv → parse |
+| `test_bridge_bolt11_plugin_to_lsp` | Plugin sends invoice_bolt11 JSON → bridge → MSG_INVOICE_BOLT11 to LSP |
+| `test_bridge_preimage_passthrough` | BRIDGE_REGISTER includes preimage, forwarded correctly to plugin |
+| `test_bridge_heartbeat_stale` | Heartbeat detects stale connections after timeout |
+| `test_bridge_heartbeat_config` | Default interval, custom interval, zero/negative fallback to 30s |
+
+### Reliability Tests (3 tests)
+
+| Test | What It Verifies |
+|------|-----------------|
+| `test_bridge_heartbeat_stale` | Stale detection after configurable timeout |
+| `test_bridge_reconnect` | Connection loss detection and reconnect counter |
+| `test_bridge_heartbeat_config` | Heartbeat interval validation and defaults |
+
+### Regtest Integration Tests (3 tests)
+
+| Test | What It Verifies |
+|------|-----------------|
+| `test_regtest_bridge_nk_handshake` | NK-authenticated Noise handshake between bridge and LSP over real TCP |
+| `test_regtest_bridge_payment` | Full inbound payment: BRIDGE_ADD_HTLC → client fulfill → BRIDGE_FULFILL_HTLC |
+| `test_regtest_bridge_invoice_flow` | Full invoice lifecycle: client REGISTER_INVOICE → BRIDGE_REGISTER → BOLT11 return → ADD_HTLC → fulfill |
+
+### Q&A: Adversarial Bridge Scenarios
+
+**Q: What if the bridge sends an ADD_HTLC for an unregistered payment hash?**
+
+The LSP looks up the payment_hash in its invoice registry. If not found, it returns `BRIDGE_FAIL_HTLC` with reason "unknown_payment_hash". The CLN plugin resolves the `htlc_accepted` hook with `"result": "fail"`. Tested by `test_bridge_unknown_hash`.
+
+**Q: What if the bridge connection drops mid-payment?**
+
+The LSP detects the stale bridge_fd via heartbeat timeout. Any in-flight bridge-originated HTLCs are failed back to the client after `FACTORY_CLTV_DELTA` blocks. The bridge daemon reconnects automatically. Tested by `test_bridge_reconnect` and `test_bridge_heartbeat_stale`.
+
+**Q: What if a client sends REGISTER_INVOICE but the bridge is not connected?**
+
+The LSP registers the invoice locally (so future inbound HTLCs can be routed) but skips the `MSG_BRIDGE_REGISTER` forward since `bridge_fd < 0`. The client can re-register after the bridge connects. The invoice stays in the LSP's registry regardless.
+
+**Q: What if the BOLT11 invoice arrives before the client registers?**
+
+The LSP receives `MSG_INVOICE_BOLT11` from the bridge but `lsp_channels_lookup_invoice` fails because no matching payment_hash exists in the registry. The LSP logs "INVOICE_BOLT11 for unknown hash" and drops the message. The client must register first.
 
 ---
 

@@ -200,6 +200,7 @@ extern int test_tor_parse_proxy_arg_edge_cases(void);
 extern int test_tor_socks5_mock(void);
 extern int test_regtest_bridge_nk_handshake(void);
 extern int test_regtest_bridge_payment(void);
+extern int test_regtest_bridge_invoice_flow(void);
 extern int test_regtest_jit_daemon_trigger(void);
 
 /* Phase 15: Daemon mode */
@@ -1099,6 +1100,7 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Bridge (Phase 14) ===\n");
     RUN_TEST(test_regtest_bridge_nk_handshake);
     RUN_TEST(test_regtest_bridge_payment);
+    RUN_TEST(test_regtest_bridge_invoice_flow);
 
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);

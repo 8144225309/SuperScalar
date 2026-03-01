@@ -283,21 +283,151 @@ Writes a JSON file with factory state, channel balances, and pending HTLCs.
 
 ## 8. CLN Bridge (Lightning Network Integration)
 
-To receive payments from the broader Lightning Network:
+The CLN bridge connects the SuperScalar factory to the broader Lightning Network. External Lightning nodes pay a CLN invoice; the bridge relays the HTLC into the factory and returns the preimage once the client fulfills. This makes factory clients reachable by any LN wallet without the sender knowing about SuperScalar.
+
+### Prerequisites
+
+- **CLN v24.11+** with `htlc_accepted` hook support
+- **Python 3.8+** (for the CLN plugin)
+- The built `superscalar_bridge` binary and `tools/cln_plugin.py` plugin
+
+### Architecture
+
+```
+External LN Node
+      │
+      ▼
+    CLN ──htlc_accepted──▶ cln_plugin.py
+                                │  (JSON over TCP)
+                                ▼
+                         superscalar_bridge
+                                │  (wire protocol over TCP/Noise)
+                                ▼
+                          superscalar_lsp
+                                │  (channel messages)
+                                ▼
+                         Factory Client
+```
+
+The plugin intercepts inbound HTLCs via CLN's `htlc_accepted` hook, forwards them through the bridge daemon to the LSP, and holds the HTLC until the client fulfills with the preimage.
+
+### Startup Order
+
+The three processes must start in this order:
+
+1. **LSP** — listens for bridge and client connections
+2. **Bridge daemon** — connects to the LSP, listens for the plugin
+3. **CLN with plugin** — connects to the bridge
+
+### Step 1: Start the LSP
 
 ```bash
-# 1. Start the bridge daemon
+./superscalar_lsp --network regtest --port 9735 --clients 4 --amount 100000 \
+  --daemon --db /tmp/lsp.db
+```
+
+The LSP automatically accepts bridge connections on its main port.
+
+### Step 2: Start the Bridge Daemon
+
+```bash
 ./superscalar_bridge \
   --lsp-host 127.0.0.1 \
   --lsp-port 9735 \
   --plugin-port 9736
-
-# 2. Start CLN with the plugin
-lightningd --plugin=/path/to/tools/cln_plugin.py \
-  --superscalar-bridge-port=9736
 ```
 
-The bridge connects CLN's `htlc_accepted` hook to the SuperScalar LSP, enabling inbound payments from any Lightning node to reach factory clients.
+The bridge connects to the LSP and listens on `--plugin-port` for the CLN plugin.
+
+### Step 3: Start CLN with the Plugin
+
+```bash
+lightningd --network=regtest \
+  --plugin=/path/to/tools/cln_plugin.py \
+  --superscalar-bridge-host=127.0.0.1 \
+  --superscalar-bridge-port=9736 \
+  --superscalar-lightning-cli=lightning-cli
+```
+
+### Bridge Daemon Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lsp-host HOST` | `127.0.0.1` | LSP hostname or IP address |
+| `--lsp-port PORT` | `9735` | LSP listening port |
+| `--plugin-port PORT` | `9736` | Port the bridge listens on for the CLN plugin |
+| `--lsp-pubkey HEX` | *(none)* | LSP static pubkey (33-byte compressed hex) for NK-authenticated Noise handshake |
+| `--tor-proxy HOST:PORT` | `127.0.0.1:9050` | SOCKS5 proxy for connecting to the LSP over Tor |
+
+### CLN Plugin Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--superscalar-bridge-host` | `127.0.0.1` | Bridge daemon hostname |
+| `--superscalar-bridge-port` | `9736` | Bridge daemon port |
+| `--superscalar-lightning-cli` | `lightning-cli` | Path to `lightning-cli` binary (used for invoice creation) |
+
+### Invoice Flow
+
+When a factory client wants to receive an external Lightning payment:
+
+1. Client sends `MSG_REGISTER_INVOICE` to the LSP with payment_hash, preimage, and amount
+2. LSP registers the invoice in its local registry
+3. LSP forwards `MSG_BRIDGE_REGISTER` to the bridge daemon (includes preimage)
+4. Bridge forwards the registration to the CLN plugin (JSON over TCP)
+5. Plugin calls `lightning-cli invoice` to create a BOLT11 invoice with the matching payment_hash
+6. Plugin sends `invoice_bolt11` response back through the bridge
+7. Bridge forwards `MSG_INVOICE_BOLT11` to the LSP
+8. LSP forwards `MSG_INVOICE_BOLT11` to the client (client can now share the BOLT11 string)
+9. External payer pays the BOLT11 invoice; CLN's `htlc_accepted` hook fires
+10. Plugin sends the HTLC through the bridge → LSP → client channel
+11. Client fulfills with preimage; LSP returns `MSG_BRIDGE_FULFILL_HTLC`; plugin resolves the CLN HTLC
+
+### NK Authentication
+
+For production, pin the LSP's static public key on the bridge to prevent MITM attacks:
+
+```bash
+# The LSP prints its pubkey at startup:
+# "LSP: clients should use --lsp-pubkey 02abcdef..."
+
+./superscalar_bridge \
+  --lsp-host 127.0.0.1 \
+  --lsp-port 9735 \
+  --plugin-port 9736 \
+  --lsp-pubkey 02abcdef...
+```
+
+Without `--lsp-pubkey`, the bridge uses an unauthenticated NN Noise handshake and prints a warning.
+
+### Monitoring
+
+**Plugin logs** — CLN logs plugin activity at the `info` level:
+```bash
+lightning-cli getlog | grep superscalar
+```
+
+**Bridge stderr** — the bridge prints connection events and message flow to stderr. Redirect to a file for persistent logging:
+```bash
+./superscalar_bridge --lsp-host 127.0.0.1 --lsp-port 9735 \
+  --plugin-port 9736 2>/var/log/superscalar-bridge.log
+```
+
+**Plugin status** — verify the plugin is loaded:
+```bash
+lightning-cli plugin list | grep cln_plugin
+```
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "bridge socketpair failed" | Check file descriptor limits: `ulimit -n 4096` |
+| "no --lsp-pubkey, using unauthenticated NN handshake" | Add `--lsp-pubkey` with the LSP's static pubkey for production |
+| Plugin not connecting | Verify `--superscalar-bridge-port` matches `--plugin-port` |
+| "INVOICE_BOLT11 for unknown hash" | Client must send `MSG_REGISTER_INVOICE` before the external payment arrives |
+| Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
+| "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |
 
 ## 9. Factory Rotation
 

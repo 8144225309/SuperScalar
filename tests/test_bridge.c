@@ -1378,6 +1378,482 @@ int test_regtest_bridge_payment(void) {
     return lsp_ok;
 }
 
+/* ---- Test 19: Bridge invoice registration + BOLT11 return flow (regtest) ---- */
+
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    int bolt11_received;
+} invoice_flow_data_t;
+
+static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
+                           secp256k1_context *ctx,
+                           const secp256k1_keypair *keypair,
+                           factory_t *factory,
+                           size_t n_participants,
+                           void *user_data) {
+    invoice_flow_data_t *data = (invoice_flow_data_t *)user_data;
+    (void)keypair; (void)factory; (void)n_participants;
+
+    if (my_index != 1) {
+        /* Only client 0 (index 1) is the invoicing party. Others idle. */
+        return 1;
+    }
+
+    /* Step 1: Send MSG_REGISTER_INVOICE to LSP */
+    printf("Invoice flow client %u: sending REGISTER_INVOICE\n", my_index);
+    cJSON *reg = wire_build_register_invoice(data->payment_hash,
+                                              data->preimage,
+                                              5000000, 0);  /* 5000 sat, dest=client 0 */
+    if (!wire_send(fd, MSG_REGISTER_INVOICE, reg)) {
+        fprintf(stderr, "Invoice flow client %u: send REGISTER_INVOICE failed\n", my_index);
+        cJSON_Delete(reg);
+        return 0;
+    }
+    cJSON_Delete(reg);
+
+    /* Step 2: Wait for MSG_INVOICE_BOLT11 from LSP */
+    wire_msg_t msg;
+    if (!recv_skip_revocations_bridge(fd, &msg)) {
+        fprintf(stderr, "Invoice flow client %u: recv BOLT11 failed\n", my_index);
+        return 0;
+    }
+    if (msg.msg_type != MSG_INVOICE_BOLT11) {
+        fprintf(stderr, "Invoice flow client %u: expected INVOICE_BOLT11 (0x%02x), got 0x%02x\n",
+                my_index, MSG_INVOICE_BOLT11, msg.msg_type);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+
+    /* Verify payment_hash matches */
+    unsigned char recv_hash[32];
+    char recv_bolt11[2048];
+    if (!wire_parse_invoice_bolt11(msg.json, recv_hash, recv_bolt11, sizeof(recv_bolt11))) {
+        fprintf(stderr, "Invoice flow client %u: parse BOLT11 failed\n", my_index);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+    if (memcmp(recv_hash, data->payment_hash, 32) != 0) {
+        fprintf(stderr, "Invoice flow client %u: BOLT11 payment_hash mismatch\n", my_index);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+    printf("Invoice flow client %u: received BOLT11 = %s\n", my_index, recv_bolt11);
+    data->bolt11_received = 1;
+    cJSON_Delete(msg.json);
+
+    /* Step 3: Wait for ADD_HTLC (inbound payment from bridge) */
+    if (!recv_skip_revocations_bridge(fd, &msg)) {
+        fprintf(stderr, "Invoice flow client %u: recv ADD_HTLC failed\n", my_index);
+        return 0;
+    }
+    if (msg.msg_type != MSG_UPDATE_ADD_HTLC) {
+        fprintf(stderr, "Invoice flow client %u: expected ADD_HTLC, got 0x%02x\n",
+                my_index, msg.msg_type);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+    uint64_t htlc_id, amount_msat;
+    unsigned char ph[32];
+    uint32_t cltv;
+    if (wire_parse_update_add_htlc(msg.json, &htlc_id, &amount_msat, ph, &cltv)) {
+        channel_add_htlc(ch, HTLC_RECEIVED, amount_msat / 1000, ph, cltv, &htlc_id);
+    }
+    cJSON_Delete(msg.json);
+
+    /* Step 4: Handle COMMITMENT_SIGNED */
+    if (!recv_skip_revocations_bridge(fd, &msg)) {
+        fprintf(stderr, "Invoice flow client %u: recv commit failed\n", my_index);
+        return 0;
+    }
+    if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        cJSON_Delete(msg.json);
+    } else {
+        cJSON_Delete(msg.json);
+    }
+
+    /* Step 5: Fulfill HTLC with preimage */
+    printf("Invoice flow client %u: fulfilling HTLC\n", my_index);
+    uint64_t fulfill_id = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].direction == HTLC_RECEIVED) {
+            fulfill_id = ch->htlcs[i].id;
+            break;
+        }
+    }
+    client_fulfill_payment(fd, ch, fulfill_id, data->preimage);
+
+    /* Step 6: Handle COMMITMENT_SIGNED for the fulfill */
+    if (!recv_skip_revocations_bridge(fd, &msg)) {
+        fprintf(stderr, "Invoice flow client %u: recv commit failed\n", my_index);
+        return 0;
+    }
+    if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        cJSON_Delete(msg.json);
+    } else {
+        cJSON_Delete(msg.json);
+    }
+
+    return 1;
+}
+
+int test_regtest_bridge_invoice_flow(void) {
+    /* Initialize regtest */
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: regtest not available\n");
+        return 0;
+    }
+    if (!regtest_create_wallet(&rt, "test_bridge_inv")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_bridge_inv\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_bridge_inv", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], bridge_seckeys[i])) return 0;
+    }
+
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Compute funding SPK */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    /* Derive bech32m address */
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    /* Mine and fund */
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "factory setup for funding");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    /* Generate payment preimage and hash */
+    unsigned char preimage[32] = { [0 ... 31] = 0x99 };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    int lsp_port = 19900 + (getpid() % 1000);
+
+    /* Prepare per-client callback data */
+    invoice_flow_data_t inv_data;
+    memcpy(inv_data.payment_hash, payment_hash, 32);
+    memcpy(inv_data.preimage, preimage, 32);
+    inv_data.bolt11_received = 0;
+
+    invoice_flow_data_t idle_data;
+    memset(&idle_data, 0, sizeof(idle_data));
+
+    /* Fork 4 client processes */
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t cpid = fork();
+        if (cpid == 0) {
+            usleep(100000 * (unsigned)(c + 1));
+            secp256k1_context *child_ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, bridge_seckeys[c + 1]))
+                _exit(1);
+
+            void *cb_data;
+            if (c == 0) cb_data = &inv_data;     /* Client 0 (index 1) = invoicing */
+            else cb_data = &idle_data;            /* Others = idle */
+
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", lsp_port,
+                                               invoice_flow_cb, cb_data);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = cpid;
+    }
+
+    /* Parent: run LSP */
+    lsp_t lsp;
+    lsp_init(&lsp, ctx, &kps[0], lsp_port, 4);
+    int lsp_ok = 1;
+
+    if (!lsp_accept_clients(&lsp)) {
+        fprintf(stderr, "LSP: accept clients failed\n");
+        lsp_ok = 0;
+    }
+
+    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+                                             funding_txid, funding_vout,
+                                             funding_amount,
+                                             fund_spk, 34, 10, 4, 0)) {
+        fprintf(stderr, "LSP: factory creation failed\n");
+        lsp_ok = 0;
+    }
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, bridge_seckeys[0], 4)) {
+            fprintf(stderr, "LSP: channel init failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+            fprintf(stderr, "LSP: basepoint exchange failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok) {
+        if (!lsp_channels_send_ready(&ch_mgr, &lsp)) {
+            fprintf(stderr, "LSP: send channel_ready failed\n");
+            lsp_ok = 0;
+        }
+    }
+
+    if (lsp_ok) {
+        /* Create socketpair to simulate bridge connection */
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            fprintf(stderr, "LSP: bridge socketpair failed\n");
+            lsp_ok = 0;
+        } else {
+            ch_mgr.bridge_fd = sv[0];
+
+            /* Step 1: Run event loop for 1 msg — client sends MSG_REGISTER_INVOICE,
+               LSP handles it and writes MSG_BRIDGE_REGISTER to bridge_fd */
+            if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 1)) {
+                fprintf(stderr, "LSP: event loop (register) failed\n");
+                lsp_ok = 0;
+            }
+
+            if (lsp_ok) {
+                /* Step 2: Read MSG_BRIDGE_REGISTER from bridge side (sv[1]) */
+                wire_msg_t reg_msg;
+                if (!wire_recv(sv[1], &reg_msg)) {
+                    fprintf(stderr, "Bridge: recv BRIDGE_REGISTER failed\n");
+                    lsp_ok = 0;
+                } else {
+                    TEST_ASSERT_EQ(reg_msg.msg_type, MSG_BRIDGE_REGISTER,
+                                   "register msg type");
+
+                    unsigned char reg_ph[32], reg_pi[32];
+                    uint64_t reg_amount;
+                    size_t reg_dest;
+                    TEST_ASSERT(wire_parse_bridge_register(reg_msg.json,
+                                    reg_ph, reg_pi, &reg_amount, &reg_dest),
+                                "parse bridge register");
+                    TEST_ASSERT_MEM_EQ(reg_ph, payment_hash, 32,
+                                       "register payment_hash matches");
+                    TEST_ASSERT_MEM_EQ(reg_pi, preimage, 32,
+                                       "register preimage present");
+                    TEST_ASSERT_EQ(reg_amount, 5000000, "register amount_msat");
+                    TEST_ASSERT_EQ(reg_dest, 0, "register dest_client");
+                    printf("Bridge: BRIDGE_REGISTER verified (hash + preimage)\n");
+                    cJSON_Delete(reg_msg.json);
+                }
+            }
+
+            if (lsp_ok) {
+                /* Step 3: Send MSG_INVOICE_BOLT11 through bridge side (sv[1]) */
+                const char *test_bolt11 = "lnbcrt50u1ptest_invoice_flow_bolt11";
+                cJSON *bolt11_msg = wire_build_invoice_bolt11(payment_hash, test_bolt11);
+                wire_send(sv[1], MSG_INVOICE_BOLT11, bolt11_msg);
+                cJSON_Delete(bolt11_msg);
+
+                /* Step 4: Run event loop for 1 msg — LSP receives INVOICE_BOLT11
+                   from bridge_fd, forwards to client */
+                if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 1)) {
+                    fprintf(stderr, "LSP: event loop (bolt11) failed\n");
+                    lsp_ok = 0;
+                }
+            }
+
+            if (lsp_ok) {
+                /* Step 5: Send MSG_BRIDGE_ADD_HTLC through bridge side (sv[1]) */
+                cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000, 600, 1);
+                wire_send(sv[1], MSG_BRIDGE_ADD_HTLC, add);
+                cJSON_Delete(add);
+
+                /* Step 6: Run event loop for 2 msgs — LSP forwards to client,
+                   client fulfills, LSP writes BRIDGE_FULFILL_HTLC */
+                if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 2)) {
+                    fprintf(stderr, "LSP: event loop (htlc) failed\n");
+                    lsp_ok = 0;
+                }
+            }
+
+            if (lsp_ok) {
+                /* Step 7: Read MSG_BRIDGE_FULFILL_HTLC from bridge side (sv[1]) */
+                wire_msg_t fulfill_msg;
+                if (!wire_recv(sv[1], &fulfill_msg)) {
+                    fprintf(stderr, "Bridge: recv fulfill failed\n");
+                    lsp_ok = 0;
+                } else {
+                    TEST_ASSERT_EQ(fulfill_msg.msg_type, MSG_BRIDGE_FULFILL_HTLC,
+                                   "fulfill msg type");
+
+                    unsigned char recv_ph[32], recv_pi[32];
+                    uint64_t recv_hid;
+                    TEST_ASSERT(wire_parse_bridge_fulfill_htlc(fulfill_msg.json,
+                                    recv_ph, recv_pi, &recv_hid),
+                                "parse bridge fulfill");
+
+                    /* Verify preimage matches payment hash */
+                    unsigned char check_hash[32];
+                    sha256(recv_pi, 32, check_hash);
+                    TEST_ASSERT_MEM_EQ(check_hash, payment_hash, 32,
+                                       "preimage→hash valid");
+                    TEST_ASSERT_EQ(recv_hid, 1, "bridge htlc_id");
+
+                    /* Verify channel balance: client 0's remote increased */
+                    channel_t *ch0 = &ch_mgr.entries[0].channel;
+                    fee_estimator_t fe;
+                    fee_init(&fe, 1000);
+                    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+                    uint64_t usable = ch0->funding_amount > commit_fee ?
+                                      ch0->funding_amount - commit_fee : 0;
+                    uint64_t orig_remote = usable / 2;
+                    TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
+                                   "payee remote balance increased");
+
+                    printf("Invoice flow: preimage matches, balance correct\n");
+                    cJSON_Delete(fulfill_msg.json);
+                }
+            }
+
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+
+    /* Cooperative close */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        size_t n_total = 5;
+        uint64_t per_party = close_total / n_total;
+
+        tx_output_t close_outputs[5];
+        for (size_t i = 0; i < n_total; i++) {
+            close_outputs[i].amount_sats = per_party;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total)) {
+            fprintf(stderr, "LSP: cooperative close failed\n");
+            lsp_ok = 0;
+        } else {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                printf("Invoice flow: cooperative close confirmed (%s)\n",
+                       close_txid);
+            } else {
+                fprintf(stderr, "LSP: broadcast close tx failed\n");
+                lsp_ok = 0;
+            }
+        }
+
+        tx_buf_free(&close_tx);
+    }
+
+    /* Wait for children */
+    for (int c = 0; c < 4; c++) {
+        int status;
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "Child client %d failed (status=%d)\n", c,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            lsp_ok = 0;
+        }
+    }
+
+    lsp_cleanup(&lsp);
+    secp256k1_context_destroy(ctx);
+    return lsp_ok;
+}
+
 /* ---- Tor Safety Tests ---- */
 
 /* Test: --tor-only refuses clearnet connections */
