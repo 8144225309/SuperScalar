@@ -693,18 +693,6 @@ int test_prop_rebalance_conservation(void) {
             total_before += local + remote;
         }
 
-        /* Detect which channels would trigger rebalance */
-        uint16_t threshold = mgr.rebalance_threshold_pct;
-        int n_imbalanced = 0;
-        for (size_t c = 0; c < 4; c++) {
-            channel_t *ch = &mgr.entries[c].channel;
-            uint64_t t = ch->local_amount + ch->remote_amount;
-            if (t == 0) continue;
-            uint64_t pct = (ch->local_amount * 100) / t;
-            if (pct > threshold)
-                n_imbalanced++;
-        }
-
         /* Verify total balance unchanged (no actual payments since no fds) */
         uint64_t total_after = 0;
         for (size_t c = 0; c < 4; c++) {
