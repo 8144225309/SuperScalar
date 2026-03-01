@@ -40,10 +40,16 @@ cln_lock = threading.Lock()  # serializes writes to CLN stdout
 
 
 def cli_cmd(*args):
-    """Build a lightning-cli command with proper --lightning-dir."""
+    """Build a lightning-cli command with proper --lightning-dir and --network.
+    CLN v25 sets lightning-dir to the network-specific subdir (e.g., .../cln/regtest),
+    but lightning-cli --lightning-dir expects the parent dir and appends its own
+    network subdir.  Split the path so both sides agree."""
     cmd = [LIGHTNING_CLI]
     if LIGHTNING_DIR:
-        cmd.extend(["--lightning-dir", LIGHTNING_DIR])
+        import os
+        parent = os.path.dirname(LIGHTNING_DIR)
+        network = os.path.basename(LIGHTNING_DIR)
+        cmd.extend(["--lightning-dir", parent, "--network", network])
     cmd.extend(args)
     return cmd
 
@@ -148,6 +154,7 @@ def handle_bridge_msg(msg):
     if method == "htlc_resolve":
         payment_hash = msg.get("payment_hash", "")
         result = msg.get("result")
+        log(f"htlc_resolve: hash={payment_hash[:16]}... result={result}")
         with lock:
             rpc_id = pending_htlcs.pop(payment_hash, None)
             # Clean up resolved invoice from registry
@@ -177,13 +184,15 @@ def handle_bridge_msg(msg):
                     "result": {"result": "continue"}
                 })
             else:
-                # Use bare "fail" — CLN defaults to temporary_node_failure.
-                # Passing a human-readable reason string would violate the
-                # CLN protocol which expects hex-encoded wire failure bytes.
+                # CLN v25+ requires failure_message for hook fail.
+                # 2002 = TEMPORARY_NODE_FAILURE (BOLT #4 wire format).
                 send_to_cln({
                     "jsonrpc": "2.0",
                     "id": rpc_id,
-                    "result": {"result": "fail"}
+                    "result": {
+                        "result": "fail",
+                        "failure_message": "2002"
+                    }
                 })
 
     elif method == "invoice_registered":
@@ -323,6 +332,10 @@ def handle_htlc_accepted(rpc_id, params):
     # Check if this HTLC is for a registered factory invoice
     with lock:
         is_ours = payment_hash in registered_invoices
+        n_registered = len(registered_invoices)
+
+    log(f"htlc_accepted: hash={payment_hash[:16]}... amt={amount_msat} "
+        f"cltv={cltv_expiry} ours={is_ours} (registry={n_registered})")
 
     if not is_ours:
         # Not a factory payment — let CLN handle it normally
@@ -346,6 +359,7 @@ def handle_htlc_accepted(rpc_id, params):
             return
         pending_htlcs[payment_hash] = rpc_id
 
+    log(f"Forwarding HTLC {payment_hash[:16]}... to bridge")
     ok = send_to_bridge({
         "method": "htlc_accepted",
         "payment_hash": payment_hash,
@@ -354,6 +368,7 @@ def handle_htlc_accepted(rpc_id, params):
     })
 
     if not ok:
+        log(f"Bridge send failed for HTLC {payment_hash[:16]}...")
         # Bridge not connected — let CLN handle it (maybe CLN has the invoice)
         with lock:
             pending_htlcs.pop(payment_hash, None)

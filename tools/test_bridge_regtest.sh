@@ -59,8 +59,8 @@ cleanup() {
     done
 
     # Stop CLN nodes
-    lightning-cli --lightning-dir="$CLN_DIR" stop 2>/dev/null || true
-    [ -d "${CLN2_DIR:-}" ] && lightning-cli --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
+    lightning-cli --network=regtest --lightning-dir="$CLN_DIR" stop 2>/dev/null || true
+    [ -d "${CLN2_DIR:-}" ] && lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
 
     # Stop bitcoind
     $BCLI stop 2>/dev/null || true
@@ -106,18 +106,23 @@ lightningd \
     --bitcoin-rpcuser=rpcuser \
     --bitcoin-rpcpassword=rpcpass \
     --log-level=debug \
+    --log-file="$CLN_DIR/cln.log" \
     --plugin="$PLUGIN_PY" \
+    --superscalar-bridge-port=19736 \
+    --bind-addr=127.0.0.1:9738 \
+    --disable-plugin clnrest \
+    --disable-plugin cln-grpc \
     --daemon
 
 sleep 3
 echo "CLN: started (lightning-dir=$CLN_DIR)"
 
 # Get CLN node info
-CLN_ID=$(lightning-cli --lightning-dir="$CLN_DIR" getinfo | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+CLN_ID=$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" getinfo | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 echo "CLN: node_id=$CLN_ID"
 
 # Fund CLN
-CLN_ADDR=$(lightning-cli --lightning-dir="$CLN_DIR" newaddr | python3 -c "import json,sys; print(json.load(sys.stdin)['bech32'])")
+CLN_ADDR=$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" newaddr | python3 -c "import json,sys; print(json.load(sys.stdin)['bech32'])")
 $BCLI -rpcwallet=test sendtoaddress "$CLN_ADDR" 1.0 > /dev/null
 $BCLI generatetoaddress 6 "$ADDR" > /dev/null
 echo "CLN: funded"
@@ -142,7 +147,7 @@ mkfifo "$LSP_FIFO"
 sleep infinity > "$LSP_FIFO" &
 FIFO_HOLDER_PID=$!
 
-$LSP_BIN \
+stdbuf -oL $LSP_BIN \
     --daemon \
     --cli \
     --network regtest \
@@ -157,7 +162,28 @@ $LSP_BIN \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
-sleep 2
+
+# Wait for LSP to start listening before connecting clients
+echo "LSP: waiting for listen socket..."
+for attempt in $(seq 1 30); do
+    if ! kill -0 $LSP_PID 2>/dev/null; then
+        echo "FAIL: LSP process exited during startup"
+        cat "$TMPDIR/lsp.log" 2>/dev/null || true
+        exit 1
+    fi
+    if grep -q "listening on port" "$TMPDIR/lsp.log" 2>/dev/null; then
+        echo "LSP: listening (after ${attempt}s)"
+        break
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "FAIL: LSP did not start listening within 30s"
+        cat "$TMPDIR/lsp.log" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
+# Extra sleep to ensure listen socket is fully open after the log message
+sleep 1
 echo "LSP: started (pid=$LSP_PID, fifo=$LSP_FIFO)"
 
 # Get LSP pubkey (derive from seckey)
@@ -173,13 +199,13 @@ echo "LSP: pubkey=$LSP_PUBKEY"
 echo ""
 echo "--- Step 5: Starting 4 factory clients ---"
 for i in 0 1 2 3; do
-    $CLIENT_BIN \
+    stdbuf -oL $CLIENT_BIN \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --host 127.0.0.1 \
         --port 9735 \
         --network regtest \
         --lsp-pubkey "$LSP_PUBKEY" \
-        --channels \
+        --daemon \
         --cli-path "$(which bitcoin-cli)" \
         --rpcuser rpcuser \
         --rpcpassword rpcpass \
@@ -189,38 +215,80 @@ for i in 0 1 2 3; do
 done
 echo "Clients: 4 started, waiting for factory..."
 
-# Wait for factory creation (mine blocks for funding tx confirmation)
-sleep 5
-# Mine blocks to confirm funding
-for _ in $(seq 1 10); do
-    $BCLI generatetoaddress 1 "$ADDR" > /dev/null
+# Wait for factory creation — poll LSP log for "entering daemon mode"
+# The LSP mines its own block for funding confirmation on regtest,
+# but we mine additional blocks to help any confirmation checks.
+echo "Waiting for LSP to enter daemon mode..."
+for attempt in $(seq 1 120); do
+    # Check if LSP exited (factory creation failed)
+    if ! kill -0 $LSP_PID 2>/dev/null; then
+        echo "FAIL: LSP process exited during factory creation"
+        echo "--- LSP log ---"
+        cat "$TMPDIR/lsp.log" 2>/dev/null || true
+        exit 1
+    fi
+    # Mine a block every 3 seconds to help confirmations
+    if [ $((attempt % 3)) -eq 0 ]; then
+        $BCLI generatetoaddress 1 "$ADDR" > /dev/null 2>&1 || true
+    fi
+    # Check for daemon mode entry
+    if grep -q "entering daemon mode" "$TMPDIR/lsp.log" 2>/dev/null; then
+        echo "LSP: entered daemon mode (after ${attempt}s)"
+        break
+    fi
+    if [ "$attempt" -eq 120 ]; then
+        echo "FAIL: LSP did not enter daemon mode within 120s"
+        echo "--- LSP log ---"
+        cat "$TMPDIR/lsp.log" 2>/dev/null || true
+        exit 1
+    fi
     sleep 1
 done
-echo "Mined 10 blocks for factory confirmation"
-
-# Wait for channels to be ready
-sleep 10
 
 # --- Step 6: Start bridge ---
+# Use port 19736 to avoid conflict with CLN's cln-grpc plugin (which defaults to 9736)
+BRIDGE_PLUGIN_PORT=19736
 echo ""
-echo "--- Step 6: Starting bridge daemon ---"
-$BRIDGE_BIN \
+echo "--- Step 6: Starting bridge daemon (plugin port $BRIDGE_PLUGIN_PORT) ---"
+stdbuf -oL $BRIDGE_BIN \
     --lsp-host 127.0.0.1 \
     --lsp-port 9735 \
-    --plugin-port 9736 \
+    --plugin-port "$BRIDGE_PLUGIN_PORT" \
     --lsp-pubkey "$LSP_PUBKEY" \
     > "$TMPDIR/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 PIDS+=("$BRIDGE_PID")
-sleep 2
-echo "Bridge: started (pid=$BRIDGE_PID)"
+echo "Bridge: started (pid=$BRIDGE_PID), waiting for LSP connection..."
+
+# Poll for bridge connection (handshake can take a few seconds)
+for attempt in $(seq 1 30); do
+    if ! kill -0 $BRIDGE_PID 2>/dev/null; then
+        echo "FAIL: Bridge process exited"
+        echo "--- Bridge log ---"
+        cat "$TMPDIR/bridge.log" 2>/dev/null || true
+        exit 1
+    fi
+    if grep -q "connected to LSP" "$TMPDIR/bridge.log" 2>/dev/null; then
+        echo "Bridge: connected to LSP (after ${attempt}s)"
+        break
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "FAIL: Bridge did not connect to LSP within 30s"
+        echo "--- Bridge log ---"
+        cat "$TMPDIR/bridge.log" 2>/dev/null || true
+        echo "--- LSP log (last 20 lines) ---"
+        tail -20 "$TMPDIR/lsp.log" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
 
 # --- Step 7: Configure CLN plugin to connect to bridge ---
 echo ""
 echo "--- Step 7: Connecting CLN plugin to bridge ---"
 # The plugin auto-connects on startup if configured, or we can use RPC
 # to trigger connection. Check if plugin is active:
-lightning-cli --lightning-dir="$CLN_DIR" plugin list | python3 -c "
+lightning-cli --network=regtest --lightning-dir="$CLN_DIR" plugin list | python3 -c "
 import json, sys
 plugins = json.load(sys.stdin)['plugins']
 ss_plugins = [p for p in plugins if 'cln_plugin' in p.get('name', '')]
@@ -255,7 +323,7 @@ fi
 # Check logs for successful connections
 echo ""
 echo "=== Connection Status ==="
-if grep -q "bridge connected" "$TMPDIR/lsp.log" 2>/dev/null; then
+if grep -q "bridge connected in daemon loop" "$TMPDIR/lsp.log" 2>/dev/null; then
     echo "  LSP: bridge connected"
 else
     echo "  LSP: bridge NOT connected"
@@ -305,23 +373,30 @@ echo "--- Step 8b: Starting second CLN node (sender) ---"
 CLN2_DIR="$TMPDIR/cln2"
 mkdir -p "$CLN2_DIR"
 
-lightningd \
+if ! lightningd \
     --network=regtest \
     --lightning-dir="$CLN2_DIR" \
     --bitcoin-cli="$(which bitcoin-cli)" \
     --bitcoin-rpcuser=rpcuser \
     --bitcoin-rpcpassword=rpcpass \
     --log-level=debug \
+    --log-file="$CLN2_DIR/cln2.log" \
     --daemon \
-    --addr=127.0.0.1:9737
+    --bind-addr=127.0.0.1:9737 \
+    --disable-plugin clnrest \
+    --disable-plugin cln-grpc; then
+    echo "FAIL: CLN2 failed to start"
+    cat "$CLN2_DIR/cln2.log" 2>/dev/null | tail -20 || true
+    exit 1
+fi
 sleep 3
 
-CLN2_ID=$(lightning-cli --lightning-dir="$CLN2_DIR" getinfo | \
+CLN2_ID=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" getinfo | \
     python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 echo "CLN2: node_id=$CLN2_ID"
 
 # Fund node 2
-CLN2_ADDR=$(lightning-cli --lightning-dir="$CLN2_DIR" newaddr | \
+CLN2_ADDR=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" newaddr | \
     python3 -c "import json,sys; print(json.load(sys.stdin)['bech32'])")
 $BCLI -rpcwallet=test sendtoaddress "$CLN2_ADDR" 1.0 > /dev/null
 $BCLI generatetoaddress 6 "$ADDR" > /dev/null
@@ -331,28 +406,33 @@ echo "CLN2: funded"
 echo ""
 echo "--- Step 9: Opening channel Node 2 → Node 1 ---"
 
-# Get CLN1 listening address (it uses default port 9846 or auto)
-CLN_PORT=$(lightning-cli --lightning-dir="$CLN_DIR" getinfo | \
-    python3 -c "
-import json,sys
-info = json.load(sys.stdin)
-bindings = info.get('binding', [])
-for b in bindings:
-    if b.get('type') == 'ipv4':
-        print(b.get('port', 9846))
-        sys.exit(0)
-print(9846)
-")
+# Wait for CLN2 to sync funds
+echo "Waiting for CLN2 to sync funds..."
+for attempt in $(seq 1 30); do
+    BALANCE=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listfunds 2>/dev/null | \
+        python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(o.get('amount_msat',0) for o in d.get('outputs',[])))" 2>/dev/null || echo "0")
+    if [ "$BALANCE" != "0" ] && [ -n "$BALANCE" ]; then
+        echo "CLN2: balance synced ($BALANCE msat, attempt $attempt)"
+        break
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "WARNING: CLN2 balance still 0 after 30s, proceeding anyway"
+    fi
+    sleep 1
+done
 
-lightning-cli --lightning-dir="$CLN2_DIR" connect "$CLN_ID" 127.0.0.1 "$CLN_PORT"
-lightning-cli --lightning-dir="$CLN2_DIR" fundchannel "$CLN_ID" 500000
-$BCLI generatetoaddress 6 "$ADDR" > /dev/null
-echo "Waiting for channel to become normal..."
-sleep 10
+lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" connect "$CLN_ID" 127.0.0.1 9738
+lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" fundchannel "$CLN_ID" 500000
 
-# Verify channel is open
-CHAN_STATE=$(lightning-cli --lightning-dir="$CLN2_DIR" listpeerchannels | \
-    python3 -c "
+# Mine blocks and wait for channel to reach NORMAL state
+echo "Mining blocks and waiting for channel to become NORMAL..."
+for attempt in $(seq 1 60); do
+    # Mine a block every 2 attempts to confirm the funding TX
+    if [ $((attempt % 2)) -eq 0 ]; then
+        $BCLI generatetoaddress 1 "$ADDR" > /dev/null 2>&1 || true
+    fi
+    CHAN_STATE=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
+        python3 -c "
 import json,sys
 data = json.load(sys.stdin)
 channels = data.get('channels', [])
@@ -361,19 +441,24 @@ for ch in channels:
         print('NORMAL')
         sys.exit(0)
 print('NOT_READY')
-")
-
-if [ "$CHAN_STATE" != "NORMAL" ]; then
-    echo "WARNING: Channel not in NORMAL state: $CHAN_STATE"
-    echo "Waiting additional 15 seconds..."
-    sleep 15
-fi
-echo "Channel Node 2 → Node 1: open"
+" 2>/dev/null || echo "NOT_READY")
+    if [ "$CHAN_STATE" = "NORMAL" ]; then
+        echo "Channel Node 2 → Node 1: NORMAL (after ${attempt}s)"
+        break
+    fi
+    if [ "$attempt" -eq 60 ]; then
+        echo "FAIL: Channel did not reach NORMAL state within 60s"
+        lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
+            python3 -c "import json,sys; [print(f'  {c[\"state\"]}') for c in json.load(sys.stdin).get('channels',[])]" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
 
 # --- Step 10: Create external invoice via LSP CLI ---
 echo ""
-echo "--- Step 10: Creating external invoice (client 0, 10000 msat) ---"
-echo "invoice 0 10000" > "$LSP_FIFO"
+echo "--- Step 10: Creating external invoice (client 0, 600000 msat) ---"
+echo "invoice 0 600000" > "$LSP_FIFO"
 sleep 2
 echo "Invoice command sent to LSP"
 
@@ -382,7 +467,7 @@ echo ""
 echo "--- Step 11: Waiting for BOLT11 invoice on CLN1 ---"
 BOLT11=""
 for attempt in $(seq 1 30); do
-    BOLT11=$(lightning-cli --lightning-dir="$CLN_DIR" listinvoices | python3 -c "
+    BOLT11=$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" listinvoices | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for inv in data.get('invoices', []):
@@ -408,7 +493,7 @@ else
     # --- Step 12: Pay from CLN2 and verify ---
     echo ""
     echo "--- Step 12: Paying invoice from CLN2 ---"
-    RESULT=$(lightning-cli --lightning-dir="$CLN2_DIR" pay "$BOLT11" 2>&1) || true
+    RESULT=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" pay "$BOLT11" 2>&1) || true
 
     SUCCESS=$(echo "$RESULT" | python3 -c "
 import json, sys

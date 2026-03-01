@@ -262,6 +262,11 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         return ok;
     }
 
+    case MSG_BRIDGE_HELLO_ACK:
+        /* Heartbeat response from LSP — update activity timestamp */
+        br->last_lsp_activity = time(NULL);
+        return 1;
+
     default:
         fprintf(stderr, "Bridge: unexpected LSP msg 0x%02x\n", msg->msg_type);
         return 0;
@@ -307,6 +312,8 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         int ok = wire_send(br->lsp_fd, MSG_BRIDGE_ADD_HTLC, msg);
         cJSON_Delete(msg);
         cJSON_Delete(json);
+        fprintf(stderr, "Bridge: forwarded ADD_HTLC to LSP (%llu msat, ok=%d)\n",
+                (unsigned long long)amount_msat, ok);
         return ok;
     }
 
