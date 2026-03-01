@@ -566,6 +566,20 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
+    /* Persist sender-side HTLC now that old state is revoked (irrevocable) */
+    if (mgr->persist) {
+        htlc_t sender_persist;
+        memset(&sender_persist, 0, sizeof(sender_persist));
+        sender_persist.id = new_htlc_id;
+        sender_persist.direction = HTLC_RECEIVED;
+        sender_persist.state = HTLC_STATE_ACTIVE;
+        sender_persist.amount_sats = amount_sats;
+        memcpy(sender_persist.payment_hash, payment_hash, 32);
+        sender_persist.cltv_expiry = cltv_expiry;
+        persist_save_htlc((persist_t *)mgr->persist,
+                          (uint32_t)sender_idx, &sender_persist);
+    }
+
     /* Find destination: check dest_client field, then bolt11 for bridge routing */
     cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
     cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
@@ -1110,6 +1124,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
+            if (mgr->persist)
+                persist_delete_htlc((persist_t *)mgr->persist, (uint32_t)s, htlc->id);
             sender_found = (int)s;
             break;
         }
@@ -1385,8 +1401,14 @@ lsp_channel_entry_t *lsp_channels_get(lsp_channel_mgr_t *mgr, size_t client_idx)
 size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
                                          const factory_t *factory,
                                          tx_output_t *outputs,
-                                         uint64_t close_fee) {
+                                         uint64_t close_fee,
+                                         const unsigned char *close_spk,
+                                         size_t close_spk_len) {
     if (!mgr || !factory || !outputs) return 0;
+
+    /* Use override SPK if provided, otherwise fall back to factory funding SPK */
+    const unsigned char *spk = close_spk ? close_spk : factory->funding_spk;
+    size_t spk_len = close_spk ? close_spk_len : factory->funding_spk_len;
 
     /* Output 0: LSP gets factory_funding - sum(client_remotes) - close_fee.
        In a cooperative close that bypasses the tree, the LSP recovers the
@@ -1399,14 +1421,14 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
     uint64_t lsp_total = factory->funding_amount_sats - client_total - close_fee;
 
     outputs[0].amount_sats = lsp_total;
-    memcpy(outputs[0].script_pubkey, factory->funding_spk, factory->funding_spk_len);
-    outputs[0].script_pubkey_len = factory->funding_spk_len;
+    memcpy(outputs[0].script_pubkey, spk, spk_len);
+    outputs[0].script_pubkey_len = spk_len;
 
     /* Outputs 1..N: each client gets their remote_amount */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         outputs[c + 1].amount_sats = mgr->entries[c].channel.remote_amount;
-        memcpy(outputs[c + 1].script_pubkey, factory->funding_spk, factory->funding_spk_len);
-        outputs[c + 1].script_pubkey_len = factory->funding_spk_len;
+        memcpy(outputs[c + 1].script_pubkey, spk, spk_len);
+        outputs[c + 1].script_pubkey_len = spk_len;
     }
 
     /* Invariant: sum of outputs + close_fee == funding_amount */

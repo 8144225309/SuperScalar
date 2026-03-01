@@ -323,6 +323,7 @@ extern int test_lsp_recovery_round_trip(void);
 /* Persistence Stress */
 extern int test_persist_crash_stress(void);
 extern int test_persist_crash_dw_state(void);
+extern int test_persist_htlc_bidirectional(void);
 extern int test_regtest_crash_double_recovery(void);
 
 /* TCP Reconnection Integration */
@@ -521,6 +522,7 @@ extern int test_rotation_retry_defaults(void);
 extern int test_profit_settlement_calculation(void);
 extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
+extern int test_close_outputs_wallet_spk(void);
 extern int test_fee_accumulation_and_settlement(void);
 
 /* Property-Based Tests (Roadmap Item #5) */
@@ -823,6 +825,7 @@ static void run_unit_tests(void) {
     printf("\n=== Persistence Stress ===\n");
     RUN_TEST(test_persist_crash_stress);
     RUN_TEST(test_persist_crash_dw_state);
+    RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");
     RUN_TEST(test_client_watchtower_init);
@@ -1015,6 +1018,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_profit_settlement_calculation);
     RUN_TEST(test_settlement_trigger_at_interval);
     RUN_TEST(test_on_close_includes_unsettled);
+    RUN_TEST(test_close_outputs_wallet_spk);
     RUN_TEST(test_fee_accumulation_and_settlement);
 
     printf("\n=== Property-Based Tests ===\n");

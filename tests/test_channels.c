@@ -1243,7 +1243,8 @@ int test_regtest_multi_payment(void) {
         uint64_t close_fee = 500;
         tx_output_t close_outputs[5];  /* 1 LSP + 4 clients */
         size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp.factory,
-                                                           close_outputs, close_fee);
+                                                           close_outputs, close_fee,
+                                                           NULL, 0);
         TEST_ASSERT(n_close == 5, "build close outputs returned 5");
 
         printf("LSP: Close outputs: LSP=%llu A=%llu B=%llu C=%llu D=%llu\n",
@@ -3195,6 +3196,75 @@ int test_fee_accumulation_and_settlement(void) {
     TEST_ASSERT_EQ(mgr.entries[0].channel.local_amount,
                    pre_local_0 - expected_share,
                    "LSP local decreased by share");
+
+    return 1;
+}
+
+/* ---- Test: build_close_outputs with wallet SPK override ---- */
+
+int test_close_outputs_wallet_spk(void) {
+    /* Set up minimal mgr with 2 channels */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.entries[0].channel.local_amount = 5000;
+    mgr.entries[0].channel.remote_amount = 3000;
+    mgr.entries[1].channel.local_amount = 4000;
+    mgr.entries[1].channel.remote_amount = 2000;
+
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    f.funding_amount_sats = 5000 + 3000 + 4000 + 2000 + 500;  /* balances + fee */
+    memset(f.funding_spk, 0xAA, 34);
+    f.funding_spk_len = 34;
+
+    uint64_t close_fee = 500;
+
+    /* Test 1: NULL SPK — should use factory funding SPK */
+    tx_output_t outputs[3];
+    size_t n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+                                                  NULL, 0);
+    TEST_ASSERT_EQ(n, 3, "NULL SPK: 3 outputs");
+
+    /* LSP output: funding - client_total - fee = 14500 - 5000 - 500 = 9000 */
+    TEST_ASSERT_EQ(outputs[0].amount_sats, 9000, "NULL SPK: LSP amount");
+    TEST_ASSERT_EQ(outputs[0].script_pubkey_len, 34, "NULL SPK: LSP spk len");
+    unsigned char expected_factory_spk[34];
+    memset(expected_factory_spk, 0xAA, 34);
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, expected_factory_spk, 34) == 0,
+                "NULL SPK: LSP uses factory SPK");
+
+    TEST_ASSERT_EQ(outputs[1].amount_sats, 3000, "NULL SPK: client 0 amount");
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, expected_factory_spk, 34) == 0,
+                "NULL SPK: client 0 uses factory SPK");
+
+    TEST_ASSERT_EQ(outputs[2].amount_sats, 2000, "NULL SPK: client 1 amount");
+    TEST_ASSERT(memcmp(outputs[2].script_pubkey, expected_factory_spk, 34) == 0,
+                "NULL SPK: client 1 uses factory SPK");
+
+    /* Test 2: Custom wallet SPK — all outputs should use override */
+    unsigned char wallet_spk[34];
+    memset(wallet_spk, 0xBB, 34);
+
+    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+                                           wallet_spk, 34);
+    TEST_ASSERT_EQ(n, 3, "wallet SPK: 3 outputs");
+
+    TEST_ASSERT_EQ(outputs[0].amount_sats, 9000, "wallet SPK: LSP amount");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, wallet_spk, 34) == 0,
+                "wallet SPK: LSP uses override");
+
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, wallet_spk, 34) == 0,
+                "wallet SPK: client 0 uses override");
+
+    TEST_ASSERT(memcmp(outputs[2].script_pubkey, wallet_spk, 34) == 0,
+                "wallet SPK: client 1 uses override");
+
+    /* Balance invariant: sum + fee == funding */
+    uint64_t sum = close_fee;
+    for (size_t i = 0; i < n; i++)
+        sum += outputs[i].amount_sats;
+    TEST_ASSERT_EQ(sum, f.funding_amount_sats, "balance invariant holds");
 
     return 1;
 }

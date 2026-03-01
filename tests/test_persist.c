@@ -1836,3 +1836,73 @@ int test_persist_crash_dw_state(void) {
     unlink(path);
     return 1;
 }
+
+/* ---- Test: bidirectional HTLC persistence (sender + receiver) ---- */
+
+int test_persist_htlc_bidirectional(void) {
+    const char *path = "/tmp/test_persist_htlc_bidir.db";
+    unlink(path);
+
+    /* Save: RECEIVED on channel 0 (sender-side), OFFERED on channel 1 (dest-side) */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "open for save");
+
+        unsigned char hash[32];
+        memset(hash, 0x42, 32);
+
+        htlc_t h_sender = {0};
+        h_sender.id = 7;
+        h_sender.direction = HTLC_RECEIVED;  /* LSP received from sender */
+        h_sender.state = HTLC_STATE_ACTIVE;
+        h_sender.amount_sats = 2000;
+        memcpy(h_sender.payment_hash, hash, 32);
+        h_sender.cltv_expiry = 144;
+
+        htlc_t h_dest = {0};
+        h_dest.id = 3;
+        h_dest.direction = HTLC_OFFERED;  /* LSP offered to dest */
+        h_dest.state = HTLC_STATE_ACTIVE;
+        h_dest.amount_sats = 2000;
+        memcpy(h_dest.payment_hash, hash, 32);
+        h_dest.cltv_expiry = 144;
+
+        TEST_ASSERT(persist_save_htlc(&db, 0, &h_sender), "save sender htlc");
+        TEST_ASSERT(persist_save_htlc(&db, 1, &h_dest), "save dest htlc");
+        persist_close(&db);
+    }
+
+    /* Load: reopen and verify both HTLCs on different channels */
+    {
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, path), "reopen for load");
+
+        htlc_t loaded[16];
+        size_t count0 = persist_load_htlcs(&db, 0, loaded, 16);
+        TEST_ASSERT_EQ(count0, 1, "channel 0 htlc count");
+        TEST_ASSERT_EQ(loaded[0].id, 7, "ch0 htlc id");
+        TEST_ASSERT_EQ(loaded[0].direction, HTLC_RECEIVED, "ch0 direction");
+        TEST_ASSERT_EQ(loaded[0].amount_sats, 2000, "ch0 amount");
+
+        size_t count1 = persist_load_htlcs(&db, 1, loaded, 16);
+        TEST_ASSERT_EQ(count1, 1, "channel 1 htlc count");
+        TEST_ASSERT_EQ(loaded[0].id, 3, "ch1 htlc id");
+        TEST_ASSERT_EQ(loaded[0].direction, HTLC_OFFERED, "ch1 direction");
+        TEST_ASSERT_EQ(loaded[0].amount_sats, 2000, "ch1 amount");
+
+        /* Delete both */
+        TEST_ASSERT(persist_delete_htlc(&db, 0, 7), "delete sender htlc");
+        TEST_ASSERT(persist_delete_htlc(&db, 1, 3), "delete dest htlc");
+
+        /* Verify zero HTLCs remain */
+        count0 = persist_load_htlcs(&db, 0, loaded, 16);
+        TEST_ASSERT_EQ(count0, 0, "ch0 empty after delete");
+        count1 = persist_load_htlcs(&db, 1, loaded, 16);
+        TEST_ASSERT_EQ(count1, 0, "ch1 empty after delete");
+
+        persist_close(&db);
+    }
+
+    unlink(path);
+    return 1;
+}

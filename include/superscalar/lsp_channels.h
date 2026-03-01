@@ -182,11 +182,15 @@ lsp_channel_entry_t *lsp_channels_get(lsp_channel_mgr_t *mgr, size_t client_idx)
 /* Build close outputs reflecting current channel balances.
    outputs: caller-allocated array of at least (n_channels + 1) entries.
    Returns number of outputs written. Output 0 = LSP (sum of local_amounts - close_fee),
-   Outputs 1..N = clients (each remote_amount). */
+   Outputs 1..N = clients (each remote_amount).
+   close_spk/close_spk_len: if non-NULL, override SPK for all outputs
+   (wallet-controlled address for UTXO recycling). If NULL/0, uses factory funding SPK. */
 size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
                                          const factory_t *factory,
                                          tx_output_t *outputs,
-                                         uint64_t close_fee);
+                                         uint64_t close_fee,
+                                         const unsigned char *close_spk,
+                                         size_t close_spk_len);
 
 /* Run a select()-based event loop handling channel messages.
    Processes messages until expected_msgs messages have been handled.

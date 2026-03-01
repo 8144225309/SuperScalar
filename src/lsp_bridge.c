@@ -256,6 +256,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (success) {
                 /* Fulfill the HTLC on the client's channel */
                 channel_fulfill_htlc(ch, htlc_id_val, preimage);
+                if (mgr->persist)
+                    persist_delete_htlc((persist_t *)mgr->persist,
+                                        (uint32_t)client_idx, htlc_id_val);
 
                 cJSON *ful = wire_build_update_fulfill_htlc(htlc_id_val, preimage);
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FULFILL_HTLC, ful);
