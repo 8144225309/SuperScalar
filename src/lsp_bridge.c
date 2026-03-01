@@ -354,6 +354,9 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
             if (dest_idx < mgr->n_channels) {
                 channel_t *ch = &mgr->entries[dest_idx].channel;
                 channel_fail_htlc(ch, dest_htlc_id);
+                if (mgr->persist)
+                    persist_delete_htlc((persist_t *)mgr->persist,
+                                        (uint32_t)dest_idx, dest_htlc_id);
                 if (lsp && lsp->client_fds[dest_idx] >= 0) {
                     cJSON *cf = wire_build_update_fail_htlc(dest_htlc_id,
                         "htlc_timeout");
