@@ -542,6 +542,9 @@ extern int test_tor_only_requires_proxy(void);
 extern int test_bind_localhost(void);
 extern int test_tor_password_file(void);
 
+/* Keysend (Signet/Testnet4 Gap) */
+extern int test_bridge_keysend_inbound(void);
+
 /* Bridge Reliability Tests (Roadmap Item #7) */
 extern int test_bridge_heartbeat_stale(void);
 extern int test_bridge_reconnect(void);
@@ -692,6 +695,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_invoice_bolt11_round_trip);
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
+    RUN_TEST(test_bridge_keysend_inbound);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

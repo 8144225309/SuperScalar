@@ -3097,6 +3097,18 @@ int test_cli_command_parsing(void) {
     ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay badargs", &shutdown_flag);
     TEST_ASSERT(ok, "pay bad args should be recognized");
 
+    /* Test "rebalance" — should be recognized (same as pay) */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance 0 1 1000", &shutdown_flag);
+    TEST_ASSERT(ok, "rebalance should be recognized");
+
+    /* Test "rebalance" self-rejection */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance 0 0 1000", &shutdown_flag);
+    TEST_ASSERT(ok, "rebalance self should be recognized (prints error)");
+
+    /* Test "rebalance" bad args */
+    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance badargs", &shutdown_flag);
+    TEST_ASSERT(ok, "rebalance bad args should be recognized");
+
     /* Test unknown command — should return 0 */
     ok = lsp_channels_handle_cli_line(&mgr, &lsp, "foobar", &shutdown_flag);
     TEST_ASSERT(!ok, "unknown command should return 0");

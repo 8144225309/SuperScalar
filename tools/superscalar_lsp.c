@@ -499,6 +499,8 @@ int main(int argc, char *argv[]) {
     char *tor_password_file = NULL;
     int tor_only = 0;
     const char *bind_addr = NULL;
+    int auto_rebalance = 0;
+    int dynamic_fees = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -644,6 +646,10 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--settlement-interval") == 0 && i + 1 < argc)
             settlement_interval = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--auto-rebalance") == 0)
+            auto_rebalance = 1;
+        else if (strcmp(argv[i], "--dynamic-fees") == 0)
+            dynamic_fees = 1;
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -868,8 +874,8 @@ int main(int argc, char *argv[]) {
     /* Initialize fee estimator */
     fee_estimator_t fee_est;
     fee_init(&fee_est, fee_rate);
-    if (!is_regtest) fee_est.use_estimatesmartfee = 1;
-    if (!is_regtest && fee_update_from_node(&fee_est, &rt, 6)) {
+    if (!is_regtest || dynamic_fees) fee_est.use_estimatesmartfee = 1;
+    if (fee_est.use_estimatesmartfee && fee_update_from_node(&fee_est, &rt, 6)) {
         printf("LSP: fee rate from estimatesmartfee(6): %llu sat/kvB\n",
                (unsigned long long)fee_est.fee_rate_sat_per_kvb);
     } else {
@@ -1106,6 +1112,7 @@ int main(int argc, char *argv[]) {
             mgr.rot_auto_rotate = 1;
             mgr.rot_attempted_mask = 0;
             mgr.cli_enabled = cli_mode;
+            mgr.auto_rebalance = auto_rebalance;
 
             /* JIT Channel Fallback */
             jit_channels_init(&mgr);
@@ -1759,6 +1766,7 @@ int main(int argc, char *argv[]) {
         mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
         mgr.rot_attempted_mask = 0;
         mgr.cli_enabled = cli_mode;
+        mgr.auto_rebalance = auto_rebalance;
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(&mgr);

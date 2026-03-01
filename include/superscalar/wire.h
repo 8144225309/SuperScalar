@@ -286,10 +286,18 @@ cJSON *wire_build_bridge_hello(void);
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
 
-/* Bridge → LSP: BRIDGE_ADD_HTLC {payment_hash, amount_msat, cltv_expiry, htlc_id} */
+/* Bridge → LSP: BRIDGE_ADD_HTLC {payment_hash, amount_msat, cltv_expiry, htlc_id,
+   [keysend], [dest_client], [preimage]} — keysend fields optional (backward-compat) */
 cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
                                     uint64_t amount_msat, uint32_t cltv_expiry,
                                     uint64_t htlc_id);
+
+/* Keysend variant: includes preimage + dest_client for spontaneous payments */
+cJSON *wire_build_bridge_add_htlc_keysend(const unsigned char *payment_hash32,
+                                            uint64_t amount_msat, uint32_t cltv_expiry,
+                                            uint64_t htlc_id,
+                                            const unsigned char *preimage32,
+                                            size_t dest_client);
 
 /* LSP → Bridge: BRIDGE_FULFILL_HTLC {payment_hash, preimage, htlc_id} */
 cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
@@ -320,6 +328,17 @@ int wire_parse_bridge_add_htlc(const cJSON *json,
                                  unsigned char *payment_hash32,
                                  uint64_t *amount_msat, uint32_t *cltv_expiry,
                                  uint64_t *htlc_id);
+
+/* Extended parser: also extracts optional keysend fields.
+   *is_keysend_out=1 if keysend present, preimage32/dest_client_out filled.
+   *is_keysend_out=0 if absent (backward-compatible). */
+int wire_parse_bridge_add_htlc_keysend(const cJSON *json,
+                                         unsigned char *payment_hash32,
+                                         uint64_t *amount_msat, uint32_t *cltv_expiry,
+                                         uint64_t *htlc_id,
+                                         int *is_keysend_out,
+                                         unsigned char *preimage32,
+                                         size_t *dest_client_out);
 
 int wire_parse_bridge_fulfill_htlc(const cJSON *json,
                                      unsigned char *payment_hash32,

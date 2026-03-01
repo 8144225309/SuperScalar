@@ -481,6 +481,73 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 0;
 }
 
+/* Rebalance entry: from → to, amount_sats */
+typedef struct {
+    size_t from;
+    size_t to;
+    uint64_t amount_sats;
+} rebalance_entry_t;
+
+int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                   const rebalance_entry_t *entries, size_t n_entries) {
+    if (!mgr || !lsp || !entries || n_entries == 0) return 0;
+
+    printf("--- Batch rebalance: %zu transfers ---\n", n_entries);
+    int successes = 0;
+    for (size_t i = 0; i < n_entries; i++) {
+        printf("  [%zu/%zu] client %zu -> client %zu (%llu sats): ",
+               i + 1, n_entries, entries[i].from, entries[i].to,
+               (unsigned long long)entries[i].amount_sats);
+        fflush(stdout);
+        if (lsp_channels_initiate_payment(mgr, lsp, entries[i].from,
+                entries[i].to, entries[i].amount_sats)) {
+            printf("OK\n");
+            successes++;
+        } else {
+            printf("FAILED\n");
+        }
+    }
+    printf("--- Batch rebalance complete: %d/%zu succeeded ---\n",
+           successes, n_entries);
+    return successes;
+}
+
+int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return 0;
+    int rebalanced = 0;
+
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        uint64_t total = ch->local_amount + ch->remote_amount;
+        if (total == 0) continue;
+
+        /* Check if channel is imbalanced (>80% on one side) */
+        uint64_t pct_local = (ch->local_amount * 100) / total;
+        if (pct_local > 80) {
+            /* LSP-heavy: move balance to a light channel */
+            uint64_t excess = ch->local_amount - (total / 2);
+            /* Find lightest LSP-side channel to receive */
+            size_t lightest = c;
+            uint64_t lightest_local = UINT64_MAX;
+            for (size_t j = 0; j < mgr->n_channels; j++) {
+                if (j == c) continue;
+                uint64_t jl = mgr->entries[j].channel.local_amount;
+                if (jl < lightest_local) {
+                    lightest_local = jl;
+                    lightest = j;
+                }
+            }
+            if (lightest != c && excess > 0) {
+                printf("Auto-rebalance: client %zu -> client %zu (%llu sats)\n",
+                       c, lightest, (unsigned long long)excess);
+                if (lsp_channels_initiate_payment(mgr, lsp, c, lightest, excess))
+                    rebalanced++;
+            }
+        }
+    }
+    return rebalanced;
+}
+
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 

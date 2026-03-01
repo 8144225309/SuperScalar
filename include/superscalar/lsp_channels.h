@@ -124,6 +124,10 @@ typedef struct {
     economic_mode_t  economic_mode;    /* CLI: --economic-mode */
     uint16_t default_profit_bps;       /* CLI: --default-profit-bps */
 
+    /* Auto-rebalance (Signet/Testnet4 deployment) */
+    int auto_rebalance;             /* 1 = enabled, check on periodic timeout */
+    uint32_t last_rebalance_block;  /* block height of last auto-rebalance */
+
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
     uint64_t locked_in_factories_sats;   /* capital in active factories */
@@ -287,5 +291,9 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Run a scripted demo sequence of payments after channels are ready.
    Returns 1 on success. */
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Check all channels for imbalance (>80% on one side) and rebalance.
+   Returns number of rebalance operations performed. */
+int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

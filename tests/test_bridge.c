@@ -2197,3 +2197,115 @@ int test_bridge_preimage_passthrough(void) {
     close(plugin_sv[1]);
     return 1;
 }
+
+/* ---- Test: keysend wire round-trip + LSP bridge keysend handling ---- */
+
+int test_bridge_keysend_inbound(void) {
+    /* 1. Build keysend ADD_HTLC with preimage + dest_client */
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0xCC, 32);
+    sha256(preimage, 32, hash);
+
+    cJSON *ks = wire_build_bridge_add_htlc_keysend(hash, 50000, 144, 7,
+                                                      preimage, 2);
+    TEST_ASSERT(ks != NULL, "build keysend");
+
+    /* Verify keysend fields present */
+    cJSON *ks_flag = cJSON_GetObjectItem(ks, "keysend");
+    TEST_ASSERT(ks_flag && cJSON_IsTrue(ks_flag), "keysend flag true");
+    cJSON *dc = cJSON_GetObjectItem(ks, "dest_client");
+    TEST_ASSERT(dc && cJSON_IsNumber(dc) && (int)dc->valuedouble == 2,
+                "dest_client == 2");
+
+    /* 2. Parse with keysend-aware parser */
+    unsigned char p_hash[32], p_pre[32];
+    uint64_t p_amt, p_htlc;
+    uint32_t p_cltv;
+    int p_is_ks = 0;
+    size_t p_dest = 99;
+
+    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(ks, p_hash, &p_amt, &p_cltv,
+                    &p_htlc, &p_is_ks, p_pre, &p_dest),
+                "parse keysend");
+    TEST_ASSERT(p_is_ks == 1, "is_keysend = 1");
+    TEST_ASSERT_MEM_EQ(p_hash, hash, 32, "hash matches");
+    TEST_ASSERT_MEM_EQ(p_pre, preimage, 32, "preimage matches");
+    TEST_ASSERT_EQ((long)p_dest, 2, "dest_client matches");
+    TEST_ASSERT_EQ((long)p_amt, 50000, "amount matches");
+    TEST_ASSERT_EQ((long)p_cltv, 144, "cltv matches");
+    TEST_ASSERT_EQ((long)p_htlc, 7, "htlc_id matches");
+
+    /* 3. Parse regular (non-keysend) ADD_HTLC — keysend flag should be 0 */
+    cJSON *reg = wire_build_bridge_add_htlc(hash, 50000, 144, 7);
+    int reg_ks = 1;
+    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(reg, p_hash, &p_amt, &p_cltv,
+                    &p_htlc, &reg_ks, p_pre, &p_dest),
+                "parse regular as keysend");
+    TEST_ASSERT(reg_ks == 0, "non-keysend flag = 0");
+
+    cJSON_Delete(ks);
+    cJSON_Delete(reg);
+
+    /* 4. Test LSP bridge handler with keysend message over socketpair */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 4;
+    mgr.bridge_fd = sv[0];
+    for (size_t i = 0; i < 4; i++) {
+        mgr.entries[i].channel.local_amount = 50000;
+        mgr.entries[i].channel.remote_amount = 50000;
+    }
+
+    /* Send keysend ADD_HTLC via bridge */
+    cJSON *ks2 = wire_build_bridge_add_htlc_keysend(hash, 10000000, 200, 42,
+                                                       preimage, 1);
+    wire_send(sv[1], MSG_BRIDGE_ADD_HTLC, ks2);
+    cJSON_Delete(ks2);
+
+    /* Read and handle in bridge handler — should register invoice for keysend */
+    wire_msg_t recv_msg;
+    TEST_ASSERT(wire_recv(sv[0], &recv_msg), "recv keysend msg");
+    TEST_ASSERT_EQ(recv_msg.msg_type, MSG_BRIDGE_ADD_HTLC, "msg type");
+
+    /* Verify invoice was NOT registered before handle (it shouldn't be) */
+    size_t lookup_dest;
+    TEST_ASSERT(!lsp_channels_lookup_invoice(&mgr, hash, &lookup_dest),
+                "no invoice before handle");
+
+    /* We can't fully run handle_bridge_msg because it needs valid lsp_t with
+       real client fds, but we can verify the keysend parsing works e2e */
+    int is_ks_check = 0;
+    unsigned char pre_check[32];
+    size_t dest_check = 99;
+    unsigned char hash_check[32];
+    uint64_t amt_check, htlc_check;
+    uint32_t cltv_check;
+    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(recv_msg.json, hash_check,
+                    &amt_check, &cltv_check, &htlc_check,
+                    &is_ks_check, pre_check, &dest_check),
+                "parse received keysend");
+    TEST_ASSERT(is_ks_check == 1, "received is keysend");
+    TEST_ASSERT_EQ((long)dest_check, 1, "dest_client = 1");
+    TEST_ASSERT_MEM_EQ(pre_check, preimage, 32, "preimage round-trip");
+
+    /* Register invoice via keysend path and verify lookup works */
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash_check, pre_check,
+                    dest_check, amt_check),
+                "keysend register");
+    TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, hash_check, &lookup_dest),
+                "lookup after keysend register");
+    TEST_ASSERT_EQ((long)lookup_dest, 1, "dest_client from lookup");
+
+    cJSON_Delete(recv_msg.json);
+    close(sv[0]);
+    close(sv[1]);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

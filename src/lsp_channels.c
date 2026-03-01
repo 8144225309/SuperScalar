@@ -1548,26 +1548,29 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     lsp_t *lsp = (lsp_t *)lsp_ptr;
     size_t len = strlen(line);
 
-    if (strncmp(line, "pay ", 4) == 0) {
+    if (strncmp(line, "pay ", 4) == 0 || strncmp(line, "rebalance ", 10) == 0) {
+        int is_rebalance = (line[0] == 'r');
+        const char *args = line + (is_rebalance ? 10 : 4);
+        const char *cmd_name = is_rebalance ? "rebalance" : "pay";
         unsigned int from, to;
         unsigned long long amt;
-        if (sscanf(line + 4, "%u %u %llu", &from, &to, &amt) == 3) {
+        if (sscanf(args, "%u %u %llu", &from, &to, &amt) == 3) {
             if (from >= mgr->n_channels || to >= mgr->n_channels) {
                 printf("CLI: invalid client index (max %zu)\n",
                        mgr->n_channels - 1);
             } else if (from == to) {
-                printf("CLI: cannot pay self\n");
+                printf("CLI: cannot %s self\n", cmd_name);
             } else {
-                printf("CLI: pay %u \xe2\x86\x92 %u (%llu sats)\n", from, to, amt);
+                printf("CLI: %s %u \xe2\x86\x92 %u (%llu sats)\n", cmd_name, from, to, amt);
                 fflush(stdout);
                 if (lsp_channels_initiate_payment(mgr, lsp,
                         (size_t)from, (size_t)to, (uint64_t)amt))
-                    printf("CLI: payment succeeded\n");
+                    printf("CLI: %s succeeded\n", cmd_name);
                 else
-                    printf("CLI: payment FAILED\n");
+                    printf("CLI: %s FAILED\n", cmd_name);
             }
         } else {
-            printf("CLI: usage: pay <from> <to> <amount>\n");
+            printf("CLI: usage: %s <from> <to> <amount>\n", cmd_name);
         }
     } else if (strcmp(line, "status") == 0) {
         printf("--- Factory Status ---\n");
@@ -1589,11 +1592,41 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             int fsi = (int)fs;
             printf("  Factory state: %s (height=%d)\n",
                    (fsi >= 0 && fsi <= 2) ? fs_names[fsi] : "?", h);
+            printf("  DW epoch: states_per_layer=%u, step_blocks=%u\n",
+                   lsp->factory.states_per_layer, lsp->factory.step_blocks);
+        }
+        /* Bridge connection status */
+        printf("  Bridge: %s\n", mgr->bridge_fd >= 0 ? "connected" : "disconnected");
+        /* Invoice registry */
+        {
+            size_t active_inv = 0;
+            for (size_t i = 0; i < mgr->n_invoices; i++)
+                if (mgr->invoices[i].active) active_inv++;
+            printf("  Registered invoices: %zu active / %zu total\n",
+                   active_inv, mgr->n_invoices);
+        }
+        /* Active HTLCs across channels */
+        {
+            size_t total_htlcs = 0;
+            for (size_t c = 0; c < mgr->n_channels; c++)
+                total_htlcs += mgr->entries[c].channel.n_htlcs;
+            printf("  Active HTLCs: %zu\n", total_htlcs);
+        }
+        /* Bridge HTLC origins */
+        {
+            size_t active_origins = 0;
+            for (size_t i = 0; i < mgr->n_htlc_origins; i++)
+                if (mgr->htlc_origins[i].active) active_origins++;
+            if (active_origins > 0)
+                printf("  Bridge HTLC origins: %zu pending\n", active_origins);
         }
         if (mgr->ladder) {
             ladder_t *lad = (ladder_t *)mgr->ladder;
             printf("  Ladder factories: %zu\n", lad->n_factories);
         }
+        /* JIT channels */
+        if (mgr->jit_enabled && mgr->n_jit_channels > 0)
+            printf("  JIT channels: %zu\n", mgr->n_jit_channels);
         printf("---\n");
     } else if (strcmp(line, "rotate") == 0) {
         printf("CLI: forcing rotation\n");
@@ -1630,12 +1663,13 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         }
     } else if (strcmp(line, "help") == 0) {
         printf("Commands:\n");
-        printf("  pay <from> <to> <amount>  Send payment between clients\n");
-        printf("  invoice <client> <msat>   Create external invoice for LN receive\n");
-        printf("  status                    Show factory and channel state\n");
-        printf("  rotate                    Force factory rotation\n");
-        printf("  close                     Cooperative close and shutdown\n");
-        printf("  help                      Show this help\n");
+        printf("  pay <from> <to> <amount>     Send payment between clients\n");
+        printf("  rebalance <from> <to> <amt>  Rebalance: move sats between clients\n");
+        printf("  invoice <client> <msat>      Create external invoice for LN receive\n");
+        printf("  status                       Show factory/channel/bridge state\n");
+        printf("  rotate                       Force factory rotation\n");
+        printf("  close                        Cooperative close and shutdown\n");
+        printf("  help                         Show this help\n");
     } else if (len > 0) {
         printf("CLI: unknown command '%s' (type 'help')\n", line);
         fflush(stdout);
@@ -2002,6 +2036,20 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);
+
+            /* Auto-rebalance: rate-limited to once per 100 blocks */
+            if (mgr->auto_rebalance && mgr->watchtower && mgr->watchtower->rt) {
+                int rh = regtest_get_block_height(mgr->watchtower->rt);
+                if (rh > 0 && (uint32_t)rh - mgr->last_rebalance_block >= 100) {
+                    int n_rb = lsp_channels_auto_rebalance(mgr, lsp);
+                    if (n_rb > 0) {
+                        printf("LSP: auto-rebalanced %d channels (height=%d)\n",
+                               n_rb, rh);
+                        fflush(stdout);
+                    }
+                    mgr->last_rebalance_block = (uint32_t)rh;
+                }
+            }
 
             /* Check bridge HTLC timeouts */
             if (mgr->bridge_fd >= 0 && mgr->watchtower && mgr->watchtower->rt) {

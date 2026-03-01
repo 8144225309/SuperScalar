@@ -881,6 +881,19 @@ cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
     return j;
 }
 
+cJSON *wire_build_bridge_add_htlc_keysend(const unsigned char *payment_hash32,
+                                            uint64_t amount_msat, uint32_t cltv_expiry,
+                                            uint64_t htlc_id,
+                                            const unsigned char *preimage32,
+                                            size_t dest_client) {
+    cJSON *j = wire_build_bridge_add_htlc(payment_hash32, amount_msat,
+                                            cltv_expiry, htlc_id);
+    cJSON_AddBoolToObject(j, "keysend", 1);
+    wire_json_add_hex(j, "preimage", preimage32, 32);
+    cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
+    return j;
+}
+
 cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
                                         const unsigned char *preimage32,
                                         uint64_t htlc_id) {
@@ -978,6 +991,29 @@ int wire_parse_bridge_add_htlc(const cJSON *json,
     *amount_msat = (uint64_t)am->valuedouble;
     *cltv_expiry = (uint32_t)ce->valuedouble;
     *htlc_id = (uint64_t)hi->valuedouble;
+    return 1;
+}
+
+int wire_parse_bridge_add_htlc_keysend(const cJSON *json,
+                                         unsigned char *payment_hash32,
+                                         uint64_t *amount_msat, uint32_t *cltv_expiry,
+                                         uint64_t *htlc_id,
+                                         int *is_keysend_out,
+                                         unsigned char *preimage32,
+                                         size_t *dest_client_out) {
+    if (!wire_parse_bridge_add_htlc(json, payment_hash32, amount_msat,
+                                      cltv_expiry, htlc_id))
+        return 0;
+    cJSON *ks = cJSON_GetObjectItem(json, "keysend");
+    if (ks && cJSON_IsBool(ks) && cJSON_IsTrue(ks)) {
+        if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+            return 0;
+        cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
+        *dest_client_out = dc && cJSON_IsNumber(dc) ? (size_t)dc->valuedouble : 0;
+        *is_keysend_out = 1;
+    } else {
+        *is_keysend_out = 0;
+    }
     return 1;
 }
 

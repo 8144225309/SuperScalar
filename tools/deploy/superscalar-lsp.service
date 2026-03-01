@@ -1,0 +1,24 @@
+[Unit]
+Description=SuperScalar LSP Daemon
+After=network-online.target bitcoind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=superscalar
+Group=superscalar
+ExecStart=/usr/local/bin/superscalar_lsp \
+    --network signet --daemon --cli \
+    --db /var/lib/superscalar/lsp.db \
+    --port 9735 --clients 4 --amount 100000 \
+    --active-blocks 4320 --dying-blocks 432 \
+    --dynamic-fees --auto-rebalance \
+    --cli-path /usr/local/bin/bitcoin-cli
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+StandardOutput=append:/var/log/superscalar/lsp.log
+StandardError=append:/var/log/superscalar/lsp.log
+
+[Install]
+WantedBy=multi-user.target

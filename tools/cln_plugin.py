@@ -19,6 +19,7 @@ Usage:
              --superscalar-lightning-cli=lightning-cli
 """
 
+import hashlib
 import json
 import socket
 import subprocess
@@ -30,6 +31,7 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
 LIGHTNING_CLI = "lightning-cli"
 LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
+KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend payments
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 pending_htlcs = {}   # payment_hash -> rpc_id for resolving
@@ -37,6 +39,9 @@ pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
 lock = threading.Lock()
 cln_lock = threading.Lock()  # serializes writes to CLN stdout
+
+# Keysend TLV type used by CLN/LND for spontaneous payments (BOLT TLV)
+KEYSEND_TLV_TYPE = "5482373484"
 
 
 def cli_cmd(*args):
@@ -318,9 +323,62 @@ def _do_pay(bolt11, request_id):
         })
 
 
+def _extract_keysend_preimage(params):
+    """Check if the HTLC contains a keysend TLV (type 5482373484).
+    Returns the preimage hex string if found and valid, None otherwise."""
+    onion = params.get("onion", {})
+    payload = onion.get("payload", "")
+    # CLN provides the payload as a hex-encoded TLV stream; but the
+    # individual TLVs are typically pre-parsed in onion.type and
+    # onion.short_channel_id etc.  The keysend preimage is in the
+    # per-hop payload's TLV.  CLN exposes it in onion.payload as raw
+    # hex, or sometimes in a "tlvs" field depending on version.
+
+    # Method 1: CLN v24+ may include parsed TLVs
+    tlvs = onion.get("tlvs", {})
+    if KEYSEND_TLV_TYPE in tlvs:
+        return tlvs[KEYSEND_TLV_TYPE]
+
+    # Method 2: Some CLN versions put keysend preimage in onion payload
+    # as raw hex TLV stream — parse manually
+    if payload and len(payload) > 64:
+        try:
+            raw = bytes.fromhex(payload)
+            offset = 0
+            while offset < len(raw):
+                # TLV: varint type, varint length, value
+                tlv_type, offset = _read_varint(raw, offset)
+                tlv_len, offset = _read_varint(raw, offset)
+                if offset + tlv_len > len(raw):
+                    break
+                if str(tlv_type) == KEYSEND_TLV_TYPE and tlv_len == 32:
+                    return raw[offset:offset + tlv_len].hex()
+                offset += tlv_len
+        except Exception:
+            pass
+
+    return None
+
+
+def _read_varint(data, offset):
+    """Read a BigSize varint from data at offset. Returns (value, new_offset)."""
+    if offset >= len(data):
+        raise ValueError("varint: no data")
+    first = data[offset]
+    if first < 0xfd:
+        return first, offset + 1
+    elif first == 0xfd:
+        return int.from_bytes(data[offset+1:offset+3], 'big'), offset + 3
+    elif first == 0xfe:
+        return int.from_bytes(data[offset+1:offset+5], 'big'), offset + 5
+    else:
+        return int.from_bytes(data[offset+1:offset+9], 'big'), offset + 9
+
+
 def handle_htlc_accepted(rpc_id, params):
     """Handle the htlc_accepted hook from CLN.
-    Only forwards HTLCs for registered factory invoices to the bridge.
+    Forwards HTLCs for registered factory invoices to the bridge.
+    Detects keysend TLV and routes spontaneous payments to factory clients.
     All other HTLCs are passed through to CLN's normal handling."""
     htlc = params.get("htlc", {})
     payment_hash = htlc.get("payment_hash", "")
@@ -334,11 +392,25 @@ def handle_htlc_accepted(rpc_id, params):
         is_ours = payment_hash in registered_invoices
         n_registered = len(registered_invoices)
 
-    log(f"htlc_accepted: hash={payment_hash[:16]}... amt={amount_msat} "
-        f"cltv={cltv_expiry} ours={is_ours} (registry={n_registered})")
-
+    # Check for keysend TLV if not a registered invoice
+    keysend_preimage = None
     if not is_ours:
-        # Not a factory payment — let CLN handle it normally
+        keysend_preimage = _extract_keysend_preimage(params)
+        if keysend_preimage:
+            # Verify SHA256(preimage) == payment_hash
+            preimage_bytes = bytes.fromhex(keysend_preimage)
+            expected_hash = hashlib.sha256(preimage_bytes).hexdigest()
+            if expected_hash != payment_hash:
+                log(f"Keysend preimage mismatch: SHA256(preimage)={expected_hash[:16]}... "
+                    f"!= hash={payment_hash[:16]}...")
+                keysend_preimage = None
+
+    log(f"htlc_accepted: hash={payment_hash[:16]}... amt={amount_msat} "
+        f"cltv={cltv_expiry} ours={is_ours} keysend={keysend_preimage is not None} "
+        f"(registry={n_registered})")
+
+    if not is_ours and not keysend_preimage:
+        # Not a factory payment and not keysend — let CLN handle it normally
         send_to_cln({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -359,13 +431,21 @@ def handle_htlc_accepted(rpc_id, params):
             return
         pending_htlcs[payment_hash] = rpc_id
 
-    log(f"Forwarding HTLC {payment_hash[:16]}... to bridge")
-    ok = send_to_bridge({
+    # Build bridge message
+    bridge_msg = {
         "method": "htlc_accepted",
         "payment_hash": payment_hash,
         "amount_msat": amount_msat,
         "cltv_expiry": cltv_expiry
-    })
+    }
+    if keysend_preimage:
+        bridge_msg["keysend"] = True
+        bridge_msg["preimage"] = keysend_preimage
+        bridge_msg["dest_client"] = KEYSEND_DEFAULT_CLIENT
+
+    log(f"Forwarding HTLC {payment_hash[:16]}... to bridge"
+        f"{' (keysend)' if keysend_preimage else ''}")
+    ok = send_to_bridge(bridge_msg)
 
     if not ok:
         log(f"Bridge send failed for HTLC {payment_hash[:16]}...")

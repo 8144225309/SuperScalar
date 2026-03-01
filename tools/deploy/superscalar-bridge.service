@@ -1,0 +1,18 @@
+[Unit]
+Description=SuperScalar Bridge Daemon
+After=superscalar-lsp.service lightningd.service
+Requires=superscalar-lsp.service
+
+[Service]
+Type=simple
+User=superscalar
+Group=superscalar
+ExecStart=/usr/local/share/superscalar/tools/deploy/start_bridge.sh \
+    --lsp-host 127.0.0.1 --lsp-port 9735 --plugin-port 19736
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/superscalar/bridge.log
+StandardError=append:/var/log/superscalar/bridge.log
+
+[Install]
+WantedBy=multi-user.target

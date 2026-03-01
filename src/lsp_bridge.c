@@ -83,25 +83,46 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char payment_hash[32];
         uint64_t amount_msat, htlc_id;
         uint32_t cltv_expiry;
-        if (!wire_parse_bridge_add_htlc(msg->json, payment_hash,
-                                          &amount_msat, &cltv_expiry, &htlc_id)) {
+        int is_keysend = 0;
+        unsigned char ks_preimage[32];
+        size_t ks_dest = 0;
+        if (!wire_parse_bridge_add_htlc_keysend(msg->json, payment_hash,
+                                                  &amount_msat, &cltv_expiry, &htlc_id,
+                                                  &is_keysend, ks_preimage, &ks_dest)) {
             fprintf(stderr, "LSP: bridge ADD_HTLC parse failed\n");
             return 0;
         }
-        printf("LSP: bridge ADD_HTLC received (%llu msat, cltv=%u, htlc_id=%llu)\n",
+        printf("LSP: bridge ADD_HTLC received (%llu msat, cltv=%u, htlc_id=%llu%s)\n",
                (unsigned long long)amount_msat, cltv_expiry,
-               (unsigned long long)htlc_id);
+               (unsigned long long)htlc_id,
+               is_keysend ? ", keysend" : "");
 
         /* Look up invoice to find dest_client */
         size_t dest_idx;
         if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
-            /* Unknown payment hash — fail back to bridge */
-            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
-                "unknown_payment_hash", htlc_id);
-            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-            cJSON_Delete(fail);
-            printf("LSP: bridge HTLC unknown hash, failing back\n");
-            return 1;
+            if (is_keysend) {
+                /* Keysend: register ephemeral invoice with sender's preimage */
+                if (ks_dest >= mgr->n_channels)
+                    ks_dest = 0;  /* default to client 0 */
+                if (!lsp_channels_register_invoice(mgr, payment_hash,
+                        ks_preimage, ks_dest, amount_msat)) {
+                    cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                        "keysend_register_failed", htlc_id);
+                    wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                    cJSON_Delete(fail);
+                    return 1;
+                }
+                dest_idx = ks_dest;
+                printf("LSP: keysend registered for client %zu\n", dest_idx);
+            } else {
+                /* Unknown payment hash — fail back to bridge */
+                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                    "unknown_payment_hash", htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+                printf("LSP: bridge HTLC unknown hash, failing back\n");
+                return 1;
+            }
         }
 
         uint64_t amount_sats = amount_msat / 1000;
