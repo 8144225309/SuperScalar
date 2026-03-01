@@ -206,6 +206,23 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         /* Full cooperative close of dying factory */
         printf("LSP rotate: Phase B — cooperative close of factory %u\n", dying_id);
 
+        /* Get a wallet-controlled address for close outputs (UTXO recycling) */
+        char wallet_addr[128];
+        unsigned char wallet_spk[64];
+        size_t wallet_spk_len = 0;
+        const unsigned char *close_spk = NULL;
+        size_t close_spk_len = 0;
+
+        if (regtest_get_new_address(rt, wallet_addr, sizeof(wallet_addr)) &&
+            regtest_get_address_scriptpubkey(rt, wallet_addr, wallet_spk, &wallet_spk_len)) {
+            close_spk = wallet_spk;
+            close_spk_len = wallet_spk_len;
+            printf("LSP rotate: close outputs to wallet address %s\n", wallet_addr);
+        } else {
+            fprintf(stderr, "LSP rotate: WARNING: wallet address fetch failed, "
+                    "using factory funding SPK (funds may strand)\n");
+        }
+
         tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
         size_t close_vsize = 68 + 43 * n_total;
         uint64_t close_fee = fee_estimate(fe, close_vsize);
@@ -216,13 +233,16 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                     (unsigned long long)close_fee);
         }
         size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,
-                                                            rot_outputs, close_fee);
+                                                            rot_outputs, close_fee,
+                                                            close_spk, close_spk_len);
         if (n_close == 0) {
+            const unsigned char *fb_spk = close_spk ? close_spk : mgr->rot_fund_spk;
+            size_t fb_spk_len = close_spk ? close_spk_len : 34;
             uint64_t per = (lsp->factory.funding_amount_sats - close_fee) / n_total;
             for (size_t ti = 0; ti < n_total; ti++) {
                 rot_outputs[ti].amount_sats = per;
-                memcpy(rot_outputs[ti].script_pubkey, mgr->rot_fund_spk, 34);
-                rot_outputs[ti].script_pubkey_len = 34;
+                memcpy(rot_outputs[ti].script_pubkey, fb_spk, fb_spk_len);
+                rot_outputs[ti].script_pubkey_len = fb_spk_len;
             }
             rot_outputs[n_total - 1].amount_sats =
                 lsp->factory.funding_amount_sats - close_fee - per * (n_total - 1);

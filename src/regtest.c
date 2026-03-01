@@ -181,6 +181,33 @@ int regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len) {
     return 1;
 }
 
+int regtest_get_address_scriptpubkey(regtest_t *rt, const char *address,
+                                      unsigned char *spk_out, size_t *spk_len_out) {
+    if (!rt || !address || !spk_out || !spk_len_out) return 0;
+
+    char params[256];
+    snprintf(params, sizeof(params), "\"%s\"", address);
+    char *result = regtest_exec(rt, "getaddressinfo", params);
+    if (!result) return 0;
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+
+    cJSON *spk = cJSON_GetObjectItem(json, "scriptPubKey");
+    if (!spk || !cJSON_IsString(spk)) {
+        cJSON_Delete(json);
+        return 0;
+    }
+
+    int decoded = hex_decode(spk->valuestring, spk_out, 256);
+    cJSON_Delete(json);
+    if (decoded <= 0) return 0;
+
+    *spk_len_out = (size_t)decoded;
+    return 1;
+}
+
 int regtest_get_block_height(regtest_t *rt) {
     char *result = regtest_exec(rt, "getblockcount", "");
     if (!result) return -1;

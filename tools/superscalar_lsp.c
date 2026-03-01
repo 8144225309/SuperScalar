@@ -2934,7 +2934,8 @@ int main(int argc, char *argv[]) {
         /* Cooperative close of Factory 1 */
         tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
         size_t n_close2 = lsp_channels_build_close_outputs(&mgr2, &lsp.factory,
-                                                             close2_outputs, 500);
+                                                             close2_outputs, 500,
+                                                             NULL, 0);
         tx_buf_t close2_tx;
         tx_buf_init(&close2_tx, 512);
         if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2)) {
@@ -2985,9 +2986,26 @@ int main(int argc, char *argv[]) {
     tx_output_t close_outputs[FACTORY_MAX_SIGNERS];
     size_t n_close_outputs;
 
+    /* Get wallet-controlled address for close outputs (UTXO recycling) */
+    char final_wallet_addr[128];
+    unsigned char final_wallet_spk[64];
+    size_t final_wallet_spk_len = 0;
+    const unsigned char *final_close_spk = NULL;
+    size_t final_close_spk_len = 0;
+
+    if (regtest_get_new_address(&rt, final_wallet_addr, sizeof(final_wallet_addr)) &&
+        regtest_get_address_scriptpubkey(&rt, final_wallet_addr,
+                                          final_wallet_spk, &final_wallet_spk_len)) {
+        final_close_spk = final_wallet_spk;
+        final_close_spk_len = final_wallet_spk_len;
+        printf("LSP: final close outputs to wallet address %s\n", final_wallet_addr);
+    }
+
     if (channels_active) {
         n_close_outputs = lsp_channels_build_close_outputs(&mgr, &lsp.factory,
-                                                            close_outputs, 500);
+                                                            close_outputs, 500,
+                                                            final_close_spk,
+                                                            final_close_spk_len);
         if (n_close_outputs == 0) {
             fprintf(stderr, "LSP: build close outputs failed\n");
             lsp_cleanup(&lsp);
@@ -2997,12 +3015,14 @@ int main(int argc, char *argv[]) {
         }
     } else {
         /* No payments — equal split (original behavior) */
+        const unsigned char *close_spk = final_close_spk ? final_close_spk : fund_spk;
+        size_t close_spk_len = final_close_spk ? final_close_spk_len : 34;
         uint64_t close_total = funding_amount - 500;  /* fee */
         uint64_t per_party = close_total / n_total;
         for (size_t i = 0; i < n_total; i++) {
             close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
+            memcpy(close_outputs[i].script_pubkey, close_spk, close_spk_len);
+            close_outputs[i].script_pubkey_len = close_spk_len;
         }
         /* Give remainder to last output */
         close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
