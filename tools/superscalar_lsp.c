@@ -712,6 +712,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: --arity must be 1 or 2\n");
         return 1;
     }
+    if (leaf_arity == 2 && n_clients < 2) {
+        fprintf(stderr, "Error: --arity 2 requires at least 2 clients\n");
+        return 1;
+    }
 
     /* Initialize diagnostic report */
     report_t rpt;

@@ -1,6 +1,7 @@
 /* Demo mode + payment initiation extracted from lsp_channels.c */
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/wire.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
 #include <string.h>

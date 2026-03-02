@@ -1,6 +1,7 @@
 /* Factory rotation extracted from lsp_channels.c */
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/wire.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
@@ -12,7 +13,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/select.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -131,18 +131,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         cJSON_Delete(pm);
 
         /* Wait for PTLC_ADAPTED_SIG (30s timeout) */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(lsp->client_fds[ci], &rfds);
-        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-        int ret = select(lsp->client_fds[ci] + 1, &rfds, NULL, NULL, &tv);
-        if (ret <= 0) {
-            fprintf(stderr, "LSP rotate: timeout waiting for adapted_sig from client %zu\n", ci);
-            return 0;
-        }
-
         wire_msg_t resp;
-        if (!wire_recv(lsp->client_fds[ci], &resp) ||
+        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 30) ||
             resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
             if (resp.json) cJSON_Delete(resp.json);
             fprintf(stderr, "LSP rotate: no adapted_sig from client %zu\n", ci);

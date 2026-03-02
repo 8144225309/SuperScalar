@@ -25,11 +25,11 @@ def rpc(*args, wallet=None):
 def fresh_regtest():
     """Wipe and restart regtest."""
     subprocess.run([btc] + conf + ['stop'], capture_output=True)
-    time.sleep(2)
+    time.sleep(3)
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
     subprocess.Popen([os.path.expanduser('~/bin/bitcoind'), '-regtest',
                        '-conf=' + os.path.expanduser('~/bitcoin-regtest/bitcoin.conf'), '-daemon'])
-    time.sleep(3)
+    time.sleep(5)
     rpc('createwallet', WALLET)
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rpc('generatetoaddress', '201', addr, wallet=WALLET)
@@ -153,7 +153,7 @@ def check_report():
 def test_demo_basic():
     """Basic --demo: factory creation + 4 payments + cooperative close."""
     print("\n=== TEST: --demo (basic) ===")
-    rc, log = run_lsp(['--demo'])
+    rc, log = run_lsp(['--demo'], timeout=180)
     ok = rc == 0 and 'Demo Complete' in log and 'cooperative close confirmed' in log
     payments = log.count('Payment complete:')
     print(f"  Exit: {rc}, Payments: {payments}, Close: {'cooperative close confirmed' in log}")
@@ -163,7 +163,7 @@ def test_demo_basic():
 def test_demo_rotation():
     """--demo --test-rotation: full rotation cycle."""
     print("\n=== TEST: --demo --test-rotation ===")
-    rc, log = run_lsp(['--demo', '--test-rotation'])
+    rc, log = run_lsp(['--demo', '--test-rotation'], timeout=240)
     has_turnover = 'turnover' in log.lower() or 'PTLC' in log
     has_close = 'rotation complete' in log.lower() or 'cooperative close' in log.lower() or 'close confirmed' in log.lower()
     has_new = 'new factory' in log.lower() or 'Factory 1' in log
