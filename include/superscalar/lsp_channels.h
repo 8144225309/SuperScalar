@@ -25,6 +25,8 @@ typedef struct {
     int ready;                  /* 1 after CHANNEL_READY sent */
     time_t last_message_time;   /* epoch timestamp of last wire message */
     int offline_detected;        /* 1 if declared offline */
+    unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
+    size_t close_spk_len;       /* 34 when populated, 0 if unset */
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -183,8 +185,10 @@ lsp_channel_entry_t *lsp_channels_get(lsp_channel_mgr_t *mgr, size_t client_idx)
    outputs: caller-allocated array of at least (n_channels + 1) entries.
    Returns number of outputs written. Output 0 = LSP (sum of local_amounts - close_fee),
    Outputs 1..N = clients (each remote_amount).
-   close_spk/close_spk_len: if non-NULL, override SPK for all outputs
-   (wallet-controlled address for UTXO recycling). If NULL/0, uses factory funding SPK. */
+   close_spk/close_spk_len: if non-NULL, override SPK for ALL outputs
+   (wallet-controlled address for UTXO recycling / rotation). If NULL/0,
+   LSP output uses factory funding SPK and client outputs use per-client
+   close addresses (entry->close_spk, derived from factory pubkey). */
 size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
                                          const factory_t *factory,
                                          tx_output_t *outputs,

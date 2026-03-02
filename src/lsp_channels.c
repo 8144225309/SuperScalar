@@ -139,6 +139,13 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
 
+        /* Derive per-client close address: P2TR from client's factory pubkey */
+        secp256k1_xonly_pubkey client_xonly;
+        if (secp256k1_xonly_pubkey_from_pubkey(ctx, &client_xonly, NULL, client_pubkey)) {
+            build_p2tr_script_pubkey(entry->close_spk, &client_xonly);
+            entry->close_spk_len = 34;
+        }
+
         /* Commitment tx fee: use manager's fee estimator if available */
         fee_estimator_t _fe_default;
         const fee_estimator_t *_fe = (const fee_estimator_t *)mgr->fee;
@@ -238,6 +245,13 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
+
+        /* Derive per-client close address: P2TR from client's factory pubkey */
+        secp256k1_xonly_pubkey client_xonly2;
+        if (secp256k1_xonly_pubkey_from_pubkey(ctx, &client_xonly2, NULL, client_pubkey)) {
+            build_p2tr_script_pubkey(entry->close_spk, &client_xonly2);
+            entry->close_spk_len = 34;
+        }
 
         /* Commitment tx fee: use manager's fee estimator if available */
         fee_estimator_t _fe_default2;
@@ -1500,11 +1514,19 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
     memcpy(outputs[0].script_pubkey, spk, spk_len);
     outputs[0].script_pubkey_len = spk_len;
 
-    /* Outputs 1..N: each client gets their remote_amount */
+    /* Outputs 1..N: each client gets their remote_amount.
+       When close_spk override is active, all outputs use it (rotation/recycling).
+       Otherwise, each client output uses their per-client close address. */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         outputs[c + 1].amount_sats = mgr->entries[c].channel.remote_amount;
-        memcpy(outputs[c + 1].script_pubkey, spk, spk_len);
-        outputs[c + 1].script_pubkey_len = spk_len;
+        if (!close_spk && mgr->entries[c].close_spk_len > 0) {
+            memcpy(outputs[c + 1].script_pubkey, mgr->entries[c].close_spk,
+                   mgr->entries[c].close_spk_len);
+            outputs[c + 1].script_pubkey_len = mgr->entries[c].close_spk_len;
+        } else {
+            memcpy(outputs[c + 1].script_pubkey, spk, spk_len);
+            outputs[c + 1].script_pubkey_len = spk_len;
+        }
     }
 
     /* Invariant: sum of outputs + close_fee == funding_amount */
