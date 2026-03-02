@@ -626,6 +626,7 @@ static int build_subtree(
 
     /* Wire kickoff → state output */
     uint64_t fee = f->fee_per_tx;
+    if (input_amount <= fee) return 0;
     uint64_t ko_out_amount = input_amount - fee;
 
     f->nodes[ko_idx].n_outputs = 1;
@@ -680,6 +681,7 @@ static int build_subtree(
         }
 
         /* State node gets 2 outputs for left and right children */
+        if (ko_out_amount <= fee) return 0;
         uint64_t state_budget = ko_out_amount - fee;
         uint64_t left_budget = state_budget / 2;
         uint64_t right_budget = state_budget - left_budget;
@@ -726,12 +728,18 @@ int factory_build_tree(factory_t *f) {
     size_t n_clients = f->n_participants - 1;
 
     /* Validate participant count */
-    if (f->n_participants < 3 || f->n_participants > FACTORY_MAX_SIGNERS)
+    if (f->n_participants < 3 || f->n_participants > FACTORY_MAX_SIGNERS) {
+        fprintf(stderr, "factory_build_tree: invalid participant count %zu (need 3..%d)\n",
+                f->n_participants, FACTORY_MAX_SIGNERS);
         return 0;
+    }
 
-    /* Arity-2 needs at least 2 clients */
-    if (f->leaf_arity == FACTORY_ARITY_2 && n_clients < 2)
+    /* Arity-2 needs at least 2 clients (paired leaves) */
+    if (f->leaf_arity == FACTORY_ARITY_2 && n_clients < 2) {
+        fprintf(stderr, "factory_build_tree: arity-2 requires at least 2 clients, got %zu\n",
+                n_clients);
         return 0;
+    }
 
     /* Override fee_per_tx from fee estimator if available */
     if (f->fee) {

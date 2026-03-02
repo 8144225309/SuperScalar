@@ -708,6 +708,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
     }
+    if (leaf_arity != 1 && leaf_arity != 2) {
+        fprintf(stderr, "Error: --arity must be 1 or 2\n");
+        return 1;
+    }
 
     /* Initialize diagnostic report */
     report_t rpt;
