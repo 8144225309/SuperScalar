@@ -58,7 +58,7 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Service bridge heartbeat if ready */
         if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
             wire_msg_t bmsg;
-            if (!wire_recv(mgr->bridge_fd, &bmsg)) {
+            if (!wire_recv_timeout(mgr->bridge_fd, &bmsg, 15)) {
                 mgr->bridge_fd = -1;
             } else {
                 lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
@@ -68,7 +68,7 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 continue;
         }
 
-        if (!wire_recv(fd, msg)) return 0;
+        if (!wire_recv_timeout(fd, msg, 15)) return 0;
 
         if (msg->msg_type == expected_type)
             return 1;
@@ -139,7 +139,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }; /* 200ms */
         while (select(lsp->client_fds[to_client] + 1, &rfds, NULL, NULL, &tv) > 0) {
             wire_msg_t drain_msg;
-            if (!wire_recv(lsp->client_fds[to_client], &drain_msg)) break;
+            if (!wire_recv_timeout(lsp->client_fds[to_client], &drain_msg, 2)) break;
             if (drain_msg.msg_type == MSG_REGISTER_INVOICE) {
                 unsigned char ph[32], pre[32];
                 uint64_t am;
@@ -170,6 +170,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
                            payment_hash, 500, &sender_htlc_id)) {
         fprintf(stderr, "LSP demo: add_htlc on sender failed\n");
+        fflush(stderr);
         return 0;
     }
 
@@ -415,6 +416,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     printf("  Payment complete: client %zu -> client %zu (%llu sats)\n",
            from_client + 1, to_client + 1, (unsigned long long)amount_sats);
+    fflush(stdout);
     return 1;
 }
 

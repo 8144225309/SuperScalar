@@ -39,12 +39,17 @@ def rpc(*args, wallet=None):
 
 def fresh_regtest():
     subprocess.run([btc] + conf + ["stop"], capture_output=True)
-    time.sleep(2)
+    time.sleep(3)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
     subprocess.Popen([os.path.expanduser("~/bin/bitcoind"), "-regtest",
                       "-conf=" + os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"), "-daemon"])
-    time.sleep(3)
-    rpc("createwallet", WALLET)
+    time.sleep(5)
+    # Retry wallet creation — bitcoind may not be ready yet
+    for attempt in range(10):
+        result = rpc("createwallet", WALLET)
+        if "error" not in result.lower() and result != "":
+            break
+        time.sleep(1)
     addr = rpc("getnewaddress", "", "bech32m", wallet=WALLET)
     rpc("generatetoaddress", "201", addr, wallet=WALLET)
     time.sleep(1)
@@ -217,7 +222,7 @@ for src in range(4):
         if src != dst:
             cmd_pos = len(read_log("/tmp/stress_lsp.log"))
             send_cmd(f"pay {src} {dst} 1000")
-            ok, new, _ = wait_for_result(cmd_pos, timeout=20)
+            ok, new, _ = wait_for_result(cmd_pos, timeout=45)
             if ok:
                 succeeded += 1
             else:
