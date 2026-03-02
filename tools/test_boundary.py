@@ -46,7 +46,12 @@ def fresh_regtest():
     subprocess.Popen([os.path.expanduser("~/bin/bitcoind"), "-regtest",
                       "-conf=" + os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"), "-daemon"])
     time.sleep(5)
-    rpc("createwallet", WALLET)
+    # Retry wallet creation — bitcoind may not be ready yet
+    for attempt in range(10):
+        result = rpc("createwallet", WALLET)
+        if "error" not in result.lower() and result != "":
+            break
+        time.sleep(1)
     addr = rpc("getnewaddress", "", "bech32m", wallet=WALLET)
     rpc("generatetoaddress", "201", addr, wallet=WALLET)
     time.sleep(1)
