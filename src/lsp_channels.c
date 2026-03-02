@@ -329,6 +329,61 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     return 1;
 }
 
+/* Receive from client_fd with timeout, servicing bridge heartbeats while waiting.
+   Replaces wire_recv_timeout() to prevent bridge starvation during HTLC processing. */
+static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       int client_fd, wire_msg_t *msg,
+                                       int timeout_sec) {
+    (void)lsp;
+    static int servicing = 0;   /* recursion guard (single-threaded) */
+    struct timeval start, now;
+    gettimeofday(&start, NULL);
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(client_fd, &rfds);
+        int max_fd = client_fd;
+
+        /* Monitor bridge fd unless we're already inside a bridge handler */
+        if (mgr->bridge_fd >= 0 && !servicing) {
+            FD_SET(mgr->bridge_fd, &rfds);
+            if (mgr->bridge_fd > max_fd)
+                max_fd = mgr->bridge_fd;
+        }
+
+        gettimeofday(&now, NULL);
+        int elapsed = (int)(now.tv_sec - start.tv_sec);
+        int remaining = timeout_sec - elapsed;
+        if (remaining <= 0) return 0;
+
+        struct timeval tv = { .tv_sec = remaining, .tv_usec = 0 };
+        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) return 0;
+
+        /* Service bridge if ready */
+        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+            wire_msg_t bmsg;
+            if (!wire_recv(mgr->bridge_fd, &bmsg)) {
+                fprintf(stderr, "LSP: bridge disconnected during client wait\n");
+                mgr->bridge_fd = -1;
+            } else {
+                servicing = 1;
+                lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
+                servicing = 0;
+                cJSON_Delete(bmsg.json);
+            }
+            /* If client fd wasn't also ready, loop back to select */
+            if (!FD_ISSET(client_fd, &rfds))
+                continue;
+        }
+
+        /* Client fd ready — read message */
+        if (FD_ISSET(client_fd, &rfds))
+            return wire_recv(client_fd, msg);
+    }
+}
+
 int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
@@ -361,7 +416,7 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
         /* Receive client's basepoints */
         wire_msg_t bp_resp;
-        if (!wire_recv_timeout(lsp->client_fds[c], &bp_resp, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &bp_resp, 30) ||
             bp_resp.msg_type != MSG_CHANNEL_BASEPOINTS) {
             fprintf(stderr, "LSP: expected CHANNEL_BASEPOINTS from client %zu, got 0x%02x\n",
                     c, bp_resp.msg_type);
@@ -441,7 +496,7 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         /* Wait for client's nonces */
         {
             wire_msg_t nonce_resp;
-            if (!wire_recv_timeout(lsp->client_fds[c], &nonce_resp, 30) ||
+            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &nonce_resp, 30) ||
                 nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
                 fprintf(stderr, "LSP: expected CHANNEL_NONCES from client %zu\n", c);
                 if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
@@ -539,7 +594,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from sender */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv_timeout(lsp->client_fds[sender_idx], &ack_msg, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[sender_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from sender %zu\n", sender_idx);
@@ -733,7 +788,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from dest */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv_timeout(lsp->client_fds[dest_idx], &ack_msg, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[dest_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from dest %zu\n", dest_idx);
@@ -841,7 +896,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
     /* Step 5: Wait for LEAF_ADVANCE_PSIG from client */
     wire_msg_t psig_msg;
-    if (!wire_recv_timeout(lsp->client_fds[leaf_side], &psig_msg, 30) ||
+    if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side], &psig_msg, 30) ||
         psig_msg.msg_type != MSG_LEAF_ADVANCE_PSIG) {
         fprintf(stderr, "LSP: expected LEAF_ADVANCE_PSIG from client %d, got 0x%02x\n",
                 leaf_side, psig_msg.msg_type);
@@ -1003,7 +1058,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv_timeout(lsp->client_fds[client_idx], &ack_msg, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[client_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             return 0;
@@ -1101,7 +1156,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             /* Wait for REVOKE_AND_ACK */
             wire_msg_t ack_msg;
-            if (wire_recv_timeout(lsp->client_fds[s], &ack_msg, 30) &&
+            if (recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[s], &ack_msg, 30) &&
                 ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
@@ -1217,6 +1272,19 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            In the PoC, leaf advance is done locally with factory_advance_leaf().
            This handler acknowledges receipt for future distributed mode. */
         printf("LSP: received LEAF_ADVANCE_PSIG from client %zu\n", client_idx);
+        return 1;
+
+    case MSG_INVOICE_CREATED:
+        /* Stale response from a timed-out payment request — discard silently */
+        return 1;
+
+    case MSG_REVOKE_AND_ACK:
+        /* Stale revocation from a timed-out commitment exchange — discard silently.
+           The commitment state was already rolled back by the timeout handler. */
+        return 1;
+
+    case MSG_COMMITMENT_SIGNED:
+        /* Stale commitment_signed — discard silently */
         return 1;
 
     default:

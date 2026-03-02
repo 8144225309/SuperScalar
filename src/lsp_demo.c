@@ -36,6 +36,14 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
+        int max_fd = fd;
+
+        /* Also monitor bridge fd for heartbeats */
+        if (mgr->bridge_fd >= 0) {
+            FD_SET(mgr->bridge_fd, &rfds);
+            if (mgr->bridge_fd > max_fd)
+                max_fd = mgr->bridge_fd;
+        }
 
         gettimeofday(&now, NULL);
         int elapsed = (int)(now.tv_sec - start.tv_sec);
@@ -43,8 +51,21 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (remaining <= 0) return 0;
 
         struct timeval tv = { .tv_sec = remaining, .tv_usec = 0 };
-        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
         if (ret <= 0) return 0;
+
+        /* Service bridge heartbeat if ready */
+        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+            wire_msg_t bmsg;
+            if (!wire_recv(mgr->bridge_fd, &bmsg)) {
+                mgr->bridge_fd = -1;
+            } else {
+                lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
+                cJSON_Delete(bmsg.json);
+            }
+            if (!FD_ISSET(fd, &rfds))
+                continue;
+        }
 
         if (!wire_recv(fd, msg)) return 0;
 
@@ -181,9 +202,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 6. Wait for REVOKE_AND_ACK from sender */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv(lsp->client_fds[from_client], &ack_msg) ||
-            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
-            if (ack_msg.json) cJSON_Delete(ack_msg.json);
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
+                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from sender\n");
             return 0;
         }
@@ -251,9 +271,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 8. Wait for REVOKE_AND_ACK from dest */
     {
         wire_msg_t ack_msg;
-        if (!wire_recv(lsp->client_fds[to_client], &ack_msg) ||
-            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
-            if (ack_msg.json) cJSON_Delete(ack_msg.json);
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from dest\n");
             return 0;
         }
@@ -279,9 +298,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 9. Wait for FULFILL_HTLC from dest (client fulfills with real preimage) */
     {
         wire_msg_t ful_msg;
-        if (!wire_recv(lsp->client_fds[to_client], &ful_msg) ||
-            ful_msg.msg_type != MSG_UPDATE_FULFILL_HTLC) {
-            if (ful_msg.json) cJSON_Delete(ful_msg.json);
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_UPDATE_FULFILL_HTLC, &ful_msg, 10)) {
             fprintf(stderr, "LSP demo: expected FULFILL from dest\n");
             return 0;
         }
@@ -320,8 +338,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Wait for REVOKE_AND_ACK from dest */
         {
             wire_msg_t ack;
-            if (wire_recv(lsp->client_fds[to_client], &ack) &&
-                ack.msg_type == MSG_REVOKE_AND_ACK) {
+            if (wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                               MSG_REVOKE_AND_ACK, &ack, 10)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
@@ -338,8 +356,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     /* Bidirectional: send LSP's own revocation to dest */
                     lsp_send_revocation(mgr, lsp, to_client, old_cn);
                 }
+                cJSON_Delete(ack.json);
             }
-            if (ack.json) cJSON_Delete(ack.json);
         }
 
         /* 10. Back-propagate fulfill to sender */
@@ -371,8 +389,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Wait for REVOKE_AND_ACK from sender */
         {
             wire_msg_t ack;
-            if (wire_recv(lsp->client_fds[from_client], &ack) &&
-                ack.msg_type == MSG_REVOKE_AND_ACK) {
+            if (wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
+                               MSG_REVOKE_AND_ACK, &ack, 10)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
@@ -389,8 +407,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     /* Bidirectional: send LSP's own revocation to sender */
                     lsp_send_revocation(mgr, lsp, from_client, old_cn);
                 }
+                cJSON_Delete(ack.json);
             }
-            if (ack.json) cJSON_Delete(ack.json);
         }
     }
 
