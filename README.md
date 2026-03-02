@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 378 tests (337 unit + 41 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 402 tests (359 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -20,12 +20,13 @@ A Bitcoin channel factory protocol combining:
 | Area | What's Implemented |
 |------|--------------------|
 | **Cryptography** | MuSig2 (key agg, 2-round signing, nonce pools), Schnorr adaptor signatures, PTLC key turnover, shachain revocation |
-| **Transport** | Noise NK encrypted handshake, length-prefixed JSON wire protocol (53 message types), Tor hidden services + SOCKS5 |
+| **Transport** | Noise NK encrypted handshake, length-prefixed JSON wire protocol (54 message types), Tor hidden services + SOCKS5 |
 | **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
 | **Wire Protocol** | Factory lifecycle, channel ops, HTLCs, PTLC rotation, JIT channels, bridge relay, reconnection |
-| **Security** | Client + LSP watchtowers, breach detection + penalty broadcast, encrypted keyfiles, Noise-authenticated connections |
+| **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
+| **Security** | Client + LSP watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes) |
-| **Testing** | 337 unit + 41 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 359 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -68,7 +69,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-378 tests (337 unit + 41 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+402 tests (359 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -538,7 +539,7 @@ State 3 (newest): nSequence = 0 blocks    <- confirms immediately
 
 Multi-layer counter works like an odometer: 2 layers x 4 states = 16 epochs.
 
-**Per-leaf advance**: Left and right subtrees can advance independently (only 3 signers needed per leaf instead of all 5). When a leaf exhausts its states, the root layer advances and both leaves reset. A cooperative epoch reset reclaims all states back to zero.
+**Per-leaf advance**: Left and right subtrees can advance independently (only 3 signers needed per leaf instead of all 5). When a leaf exhausts its states, the root layer advances and both leaves reset. **Distributed epoch reset** reclaims all states via a 2-round MuSig2 ceremony: LSP collects nonces from all clients (round 1), then distributes the aggregate and collects partial signatures (round 2).
 
 ### Timeout-Sig-Trees
 
@@ -617,7 +618,10 @@ CLN (lightningd)
 | `wire` | wire.c | TCP transport, JSON framing, 53 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
-| `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |
+| `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, distributed epoch reset, per-leaf advance |
+| `lsp_bridge` | lsp_bridge.c | Bridge invoice registry, HTLC origin tracking, bridge message handling |
+| `lsp_rotation` | lsp_rotation.c | Factory rotation: PTLC turnover, cooperative close, ladder management |
+| `lsp_demo` | lsp_demo.c | Demo payment sequences, balance printing, external invoice creation |
 | `persist` | persist.c | SQLite3: 27 tables for full state persistence |
 | `bridge` | bridge.c | CLN bridge daemon |
 | `fee` | fee.c | Configurable fee estimation |
@@ -631,6 +635,20 @@ CLN (lightningd)
 | `ceremony` | ceremony.c | Factory creation ceremony: parallel client collection, timeout handling, quorum |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
+
+## Known Limitations
+
+Production deployment considerations — see [docs/gaps-and-changes.md](docs/gaps-and-changes.md) for full roadmap.
+
+| Area | Status | Notes |
+|------|--------|-------|
+| **Reconnect (BOLT #2)** | PoC | Commitment mismatch logs warning + proceeds; no HTLC replay after reconnect |
+| **AEAD crypto** | PoC | Hand-rolled ChaCha20-Poly1305; should link libsodium or OpenSSL EVP |
+| **Capacity limits** | Static | `LSP_MAX_CLIENTS=8`, `MAX_HTLCS=16` — compile-time constants |
+| **JIT migration** | PoC | Direct balance addition, not a real splice-in transaction |
+| **Fee estimation** | Opt-in | Dynamic `estimatesmartfee` available but defaults to static 1000 sat/kvB |
+| **Gossip (BOLT #7)** | Not implemented | Factory channels not advertised to LN graph; bridge handles routing |
+| **Hashlock burn** | By design | L-stock burn enforced by `factory_build_burn_tx()`, not by Script (would require covenant opcodes) |
 
 ## License
 

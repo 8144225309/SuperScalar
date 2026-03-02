@@ -635,6 +635,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
+    /* Persist sender channel balance after successful revocation (Gap 2B) */
+    if (mgr->persist)
+        persist_update_channel_balance((persist_t *)mgr->persist,
+            (uint32_t)sender_idx,
+            sender_ch->local_amount, sender_ch->remote_amount,
+            sender_ch->commitment_number);
+
     /* Persist sender-side HTLC now that old state is revoked (irrevocable) */
     if (mgr->persist) {
         htlc_t sender_persist;
@@ -828,6 +835,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ack_msg.json);
     }
+
+    /* Persist dest channel balance after successful revocation (Gap 2B) */
+    if (mgr->persist)
+        persist_update_channel_balance((persist_t *)mgr->persist,
+            (uint32_t)dest_idx,
+            dest_ch->local_amount, dest_ch->remote_amount,
+            dest_ch->commitment_number);
 
     printf("LSP: HTLC %llu forwarded: client %zu -> client %zu (%llu sats)\n",
            (unsigned long long)new_htlc_id, sender_idx, dest_idx,
@@ -1371,6 +1385,13 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
+    /* Persist payee channel balance after fulfill revocation (Gap 2B) */
+    if (mgr->persist)
+        persist_update_channel_balance((persist_t *)mgr->persist,
+            (uint32_t)client_idx,
+            ch->local_amount, ch->remote_amount,
+            ch->commitment_number);
+
     /* Now back-propagate: find the sender's channel that has a matching HTLC.
        We search all other channels for a received HTLC with the same payment_hash. */
     unsigned char payment_hash[32];
@@ -1474,6 +1495,13 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
 
+            /* Persist sender channel balance after fulfill back-propagation (Gap 2B) */
+            if (mgr->persist)
+                persist_update_channel_balance((persist_t *)mgr->persist,
+                    (uint32_t)s,
+                    sender_ch->local_amount, sender_ch->remote_amount,
+                    sender_ch->commitment_number);
+
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
             if (mgr->persist)
@@ -1564,10 +1592,10 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
 
     case MSG_LEAF_ADVANCE_PSIG:
-        /* Client sent partial sig for leaf advance.
-           In the PoC, leaf advance is done locally with factory_advance_leaf().
-           This handler acknowledges receipt for future distributed mode. */
-        printf("LSP: received LEAF_ADVANCE_PSIG from client %zu\n", client_idx);
+        /* Stale PSIG outside of active ceremony — discard. Active ceremony
+           (lsp_advance_leaf) uses recv_timeout_service_bridge() to read
+           responses directly from the affected client. */
+        printf("LSP: discarding stale LEAF_ADVANCE_PSIG from client %zu\n", client_idx);
         return 1;
 
     case MSG_INVOICE_CREATED:
@@ -1593,6 +1621,143 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Bridge/invoice functions moved to lsp_bridge.c */
 
 /* --- Reconnection (Phase 16) --- */
+
+/* Replay pending HTLC forwards to a reconnected client (Gap 2C).
+   Scans all channels for ACTIVE RECEIVED HTLCs whose invoice destination
+   matches the reconnected client. For each unforwarded HTLC, re-does the
+   forward: channel_add_htlc → ADD_HTLC → COMMITMENT_SIGNED →
+   wait for REVOKE_AND_ACK → persist. */
+static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reconnected_idx) {
+    if (!mgr || !lsp) return;
+
+    for (size_t src = 0; src < mgr->n_channels; src++) {
+        if (src == reconnected_idx) continue;
+        channel_t *src_ch = &mgr->entries[src].channel;
+
+        for (size_t h = 0; h < src_ch->n_htlcs; h++) {
+            htlc_t *htlc = &src_ch->htlcs[h];
+            if (htlc->state != HTLC_STATE_ACTIVE) continue;
+            if (htlc->direction != HTLC_RECEIVED) continue;
+
+            /* Check if this HTLC is destined for the reconnected client */
+            size_t dest_client;
+            if (!lsp_channels_lookup_invoice(mgr, htlc->payment_hash, &dest_client))
+                continue;
+            if (dest_client != reconnected_idx) continue;
+
+            /* Check if HTLC is already on the dest channel (already forwarded) */
+            channel_t *dest_ch = &mgr->entries[reconnected_idx].channel;
+            int already_forwarded = 0;
+            for (size_t dh = 0; dh < dest_ch->n_htlcs; dh++) {
+                if (dest_ch->htlcs[dh].state == HTLC_STATE_ACTIVE &&
+                    memcmp(dest_ch->htlcs[dh].payment_hash, htlc->payment_hash, 32) == 0) {
+                    already_forwarded = 1;
+                    break;
+                }
+            }
+            if (already_forwarded) continue;
+
+            /* Forward this HTLC to the reconnected client */
+            uint64_t old_dest_local = dest_ch->local_amount;
+            uint64_t old_dest_remote = dest_ch->remote_amount;
+            size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+            htlc_t old_dest_htlcs[MAX_HTLCS];
+            if (old_dest_n_htlcs > 0)
+                memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
+
+            uint64_t dest_htlc_id;
+            if (!channel_add_htlc(dest_ch, HTLC_OFFERED,
+                                    htlc->amount_sats, htlc->payment_hash,
+                                    htlc->cltv_expiry, &dest_htlc_id)) {
+                fprintf(stderr, "LSP: HTLC replay add failed for client %zu\n",
+                        reconnected_idx);
+                continue;
+            }
+
+            /* Persist the forwarded HTLC */
+            if (mgr->persist) {
+                htlc_t persist_htlc;
+                memset(&persist_htlc, 0, sizeof(persist_htlc));
+                persist_htlc.id = dest_htlc_id;
+                persist_htlc.direction = HTLC_OFFERED;
+                persist_htlc.state = HTLC_STATE_ACTIVE;
+                persist_htlc.amount_sats = htlc->amount_sats;
+                memcpy(persist_htlc.payment_hash, htlc->payment_hash, 32);
+                persist_htlc.cltv_expiry = htlc->cltv_expiry;
+                persist_save_htlc((persist_t *)mgr->persist,
+                                    (uint32_t)reconnected_idx, &persist_htlc);
+            }
+
+            /* Send ADD_HTLC to dest */
+            cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, htlc->amount_sats,
+                                                       htlc->payment_hash, htlc->cltv_expiry);
+            if (!wire_send(lsp->client_fds[reconnected_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
+                cJSON_Delete(fwd);
+                continue;
+            }
+            cJSON_Delete(fwd);
+
+            /* Send COMMITMENT_SIGNED (real partial sig) */
+            {
+                unsigned char psig32[32];
+                uint32_t nonce_idx;
+                if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+                    fprintf(stderr, "LSP: replay partial sig failed for client %zu\n",
+                            reconnected_idx);
+                    continue;
+                }
+                cJSON *cs = wire_build_commitment_signed(
+                    mgr->entries[reconnected_idx].channel_id,
+                    dest_ch->commitment_number, psig32, nonce_idx);
+                if (!wire_send(lsp->client_fds[reconnected_idx], MSG_COMMITMENT_SIGNED, cs)) {
+                    cJSON_Delete(cs);
+                    continue;
+                }
+                cJSON_Delete(cs);
+            }
+
+            /* Wait for REVOKE_AND_ACK from dest */
+            {
+                wire_msg_t ack_msg;
+                if (!recv_timeout_service_bridge(mgr, lsp,
+                        lsp->client_fds[reconnected_idx], &ack_msg, 30) ||
+                    ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+                    if (ack_msg.json) cJSON_Delete(ack_msg.json);
+                    fprintf(stderr, "LSP: replay REVOKE_AND_ACK timeout for client %zu\n",
+                            reconnected_idx);
+                    continue;
+                }
+                uint32_t ack_chan_id;
+                unsigned char rev_secret[32], next_point[33];
+                if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                                rev_secret, next_point)) {
+                    uint64_t old_cn = dest_ch->commitment_number - 1;
+                    channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                    watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
+                        (uint32_t)reconnected_idx, old_cn,
+                        old_dest_local, old_dest_remote,
+                        old_dest_htlcs, old_dest_n_htlcs);
+                    secp256k1_pubkey next_pcp;
+                    if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+                        channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                    lsp_send_revocation(mgr, lsp, reconnected_idx, old_cn);
+                }
+                cJSON_Delete(ack_msg.json);
+            }
+
+            /* Persist dest channel balance after replay (Gap 2B) */
+            if (mgr->persist)
+                persist_update_channel_balance((persist_t *)mgr->persist,
+                    (uint32_t)reconnected_idx,
+                    dest_ch->local_amount, dest_ch->remote_amount,
+                    dest_ch->commitment_number);
+
+            printf("LSP: replayed HTLC to client %zu (amount=%llu, htlc_id=%llu)\n",
+                   reconnected_idx, (unsigned long long)htlc->amount_sats,
+                   (unsigned long long)dest_htlc_id);
+        }
+    }
+}
 
 /* Core reconnect handler that takes an already-read MSG_RECONNECT message. */
 static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -1634,14 +1799,54 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     size_t c = (size_t)found;
 
-    /* 4. Verify commitment_number matches */
+    /* 4. Verify commitment_number matches (Gap 2B: proper reconciliation) */
     channel_t *ch = &mgr->entries[c].channel;
     if (commitment_number != ch->commitment_number) {
-        fprintf(stderr, "LSP reconnect: commitment_number mismatch "
-                "(client=%llu, lsp=%llu) for slot %zu\n",
-                (unsigned long long)commitment_number,
-                (unsigned long long)ch->commitment_number, c);
-        /* Proceed anyway for PoC — the ACK will tell client the LSP's state */
+        int64_t diff = (int64_t)ch->commitment_number - (int64_t)commitment_number;
+
+        if (diff == 1 && mgr->persist) {
+            /* LSP is 1 ahead: last operation wasn't confirmed by client.
+               Roll back to last committed state from persistence. */
+            uint64_t db_local, db_remote, db_cn;
+            if (persist_load_channel_state((persist_t *)mgr->persist,
+                    (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                ch->local_amount = db_local;
+                ch->remote_amount = db_remote;
+                ch->commitment_number = db_cn;
+                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
+                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
+                printf("LSP: rolled back channel %zu to committed state "
+                       "(cn=%llu)\n", c, (unsigned long long)db_cn);
+            } else {
+                fprintf(stderr, "LSP: rollback failed — no DB state for %zu\n", c);
+                wire_close(new_fd);
+                return 0;
+            }
+        } else if (diff == -1 && mgr->persist) {
+            /* Client is 1 ahead: LSP crashed after client committed but
+               before LSP persisted. Accept client's commitment_number. */
+            ch->commitment_number = commitment_number;
+            uint64_t db_local, db_remote, db_cn;
+            if (persist_load_channel_state((persist_t *)mgr->persist,
+                    (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                ch->local_amount = db_local;
+                ch->remote_amount = db_remote;
+                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
+                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
+            }
+            printf("LSP: accepted client %zu commitment_number %llu "
+                   "(LSP was behind)\n", c, (unsigned long long)commitment_number);
+        } else {
+            /* Large mismatch or no persistence: irreconcilable */
+            fprintf(stderr, "LSP reconnect: irreconcilable commitment mismatch "
+                    "(client=%llu, lsp=%llu, diff=%lld) for slot %zu — "
+                    "closing connection\n",
+                    (unsigned long long)commitment_number,
+                    (unsigned long long)ch->commitment_number,
+                    (long long)diff, c);
+            wire_close(new_fd);
+            return 0;
+        }
     }
 
     /* 5. Close old client_fds[c] if still open */
@@ -1728,11 +1933,8 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack);
     }
 
-    /* In-flight HTLCs: no replay needed on reconnect.
-       Both sides already have committed HTLCs from before disconnect.
-       Recovery path loads HTLCs into channel.htlcs[] via init_from_db.
-       Normal reconnect path retains them in memory.
-       Replaying ADD without full commitment exchange would be a protocol violation. */
+    /* Replay any pending HTLC forwards to this client (Gap 2C) */
+    replay_pending_htlcs(mgr, lsp, c);
 
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);

@@ -3400,6 +3400,7 @@ int test_distributed_epoch_reset_ceremony(void) {
     secp256k1_musig_secnonce lsp_secnonces[FACTORY_MAX_NODES];
     memset(lsp_secnonces, 0, sizeof(lsp_secnonces));
     wire_bundle_entry_t lsp_nonce_entries[FACTORY_MAX_NODES];
+    memset(lsp_nonce_entries, 0, sizeof(lsp_nonce_entries));
     size_t n_lsp_nonces = 0;
 
     unsigned char lsp_sk[32];

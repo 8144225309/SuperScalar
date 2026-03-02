@@ -215,6 +215,11 @@ extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
 extern int test_client_persist_reload(void);
 
+/* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
+extern int test_reconnect_commitment_mismatch_rollback(void);
+extern int test_reconnect_commitment_mismatch_reject(void);
+extern int test_reconnect_htlc_replay(void);
+
 /* Security hardening */
 extern int test_secure_zero_basic(void);
 extern int test_wire_plaintext_refused_after_handshake(void);
@@ -731,6 +736,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
     RUN_TEST(test_client_persist_reload);
+
+    printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
+    RUN_TEST(test_reconnect_commitment_mismatch_rollback);
+    RUN_TEST(test_reconnect_commitment_mismatch_reject);
+    RUN_TEST(test_reconnect_htlc_replay);
 
     printf("\n=== Security Hardening ===\n");
     RUN_TEST(test_secure_zero_basic);

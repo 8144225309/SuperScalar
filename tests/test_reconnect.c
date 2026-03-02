@@ -2291,3 +2291,387 @@ int test_fd_table_grows_beyond_16(void) {
 
     return 1;
 }
+
+/* --- Gap 2B / 2C Tests: Commitment Reconciliation + HTLC Replay --- */
+
+/* Helper: set up LSP + factory + channel manager with persistence for reconnect tests.
+   Creates 4 clients. Returns 1 on success. */
+static int setup_reconnect_env(secp256k1_context **ctx_out,
+                                 unsigned char *lsp_sec,
+                                 secp256k1_pubkey *lsp_pk,
+                                 secp256k1_pubkey *client_pks,
+                                 unsigned char client_secs[][32],
+                                 factory_t *factory,
+                                 lsp_t *lsp,
+                                 lsp_channel_mgr_t *mgr,
+                                 persist_t *db) {
+    secp256k1_context *ctx = test_ctx();
+    *ctx_out = ctx;
+
+    memset(lsp_sec, 0x10, 32);
+    if (!secp256k1_ec_pubkey_create(ctx, lsp_pk, lsp_sec)) return 0;
+
+    for (int i = 0; i < 4; i++) {
+        memset(client_secs[i], 0x21 + i, 32);
+        if (!secp256k1_ec_pubkey_create(ctx, &client_pks[i], client_secs[i])) return 0;
+    }
+
+    secp256k1_pubkey all_pks[5];
+    all_pks[0] = *lsp_pk;
+    for (int i = 0; i < 4; i++)
+        all_pks[i + 1] = client_pks[i];
+
+    factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
+
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0x01, 32);
+    memset(fake_spk, 0x51, 1);
+    fake_spk[1] = 0x20;
+    memset(fake_spk + 2, 0xAA, 32);
+    factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    factory_build_tree(factory);
+
+    memset(lsp, 0, sizeof(*lsp));
+    lsp->ctx = ctx;
+    lsp->lsp_pubkey = *lsp_pk;
+    lsp->n_clients = 4;
+    lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
+    for (int i = 0; i < 4; i++) {
+        lsp->client_pubkeys[i] = client_pks[i];
+        lsp->client_fds[i] = -1;
+    }
+    lsp->factory = *factory;
+
+    memset(mgr, 0, sizeof(*mgr));
+    if (!lsp_channels_init(mgr, ctx, factory, lsp_sec, 4)) return 0;
+
+    /* Open in-memory persistence */
+    if (!persist_open(db, NULL)) return 0;
+
+    /* Save initial channel states */
+    for (int i = 0; i < 4; i++) {
+        channel_t *ch = &mgr->entries[i].channel;
+        if (!persist_save_channel(db, ch, 0, (uint32_t)i)) return 0;
+    }
+
+    mgr->persist = db;
+    return 1;
+}
+
+/* Helper: child process for reconnect nonce exchange.
+   Receives CHANNEL_NONCES, sends back valid nonces, receives RECONNECT_ACK. */
+static void child_nonce_exchange(int fd, int client_idx,
+                                  secp256k1_pubkey lsp_pk,
+                                  unsigned char client_sec[32]) {
+    secp256k1_context *cctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_pubkey cpk;
+    if (!secp256k1_ec_pubkey_create(cctx, &cpk, client_sec)) _exit(1);
+
+    /* Recv CHANNEL_NONCES from LSP */
+    wire_msg_t nm;
+    if (!wire_recv(fd, &nm)) _exit(2);
+    if (nm.msg_type != MSG_CHANNEL_NONCES) _exit(3);
+    cJSON_Delete(nm.json);
+
+    /* Generate and send client nonces */
+    unsigned char nonces[MUSIG_NONCE_POOL_MAX][66];
+    memset(nonces, 0, sizeof(nonces));
+    for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+        secp256k1_musig_secnonce sn;
+        secp256k1_musig_pubnonce pn;
+        musig_keyagg_t ka;
+        secp256k1_pubkey pks[2] = {lsp_pk, cpk};
+        musig_aggregate_keys(cctx, &ka, pks, 2);
+        musig_generate_nonce(cctx, &sn, &pn, client_sec, &cpk, &ka.cache);
+        musig_pubnonce_serialize(cctx, nonces[i], &pn);
+    }
+
+    cJSON *reply = wire_build_channel_nonces((uint32_t)client_idx,
+        (const unsigned char (*)[66])nonces, MUSIG_NONCE_POOL_MAX);
+    wire_send(fd, MSG_CHANNEL_NONCES, reply);
+    cJSON_Delete(reply);
+
+    /* Recv RECONNECT_ACK */
+    wire_msg_t ack_msg;
+    if (!wire_recv(fd, &ack_msg)) _exit(4);
+    if (ack_msg.msg_type != MSG_RECONNECT_ACK) _exit(5);
+    cJSON_Delete(ack_msg.json);
+
+    close(fd);
+    secp256k1_context_destroy(cctx);
+}
+
+/* Test 5A: Commitment mismatch rollback (LSP ahead by 1) */
+int test_reconnect_commitment_mismatch_rollback(void) {
+    secp256k1_context *ctx;
+    unsigned char lsp_sec[32];
+    secp256k1_pubkey lsp_pk;
+    unsigned char client_secs[4][32];
+    secp256k1_pubkey client_pks[4];
+    factory_t factory;
+    lsp_t lsp;
+    lsp_channel_mgr_t mgr;
+    persist_t db;
+
+    TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                client_secs, &factory, &lsp, &mgr, &db),
+                "setup_reconnect_env failed");
+
+    /* Persist initial state for client 2 (cn=0, local=12500, remote=12500) */
+    channel_t *ch = &mgr.entries[2].channel;
+    uint64_t orig_local = ch->local_amount;
+    uint64_t orig_remote = ch->remote_amount;
+    TEST_ASSERT(persist_update_channel_balance(&db, 2,
+        orig_local, orig_remote, 0), "persist initial balance");
+
+    /* Simulate LSP being 1 ahead: manually advance commitment_number */
+    ch->commitment_number = 1;
+    ch->local_amount = orig_local + 1000;  /* simulated in-flight change */
+    ch->remote_amount = orig_remote - 1000;
+
+    /* Client sends reconnect with cn=0 (behind by 1) */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
+    TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
+    cJSON_Delete(reconn);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        child_nonce_exchange(sv[1], 2, lsp_pk, client_secs[2]);
+        _exit(0);
+    }
+
+    close(sv[1]);
+    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv[0]);
+    TEST_ASSERT(ok, "handle_reconnect should succeed with rollback");
+
+    /* Verify channel was rolled back to DB state */
+    TEST_ASSERT_EQ(ch->commitment_number, 0, "cn should be rolled back to 0");
+    TEST_ASSERT(ch->local_amount == orig_local, "local should match DB");
+    TEST_ASSERT(ch->remote_amount == orig_remote, "remote should match DB");
+
+    int status;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
+
+    persist_close(&db);
+    factory_free(&factory);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 5B: Irreconcilable commitment mismatch (diff > 1) → reject */
+int test_reconnect_commitment_mismatch_reject(void) {
+    secp256k1_context *ctx;
+    unsigned char lsp_sec[32];
+    secp256k1_pubkey lsp_pk;
+    unsigned char client_secs[4][32];
+    secp256k1_pubkey client_pks[4];
+    factory_t factory;
+    lsp_t lsp;
+    lsp_channel_mgr_t mgr;
+    persist_t db;
+
+    TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                client_secs, &factory, &lsp, &mgr, &db),
+                "setup_reconnect_env failed");
+
+    /* Set LSP's cn = 5, client will send cn = 0 (diff = 5, irreconcilable) */
+    mgr.entries[2].channel.commitment_number = 5;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
+    TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
+    cJSON_Delete(reconn);
+
+    /* No fork needed — reconnect should fail before nonce exchange */
+    close(sv[1]);  /* close client end so LSP can detect disconnect */
+
+    wire_msg_t msg;
+    if (!wire_recv_timeout(sv[0], &msg, 5)) {
+        /* If recv fails, that's fine — we'll call handle_reconnect_with_msg directly */
+    }
+
+    /* Re-create socketpair for clean test */
+    int sv2[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0, "socketpair2");
+
+    cJSON *reconn2 = wire_build_reconnect(ctx, &client_pks[2], 0);
+    TEST_ASSERT(wire_send(sv2[1], MSG_RECONNECT, reconn2), "send reconnect2");
+    cJSON_Delete(reconn2);
+    close(sv2[1]);
+
+    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv2[0]);
+    TEST_ASSERT(!ok, "handle_reconnect should fail for large mismatch");
+
+    /* Also test: no persistence + mismatch by 1 → fails */
+    mgr.persist = NULL;
+    mgr.entries[2].channel.commitment_number = 1;
+
+    int sv3[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv3) == 0, "socketpair3");
+
+    cJSON *reconn3 = wire_build_reconnect(ctx, &client_pks[2], 0);
+    TEST_ASSERT(wire_send(sv3[1], MSG_RECONNECT, reconn3), "send reconnect3");
+    cJSON_Delete(reconn3);
+    close(sv3[1]);
+
+    ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv3[0]);
+    TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
+
+    persist_close(&db);
+    factory_free(&factory);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test 5C: HTLC replay on reconnect (Gap 2C) */
+int test_reconnect_htlc_replay(void) {
+    secp256k1_context *ctx;
+    unsigned char lsp_sec[32];
+    secp256k1_pubkey lsp_pk;
+    unsigned char client_secs[4][32];
+    secp256k1_pubkey client_pks[4];
+    factory_t factory;
+    lsp_t lsp;
+    lsp_channel_mgr_t mgr;
+    persist_t db;
+
+    TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                client_secs, &factory, &lsp, &mgr, &db),
+                "setup_reconnect_env failed");
+
+    /* Create a payment_hash and register an invoice destined for client 1 */
+    unsigned char preimage[32], payment_hash[32];
+    memset(preimage, 0xBB, 32);
+    sha256(preimage, 32, payment_hash);
+
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, preimage, 1, 1000000),
+                "register invoice failed");
+
+    /* Add an ACTIVE RECEIVED HTLC on client 0's channel (sender side) */
+    channel_t *src_ch = &mgr.entries[0].channel;
+    TEST_ASSERT(src_ch->n_htlcs < MAX_HTLCS, "htlc space");
+    htlc_t *htlc = &src_ch->htlcs[src_ch->n_htlcs];
+    memset(htlc, 0, sizeof(*htlc));
+    htlc->id = 1;
+    htlc->direction = HTLC_RECEIVED;
+    htlc->state = HTLC_STATE_ACTIVE;
+    htlc->amount_sats = 1000;
+    memcpy(htlc->payment_hash, payment_hash, 32);
+    htlc->cltv_expiry = 500;
+    src_ch->n_htlcs++;
+
+    /* Verify dest channel has no HTLCs yet */
+    channel_t *dest_ch = &mgr.entries[1].channel;
+    TEST_ASSERT_EQ(dest_ch->n_htlcs, 0, "dest should have no HTLCs before replay");
+
+    /* Client 1 reconnects */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    cJSON *reconn = wire_build_reconnect(ctx, &client_pks[1], 0);
+    TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
+    cJSON_Delete(reconn);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        secp256k1_context *cctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        secp256k1_pubkey cpk;
+        if (!secp256k1_ec_pubkey_create(cctx, &cpk, client_secs[1])) _exit(1);
+
+        /* Recv CHANNEL_NONCES from LSP */
+        wire_msg_t nm;
+        if (!wire_recv(sv[1], &nm)) _exit(2);
+        if (nm.msg_type != MSG_CHANNEL_NONCES) _exit(3);
+        cJSON_Delete(nm.json);
+
+        /* Generate and send client nonces */
+        unsigned char nonces[MUSIG_NONCE_POOL_MAX][66];
+        memset(nonces, 0, sizeof(nonces));
+        for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+            secp256k1_musig_secnonce sn;
+            secp256k1_musig_pubnonce pn;
+            musig_keyagg_t ka;
+            secp256k1_pubkey pks[2] = {lsp_pk, cpk};
+            musig_aggregate_keys(cctx, &ka, pks, 2);
+            musig_generate_nonce(cctx, &sn, &pn, client_secs[1], &cpk, &ka.cache);
+            musig_pubnonce_serialize(cctx, nonces[i], &pn);
+        }
+
+        cJSON *reply = wire_build_channel_nonces(1,
+            (const unsigned char (*)[66])nonces, MUSIG_NONCE_POOL_MAX);
+        wire_send(sv[1], MSG_CHANNEL_NONCES, reply);
+        cJSON_Delete(reply);
+
+        /* Recv RECONNECT_ACK */
+        wire_msg_t ack_msg;
+        if (!wire_recv(sv[1], &ack_msg)) _exit(4);
+        if (ack_msg.msg_type != MSG_RECONNECT_ACK) _exit(5);
+        cJSON_Delete(ack_msg.json);
+
+        /* Drain any replayed messages (ADD_HTLC, COMMITMENT_SIGNED, etc.)
+           The partial sig may fail in unit test context, so use timeouts. */
+        for (int drain = 0; drain < 5; drain++) {
+            wire_msg_t extra;
+            if (!wire_recv_timeout(sv[1], &extra, 2)) break;
+            if (extra.msg_type == MSG_COMMITMENT_SIGNED) {
+                /* Send REVOKE_AND_ACK */
+                secp256k1_pubkey tmp_pk;
+                unsigned char tmp_sec[32];
+                memset(tmp_sec, 0x99, 32);
+                if (!secp256k1_ec_pubkey_create(cctx, &tmp_pk, tmp_sec)) _exit(10);
+                unsigned char rev_sec[32];
+                memset(rev_sec, 0, 32);
+                cJSON *revack = wire_build_revoke_and_ack(1, rev_sec, cctx, &tmp_pk);
+                wire_send(sv[1], MSG_REVOKE_AND_ACK, revack);
+                cJSON_Delete(revack);
+            }
+            if (extra.json) cJSON_Delete(extra.json);
+        }
+
+        close(sv[1]);
+        secp256k1_context_destroy(cctx);
+        _exit(0);
+    }
+
+    close(sv[1]);
+    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv[0]);
+    TEST_ASSERT(ok, "handle_reconnect with replay should succeed");
+
+    /* Verify HTLC was replayed to dest channel */
+    TEST_ASSERT(dest_ch->n_htlcs > 0, "dest should have replayed HTLC");
+
+    /* Check the replayed HTLC has matching payment_hash */
+    int found = 0;
+    for (size_t i = 0; i < dest_ch->n_htlcs; i++) {
+        if (memcmp(dest_ch->htlcs[i].payment_hash, payment_hash, 32) == 0) {
+            found = 1;
+            TEST_ASSERT_EQ(dest_ch->htlcs[i].direction, HTLC_OFFERED,
+                           "replayed HTLC should be OFFERED on dest");
+            TEST_ASSERT_EQ(dest_ch->htlcs[i].amount_sats, 1000,
+                           "replayed HTLC amount mismatch");
+            break;
+        }
+    }
+    TEST_ASSERT(found, "replayed HTLC not found on dest channel");
+
+    int status;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "child process failed");
+
+    persist_close(&db);
+    factory_free(&factory);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
