@@ -1119,6 +1119,19 @@ void channel_set_remote_htlc_basepoint(channel_t *ch,
 
 /* ---- HTLC operations ---- */
 
+/* Remove settled (fulfilled/failed) HTLCs from the array to free slots. */
+static void channel_compact_htlcs(channel_t *ch) {
+    size_t write = 0;
+    for (size_t read = 0; read < ch->n_htlcs; read++) {
+        if (ch->htlcs[read].state == HTLC_STATE_ACTIVE) {
+            if (write != read)
+                ch->htlcs[write] = ch->htlcs[read];
+            write++;
+        }
+    }
+    ch->n_htlcs = write;
+}
+
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
@@ -1212,6 +1225,7 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
     h->state = HTLC_STATE_FULFILLED;
     ch->commitment_number++;
     channel_generate_local_pcs(ch, ch->commitment_number + 1);
+    channel_compact_htlcs(ch);
     return 1;
 }
 
@@ -1243,6 +1257,7 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
     h->state = HTLC_STATE_FAILED;
     ch->commitment_number++;
     channel_generate_local_pcs(ch, ch->commitment_number + 1);
+    channel_compact_htlcs(ch);
     return 1;
 }
 

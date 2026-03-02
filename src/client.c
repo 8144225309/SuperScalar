@@ -870,14 +870,25 @@ int client_run_with_channels(secp256k1_context *ctx,
     unsigned char funding_txid[32];
     wire_json_get_hex(msg.json, "funding_txid", funding_txid, 32);
     reverse_bytes(funding_txid, 32);
-    uint32_t funding_vout = (uint32_t)cJSON_GetObjectItem(msg.json, "funding_vout")->valuedouble;
-    uint64_t funding_amount = (uint64_t)cJSON_GetObjectItem(msg.json, "funding_amount")->valuedouble;
+    cJSON *fv_item = cJSON_GetObjectItem(msg.json, "funding_vout");
+    cJSON *fa_item = cJSON_GetObjectItem(msg.json, "funding_amount");
+    cJSON *sb_item = cJSON_GetObjectItem(msg.json, "step_blocks");
+    cJSON *spl_item = cJSON_GetObjectItem(msg.json, "states_per_layer");
+    cJSON *ct_item = cJSON_GetObjectItem(msg.json, "cltv_timeout");
+    cJSON *fpt_item = cJSON_GetObjectItem(msg.json, "fee_per_tx");
+    if (!fv_item || !fa_item || !sb_item || !spl_item || !ct_item || !fpt_item) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE missing required fields\n");
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+    uint32_t funding_vout = (uint32_t)fv_item->valuedouble;
+    uint64_t funding_amount = (uint64_t)fa_item->valuedouble;
     unsigned char funding_spk[34];
     size_t spk_len = (size_t)wire_json_get_hex(msg.json, "funding_spk", funding_spk, 34);
-    uint16_t step_blocks = (uint16_t)cJSON_GetObjectItem(msg.json, "step_blocks")->valuedouble;
-    uint32_t states_per_layer = (uint32_t)cJSON_GetObjectItem(msg.json, "states_per_layer")->valuedouble;
-    uint32_t cltv_timeout = (uint32_t)cJSON_GetObjectItem(msg.json, "cltv_timeout")->valuedouble;
-    uint64_t fee_per_tx = (uint64_t)cJSON_GetObjectItem(msg.json, "fee_per_tx")->valuedouble;
+    uint16_t step_blocks = (uint16_t)sb_item->valuedouble;
+    uint32_t states_per_layer = (uint32_t)spl_item->valuedouble;
+    uint32_t cltv_timeout = (uint32_t)ct_item->valuedouble;
+    uint64_t fee_per_tx = (uint64_t)fpt_item->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
     int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
 
