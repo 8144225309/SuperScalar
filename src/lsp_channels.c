@@ -2168,6 +2168,7 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         } else {
             printf("CLI: usage: %s <from> <to> <amount>\n", cmd_name);
         }
+        fflush(stdout);
     } else if (strcmp(line, "status") == 0) {
         printf("--- Factory Status ---\n");
         printf("  Channels: %zu\n", mgr->n_channels);
@@ -2224,6 +2225,7 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         if (mgr->jit_enabled && mgr->n_jit_channels > 0)
             printf("  JIT channels: %zu\n", mgr->n_jit_channels);
         printf("---\n");
+        fflush(stdout);
     } else if (strcmp(line, "rotate") == 0) {
         printf("CLI: forcing rotation\n");
         fflush(stdout);
