@@ -331,9 +331,32 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
-            /* Free response_tx and remove entry */
+            /* Also broadcast burn tx to destroy L-stock */
+            if (e->burn_tx && e->burn_tx_len > 0) {
+                char *burn_hex = (char *)malloc(e->burn_tx_len * 2 + 1);
+                if (burn_hex) {
+                    hex_encode(e->burn_tx, e->burn_tx_len, burn_hex);
+                    char burn_txid[65];
+                    if (regtest_send_raw_tx(wt->rt, burn_hex, burn_txid)) {
+                        printf("  L-stock burn tx broadcast: %s\n", burn_txid);
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, burn_txid,
+                                                  "factory_burn", burn_hex, "ok");
+                    } else {
+                        fprintf(stderr, "  L-stock burn tx broadcast failed\n");
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "factory_burn", burn_hex, "failed");
+                    }
+                    free(burn_hex);
+                }
+            }
+
+            /* Free response_tx, burn_tx and remove entry */
             free(e->response_tx);
             e->response_tx = NULL;
+            free(e->burn_tx);
+            e->burn_tx = NULL;
             wt->entries[i] = wt->entries[wt->n_entries - 1];
             wt->n_entries--;
             continue;
@@ -675,7 +698,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
 int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *old_txid32,
                                     const unsigned char *response_tx,
-                                    size_t response_tx_len) {
+                                    size_t response_tx_len,
+                                    const unsigned char *burn_tx,
+                                    size_t burn_tx_len) {
     if (!wt || !old_txid32 || !response_tx || response_tx_len == 0) return 0;
     if (wt->n_entries >= WATCHTOWER_MAX_WATCH) return 0;
 
@@ -694,15 +719,26 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
     memcpy(e->response_tx, response_tx, response_tx_len);
     e->response_tx_len = response_tx_len;
 
+    /* Store pre-built burn tx for L-stock destruction (optional) */
+    if (burn_tx && burn_tx_len > 0) {
+        e->burn_tx = (unsigned char *)malloc(burn_tx_len);
+        if (e->burn_tx) {
+            memcpy(e->burn_tx, burn_tx, burn_tx_len);
+            e->burn_tx_len = burn_tx_len;
+        }
+    }
+
     return 1;
 }
 
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
-        if (wt->entries[i].type == WATCH_FACTORY_NODE && wt->entries[i].response_tx) {
+        if (wt->entries[i].type == WATCH_FACTORY_NODE) {
             free(wt->entries[i].response_tx);
             wt->entries[i].response_tx = NULL;
+            free(wt->entries[i].burn_tx);
+            wt->entries[i].burn_tx = NULL;
         }
     }
 }
@@ -712,9 +748,9 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
 
     for (size_t i = 0; i < wt->n_entries; ) {
         if (wt->entries[i].channel_id == channel_id) {
-            if (wt->entries[i].type == WATCH_FACTORY_NODE &&
-                wt->entries[i].response_tx) {
+            if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);
+                free(wt->entries[i].burn_tx);
             }
             wt->entries[i] = wt->entries[wt->n_entries - 1];
             wt->n_entries--;

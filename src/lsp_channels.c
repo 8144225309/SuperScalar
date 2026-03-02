@@ -1088,6 +1088,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Compute hash from preimage */
     sha256(preimage, 32, payment_hash);
 
+    /* Deactivate fulfilled invoice in memory (enables slot reuse) */
+    for (size_t iv = 0; iv < mgr->n_invoices; iv++) {
+        if (mgr->invoices[iv].active &&
+            memcmp(mgr->invoices[iv].payment_hash, payment_hash, 32) == 0) {
+            mgr->invoices[iv].active = 0;
+            break;
+        }
+    }
     /* Deactivate fulfilled invoice in persistence */
     if (mgr->persist)
         persist_deactivate_invoice((persist_t *)mgr->persist, payment_hash);

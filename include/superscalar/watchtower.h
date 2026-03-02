@@ -42,6 +42,8 @@ typedef struct {
     /* WATCH_FACTORY_NODE fields */
     unsigned char *response_tx;   /* heap-allocated latest state tx to broadcast */
     size_t response_tx_len;
+    unsigned char *burn_tx;       /* heap-allocated pre-built L-stock burn tx */
+    size_t burn_tx_len;
 } watchtower_entry_t;
 
 #define WATCHTOWER_MAX_CHANNELS 8
@@ -108,12 +110,15 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);
 
-/* Watch for an old factory state node. If detected, broadcast latest state tx.
-   response_tx is copied (caller can free theirs). */
+/* Watch for an old factory state node. If detected, broadcast latest state tx
+   and burn tx (if provided). Both are copied (caller can free theirs).
+   burn_tx may be NULL (no L-stock burn). */
 int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *old_txid32,
                                     const unsigned char *response_tx,
-                                    size_t response_tx_len);
+                                    size_t response_tx_len,
+                                    const unsigned char *burn_tx,
+                                    size_t burn_tx_len);
 
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
