@@ -1553,6 +1553,23 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
         cJSON_Delete(msg.json);
 
+        /* Verify commitment_number matches (Gap 2B: client-side) */
+        if (ack_commit != channel.commitment_number) {
+            fprintf(stderr, "Client %u: commitment mismatch after reconnect "
+                    "(ack=%llu, local=%llu) — reloading from DB\n",
+                    my_index, (unsigned long long)ack_commit,
+                    (unsigned long long)channel.commitment_number);
+            if (db) {
+                uint64_t db_l, db_r, db_cn;
+                if (persist_load_channel_state(db, my_index - 1,
+                        &db_l, &db_r, &db_cn)) {
+                    channel.local_amount = db_l;
+                    channel.remote_amount = db_r;
+                    channel.commitment_number = db_cn;
+                }
+            }
+        }
+
         printf("Client %u: reconnected (channel=%u, commit=%llu)\n",
                my_index, ack_channel_id,
                (unsigned long long)ack_commit);
