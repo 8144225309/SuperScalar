@@ -3266,5 +3266,33 @@ int test_close_outputs_wallet_spk(void) {
         sum += outputs[i].amount_sats;
     TEST_ASSERT_EQ(sum, f.funding_amount_sats, "balance invariant holds");
 
+    /* Test 3: Per-client close addresses (NULL SPK + populated entry close_spk) */
+    unsigned char client0_spk[34], client1_spk[34];
+    memset(client0_spk, 0xC0, 34);
+    memset(client1_spk, 0xC1, 34);
+    memcpy(mgr.entries[0].close_spk, client0_spk, 34);
+    mgr.entries[0].close_spk_len = 34;
+    memcpy(mgr.entries[1].close_spk, client1_spk, 34);
+    mgr.entries[1].close_spk_len = 34;
+
+    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+                                           NULL, 0);
+    TEST_ASSERT_EQ(n, 3, "per-client: 3 outputs");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, expected_factory_spk, 34) == 0,
+                "per-client: LSP uses factory SPK");
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, client0_spk, 34) == 0,
+                "per-client: client 0 uses own close address");
+    TEST_ASSERT(memcmp(outputs[2].script_pubkey, client1_spk, 34) == 0,
+                "per-client: client 1 uses own close address");
+
+    /* Test 4: Override still takes precedence even with per-client addresses set */
+    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+                                           wallet_spk, 34);
+    TEST_ASSERT_EQ(n, 3, "override+per-client: 3 outputs");
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, wallet_spk, 34) == 0,
+                "override+per-client: client 0 uses override (rotation mode)");
+    TEST_ASSERT(memcmp(outputs[2].script_pubkey, wallet_spk, 34) == 0,
+                "override+per-client: client 1 uses override (rotation mode)");
+
     return 1;
 }

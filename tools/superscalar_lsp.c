@@ -3006,10 +3006,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (channels_active) {
+        /* Pass NULL for close_spk so client outputs use per-client P2TR
+           addresses derived from their factory pubkeys. LSP output uses
+           factory funding SPK (or wallet SPK if needed). */
         n_close_outputs = lsp_channels_build_close_outputs(&mgr, &lsp.factory,
                                                             close_outputs, 500,
-                                                            final_close_spk,
-                                                            final_close_spk_len);
+                                                            NULL, 0);
         if (n_close_outputs == 0) {
             fprintf(stderr, "LSP: build close outputs failed\n");
             lsp_cleanup(&lsp);
