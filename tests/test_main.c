@@ -525,6 +525,10 @@ extern int test_on_close_includes_unsettled(void);
 extern int test_close_outputs_wallet_spk(void);
 extern int test_fee_accumulation_and_settlement(void);
 
+/* Distributed Epoch Reset tests */
+extern int test_epoch_reset_propose_round_field(void);
+extern int test_distributed_epoch_reset_ceremony(void);
+
 /* Property-Based Tests (Roadmap Item #5) */
 extern int test_prop_hex_roundtrip(void);
 extern int test_prop_shachain_uniqueness(void);
@@ -1020,6 +1024,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_on_close_includes_unsettled);
     RUN_TEST(test_close_outputs_wallet_spk);
     RUN_TEST(test_fee_accumulation_and_settlement);
+
+    printf("\n=== Distributed Epoch Reset ===\n");
+    RUN_TEST(test_epoch_reset_propose_round_field);
+    RUN_TEST(test_distributed_epoch_reset_ceremony);
 
     printf("\n=== Property-Based Tests ===\n");
     RUN_TEST(test_prop_hex_roundtrip);

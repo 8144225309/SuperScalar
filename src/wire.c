@@ -1474,23 +1474,28 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
 
 /* --- Epoch Reset messages (Phase 5) --- */
 
-cJSON *wire_build_epoch_reset_propose(const wire_bundle_entry_t *nonce_entries,
+cJSON *wire_build_epoch_reset_propose(int round,
+                                       const wire_bundle_entry_t *nonce_entries,
                                        size_t n_entries) {
     cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "round", round);
     cJSON *arr = cJSON_AddArrayToObject(j, "nonces");
     for (size_t i = 0; i < n_entries; i++) {
         cJSON *e = cJSON_CreateObject();
         cJSON_AddNumberToObject(e, "node_idx", nonce_entries[i].node_idx);
-        cJSON_AddNumberToObject(e, "signer_slot", nonce_entries[i].signer_slot);
-        wire_json_add_hex(e, "data", nonce_entries[i].data, 66);
+        cJSON_AddNumberToObject(e, "slot", nonce_entries[i].signer_slot);
+        wire_json_add_hex(e, "data", nonce_entries[i].data, nonce_entries[i].data_len);
         cJSON_AddItemToArray(arr, e);
     }
     return j;
 }
 
-int wire_parse_epoch_reset_propose(const cJSON *json,
+int wire_parse_epoch_reset_propose(const cJSON *json, int *round_out,
                                     wire_bundle_entry_t *entries_out,
                                     size_t max_entries, size_t *n_entries_out) {
+    cJSON *r = cJSON_GetObjectItem(json, "round");
+    if (!r || !cJSON_IsNumber(r)) return 0;
+    *round_out = (int)cJSON_GetNumberValue(r);
     cJSON *arr = cJSON_GetObjectItem(json, "nonces");
     if (!arr || !cJSON_IsArray(arr)) return 0;
     *n_entries_out = wire_parse_bundle(arr, entries_out, max_entries, 66);
@@ -1506,7 +1511,7 @@ cJSON *wire_build_epoch_reset_psig(const wire_bundle_entry_t *nonce_entries,
     for (size_t i = 0; i < n_nonces; i++) {
         cJSON *e = cJSON_CreateObject();
         cJSON_AddNumberToObject(e, "node_idx", nonce_entries[i].node_idx);
-        cJSON_AddNumberToObject(e, "signer_slot", nonce_entries[i].signer_slot);
+        cJSON_AddNumberToObject(e, "slot", nonce_entries[i].signer_slot);
         wire_json_add_hex(e, "data", nonce_entries[i].data, 66);
         cJSON_AddItemToArray(narr, e);
     }
@@ -1514,7 +1519,7 @@ cJSON *wire_build_epoch_reset_psig(const wire_bundle_entry_t *nonce_entries,
     for (size_t i = 0; i < n_psigs; i++) {
         cJSON *e = cJSON_CreateObject();
         cJSON_AddNumberToObject(e, "node_idx", psig_entries[i].node_idx);
-        cJSON_AddNumberToObject(e, "signer_slot", psig_entries[i].signer_slot);
+        cJSON_AddNumberToObject(e, "slot", psig_entries[i].signer_slot);
         wire_json_add_hex(e, "data", psig_entries[i].data, 32);
         cJSON_AddItemToArray(parr, e);
     }

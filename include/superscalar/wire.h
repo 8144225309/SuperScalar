@@ -499,10 +499,11 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
 /* --- Epoch Reset message builders (Phase 5) --- */
 
 /* LSP -> All: EPOCH_RESET_PROPOSE with LSP's nonce bundle for all nodes. */
-cJSON *wire_build_epoch_reset_propose(const wire_bundle_entry_t *nonce_entries,
+cJSON *wire_build_epoch_reset_propose(int round,
+                                       const wire_bundle_entry_t *nonce_entries,
                                        size_t n_entries);
 
-int wire_parse_epoch_reset_propose(const cJSON *json,
+int wire_parse_epoch_reset_propose(const cJSON *json, int *round_out,
                                     wire_bundle_entry_t *entries_out,
                                     size_t max_entries, size_t *n_entries_out);
 
