@@ -3296,3 +3296,309 @@ int test_close_outputs_wallet_spk(void) {
 
     return 1;
 }
+
+/* --- Distributed Epoch Reset Tests --- */
+
+int test_epoch_reset_propose_round_field(void) {
+    /* Test that wire_build/parse_epoch_reset_propose round-trips the round field */
+    wire_bundle_entry_t entries[2];
+    memset(entries, 0, sizeof(entries));
+    entries[0].node_idx = 0;
+    entries[0].signer_slot = 0;
+    memset(entries[0].data, 0xAA, 66);
+    entries[0].data_len = 66;
+    entries[1].node_idx = 1;
+    entries[1].signer_slot = 2;
+    memset(entries[1].data, 0xBB, 66);
+    entries[1].data_len = 66;
+
+    /* Round 1 */
+    cJSON *j1 = wire_build_epoch_reset_propose(1, entries, 2);
+    TEST_ASSERT(j1 != NULL, "build propose round 1");
+    int round = 0;
+    size_t n_out = 0;
+    wire_bundle_entry_t out[2];
+    TEST_ASSERT(wire_parse_epoch_reset_propose(j1, &round, out, 2, &n_out),
+                "parse propose round 1");
+    TEST_ASSERT_EQ((uint32_t)round, 1, "round == 1");
+    TEST_ASSERT_EQ((uint32_t)n_out, 2, "2 entries");
+    TEST_ASSERT_EQ(out[0].node_idx, 0, "entry 0 node_idx");
+    TEST_ASSERT_EQ(out[0].signer_slot, 0, "entry 0 signer_slot");
+    TEST_ASSERT_EQ(out[1].node_idx, 1, "entry 1 node_idx");
+    TEST_ASSERT_EQ(out[1].signer_slot, 2, "entry 1 signer_slot");
+    TEST_ASSERT(memcmp(out[0].data, entries[0].data, 66) == 0, "entry 0 data");
+    TEST_ASSERT(memcmp(out[1].data, entries[1].data, 66) == 0, "entry 1 data");
+    cJSON_Delete(j1);
+
+    /* Round 2 */
+    cJSON *j2 = wire_build_epoch_reset_propose(2, entries, 2);
+    TEST_ASSERT(j2 != NULL, "build propose round 2");
+    TEST_ASSERT(wire_parse_epoch_reset_propose(j2, &round, out, 2, &n_out),
+                "parse propose round 2");
+    TEST_ASSERT_EQ((uint32_t)round, 2, "round == 2");
+    TEST_ASSERT_EQ((uint32_t)n_out, 2, "2 entries round 2");
+    cJSON_Delete(j2);
+
+    return 1;
+}
+
+int test_distributed_epoch_reset_ceremony(void) {
+    /* Simulate the full 2-round distributed epoch reset ceremony:
+       LSP (participant 0) + 4 clients (participants 1..4), 5 total.
+       Uses wire encoding/decoding for the PROPOSE/PSIG messages. */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx create");
+
+    /* Create 5 keypairs */
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32];
+        memset(sk, 0, 32);
+        sk[31] = (unsigned char)(i + 1);
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair create");
+    }
+
+    /* Build a 5-participant factory */
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]), "get pubkey");
+
+    /* Dummy funding SPK — factory_build_tree computes the real one internally */
+    unsigned char fund_spk[34];
+    memset(fund_spk, 0, 34);
+    fund_spk[0] = 0x51;  /* OP_1 */
+    fund_spk[1] = 0x20;  /* PUSH32 */
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 4, 4);
+    factory_set_funding(&f, fake_txid, 0, 500000, fund_spk, 34);
+    f.fee_per_tx = 330;
+    f.cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "initial sign");
+
+    /* Advance a few times to consume DW states */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_advance(&f), "advance");
+
+    /* --- Begin distributed epoch reset --- */
+
+    /* Step 1: Reset epoch + rebuild unsigned txs */
+    TEST_ASSERT(factory_reset_epoch_unsigned(&f), "reset epoch unsigned");
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed == 0, "node unsigned after reset");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch back to 0");
+
+    /* Step 2: Init sessions */
+    TEST_ASSERT(factory_sessions_init(&f), "sessions init");
+
+    /* Step 3: LSP generates nonces (participant 0) */
+    secp256k1_musig_secnonce lsp_secnonces[FACTORY_MAX_NODES];
+    memset(lsp_secnonces, 0, sizeof(lsp_secnonces));
+    wire_bundle_entry_t lsp_nonce_entries[FACTORY_MAX_NODES];
+    size_t n_lsp_nonces = 0;
+
+    unsigned char lsp_sk[32];
+    TEST_ASSERT(secp256k1_keypair_sec(ctx, lsp_sk, &kps[0]), "lsp seckey");
+
+    for (size_t n = 0; n < f.n_nodes; n++) {
+        int slot = factory_find_signer_slot(&f, n, 0);
+        if (slot < 0) continue;
+        secp256k1_musig_pubnonce pn;
+        TEST_ASSERT(musig_generate_nonce(ctx, &lsp_secnonces[n], &pn,
+                                           lsp_sk, &pks[0],
+                                           &f.nodes[n].keyagg.cache),
+                    "lsp nonce gen");
+        TEST_ASSERT(factory_session_set_nonce(&f, n, (size_t)slot, &pn),
+                    "lsp set nonce");
+        lsp_nonce_entries[n_lsp_nonces].node_idx = (uint32_t)n;
+        lsp_nonce_entries[n_lsp_nonces].signer_slot = (uint32_t)slot;
+        musig_pubnonce_serialize(ctx, lsp_nonce_entries[n_lsp_nonces].data, &pn);
+        lsp_nonce_entries[n_lsp_nonces].data_len = 66;
+        n_lsp_nonces++;
+    }
+
+    /* Accumulate ALL nonces for round 2 */
+    wire_bundle_entry_t all_nonces[FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS];
+    size_t n_all_nonces = 0;
+    memcpy(all_nonces, lsp_nonce_entries, n_lsp_nonces * sizeof(wire_bundle_entry_t));
+    n_all_nonces = n_lsp_nonces;
+
+    /* Step 4: ROUND 1 — for each client, encode/decode PROPOSE + PSIG */
+    secp256k1_musig_secnonce client_secnonces[4][FACTORY_MAX_NODES];
+    memset(client_secnonces, 0, sizeof(client_secnonces));
+
+    for (uint32_t c = 1; c <= 4; c++) {
+        /* Encode Round 1 PROPOSE */
+        cJSON *propose = wire_build_epoch_reset_propose(1, lsp_nonce_entries,
+                                                          n_lsp_nonces);
+        TEST_ASSERT(propose != NULL, "build propose r1");
+
+        /* Client parses PROPOSE */
+        int round;
+        wire_bundle_entry_t recv_entries[FACTORY_MAX_NODES];
+        size_t n_recv = 0;
+        TEST_ASSERT(wire_parse_epoch_reset_propose(propose, &round,
+                                                     recv_entries,
+                                                     FACTORY_MAX_NODES, &n_recv),
+                    "client parse propose r1");
+        TEST_ASSERT_EQ((uint32_t)round, 1, "round 1");
+        cJSON_Delete(propose);
+
+        /* Client sets LSP's nonces (already set on factory, but simulating
+           the client's own factory copy) */
+
+        /* Client generates nonces for nodes it signs */
+        unsigned char csk[32];
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, csk, &kps[c]), "client seckey");
+
+        wire_bundle_entry_t my_nonces[FACTORY_MAX_NODES];
+        size_t n_my = 0;
+
+        for (size_t n = 0; n < f.n_nodes; n++) {
+            int slot = factory_find_signer_slot(&f, n, c);
+            if (slot < 0) continue;
+            secp256k1_musig_pubnonce pn;
+            TEST_ASSERT(musig_generate_nonce(ctx, &client_secnonces[c - 1][n],
+                                               &pn, csk, &pks[c],
+                                               &f.nodes[n].keyagg.cache),
+                        "client nonce gen");
+            TEST_ASSERT(factory_session_set_nonce(&f, n, (size_t)slot, &pn),
+                        "client set nonce");
+            my_nonces[n_my].node_idx = (uint32_t)n;
+            my_nonces[n_my].signer_slot = (uint32_t)slot;
+            musig_pubnonce_serialize(ctx, my_nonces[n_my].data, &pn);
+            my_nonces[n_my].data_len = 66;
+            n_my++;
+        }
+        memset(csk, 0, 32);
+
+        /* Client sends EPOCH_RESET_PSIG (nonces only, empty psigs) */
+        cJSON *psig_msg = wire_build_epoch_reset_psig(my_nonces, n_my, NULL, 0);
+        TEST_ASSERT(psig_msg != NULL, "build psig r1");
+
+        /* LSP parses client's nonces */
+        wire_bundle_entry_t parsed_nonces[FACTORY_MAX_NODES];
+        size_t n_parsed_nonces = 0;
+        wire_bundle_entry_t parsed_psigs[1];
+        size_t n_parsed_psigs = 0;
+        TEST_ASSERT(wire_parse_epoch_reset_psig(psig_msg,
+                                                  parsed_nonces, FACTORY_MAX_NODES,
+                                                  &n_parsed_nonces,
+                                                  parsed_psigs, 1,
+                                                  &n_parsed_psigs),
+                    "lsp parse psig r1");
+        TEST_ASSERT_EQ((uint32_t)n_parsed_psigs, 0, "no psigs in round 1");
+        cJSON_Delete(psig_msg);
+
+        /* Accumulate for round 2 */
+        for (size_t i = 0; i < n_parsed_nonces; i++) {
+            all_nonces[n_all_nonces] = parsed_nonces[i];
+            n_all_nonces++;
+        }
+    }
+
+    /* Step 5: Finalize sessions (all nonces collected) */
+    TEST_ASSERT(factory_sessions_finalize(&f), "sessions finalize");
+
+    /* Step 6: LSP creates partial sigs */
+    secp256k1_keypair lsp_kp;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &lsp_kp, lsp_sk), "lsp kp");
+    memset(lsp_sk, 0, 32);
+
+    for (size_t n = 0; n < f.n_nodes; n++) {
+        int slot = factory_find_signer_slot(&f, n, 0);
+        if (slot < 0) continue;
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &lsp_secnonces[n],
+                                               &lsp_kp, &f.nodes[n].signing_session),
+                    "lsp psig");
+        TEST_ASSERT(factory_session_set_partial_sig(&f, n, (size_t)slot, &psig),
+                    "lsp set psig");
+    }
+
+    /* Step 7: ROUND 2 — send ALL nonces, collect client psigs */
+    for (uint32_t c = 1; c <= 4; c++) {
+        /* Encode Round 2 PROPOSE */
+        cJSON *propose2 = wire_build_epoch_reset_propose(2, all_nonces,
+                                                           n_all_nonces);
+        TEST_ASSERT(propose2 != NULL, "build propose r2");
+
+        /* Client parses Round 2 */
+        int round2;
+        wire_bundle_entry_t recv2[FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS];
+        size_t n_recv2 = 0;
+        TEST_ASSERT(wire_parse_epoch_reset_propose(propose2, &round2,
+                                                     recv2,
+                                                     FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS,
+                                                     &n_recv2),
+                    "client parse propose r2");
+        TEST_ASSERT_EQ((uint32_t)round2, 2, "round 2");
+        cJSON_Delete(propose2);
+
+        /* Client creates partial sigs */
+        unsigned char csk2[32];
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, csk2, &kps[c]), "client seckey r2");
+        secp256k1_keypair ckp;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &ckp, csk2), "client kp");
+        memset(csk2, 0, 32);
+
+        wire_bundle_entry_t my_psigs[FACTORY_MAX_NODES];
+        size_t n_my_psigs = 0;
+
+        for (size_t n = 0; n < f.n_nodes; n++) {
+            int slot = factory_find_signer_slot(&f, n, c);
+            if (slot < 0) continue;
+
+            /* Client would finalize per-node here. Since we share the factory
+               in this test, sessions are already finalized. Just create psigs. */
+            secp256k1_musig_partial_sig ps;
+            TEST_ASSERT(musig_create_partial_sig(ctx, &ps,
+                            &client_secnonces[c - 1][n], &ckp,
+                            &f.nodes[n].signing_session),
+                        "client psig r2");
+            TEST_ASSERT(factory_session_set_partial_sig(&f, n, (size_t)slot, &ps),
+                        "client set psig r2");
+
+            my_psigs[n_my_psigs].node_idx = (uint32_t)n;
+            my_psigs[n_my_psigs].signer_slot = (uint32_t)slot;
+            musig_partial_sig_serialize(ctx, my_psigs[n_my_psigs].data, &ps);
+            my_psigs[n_my_psigs].data_len = 32;
+            n_my_psigs++;
+        }
+
+        /* Encode client's PSIG response */
+        cJSON *psig2 = wire_build_epoch_reset_psig(NULL, 0, my_psigs, n_my_psigs);
+        TEST_ASSERT(psig2 != NULL, "build psig r2");
+
+        /* LSP parses client's psigs */
+        wire_bundle_entry_t dummy_nonces[1];
+        size_t n_dummy = 0;
+        wire_bundle_entry_t parsed_psigs2[FACTORY_MAX_NODES];
+        size_t n_pp2 = 0;
+        TEST_ASSERT(wire_parse_epoch_reset_psig(psig2,
+                                                  dummy_nonces, 1, &n_dummy,
+                                                  parsed_psigs2, FACTORY_MAX_NODES,
+                                                  &n_pp2),
+                    "lsp parse psig r2");
+        TEST_ASSERT_EQ((uint32_t)n_dummy, 0, "no nonces in round 2");
+        TEST_ASSERT(n_pp2 > 0, "got psigs in round 2");
+        cJSON_Delete(psig2);
+    }
+
+    /* Step 8: Aggregate */
+    TEST_ASSERT(factory_sessions_complete(&f), "sessions complete");
+
+    /* Verify all nodes signed */
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed == 1,
+                    "node signed after distributed epoch reset");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
