@@ -39,9 +39,10 @@ int tapscript_build_csv_delay(
 /* Compute TapLeaf hash for a populated leaf */
 void tapscript_compute_leaf_hash(tapscript_leaf_t *leaf);
 
-/* Compute merkle root from leaves (single leaf: root = leaf_hash) */
-void tapscript_merkle_root(unsigned char *root_out32,
-                           const tapscript_leaf_t *leaves, size_t n_leaves);
+/* Compute merkle root from leaves (single leaf: root = leaf_hash).
+   Returns 1 on success, 0 on error (e.g., n_leaves == 0). */
+int tapscript_merkle_root(unsigned char *root_out32,
+                          const tapscript_leaf_t *leaves, size_t n_leaves);
 
 /* Tweak internal key with merkle root -> output key */
 int tapscript_tweak_pubkey(

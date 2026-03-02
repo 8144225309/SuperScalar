@@ -13,10 +13,21 @@ int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
                                     const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat) {
-    if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) return 0;
     if (dest_client >= mgr->n_channels) return 0;
 
-    invoice_entry_t *inv = &mgr->invoices[mgr->n_invoices++];
+    /* Reuse an inactive slot first */
+    invoice_entry_t *inv = NULL;
+    for (size_t i = 0; i < mgr->n_invoices; i++) {
+        if (!mgr->invoices[i].active) {
+            inv = &mgr->invoices[i];
+            break;
+        }
+    }
+    /* Fall back to appending if no inactive slot */
+    if (!inv) {
+        if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) return 0;
+        inv = &mgr->invoices[mgr->n_invoices++];
+    }
     memcpy(inv->payment_hash, payment_hash32, 32);
     memcpy(inv->preimage, preimage32, 32);
     inv->dest_client = dest_client;
@@ -46,8 +57,18 @@ int lsp_channels_lookup_invoice(lsp_channel_mgr_t *mgr,
 void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id) {
-    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) return;
-    htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
+    /* Reuse an inactive slot first */
+    htlc_origin_t *origin = NULL;
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        if (!mgr->htlc_origins[i].active) {
+            origin = &mgr->htlc_origins[i];
+            break;
+        }
+    }
+    if (!origin) {
+        if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) return;
+        origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
+    }
     memcpy(origin->payment_hash, payment_hash32, 32);
     origin->bridge_htlc_id = bridge_htlc_id;
     origin->cltv_expiry = 0;
@@ -164,12 +185,16 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Track bridge origin for back-propagation (with cltv for timeout) */
         lsp_channels_track_bridge_origin(mgr, payment_hash, htlc_id);
-        /* Store cltv_expiry and dest info for timeout cleanup */
-        if (mgr->n_htlc_origins > 0) {
-            htlc_origin_t *org = &mgr->htlc_origins[mgr->n_htlc_origins - 1];
-            org->cltv_expiry = cltv_expiry;
-            org->sender_idx = dest_idx;
-            org->sender_htlc_id = dest_htlc_id;
+        /* Store cltv_expiry and dest info for timeout cleanup.
+           Look up by payment_hash since slot reuse may place it anywhere. */
+        for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
+            htlc_origin_t *org = &mgr->htlc_origins[oi];
+            if (org->active && memcmp(org->payment_hash, payment_hash, 32) == 0) {
+                org->cltv_expiry = cltv_expiry;
+                org->sender_idx = dest_idx;
+                org->sender_htlc_id = dest_htlc_id;
+                break;
+            }
         }
 
         /* Forward ADD_HTLC to destination client */

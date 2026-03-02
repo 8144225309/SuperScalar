@@ -262,7 +262,7 @@ int test_factory_node_watch(void) {
     unsigned char response[64];
     memset(response, 0xDD, 64);
 
-    int ok = watchtower_watch_factory_node(&wt, 2, old_txid, response, 64);
+    int ok = watchtower_watch_factory_node(&wt, 2, old_txid, response, 64, NULL, 0);
     TEST_ASSERT(ok == 1, "watchtower_watch_factory_node should succeed");
     TEST_ASSERT(wt.n_entries == 1, "should have 1 entry");
     TEST_ASSERT(wt.entries[0].type == WATCH_FACTORY_NODE,
@@ -302,7 +302,7 @@ int test_factory_and_commitment_entries(void) {
     memset(factory_txid, 0xCC, 32);
     unsigned char response[32];
     memset(response, 0xEE, 32);
-    watchtower_watch_factory_node(&wt, 1, factory_txid, response, 32);
+    watchtower_watch_factory_node(&wt, 1, factory_txid, response, 32, NULL, 0);
     TEST_ASSERT(wt.n_entries == 2, "should have 2 entries");
     TEST_ASSERT(wt.entries[1].type == WATCH_FACTORY_NODE,
                 "second entry should be WATCH_FACTORY_NODE");

@@ -36,6 +36,13 @@ static size_t encode_scriptnum(unsigned char *out, uint32_t val) {
     return 1 + n;
 }
 
+/* NOTE: The hashlock script validates preimage knowledge but cannot enforce
+   that the spending tx sends funds to OP_RETURN — Bitcoin Script cannot
+   inspect outputs. The burn-to-OP_RETURN behavior is enforced by
+   factory_build_burn_tx() which constructs the spending tx. A miner with
+   the preimage could theoretically redirect funds, but the preimage is only
+   exposed during breach response (narrow window). Consensus-enforced burn
+   would require covenant opcodes (e.g., OP_CTV). */
 void tapscript_build_hashlock(tapscript_leaf_t *leaf,
                                const unsigned char *hash32) {
     size_t pos = 0;
@@ -133,17 +140,18 @@ void tapscript_compute_leaf_hash(tapscript_leaf_t *leaf) {
     free(data);
 }
 
-void tapscript_merkle_root(unsigned char *root_out32,
-                           const tapscript_leaf_t *leaves, size_t n_leaves) {
+int tapscript_merkle_root(unsigned char *root_out32,
+                          const tapscript_leaf_t *leaves, size_t n_leaves) {
+    if (n_leaves == 0) return 0;
+
     if (n_leaves == 1) {
         memcpy(root_out32, leaves[0].leaf_hash, 32);
-        return;
+        return 1;
     }
 
-    /* For 2 leaves: TapBranch = tagged_hash("TapBranch", sorted(left, right)) */
     if (n_leaves == 2) {
         unsigned char branch_data[64];
-        /* Lexicographic sort */
+        /* Lexicographic sort (BIP-341) */
         if (memcmp(leaves[0].leaf_hash, leaves[1].leaf_hash, 32) <= 0) {
             memcpy(branch_data, leaves[0].leaf_hash, 32);
             memcpy(branch_data + 32, leaves[1].leaf_hash, 32);
@@ -152,11 +160,26 @@ void tapscript_merkle_root(unsigned char *root_out32,
             memcpy(branch_data + 32, leaves[0].leaf_hash, 32);
         }
         sha256_tagged("TapBranch", branch_data, 64, root_out32);
-        return;
+        return 1;
     }
 
-    /* For now, only 1 or 2 leaves supported */
-    memset(root_out32, 0, 32);
+    /* N > 2: balanced binary tree (BIP-341 compliant).
+       Split in half, recurse, then hash the two sub-roots as a TapBranch. */
+    size_t mid = n_leaves / 2;
+    unsigned char left_root[32], right_root[32];
+    if (!tapscript_merkle_root(left_root, leaves, mid)) return 0;
+    if (!tapscript_merkle_root(right_root, leaves + mid, n_leaves - mid)) return 0;
+
+    unsigned char branch_data[64];
+    if (memcmp(left_root, right_root, 32) <= 0) {
+        memcpy(branch_data, left_root, 32);
+        memcpy(branch_data + 32, right_root, 32);
+    } else {
+        memcpy(branch_data, right_root, 32);
+        memcpy(branch_data + 32, left_root, 32);
+    }
+    sha256_tagged("TapBranch", branch_data, 64, root_out32);
+    return 1;
 }
 
 int tapscript_tweak_pubkey(
