@@ -91,7 +91,7 @@ static void usage(const char *prog) {
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
+        "  --arity N|N,N,...   Leaf arity: 1 or 2 (default 2). Comma-separated for per-level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
@@ -459,6 +459,8 @@ int main(int argc, char *argv[]) {
     int no_jit = 0;
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
+    uint8_t level_arities[FACTORY_MAX_LEVELS];
+    size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
     int force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
@@ -555,8 +557,25 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc)
-            leaf_arity = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc) {
+            const char *arity_str = argv[++i];
+            /* Comma-separated: --arity 1,1,2,2  or single: --arity 2 */
+            if (strchr(arity_str, ',')) {
+                char buf[128];
+                strncpy(buf, arity_str, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *tok = strtok(buf, ",");
+                while (tok && n_level_arity < FACTORY_MAX_LEVELS) {
+                    int v = atoi(tok);
+                    if (v != 1 && v != 2) { fprintf(stderr, "Error: each arity must be 1 or 2\n"); return 1; }
+                    level_arities[n_level_arity++] = (uint8_t)v;
+                    tok = strtok(NULL, ",");
+                }
+                leaf_arity = (int)level_arities[n_level_arity - 1];
+            } else {
+                leaf_arity = atoi(arity_str);
+            }
+        }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
@@ -1471,8 +1490,10 @@ int main(int argc, char *argv[]) {
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (leaf_arity == 1)
-        lsp.factory.leaf_arity = FACTORY_ARITY_1;
+    if (n_level_arity > 0)
+        factory_set_level_arity(&lsp.factory, level_arities, n_level_arity);
+    else if (leaf_arity == 1)
+        factory_set_arity(&lsp.factory, FACTORY_ARITY_1);
     lsp.factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp.factory.economic_mode = (economic_mode_t)economic_mode_arg;
 

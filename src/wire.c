@@ -556,6 +556,12 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     cJSON_AddNumberToObject(j, "cltv_timeout", f->cltv_timeout);
     cJSON_AddNumberToObject(j, "fee_per_tx", (double)f->fee_per_tx);
     cJSON_AddNumberToObject(j, "leaf_arity", (double)f->leaf_arity);
+    if (f->n_level_arity > 0) {
+        cJSON *la = cJSON_CreateArray();
+        for (size_t i = 0; i < f->n_level_arity; i++)
+            cJSON_AddItemToArray(la, cJSON_CreateNumber(f->level_arity[i]));
+        cJSON_AddItemToObject(j, "level_arity", la);
+    }
     cJSON_AddNumberToObject(j, "placement_mode", (double)f->placement_mode);
     cJSON_AddNumberToObject(j, "economic_mode", (double)f->economic_mode);
 

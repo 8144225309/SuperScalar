@@ -455,9 +455,79 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
     f->leaf_arity = arity;
+    f->n_level_arity = 0;  /* clear variable arity */
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
     int n_leaves = compute_leaf_count(nc, arity);
     int n_layers = compute_tree_depth(nc, arity) + 1;
+    f->n_leaf_nodes = n_leaves;
+    dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
+    for (int i = 0; i < n_leaves; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+    f->per_leaf_enabled = 0;
+}
+
+/* Return the arity at a given tree depth. If variable arity is set,
+   look up level_arity[depth]; if depth >= n_level_arity, use the last entry.
+   If variable arity is not set, use uniform leaf_arity. */
+static int arity_at_depth(const factory_t *f, int depth) {
+    if (f->n_level_arity == 0)
+        return (int)f->leaf_arity;
+    if (depth < (int)f->n_level_arity)
+        return (int)f->level_arity[depth];
+    return (int)f->level_arity[f->n_level_arity - 1];
+}
+
+/* Simulate the variable-arity tree to compute leaf count and max depth.
+   Returns leaf count via *leaves_out and max depth via *depth_out. */
+static void simulate_tree(const factory_t *f, size_t n_clients,
+                           int *depth_out, int *leaves_out) {
+    /* Recursive simulation via stack */
+    int leaves = 0;
+    int max_depth = 0;
+    struct { size_t nc; int depth; } stack[128];
+    int sp = 0;
+    stack[sp++] = (typeof(stack[0])){n_clients, 0};
+    while (sp > 0) {
+        size_t nc = stack[sp - 1].nc;
+        int d = stack[sp - 1].depth;
+        sp--;
+        if (nc == 0) continue;
+        if (d > max_depth) max_depth = d;
+        int a = arity_at_depth(f, d);
+        int is_leaf = (a == 1) ? (nc <= 1) : (nc <= 2);
+        if (is_leaf) {
+            leaves++;
+        } else {
+            size_t left_n, right_n;
+            if (a == 1) {
+                left_n = nc / 2;
+                right_n = nc - left_n;
+            } else {
+                size_t total_leaves_est = (nc + 1) / 2;
+                size_t left_leaves = total_leaves_est / 2;
+                left_n = left_leaves * 2;
+                if (left_n > nc) left_n = nc;
+                right_n = nc - left_n;
+            }
+            stack[sp++] = (typeof(stack[0])){left_n, d + 1};
+            stack[sp++] = (typeof(stack[0])){right_n, d + 1};
+        }
+    }
+    *depth_out = max_depth;
+    *leaves_out = leaves;
+}
+
+void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
+    if (n > FACTORY_MAX_LEVELS) n = FACTORY_MAX_LEVELS;
+    memcpy(f->level_arity, arities, n);
+    f->n_level_arity = n;
+    /* Set leaf_arity to the last entry for backward-compat code paths */
+    f->leaf_arity = (factory_arity_t)arities[n - 1];
+
+    size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
+    int depth, n_leaves;
+    simulate_tree(f, nc, &depth, &n_leaves);
+    int n_layers = depth + 1;
     f->n_leaf_nodes = n_leaves;
     dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
     for (int i = 0; i < n_leaves; i++)
@@ -636,9 +706,10 @@ static int build_subtree(
     f->nodes[ko_idx].outputs[0].script_pubkey_len = 34;
     f->nodes[ko_idx].input_amount = input_amount;
 
-    /* Determine if this is a leaf */
+    /* Determine if this is a leaf (using per-level arity) */
+    int cur_arity = arity_at_depth(f, depth);
     int is_leaf;
-    if (f->leaf_arity == FACTORY_ARITY_1)
+    if (cur_arity == 1)
         is_leaf = (n_clients <= 1);
     else
         is_leaf = (n_clients <= 2);
@@ -666,15 +737,14 @@ static int build_subtree(
     } else {
         /* Internal node: split clients in half, recurse */
         size_t left_n, right_n;
-        if (f->leaf_arity == FACTORY_ARITY_1) {
+        if (cur_arity == 1) {
             left_n = n_clients / 2;
             right_n = n_clients - left_n;
         } else {
-            /* Arity-2: split in pairs. Left gets floor(n/2) clients rounded
-               to even, right gets the rest. Actually: split into two groups
-               that will each become subtrees. Each leaf holds 2 clients,
+            /* Arity-2 at this level: split in pairs. Each leaf holds 2 clients,
                so split to balance leaf count. */
-            size_t left_leaves = compute_leaf_count(n_clients, f->leaf_arity) / 2;
+            size_t total_leaves_est = (n_clients + 1) / 2;
+            size_t left_leaves = total_leaves_est / 2;
             left_n = left_leaves * 2;
             if (left_n > n_clients) left_n = n_clients;
             right_n = n_clients - left_n;
@@ -746,11 +816,16 @@ int factory_build_tree(factory_t *f) {
         f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
     }
 
-    /* Compute tree metrics */
-    int tree_depth = compute_tree_depth(n_clients, f->leaf_arity);
-    int n_leaves = compute_leaf_count(n_clients, f->leaf_arity);
+    /* Compute tree metrics (variable arity uses simulation) */
+    int tree_depth, n_leaves;
+    if (f->n_level_arity > 0) {
+        simulate_tree(f, n_clients, &tree_depth, &n_leaves);
+    } else {
+        tree_depth = compute_tree_depth(n_clients, f->leaf_arity);
+        n_leaves = compute_leaf_count(n_clients, f->leaf_arity);
+    }
     int n_dw_layers = tree_depth + 1;
-    int total_nodes_ub = compute_total_nodes_upper_bound(n_clients, f->leaf_arity);
+    int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
     if (total_nodes_ub > FACTORY_MAX_NODES) return 0;
     if (n_leaves > FACTORY_MAX_LEAVES) return 0;
