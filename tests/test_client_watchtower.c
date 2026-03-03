@@ -140,6 +140,8 @@ int test_bidirectional_revocation(void) {
     TEST_ASSERT(memcmp(verify_lsp, lsp_old_secret, 32) == 0,
                 "stored LSP secret should match");
 
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -195,6 +197,8 @@ int test_client_watch_revoked_commitment(void) {
     TEST_ASSERT(wt.entries[entries_before].commit_num == old_cn,
                 "entry commit_num should match old_cn");
 
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -402,6 +406,8 @@ int test_htlc_penalty_watch(void) {
     TEST_ASSERT(entry->htlc_outputs[0].cltv_expiry == 500,
                 "HTLC cltv_expiry should be 500");
 
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }

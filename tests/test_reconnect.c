@@ -119,6 +119,9 @@ int test_reconnect_pubkey_match(void) {
     /* Set up lsp_t with known pubkeys */
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp.clients_cap = LSP_MAX_CLIENTS;
     lsp.ctx = ctx;
     lsp.lsp_pubkey = lsp_pk;
     lsp.n_clients = 4;
@@ -231,6 +234,8 @@ int test_reconnect_pubkey_match(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     factory_free(&factory);
     secp256k1_context_destroy(ctx);
     return 1;
@@ -317,6 +322,7 @@ int test_reconnect_nonce_reexchange(void) {
     TEST_ASSERT(musig_nonce_pool_next(&ch.local_nonce_pool, &sn, &pn),
                 "consume from re-init pool");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -391,6 +397,7 @@ int test_client_persist_reload(void) {
     TEST_ASSERT_EQ(remote_amount, 14000, "remote_amount mismatch");
     TEST_ASSERT_EQ(commitment_number, 7, "commitment_number mismatch");
 
+    channel_cleanup(&ch);
     persist_close(&db);
     factory_free(&factory);
     factory_free(&loaded_factory);
@@ -484,6 +491,7 @@ int test_preimage_fulfills_htlc(void) {
     TEST_ASSERT(memcmp(wrong_hash, payment_hash, 32) != 0,
                 "wrong preimage should not match payment_hash");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -691,6 +699,7 @@ int test_watchtower_watch_and_check(void) {
     watchtower_remove_channel(&wt, 0);
     TEST_ASSERT_EQ(wt.n_entries, 0, "0 entries after remove");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1211,6 +1220,7 @@ int test_dust_limit_reject(void) {
     TEST_ASSERT(ok == 1, "HTLC at dust limit accepted");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1235,6 +1245,7 @@ int test_reserve_enforcement(void) {
     TEST_ASSERT(ok == 1, "HTLC respecting reserve accepted");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1293,6 +1304,7 @@ int test_watchtower_wired(void) {
     TEST_ASSERT_EQ(wt.n_entries, 1, "watchtower has 1 entry");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1348,6 +1360,7 @@ int test_htlc_timeout_auto_fail(void) {
     TEST_ASSERT_EQ(ch.local_amount, 50000, "local balance restored");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1375,6 +1388,7 @@ int test_htlc_fulfill_before_timeout(void) {
     TEST_ASSERT_EQ(failed, 0, "no timeout for fulfilled HTLC");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1396,6 +1410,7 @@ int test_htlc_no_timeout_zero_expiry(void) {
     TEST_ASSERT_EQ(failed, 0, "zero expiry HTLCs not auto-failed");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1666,6 +1681,7 @@ int test_breach_detect_old_commitment(void) {
                         "watchtower entry matches rebuilt txid");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2279,6 +2295,9 @@ static int setup_reconnect_env(secp256k1_context **ctx_out,
     factory_build_tree(factory);
 
     memset(lsp, 0, sizeof(*lsp));
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
     lsp->ctx = ctx;
     lsp->lsp_pubkey = *lsp_pk;
     lsp->n_clients = 4;
@@ -2407,6 +2426,8 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
 
     persist_close(&db);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     factory_free(&factory);
     secp256k1_context_destroy(ctx);
     return 1;
@@ -2474,6 +2495,8 @@ int test_reconnect_commitment_mismatch_reject(void) {
     TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
 
     persist_close(&db);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     factory_free(&factory);
     secp256k1_context_destroy(ctx);
     return 1;
@@ -2618,6 +2641,8 @@ int test_reconnect_htlc_replay(void) {
                 "child process failed");
 
     persist_close(&db);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     factory_free(&factory);
     secp256k1_context_destroy(ctx);
     return 1;

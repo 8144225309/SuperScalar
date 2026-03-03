@@ -857,6 +857,8 @@ int test_regtest_breach_penalty_cpfp(void) {
     secp256k1_context_destroy(ctx);
 
     printf("  Breach → Penalty → CPFP flow complete!\n");
+    channel_cleanup(&client_ch);
+    channel_cleanup(&lsp_ch);
     return 1;
 }
 
@@ -1032,6 +1034,8 @@ int test_regtest_watchtower_mempool_detection(void) {
     tx_buf_free(&commit0_signed);
     watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&client_ch);
+    channel_cleanup(&lsp_ch);
     return 1;
 }
 
@@ -1207,6 +1211,8 @@ int test_regtest_watchtower_late_detection(void) {
     tx_buf_free(&commit0_signed);
     watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&client_ch);
+    channel_cleanup(&lsp_ch);
     return 1;
 }
 

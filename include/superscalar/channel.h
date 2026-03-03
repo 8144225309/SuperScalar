@@ -86,9 +86,10 @@ typedef struct {
     uint64_t local_amount;
     uint64_t remote_amount;
 
-    /* HTLCs */
-    htlc_t htlcs[MAX_HTLCS];
+    /* HTLCs (dynamically allocated, capacity htlcs_cap) */
+    htlc_t *htlcs;
     size_t n_htlcs;
+    size_t htlcs_cap;
     uint64_t next_htlc_id;
 
     /* Config */
@@ -144,6 +145,8 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                   const unsigned char *funding_spk, size_t funding_spk_len,
                   uint64_t local_amount, uint64_t remote_amount,
                   uint32_t to_self_delay);
+
+void channel_cleanup(channel_t *ch);
 
 int channel_set_local_basepoints(channel_t *ch,
                                    const unsigned char *payment_secret32,

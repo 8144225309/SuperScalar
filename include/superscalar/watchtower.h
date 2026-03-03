@@ -36,8 +36,9 @@ typedef struct {
     size_t to_local_spk_len;
 
     /* HTLC outputs on the breached commitment (for penalty sweep) */
-    watchtower_htlc_t htlc_outputs[MAX_HTLCS];
+    watchtower_htlc_t *htlc_outputs;
     size_t n_htlc_outputs;
+    size_t htlc_outputs_cap;
 
     /* WATCH_FACTORY_NODE fields */
     unsigned char *response_tx;   /* heap-allocated latest state tx to broadcast */
@@ -61,10 +62,12 @@ typedef struct {
 } watchtower_pending_t;
 
 typedef struct {
-    watchtower_entry_t entries[WATCHTOWER_MAX_WATCH];
+    watchtower_entry_t *entries;
     size_t n_entries;
-    channel_t *channels[WATCHTOWER_MAX_CHANNELS];  /* pointers to channels by index */
+    size_t entries_cap;
+    channel_t **channels;  /* pointers to channels by index */
     size_t n_channels;
+    size_t channels_cap;
     regtest_t *rt;                 /* for chain queries + broadcasting */
     fee_estimator_t *fee;
     persist_t *db;
@@ -74,8 +77,9 @@ typedef struct {
     size_t anchor_spk_len;
 
     /* Pending penalty txs awaiting confirmation */
-    watchtower_pending_t pending[WATCHTOWER_MAX_PENDING];
+    watchtower_pending_t *pending;
     size_t n_pending;
+    size_t pending_cap;
 } watchtower_t;
 
 /* Initialize watchtower. Load old commitments from DB if available. */

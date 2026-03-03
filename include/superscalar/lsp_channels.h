@@ -55,16 +55,19 @@ typedef struct {
 } htlc_origin_t;
 
 typedef struct {
-    lsp_channel_entry_t entries[LSP_MAX_CLIENTS];
+    lsp_channel_entry_t *entries;
     size_t n_channels;
+    size_t entries_cap;
     secp256k1_context *ctx;
 
     /* Bridge support (Phase 14) */
     int bridge_fd;               /* -1 if no bridge connected */
-    invoice_entry_t invoices[MAX_INVOICE_REGISTRY];
+    invoice_entry_t *invoices;
     size_t n_invoices;
-    htlc_origin_t htlc_origins[MAX_HTLC_ORIGINS];
+    size_t invoices_cap;
+    htlc_origin_t *htlc_origins;
     size_t n_htlc_origins;
+    size_t htlc_origins_cap;
     uint64_t next_request_id;    /* for outbound pay correlation */
 
     /* Watchtower (Phase 18) */
@@ -103,6 +106,7 @@ typedef struct {
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
     size_t n_jit_channels;
+    size_t jit_channels_cap;
     int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 
@@ -146,6 +150,8 @@ typedef struct {
    Must be called after factory creation succeeds.
    lsp_seckey32: LSP's secret key (used to derive channel basepoints).
    Returns 1 on success. */
+void lsp_channels_cleanup(lsp_channel_mgr_t *mgr);
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,

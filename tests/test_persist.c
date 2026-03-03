@@ -99,6 +99,7 @@ int test_persist_channel_round_trip(void) {
     TEST_ASSERT_EQ(remote, 60000, "updated remote");
     TEST_ASSERT_EQ(commit, 4, "updated commit");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
     return 1;
@@ -391,6 +392,7 @@ int test_persist_multi_channel(void) {
                       50000 - i * 1000, 50000 + i * 1000, 144);
         ch.commitment_number = i;
         TEST_ASSERT(persist_save_channel(&db, &ch, 0, i), "save channel");
+        channel_cleanup(&ch);
     }
 
     /* Load each and verify */
@@ -715,6 +717,7 @@ int test_persist_basepoints(void) {
     TEST_ASSERT(!persist_load_basepoints(&db, 99, loaded_local, loaded_remote),
                 "non-existent channel fails");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
     return 1;
@@ -962,6 +965,7 @@ int test_persist_file_reopen_round_trip(void) {
         ch.commitment_number = 7;
 
         TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "save channel");
+        channel_cleanup(&ch);
 
         /* Also save a counter and an HTLC */
         TEST_ASSERT(persist_save_counter(&db, "test_counter", 42), "save counter");

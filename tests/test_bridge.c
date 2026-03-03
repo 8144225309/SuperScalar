@@ -207,6 +207,8 @@ int test_bridge_invoice_registry(void) {
     memset(&mgr, 0, sizeof(mgr));
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
 
     unsigned char hash1[32], hash2[32], hash3[32];
     unsigned char pre1[32], pre2[32];
@@ -234,6 +236,7 @@ int test_bridge_invoice_registry(void) {
     /* Look up non-existing */
     TEST_ASSERT(!lsp_channels_lookup_invoice(&mgr, hash3, &dest), "lookup unknown");
 
+    free(mgr.invoices);
     return 1;
 }
 
@@ -350,6 +353,8 @@ int test_bridge_unknown_hash(void) {
     memset(&mgr, 0, sizeof(mgr));
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
 
     unsigned char hash[32];
     memset(hash, 0x99, 32);
@@ -372,6 +377,7 @@ int test_bridge_unknown_hash(void) {
     TEST_ASSERT_EQ(hid, 5, "fail htlc_id");
     cJSON_Delete(fail);
 
+    free(mgr.invoices);
     return 1;
 }
 
@@ -488,6 +494,10 @@ int test_lsp_inbound_via_bridge(void) {
     memset(&mgr, 0, sizeof(mgr));
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
 
     /* Create a payment hash from a known preimage */
     unsigned char preimage[32];
@@ -560,6 +570,8 @@ int test_lsp_inbound_via_bridge(void) {
     cJSON_Delete(msg.json);
     close(sv[0]);
     close(sv[1]);
+    free(mgr.invoices);
+    free(mgr.htlc_origins);
     return 1;
 }
 
@@ -607,6 +619,10 @@ int test_bridge_htlc_timeout(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.n_channels = 4;
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
 
     /* Create a socketpair to act as bridge_fd */
     int sv[2];
@@ -645,6 +661,8 @@ int test_bridge_htlc_timeout(void) {
 
     close(sv[0]);
     close(sv[1]);
+    free(mgr.entries);
+    free(mgr.htlc_origins);
     return 1;
 }
 
@@ -2258,6 +2276,12 @@ int test_bridge_keysend_inbound(void) {
     mgr.ctx = ctx;
     mgr.n_channels = 4;
     mgr.bridge_fd = sv[0];
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
     for (size_t i = 0; i < 4; i++) {
         mgr.entries[i].channel.local_amount = 50000;
         mgr.entries[i].channel.remote_amount = 50000;
@@ -2306,6 +2330,9 @@ int test_bridge_keysend_inbound(void) {
     cJSON_Delete(recv_msg.json);
     close(sv[0]);
     close(sv[1]);
+    free(mgr.entries);
+    free(mgr.invoices);
+    free(mgr.htlc_origins);
     secp256k1_context_destroy(ctx);
     return 1;
 }

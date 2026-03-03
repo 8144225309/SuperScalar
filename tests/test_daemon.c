@@ -84,6 +84,9 @@ int test_daemon_event_loop(void) {
     /* Set up minimal lsp_t with one client fd */
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp.clients_cap = LSP_MAX_CLIENTS;
     lsp.client_fds[0] = sv[0];
     lsp.client_fds[1] = sv[0];
     lsp.client_fds[2] = sv[0];
@@ -93,6 +96,8 @@ int test_daemon_event_loop(void) {
     /* Set up minimal channel manager */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
     mgr.ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -107,6 +112,9 @@ int test_daemon_event_loop(void) {
 
     pthread_join(tid, NULL);
     secp256k1_context_destroy(mgr.ctx);
+    free(mgr.entries);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     close(sv[0]);
     close(sv[1]);
     return 1;
@@ -212,6 +220,7 @@ int test_client_daemon_autofulfill(void) {
     waitpid(pid, &status, 0);
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }

@@ -264,6 +264,7 @@ int test_channel_commitment_tx(void) {
 
     tx_buf_free(&unsigned_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -340,6 +341,7 @@ int test_channel_sign_commitment(void) {
     tx_buf_free(&unsigned_tx);
     tx_buf_free(&signed_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -393,6 +395,7 @@ int test_channel_update(void) {
     tx_buf_free(&tx0);
     tx_buf_free(&tx1);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -485,6 +488,8 @@ int test_channel_revocation(void) {
                 "serialize revocation pubkey");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&local_ch);
+    channel_cleanup(&remote_ch);
     return 1;
 }
 
@@ -653,6 +658,8 @@ int test_channel_penalty_tx(void) {
     tx_buf_free(&local_signed);
     tx_buf_free(&penalty_tx);
     tx_buf_free(&penalty_unsigned);
+    channel_cleanup(&local_ch);
+    channel_cleanup(&remote_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1356,6 +1363,7 @@ int test_htlc_add_fulfill(void) {
                 "wrong preimage rejected");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1405,6 +1413,7 @@ int test_htlc_add_fail(void) {
     TEST_ASSERT(!channel_fail_htlc(&ch, htlc_id), "double fail rejected");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1481,6 +1490,7 @@ int test_htlc_commitment_tx(void) {
     tx_buf_free(&tx0);
     tx_buf_free(&tx1);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1581,6 +1591,8 @@ int test_htlc_success_spend(void) {
     tx_buf_free(&commit_tx);
     tx_buf_free(&success_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
+    channel_cleanup(&ch2);
     return 1;
 }
 
@@ -1655,6 +1667,7 @@ int test_htlc_timeout_spend(void) {
     tx_buf_free(&commit_tx);
     tx_buf_free(&timeout_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -1814,6 +1827,8 @@ int test_htlc_penalty(void) {
     tx_buf_free(&penalty_tx);
     tx_buf_free(&penalty_unsigned);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&local_ch);
+    channel_cleanup(&remote_ch);
     return 1;
 }
 
@@ -2034,6 +2049,7 @@ int test_regtest_htlc_success(void) {
     tx_buf_free(&commit_signed);
     tx_buf_free(&success_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2260,6 +2276,7 @@ int test_regtest_htlc_timeout(void) {
     tx_buf_free(&commit_signed);
     tx_buf_free(&timeout_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2355,6 +2372,7 @@ int test_channel_cooperative_close(void) {
 
     tx_buf_free(&close_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2563,6 +2581,7 @@ int test_regtest_channel_coop_close(void) {
     tx_buf_free(&close_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2623,6 +2642,7 @@ int test_commitment_number_overflow(void) {
                 "fail at limit must be rejected");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2674,6 +2694,7 @@ int test_htlc_double_fulfill_rejected(void) {
     TEST_ASSERT_EQ(ch.remote_amount, remote_after, "remote unchanged");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2725,6 +2746,7 @@ int test_htlc_fail_after_fulfill_rejected(void) {
     TEST_ASSERT_EQ(ch.remote_amount, remote_after, "remote unchanged");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2775,6 +2797,7 @@ int test_htlc_fulfill_after_fail_rejected(void) {
     TEST_ASSERT_EQ(ch.remote_amount, remote_after, "remote unchanged");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2825,6 +2848,7 @@ int test_htlc_max_count_enforcement(void) {
                 "HTLC beyond MAX_HTLCS rejected");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2865,6 +2889,7 @@ int test_htlc_dust_amount_rejected(void) {
                 "exactly-dust-limit HTLC accepted");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -2907,6 +2932,7 @@ int test_htlc_reserve_enforcement(void) {
     /* Let's use a larger balance to test reserve properly */
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -3228,6 +3254,8 @@ int test_regtest_channel_penalty(void) {
     tx_buf_free(&penalty_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&cheater_ch);
+    channel_cleanup(&honest_ch);
     return 1;
 }
 
@@ -3297,6 +3325,8 @@ int test_random_basepoints(void) {
     TEST_ASSERT_MEM_EQ(vser, cser, 33, "pay secret matches pubkey");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch1);
+    channel_cleanup(&ch2);
     return 1;
 }
 
@@ -3575,6 +3605,7 @@ int test_regtest_multi_htlc_unilateral(void) {
     tx_buf_free(&success_tx);
     tx_buf_free(&timeout_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -3905,6 +3936,8 @@ int test_regtest_penalty_with_htlcs(void) {
     tx_buf_free(&htlc_penalty_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&cheater_ch);
+    channel_cleanup(&honest_ch);
     return 1;
 }
 
@@ -4176,6 +4209,7 @@ int test_regtest_htlc_timeout_race(void) {
     tx_buf_free(&success_tx);
     tx_buf_free(&timeout_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -4220,6 +4254,7 @@ int test_channel_near_exhaustion(void) {
     TEST_ASSERT(!channel_near_exhaustion(NULL), "NULL channel not exhausted");
 
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -4446,5 +4481,6 @@ int test_regtest_htlc_wrong_preimage_rejected(void) {
     tx_buf_free(&bad_success_tx);
     tx_buf_free(&good_success_tx);
     secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
     return 1;
 }

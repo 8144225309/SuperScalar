@@ -620,6 +620,10 @@ int test_prop_keysend_preimage_verify(void) {
     mgr.ctx = ctx;
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
     for (size_t i = 0; i < 4; i++) {
         mgr.entries[i].channel.local_amount = 100000;
         mgr.entries[i].channel.remote_amount = 100000;
@@ -634,7 +638,7 @@ int test_prop_keysend_preimage_verify(void) {
         /* Valid: register with correct hash should succeed */
         int ok = lsp_channels_register_invoice(&mgr, correct_hash, preimage,
                     trial % 4, 50000);
-        TEST_ASSERT(ok || mgr.n_invoices >= MAX_INVOICE_REGISTRY,
+        TEST_ASSERT(ok || mgr.n_invoices >= mgr.invoices_cap,
                     "valid register failed (not full)");
 
         /* Verify lookup succeeds (only when register succeeded) */
@@ -667,6 +671,8 @@ int test_prop_keysend_preimage_verify(void) {
         TEST_ASSERT(ok, "boundary amount register failed");
     }
 
+    free(mgr.entries);
+    free(mgr.invoices);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -677,10 +683,14 @@ int test_prop_rebalance_conservation(void) {
     /* We can't run the full auto_rebalance (needs real fds + wire protocol),
        but we CAN verify the threshold detection and balance math. */
     unsigned int seed = 77;
+    lsp_channel_entry_t *entries_buf = calloc(4, sizeof(lsp_channel_entry_t));
 
     for (int trial = 0; trial < 100; trial++) {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
+        mgr.entries = entries_buf;
+        mgr.entries_cap = 4;
+        memset(entries_buf, 0, 4 * sizeof(lsp_channel_entry_t));
         mgr.n_channels = 4;
         mgr.rebalance_threshold_pct = 60 + (rand_r(&seed) % 35); /* 60-94% */
 
@@ -720,6 +730,7 @@ int test_prop_rebalance_conservation(void) {
             TEST_ASSERT(pct == 0, "0% local");
         }
     }
+    free(entries_buf);
     return 1;
 }
 
@@ -734,10 +745,12 @@ int test_prop_invoice_registry_exhaustion(void) {
     mgr.ctx = ctx;
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
 
-    /* Fill all 64 slots */
+    /* Fill all slots */
     unsigned int seed = 55;
-    for (int i = 0; i < MAX_INVOICE_REGISTRY; i++) {
+    for (int i = 0; i < (int)mgr.invoices_cap; i++) {
         unsigned char pre[32], hash[32];
         for (int j = 0; j < 32; j++)
             pre[j] = (unsigned char)(rand_r(&seed) & 0xff);
@@ -745,7 +758,7 @@ int test_prop_invoice_registry_exhaustion(void) {
         int ok = lsp_channels_register_invoice(&mgr, hash, pre, i % 4, 50000);
         TEST_ASSERT(ok, "register should succeed");
     }
-    TEST_ASSERT_EQ((long)mgr.n_invoices, (long)MAX_INVOICE_REGISTRY,
+    TEST_ASSERT_EQ((long)mgr.n_invoices, (long)mgr.invoices_cap,
                    "should be full");
 
     /* 65th should fail */
@@ -766,9 +779,9 @@ int test_prop_invoice_registry_exhaustion(void) {
         TEST_ASSERT(!ok, "keysend register when full should fail");
     }
 
-    /* Verify all 64 original invoices are still lookupable */
+    /* Verify all original invoices are still lookupable */
     seed = 55;  /* reset seed to regenerate same hashes */
-    for (int i = 0; i < MAX_INVOICE_REGISTRY; i++) {
+    for (int i = 0; i < (int)mgr.invoices_cap; i++) {
         unsigned char pre[32], hash[32];
         for (int j = 0; j < 32; j++)
             pre[j] = (unsigned char)(rand_r(&seed) & 0xff);
@@ -788,6 +801,7 @@ int test_prop_invoice_registry_exhaustion(void) {
         TEST_ASSERT(!ok, "deactivated invoice should not be found");
     }
 
+    free(mgr.invoices);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -803,6 +817,7 @@ int test_prop_keysend_bridge_e2e(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     unsigned int seed = 33;
+    invoice_entry_t *invoices_buf = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
     for (int trial = 0; trial < 50; trial++) {
         unsigned char preimage[32], hash[32];
         for (int i = 0; i < 32; i++)
@@ -847,6 +862,9 @@ int test_prop_keysend_bridge_e2e(void) {
         /* Register invoice and verify lookup */
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
+        mgr.invoices = invoices_buf;
+        mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+        memset(invoices_buf, 0, MAX_INVOICE_REGISTRY * sizeof(invoice_entry_t));
         mgr.ctx = ctx;
         mgr.n_channels = 4;
         TEST_ASSERT(lsp_channels_register_invoice(&mgr, p_hash, p_pre,
@@ -876,6 +894,7 @@ int test_prop_keysend_bridge_e2e(void) {
         cJSON_Delete(ful_recv.json);
     }
 
+    free(invoices_buf);
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);
@@ -893,9 +912,18 @@ int test_prop_cli_command_fuzzing(void) {
     mgr.ctx = ctx;
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
 
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp.clients_cap = LSP_MAX_CLIENTS;
     for (size_t i = 0; i < LSP_MAX_CLIENTS; i++)
         lsp.client_fds[i] = -1;
 
@@ -944,6 +972,11 @@ int test_prop_cli_command_fuzzing(void) {
     lsp_channels_handle_cli_line(&mgr, &lsp,
         "pay \x00hidden", &shutdown_flag);
 
+    free(mgr.entries);
+    free(mgr.invoices);
+    free(mgr.htlc_origins);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -957,6 +990,8 @@ int test_prop_batch_rebalance_partial_fail(void) {
 
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
 
     /* Set up initial balances */
@@ -1014,6 +1049,7 @@ int test_prop_batch_rebalance_partial_fail(void) {
     result = lsp_channels_auto_rebalance(&mgr, NULL);
     TEST_ASSERT(result == 0, "1-channel rebalance is no-op");
 
+    free(mgr.entries);
     return 1;
 }
 
@@ -1025,10 +1061,14 @@ int test_prop_keysend_invoice_collision(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     unsigned int seed = 66;
+    invoice_entry_t *invoices_buf = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
 
     for (int trial = 0; trial < 100; trial++) {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
+        mgr.invoices = invoices_buf;
+        mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+        memset(invoices_buf, 0, MAX_INVOICE_REGISTRY * sizeof(invoice_entry_t));
         mgr.ctx = ctx;
         mgr.n_channels = 4;
         mgr.bridge_fd = -1;
@@ -1077,6 +1117,7 @@ int test_prop_keysend_invoice_collision(void) {
                     "lookup after both deactivated");
     }
 
+    free(invoices_buf);
     secp256k1_context_destroy(ctx);
     return 1;
 }
