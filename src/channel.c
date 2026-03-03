@@ -680,9 +680,18 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
     if (!channel_get_remote_pcp(ch, ch->commitment_number, &remote_pcp))
         return 0;
 
-    /* Create a shallow copy with local/remote swapped to represent
-       the remote party's view of their own commitment transaction. */
+    /* Create a copy with local/remote swapped to represent
+       the remote party's view of their own commitment transaction.
+       htlcs is a pointer (dynamic allocation), so we must copy the
+       array separately to avoid mutating the original channel. */
     channel_t rv = *ch;
+    htlc_t *htlc_copy = NULL;
+    if (rv.n_htlcs > 0) {
+        htlc_copy = (htlc_t *)malloc(rv.n_htlcs * sizeof(htlc_t));
+        if (!htlc_copy) return 0;
+        memcpy(htlc_copy, ch->htlcs, rv.n_htlcs * sizeof(htlc_t));
+        rv.htlcs = htlc_copy;
+    }
 
     /* Swap amounts */
     rv.local_amount = ch->remote_amount;
@@ -703,7 +712,9 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
             rv.htlcs[i].direction = HTLC_OFFERED;
     }
 
-    return channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, &remote_pcp);
+    int result = channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, &remote_pcp);
+    free(htlc_copy);
+    return result;
 }
 
 int channel_sign_commitment(const channel_t *ch,
