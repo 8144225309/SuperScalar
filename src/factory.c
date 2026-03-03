@@ -617,19 +617,6 @@ static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
     return (int)((n_clients + 1) / 2);
 }
 
-/* Compute total tree nodes: each logical node = kickoff + state pair.
-   Internal nodes = 2 * (total_logical - leaves) pairs, leaf nodes = leaves pairs.
-   total_logical = 2*n_leaves - 1 (full binary tree with padding).
-   Actually: total_nodes = 2 * (2*n_leaves - 1) for full binary,
-   but we use actual recursion count. For the general case with
-   unbalanced splits we just let build_subtree count. This is used
-   only for validation. */
-static int compute_total_nodes_upper_bound(size_t n_clients, factory_arity_t arity) {
-    int n_leaves = compute_leaf_count(n_clients, arity);
-    /* Full binary tree: 2*n_leaves - 1 logical nodes, each = kickoff+state pair */
-    return 2 * (2 * n_leaves - 1);
-}
-
 /* Recursive subtree builder.
    client_indices: array of 1-based participant indices for clients in this subtree.
    n_clients: number of clients in this subtree.
