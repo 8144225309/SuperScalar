@@ -497,6 +497,10 @@ int lsp_run_factory_creation(lsp_t *lsp,
 fail:
     lsp_abort_ceremony(lsp, "factory creation failed");
     free(all_nonce_entries);
+    /* Clean up partially-built factory: factory_build_tree may have allocated
+       tx_bufs in f->nodes that would otherwise leak (or worse, get double-freed
+       if a subsequent operation shallow-copies the factory before freeing). */
+    factory_free(&lsp->factory);
     return 0;
 }
 

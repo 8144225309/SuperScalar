@@ -52,11 +52,11 @@ int test_last_message_time_update(void) {
     TEST_ASSERT(entry.last_message_time > 0, "last_message_time should be set");
     TEST_ASSERT_EQ(entry.offline_detected, 0, "offline_detected should be 0");
 
-    /* Simulate aging */
-    entry.last_message_time -= 200;  /* 200 seconds ago */
+    /* Simulate aging (must exceed JIT_OFFLINE_TIMEOUT_SEC = 300) */
+    entry.last_message_time -= 400;  /* 400 seconds ago */
     time_t now = time(NULL);
     int is_stale = (now - entry.last_message_time >= JIT_OFFLINE_TIMEOUT_SEC);
-    TEST_ASSERT(is_stale, "should be stale after 200s");
+    TEST_ASSERT(is_stale, "should be stale after 400s");
 
     return 1;
 }
@@ -64,7 +64,7 @@ int test_last_message_time_update(void) {
 int test_offline_detection_flag(void) {
     lsp_channel_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    entry.last_message_time = time(NULL) - 200;  /* 200s ago */
+    entry.last_message_time = time(NULL) - 400;  /* 400s ago */
     entry.offline_detected = 0;
 
     /* Simulate detection logic */

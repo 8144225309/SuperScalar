@@ -1856,4 +1856,13 @@ void factory_free(factory_t *f) {
         tx_buf_free(&f->nodes[i].unsigned_tx);
         tx_buf_free(&f->nodes[i].signed_tx);
     }
+    /* Zero node count so a second factory_free is a no-op (idempotent). */
+    f->n_nodes = 0;
+}
+
+void factory_detach_txbufs(factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));
+        memset(&f->nodes[i].signed_tx, 0, sizeof(tx_buf_t));
+    }
 }

@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include "cJSON.h"
@@ -220,6 +221,64 @@ typedef struct {
     int auto_accept_jit;    /* 1 = auto-accept JIT offers */
 } daemon_cb_data_t;
 
+/* Handle a PTLC_PRESIG message inline (when received during a blocking wait
+   for another message type like COMMITMENT_SIGNED).  This prevents the rotation
+   PTLC from being silently discarded when it arrives mid-HTLC-flow. */
+static void handle_ptlc_presig_inline(int fd, wire_msg_t *msg,
+                                       secp256k1_context *ctx,
+                                       const secp256k1_keypair *keypair,
+                                       uint32_t my_index) {
+    unsigned char presig[64], turnover_msg[32];
+    int nonce_parity;
+    if (!wire_parse_ptlc_presig(msg->json, presig, &nonce_parity, turnover_msg)) {
+        fprintf(stderr, "Client %u: bad inline PTLC_PRESIG\n", my_index);
+        return;
+    }
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair))
+        return;
+    unsigned char adapted_sig[64];
+    if (!adaptor_adapt(ctx, adapted_sig, presig, my_seckey, nonce_parity)) {
+        memset(my_seckey, 0, 32);
+        return;
+    }
+    memset(my_seckey, 0, 32);
+    cJSON *reply = wire_build_ptlc_adapted_sig(adapted_sig);
+    wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply);
+    cJSON_Delete(reply);
+    printf("Client %u: handled PTLC_PRESIG inline (mid-HTLC flow)\n", my_index);
+}
+
+/* Receive a specific message type, handling PTLC_PRESIG inline if it arrives
+   instead.  Returns 1 if expected message received, 0 on timeout/error. */
+static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
+                                uint8_t expected_type,
+                                secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                uint32_t my_index) {
+    struct timeval start, now;
+    gettimeofday(&start, NULL);
+    while (1) {
+        gettimeofday(&now, NULL);
+        int elapsed = (int)(now.tv_sec - start.tv_sec);
+        int remaining = timeout_sec - elapsed;
+        if (remaining <= 0)
+            return 0;
+        if (!wire_recv_timeout(fd, msg, remaining))
+            return 0;
+        if (msg->msg_type == expected_type)
+            return 1;
+        if (msg->msg_type == MSG_PTLC_PRESIG) {
+            handle_ptlc_presig_inline(fd, msg, ctx, keypair, my_index);
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;  /* Retry for the expected message */
+        }
+        /* Unexpected non-PTLC message — return it as-is */
+        return 1;
+    }
+}
+
 /* Receive and process LSP's own revocation (bidirectional revocation).
    Call after each client_handle_commitment_signed in daemon mode.
    old_local/old_remote are the channel amounts at the OLD commitment being
@@ -227,12 +286,15 @@ typedef struct {
 static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
                                          secp256k1_context *ctx,
                                          uint64_t old_local, uint64_t old_remote,
-                                         const htlc_t *old_htlcs, size_t old_n_htlcs) {
+                                         const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                         const secp256k1_keypair *keypair,
+                                         uint32_t my_index) {
     wire_msg_t rev_msg;
-    if (!wire_recv(fd, &rev_msg))
+    if (!recv_or_handle_ptlc(fd, &rev_msg, 2, MSG_LSP_REVOKE_AND_ACK,
+                              ctx, keypair, my_index))
         return;
     if (rev_msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
-        /* Not a revocation — might be an error or unexpected msg; silently skip */
+        /* Not a revocation — unexpected msg; silently skip */
         cJSON_Delete(rev_msg.json);
         return;
     }
@@ -361,18 +423,31 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             client_handle_add_htlc(ch, &msg);
             cJSON_Delete(msg.json);
 
-            /* Wait for COMMITMENT_SIGNED */
-            if (!wire_recv(fd, &msg)) {
-                fprintf(stderr, "Client %u: recv commit failed\n", my_index);
-                return 0;
+            /* Wait for COMMITMENT_SIGNED (5s timeout), handling PTLC_PRESIG
+               inline to prevent rotation messages from being discarded */
+            if (!recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                      ctx, keypair, my_index)) {
+                fprintf(stderr, "Client %u: timeout waiting for commit after ADD\n", my_index);
+                break;
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                if (!client_handle_commitment_signed(fd, ch, ctx, &msg)) {
+                    fprintf(stderr, "Client %u: commitment_signed handling failed "
+                            "(cn=%llu, local=%llu, remote=%llu, htlcs=%zu)\n",
+                            my_index,
+                            (unsigned long long)ch->commitment_number,
+                            (unsigned long long)ch->local_amount,
+                            (unsigned long long)ch->remote_amount,
+                            ch->n_htlcs);
+                    cJSON_Delete(msg.json);
+                    break;
+                }
                 cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
                     pre_add_local, pre_add_remote,
-                    pre_add_n_htlcs > 0 ? pre_add_htlcs : NULL, pre_add_n_htlcs);
+                    pre_add_n_htlcs > 0 ? pre_add_htlcs : NULL, pre_add_n_htlcs,
+                    keypair, my_index);
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -432,14 +507,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
                     client_fulfill_payment(fd, ch, htlc_id, preimage);
 
-                    /* Handle COMMITMENT_SIGNED for the fulfill */
-                    if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    /* Handle COMMITMENT_SIGNED for the fulfill (5s timeout),
+                       handling PTLC_PRESIG inline to prevent rotation loss */
+                    if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                             ctx, keypair, my_index) &&
+                        msg.msg_type == MSG_COMMITMENT_SIGNED) {
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
                         if (msg.json) cJSON_Delete(msg.json);
                         /* Receive LSP's own revocation (bidirectional) */
                         client_recv_lsp_revocation(fd, ch, cbd, ctx,
                             pre_ful_local, pre_ful_remote,
-                            pre_ful_n_htlcs > 0 ? pre_ful_htlcs : NULL, pre_ful_n_htlcs);
+                            pre_ful_n_htlcs > 0 ? pre_ful_htlcs : NULL, pre_ful_n_htlcs,
+                            keypair, my_index);
                     } else {
                         if (msg.json) cJSON_Delete(msg.json);
                     }
@@ -461,7 +540,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                No add/fulfill preceded this, so current state = old commitment state. */
             client_recv_lsp_revocation(fd, ch, cbd, ctx,
                 ch->local_amount, ch->remote_amount,
-                ch->n_htlcs > 0 ? ch->htlcs : NULL, ch->n_htlcs);
+                ch->n_htlcs > 0 ? ch->htlcs : NULL, ch->n_htlcs,
+                keypair, my_index);
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
                 persist_update_channel_balance(cbd->db, my_index - 1,
@@ -490,14 +570,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 fprintf(stderr, "Client %u: bad FULFILL_HTLC\n", my_index);
             }
             cJSON_Delete(msg.json);
-            /* Handle follow-up COMMITMENT_SIGNED */
-            if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
+            /* Handle follow-up COMMITMENT_SIGNED (5s timeout),
+               handling PTLC_PRESIG inline to prevent rotation loss */
+            if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                     ctx, keypair, my_index) &&
+                msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 if (msg.json) cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
                     pre_ful2_local, pre_ful2_remote,
-                    pre_ful2_n_htlcs > 0 ? pre_ful2_htlcs : NULL, pre_ful2_n_htlcs);
+                    pre_ful2_n_htlcs > 0 ? pre_ful2_htlcs : NULL, pre_ful2_n_htlcs,
+                    keypair, my_index);
             } else {
                 if (msg.json) cJSON_Delete(msg.json);
             }
@@ -621,9 +705,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply);
             cJSON_Delete(reply);
 
-            /* Receive PTLC_COMPLETE acknowledgement */
+            /* Receive PTLC_COMPLETE acknowledgement (5s timeout) */
             wire_msg_t complete_msg;
-            if (wire_recv(fd, &complete_msg)) {
+            if (wire_recv_timeout(fd, &complete_msg, 5)) {
                 if (complete_msg.msg_type == MSG_PTLC_COMPLETE)
                     printf("Client %u: PTLC departure complete\n", my_index);
                 cJSON_Delete(complete_msg.json);
@@ -886,17 +970,22 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             cJSON_Delete(msg.json);
 
-            /* Re-register watchtower channel pointer after rotation */
+            /* Clear old watchtower entries (old factory is closed) and
+               re-register channel pointer for the new factory */
+            if (cbd && cbd->wt)
+                watchtower_clear_entries(cbd->wt);
             if (cbd && cbd->wt)
                 watchtower_set_channel(cbd->wt, 0, ch);
 
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
                 if (persist_begin(cbd->db)) {
+                    uint32_t rot_client_idx = my_index - 1;
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                        persist_save_channel(cbd->db, ch, 0, my_index - 1)) {
+                        persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
+                        persist_save_basepoints(cbd->db, rot_client_idx, ch)) {
                         persist_commit(cbd->db);
-                        printf("Client %u: persisted rotated factory + channel\n", my_index);
+                        printf("Client %u: persisted rotated factory + channel + basepoints\n", my_index);
                     } else {
                         fprintf(stderr, "Client %u: rotation persist failed, rolling back\n", my_index);
                         persist_rollback(cbd->db);
@@ -1272,6 +1361,10 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Line-buffered stdout so logs are visible even if process is killed */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
     /* Ignore SIGPIPE — write() to dead LSP socket returns EPIPE instead of killing us */
     signal(SIGPIPE, SIG_IGN);
 

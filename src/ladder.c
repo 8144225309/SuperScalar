@@ -116,7 +116,8 @@ ladder_factory_t *ladder_get_dying(ladder_t *lad)
 {
     for (size_t i = 0; i < lad->n_factories; i++) {
         if (lad->factories[i].cached_state == FACTORY_DYING &&
-            lad->factories[i].is_initialized)
+            lad->factories[i].is_initialized &&
+            !lad->factories[i].partial_rotation_done)
             return &lad->factories[i];
     }
     return NULL;
@@ -143,9 +144,11 @@ int ladder_record_key_turnover(ladder_t *lad, uint32_t factory_id,
     if (client_idx == 0)
         return 0;  /* Can't depart LSP */
 
-    lf->client_departed[client_idx] = 1;
     memcpy(lf->extracted_keys[client_idx], extracted_key32, 32);
-    lf->n_departed++;
+    if (!lf->client_departed[client_idx]) {
+        lf->client_departed[client_idx] = 1;
+        lf->n_departed++;
+    }
     return 1;
 }
 

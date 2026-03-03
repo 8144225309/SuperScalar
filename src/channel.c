@@ -1025,6 +1025,8 @@ int channel_verify_and_aggregate_commitment_sig(
     tx_buf_init(&unsigned_tx, 512);
     unsigned char txid[32];
     if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        fprintf(stderr, "verify_agg: build_commitment_tx failed (cn=%llu)\n",
+                (unsigned long long)ch->commitment_number);
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1033,6 +1035,7 @@ int channel_verify_and_aggregate_commitment_sig(
     if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
                                   0, ch->funding_spk, ch->funding_spk_len,
                                   ch->funding_amount, 0xFFFFFFFE)) {
+        fprintf(stderr, "verify_agg: compute_sighash failed\n");
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1042,11 +1045,18 @@ int channel_verify_and_aggregate_commitment_sig(
        We consume nonces in order, so this should be our next nonce. */
     secp256k1_musig_secnonce *my_secnonce;
     secp256k1_musig_pubnonce my_pubnonce;
-    if (!musig_nonce_pool_next(&ch->local_nonce_pool, &my_secnonce, &my_pubnonce))
+    if (!musig_nonce_pool_next(&ch->local_nonce_pool, &my_secnonce, &my_pubnonce)) {
+        fprintf(stderr, "verify_agg: nonce_pool_next failed (pool_next=%zu, count=%zu)\n",
+                ch->local_nonce_pool.next_unused, ch->local_nonce_pool.count);
         return 0;
+    }
 
     /* 3. Parse peer's pubnonce at peer_nonce_index */
-    if (peer_nonce_index >= ch->remote_nonce_count) return 0;
+    if (peer_nonce_index >= ch->remote_nonce_count) {
+        fprintf(stderr, "verify_agg: peer_nonce_index %u >= remote_nonce_count %zu\n",
+                peer_nonce_index, ch->remote_nonce_count);
+        return 0;
+    }
     secp256k1_musig_pubnonce peer_pubnonce;
     if (!musig_pubnonce_parse(ch->ctx, &peer_pubnonce,
                                ch->remote_pubnonces_ser[peer_nonce_index]))
@@ -1064,19 +1074,31 @@ int channel_verify_and_aggregate_commitment_sig(
         musig_session_set_pubnonce(&session, 1, &my_pubnonce);
     }
 
-    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL))
+    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL)) {
+        fprintf(stderr, "verify_agg: finalize_nonces failed\n");
         return 0;
+    }
 
     /* 5. Parse peer's partial sig */
     secp256k1_musig_partial_sig peer_psig;
-    if (!musig_partial_sig_parse(ch->ctx, &peer_psig, peer_partial_sig32))
+    if (!musig_partial_sig_parse(ch->ctx, &peer_psig, peer_partial_sig32)) {
+        fprintf(stderr, "verify_agg: partial_sig_parse failed\n");
         return 0;
+    }
 
     /* 6. Verify peer's partial sig */
     secp256k1_pubkey peer_pubkey = ch->remote_funding_pubkey;
     if (!musig_verify_partial_sig(ch->ctx, &peer_psig, &peer_pubnonce,
-                                    &peer_pubkey, &session))
+                                    &peer_pubkey, &session)) {
+        fprintf(stderr, "verify_agg: partial_sig_verify failed (cn=%llu, nonce_idx=%u, "
+                "signer_idx=%d, local=%llu, remote=%llu, htlcs=%zu)\n",
+                (unsigned long long)ch->commitment_number,
+                peer_nonce_index, ch->local_funding_signer_idx,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                ch->n_htlcs);
         return 0;
+    }
 
     /* 7. Create our own partial sig */
     secp256k1_musig_partial_sig my_psig;

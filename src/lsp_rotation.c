@@ -14,7 +14,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "superscalar/sha256.h"
 extern void hex_encode(const unsigned char *, size_t, char *);
@@ -54,6 +56,8 @@ void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
     uint32_t idx = factory_id % 8;
     mgr->rot_retry_count[idx] = 0;
     mgr->rot_last_attempt_block[idx] = 0;
+    /* Clear attempted mask so retry logic won't fire for this factory */
+    mgr->rot_attempted_mask &= ~(1u << (factory_id & 31));
 }
 
 /* --- Factory rotation --- */
@@ -65,10 +69,22 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
     if (!fe) return 0;
 
-    /* Find the DYING factory to rotate from */
+    /* Find the DYING (or EXPIRED) factory to rotate from.
+       Factory may skip DYING if blocks mine faster than the daemon polls. */
     ladder_factory_t *dying = ladder_get_dying(lad);
     if (!dying) {
-        fprintf(stderr, "LSP rotate: no DYING factory found\n");
+        /* Fallback: look for the first EXPIRED factory that hasn't been rotated */
+        for (size_t i = 0; i < lad->n_factories; i++) {
+            if (lad->factories[i].cached_state == FACTORY_EXPIRED &&
+                lad->factories[i].is_initialized &&
+                !lad->factories[i].partial_rotation_done) {
+                dying = &lad->factories[i];
+                break;
+            }
+        }
+    }
+    if (!dying) {
+        fprintf(stderr, "LSP rotate: no DYING/EXPIRED factory found\n");
         return 0;
     }
     uint32_t dying_id = dying->factory_id;
@@ -102,9 +118,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* --- Phase A: PTLC key turnover over wire --- */
     printf("LSP rotate: Phase A — PTLC key turnover\n");
+    size_t turnover_ok = 0, turnover_fail = 0;
     for (size_t ci = 0; ci < lsp->n_clients; ci++) {
         if (lsp->client_fds[ci] < 0) {
             printf("LSP rotate: client %zu offline, skipping turnover\n", ci);
+            turnover_fail++;
             continue;
         }
 
@@ -117,33 +135,40 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (!adaptor_create_turnover_presig(mgr->ctx, presig, &nonce_parity,
                                               turnover_msg, rot_kps, n_total,
                                               &ka_copy, NULL, &client_pk)) {
-            fprintf(stderr, "LSP rotate: presig failed client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: presig failed client %zu, skipping\n", ci);
+            turnover_fail++;
+            continue;
         }
 
         /* Send PTLC_PRESIG to client */
         cJSON *pm = wire_build_ptlc_presig(presig, nonce_parity, turnover_msg);
         if (!wire_send(lsp->client_fds[ci], MSG_PTLC_PRESIG, pm)) {
             cJSON_Delete(pm);
-            fprintf(stderr, "LSP rotate: send presig failed client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: send presig failed client %zu, skipping\n", ci);
+            wire_close(lsp->client_fds[ci]);
+            lsp->client_fds[ci] = -1;
+            turnover_fail++;
+            continue;
         }
         cJSON_Delete(pm);
 
-        /* Wait for PTLC_ADAPTED_SIG (30s timeout) */
+        /* Wait for PTLC_ADAPTED_SIG (15s timeout per client) */
         wire_msg_t resp;
-        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 30) ||
+        memset(&resp, 0, sizeof(resp));
+        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 15) ||
             resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
             if (resp.json) cJSON_Delete(resp.json);
-            fprintf(stderr, "LSP rotate: no adapted_sig from client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: no adapted_sig from client %zu, skipping\n", ci);
+            turnover_fail++;
+            continue;
         }
 
         unsigned char adapted_sig[64];
         if (!wire_parse_ptlc_adapted_sig(resp.json, adapted_sig)) {
             cJSON_Delete(resp.json);
-            fprintf(stderr, "LSP rotate: parse adapted_sig failed client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: parse adapted_sig failed client %zu, skipping\n", ci);
+            turnover_fail++;
+            continue;
         }
         cJSON_Delete(resp.json);
 
@@ -151,12 +176,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         unsigned char extracted[32];
         if (!adaptor_extract_secret(mgr->ctx, extracted, adapted_sig, presig,
                                       nonce_parity)) {
-            fprintf(stderr, "LSP rotate: extract failed client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: extract failed client %zu, skipping\n", ci);
+            turnover_fail++;
+            continue;
         }
         if (!adaptor_verify_extracted_key(mgr->ctx, extracted, &client_pk)) {
-            fprintf(stderr, "LSP rotate: verify failed client %zu\n", ci);
-            return 0;
+            fprintf(stderr, "LSP rotate: verify failed client %zu, skipping\n", ci);
+            turnover_fail++;
+            continue;
         }
 
         ladder_record_key_turnover(lad, dying_id, pidx, extracted);
@@ -169,13 +196,50 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         wire_send(lsp->client_fds[ci], MSG_PTLC_COMPLETE, cm);
         cJSON_Delete(cm);
 
+        turnover_ok++;
         printf("LSP rotate: client %zu key extracted via wire PTLC\n", ci + 1);
     }
+    printf("LSP rotate: Phase A complete — %zu/%zu clients cooperated\n",
+           turnover_ok, lsp->n_clients);
 
-    /* Check if all online clients departed (full close) or partial */
+    /* Probe client sockets: detect fds that are still positive but the
+       remote end has closed (e.g., client disconnected after MSG_ERROR from
+       a prior failed rotation).  Without this, subsequent checks would see
+       stale fds as "online" and proceed with an irreversible close TX. */
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (lsp->client_fds[i] < 0) continue;
+        char probe;
+        int rc = recv(lsp->client_fds[i], &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (rc == 0) {
+            /* EOF: remote end closed */
+            printf("LSP rotate: client %zu socket closed (stale fd), marking offline\n", i);
+            wire_close(lsp->client_fds[i]);
+            lsp->client_fds[i] = -1;
+        }
+        /* rc > 0: data waiting (client still alive)
+           rc < 0 && errno == EAGAIN/EWOULDBLOCK: no data but socket open (alive) */
+    }
+
+    /* Check if all online clients departed (full close) or partial.
+       Even if all keys are extracted, only do full close when ALL clients
+       are currently online — the close TX is irreversible, and the new
+       factory ceremony requires every participant. */
     int full_close = ladder_can_close(lad, dying_id);
     int partial = 0;
-    if (!full_close) {
+    if (full_close) {
+        size_t n_online = 0;
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            if (lsp->client_fds[i] >= 0)
+                n_online++;
+        }
+        if (n_online < lsp->n_clients) {
+            printf("LSP rotate: all keys extracted but only %zu/%zu online — "
+                   "downgrading to partial rotation\n", n_online, lsp->n_clients);
+            full_close = 0;
+            partial = 1;
+        }
+    }
+    if (!full_close && !partial) {
         partial = ladder_can_partial_close(lad, dying_id);
         if (!partial) {
             fprintf(stderr, "LSP rotate: < 2 clients departed, cannot rotate\n");
@@ -296,6 +360,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             }
         }
         printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
+        /* Mark as rotated so CLI "rotate" won't try to rotate it again */
+        dying->partial_rotation_done = 1;
     } else {
         /* Partial rotation: skip cooperative close, old factory expires naturally.
            The distribution TX (nLockTime) protects all participants. */
@@ -405,17 +471,70 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         n_coop = ladder_get_cooperative_clients(lad, dying_id,
                                                  coop, FACTORY_MAX_SIGNERS);
 
-        /* Remap to contiguous indices 0..n_coop-1 */
+        /* Remap to contiguous indices, skipping clients whose fd went stale */
+        size_t n_online = 0;
         for (size_t i = 0; i < n_coop; i++) {
-            lsp->client_fds[i] = saved_client_fds[coop[i] - 1];
-            lsp->client_pubkeys[i] = saved_client_pks[coop[i] - 1];
+            int fd = saved_client_fds[coop[i] - 1];
+            if (fd >= 0) {
+                lsp->client_fds[n_online] = fd;
+                lsp->client_pubkeys[n_online] = saved_client_pks[coop[i] - 1];
+                n_online++;
+            } else {
+                printf("LSP rotate: cooperative client %u went offline, skipping\n",
+                       coop[i]);
+            }
         }
-        lsp->n_clients = n_coop;
-        printf("LSP rotate: remapped %zu cooperative clients for new factory\n",
-               n_coop);
+        if (n_online < 2) {
+            fprintf(stderr, "LSP rotate: only %zu online clients, need >= 2\n",
+                    n_online);
+            /* Restore original client arrays */
+            memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+            memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            lsp->n_clients = (size_t)mgr->n_channels;
+            return 0;
+        }
+        lsp->n_clients = n_online;
+        printf("LSP rotate: remapped %zu/%zu cooperative clients for new factory\n",
+               n_online, n_coop);
+    } else {
+        /* Full close: verify all clients still online */
+        size_t n_online = 0;
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            if (lsp->client_fds[i] >= 0)
+                n_online++;
+        }
+        if (n_online < lsp->n_clients) {
+            printf("LSP rotate: %zu/%zu clients online for full close\n",
+                   n_online, lsp->n_clients);
+        }
     }
 
-    /* Free old factory, but preserve arity for new factory */
+    /* Verify ALL participating clients are still connected before committing
+       to new factory.  Factory creation sends FACTORY_PROPOSE to every client;
+       if any is offline the ceremony fails AFTER we've already freed the old
+       factory, leaving the daemon in a broken state. */
+    {
+        size_t online = 0;
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            if (lsp->client_fds[i] >= 0)
+                online++;
+        }
+        if (online < lsp->n_clients) {
+            fprintf(stderr, "LSP rotate: only %zu/%zu clients online before "
+                    "factory creation, aborting (factory preserved)\n",
+                    online, lsp->n_clients);
+            if (partial) {
+                memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+                memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                lsp->n_clients = (size_t)mgr->n_channels;
+            }
+            return 0;
+        }
+    }
+
+    /* Free old factory, preserve arity for new factory.
+       Ladder entries use detached copies (factory_detach_txbufs) so they
+       don't share heap data — no risk of double-free from ladder. */
     factory_arity_t saved_arity = (factory_arity_t)mgr->rot_leaf_arity;
     factory_free(&lsp->factory);
     /* Restore arity on the zeroed struct so lsp_run_factory_creation's
@@ -440,6 +559,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                                    mgr->rot_step_blocks,
                                    mgr->rot_states_per_layer, new_cltv)) {
         fprintf(stderr, "LSP rotate: new factory creation failed\n");
+        /* Factory is already freed — restore client arrays so daemon
+           can still service existing connections without crashing. */
+        if (partial) {
+            memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+            memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            lsp->n_clients = (size_t)mgr->n_channels;
+        }
         return 0;
     }
 
@@ -461,6 +587,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         ladder_factory_t *lf_new = &lad->factories[lad->n_factories];
         memset(lf_new, 0, sizeof(*lf_new));
         lf_new->factory = lsp->factory;
+        factory_detach_txbufs(&lf_new->factory);
         lf_new->factory_id = lad->next_factory_id++;
         lf_new->is_initialized = 1;
         lf_new->is_funded = 1;
@@ -538,6 +665,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     memcpy(saved_retry_count, mgr->rot_retry_count, sizeof(saved_retry_count));
     memcpy(saved_last_attempt_block, mgr->rot_last_attempt_block,
            sizeof(saved_last_attempt_block));
+    int saved_cli_enabled = mgr->cli_enabled;
+    int saved_confirm_timeout = mgr->confirm_timeout_secs;
 
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
@@ -574,6 +703,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->n_jit_channels = saved_n_jit;
     mgr->jit_enabled = saved_jit_enabled;
     mgr->jit_funding_sats = saved_jit_funding;
+    mgr->cli_enabled = saved_cli_enabled;
+    mgr->confirm_timeout_secs = saved_confirm_timeout;
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: basepoint exchange failed\n");
