@@ -199,8 +199,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         turnover_ok++;
         printf("LSP rotate: client %zu key extracted via wire PTLC\n", ci + 1);
     }
-    printf("LSP rotate: Phase A complete — %zu/%zu clients cooperated\n",
-           turnover_ok, lsp->n_clients);
+    printf("LSP rotate: Phase A complete — %zu/%zu clients cooperated (%zu failed)\n",
+           turnover_ok, lsp->n_clients, turnover_fail);
 
     /* Probe client sockets: detect fds that are still positive but the
        remote end has closed (e.g., client disconnected after MSG_ERROR from
