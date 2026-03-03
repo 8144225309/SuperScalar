@@ -2016,10 +2016,23 @@ int main(int argc, char *argv[]) {
             chX->remote_amount = init_remote;
             chX->n_htlcs = 0;
 
+            /* Ensure remote PCP for commitment #0 is available.
+               Re-derive from the stored revocation secret (same approach
+               as watchtower_watch_revoked_commitment). */
+            {
+                unsigned char rev_secret[32];
+                if (channel_get_received_revocation(chX, 0, rev_secret)) {
+                    secp256k1_pubkey old_pcp;
+                    if (secp256k1_ec_pubkey_create(ctx, &old_pcp, rev_secret))
+                        channel_set_remote_pcp(chX, 0, &old_pcp);
+                    memset(rev_secret, 0, 32);
+                }
+            }
+
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
+            int built = channel_build_commitment_tx_for_remote(chX, &old_commit_tx, old_txid);
 
             /* Restore current state */
             chX->commitment_number = saved_num;
