@@ -720,6 +720,51 @@ int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
     return found;
 }
 
+int regtest_derive_p2tr_address(const regtest_t *rt,
+                                const unsigned char *tweaked_ser32,
+                                char *addr_out, size_t addr_len) {
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser32, 32, tweaked_hex);
+
+    /* Step 1: getdescriptorinfo "rawtr(HEX)" -> checksummed descriptor */
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(rt, "getdescriptorinfo", params);
+    if (!desc_result) return 0;
+
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    if (!dstart) { free(desc_result); return 0; }
+    dstart = strchr(dstart + 12, '"');
+    if (!dstart) { free(desc_result); return 0; }
+    dstart++;
+    char *dend = strchr(dstart, '"');
+    if (!dend) { free(desc_result); return 0; }
+    size_t dlen = (size_t)(dend - dstart);
+    if (dlen >= sizeof(checksummed_desc)) { free(desc_result); return 0; }
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    /* Step 2: deriveaddresses "rawtr(HEX)#checksum" -> bech32m address */
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(rt, "deriveaddresses", params);
+    if (!addr_result) return 0;
+
+    char *astart = strchr(addr_result, '"');
+    if (!astart) { free(addr_result); return 0; }
+    astart++;
+    char *aend = strchr(astart, '"');
+    if (!aend) { free(addr_result); return 0; }
+    size_t alen = (size_t)(aend - astart);
+    if (alen == 0 || alen >= addr_len) { free(addr_result); return 0; }
+    memcpy(addr_out, astart, alen);
+    addr_out[alen] = '\0';
+    free(addr_result);
+
+    return 1;
+}
+
 char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
                                         const char *prevtxs_json) {
     if (!rt || !unsigned_hex) return NULL;

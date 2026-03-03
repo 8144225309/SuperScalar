@@ -77,4 +77,11 @@ int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
 char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
                                         const char *prevtxs_json);
 
+/* Derive bech32m P2TR address from a tweaked x-only pubkey via bitcoin-cli.
+   tweaked_ser32: 32-byte serialized x-only public key (already TapTweaked).
+   Returns 1 on success with address written to addr_out. */
+int regtest_derive_p2tr_address(const regtest_t *rt,
+                                const unsigned char *tweaked_ser32,
+                                char *addr_out, size_t addr_len);
+
 #endif /* SUPERSCALAR_REGTEST_H */
