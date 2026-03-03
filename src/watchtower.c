@@ -13,7 +13,21 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db) {
     if (!wt) return 0;
     memset(wt, 0, sizeof(*wt));
-    wt->n_channels = n_channels < WATCHTOWER_MAX_CHANNELS ? n_channels : WATCHTOWER_MAX_CHANNELS;
+
+    /* Allocate dynamic arrays */
+    size_t ch_cap = n_channels < WATCHTOWER_MAX_CHANNELS ? WATCHTOWER_MAX_CHANNELS : n_channels;
+    wt->entries = calloc(WATCHTOWER_MAX_WATCH, sizeof(watchtower_entry_t));
+    wt->channels = calloc(ch_cap, sizeof(channel_t *));
+    wt->pending = calloc(WATCHTOWER_MAX_PENDING, sizeof(watchtower_pending_t));
+    if (!wt->entries || !wt->channels || !wt->pending) {
+        free(wt->entries); free(wt->channels); free(wt->pending);
+        memset(wt, 0, sizeof(*wt));
+        return 0;
+    }
+    wt->entries_cap = WATCHTOWER_MAX_WATCH;
+    wt->channels_cap = ch_cap;
+    wt->pending_cap = WATCHTOWER_MAX_PENDING;
+    wt->n_channels = n_channels < ch_cap ? n_channels : ch_cap;
     wt->rt = rt;
     wt->fee = fee;
     wt->db = db;
@@ -34,9 +48,9 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 
             size_t loaded = persist_load_old_commitments(
                 db, (uint32_t)c, commit_nums, txids, vouts, amounts,
-                spks, spk_lens, WATCHTOWER_MAX_WATCH - wt->n_entries);
+                spks, spk_lens, wt->entries_cap - wt->n_entries);
 
-            for (size_t i = 0; i < loaded && wt->n_entries < WATCHTOWER_MAX_WATCH; i++) {
+            for (size_t i = 0; i < loaded && wt->n_entries < wt->entries_cap; i++) {
                 watchtower_entry_t *e = &wt->entries[wt->n_entries++];
                 e->type = WATCH_COMMITMENT;
                 e->channel_id = (uint32_t)c;
@@ -52,9 +66,19 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 
                 /* Load persisted HTLC output data for this commitment */
                 if (db && db->db) {
-                    e->n_htlc_outputs = persist_load_old_commitment_htlcs(
+                    watchtower_htlc_t tmp_htlcs[MAX_HTLCS];
+                    size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
                         db, (uint32_t)c, commit_nums[i],
-                        e->htlc_outputs, MAX_HTLCS);
+                        tmp_htlcs, MAX_HTLCS);
+                    if (n_loaded_htlcs > 0) {
+                        e->htlc_outputs = calloc(n_loaded_htlcs, sizeof(watchtower_htlc_t));
+                        if (e->htlc_outputs) {
+                            memcpy(e->htlc_outputs, tmp_htlcs,
+                                   n_loaded_htlcs * sizeof(watchtower_htlc_t));
+                            e->n_htlc_outputs = n_loaded_htlcs;
+                            e->htlc_outputs_cap = n_loaded_htlcs;
+                        }
+                    }
                 }
             }
         }
@@ -68,7 +92,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
         size_t n_loaded = persist_load_pending(db, pending_txids,
             pending_vouts, pending_amounts, pending_cycles, pending_bumps,
             WATCHTOWER_MAX_PENDING);
-        for (size_t i = 0; i < n_loaded && wt->n_pending < WATCHTOWER_MAX_PENDING; i++) {
+        for (size_t i = 0; i < n_loaded && wt->n_pending < wt->pending_cap; i++) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             memcpy(p->txid, pending_txids[i], 64);
             p->txid[64] = '\0';
@@ -84,7 +108,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 }
 
 void watchtower_set_channel(watchtower_t *wt, size_t idx, channel_t *ch) {
-    if (!wt || idx >= WATCHTOWER_MAX_CHANNELS) return;
+    if (!wt || idx >= wt->channels_cap) return;
     wt->channels[idx] = ch;
     if (idx >= wt->n_channels)
         wt->n_channels = idx + 1;
@@ -95,7 +119,7 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
                        uint32_t to_local_vout, uint64_t to_local_amount,
                        const unsigned char *to_local_spk, size_t spk_len) {
     if (!wt || !txid32 || !to_local_spk) return 0;
-    if (wt->n_entries >= WATCHTOWER_MAX_WATCH) return 0;
+    if (wt->n_entries >= wt->entries_cap) return 0;
     if (spk_len > 34) return 0;
 
     watchtower_entry_t *e = &wt->entries[wt->n_entries++];
@@ -215,6 +239,8 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
          * in the watchtower entry we just created */
         if (n_active_htlcs > 0 && wt->n_entries > 0) {
             watchtower_entry_t *entry = &wt->entries[wt->n_entries - 1];
+            entry->htlc_outputs = calloc(n_active_htlcs, sizeof(watchtower_htlc_t));
+            entry->htlc_outputs_cap = entry->htlc_outputs ? n_active_htlcs : 0;
             entry->n_htlc_outputs = 0;
 
             /* Skip output 0 and output 1 to reach HTLC outputs */
@@ -376,7 +402,7 @@ int watchtower_check(watchtower_t *wt) {
 
         /* Find corresponding channel */
         channel_t *ch = NULL;
-        if (e->channel_id < WATCHTOWER_MAX_CHANNELS)
+        if (e->channel_id < wt->channels_cap)
             ch = wt->channels[e->channel_id];
 
         if (!ch) {
@@ -428,7 +454,7 @@ int watchtower_check(watchtower_t *wt) {
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order. */
         if (penalty_sent && wt->anchor_spk_len == P2A_SPK_LEN &&
-            wt->n_pending < WATCHTOWER_MAX_PENDING) {
+            wt->n_pending < wt->pending_cap) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             memcpy(p->txid, penalty_txid, 64);
             p->txid[64] = '\0';
@@ -702,7 +728,7 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *burn_tx,
                                     size_t burn_tx_len) {
     if (!wt || !old_txid32 || !response_tx || response_tx_len == 0) return 0;
-    if (wt->n_entries >= WATCHTOWER_MAX_WATCH) return 0;
+    if (wt->n_entries >= wt->entries_cap) return 0;
 
     watchtower_entry_t *e = &wt->entries[wt->n_entries++];
     memset(e, 0, sizeof(*e));
@@ -734,6 +760,8 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
+        free(wt->entries[i].htlc_outputs);
+        wt->entries[i].htlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE) {
             free(wt->entries[i].response_tx);
             wt->entries[i].response_tx = NULL;
@@ -741,6 +769,14 @@ void watchtower_cleanup(watchtower_t *wt) {
             wt->entries[i].burn_tx = NULL;
         }
     }
+    free(wt->entries);
+    free(wt->channels);
+    free(wt->pending);
+    wt->entries = NULL;
+    wt->channels = NULL;
+    wt->pending = NULL;
+    wt->n_entries = 0;
+    wt->n_pending = 0;
 }
 
 void watchtower_clear_entries(watchtower_t *wt) {
@@ -755,11 +791,16 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
 
     for (size_t i = 0; i < wt->n_entries; ) {
         if (wt->entries[i].channel_id == channel_id) {
+            free(wt->entries[i].htlc_outputs);
             if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);
                 free(wt->entries[i].burn_tx);
             }
             wt->entries[i] = wt->entries[wt->n_entries - 1];
+            /* NULL the source entry's pointers after swap */
+            wt->entries[wt->n_entries - 1].htlc_outputs = NULL;
+            wt->entries[wt->n_entries - 1].response_tx = NULL;
+            wt->entries[wt->n_entries - 1].burn_tx = NULL;
             wt->n_entries--;
         } else {
             i++;

@@ -19,11 +19,21 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
         return 0;
     lsp->port = port;
     lsp->expected_clients = expected_clients;
-    lsp->max_connections = LSP_MAX_CLIENTS;
+
+    size_t cap = expected_clients < LSP_MAX_CLIENTS ? LSP_MAX_CLIENTS : expected_clients;
+    lsp->client_fds = malloc(cap * sizeof(int));
+    lsp->client_pubkeys = calloc(cap, sizeof(secp256k1_pubkey));
+    if (!lsp->client_fds || !lsp->client_pubkeys) {
+        free(lsp->client_fds); free(lsp->client_pubkeys);
+        memset(lsp, 0, sizeof(*lsp));
+        return 0;
+    }
+    lsp->clients_cap = cap;
+    lsp->max_connections = (int)cap;
     lsp->listen_fd = -1;
     lsp->bridge_fd = -1;
 
-    for (size_t i = 0; i < LSP_MAX_CLIENTS; i++)
+    for (size_t i = 0; i < cap; i++)
         lsp->client_fds[i] = -1;
     return 1;
 }
@@ -817,11 +827,16 @@ void lsp_abort_ceremony(lsp_t *lsp, const char *reason) {
 }
 
 void lsp_cleanup(lsp_t *lsp) {
-    for (size_t i = 0; i < lsp->n_clients; i++) {
-        if (lsp->client_fds[i] >= 0)
-            wire_close(lsp->client_fds[i]);
-        lsp->client_fds[i] = -1;
+    if (lsp->client_fds) {
+        for (size_t i = 0; i < lsp->clients_cap; i++) {
+            if (lsp->client_fds[i] >= 0)
+                wire_close(lsp->client_fds[i]);
+        }
     }
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    lsp->client_fds = NULL;
+    lsp->client_pubkeys = NULL;
     if (lsp->bridge_fd >= 0) {
         wire_close(lsp->bridge_fd);
         lsp->bridge_fd = -1;

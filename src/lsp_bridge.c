@@ -25,7 +25,7 @@ int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
     }
     /* Fall back to appending if no inactive slot */
     if (!inv) {
-        if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) return 0;
+        if (mgr->n_invoices >= mgr->invoices_cap) return 0;
         inv = &mgr->invoices[mgr->n_invoices++];
     }
     memcpy(inv->payment_hash, payment_hash32, 32);
@@ -66,7 +66,7 @@ void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
         }
     }
     if (!origin) {
-        if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) return;
+        if (mgr->n_htlc_origins >= mgr->htlc_origins_cap) return;
         origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
     }
     memcpy(origin->payment_hash, payment_hash32, 32);

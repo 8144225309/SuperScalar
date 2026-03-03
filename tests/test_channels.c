@@ -2156,6 +2156,8 @@ int test_regtest_lsp_restart_recovery(void) {
 int test_profit_settlement_calculation(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(3, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 3;
 
     /* Set up 3 channels with known balances */
     mgr.n_channels = 3;
@@ -2192,12 +2194,15 @@ int test_profit_settlement_calculation(void) {
     }
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
+    free(mgr.entries);
     return 1;
 }
 
 int test_settlement_trigger_at_interval(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 2;
     mgr.n_channels = 2;
     mgr.entries[0].channel.local_amount = 50000;
     mgr.entries[0].channel.remote_amount = 50000;
@@ -2226,6 +2231,7 @@ int test_settlement_trigger_at_interval(void) {
     settled = lsp_channels_settle_profits(&mgr, &f);
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
+    free(mgr.entries);
     return 1;
 }
 
@@ -3046,6 +3052,8 @@ int test_cli_command_parsing(void) {
 
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(LSP_MAX_CLIENTS, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = LSP_MAX_CLIENTS;
     mgr.ctx = ctx;
     mgr.n_channels = 4;
     mgr.bridge_fd = -1;
@@ -3057,6 +3065,9 @@ int test_cli_command_parsing(void) {
 
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp.clients_cap = LSP_MAX_CLIENTS;
     lsp.client_fds[0] = -1;
     lsp.client_fds[1] = -1;
     lsp.client_fds[2] = -1;
@@ -3118,6 +3129,9 @@ int test_cli_command_parsing(void) {
     ok = lsp_channels_handle_cli_line(&mgr, &lsp, "", &shutdown_flag);
     TEST_ASSERT(ok, "empty string should be recognized (no-op)");
 
+    free(mgr.entries);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3128,6 +3142,8 @@ int test_cli_command_parsing(void) {
 int test_fee_accumulation_and_settlement(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 2;
     mgr.economic_mode = ECON_PROFIT_SHARED;
     mgr.routing_fee_ppm = 1000; /* 0.1% = 1000 ppm */
     mgr.settlement_interval_blocks = 144;
@@ -3197,6 +3213,7 @@ int test_fee_accumulation_and_settlement(void) {
                    pre_local_0 - expected_share,
                    "LSP local decreased by share");
 
+    free(mgr.entries);
     return 1;
 }
 
@@ -3206,6 +3223,8 @@ int test_close_outputs_wallet_spk(void) {
     /* Set up minimal mgr with 2 channels */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 2;
     mgr.n_channels = 2;
     mgr.entries[0].channel.local_amount = 5000;
     mgr.entries[0].channel.remote_amount = 3000;
@@ -3294,6 +3313,7 @@ int test_close_outputs_wallet_spk(void) {
     TEST_ASSERT(memcmp(outputs[2].script_pubkey, wallet_spk, 34) == 0,
                 "override+per-client: client 1 uses override (rotation mode)");
 
+    free(mgr.entries);
     return 1;
 }
 

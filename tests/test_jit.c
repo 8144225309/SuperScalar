@@ -240,6 +240,8 @@ int test_jit_channel_id_no_collision(void) {
 int test_jit_routing_prefers_factory(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
     mgr.entries[0].ready = 1;
     mgr.entries[0].channel_id = 0;
@@ -263,12 +265,15 @@ int test_jit_routing_prefers_factory(void) {
     TEST_ASSERT_EQ((long)ch->local_amount, 50000, "should be factory local_amount");
 
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
     return 1;
 }
 
 int test_jit_routing_fallback(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
     mgr.entries[2].ready = 0;  /* Factory channel NOT ready */
     mgr.entries[2].channel_id = 2;
@@ -292,6 +297,7 @@ int test_jit_routing_fallback(void) {
     TEST_ASSERT_EQ((long)ch->local_amount, 20000, "should be JIT local_amount");
 
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
     return 1;
 }
 
@@ -562,6 +568,8 @@ int test_jit_cooperative_close_key_mismatch(void) {
 int test_jit_migrate_lifecycle(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
     mgr.entries[1].ready = 1;
     mgr.entries[1].channel_id = 1;
@@ -595,6 +603,7 @@ int test_jit_migrate_lifecycle(void) {
                    "factory remote should be unchanged after migration");
 
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
     return 1;
 }
 
@@ -604,6 +613,8 @@ int test_jit_migrate_no_balance_hack(void) {
        not by adjusting in-memory balances. */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
     mgr.entries[0].ready = 1;
     mgr.entries[0].channel_id = 0;
@@ -628,6 +639,7 @@ int test_jit_migrate_no_balance_hack(void) {
                    "factory remote unchanged");
 
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
     return 1;
 }
 
@@ -676,8 +688,7 @@ int test_jit_watchtower_registration(void) {
 
     /* Set up a watchtower */
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.n_channels = 4;
+    watchtower_init(&wt, 4, NULL, NULL, NULL);
     mgr.watchtower = &wt;
 
     jit_channels_init(&mgr);
@@ -732,8 +743,7 @@ int test_jit_watchtower_revocation(void) {
     channel_generate_random_basepoints(&ch);
 
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.n_channels = 8;
+    watchtower_init(&wt, 8, NULL, NULL, NULL);
 
     /* Register as JIT watchtower index (e.g. index 5 for client 1 with 4 factory channels) */
     uint32_t wt_chan_id = 5;
@@ -753,6 +763,7 @@ int test_jit_watchtower_revocation(void) {
     TEST_ASSERT_EQ((long)wt.entries[0].channel_id, (long)wt_chan_id,
                    "entry channel_id should be JIT watchtower index");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -760,8 +771,7 @@ int test_jit_watchtower_revocation(void) {
 /* Step 1: Watchtower entries removed on JIT close/migrate */
 int test_jit_watchtower_cleanup_on_close(void) {
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.n_channels = 8;
+    watchtower_init(&wt, 8, NULL, NULL, NULL);
 
     /* Add entries for JIT channel index 6 */
     unsigned char txid1[32], txid2[32];
@@ -891,6 +901,8 @@ int test_jit_persist_skip_closed(void) {
 int test_jit_multiple_channels(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(4, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 4;
     mgr.n_channels = 4;
 
     jit_channels_init(&mgr);
@@ -937,6 +949,7 @@ int test_jit_multiple_channels(void) {
     TEST_ASSERT_EQ((long)ch_id, (long)(JIT_CHANNEL_ID_BASE | 0), "JIT ch_id for 0");
 
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
     return 1;
 }
 
@@ -947,8 +960,7 @@ int test_jit_multiple_watchtower_indices(void) {
     mgr.n_channels = 4;
 
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.n_channels = 4;
+    watchtower_init(&wt, 4, NULL, NULL, NULL);
     mgr.watchtower = &wt;
 
     jit_channels_init(&mgr);
@@ -987,8 +999,7 @@ int test_jit_funding_confirmation_transition(void) {
     mgr.n_channels = 4;
 
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.n_channels = 4;
+    watchtower_init(&wt, 4, NULL, NULL, NULL);
     mgr.watchtower = &wt;
     /* No regtest connection — check_funding should return 0 */
 
@@ -1123,9 +1134,7 @@ int test_regtest_jit_daemon_trigger(void) {
 
     /* Set up watchtower with regtest connection */
     watchtower_t wt;
-    memset(&wt, 0, sizeof(wt));
-    wt.rt = &rt;
-    wt.n_channels = 2; /* factory channels + JIT slots */
+    watchtower_init(&wt, 2, &rt, NULL, NULL); /* factory channels + JIT slots */
 
     /* Set up lsp_channel_mgr_t */
     unsigned char lsp_seckey[32];
@@ -1134,6 +1143,8 @@ int test_regtest_jit_daemon_trigger(void) {
 
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 1;
     mgr.ctx = ctx;
     mgr.n_channels = 1;
     mgr.watchtower = &wt;
@@ -1147,6 +1158,9 @@ int test_regtest_jit_daemon_trigger(void) {
     /* Set up lsp_t with factory */
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp.clients_cap = LSP_MAX_CLIENTS;
     lsp.factory = f;
 
     /* Verify daemon loop JIT trigger conditions */
@@ -1190,6 +1204,9 @@ int test_regtest_jit_daemon_trigger(void) {
 
     /* Cleanup */
     jit_channels_cleanup(&mgr);
+    free(mgr.entries);
+    free(lsp.client_fds);
+    free(lsp.client_pubkeys);
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);

@@ -211,6 +211,8 @@ int test_penalty_tx_has_anchor(void) {
     TEST_ASSERT_EQ(penalty_no_anchor.data[48], 1, "1 output without anchor");
     tx_buf_free(&penalty_no_anchor);
 
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -283,6 +285,8 @@ int test_htlc_penalty_tx_has_anchor(void) {
     TEST_ASSERT_EQ(anchor_amt, 240, "anchor amount = 240");
 
     tx_buf_free(&htlc_penalty);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }

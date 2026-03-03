@@ -43,11 +43,12 @@ int jit_channels_init(void *mgr_ptr) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
     if (!mgr) return 0;
 
+    if (!mgr->jit_channels_cap) mgr->jit_channels_cap = JIT_MAX_CHANNELS;
     if (!mgr->jit_channels) {
-        mgr->jit_channels = calloc(JIT_MAX_CHANNELS, sizeof(jit_channel_t));
+        mgr->jit_channels = calloc(mgr->jit_channels_cap, sizeof(jit_channel_t));
         if (!mgr->jit_channels) return 0;
     } else {
-        memset(mgr->jit_channels, 0, JIT_MAX_CHANNELS * sizeof(jit_channel_t));
+        memset(mgr->jit_channels, 0, mgr->jit_channels_cap * sizeof(jit_channel_t));
     }
     mgr->n_jit_channels = 0;
     mgr->jit_enabled = 1;
@@ -103,7 +104,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     if (!mgr || !lsp || !mgr->jit_channels) return 0;
     if (client_idx >= mgr->n_channels) return 0;
     if (lsp->client_fds[client_idx] < 0) return 0;
-    if (mgr->n_jit_channels >= JIT_MAX_CHANNELS) return 0;
+    if (mgr->n_jit_channels >= mgr->jit_channels_cap) return 0;
 
     /* Already have an active JIT channel for this client? */
     if (jit_channel_is_active(mgr, client_idx)) return 1;

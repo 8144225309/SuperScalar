@@ -92,7 +92,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        const unsigned char *lsp_seckey32,
                        size_t n_clients) {
     if (!mgr || !ctx || !factory || !lsp_seckey32) return 0;
-    if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
+    if (n_clients == 0) return 0;
 
     /* Preserve fee policy set before init (caller may configure these) */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
@@ -107,6 +107,19 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     mgr->bridge_fd = -1;
     mgr->n_invoices = 0;
     mgr->n_htlc_origins = 0;
+
+    /* Allocate dynamic arrays */
+    mgr->entries = calloc(n_clients, sizeof(lsp_channel_entry_t));
+    mgr->invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr->htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    if (!mgr->entries || !mgr->invoices || !mgr->htlc_origins) {
+        free(mgr->entries); free(mgr->invoices); free(mgr->htlc_origins);
+        memset(mgr, 0, sizeof(*mgr));
+        return 0;
+    }
+    mgr->entries_cap = n_clients;
+    mgr->invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr->htlc_origins_cap = MAX_HTLC_ORIGINS;
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
 
@@ -199,7 +212,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                                void *db) {
     persist_t *pdb = (persist_t *)db;
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
-    if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
+    if (n_clients == 0) return 0;
 
     /* Preserve fee policy set before init (caller may configure these) */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
@@ -214,6 +227,19 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->bridge_fd = -1;
     mgr->n_invoices = 0;
     mgr->n_htlc_origins = 0;
+
+    /* Allocate dynamic arrays */
+    mgr->entries = calloc(n_clients, sizeof(lsp_channel_entry_t));
+    mgr->invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr->htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    if (!mgr->entries || !mgr->invoices || !mgr->htlc_origins) {
+        free(mgr->entries); free(mgr->invoices); free(mgr->htlc_origins);
+        memset(mgr, 0, sizeof(*mgr));
+        return 0;
+    }
+    mgr->entries_cap = n_clients;
+    mgr->invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr->htlc_origins_cap = MAX_HTLC_ORIGINS;
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
 
@@ -398,6 +424,23 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (FD_ISSET(client_fd, &rfds))
             return wire_recv(client_fd, msg);
     }
+}
+
+void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    if (mgr->entries) {
+        for (size_t i = 0; i < mgr->n_channels; i++)
+            channel_cleanup(&mgr->entries[i].channel);
+    }
+    free(mgr->entries);
+    free(mgr->invoices);
+    free(mgr->htlc_origins);
+    mgr->entries = NULL;
+    mgr->invoices = NULL;
+    mgr->htlc_origins = NULL;
+    mgr->n_channels = 0;
+    mgr->n_invoices = 0;
+    mgr->n_htlc_origins = 0;
 }
 
 int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {

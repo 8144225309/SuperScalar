@@ -189,6 +189,9 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                   uint64_t local_amount, uint64_t remote_amount,
                   uint32_t to_self_delay) {
     memset(ch, 0, sizeof(*ch));
+    ch->htlcs = calloc(MAX_HTLCS, sizeof(htlc_t));
+    if (!ch->htlcs) return 0;
+    ch->htlcs_cap = MAX_HTLCS;
     ch->ctx = ctx;
 
     ch->local_funding_pubkey = *local_funding_pubkey;
@@ -267,6 +270,14 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     channel_generate_local_pcs(ch, 1);
 
     return 1;
+}
+
+void channel_cleanup(channel_t *ch) {
+    if (!ch) return;
+    free(ch->htlcs);
+    ch->htlcs = NULL;
+    ch->htlcs_cap = 0;
+    ch->n_htlcs = 0;
 }
 
 int channel_set_local_basepoints(channel_t *ch,
@@ -1157,7 +1168,7 @@ static void channel_compact_htlcs(channel_t *ch) {
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
-    if (ch->n_htlcs >= MAX_HTLCS)
+    if (ch->n_htlcs >= ch->htlcs_cap)
         return 0;
     if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
         return 0;  /* commitment number would overflow storage */

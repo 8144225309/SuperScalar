@@ -12,10 +12,11 @@ typedef struct {
     secp256k1_keypair  lsp_keypair;
     secp256k1_pubkey   lsp_pubkey;
 
-    /* Connected clients */
-    int client_fds[LSP_MAX_CLIENTS];
-    secp256k1_pubkey client_pubkeys[LSP_MAX_CLIENTS];
+    /* Connected clients (dynamically allocated, capacity clients_cap) */
+    int *client_fds;
+    secp256k1_pubkey *client_pubkeys;
     size_t n_clients;
+    size_t clients_cap;
     size_t expected_clients;
 
     /* Factory (built after all clients connect) */
