@@ -52,9 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 337 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, property-based tests |
+| Unit tests | 361 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, property-based tests |
 | Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| **Total** | **379** | | |
+| **Total** | **403** | | |
 
 ---
 
@@ -67,7 +67,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 337/337 passed`
+Expected output: `Results: 361/361 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
@@ -419,7 +419,7 @@ GitHub Actions runs on every push and pull request:
 | Static Analysis | cppcheck (zero warnings enforced) |
 | Regtest Integration | Real Bitcoin Core 28.1 + regtest tests |
 | Coverage | gcov/lcov instrumented build + HTML report artifact |
-| Fuzz Testing | 5 libFuzzer targets, 5 minutes each |
+| Fuzz Testing | 7 libFuzzer targets, 5 minutes each |
 
 Additionally:
 - All platforms compile with `-Wall -Wextra -Werror` — zero warnings is a hard gate

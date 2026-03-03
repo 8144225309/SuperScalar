@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 402 tests (359 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 403 tests (361 unit + 42 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -26,7 +26,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes) |
-| **Testing** | 359 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 361 unit + 42 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-402 tests (359 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+403 tests (361 unit + 42 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -567,7 +567,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-53 message types over TCP with length-prefixed JSON framing:
+54 message types over TCP with length-prefixed JSON framing:
 
 | Category | Messages |
 |----------|----------|
@@ -615,7 +615,7 @@ CLN (lightningd)
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
-| `wire` | wire.c | TCP transport, JSON framing, 53 message types |
+| `wire` | wire.c | TCP transport, JSON framing, 54 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
 | `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, distributed epoch reset, per-leaf advance |
@@ -642,11 +642,11 @@ Production deployment considerations — see [docs/gaps-and-changes.md](docs/gap
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Reconnect (BOLT #2)** | PoC | Commitment mismatch logs warning + proceeds; no HTLC replay after reconnect |
+| **Reconnect (BOLT #2)** | Implemented | Commitment reconciliation with DB rollback; HTLC replay after reconnect |
 | **AEAD crypto** | PoC | Hand-rolled ChaCha20-Poly1305; should link libsodium or OpenSSL EVP |
-| **Capacity limits** | Static | `LSP_MAX_CLIENTS=8`, `MAX_HTLCS=16` — compile-time constants |
-| **JIT migration** | PoC | Direct balance addition, not a real splice-in transaction |
-| **Fee estimation** | Opt-in | Dynamic `estimatesmartfee` available but defaults to static 1000 sat/kvB |
+| **Capacity limits** | Bumped | `LSP_MAX_CLIENTS=16`, `MAX_HTLCS=32` — compile-time constants, increased from original 8/16 |
+| **JIT migration** | Implemented | JIT channels cooperatively closed on-chain during rotation (Phase A.5); balance recovered to LSP wallet |
+| **Fee estimation** | Default-on | Dynamic `estimatesmartfee` enabled by default; static 1000 sat/kvB fallback |
 | **Gossip (BOLT #7)** | Not implemented | Factory channels not advertised to LN graph; bridge handles routing |
 | **Hashlock burn** | By design | L-stock burn enforced by `factory_build_burn_tx()`, not by Script (would require covenant opcodes) |
 
