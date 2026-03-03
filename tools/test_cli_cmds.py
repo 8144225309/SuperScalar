@@ -4,9 +4,11 @@ Uses a simple approach: pipe commands via stdin with delays, log to file."""
 
 import subprocess, time, os, sys, threading
 
-btc = "/home/pirq/bin/bitcoin-cli"
-conf = ["-regtest", "-conf=/home/pirq/bitcoin-regtest/bitcoin.conf"]
-build = "/home/pirq/superscalar-build"
+# Auto-detect paths: env vars (Docker) → hardcoded (WSL dev)
+btc = os.environ.get('SUPERSCALAR_BTC', '/home/pirq/bin/bitcoin-cli')
+_btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
+conf = ["-regtest"] if _btcconf == '' else ["-regtest", f"-conf={_btcconf or '/home/pirq/bitcoin-regtest/bitcoin.conf'}"]
+build = os.environ.get('SUPERSCALAR_BUILD', '/home/pirq/superscalar-build')
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
 
@@ -39,8 +41,12 @@ def wait_for_in_file(path, keyword, timeout=120):
 subprocess.run([btc] + conf + ["stop"], capture_output=True)
 time.sleep(2)
 subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
-subprocess.Popen([os.path.expanduser("~/bin/bitcoind"), "-regtest",
-                   "-conf=" + os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"), "-daemon"])
+btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
+btcd_cmd = [btcd, "-daemon"]
+if _btcconf != "":
+    btcd_cmd.extend(["-regtest", "-conf=" + (
+        _btcconf or os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"))])
+subprocess.Popen(btcd_cmd)
 time.sleep(3)
 rpc("createwallet", WALLET)
 addr = rpc("getnewaddress", "", "bech32m", wallet=WALLET)
@@ -61,7 +67,7 @@ for i in range(4):
         except: pass
 
 env = dict(os.environ)
-env["PATH"] = "/home/pirq/bin:" + env.get("PATH", "")
+env["PATH"] = os.path.dirname(btc) + ":" + env.get("PATH", "")
 
 # Start LSP in daemon+cli mode, stdout to log file
 lsp_log = open("/tmp/cli_lsp.log", "w")

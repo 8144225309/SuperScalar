@@ -13,9 +13,11 @@ Tests:
 
 import subprocess, time, os, sys, threading
 
-btc = "/home/pirq/bin/bitcoin-cli"
-conf = ["-regtest", "-conf=/home/pirq/bitcoin-regtest/bitcoin.conf"]
-build = "/home/pirq/superscalar-build"
+# Auto-detect paths: env vars (Docker) → hardcoded (WSL dev)
+btc = os.environ.get('SUPERSCALAR_BTC', '/home/pirq/bin/bitcoin-cli')
+_btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
+conf = ["-regtest"] if _btcconf == '' else ["-regtest", f"-conf={_btcconf or '/home/pirq/bitcoin-regtest/bitcoin.conf'}"]
+build = os.environ.get('SUPERSCALAR_BUILD', '/home/pirq/superscalar-build')
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
 
@@ -26,7 +28,7 @@ WALLET = "stress_test"
 PORT = 9760
 
 env = dict(os.environ)
-env["PATH"] = "/home/pirq/bin:" + env.get("PATH", "")
+env["PATH"] = os.path.dirname(btc) + ":" + env.get("PATH", "")
 env["MALLOC_CHECK_"] = "3"  # abort on double-free / heap corruption
 results = {}
 
@@ -42,8 +44,12 @@ def fresh_regtest():
     subprocess.run([btc] + conf + ["stop"], capture_output=True)
     time.sleep(3)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
-    subprocess.Popen([os.path.expanduser("~/bin/bitcoind"), "-regtest",
-                      "-conf=" + os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"), "-daemon"])
+    btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
+    btcd_cmd = [btcd, "-daemon"]
+    if _btcconf != "":
+        btcd_cmd.extend(["-regtest", "-conf=" + (
+            _btcconf or os.path.expanduser("~/bitcoin-regtest/bitcoin.conf"))])
+    subprocess.Popen(btcd_cmd)
     time.sleep(5)
     # Retry wallet creation — bitcoind may not be ready yet
     for attempt in range(10):

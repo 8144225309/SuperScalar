@@ -1,13 +1,20 @@
 #!/bin/bash
 # Docker entrypoint for SuperScalar
-# Modes: demo (default), demo-all, test, unit, bash
+# Modes: demo (default), demo-all, test, stress, unit, bash
 set -e
 
 export PATH="/usr/local/bin:$PATH"
+# RPC credentials (match bitcoin.conf written in Dockerfile)
+export RPCUSER="rpcuser"
+export RPCPASSWORD="rpcpass"
+# Tell Python test scripts where to find binaries
+export SUPERSCALAR_BUILD="/superscalar/build"
+export SUPERSCALAR_BTC="bitcoin-cli"
+export SUPERSCALAR_BTCCONF=""
 
 setup_regtest() {
-    # Start bitcoind regtest
-    bitcoind -regtest -daemon -fallbackfee=0.00001 -txindex=1
+    # Start bitcoind (config from /root/.bitcoin/bitcoin.conf)
+    bitcoind -daemon
     # Wait for RPC readiness
     for i in $(seq 1 30); do
         if bitcoin-cli -regtest getblockchaininfo >/dev/null 2>&1; then
@@ -44,10 +51,16 @@ case "${1:-demo}" in
         cd /superscalar
         exec python3 tools/manual_tests.py
         ;;
+    stress)
+        setup_regtest
+        cd /superscalar
+        exec python3 tools/test_stress.py
+        ;;
     unit)
         exec /superscalar/build/test_superscalar --unit
         ;;
     bash)
+        setup_regtest
         exec /bin/bash
         ;;
     *)
