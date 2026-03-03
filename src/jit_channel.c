@@ -6,6 +6,8 @@
 #include "superscalar/regtest.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
+#include "superscalar/tx_builder.h"
+#include "superscalar/sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -190,30 +192,42 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     musig_keyagg_t jit_ka;
     musig_aggregate_keys(mgr->ctx, &jit_ka, funding_pks, 2);
 
-    /* Build P2TR funding SPK from aggregated key */
+    /* Serialize the internal (untweaked) aggregate key */
     unsigned char agg_ser[32];
     secp256k1_pubkey agg_pk;
     secp256k1_xonly_pubkey agg_xonly;
     if (!secp256k1_musig_pubkey_get(mgr->ctx, &agg_pk, &jit_ka.cache))
-        return 0;
+        { memset(lsp_seckey, 0, 32); return 0; }
     if (!secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &agg_xonly, NULL, &agg_pk))
-        return 0;
+        { memset(lsp_seckey, 0, 32); return 0; }
     if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, agg_ser, &agg_xonly))
-        return 0;
+        { memset(lsp_seckey, 0, 32); return 0; }
 
+    /* TapTweak (key-path-only, no script tree) */
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+
+    musig_keyagg_t jit_ka_tweak = jit_ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(mgr->ctx, &tweaked_pk,
+                                                  &jit_ka_tweak.cache, tweak))
+        { memset(lsp_seckey, 0, 32); return 0; }
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &tweaked_xonly, NULL, &tweaked_pk))
+        { memset(lsp_seckey, 0, 32); return 0; }
+
+    /* Build correct P2TR funding SPK from tweaked key */
     unsigned char funding_spk[34];
-    funding_spk[0] = 0x51;  /* OP_1 */
-    funding_spk[1] = 0x20;  /* push 32 */
-    memcpy(funding_spk + 2, agg_ser, 32);
+    build_p2tr_script_pubkey(funding_spk, &tweaked_xonly);
     size_t funding_spk_len = 34;
 
-    /* Use the same funding address derivation as the main factory */
+    /* Derive bech32m address from the JIT tweaked key */
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, tweaked_ser, &tweaked_xonly))
+        { memset(lsp_seckey, 0, 32); return 0; }
     char funding_addr[128];
-    if (mgr->rot_fund_addr[0]) {
-        snprintf(funding_addr, sizeof(funding_addr), "%s", mgr->rot_fund_addr);
-    } else {
-        /* Can't derive address without bitcoin-cli, use raw funding */
-        fprintf(stderr, "LSP JIT: no funding address configured\n");
+    if (!regtest_derive_p2tr_address(rt, tweaked_ser, funding_addr, sizeof(funding_addr))) {
+        fprintf(stderr, "LSP JIT: failed to derive JIT funding address\n");
         memset(lsp_seckey, 0, 32);
         return 0;
     }
@@ -275,9 +289,10 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         }
     }
     if (actual_amount == 0) {
-        /* Fallback: use vout 0 and trust the amount */
-        fund_vout = 0;
-        actual_amount = funding_amount;
+        fprintf(stderr, "LSP JIT: funding output SPK mismatch in tx %s\n",
+                fund_txid_hex);
+        memset(lsp_seckey, 0, 32);
+        return 0;
     }
 
     memcpy(jit->funding_txid_hex, fund_txid_hex, 64);

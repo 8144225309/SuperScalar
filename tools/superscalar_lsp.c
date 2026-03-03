@@ -110,51 +110,6 @@ static void usage(const char *prog) {
         prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
 }
 
-/* Derive bech32m address from tweaked xonly pubkey via bitcoin-cli descriptors */
-static int derive_p2tr_address(regtest_t *rt, const unsigned char *tweaked_ser32,
-                                char *addr_out, size_t addr_len) {
-    char tweaked_hex[65];
-    hex_encode(tweaked_ser32, 32, tweaked_hex);
-
-    /* Step 1: getdescriptorinfo "rawtr(HEX)" -> checksummed descriptor */
-    char params[512];
-    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
-    char *desc_result = regtest_exec(rt, "getdescriptorinfo", params);
-    if (!desc_result) return 0;
-
-    char checksummed_desc[256];
-    char *dstart = strstr(desc_result, "\"descriptor\"");
-    if (!dstart) { free(desc_result); return 0; }
-    dstart = strchr(dstart + 12, '"');
-    if (!dstart) { free(desc_result); return 0; }
-    dstart++;
-    char *dend = strchr(dstart, '"');
-    if (!dend) { free(desc_result); return 0; }
-    size_t dlen = (size_t)(dend - dstart);
-    if (dlen >= sizeof(checksummed_desc)) { free(desc_result); return 0; }
-    memcpy(checksummed_desc, dstart, dlen);
-    checksummed_desc[dlen] = '\0';
-    free(desc_result);
-
-    /* Step 2: deriveaddresses "rawtr(HEX)#checksum" -> bech32m address */
-    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
-    char *addr_result = regtest_exec(rt, "deriveaddresses", params);
-    if (!addr_result) return 0;
-
-    char *astart = strchr(addr_result, '"');
-    if (!astart) { free(addr_result); return 0; }
-    astart++;
-    char *aend = strchr(astart, '"');
-    if (!aend) { free(addr_result); return 0; }
-    size_t alen = (size_t)(aend - astart);
-    if (alen == 0 || alen >= addr_len) { free(addr_result); return 0; }
-    memcpy(addr_out, astart, alen);
-    addr_out[alen] = '\0';
-    free(addr_result);
-
-    return 1;
-}
-
 /* Ensure wallet has funds (handle exhausted regtest chains) */
 static int ensure_funded(regtest_t *rt, const char *mine_addr) {
     char *bal_s = regtest_exec(rt, "getbalance", "");
@@ -1138,7 +1093,7 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 char rfa[128];
-                if (derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
+                if (regtest_derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
                     snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr),
                              "%s", rfa);
             }
@@ -1392,7 +1347,7 @@ int main(int argc, char *argv[]) {
     }
 
     char fund_addr[128];
-    if (!derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
+    if (!regtest_derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
         fprintf(stderr, "LSP: failed to derive funding address\n");
         lsp_cleanup(&lsp);
         secp256k1_context_destroy(ctx);
