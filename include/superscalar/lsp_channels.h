@@ -30,7 +30,7 @@ typedef struct {
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
-#define MAX_INVOICE_REGISTRY 64
+#define MAX_INVOICE_REGISTRY 256
 
 typedef struct {
     unsigned char payment_hash[32];
@@ -42,7 +42,7 @@ typedef struct {
 } invoice_entry_t;
 
 /* HTLC origin tracking for bridge back-propagation (Phase 14) */
-#define MAX_HTLC_ORIGINS 64
+#define MAX_HTLC_ORIGINS 256
 
 typedef struct {
     unsigned char payment_hash[32];

@@ -23,7 +23,7 @@ int fee_update_from_node(fee_estimator_t *fe, void *rt, int target_blocks);
 /* Estimate fee for a tx of given virtual size. Returns fee in sats. */
 uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes);
 
-/* Convenience: penalty tx is ~195 vB (1-in, 2-out: sweep + anchor, keypath schnorr). */
+/* Convenience: penalty tx is ~165 vB (1-in, 2-out: sweep + anchor, keypath schnorr). */
 uint64_t fee_for_penalty_tx(const fee_estimator_t *fe);
 
 /* Convenience: HTLC resolution tx is ~180 vB. */

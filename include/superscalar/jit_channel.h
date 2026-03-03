@@ -34,7 +34,7 @@ typedef struct jit_channel {
     char funding_tx_hex[4096]; /* Signed funding tx hex for crash recovery */
 } jit_channel_t;
 
-#define JIT_MAX_CHANNELS 8
+#define JIT_MAX_CHANNELS 16
 #define JIT_CHANNEL_ID_BASE 0x8000
 #define JIT_OFFLINE_TIMEOUT_SEC 300  /* Seconds without message = offline */
 

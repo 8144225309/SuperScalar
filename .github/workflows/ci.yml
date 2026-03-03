@@ -31,7 +31,9 @@ jobs:
       - name: Unit tests
         env:
           ASAN_OPTIONS: detect_leaks=0
-        run: ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
 
   static-analysis:
     runs-on: ubuntu-latest
@@ -98,6 +100,7 @@ jobs:
           cmake --build build --parallel
       - name: Regtest tests
         run: |
+          ulimit -s unlimited
           cd build && ./test_superscalar --regtest
       - name: Stop bitcoind
         if: always()
@@ -116,7 +119,7 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build --parallel
       - name: Run tests
-        run: ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
+        run: ulimit -s unlimited && ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
       - name: Generate coverage report
         run: |
           cd build

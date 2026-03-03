@@ -7,7 +7,7 @@
 #include "fee.h"
 #include <secp256k1.h>
 
-#define WATCHTOWER_MAX_WATCH 64
+#define WATCHTOWER_MAX_WATCH 128
 
 typedef enum {
     WATCH_COMMITMENT,      /* Channel commitment breach — build penalty tx */
@@ -46,7 +46,7 @@ typedef struct {
     size_t burn_tx_len;
 } watchtower_entry_t;
 
-#define WATCHTOWER_MAX_CHANNELS 8
+#define WATCHTOWER_MAX_CHANNELS 32
 #define WATCHTOWER_MAX_PENDING 16
 #define WATCHTOWER_ANCHOR_AMOUNT ANCHOR_OUTPUT_AMOUNT
 

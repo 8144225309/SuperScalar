@@ -66,6 +66,7 @@ static void usage(const char *prog) {
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
+        "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
         "  --network MODE      Network: regtest, signet, testnet, testnet4, mainnet (default: regtest)\n"
@@ -864,10 +865,11 @@ int main(int argc, char *argv[]) {
         regtest_create_wallet(&rt, "superscalar_lsp");
     }
 
-    /* Initialize fee estimator */
+    /* Initialize fee estimator (dynamic fees always enabled; --dynamic-fees kept for compat) */
+    (void)dynamic_fees;
     fee_estimator_t fee_est;
     fee_init(&fee_est, fee_rate);
-    if (!is_regtest || dynamic_fees) fee_est.use_estimatesmartfee = 1;
+    fee_est.use_estimatesmartfee = 1;
     if (fee_est.use_estimatesmartfee && fee_update_from_node(&fee_est, &rt, 6)) {
         printf("LSP: fee rate from estimatesmartfee(6): %llu sat/kvB\n",
                (unsigned long long)fee_est.fee_rate_sat_per_kvb);

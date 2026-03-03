@@ -9,7 +9,7 @@
 #include <secp256k1_extrakeys.h>
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
-#define MAX_HTLCS 16
+#define MAX_HTLCS 32
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */

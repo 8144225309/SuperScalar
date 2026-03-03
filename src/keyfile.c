@@ -53,8 +53,9 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
         }
         fclose(urand);
     } else {
-        /* Deterministic fallback for testing environments without /dev/urandom */
-        memset(nonce, 0x01, 12);
+        fprintf(stderr, "keyfile_save: /dev/urandom unavailable, refusing to use static nonce\n");
+        secure_zero(enc_key, 32);
+        return 0;
     }
 
     /* Encrypt */
