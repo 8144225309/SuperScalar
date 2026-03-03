@@ -112,6 +112,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x58: return "LEAF_ADVANCE_PROPOSE";
     case 0x59: return "LEAF_ADVANCE_PSIG";
     case 0x5A: return "LEAF_ADVANCE_DONE";
+    case 0x5B: return "SCID_ASSIGN";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1595,6 +1596,43 @@ int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
+    return 1;
+}
+
+/* --- SCID assignment for route hints (4B) --- */
+
+cJSON *wire_build_scid_assign(uint32_t channel_id, uint64_t scid,
+                               uint32_t fee_base_msat, uint32_t fee_ppm,
+                               uint16_t cltv_delta) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "channel_id", channel_id);
+    /* JSON numbers lose precision above 2^53; encode SCID as hex string */
+    char scid_hex[17];
+    snprintf(scid_hex, sizeof(scid_hex), "%016llx", (unsigned long long)scid);
+    cJSON_AddStringToObject(j, "scid", scid_hex);
+    cJSON_AddNumberToObject(j, "fee_base_msat", fee_base_msat);
+    cJSON_AddNumberToObject(j, "fee_ppm", fee_ppm);
+    cJSON_AddNumberToObject(j, "cltv_delta", cltv_delta);
+    return j;
+}
+
+int wire_parse_scid_assign(const cJSON *json, uint32_t *channel_id,
+                             uint64_t *scid, uint32_t *fee_base_msat,
+                             uint32_t *fee_ppm, uint16_t *cltv_delta) {
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
+    cJSON *si = cJSON_GetObjectItem(json, "scid");
+    cJSON *fb = cJSON_GetObjectItem(json, "fee_base_msat");
+    cJSON *fp = cJSON_GetObjectItem(json, "fee_ppm");
+    cJSON *cd = cJSON_GetObjectItem(json, "cltv_delta");
+    if (!ci || !cJSON_IsNumber(ci) || !si || !cJSON_IsString(si) ||
+        !fb || !cJSON_IsNumber(fb) || !fp || !cJSON_IsNumber(fp) ||
+        !cd || !cJSON_IsNumber(cd))
+        return 0;
+    *channel_id = (uint32_t)ci->valuedouble;
+    *scid = (uint64_t)strtoull(si->valuestring, NULL, 16);
+    *fee_base_msat = (uint32_t)fb->valuedouble;
+    *fee_ppm = (uint32_t)fp->valuedouble;
+    *cltv_delta = (uint16_t)cd->valuedouble;
     return 1;
 }
 

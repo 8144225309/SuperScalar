@@ -1935,6 +1935,11 @@ void factory_free(factory_t *f) {
     f->n_nodes = 0;
 }
 
+uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output_index) {
+    uint64_t epoch = (uint64_t)dw_counter_epoch(&f->counter);
+    return (epoch << 40) | ((uint64_t)(leaf_index & 0xFFFFFF) << 16) | (output_index & 0xFFFF);
+}
+
 void factory_detach_txbufs(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));

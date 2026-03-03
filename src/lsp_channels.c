@@ -526,6 +526,33 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         cJSON_Delete(msg);
 
+        /* 4B: Send SCID assignment for route hints */
+        {
+            /* Derive SCID from factory epoch + leaf position + output index.
+               client_idx is c+1 (0=LSP). leaf_index for SCID = leaf position. */
+            int leaf_pos = -1;
+            for (int li = 0; li < lsp->factory.n_leaf_nodes; li++) {
+                size_t ni = lsp->factory.leaf_node_indices[li];
+                const factory_node_t *nd = &lsp->factory.nodes[ni];
+                for (size_t s = 0; s < nd->n_signers; s++) {
+                    if (nd->signer_indices[s] == (uint32_t)(c + 1)) {
+                        leaf_pos = li;
+                        break;
+                    }
+                }
+                if (leaf_pos >= 0) break;
+            }
+            if (leaf_pos < 0) leaf_pos = (int)c; /* fallback */
+            uint64_t scid = factory_derive_scid(&lsp->factory, leaf_pos, 0);
+            cJSON *scid_msg = wire_build_scid_assign(
+                entry->channel_id, scid,
+                0,                                  /* fee_base_msat */
+                (uint32_t)mgr->routing_fee_ppm,     /* fee_ppm */
+                40);                                 /* cltv_delta */
+            wire_send(lsp->client_fds[c], MSG_SCID_ASSIGN, scid_msg);
+            cJSON_Delete(scid_msg);
+        }
+
         /* Phase 12: Send nonce pool pubnonces to client */
         {
             channel_t *ch = &entry->channel;

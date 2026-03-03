@@ -703,6 +703,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                my_index, channel_id, (unsigned long long)bl, (unsigned long long)br);
     }
 
+    /* Receive SCID_ASSIGN for route hints */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+        msg.msg_type != MSG_SCID_ASSIGN) {
+        if (msg.json) cJSON_Delete(msg.json);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    {
+        uint32_t scid_ch; uint64_t scid; uint32_t fb, fp; uint16_t cd;
+        if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd))
+            printf("Client %u: SCID=%016llx fee_base=%u fee_ppm=%u cltv=%u\n",
+                   my_index, (unsigned long long)scid, fb, fp, cd);
+        cJSON_Delete(msg.json);
+    }
+
     /* Initialize client-side channel */
     if (!client_init_channel(channel_out, ctx, factory_out, keypair, my_index,
                               &rot_lsp_pay_bp, &rot_lsp_delay_bp,
@@ -1235,6 +1249,21 @@ int client_run_with_channels(secp256k1_context *ctx,
         printf("Client %u: channel %u ready (local=%llu msat, remote=%llu msat)\n",
                my_index, channel_id,
                (unsigned long long)bal_local, (unsigned long long)bal_remote);
+
+        /* Receive SCID_ASSIGN for route hints */
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+            msg.msg_type != MSG_SCID_ASSIGN) {
+            fprintf(stderr, "Client %u: expected SCID_ASSIGN\n", my_index);
+            if (msg.json) cJSON_Delete(msg.json);
+            goto fail;
+        }
+        {
+            uint32_t scid_ch; uint64_t scid; uint32_t fb, fp; uint16_t cd;
+            if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd))
+                printf("Client %u: SCID=%016llx fee_base=%u fee_ppm=%u cltv=%u\n",
+                       my_index, (unsigned long long)scid, fb, fp, cd);
+            cJSON_Delete(msg.json);
+        }
 
         /* Initialize client-side channel */
         channel_t channel;

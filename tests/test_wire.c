@@ -1239,3 +1239,30 @@ int test_placement_profiles_wire_round_trip(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- 4B: SCID_ASSIGN wire round-trip --- */
+
+int test_wire_scid_assign(void) {
+    uint32_t ch_id = 7;
+    uint64_t scid = ((uint64_t)3 << 40) | ((uint64_t)2 << 16) | 1;
+    uint32_t fee_base = 1000;
+    uint32_t fee_ppm = 500;
+    uint16_t cltv = 40;
+
+    cJSON *j = wire_build_scid_assign(ch_id, scid, fee_base, fee_ppm, cltv);
+    TEST_ASSERT(j != NULL, "build scid_assign");
+
+    uint32_t ch_out; uint64_t scid_out;
+    uint32_t fb_out, fp_out; uint16_t cd_out;
+    TEST_ASSERT(wire_parse_scid_assign(j, &ch_out, &scid_out, &fb_out, &fp_out, &cd_out),
+                "parse scid_assign");
+
+    TEST_ASSERT_EQ(ch_out, ch_id, "channel_id");
+    TEST_ASSERT(scid_out == scid, "scid round-trip");
+    TEST_ASSERT_EQ(fb_out, fee_base, "fee_base_msat");
+    TEST_ASSERT_EQ(fp_out, fee_ppm, "fee_ppm");
+    TEST_ASSERT_EQ(cd_out, cltv, "cltv_delta");
+
+    cJSON_Delete(j);
+    return 1;
+}
