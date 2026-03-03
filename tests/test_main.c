@@ -395,8 +395,10 @@ extern int test_client_jit_channel_dispatch(void);
 extern int test_persist_jit_save_load(void);
 extern int test_persist_jit_update(void);
 extern int test_persist_jit_delete(void);
+extern int test_jit_cooperative_close(void);
+extern int test_jit_cooperative_close_key_mismatch(void);
 extern int test_jit_migrate_lifecycle(void);
-extern int test_jit_migrate_balance(void);
+extern int test_jit_migrate_no_balance_hack(void);
 extern int test_jit_state_conversion(void);
 extern int test_jit_msg_type_names(void);
 
@@ -900,8 +902,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_jit_save_load);
     RUN_TEST(test_persist_jit_update);
     RUN_TEST(test_persist_jit_delete);
+    RUN_TEST(test_jit_cooperative_close);
+    RUN_TEST(test_jit_cooperative_close_key_mismatch);
     RUN_TEST(test_jit_migrate_lifecycle);
-    RUN_TEST(test_jit_migrate_balance);
+    RUN_TEST(test_jit_migrate_no_balance_hack);
     RUN_TEST(test_jit_state_conversion);
     RUN_TEST(test_jit_msg_type_names);
 

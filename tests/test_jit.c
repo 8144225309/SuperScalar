@@ -455,7 +455,109 @@ int test_persist_jit_delete(void) {
     return 1;
 }
 
-/* --- Step 7: Migration Tests --- */
+/* --- Step 7: Cooperative Close Tests --- */
+
+int test_jit_cooperative_close(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Set up LSP and client keys */
+    unsigned char lsp_sec[32], cli_sec[32];
+    memset(lsp_sec, 0x71, 32);
+    memset(cli_sec, 0x72, 32);
+    secp256k1_pubkey lsp_pk, cli_pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec), "lsp pk");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec), "cli pk");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 4;
+    memcpy(mgr.rot_lsp_seckey, lsp_sec, 32);
+
+    jit_channels_init(&mgr);
+
+    /* Create a JIT channel with proper channel_t initialization */
+    jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+    jits[0].client_idx = 1;
+    jits[0].state = JIT_STATE_OPEN;
+    jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 1;
+    jits[0].funding_amount = 100000;
+    jits[0].channel.local_amount = 45000;
+    jits[0].channel.remote_amount = 45000;
+    jits[0].channel.remote_funding_pubkey = cli_pk;
+    mgr.n_jit_channels = 1;
+
+    /* Verify key match logic: provide correct extracted key */
+    secp256k1_pubkey extracted_pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &extracted_pk, cli_sec),
+                "create extracted pk");
+    unsigned char ser_ext[33], ser_remote[33];
+    size_t l1 = 33, l2 = 33;
+    secp256k1_ec_pubkey_serialize(ctx, ser_ext, &l1, &extracted_pk,
+                                    SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, ser_remote, &l2,
+                                    &jits[0].channel.remote_funding_pubkey,
+                                    SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(ser_ext, ser_remote, 33) == 0,
+                "extracted key should match JIT remote funding pubkey");
+
+    /* Can't fully test broadcast without regtest, but verify the key match
+       and state prerequisites work correctly */
+    TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active");
+
+    /* Call with NULL rt — should return 0 (no crash) */
+    int ret = jit_channel_cooperative_close(&mgr, 1, cli_sec, NULL);
+    TEST_ASSERT_EQ(ret, 0, "should fail with NULL regtest");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN,
+                "state should remain OPEN after failed close");
+
+    jit_channels_cleanup(&mgr);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_jit_cooperative_close_key_mismatch(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char lsp_sec[32], cli_sec[32], wrong_sec[32];
+    memset(lsp_sec, 0x81, 32);
+    memset(cli_sec, 0x82, 32);
+    memset(wrong_sec, 0x99, 32);
+    secp256k1_pubkey lsp_pk, cli_pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec), "lsp pk");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &cli_pk, cli_sec), "cli pk");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 4;
+
+    jit_channels_init(&mgr);
+
+    jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+    jits[0].client_idx = 2;
+    jits[0].state = JIT_STATE_OPEN;
+    jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 2;
+    jits[0].funding_amount = 50000;
+    jits[0].channel.remote_funding_pubkey = cli_pk;
+    mgr.n_jit_channels = 1;
+
+    /* Provide wrong extracted key */
+    regtest_t dummy_rt;
+    memset(&dummy_rt, 0, sizeof(dummy_rt));
+    int ret = jit_channel_cooperative_close(&mgr, 2, wrong_sec, &dummy_rt);
+    TEST_ASSERT_EQ(ret, 0, "should fail with wrong key");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN,
+                "state should remain OPEN on key mismatch");
+
+    jit_channels_cleanup(&mgr);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- Step 7b: Migration Tests --- */
 
 int test_jit_migrate_lifecycle(void) {
     lsp_channel_mgr_t mgr;
@@ -479,36 +581,53 @@ int test_jit_migrate_lifecycle(void) {
 
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active before migrate");
 
-    /* Migrate (no LSP/fd needed for balance accounting test) */
+    /* Migrate (no LSP/fd needed for state transition test) */
     jit_channel_migrate(&mgr, NULL, 1, 0);
 
     /* JIT channel should be closed */
     TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
     TEST_ASSERT_EQ(jit_channel_is_active(&mgr, 1), 0, "JIT should not be active");
 
-    /* Factory channel should have absorbed JIT balance */
-    TEST_ASSERT_EQ((long)mgr.entries[1].channel.local_amount, 45000,
-                   "factory local should include JIT local");
-    TEST_ASSERT_EQ((long)mgr.entries[1].channel.remote_amount, 43000,
-                   "factory remote should include JIT remote");
+    /* Factory balances should be UNCHANGED (JIT funds recovered on-chain) */
+    TEST_ASSERT_EQ((long)mgr.entries[1].channel.local_amount, 40000,
+                   "factory local should be unchanged after migration");
+    TEST_ASSERT_EQ((long)mgr.entries[1].channel.remote_amount, 40000,
+                   "factory remote should be unchanged after migration");
 
     jit_channels_cleanup(&mgr);
     return 1;
 }
 
-int test_jit_migrate_balance(void) {
-    /* Verify balance arithmetic in migration */
-    uint64_t factory_local = 100000;
-    uint64_t factory_remote = 80000;
-    uint64_t jit_local = 15000;
-    uint64_t jit_remote = 12000;
+int test_jit_migrate_no_balance_hack(void) {
+    /* Verify migration does NOT touch factory channel balances.
+       JIT funds are recovered via on-chain cooperative close (Phase A.5),
+       not by adjusting in-memory balances. */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 4;
+    mgr.entries[0].ready = 1;
+    mgr.entries[0].channel_id = 0;
+    mgr.entries[0].channel.local_amount = 100000;
+    mgr.entries[0].channel.remote_amount = 80000;
 
-    factory_local += jit_local;
-    factory_remote += jit_remote;
+    jit_channels_init(&mgr);
 
-    TEST_ASSERT_EQ((long)factory_local, 115000, "local sum");
-    TEST_ASSERT_EQ((long)factory_remote, 92000, "remote sum");
+    jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+    jits[0].client_idx = 0;
+    jits[0].state = JIT_STATE_OPEN;
+    jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 0;
+    jits[0].channel.local_amount = 15000;
+    jits[0].channel.remote_amount = 12000;
+    mgr.n_jit_channels = 1;
 
+    jit_channel_migrate(&mgr, NULL, 0, 0);
+
+    TEST_ASSERT_EQ((long)mgr.entries[0].channel.local_amount, 100000,
+                   "factory local unchanged");
+    TEST_ASSERT_EQ((long)mgr.entries[0].channel.remote_amount, 80000,
+                   "factory remote unchanged");
+
+    jit_channels_cleanup(&mgr);
     return 1;
 }
 
