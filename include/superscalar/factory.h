@@ -233,6 +233,12 @@ int factory_session_complete_node(factory_t *f, size_t node_idx);
 
 void factory_free(factory_t *f);
 
+/* Derive a short channel ID (SCID) for a factory leaf channel.
+   Format: (epoch << 40) | (leaf_index << 16) | output_index.
+   This creates unique, deterministic SCIDs for route hints in BOLT #11 invoices.
+   Factory channels are off-chain, so full BOLT #7 gossip is impossible. */
+uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output_index);
+
 /* Detach tx_buf heap data from a factory so it can be used as a read-only
    shallow copy without risk of double-free.  Zeroes all tx_buf data pointers
    while preserving metadata (n_nodes, keypairs, lifecycle, etc.).  The factory

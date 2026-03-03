@@ -4553,3 +4553,48 @@ int test_factory_variable_arity_backward_compat(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- 4B: SCID derivation --- */
+
+int test_factory_derive_scid(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sec[32]; memset(sec, 0x40 + i, 32);
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sec), "keypair create");
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 10, 100);
+    f.cltv_timeout = 1000;
+    factory_set_funding(&f, (unsigned char[32]){0}, 0, 500000,
+                         (unsigned char[34]){0x51, 0x20}, 34);
+    factory_build_tree(&f);
+
+    /* Epoch 0, leaf 0, output 0 */
+    uint64_t scid0 = factory_derive_scid(&f, 0, 0);
+    TEST_ASSERT(scid0 == ((uint64_t)0 << 40 | (uint64_t)0 << 16 | 0),
+                "scid epoch0 leaf0 out0");
+
+    /* Different leaf index produces different SCID */
+    uint64_t scid1 = factory_derive_scid(&f, 1, 0);
+    TEST_ASSERT(scid1 != scid0, "different leaf -> different scid");
+    TEST_ASSERT(scid1 == ((uint64_t)0 << 40 | (uint64_t)1 << 16 | 0),
+                "scid epoch0 leaf1 out0");
+
+    /* Different output index produces different SCID */
+    uint64_t scid2 = factory_derive_scid(&f, 0, 1);
+    TEST_ASSERT(scid2 != scid0, "different output -> different scid");
+
+    /* After advance, epoch changes → different SCID for same leaf */
+    factory_sign_all(&f);
+    factory_advance(&f);
+    uint64_t scid_e1 = factory_derive_scid(&f, 0, 0);
+    TEST_ASSERT(scid_e1 != scid0, "different epoch -> different scid");
+    TEST_ASSERT(scid_e1 == ((uint64_t)1 << 40 | (uint64_t)0 << 16 | 0),
+                "scid epoch1 leaf0 out0");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

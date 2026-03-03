@@ -32,6 +32,7 @@ BRIDGE_PORT = 9736
 LIGHTNING_CLI = "lightning-cli"
 LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
 KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via plugin option)
+ROUTE_HINT = None  # "node_id/scid/fee_base/fee_ppm/cltv_delta" for factory channels
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 pending_htlcs = {}   # payment_hash -> rpc_id for resolving
@@ -246,7 +247,8 @@ def handle_bridge_msg(msg):
 
 
 def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
-    """Create a CLN invoice with a known preimage and send BOLT11 back to bridge."""
+    """Create a CLN invoice with a known preimage and send BOLT11 back to bridge.
+    If ROUTE_HINT is set, includes it so external nodes can route via the LSP."""
     label = f"superscalar-{payment_hash[:16]}-{int(time.time())}"
     try:
         cmd = cli_cmd(
@@ -258,6 +260,8 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             "null",    # fallbacks
             preimage_hex
         )
+        if ROUTE_HINT:
+            cmd.extend(["--exposeprivatechannels", ROUTE_HINT])
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             inv_result = json.loads(result.stdout)
@@ -477,7 +481,7 @@ def read_requests():
 
 
 def main():
-    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT
+    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT, ROUTE_HINT
 
     # CLN plugin main loop: read JSON-RPC requests
     for request in read_requests():
@@ -513,6 +517,12 @@ def main():
                             "type": "int",
                             "default": 0,
                             "description": "Default factory client index for keysend payments"
+                        },
+                        {
+                            "name": "superscalar-route-hint",
+                            "type": "string",
+                            "default": "",
+                            "description": "Route hint SCID for factory channel invoices (exposeprivatechannels)"
                         }
                     ],
                     "rpcmethods": [
@@ -536,6 +546,8 @@ def main():
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
             KEYSEND_DEFAULT_CLIENT = int(config.get("superscalar-keysend-client",
                                                       KEYSEND_DEFAULT_CLIENT))
+            rh = config.get("superscalar-route-hint", "")
+            ROUTE_HINT = rh if rh else None
 
             # Capture lightning-dir from CLN's configuration so we can
             # pass it to lightning-cli subprocess calls

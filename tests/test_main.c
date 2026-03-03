@@ -485,6 +485,8 @@ extern int test_factory_arity1_split_round_leaf_advance(void);
 extern int test_factory_variable_arity_build(void);
 extern int test_factory_variable_arity_sign(void);
 extern int test_factory_variable_arity_backward_compat(void);
+extern int test_factory_derive_scid(void);
+extern int test_wire_scid_assign(void);
 extern int test_persist_dw_counter_with_leaves_4(void);
 extern int test_persist_file_reopen_round_trip(void);
 
@@ -995,6 +997,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_variable_arity_build);
     RUN_TEST(test_factory_variable_arity_sign);
     RUN_TEST(test_factory_variable_arity_backward_compat);
+    RUN_TEST(test_factory_derive_scid);
+
+    printf("\n=== Route Hints (SCID) ===\n");
+    RUN_TEST(test_wire_scid_assign);
 
     RUN_TEST(test_persist_dw_counter_with_leaves_4);
     RUN_TEST(test_persist_file_reopen_round_trip);

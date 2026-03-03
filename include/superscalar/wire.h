@@ -77,6 +77,9 @@
 #define MSG_LEAF_ADVANCE_PSIG    0x59 /* Client -> LSP: partial sig for leaf node */
 #define MSG_LEAF_ADVANCE_DONE    0x5A /* LSP -> Subtree clients: leaf advance complete */
 
+/* SCID assignment for route hints (4B) */
+#define MSG_SCID_ASSIGN         0x5B  /* LSP → Client: SCID + routing params */
+
 /* Path-scoped signing (subtree re-sign on leaf exhaustion) */
 #define MSG_PATH_NONCE_BUNDLE   0x60  /* Client -> LSP: nonces for path nodes */
 #define MSG_PATH_ALL_NONCES     0x61  /* LSP -> Clients: aggregated path nonces */
@@ -543,6 +546,17 @@ int wire_parse_leaf_advance_psig(const cJSON *json,
 cJSON *wire_build_leaf_advance_done(int leaf_side);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
+
+/* --- SCID assignment for route hints (4B) --- */
+
+/* LSP → Client: SCID_ASSIGN {channel_id, scid, fee_base_msat, fee_ppm, cltv_delta} */
+cJSON *wire_build_scid_assign(uint32_t channel_id, uint64_t scid,
+                               uint32_t fee_base_msat, uint32_t fee_ppm,
+                               uint16_t cltv_delta);
+
+int wire_parse_scid_assign(const cJSON *json, uint32_t *channel_id,
+                             uint64_t *scid, uint32_t *fee_base_msat,
+                             uint32_t *fee_ppm, uint16_t *cltv_delta);
 
 /* --- Bundle parsing --- */
 
