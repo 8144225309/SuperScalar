@@ -638,17 +638,16 @@ CLN (lightningd)
 
 ## Known Limitations
 
-Production deployment considerations — see [docs/gaps-and-changes.md](docs/gaps-and-changes.md) for full roadmap.
-
 | Area | Status | Notes |
 |------|--------|-------|
 | **Reconnect (BOLT #2)** | Implemented | Commitment reconciliation with DB rollback; HTLC replay after reconnect |
-| **AEAD crypto** | PoC | Hand-rolled ChaCha20-Poly1305; should link libsodium or OpenSSL EVP |
-| **Capacity limits** | Bumped | `LSP_MAX_CLIENTS=16`, `MAX_HTLCS=32` — compile-time constants, increased from original 8/16 |
-| **JIT migration** | Implemented | JIT channels cooperatively closed on-chain during rotation (Phase A.5); balance recovered to LSP wallet |
-| **Fee estimation** | Default-on | Dynamic `estimatesmartfee` enabled by default; static 1000 sat/kvB fallback |
-| **Gossip (BOLT #7)** | Not implemented | Factory channels not advertised to LN graph; bridge handles routing |
-| **Hashlock burn** | By design | L-stock burn enforced by `factory_build_burn_tx()`, not by Script (would require covenant opcodes) |
+| **AEAD crypto** | Implemented | OpenSSL EVP ChaCha20-Poly1305 (hardware-accelerated) |
+| **Capacity limits** | Dynamic | Pointer + count + capacity; defaults match previous compile-time constants |
+| **JIT migration** | Implemented | JIT channels cooperatively closed on-chain during rotation (Phase A.5) |
+| **Fee estimation** | Default-on | Dynamic `estimatesmartfee`; static 1000 sat/kvB fallback |
+| **Gossip (BOLT #7)** | Route hints | Full gossip impossible (off-chain); SCID + route hints in BOLT #11 invoices |
+| **Variable arity** | Implemented | Per-level branching factors via `--arity 1,1,2,2` |
+| **Hashlock burn** | By design | Enforced by `factory_build_burn_tx()`, not Script (would require covenant opcodes) |
 
 ## License
 
