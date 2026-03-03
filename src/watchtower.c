@@ -743,6 +743,13 @@ void watchtower_cleanup(watchtower_t *wt) {
     }
 }
 
+void watchtower_clear_entries(watchtower_t *wt) {
+    if (!wt) return;
+    /* Free any factory node response/burn data, then reset count */
+    watchtower_cleanup(wt);
+    wt->n_entries = 0;
+}
+
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
     if (!wt) return;
 

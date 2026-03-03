@@ -221,6 +221,12 @@ int factory_session_complete_node(factory_t *f, size_t node_idx);
 
 void factory_free(factory_t *f);
 
+/* Detach tx_buf heap data from a factory so it can be used as a read-only
+   shallow copy without risk of double-free.  Zeroes all tx_buf data pointers
+   while preserving metadata (n_nodes, keypairs, lifecycle, etc.).  The factory
+   must NOT be used for signing or TX building after this call. */
+void factory_detach_txbufs(factory_t *f);
+
 /* Shachain L-output invalidation API */
 
 /* Enable shachain-based L-output invalidation. Call before factory_build_tree. */

@@ -35,7 +35,7 @@ typedef struct jit_channel {
 
 #define JIT_MAX_CHANNELS 8
 #define JIT_CHANNEL_ID_BASE 0x8000
-#define JIT_OFFLINE_TIMEOUT_SEC 120  /* Seconds without message = offline */
+#define JIT_OFFLINE_TIMEOUT_SEC 300  /* Seconds without message = offline */
 
 /* Forward declarations to avoid circular includes */
 struct lsp_channel_mgr;

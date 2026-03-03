@@ -349,6 +349,8 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        int client_fd, wire_msg_t *msg,
                                        int timeout_sec) {
     (void)lsp;
+    /* Zero msg so callers can safely check msg->json on failure */
+    memset(msg, 0, sizeof(*msg));
     static int servicing = 0;   /* recursion guard (single-threaded) */
     struct timeval start, now;
     gettimeofday(&start, NULL);
@@ -1611,6 +1613,16 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Stale commitment_signed — discard silently */
         return 1;
 
+    case MSG_PTLC_ADAPTED_SIG:
+        /* Late adapted_sig from a rotation Phase A that already timed out.
+           The rotation code reads these via wire_recv_timeout with a 15s
+           deadline per client; if the client responds after the deadline,
+           the message sits in the fd buffer until the daemon loop picks
+           it up here. Safe to discard. */
+        printf("LSP: discarding stale PTLC_ADAPTED_SIG from client %zu\n",
+               client_idx);
+        return 1;
+
     default:
         fprintf(stderr, "LSP: unexpected msg 0x%02x from client %zu\n",
                 msg->msg_type, client_idx);
@@ -1629,6 +1641,16 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    wait for REVOKE_AND_ACK → persist. */
 static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reconnected_idx) {
     if (!mgr || !lsp) return;
+
+    /* Skip replay if factory is expired — forwarding HTLCs is pointless
+       when the factory can no longer advance DW state. */
+    if (lsp->factory.n_nodes == 0) return;
+    {
+        int h = mgr->watchtower && mgr->watchtower->rt ?
+                regtest_get_block_height(mgr->watchtower->rt) : 0;
+        if (h > 0 && factory_get_state(&lsp->factory, (uint32_t)h) == FACTORY_EXPIRED)
+            return;
+    }
 
     for (size_t src = 0; src < mgr->n_channels; src++) {
         if (src == reconnected_idx) continue;
@@ -2231,8 +2253,19 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         fflush(stdout);
         if (lsp_channels_rotate_factory(mgr, lsp))
             printf("CLI: rotation succeeded\n");
-        else
+        else {
             printf("CLI: rotation FAILED\n");
+            fflush(stdout);
+            fflush(stderr);
+        }
+        /* Reset offline timers after rotation attempt */
+        {
+            time_t tnow = time(NULL);
+            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                mgr->entries[rc].last_message_time = tnow;
+                mgr->entries[rc].offline_detected = 0;
+            }
+        }
     } else if (strcmp(line, "close") == 0) {
         printf("CLI: triggering shutdown (cooperative close)\n");
         fflush(stdout);
@@ -2473,6 +2506,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         mgr->rot_retry_count[ridx] = 0;
                                         mgr->rot_last_attempt_block[ridx] = 0;
                                         int ok = lsp_channels_rotate_factory(mgr, lsp);
+                                        /* Reset offline timers — rotation involves client
+                                           communication that doesn't go through the
+                                           daemon loop's message handler */
+                                        {
+                                            time_t tnow = time(NULL);
+                                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                                mgr->entries[rc].last_message_time = tnow;
+                                                mgr->entries[rc].offline_detected = 0;
+                                            }
+                                        }
                                         if (ok) {
                                             printf("LSP: auto-rotation complete — new factory active\n");
                                             fflush(stdout);
@@ -2498,6 +2541,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                lf->factory_id, attempt, mret);
                                         fflush(stdout);
                                         int ok = lsp_channels_rotate_factory(mgr, lsp);
+                                        {
+                                            time_t tnow = time(NULL);
+                                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                                mgr->entries[rc].last_message_time = tnow;
+                                                mgr->entries[rc].offline_detected = 0;
+                                            }
+                                        }
                                         if (ok) {
                                             printf("LSP: retry rotation complete\n");
                                             fflush(stdout);

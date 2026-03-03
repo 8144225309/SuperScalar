@@ -1788,6 +1788,7 @@ int test_ladder_daemon_integration(void) {
 
     ladder_factory_t *lf = &lad.factories[0];
     lf->factory = f;
+    factory_detach_txbufs(&lf->factory);
     lf->factory_id = lad.next_factory_id++;
     lf->is_initialized = 1;
     lf->is_funded = 1;

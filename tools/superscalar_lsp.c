@@ -18,6 +18,9 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <execinfo.h>
+#endif
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
 
@@ -34,6 +37,17 @@ static void sigint_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
 }
+
+#ifdef __linux__
+static void crash_handler(int sig) {
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    fprintf(stderr, "\n=== CRASH (signal %d) ===\n", sig);
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    fflush(stderr);
+    _exit(128 + sig);
+}
+#endif
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -445,8 +459,16 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
 }
 
 int main(int argc, char *argv[]) {
+    /* Line-buffered stdout/stderr so logs are visible in real time */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
     /* Ignore SIGPIPE — write() to dead client sockets returns EPIPE instead of killing us */
     signal(SIGPIPE, SIG_IGN);
+#ifdef __linux__
+    signal(SIGABRT, crash_handler);
+    signal(SIGSEGV, crash_handler);
+#endif
 
     int port = 9735;
     int n_clients = 4;
@@ -1060,6 +1082,7 @@ int main(int argc, char *argv[]) {
             {
                 ladder_factory_t *lf = &rec_lad.factories[0];
                 lf->factory = lsp.factory;
+                factory_detach_txbufs(&lf->factory);
                 lf->factory_id = rec_lad.next_factory_id++;
                 lf->is_initialized = 1;
                 lf->is_funded = 1;
@@ -1560,10 +1583,12 @@ int main(int argc, char *argv[]) {
         int cur_h = regtest_get_block_height(&rt);
         if (cur_h > 0) lad.current_block = (uint32_t)cur_h;
     }
-    /* Populate slot 0 with the existing factory (shallow copy) */
+    /* Populate slot 0 with the existing factory (detached copy — no shared
+       tx_buf heap data, preventing double-free if lsp.factory is freed later). */
     {
         ladder_factory_t *lf = &lad.factories[0];
         lf->factory = lsp.factory;
+        factory_detach_txbufs(&lf->factory);
         lf->factory_id = lad.next_factory_id++;
         lf->is_initialized = 1;
         lf->is_funded = 1;
@@ -2856,7 +2881,8 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx); return 1;
         }
 
-        /* Free old factory in lsp before reusing */
+        /* Free old factory in lsp before reusing.
+           Ladder entries use detached copies so no double-free risk. */
         factory_free(&lsp.factory);
 
         /* Compute cltv_timeout for Factory 1 */

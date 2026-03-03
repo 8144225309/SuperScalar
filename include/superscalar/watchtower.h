@@ -123,6 +123,10 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
 
+/* Clear all watchtower entries (e.g., after factory rotation).
+   Frees any allocated data and resets the entry count to 0. */
+void watchtower_clear_entries(watchtower_t *wt);
+
 /* Build a CPFP child tx to bump a stuck penalty tx.
    Uses anchor output from penalty tx + wallet UTXO.
    Returns 1 on success, 0 on failure. */
