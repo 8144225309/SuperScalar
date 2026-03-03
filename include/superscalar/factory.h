@@ -155,6 +155,13 @@ typedef struct {
     int per_leaf_enabled;          /* activated after first leaf advance */
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
+    /* Variable arity per tree level (4A): overrides leaf_arity when set.
+       level_arity[d] = arity at depth d (1 or 2). The last entry applies
+       to all deeper levels. n_level_arity == 0 means uniform leaf_arity. */
+    #define FACTORY_MAX_LEVELS 8
+    uint8_t level_arity[FACTORY_MAX_LEVELS];
+    size_t n_level_arity;
+
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
@@ -180,6 +187,11 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 /* Set factory arity. Must be called after init, before build_tree.
    Reinitializes DW counter with correct layer count for the arity. */
 void factory_set_arity(factory_t *f, factory_arity_t arity);
+
+/* Set variable arity per tree level (4A). arities[0]=root level, etc.
+   Last entry applies to all deeper levels. Clears uniform leaf_arity.
+   Must be called after init, before build_tree. */
+void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
 
 void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,

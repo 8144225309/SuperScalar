@@ -460,6 +460,17 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     uint64_t fee_per_tx = (uint64_t)fp->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(pj, "leaf_arity");
     int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
+    uint8_t rot_level_arities[FACTORY_MAX_LEVELS];
+    size_t rot_n_level_arity = 0;
+    cJSON *rla_arr = cJSON_GetObjectItem(pj, "level_arity");
+    if (rla_arr && cJSON_IsArray(rla_arr)) {
+        int rla_n = cJSON_GetArraySize(rla_arr);
+        for (int rli = 0; rli < rla_n && rli < FACTORY_MAX_LEVELS; rli++) {
+            cJSON *rlai = cJSON_GetArrayItem(rla_arr, rli);
+            if (rlai && cJSON_IsNumber(rlai))
+                rot_level_arities[rot_n_level_arity++] = (uint8_t)rlai->valuedouble;
+        }
+    }
 
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *rpm_item = cJSON_GetObjectItem(pj, "placement_mode");
@@ -498,7 +509,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
     memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
-    if (rot_leaf_arity == 1)
+    if (rot_n_level_arity > 0)
+        factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
+    else if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
@@ -892,6 +905,19 @@ int client_run_with_channels(secp256k1_context *ctx,
     cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
     int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
 
+    /* Parse variable level_arity array (4A), fall back to leaf_arity */
+    uint8_t level_arities[FACTORY_MAX_LEVELS];
+    size_t n_level_arity = 0;
+    cJSON *la_arr = cJSON_GetObjectItem(msg.json, "level_arity");
+    if (la_arr && cJSON_IsArray(la_arr)) {
+        int la_n = cJSON_GetArraySize(la_arr);
+        for (int li = 0; li < la_n && li < FACTORY_MAX_LEVELS; li++) {
+            cJSON *lai = cJSON_GetArrayItem(la_arr, li);
+            if (lai && cJSON_IsNumber(lai))
+                level_arities[n_level_arity++] = (uint8_t)lai->valuedouble;
+        }
+    }
+
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
     int placement_mode = (pm_item && cJSON_IsNumber(pm_item)) ? (int)pm_item->valuedouble : 0;
@@ -931,7 +957,9 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory.placement_mode = (placement_mode_t)placement_mode;
     factory.economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory.profiles, profiles, sizeof(profiles));
-    if (leaf_arity == 1)
+    if (n_level_arity > 0)
+        factory_set_level_arity(&factory, level_arities, n_level_arity);
+    else if (leaf_arity == 1)
         factory_set_arity(&factory, FACTORY_ARITY_1);
     factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);

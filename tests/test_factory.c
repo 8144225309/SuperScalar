@@ -4433,3 +4433,123 @@ int test_distribution_tx_has_anchor(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Variable arity per tree level (4A) ---- */
+
+static int setup_variable_arity_factory(factory_t *f, secp256k1_context *ctx,
+                                         secp256k1_keypair *kps, size_t n_participants,
+                                         const uint8_t *arities, size_t n_arities,
+                                         uint64_t funding) {
+    for (size_t i = 0; i < n_participants; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]))
+            return 0;
+    }
+    secp256k1_pubkey pks[16];
+    for (size_t i = 0; i < n_participants; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, n_participants)) return 0;
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak))
+        return 0;
+    secp256k1_xonly_pubkey fund_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_xonly, NULL, &tweaked_pk);
+
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &fund_xonly);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_init(f, ctx, kps, n_participants, 2, 4);
+    factory_set_level_arity(f, arities, n_arities);
+    factory_set_funding(f, fake_txid, 0, funding, fund_spk, 34);
+    return 1;
+}
+
+/* Test: variable arity [1,1,2] with 8 clients (9 participants).
+   Level 0 (root): arity 1, Level 1: arity 1, Level 2+: arity 2.
+   8 clients → split 4/4 → split 2/2 → paired leaves → 4 leaves. */
+int test_factory_variable_arity_build(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[9];
+    factory_t f;
+    uint8_t arities[] = {1, 1, 2};
+    TEST_ASSERT(setup_variable_arity_factory(&f, ctx, kps, 9, arities, 3, 5000000),
+                "setup variable arity");
+    f.cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(&f), "build tree variable arity");
+
+    TEST_ASSERT_EQ(f.n_leaf_nodes, 4, "4 leaves with [1,1,2]");
+
+    /* Check all node types alternate kickoff/state */
+    for (size_t i = 0; i < f.n_nodes; i += 2) {
+        TEST_ASSERT(f.nodes[i].type == NODE_KICKOFF, "even = kickoff");
+        TEST_ASSERT(f.nodes[i+1].type == NODE_STATE, "odd = state");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: variable arity build + sign + advance cycle. */
+int test_factory_variable_arity_sign(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    uint8_t arities[] = {1, 2};
+    TEST_ASSERT(setup_variable_arity_factory(&f, ctx, kps, 5, arities, 2, 2000000),
+                "setup");
+    f.cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(&f), "build");
+    TEST_ASSERT(factory_sign_all(&f), "sign");
+    TEST_ASSERT(factory_advance(&f), "advance 1");
+    TEST_ASSERT(factory_advance(&f), "advance 2");
+
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        TEST_ASSERT(f.nodes[i].signed_tx.data != NULL, "signed tx not null");
+        TEST_ASSERT(f.nodes[i].signed_tx.len > 0, "signed tx non-empty");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: uniform arity via set_level_arity produces same result as set_arity. */
+int test_factory_variable_arity_backward_compat(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps1[5], kps2[5];
+    factory_t f1, f2;
+
+    TEST_ASSERT(setup_n_factory(&f1, ctx, kps1, 5, FACTORY_ARITY_2, 2000000), "setup f1");
+    f1.cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(&f1), "build f1");
+
+    uint8_t arities[] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(&f2, ctx, kps2, 5, arities, 1, 2000000), "setup f2");
+    f2.cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(&f2), "build f2");
+
+    TEST_ASSERT_EQ(f1.n_nodes, f2.n_nodes, "same node count");
+    TEST_ASSERT_EQ(f1.n_leaf_nodes, f2.n_leaf_nodes, "same leaf count");
+
+    for (size_t i = 0; i < f1.n_nodes; i++) {
+        TEST_ASSERT(f1.nodes[i].type == f2.nodes[i].type, "same node type");
+        TEST_ASSERT_EQ(f1.nodes[i].n_signers, f2.nodes[i].n_signers, "same signers");
+    }
+
+    factory_free(&f1);
+    factory_free(&f2);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
