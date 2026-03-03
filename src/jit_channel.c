@@ -480,6 +480,133 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     return 1;
 }
 
+int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
+                                   const unsigned char *extracted_client_key,
+                                   regtest_t *rt) {
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    if (!mgr || !extracted_client_key || !rt) return 0;
+
+    jit_channel_t *jit = jit_channel_find(mgr, client_idx);
+    if (!jit || jit->state != JIT_STATE_OPEN) return 0;
+
+    /* Verify extracted key matches jit->channel.remote_funding_pubkey */
+    secp256k1_pubkey extracted_pk;
+    if (!secp256k1_ec_pubkey_create(mgr->ctx, &extracted_pk, extracted_client_key)) {
+        fprintf(stderr, "LSP JIT close: invalid extracted key for client %zu\n",
+                client_idx);
+        return 0;
+    }
+    unsigned char ser_extracted[33], ser_remote[33];
+    size_t l1 = 33, l2 = 33;
+    secp256k1_ec_pubkey_serialize(mgr->ctx, ser_extracted, &l1, &extracted_pk,
+                                    SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(mgr->ctx, ser_remote, &l2,
+                                    &jit->channel.remote_funding_pubkey,
+                                    SECP256K1_EC_COMPRESSED);
+    if (memcmp(ser_extracted, ser_remote, 33) != 0) {
+        fprintf(stderr, "LSP JIT close: key mismatch for client %zu "
+                "(extracted != JIT remote funding key)\n", client_idx);
+        return 0;
+    }
+
+    /* Build remote keypair from extracted secret */
+    secp256k1_keypair remote_kp;
+    if (!secp256k1_keypair_create(mgr->ctx, &remote_kp, extracted_client_key)) {
+        fprintf(stderr, "LSP JIT close: keypair_create failed for client %zu\n",
+                client_idx);
+        return 0;
+    }
+
+    /* Get fresh wallet address for close output */
+    char close_addr[128];
+    unsigned char close_spk[64];
+    size_t close_spk_len = 0;
+    if (!regtest_get_new_address(rt, close_addr, sizeof(close_addr)) ||
+        !regtest_get_address_scriptpubkey(rt, close_addr, close_spk, &close_spk_len)) {
+        fprintf(stderr, "LSP JIT close: failed to get wallet address for client %zu\n",
+                client_idx);
+        return 0;
+    }
+
+    /* Calculate fee: 1-in-1-out P2TR close ~111 vbytes */
+    uint64_t total = jit->funding_amount;
+    const fee_estimator_t *fe = (const fee_estimator_t *)mgr->fee;
+    uint64_t close_fee = fe ? fee_estimate(fe, 111) : 200;
+    if (close_fee == 0) close_fee = 200;
+    if (close_fee > total / 2) close_fee = total / 2;
+
+    /* Build single close output: total - fee to LSP wallet */
+    tx_output_t output;
+    output.amount_sats = total - close_fee;
+    memcpy(output.script_pubkey, close_spk, close_spk_len);
+    output.script_pubkey_len = close_spk_len;
+
+    /* Build cooperative close tx */
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 256);
+    if (!channel_build_cooperative_close_tx(&jit->channel, &close_tx, NULL,
+                                              &remote_kp, &output, 1)) {
+        fprintf(stderr, "LSP JIT close: build close tx failed for client %zu\n",
+                client_idx);
+        tx_buf_free(&close_tx);
+        return 0;
+    }
+
+    /* Broadcast */
+    char *close_hex = malloc(close_tx.len * 2 + 1);
+    if (!close_hex) { tx_buf_free(&close_tx); return 0; }
+    hex_encode(close_tx.data, close_tx.len, close_hex);
+    char close_txid[65];
+    int sent = regtest_send_raw_tx(rt, close_hex, close_txid);
+    if (mgr->persist) {
+        persist_log_broadcast((persist_t *)mgr->persist,
+                              sent ? close_txid : "?", "jit_cooperative_close",
+                              close_hex, sent ? "ok" : "failed");
+    }
+    free(close_hex);
+    tx_buf_free(&close_tx);
+
+    if (!sent) {
+        fprintf(stderr, "LSP JIT close: broadcast failed for client %zu\n",
+                client_idx);
+        return 0;
+    }
+
+    /* Confirm */
+    if (mgr->rot_is_regtest) {
+        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+    } else {
+        int timeout = mgr->confirm_timeout_secs > 0 ?
+                      mgr->confirm_timeout_secs : 7200;
+        if (regtest_wait_for_confirmation(rt, close_txid, timeout) < 1) {
+            fprintf(stderr, "LSP JIT close: confirmation timeout for client %zu\n",
+                    client_idx);
+            return 0;
+        }
+    }
+
+    /* Update state */
+    jit->state = JIT_STATE_CLOSED;
+
+    /* Cleanup watchtower */
+    if (mgr->watchtower) {
+        size_t wt_idx = mgr->n_channels + client_idx;
+        watchtower_remove_channel(mgr->watchtower, (uint32_t)wt_idx);
+        mgr->watchtower->channels[wt_idx] = NULL;
+    }
+
+    /* Persist */
+    if (mgr->persist) {
+        persist_delete_jit_channel((persist_t *)mgr->persist, jit->jit_channel_id);
+        persist_log_broadcast((persist_t *)mgr->persist, close_txid,
+                              "jit_close_confirmed", "", "ok");
+    }
+
+    printf("LSP JIT close: channel %08x for client %zu closed: %s\n",
+           jit->jit_channel_id, client_idx, close_txid);
+    return 1;
+}
+
 int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
                          size_t client_idx, uint32_t target_factory_id) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
@@ -503,14 +630,8 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
         cJSON_Delete(mig);
     }
 
-    /* Account for JIT balance in the new factory channel */
-    if (client_idx < mgr->n_channels && mgr->entries[client_idx].ready) {
-        channel_t *factory_ch = &mgr->entries[client_idx].channel;
-        /* The remote_amount in JIT (client's money) should be reflected
-           in the factory channel. For PoC, we adjust balances directly. */
-        factory_ch->local_amount += jit->channel.local_amount;
-        factory_ch->remote_amount += jit->channel.remote_amount;
-    }
+    /* JIT funds recovered via on-chain cooperative close (Phase A.5).
+       New factory funding draws from wallet which now includes JIT sats. */
 
     /* Close the JIT channel */
     jit->state = JIT_STATE_CLOSED;

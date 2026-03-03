@@ -2,6 +2,7 @@
 #define SUPERSCALAR_JIT_CHANNEL_H
 
 #include "channel.h"
+#include "regtest.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
@@ -76,6 +77,13 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
 /* Check JIT channels in FUNDING state; transition to OPEN when confirmed.
    Returns number of channels that transitioned. */
 int jit_channels_check_funding(void *mgr_ptr);
+
+/* Cooperatively close a JIT channel using an extracted client secret key.
+   Used during rotation (Phase A.5) after PTLC turnover reveals the client key.
+   Spends the JIT UTXO to the LSP wallet. Returns 1 on success. */
+int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
+                                   const unsigned char *extracted_client_key,
+                                   regtest_t *rt);
 
 /* Clean up JIT channel resources. */
 void jit_channels_cleanup(void *mgr_ptr);

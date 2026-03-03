@@ -220,6 +220,31 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
            rc < 0 && errno == EAGAIN/EWOULDBLOCK: no data but socket open (alive) */
     }
 
+    /* Phase A.5: Close active JIT channels using extracted keys */
+    if (mgr->jit_channels) {
+        ladder_factory_t *dying_lf = ladder_get_by_id(lad, dying_id);
+        regtest_t *jit_rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
+        if (jit_rt) {
+            for (size_t c = 0; c < mgr->n_channels; c++) {
+                if (!jit_channel_is_active(mgr, c)) continue;
+                size_t pidx = c + 1; /* participant index: 0=LSP, 1..N=clients */
+                if (!dying_lf || !dying_lf->client_departed[pidx]) {
+                    fprintf(stderr, "LSP rotate: client %zu JIT active but "
+                            "key not extracted\n", c);
+                    continue;
+                }
+                if (jit_channel_cooperative_close(mgr, c,
+                        dying_lf->extracted_keys[pidx], jit_rt)) {
+                    printf("LSP rotate: closed JIT channel for client %zu\n", c);
+                } else {
+                    fprintf(stderr, "LSP rotate: WARNING: could not close JIT "
+                            "for client %zu (key mismatch or broadcast failure)\n",
+                            c);
+                }
+            }
+        }
+    }
+
     /* Check if all online clients departed (full close) or partial.
        Even if all keys are extracted, only do full close when ALL clients
        are currently online — the close TX is irreversible, and the new
