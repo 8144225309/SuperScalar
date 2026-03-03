@@ -2,3 +2,4 @@ services:
   superscalar:
     build: .
     command: demo
+    mem_limit: 512m

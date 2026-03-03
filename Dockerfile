@@ -1,9 +1,9 @@
 FROM ubuntu:24.04
 
-# Build deps
+# Build deps + python3 for integration tests
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git libsqlite3-dev ca-certificates \
-    autoconf automake libtool pkg-config \
+    autoconf automake libtool pkg-config python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Bitcoin Core 28.1 (regtest only)
