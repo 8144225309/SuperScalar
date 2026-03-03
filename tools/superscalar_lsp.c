@@ -925,12 +925,13 @@ int main(int argc, char *argv[]) {
 
     /* === Recovery probe: skip ceremony if factory exists in DB === */
     if (use_db && daemon_mode) {
-        factory_t rec_f;
-        memset(&rec_f, 0, sizeof(rec_f));
-        if (persist_load_factory(&db, 0, &rec_f, ctx)) {
-            if (rec_f.n_participants < 2) {
+        factory_t *rec_f = calloc(1, sizeof(factory_t));
+        if (!rec_f) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
+        if (persist_load_factory(&db, 0, rec_f, ctx)) {
+            if (rec_f->n_participants < 2) {
                 fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
-                        rec_f.n_participants);
+                        rec_f->n_participants);
+                free(rec_f);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
@@ -941,8 +942,9 @@ int main(int argc, char *argv[]) {
 
             /* Set up LSP with listen socket only (skip ceremony) */
             lsp_t lsp;
-            if (!lsp_init(&lsp, ctx, &lsp_kp, port, rec_f.n_participants - 1)) {
+            if (!lsp_init(&lsp, ctx, &lsp_kp, port, rec_f->n_participants - 1)) {
                 fprintf(stderr, "LSP recovery: lsp_init failed\n");
+                free(rec_f);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
@@ -966,13 +968,15 @@ int main(int argc, char *argv[]) {
             }
 
             /* Populate pubkeys from recovered factory */
-            size_t rec_n_clients = rec_f.n_participants - 1;
+            size_t rec_n_clients = rec_f->n_participants - 1;
             lsp.n_clients = rec_n_clients;
             for (size_t i = 0; i < rec_n_clients; i++)
-                lsp.client_pubkeys[i] = rec_f.pubkeys[i + 1];
+                lsp.client_pubkeys[i] = rec_f->pubkeys[i + 1];
 
             /* Copy factory and set fee estimator */
-            lsp.factory = rec_f;
+            lsp.factory = *rec_f;
+            free(rec_f);
+            rec_f = NULL;
             lsp.factory.fee = &fee_est;
 
             /* Load DW counter state from DB */
@@ -999,23 +1003,24 @@ int main(int argc, char *argv[]) {
             }
 
             /* Initialize channels from DB */
-            lsp_channel_mgr_t mgr;
-            memset(&mgr, 0, sizeof(mgr));
-            mgr.fee = &fee_est;
-            if (!lsp_channels_init_from_db(&mgr, ctx, &lsp.factory, lsp_seckey,
+            lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+            if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+            mgr->fee = &fee_est;
+            if (!lsp_channels_init_from_db(mgr, ctx, &lsp.factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
+                free(mgr);
                 lsp_cleanup(&lsp);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            mgr.persist = &db;
-            mgr.confirm_timeout_secs = confirm_timeout_secs;
+            mgr->persist = &db;
+            mgr->confirm_timeout_secs = confirm_timeout_secs;
 
             /* Load persisted state: invoices, HTLC origins, request_id */
-            mgr.next_request_id = persist_load_counter(&db, "next_request_id", 1);
+            mgr->next_request_id = persist_load_counter(&db, "next_request_id", 1);
 
             {
                 unsigned char inv_hashes[MAX_INVOICE_REGISTRY][32];
@@ -1024,8 +1029,8 @@ int main(int argc, char *argv[]) {
                 size_t n_inv = persist_load_invoices(&db,
                     inv_hashes, inv_dests, inv_amounts, MAX_INVOICE_REGISTRY);
                 for (size_t i = 0; i < n_inv; i++) {
-                    if (mgr.n_invoices >= MAX_INVOICE_REGISTRY) break;
-                    invoice_entry_t *inv = &mgr.invoices[mgr.n_invoices++];
+                    if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) break;
+                    invoice_entry_t *inv = &mgr->invoices[mgr->n_invoices++];
                     memcpy(inv->payment_hash, inv_hashes[i], 32);
                     inv->dest_client = inv_dests[i];
                     inv->amount_msat = inv_amounts[i];
@@ -1045,8 +1050,8 @@ int main(int argc, char *argv[]) {
                     orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
                     MAX_HTLC_ORIGINS);
                 for (size_t i = 0; i < n_orig; i++) {
-                    if (mgr.n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                    htlc_origin_t *o = &mgr.htlc_origins[mgr.n_htlc_origins++];
+                    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
+                    htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
                     memcpy(o->payment_hash, orig_hashes[i], 32);
                     o->bridge_htlc_id = orig_bridge[i];
                     o->request_id = orig_req[i];
@@ -1061,10 +1066,10 @@ int main(int argc, char *argv[]) {
             /* Initialize watchtower */
             static watchtower_t rec_wt;
             memset(&rec_wt, 0, sizeof(rec_wt));
-            watchtower_init(&rec_wt, mgr.n_channels, &rt, &fee_est, &db);
-            for (size_t c = 0; c < mgr.n_channels; c++)
-                watchtower_set_channel(&rec_wt, c, &mgr.entries[c].channel);
-            mgr.watchtower = &rec_wt;
+            watchtower_init(&rec_wt, mgr->n_channels, &rt, &fee_est, &db);
+            for (size_t c = 0; c < mgr->n_channels; c++)
+                watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
+            mgr->watchtower = &rec_wt;
 
             /* Initialize ladder */
             ladder_t rec_lad;
@@ -1091,14 +1096,14 @@ int main(int argc, char *argv[]) {
                 tx_buf_init(&lf->distribution_tx, 256);
                 rec_lad.n_factories = 1;
             }
-            mgr.ladder = &rec_lad;
+            mgr->ladder = &rec_lad;
 
             /* Wire rotation parameters */
-            memcpy(mgr.rot_lsp_seckey, lsp_seckey, 32);
-            mgr.rot_fee_est = &fee_est;
-            memcpy(mgr.rot_fund_spk, lsp.factory.funding_spk,
+            memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
+            mgr->rot_fee_est = &fee_est;
+            memcpy(mgr->rot_fund_spk, lsp.factory.funding_spk,
                    lsp.factory.funding_spk_len);
-            mgr.rot_fund_spk_len = lsp.factory.funding_spk_len;
+            mgr->rot_fund_spk_len = lsp.factory.funding_spk_len;
 
             /* Derive funding + mining addresses for rotation */
             {
@@ -1134,40 +1139,40 @@ int main(int argc, char *argv[]) {
                 }
                 char rfa[128];
                 if (derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
-                    snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr),
+                    snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr),
                              "%s", rfa);
             }
             {
                 char rma[128];
                 if (regtest_get_new_address(&rt, rma, sizeof(rma)))
-                    snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr),
+                    snprintf(mgr->rot_mine_addr, sizeof(mgr->rot_mine_addr),
                              "%s", rma);
             }
-            mgr.rot_step_blocks = step_blocks;
-            mgr.rot_states_per_layer = states_per_layer;
-            mgr.rot_leaf_arity = leaf_arity;
-            mgr.rot_is_regtest = is_regtest;
-            mgr.rot_funding_sats = funding_sats;
-            mgr.rot_auto_rotate = 1;
-            mgr.rot_attempted_mask = 0;
-            mgr.cli_enabled = cli_mode;
-            mgr.auto_rebalance = auto_rebalance;
-            mgr.rebalance_threshold_pct = (uint16_t)rebalance_threshold;
+            mgr->rot_step_blocks = step_blocks;
+            mgr->rot_states_per_layer = states_per_layer;
+            mgr->rot_leaf_arity = leaf_arity;
+            mgr->rot_is_regtest = is_regtest;
+            mgr->rot_funding_sats = funding_sats;
+            mgr->rot_auto_rotate = 1;
+            mgr->rot_attempted_mask = 0;
+            mgr->cli_enabled = cli_mode;
+            mgr->auto_rebalance = auto_rebalance;
+            mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
             /* JIT Channel Fallback */
-            jit_channels_init(&mgr);
-            if (no_jit) mgr.jit_enabled = 0;
-            mgr.jit_funding_sats = (jit_amount_arg > 0) ?
+            jit_channels_init(mgr);
+            if (no_jit) mgr->jit_enabled = 0;
+            mgr->jit_funding_sats = (jit_amount_arg > 0) ?
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
 
             /* Load JIT channels from DB */
             {
-                jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+                jit_channel_t *jits = (jit_channel_t *)mgr->jit_channels;
                 size_t jit_count = 0;
                 persist_load_jit_channels(&db, jits, JIT_MAX_CHANNELS,
                                             &jit_count);
-                mgr.n_jit_channels = jit_count;
+                mgr->n_jit_channels = jit_count;
                 for (size_t ji = 0; ji < jit_count; ji++) {
                     if (jits[ji].state != JIT_STATE_OPEN)
                         continue;
@@ -1215,7 +1220,7 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
 
-                    size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
+                    size_t wt_idx = mgr->n_channels + jits[ji].client_idx;
                     if (wt_idx < WATCHTOWER_MAX_CHANNELS)
                         watchtower_set_channel(&rec_wt, wt_idx, jch);
                 }
@@ -1227,13 +1232,13 @@ int main(int argc, char *argv[]) {
             printf("LSP recovery: entering daemon mode "
                    "(waiting for client reconnections)...\n");
             fflush(stdout);
-            lsp_channels_run_daemon_loop(&mgr, &lsp, &g_shutdown);
+            lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
 
             /* Persist updated channel balances on shutdown */
             if (persist_begin(&db)) {
                 int bal_ok = 1;
-                for (size_t c = 0; c < mgr.n_channels; c++) {
-                    const channel_t *ch = &mgr.entries[c].channel;
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    const channel_t *ch = &mgr->entries[c].channel;
                     if (!persist_update_channel_balance(&db, (uint32_t)c,
                         ch->local_amount, ch->remote_amount,
                         ch->commitment_number)) {
@@ -1246,7 +1251,8 @@ int main(int argc, char *argv[]) {
             }
 
             printf("LSP recovery: daemon shutdown complete\n");
-            jit_channels_cleanup(&mgr);
+            jit_channels_cleanup(mgr);
+            free(mgr);
             persist_close(&db);
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -1571,9 +1577,11 @@ int main(int argc, char *argv[]) {
     lsp.factory.fee = &fee_est;
 
     /* === Ladder manager initialization (Tier 2) === */
-    ladder_t lad;
-    if (!ladder_init(&lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+    if (!ladder_init(lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
         fprintf(stderr, "LSP: ladder_init failed\n");
+        free(lad);
         lsp_cleanup(&lsp);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
@@ -1581,24 +1589,24 @@ int main(int argc, char *argv[]) {
     }
     {
         int cur_h = regtest_get_block_height(&rt);
-        if (cur_h > 0) lad.current_block = (uint32_t)cur_h;
+        if (cur_h > 0) lad->current_block = (uint32_t)cur_h;
     }
     /* Populate slot 0 with the existing factory (detached copy — no shared
        tx_buf heap data, preventing double-free if lsp.factory is freed later). */
     {
-        ladder_factory_t *lf = &lad.factories[0];
+        ladder_factory_t *lf = &lad->factories[0];
         lf->factory = lsp.factory;
         factory_detach_txbufs(&lf->factory);
-        lf->factory_id = lad.next_factory_id++;
+        lf->factory_id = lad->next_factory_id++;
         lf->is_initialized = 1;
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp.factory,
-                                               lad.current_block);
+                                               lad->current_block);
         tx_buf_init(&lf->distribution_tx, 256);
-        lad.n_factories = 1;
+        lad->n_factories = 1;
     }
     printf("LSP: ladder initialized (factory 0 at slot 0, state=%d)\n",
-           (int)lad.factories[0].cached_state);
+           (int)lad->factories[0].cached_state);
 
     /* Persist factory + tree nodes + DW counter */
     if (use_db) {
@@ -1645,28 +1653,28 @@ int main(int argc, char *argv[]) {
     report_flush(&rpt);
 
     /* === Phase 4b: Channel Operations === */
-    lsp_channel_mgr_t mgr;
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close) {
         /* Set fee policy before init (init preserves these across memset) */
-        memset(&mgr, 0, sizeof(mgr));
-        mgr.fee = &fee_est;
-        mgr.routing_fee_ppm = routing_fee_ppm;
-        mgr.lsp_balance_pct = lsp_balance_pct;
-        mgr.placement_mode = (placement_mode_t)placement_mode_arg;
-        mgr.economic_mode = (economic_mode_t)economic_mode_arg;
-        mgr.default_profit_bps = default_profit_bps;
-        mgr.settlement_interval_blocks = settlement_interval;
-        if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+        mgr->fee = &fee_est;
+        mgr->routing_fee_ppm = routing_fee_ppm;
+        mgr->lsp_balance_pct = lsp_balance_pct;
+        mgr->placement_mode = (placement_mode_t)placement_mode_arg;
+        mgr->economic_mode = (economic_mode_t)economic_mode_arg;
+        mgr->default_profit_bps = default_profit_bps;
+        mgr->settlement_interval_blocks = settlement_interval;
+        if (!lsp_channels_init(mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        if (!lsp_channels_exchange_basepoints(&mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(mgr, &lsp)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -1679,9 +1687,9 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "LSP: warning: persist_begin failed for basepoint save\n");
             } else {
                 int bp_ok = 1;
-                for (size_t c = 0; c < mgr.n_channels; c++) {
+                for (size_t c = 0; c < mgr->n_channels; c++) {
                     if (!persist_save_basepoints(&db, (uint32_t)c,
-                                                   &mgr.entries[c].channel)) {
+                                                   &mgr->entries[c].channel)) {
                         fprintf(stderr, "LSP: warning: failed to persist basepoints "
                                 "for channel %zu\n", c);
                         bp_ok = 0;
@@ -1696,14 +1704,14 @@ int main(int argc, char *argv[]) {
         }
 
         /* Set persistence pointer (Phase 23) */
-        mgr.persist = use_db ? &db : NULL;
+        mgr->persist = use_db ? &db : NULL;
 
         /* Set configurable confirmation timeout */
-        mgr.confirm_timeout_secs = confirm_timeout_secs;
+        mgr->confirm_timeout_secs = confirm_timeout_secs;
 
         /* Load persisted state (Phase 23) */
         if (use_db) {
-            mgr.next_request_id = persist_load_counter(&db, "next_request_id", 1);
+            mgr->next_request_id = persist_load_counter(&db, "next_request_id", 1);
 
             /* Load invoices */
             unsigned char inv_hashes[MAX_INVOICE_REGISTRY][32];
@@ -1712,8 +1720,8 @@ int main(int argc, char *argv[]) {
             size_t n_inv = persist_load_invoices(&db,
                 inv_hashes, inv_dests, inv_amounts, MAX_INVOICE_REGISTRY);
             for (size_t i = 0; i < n_inv; i++) {
-                if (mgr.n_invoices >= MAX_INVOICE_REGISTRY) break;
-                invoice_entry_t *inv = &mgr.invoices[mgr.n_invoices++];
+                if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) break;
+                invoice_entry_t *inv = &mgr->invoices[mgr->n_invoices++];
                 memcpy(inv->payment_hash, inv_hashes[i], 32);
                 inv->dest_client = inv_dests[i];
                 inv->amount_msat = inv_amounts[i];
@@ -1732,8 +1740,8 @@ int main(int argc, char *argv[]) {
                 orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
                 MAX_HTLC_ORIGINS);
             for (size_t i = 0; i < n_orig; i++) {
-                if (mgr.n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                htlc_origin_t *origin = &mgr.htlc_origins[mgr.n_htlc_origins++];
+                if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
+                htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
                 memcpy(origin->payment_hash, orig_hashes[i], 32);
                 origin->bridge_htlc_id = orig_bridge[i];
                 origin->request_id = orig_req[i];
@@ -1746,10 +1754,10 @@ int main(int argc, char *argv[]) {
         }
 
         /* Set fee rate on all channels */
-        for (size_t c = 0; c < mgr.n_channels; c++)
-            mgr.entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
+        for (size_t c = 0; c < mgr->n_channels; c++)
+            mgr->entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
 
-        if (!lsp_channels_send_ready(&mgr, &lsp)) {
+        if (!lsp_channels_send_ready(mgr, &lsp)) {
             fprintf(stderr, "LSP: send CHANNEL_READY failed\n");
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -1763,8 +1771,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "LSP: warning: persist_begin failed for channels\n");
             } else {
                 int ch_ok = 1;
-                for (size_t c = 0; c < mgr.n_channels; c++) {
-                    if (!persist_save_channel(&db, &mgr.entries[c].channel, 0, (uint32_t)c)) {
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    if (!persist_save_channel(&db, &mgr->entries[c].channel, 0, (uint32_t)c)) {
                         ch_ok = 0;
                         break;
                     }
@@ -1777,52 +1785,52 @@ int main(int argc, char *argv[]) {
         }
 
         /* Report: channel init */
-        report_channel_state(&rpt, "channels_initial", &mgr);
+        report_channel_state(&rpt, "channels_initial", mgr);
         report_flush(&rpt);
 
         /* Initialize watchtower for breach detection.
          * Use static to avoid stack corruption (watchtower_t is ~6.5KB). */
         static watchtower_t wt;
         memset(&wt, 0, sizeof(wt));
-        watchtower_init(&wt, mgr.n_channels, &rt, &fee_est,
+        watchtower_init(&wt, mgr->n_channels, &rt, &fee_est,
                           use_db ? &db : NULL);
-        for (size_t c = 0; c < mgr.n_channels; c++)
-            watchtower_set_channel(&wt, c, &mgr.entries[c].channel);
-        mgr.watchtower = &wt;
+        for (size_t c = 0; c < mgr->n_channels; c++)
+            watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
+        mgr->watchtower = &wt;
 
         /* Wire ladder into channel manager (Tier 2) */
-        mgr.ladder = &lad;
+        mgr->ladder = lad;
 
         /* Wire rotation parameters for continuous ladder (Gap #3) */
-        memcpy(mgr.rot_lsp_seckey, lsp_seckey, 32);
-        mgr.rot_fee_est = &fee_est;
-        memcpy(mgr.rot_fund_spk, fund_spk, 34);
-        mgr.rot_fund_spk_len = 34;
-        snprintf(mgr.rot_fund_addr, sizeof(mgr.rot_fund_addr), "%s", fund_addr);
-        snprintf(mgr.rot_mine_addr, sizeof(mgr.rot_mine_addr), "%s", mine_addr);
-        mgr.rot_step_blocks = step_blocks;
-        mgr.rot_states_per_layer = states_per_layer;
-        mgr.rot_leaf_arity = leaf_arity;
-        mgr.rot_is_regtest = is_regtest;
-        mgr.rot_funding_sats = funding_sats;
-        mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
-        mgr.rot_attempted_mask = 0;
-        mgr.cli_enabled = cli_mode;
-        mgr.auto_rebalance = auto_rebalance;
-        mgr.rebalance_threshold_pct = (uint16_t)rebalance_threshold;
+        memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
+        mgr->rot_fee_est = &fee_est;
+        memcpy(mgr->rot_fund_spk, fund_spk, 34);
+        mgr->rot_fund_spk_len = 34;
+        snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr), "%s", fund_addr);
+        snprintf(mgr->rot_mine_addr, sizeof(mgr->rot_mine_addr), "%s", mine_addr);
+        mgr->rot_step_blocks = step_blocks;
+        mgr->rot_states_per_layer = states_per_layer;
+        mgr->rot_leaf_arity = leaf_arity;
+        mgr->rot_is_regtest = is_regtest;
+        mgr->rot_funding_sats = funding_sats;
+        mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        mgr->rot_attempted_mask = 0;
+        mgr->cli_enabled = cli_mode;
+        mgr->auto_rebalance = auto_rebalance;
+        mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
         /* JIT Channel Fallback (Gap #2) */
-        jit_channels_init(&mgr);
-        if (no_jit) mgr.jit_enabled = 0;
-        mgr.jit_funding_sats = (jit_amount_arg > 0) ?
+        jit_channels_init(mgr);
+        if (no_jit) mgr->jit_enabled = 0;
+        mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
 
         /* Load persisted JIT channels from DB */
         if (use_db) {
-            jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+            jit_channel_t *jits = (jit_channel_t *)mgr->jit_channels;
             size_t jit_count = 0;
             persist_load_jit_channels(&db, jits, JIT_MAX_CHANNELS, &jit_count);
-            mgr.n_jit_channels = jit_count;
+            mgr->n_jit_channels = jit_count;
             for (size_t ji = 0; ji < jit_count; ji++) {
                 if (jits[ji].state == JIT_STATE_OPEN) {
                     unsigned char ls[4][32], rb[4][33];
@@ -1848,7 +1856,7 @@ int main(int argc, char *argv[]) {
                             continue;
                         }
                     }
-                    size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
+                    size_t wt_idx = mgr->n_channels + jits[ji].client_idx;
                     watchtower_set_channel(&wt, wt_idx, &jits[ji].channel);
                 }
             }
@@ -1859,7 +1867,7 @@ int main(int argc, char *argv[]) {
         if (n_payments > 0) {
             printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
                    n_payments, n_payments * 2);
-            if (!lsp_channels_run_event_loop(&mgr, &lsp, (size_t)(n_payments * 2))) {
+            if (!lsp_channels_run_event_loop(mgr, &lsp, (size_t)(n_payments * 2))) {
                 fprintf(stderr, "LSP: event loop failed\n");
                 lsp_cleanup(&lsp);
                 memset(lsp_seckey, 0, 32);
@@ -1870,14 +1878,14 @@ int main(int argc, char *argv[]) {
         }
 
         /* Capture initial balances before demo (for breach test) */
-        if ((breach_test || test_expiry) && mgr.n_channels > 0) {
-            init_local = mgr.entries[0].channel.local_amount;
-            init_remote = mgr.entries[0].channel.remote_amount;
+        if ((breach_test || test_expiry) && mgr->n_channels > 0) {
+            init_local = mgr->entries[0].channel.local_amount;
+            init_remote = mgr->entries[0].channel.remote_amount;
         }
 
         if (demo_mode) {
             printf("LSP: channels ready, running demo sequence...\n");
-            if (!lsp_channels_run_demo_sequence(&mgr, &lsp)) {
+            if (!lsp_channels_run_demo_sequence(mgr, &lsp)) {
                 fprintf(stderr, "LSP: demo sequence failed\n");
             }
 
@@ -1927,7 +1935,7 @@ int main(int argc, char *argv[]) {
             /* Skip cooperative close — factory already spent */
             report_add_string(&rpt, "result", "force_close_complete");
             report_close(&rpt);
-            jit_channels_cleanup(&mgr);
+            jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -1946,7 +1954,7 @@ int main(int argc, char *argv[]) {
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
 
-            lsp_channels_run_daemon_loop(&mgr, &lsp, &g_shutdown);
+            lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
         }
 
         channels_active = 1;
@@ -1957,8 +1965,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "LSP: warning: persist_begin failed for balance update\n");
             } else {
                 int bal_ok = 1;
-                for (size_t c = 0; c < mgr.n_channels; c++) {
-                    const channel_t *ch = &mgr.entries[c].channel;
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    const channel_t *ch = &mgr->entries[c].channel;
                     if (!persist_update_channel_balance(&db, (uint32_t)c,
                         ch->local_amount, ch->remote_amount, ch->commitment_number)) {
                         bal_ok = 0;
@@ -1973,7 +1981,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Report: channel state after payments */
-        report_channel_state(&rpt, "channels_after_payments", &mgr);
+        report_channel_state(&rpt, "channels_after_payments", mgr);
         report_flush(&rpt);
     }
 
@@ -2003,8 +2011,8 @@ int main(int argc, char *argv[]) {
         /* Broadcast revoked commitments for ALL channels so every client's
          * watchtower can detect the breach independently. */
         static const unsigned char client_fills[4] = { 0x22, 0x33, 0x44, 0x55 };
-        for (size_t ci = 0; ci < mgr.n_channels; ci++) {
-            channel_t *chX = &mgr.entries[ci].channel;
+        for (size_t ci = 0; ci < mgr->n_channels; ci++) {
+            channel_t *chX = &mgr->entries[ci].channel;
             uint64_t saved_num = chX->commitment_number;
             uint64_t saved_local = chX->local_amount;
             uint64_t saved_remote = chX->remote_amount;
@@ -2122,7 +2130,7 @@ int main(int argc, char *argv[]) {
 
         /* Watchtower check: should detect breach and broadcast penalty */
         printf("Running watchtower check...\n");
-        watchtower_t *wt = mgr.watchtower;
+        watchtower_t *wt = mgr->watchtower;
         if (wt) {
             int detected = watchtower_check(wt);
             if (detected > 0) {
@@ -2497,7 +2505,7 @@ int main(int argc, char *argv[]) {
         printf("Distribution TX built (%zu bytes)\n", dist_tx.len);
 
         /* Store in ladder slot */
-        lad.factories[0].distribution_tx = dist_tx;
+        lad->factories[0].distribution_tx = dist_tx;
 
         /* Mine past CLTV timeout */
         int cur_h = regtest_get_block_height(&rt);
@@ -2517,7 +2525,7 @@ int main(int argc, char *argv[]) {
 
         if (!dt_sent) {
             fprintf(stderr, "DISTRIBUTION TX TEST: broadcast failed\n");
-            tx_buf_free(&lad.factories[0].distribution_tx);
+            tx_buf_free(&lad->factories[0].distribution_tx);
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
@@ -2531,7 +2539,7 @@ int main(int argc, char *argv[]) {
         report_add_string(&rpt, "result", "distrib_test_complete");
         report_close(&rpt);
         if (use_db) persist_close(&db);
-        tx_buf_free(&lad.factories[0].distribution_tx);
+        tx_buf_free(&lad->factories[0].distribution_tx);
         lsp_cleanup(&lsp);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
@@ -2636,7 +2644,7 @@ int main(int argc, char *argv[]) {
             }
 
             /* Record in ladder */
-            ladder_record_key_turnover(&lad, 0, participant_idx, extracted);
+            ladder_record_key_turnover(lad, 0, participant_idx, extracted);
 
             /* Persist departed client */
             if (use_db)
@@ -2647,7 +2655,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Verify all clients departed */
-        if (!ladder_can_close(&lad, 0)) {
+        if (!ladder_can_close(lad, 0)) {
             fprintf(stderr, "TURNOVER TEST: ladder_can_close returned false\n");
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -2670,7 +2678,7 @@ int main(int argc, char *argv[]) {
         /* Build cooperative close using extracted keys */
         tx_buf_t turnover_close_tx;
         tx_buf_init(&turnover_close_tx, 512);
-        if (!ladder_build_close(&lad, 0, &turnover_close_tx,
+        if (!ladder_build_close(lad, 0, &turnover_close_tx,
                                   to_outputs, n_total)) {
             fprintf(stderr, "TURNOVER TEST: ladder_build_close failed\n");
             tx_buf_free(&turnover_close_tx);
@@ -2804,7 +2812,7 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx); return 1;
             }
 
-            ladder_record_key_turnover(&lad, 0, pidx, extracted);
+            ladder_record_key_turnover(lad, 0, pidx, extracted);
             if (use_db)
                 persist_save_departed_client(&db, 0, pidx, extracted);
 
@@ -2818,7 +2826,7 @@ int main(int argc, char *argv[]) {
 
         /* --- Phase B: Ladder close of Factory 0 --- */
         printf("Phase B: Ladder close of Factory 0\n");
-        if (!ladder_can_close(&lad, 0)) {
+        if (!ladder_can_close(lad, 0)) {
             fprintf(stderr, "ROTATION: ladder_can_close returned false\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
@@ -2836,7 +2844,7 @@ int main(int argc, char *argv[]) {
 
         tx_buf_t rot_close_tx;
         tx_buf_init(&rot_close_tx, 512);
-        if (!ladder_build_close(&lad, 0, &rot_close_tx, rot_outputs, n_total)) {
+        if (!ladder_build_close(lad, 0, &rot_close_tx, rot_outputs, n_total)) {
             fprintf(stderr, "ROTATION: ladder_build_close failed\n");
             tx_buf_free(&rot_close_tx);
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
@@ -2931,37 +2939,37 @@ int main(int argc, char *argv[]) {
 
         /* Store in ladder slot 1 */
         {
-            ladder_factory_t *lf1 = &lad.factories[1];
+            ladder_factory_t *lf1 = &lad->factories[1];
             lf1->factory = lsp.factory;
-            lf1->factory_id = lad.next_factory_id++;
+            lf1->factory_id = lad->next_factory_id++;
             lf1->is_initialized = 1;
             lf1->is_funded = 1;
             lf1->cached_state = FACTORY_ACTIVE;
             tx_buf_init(&lf1->distribution_tx, 256);
-            lad.n_factories = 2;
+            lad->n_factories = 2;
         }
         printf("  Factory 1 created and stored in ladder slot 1\n");
 
         /* Initialize new channel manager + send CHANNEL_READY */
-        lsp_channel_mgr_t mgr2;
-        memset(&mgr2, 0, sizeof(mgr2));
-        mgr2.fee = &fee_est;
-        mgr2.routing_fee_ppm = routing_fee_ppm;
-        mgr2.lsp_balance_pct = lsp_balance_pct;
-        mgr2.settlement_interval_blocks = settlement_interval;
-        if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+        lsp_channel_mgr_t *mgr2 = calloc(1, sizeof(lsp_channel_mgr_t));
+        if (!mgr2) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
+        mgr2->fee = &fee_est;
+        mgr2->routing_fee_ppm = routing_fee_ppm;
+        mgr2->lsp_balance_pct = lsp_balance_pct;
+        mgr2->settlement_interval_blocks = settlement_interval;
+        if (!lsp_channels_init(mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        if (!lsp_channels_exchange_basepoints(&mgr2, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(mgr2, &lsp)) {
             fprintf(stderr, "ROTATION: basepoint exchange for Factory 1 failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        if (!lsp_channels_send_ready(&mgr2, &lsp)) {
+        if (!lsp_channels_send_ready(mgr2, &lsp)) {
             fprintf(stderr, "ROTATION: send_ready for Factory 1 failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
         printf("  Factory 1 channels ready\n");
@@ -2970,24 +2978,24 @@ int main(int argc, char *argv[]) {
         printf("Phase D: Payment on Factory 1\n");
 
         /* Run one payment: client 0 → client 1 */
-        if (!lsp_channels_initiate_payment(&mgr2, &lsp, 0, 1, 1000)) {
+        if (!lsp_channels_initiate_payment(mgr2, &lsp, 0, 1, 1000)) {
             fprintf(stderr, "ROTATION: payment on Factory 1 failed\n");
             /* Non-fatal — continue to close */
         } else {
             printf("  Payment: client 1 -> client 2: 1000 sats\n");
-            lsp_channels_print_balances(&mgr2);
+            lsp_channels_print_balances(mgr2);
         }
 
         /* Cooperative close of Factory 1 */
         tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
-        size_t n_close2 = lsp_channels_build_close_outputs(&mgr2, &lsp.factory,
+        size_t n_close2 = lsp_channels_build_close_outputs(mgr2, &lsp.factory,
                                                              close2_outputs, 500,
                                                              NULL, 0);
         tx_buf_t close2_tx;
         tx_buf_init(&close2_tx, 512);
         if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2)) {
             fprintf(stderr, "ROTATION: cooperative close of Factory 1 failed\n");
-            tx_buf_free(&close2_tx);
+            tx_buf_free(&close2_tx); free(mgr2);
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
@@ -3011,9 +3019,10 @@ int main(int argc, char *argv[]) {
 
         report_add_string(&rpt, "result", "rotation_test_complete");
         report_close(&rpt);
+        free(mgr2);
         if (use_db) persist_close(&db);
-        tx_buf_free(&lad.factories[0].distribution_tx);
-        tx_buf_free(&lad.factories[1].distribution_tx);
+        tx_buf_free(&lad->factories[0].distribution_tx);
+        tx_buf_free(&lad->factories[1].distribution_tx);
         lsp_cleanup(&lsp);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
@@ -3052,7 +3061,7 @@ int main(int argc, char *argv[]) {
         /* Pass NULL for close_spk so client outputs use per-client P2TR
            addresses derived from their factory pubkeys. LSP output uses
            factory funding SPK (or wallet SPK if needed). */
-        n_close_outputs = lsp_channels_build_close_outputs(&mgr, &lsp.factory,
+        n_close_outputs = lsp_channels_build_close_outputs(mgr, &lsp.factory,
                                                             close_outputs, 500,
                                                             NULL, 0);
         if (n_close_outputs == 0) {
@@ -3146,7 +3155,8 @@ int main(int argc, char *argv[]) {
     report_add_string(&rpt, "result", "success");
     report_close(&rpt);
 
-    jit_channels_cleanup(&mgr);
+    jit_channels_cleanup(mgr);
+    free(mgr);
     if (use_db)
         persist_close(&db);
     if (tor_control_fd >= 0)
