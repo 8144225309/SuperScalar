@@ -1,6 +1,6 @@
 # SuperScalar: Verified Gaps & Changes Roadmap
 
-Cross-referenced against repo state as of 2026-03-02 (commit 15341af).
+Cross-referenced against repo state as of 2026-03-03 (commit 055f1d3).
 Items verified by reading actual source — claims from external AI review
 that turned out to be wrong (already implemented) are excluded.
 
@@ -76,29 +76,26 @@ that turned out to be wrong (already implemented) are excluded.
 - **Fix**: Link libsodium or use OpenSSL EVP, drop crypto_aead.c.
 - **Effort**: Low
 
-### 3B. Static capacity limits
-- **Files**: `include/superscalar/lsp.h` (LSP_MAX_CLIENTS=8),
-  `include/superscalar/channel.h` (MAX_HTLCS=16),
-  `include/superscalar/lsp_channels.h` (MAX_INVOICE_REGISTRY=64)
-- **Problem**: Compile-time constants limit scale.
-- **Fix**: Dynamic allocation or at least increase the caps.
-- **Effort**: Low-moderate (dynamic alloc touches many array accesses)
+### 3B. ~~Static capacity limits~~ — BUMPED (commit 055f1d3)
+- Limits increased: `LSP_MAX_CLIENTS=16` (was 8), `MAX_HTLCS=32` (was 16),
+  `WATCHTOWER_MAX_CHANNELS=32` (was 8), `WATCHTOWER_MAX_WATCH=128` (was 64),
+  `JIT_MAX_CHANNELS=16` (was 8), `MAX_INVOICE_REGISTRY=256` (was 64),
+  `MAX_HTLC_ORIGINS=256` (was 64).
+- Still compile-time constants; dynamic allocation deferred to post-v0.1.0.
 
-### 3C. JIT migration is naive balance addition
-- **Files**: `src/jit_channel.c` (lines 491-498)
-- **Problem**: `jit_channel_migrate()` does direct balance addition in
-  memory. Comment: "For PoC, we adjust balances directly." Not a real splice.
-- **Fix**: Implement proper splice-in transaction for JIT-to-factory
-  migration.
-- **Effort**: Significant (splice is complex)
+### 3C. ~~JIT migration is naive balance addition~~ — FIXED (commit a57b220)
+- JIT channels are now cooperatively closed on-chain during factory rotation
+  (Phase A.5). The LSP uses PTLC-extracted client keys to locally sign a
+  MuSig2 close tx, broadcasting the JIT UTXO to the LSP wallet. New factory
+  funding draws from the now-larger wallet balance. The old `+= balance` hack
+  in `jit_channel_migrate()` has been removed.
+- Full splice-in not implemented (would require consensus changes); on-chain
+  close is the correct approach for SuperScalar's design.
 
-### 3D. Fee estimation defaults to static 1000 sat/kvB
-- **Files**: `src/fee.c` (lines 9-46)
-- **Problem**: `use_estimatesmartfee` defaults to 0. Dynamic estimation via
-  bitcoin-cli RPC exists but is opt-in. Floor clamped at 1000 sat/kvB.
-- **Fix**: Enable dynamic estimation by default when bitcoind is available.
-  Add mempool-based estimation as fallback.
-- **Effort**: Low
+### 3D. ~~Fee estimation defaults to static 1000 sat/kvB~~ — FIXED (commit 055f1d3)
+- Dynamic `estimatesmartfee` via bitcoin-cli RPC now enabled by default.
+  Falls back to static 1000 sat/kvB floor if the RPC call fails.
+  Stale vsize comment (195→165 vB) also corrected.
 
 ---
 
