@@ -718,3 +718,7 @@ Join the [Discussions](https://github.com/8144225309/SuperScalar/discussions) fo
 ## License
 
 MIT
+
+---
+
+Support development: `bc1qym7552af6exkn68zuqcv5nhstaktkgtvjwfvmm`
