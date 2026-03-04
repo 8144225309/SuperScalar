@@ -19,3 +19,4 @@ __pycache__/
 run_*.sh
 docs/plan-*.md
 signet-launch-*.md
+github-issue-drafts.md
