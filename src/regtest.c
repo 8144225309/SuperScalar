@@ -34,7 +34,38 @@ static char *run_command(const char *cmd) {
     return buf;
 }
 
+/* Validate RPC parameter against allowed character set.
+   Rejects shell metacharacters to prevent command injection via popen().
+   Returns 1 if safe, 0 if rejected. */
+static int sanitize_rpc_param(const char *s) {
+    if (!s) return 1;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) continue;
+        switch (c) {
+        case '.': case '_': case ':': case '/': case '-':
+        case ' ': case ',': case '"': case '\'':
+        case '[': case ']': case '{': case '}':
+        case '+': case '=': continue;
+        default: return 0;  /* rejected */
+        }
+    }
+    return 1;
+}
+
 static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
+    /* Validate all rt fields that will be interpolated into shell commands */
+    if (!sanitize_rpc_param(rt->cli_path) ||
+        !sanitize_rpc_param(rt->network) ||
+        !sanitize_rpc_param(rt->rpcuser) ||
+        !sanitize_rpc_param(rt->rpcpassword) ||
+        !sanitize_rpc_param(rt->datadir) ||
+        !sanitize_rpc_param(rt->wallet)) {
+        buf[0] = '\0';
+        return;
+    }
+
     if (strcmp(rt->network, "mainnet") == 0) {
         snprintf(buf, buf_len,
             "%s -rpcuser=%s -rpcpassword=%s",
@@ -128,8 +159,13 @@ int regtest_init_full(regtest_t *rt, const char *network,
 }
 
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params) {
+    /* Reject shell metacharacters in method and params */
+    if (!sanitize_rpc_param(method) || !sanitize_rpc_param(params))
+        return NULL;
+
     char prefix[512];
     build_cli_prefix(rt, prefix, sizeof(prefix));
+    if (prefix[0] == '\0') return NULL;
 
     char cmd[2048];
     if (params && params[0] != '\0') {

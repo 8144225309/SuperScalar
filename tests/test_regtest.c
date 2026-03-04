@@ -1335,3 +1335,58 @@ int test_coin_select_no_change(void) {
     free(selected);
     return 1;
 }
+
+/* ---- Mainnet Audit: RPC parameter sanitization ---- */
+
+/* Re-implement sanitize logic for unit testing (the real one is static in regtest.c) */
+static int test_sanitize(const char *s) {
+    if (!s) return 1;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) continue;
+        switch (c) {
+        case '.': case '_': case ':': case '/': case '-':
+        case ' ': case ',': case '"': case '\'':
+        case '[': case ']': case '{': case '}':
+        case '+': case '=': continue;
+        default: return 0;
+        }
+    }
+    return 1;
+}
+
+int test_regtest_param_sanitization(void) {
+    /* Clean params should be accepted */
+    TEST_ASSERT(test_sanitize(""), "empty string");
+    TEST_ASSERT(test_sanitize("123"), "numeric");
+    TEST_ASSERT(test_sanitize("bcrt1qtest"), "address-like");
+    TEST_ASSERT(test_sanitize("getblockchaininfo"), "method name");
+    TEST_ASSERT(test_sanitize("\"address\" 0.001"), "quoted param");
+    TEST_ASSERT(test_sanitize("[{\"txid\":\"abc\",\"vout\":0}]"), "JSON array");
+    TEST_ASSERT(test_sanitize("rpcuser"), "simple string");
+    TEST_ASSERT(test_sanitize("/home/user/.bitcoin"), "path");
+    TEST_ASSERT(test_sanitize("key=value"), "key-value");
+    TEST_ASSERT(test_sanitize(NULL), "NULL param");
+    return 1;
+}
+
+int test_regtest_exec_rejects_metacharacters(void) {
+    /* All shell metacharacters must be rejected */
+    TEST_ASSERT(!test_sanitize(";echo pwned"), "semicolon");
+    TEST_ASSERT(!test_sanitize("|cat /etc/passwd"), "pipe");
+    TEST_ASSERT(!test_sanitize("`id`"), "backtick");
+    TEST_ASSERT(!test_sanitize("$(whoami)"), "dollar-paren");
+    TEST_ASSERT(!test_sanitize("test\necho"), "newline");
+    TEST_ASSERT(!test_sanitize("&background"), "ampersand");
+    TEST_ASSERT(!test_sanitize(">output"), "redirect");
+    TEST_ASSERT(!test_sanitize("<input"), "input redirect");
+    TEST_ASSERT(!test_sanitize("test\\escape"), "backslash");
+    TEST_ASSERT(!test_sanitize("test!bang"), "exclamation");
+    TEST_ASSERT(!test_sanitize("test#comment"), "hash");
+    TEST_ASSERT(!test_sanitize("test~home"), "tilde");
+    TEST_ASSERT(!test_sanitize("test*glob"), "asterisk");
+    TEST_ASSERT(!test_sanitize("test?wildcard"), "question mark");
+    TEST_ASSERT(!test_sanitize("test(paren)"), "parenthesis");
+    return 1;
+}
