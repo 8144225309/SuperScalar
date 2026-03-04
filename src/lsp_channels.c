@@ -707,15 +707,17 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
-    /* Persist sender channel balance after successful revocation (Gap 2B) */
-    if (mgr->persist)
-        persist_update_channel_balance((persist_t *)mgr->persist,
+    /* Persist sender channel balance + HTLC atomically (crash-state protection) */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+
+        persist_update_channel_balance(db,
             (uint32_t)sender_idx,
             sender_ch->local_amount, sender_ch->remote_amount,
             sender_ch->commitment_number);
 
-    /* Persist sender-side HTLC now that old state is revoked (irrevocable) */
-    if (mgr->persist) {
         htlc_t sender_persist;
         memset(&sender_persist, 0, sizeof(sender_persist));
         sender_persist.id = new_htlc_id;
@@ -724,8 +726,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         sender_persist.amount_sats = amount_sats;
         memcpy(sender_persist.payment_hash, payment_hash, 32);
         sender_persist.cltv_expiry = cltv_expiry;
-        persist_save_htlc((persist_t *)mgr->persist,
-                          (uint32_t)sender_idx, &sender_persist);
+        persist_save_htlc(db, (uint32_t)sender_idx, &sender_persist);
+
+        if (own_txn) persist_commit(db);
     }
 
     /* Find destination: check dest_client field, then bolt11 for bridge routing */
@@ -750,14 +753,21 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             origin->request_id = request_id;
             origin->sender_idx = sender_idx;
             origin->sender_htlc_id = new_htlc_id;
-            /* Persist full origin with all fields */
-            if (mgr->persist)
-                persist_save_htlc_origin((persist_t *)mgr->persist,
+            /* Persist origin + counter atomically */
+            if (mgr->persist) {
+                persist_t *db = (persist_t *)mgr->persist;
+                int own_txn = !persist_in_transaction(db);
+                if (own_txn) persist_begin(db);
+                persist_save_htlc_origin(db,
                     payment_hash, 0, request_id, sender_idx, new_htlc_id);
-        }
-        if (mgr->persist)
+                persist_save_counter(db,
+                                      "next_request_id", mgr->next_request_id);
+                if (own_txn) persist_commit(db);
+            }
+        } else if (mgr->persist) {
             persist_save_counter((persist_t *)mgr->persist,
                                   "next_request_id", mgr->next_request_id);
+        }
         printf("LSP: HTLC from client %zu routed to bridge (bolt11)\n", sender_idx);
         return 1;
     }
@@ -837,6 +847,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        If we crash after CS but before persist, the HTLC is in committed
        state but not tracked. Persisting first avoids that window. */
     if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
         htlc_t persist_htlc;
         memset(&persist_htlc, 0, sizeof(persist_htlc));
         persist_htlc.id = dest_htlc_id;
@@ -845,8 +856,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         persist_htlc.amount_sats = fwd_amount_sats;
         memcpy(persist_htlc.payment_hash, payment_hash, 32);
         persist_htlc.cltv_expiry = fwd_cltv_expiry;
-        persist_save_htlc((persist_t *)mgr->persist,
-                            (uint32_t)dest_idx, &persist_htlc);
+        persist_save_htlc(db, (uint32_t)dest_idx, &persist_htlc);
     }
 
     /* Forward ADD_HTLC to destination */
@@ -1711,13 +1721,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
-    /* Persist payee channel balance after fulfill revocation (Gap 2B) */
-    if (mgr->persist)
-        persist_update_channel_balance((persist_t *)mgr->persist,
-            (uint32_t)client_idx,
-            ch->local_amount, ch->remote_amount,
-            ch->commitment_number);
-
     /* Now back-propagate: find the sender's channel that has a matching HTLC.
        We search all other channels for a received HTLC with the same payment_hash. */
     unsigned char payment_hash[32];
@@ -1732,14 +1735,22 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             break;
         }
     }
-    /* Deactivate fulfilled invoice in persistence */
-    if (mgr->persist)
-        persist_deactivate_invoice((persist_t *)mgr->persist, payment_hash);
 
-    /* Delete settled HTLC from persistence */
-    if (mgr->persist)
-        persist_delete_htlc((persist_t *)mgr->persist,
-                              (uint32_t)client_idx, htlc_id);
+    /* Persist payee balance + deactivate invoice + delete HTLC atomically */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+
+        persist_update_channel_balance(db,
+            (uint32_t)client_idx,
+            ch->local_amount, ch->remote_amount,
+            ch->commitment_number);
+        persist_deactivate_invoice(db, payment_hash);
+        persist_delete_htlc(db, (uint32_t)client_idx, htlc_id);
+
+        if (own_txn) persist_commit(db);
+    }
 
     /* Check if this HTLC originated from the bridge */
     uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
@@ -1821,17 +1832,23 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
 
-            /* Persist sender channel balance after fulfill back-propagation (Gap 2B) */
-            if (mgr->persist)
-                persist_update_channel_balance((persist_t *)mgr->persist,
+            /* Persist sender balance + delete HTLC atomically */
+            if (mgr->persist) {
+                persist_t *db = (persist_t *)mgr->persist;
+                int own_txn = !persist_in_transaction(db);
+                if (own_txn) persist_begin(db);
+
+                persist_update_channel_balance(db,
                     (uint32_t)s,
                     sender_ch->local_amount, sender_ch->remote_amount,
                     sender_ch->commitment_number);
+                persist_delete_htlc(db, (uint32_t)s, htlc->id);
+
+                if (own_txn) persist_commit(db);
+            }
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
-            if (mgr->persist)
-                persist_delete_htlc((persist_t *)mgr->persist, (uint32_t)s, htlc->id);
             sender_found = (int)s;
             break;
         }
@@ -2029,6 +2046,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
 
             /* Persist the forwarded HTLC */
             if (mgr->persist) {
+                persist_t *db = (persist_t *)mgr->persist;
                 htlc_t persist_htlc;
                 memset(&persist_htlc, 0, sizeof(persist_htlc));
                 persist_htlc.id = dest_htlc_id;
@@ -2037,8 +2055,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 persist_htlc.amount_sats = htlc->amount_sats;
                 memcpy(persist_htlc.payment_hash, htlc->payment_hash, 32);
                 persist_htlc.cltv_expiry = htlc->cltv_expiry;
-                persist_save_htlc((persist_t *)mgr->persist,
-                                    (uint32_t)reconnected_idx, &persist_htlc);
+                persist_save_htlc(db, (uint32_t)reconnected_idx, &persist_htlc);
             }
 
             /* Send ADD_HTLC to dest */
@@ -2745,13 +2762,17 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         if (n_failed > 0) {
                             printf("LSP: auto-failed %d expired HTLCs on channel %zu "
                                    "(height=%d)\n", n_failed, c, height);
-                            /* Delete failed HTLCs from persistence */
+                            /* Delete failed HTLCs from persistence (atomic batch) */
                             if (mgr->persist) {
+                                persist_t *db = (persist_t *)mgr->persist;
+                                int own_txn = !persist_in_transaction(db);
+                                if (own_txn) persist_begin(db);
                                 for (size_t h = 0; h < ch->n_htlcs; h++) {
                                     if (ch->htlcs[h].state == HTLC_STATE_FAILED)
-                                        persist_delete_htlc((persist_t *)mgr->persist,
+                                        persist_delete_htlc(db,
                                                             (uint32_t)c, ch->htlcs[h].id);
                                 }
+                                if (own_txn) persist_commit(db);
                             }
                         }
                     }
