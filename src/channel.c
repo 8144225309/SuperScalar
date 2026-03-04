@@ -189,9 +189,9 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                   uint64_t local_amount, uint64_t remote_amount,
                   uint32_t to_self_delay) {
     memset(ch, 0, sizeof(*ch));
-    ch->htlcs = calloc(MAX_HTLCS, sizeof(htlc_t));
+    ch->htlcs = calloc(DEFAULT_HTLCS_CAP, sizeof(htlc_t));
     if (!ch->htlcs) return 0;
-    ch->htlcs_cap = MAX_HTLCS;
+    ch->htlcs_cap = DEFAULT_HTLCS_CAP;
 
     /* Allocate dynamic per-commitment secret storage */
     ch->local_pcs = calloc(512, 32);
@@ -616,7 +616,10 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             n_active_htlcs++;
     }
 
-    tx_output_t outputs[2 + MAX_HTLCS];
+    tx_output_t *outputs = calloc(2 + n_active_htlcs, sizeof(tx_output_t));
+    if (!outputs) return 0;
+
+    int ret = 0;
 
     /* to-local */
     build_p2tr_script_pubkey(outputs[0].script_pubkey, &to_local_tweaked);
@@ -627,23 +630,23 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
     secp256k1_xonly_pubkey remote_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_xonly, NULL,
                                              &remote_payment_pubkey))
-        return 0;
+        goto commit_tx_done;
 
     /* Key-path-only tweak: TapTweak(key, empty) */
     unsigned char internal_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &remote_xonly))
-        return 0;
+        goto commit_tx_done;
     unsigned char tweak[32];
     sha256_tagged("TapTweak", internal_ser, 32, tweak);
 
     secp256k1_pubkey remote_tweaked_full;
     if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &remote_tweaked_full,
                                             &remote_xonly, tweak))
-        return 0;
+        goto commit_tx_done;
     secp256k1_xonly_pubkey remote_tweaked;
     if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_tweaked, NULL,
                                              &remote_tweaked_full))
-        return 0;
+        goto commit_tx_done;
 
     build_p2tr_script_pubkey(outputs[1].script_pubkey, &remote_tweaked);
     outputs[1].script_pubkey_len = 34;
@@ -662,10 +665,10 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         secp256k1_xonly_pubkey local_htlc_xonly, remote_htlc_xonly;
         if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL,
                                                  &local_htlc_pub))
-            return 0;
+            goto commit_tx_done;
         if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL,
                                                  &remote_htlc_pub))
-            return 0;
+            goto commit_tx_done;
 
         for (size_t i = 0; i < ch->n_htlcs; i++) {
             if (ch->htlcs[i].state != HTLC_STATE_ACTIVE)
@@ -676,19 +679,19 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             if (ch->htlcs[i].direction == HTLC_OFFERED) {
                 if (!tapscript_build_htlc_offered_success(&success_leaf,
                         ch->htlcs[i].payment_hash, &remote_htlc_xonly, ch->ctx))
-                    return 0;
+                    goto commit_tx_done;
                 if (!tapscript_build_htlc_offered_timeout(&timeout_leaf,
                         ch->htlcs[i].cltv_expiry, ch->to_self_delay,
                         &local_htlc_xonly, ch->ctx))
-                    return 0;
+                    goto commit_tx_done;
             } else {
                 if (!tapscript_build_htlc_received_success(&success_leaf,
                         ch->htlcs[i].payment_hash, ch->to_self_delay,
                         &local_htlc_xonly, ch->ctx))
-                    return 0;
+                    goto commit_tx_done;
                 if (!tapscript_build_htlc_received_timeout(&timeout_leaf,
                         ch->htlcs[i].cltv_expiry, &remote_htlc_xonly, ch->ctx))
-                    return 0;
+                    goto commit_tx_done;
             }
 
             /* 2-leaf merkle root */
@@ -700,7 +703,7 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             secp256k1_xonly_pubkey htlc_tweaked;
             if (!tapscript_tweak_pubkey(ch->ctx, &htlc_tweaked, NULL,
                                          &revocation_xonly, htlc_merkle))
-                return 0;
+                goto commit_tx_done;
 
             build_p2tr_script_pubkey(outputs[out_idx].script_pubkey,
                                      &htlc_tweaked);
@@ -714,14 +717,18 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
     if (!build_unsigned_tx(unsigned_tx_out, txid_out32,
                             ch->funding_txid, ch->funding_vout,
                             0xFFFFFFFE, outputs, out_idx))
-        return 0;
+        goto commit_tx_done;
 
     /* Convert display-order txid to internal byte order (wire format),
        matching factory convention where node->txid is wire format. */
     if (txid_out32)
         reverse_bytes(txid_out32, 32);
 
-    return 1;
+    ret = 1;
+
+commit_tx_done:
+    free(outputs);
+    return ret;
 }
 
 int channel_build_commitment_tx(const channel_t *ch,
@@ -1232,8 +1239,19 @@ static void channel_compact_htlcs(channel_t *ch) {
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
-    if (ch->n_htlcs >= ch->htlcs_cap)
+    if (ch->n_htlcs >= MAX_HTLCS)
         return 0;
+
+    /* Grow htlc array if at capacity (up to MAX_HTLCS) */
+    if (ch->n_htlcs >= ch->htlcs_cap) {
+        size_t new_cap = ch->htlcs_cap < DEFAULT_HTLCS_CAP
+                         ? DEFAULT_HTLCS_CAP : ch->htlcs_cap * 2;
+        if (new_cap > MAX_HTLCS) new_cap = MAX_HTLCS;
+        htlc_t *tmp = realloc(ch->htlcs, new_cap * sizeof(htlc_t));
+        if (!tmp) return 0;
+        ch->htlcs = tmp;
+        ch->htlcs_cap = new_cap;
+    }
 
     /* Reject HTLC amount below dust */
     if (amount_sats < CHANNEL_DUST_LIMIT_SATS)

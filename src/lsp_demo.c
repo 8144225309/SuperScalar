@@ -4,6 +4,7 @@
 #include "superscalar/wire.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -162,7 +163,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_sender_local = sender_ch->local_amount;
     uint64_t old_sender_remote = sender_ch->remote_amount;
     size_t old_sender_n_htlcs = sender_ch->n_htlcs;
-    htlc_t old_sender_htlcs[MAX_HTLCS];
+    htlc_t *old_sender_htlcs = old_sender_n_htlcs > 0
+        ? malloc(old_sender_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_sender_n_htlcs > 0 && !old_sender_htlcs) return 0;
     if (old_sender_n_htlcs > 0)
         memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
 
@@ -171,6 +174,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            payment_hash, 500, &sender_htlc_id)) {
         fprintf(stderr, "LSP demo: add_htlc on sender failed\n");
         fflush(stderr);
+        free(old_sender_htlcs);
         return 0;
     }
 
@@ -182,6 +186,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_AddNumberToObject(add, "dest_client", (double)to_client);
         if (!wire_send(lsp->client_fds[from_client], MSG_UPDATE_ADD_HTLC, add)) {
             cJSON_Delete(add);
+            free(old_sender_htlcs);
             return 0;
         }
         cJSON_Delete(add);
@@ -189,13 +194,16 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         unsigned char psig32[32];
         uint32_t nonce_idx;
-        if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx))
+        if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+            free(old_sender_htlcs);
             return 0;
+        }
         cJSON *cs = wire_build_commitment_signed(
             mgr->entries[from_client].channel_id,
             sender_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[from_client], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
+            free(old_sender_htlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -207,6 +215,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
                             MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from sender\n");
+            free(old_sender_htlcs);
             return 0;
         }
         uint32_t ack_chan_id;
@@ -235,7 +244,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_dest_local = dest_ch->local_amount;
     uint64_t old_dest_remote = dest_ch->remote_amount;
     size_t old_dest_n_htlcs = dest_ch->n_htlcs;
-    htlc_t old_dest_htlcs[MAX_HTLCS];
+    htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
+        ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_dest_n_htlcs > 0 && !old_dest_htlcs) { free(old_sender_htlcs); return 0; }
     if (old_dest_n_htlcs > 0)
         memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
@@ -243,6 +254,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
                            payment_hash, 500, &dest_htlc_id)) {
         fprintf(stderr, "LSP demo: forward add_htlc failed\n");
+        free(old_sender_htlcs); free(old_dest_htlcs);
         return 0;
     }
 
@@ -251,6 +263,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                    payment_hash, 500);
         if (!wire_send(lsp->client_fds[to_client], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(fwd);
@@ -258,13 +271,16 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         unsigned char psig32[32];
         uint32_t nonce_idx;
-        if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+        if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
+        }
         cJSON *cs = wire_build_commitment_signed(
             mgr->entries[to_client].channel_id,
             dest_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -276,6 +292,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
                             MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from dest\n");
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
         }
         uint32_t ack_chan_id;
@@ -303,12 +320,14 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
                             MSG_UPDATE_FULFILL_HTLC, &ful_msg, 10)) {
             fprintf(stderr, "LSP demo: expected FULFILL from dest\n");
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
         }
         uint64_t ful_htlc_id;
         unsigned char preimage[32];
         if (!wire_parse_update_fulfill_htlc(ful_msg.json, &ful_htlc_id, preimage)) {
             cJSON_Delete(ful_msg.json);
+            free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(ful_msg.json);
@@ -317,7 +336,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t old_dest_ful_local = dest_ch->local_amount;
         uint64_t old_dest_ful_remote = dest_ch->remote_amount;
         size_t old_dest_ful_n_htlcs = dest_ch->n_htlcs;
-        htlc_t old_dest_ful_htlcs[MAX_HTLCS];
+        htlc_t *old_dest_ful_htlcs = old_dest_ful_n_htlcs > 0
+            ? malloc(old_dest_ful_n_htlcs * sizeof(htlc_t)) : NULL;
+        if (old_dest_ful_n_htlcs > 0 && !old_dest_ful_htlcs) {
+            free(old_sender_htlcs); free(old_dest_htlcs); return 0;
+        }
         if (old_dest_ful_n_htlcs > 0)
             memcpy(old_dest_ful_htlcs, dest_ch->htlcs, old_dest_ful_n_htlcs * sizeof(htlc_t));
 
@@ -328,8 +351,10 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             unsigned char psig32[32];
             uint32_t nonce_idx;
-            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+                free(old_sender_htlcs); free(old_dest_htlcs); free(old_dest_ful_htlcs);
                 return 0;
+            }
             cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[to_client].channel_id,
                 dest_ch->commitment_number, psig32, nonce_idx);
@@ -366,7 +391,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t old_sender_ful_local = sender_ch->local_amount;
         uint64_t old_sender_ful_remote = sender_ch->remote_amount;
         size_t old_sender_ful_n_htlcs = sender_ch->n_htlcs;
-        htlc_t old_sender_ful_htlcs[MAX_HTLCS];
+        htlc_t *old_sender_ful_htlcs = old_sender_ful_n_htlcs > 0
+            ? malloc(old_sender_ful_n_htlcs * sizeof(htlc_t)) : NULL;
+        if (old_sender_ful_n_htlcs > 0 && !old_sender_ful_htlcs) {
+            free(old_sender_htlcs); free(old_dest_htlcs); free(old_dest_ful_htlcs); return 0;
+        }
         if (old_sender_ful_n_htlcs > 0)
             memcpy(old_sender_ful_htlcs, sender_ch->htlcs, old_sender_ful_n_htlcs * sizeof(htlc_t));
         channel_fulfill_htlc(sender_ch, sender_htlc_id, preimage);
@@ -379,8 +408,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             unsigned char psig32[32];
             uint32_t nonce_idx;
-            if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx))
+            if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+                free(old_sender_htlcs); free(old_dest_htlcs);
+                free(old_dest_ful_htlcs); free(old_sender_ful_htlcs);
                 return 0;
+            }
             cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[from_client].channel_id,
                 sender_ch->commitment_number, psig32, nonce_idx);
@@ -412,8 +444,12 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 cJSON_Delete(ack.json);
             }
         }
+        free(old_dest_ful_htlcs);
+        free(old_sender_ful_htlcs);
     }
 
+    free(old_sender_htlcs);
+    free(old_dest_htlcs);
     printf("  Payment complete: client %zu -> client %zu (%llu sats)\n",
            from_client + 1, to_client + 1, (unsigned long long)amount_sats);
     fflush(stdout);

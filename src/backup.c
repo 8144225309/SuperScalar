@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/evp.h>
 
 /* From noise.c */
 extern void hkdf_extract(unsigned char prk[32], const unsigned char *salt, size_t salt_len,
@@ -35,15 +36,27 @@ static unsigned char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* Derive 32-byte key from passphrase + salt via HKDF-SHA256. */
-static void derive_backup_key(unsigned char key[32],
-                               const unsigned char *passphrase, size_t passphrase_len,
-                               const unsigned char salt[32]) {
+/* v1 KDF: HKDF-SHA256 (kept for reading old backups). */
+static void derive_backup_key_v1(unsigned char key[32],
+                                  const unsigned char *passphrase, size_t passphrase_len,
+                                  const unsigned char salt[32]) {
     static const unsigned char info[] = "superscalar-backup-encryption";
     unsigned char prk[32];
     hkdf_extract(prk, salt, BACKUP_SALT_LEN, passphrase, passphrase_len);
     hkdf_expand(key, 32, prk, info, sizeof(info) - 1);
     secure_zero(prk, 32);
+}
+
+/* v2 KDF: PBKDF2-HMAC-SHA256 with configurable iterations. */
+static int derive_backup_key_v2(unsigned char key[32],
+                                 const unsigned char *passphrase, size_t passphrase_len,
+                                 const unsigned char *salt, size_t salt_len,
+                                 int iterations) {
+    int ok = PKCS5_PBKDF2_HMAC((const char *)passphrase, (int)passphrase_len,
+                                 salt, (int)salt_len,
+                                 iterations, EVP_sha256(),
+                                 32, key);
+    return ok == 1;
 }
 
 /* Write len as 4 LE bytes into buf. */
@@ -99,9 +112,13 @@ int backup_create(const char *db_path, const char *keyfile_path,
     fclose(urand);
     if (!ok) { free(plaintext); return 0; }
 
-    /* Derive key */
+    /* Derive key via PBKDF2 */
     unsigned char key[32];
-    derive_backup_key(key, passphrase, passphrase_len, salt);
+    if (!derive_backup_key_v2(key, passphrase, passphrase_len,
+                               salt, BACKUP_SALT_LEN, BACKUP_PBKDF2_ITERATIONS)) {
+        free(plaintext);
+        return 0;
+    }
 
     /* Build AAD = magic + version */
     unsigned char aad[BACKUP_MAGIC_LEN + 1];
@@ -125,7 +142,7 @@ int backup_create(const char *db_path, const char *keyfile_path,
 
     if (!enc_ok) { free(ciphertext); return 0; }
 
-    /* Write backup file */
+    /* Write backup file (v2: magic + version + iters_BE + salt + nonce + ct + tag) */
     FILE *fp = fopen(backup_path, "wb");
     if (!fp) { free(ciphertext); return 0; }
 
@@ -133,6 +150,13 @@ int backup_create(const char *db_path, const char *keyfile_path,
     written += fwrite(BACKUP_MAGIC, 1, BACKUP_MAGIC_LEN, fp);
     unsigned char ver = BACKUP_VERSION;
     written += fwrite(&ver, 1, 1, fp);
+    unsigned char iters_be[4];
+    uint32_t iters = BACKUP_PBKDF2_ITERATIONS;
+    iters_be[0] = (unsigned char)(iters >> 24);
+    iters_be[1] = (unsigned char)(iters >> 16);
+    iters_be[2] = (unsigned char)(iters >> 8);
+    iters_be[3] = (unsigned char)(iters);
+    written += fwrite(iters_be, 1, 4, fp);
     written += fwrite(salt, 1, BACKUP_SALT_LEN, fp);
     written += fwrite(nonce, 1, BACKUP_NONCE_LEN, fp);
     written += fwrite(ciphertext, 1, pt_len, fp);
@@ -143,7 +167,7 @@ int backup_create(const char *db_path, const char *keyfile_path,
     return (written == BACKUP_HEADER_LEN + pt_len + BACKUP_TAG_LEN) ? 1 : 0;
 }
 
-/* Internal: decrypt backup, return plaintext. Caller frees. */
+/* Internal: decrypt backup, return plaintext. Auto-detects v1/v2. Caller frees. */
 static unsigned char *backup_decrypt(const char *backup_path,
                                       const unsigned char *passphrase,
                                       size_t passphrase_len,
@@ -155,38 +179,65 @@ static unsigned char *backup_decrypt(const char *backup_path,
     unsigned char *file_data = read_file(backup_path, &file_len);
     if (!file_data) return NULL;
 
+    /* Determine format by magic bytes */
+    int is_v2 = 0;
+    if (file_len >= BACKUP_MAGIC_LEN &&
+        memcmp(file_data, BACKUP_MAGIC, BACKUP_MAGIC_LEN) == 0 &&
+        file_data[BACKUP_MAGIC_LEN] == BACKUP_VERSION) {
+        is_v2 = 1;
+    }
+
+    size_t hdr_len = is_v2 ? BACKUP_HEADER_LEN : BACKUP_HEADER_LEN_V1;
+
     /* Validate minimum size */
-    if (file_len < BACKUP_HEADER_LEN + BACKUP_TAG_LEN) {
+    if (file_len < hdr_len + BACKUP_TAG_LEN) {
         free(file_data);
         return NULL;
     }
 
-    /* Check magic */
-    if (memcmp(file_data, BACKUP_MAGIC, BACKUP_MAGIC_LEN) != 0) {
-        free(file_data);
-        return NULL;
+    /* v1: check magic "SSBK0001" + version 1 */
+    if (!is_v2) {
+        if (memcmp(file_data, BACKUP_MAGIC_V1, BACKUP_MAGIC_LEN) != 0 ||
+            file_data[BACKUP_MAGIC_LEN] != BACKUP_VERSION_V1) {
+            free(file_data);
+            return NULL;
+        }
     }
 
-    /* Check version */
-    if (file_data[BACKUP_MAGIC_LEN] != BACKUP_VERSION) {
-        free(file_data);
-        return NULL;
-    }
-
-    const unsigned char *salt = file_data + BACKUP_MAGIC_LEN + 1;
-    const unsigned char *nonce_ptr = salt + BACKUP_SALT_LEN;
-    const unsigned char *ct = nonce_ptr + BACKUP_NONCE_LEN;
-    size_t ct_len = file_len - BACKUP_HEADER_LEN - BACKUP_TAG_LEN;
-    const unsigned char *tag = ct + ct_len;
-
-    /* Derive key */
+    const unsigned char *salt;
+    const unsigned char *nonce_ptr;
     unsigned char key[32];
-    derive_backup_key(key, passphrase, passphrase_len, salt);
-
-    /* Build AAD */
     unsigned char aad[BACKUP_MAGIC_LEN + 1];
-    memcpy(aad, BACKUP_MAGIC, BACKUP_MAGIC_LEN);
-    aad[BACKUP_MAGIC_LEN] = BACKUP_VERSION;
+
+    if (is_v2) {
+        /* v2: [magic 8][ver 1][iters_BE 4][salt 32][nonce 12][ct][tag 16] */
+        uint32_t iters = ((uint32_t)file_data[9] << 24)
+                       | ((uint32_t)file_data[10] << 16)
+                       | ((uint32_t)file_data[11] << 8)
+                       | (uint32_t)file_data[12];
+        salt = file_data + 13;
+        nonce_ptr = salt + BACKUP_SALT_LEN;
+
+        if (!derive_backup_key_v2(key, passphrase, passphrase_len,
+                                   salt, BACKUP_SALT_LEN, (int)iters)) {
+            free(file_data);
+            return NULL;
+        }
+        memcpy(aad, BACKUP_MAGIC, BACKUP_MAGIC_LEN);
+        aad[BACKUP_MAGIC_LEN] = BACKUP_VERSION;
+    } else {
+        /* v1: [magic 8][ver 1][salt 32][nonce 12][ct][tag 16] */
+        salt = file_data + BACKUP_MAGIC_LEN + 1;
+        nonce_ptr = salt + BACKUP_SALT_LEN;
+
+        derive_backup_key_v1(key, passphrase, passphrase_len, salt);
+        memcpy(aad, BACKUP_MAGIC_V1, BACKUP_MAGIC_LEN);
+        aad[BACKUP_MAGIC_LEN] = BACKUP_VERSION_V1;
+    }
+
+    const unsigned char *ct = file_data + hdr_len;
+    size_t ct_len = file_len - hdr_len - BACKUP_TAG_LEN;
+    const unsigned char *tag = ct + ct_len;
 
     /* Decrypt */
     unsigned char *plaintext = malloc(ct_len);

@@ -3,6 +3,7 @@
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd) {
@@ -163,7 +164,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t old_dest_local = dest_ch->local_amount;
         uint64_t old_dest_remote = dest_ch->remote_amount;
         size_t old_dest_n_htlcs = dest_ch->n_htlcs;
-        htlc_t old_dest_htlcs[MAX_HTLCS];
+        htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
+            ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
+        if (old_dest_n_htlcs > 0 && !old_dest_htlcs) return 0;
         if (old_dest_n_htlcs > 0)
             memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
@@ -180,6 +183,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    dest_idx, (unsigned long long)amount_sats,
                    (unsigned long long)dest_ch->local_amount,
                    (unsigned long long)dest_ch->remote_amount);
+            free(old_dest_htlcs);
             return 1;
         }
 
@@ -202,6 +206,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                    payment_hash, cltv_expiry);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
+            free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(fwd);
@@ -210,13 +215,16 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             unsigned char psig32[32];
             uint32_t nonce_idx;
-            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+                free(old_dest_htlcs);
                 return 0;
+            }
             cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[dest_idx].channel_id,
                 dest_ch->commitment_number, psig32, nonce_idx);
             if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
                 cJSON_Delete(cs);
+                free(old_dest_htlcs);
                 return 0;
             }
             cJSON_Delete(cs);
@@ -228,6 +236,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (!wire_recv(lsp->client_fds[dest_idx], &ack_msg) ||
                 ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
                 if (ack_msg.json) cJSON_Delete(ack_msg.json);
+                free(old_dest_htlcs);
                 return 0;
             }
             uint32_t ack_chan_id;
@@ -248,6 +257,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             cJSON_Delete(ack_msg.json);
         }
+        free(old_dest_htlcs);
 
         printf("LSP: bridge HTLC forwarded to client %zu (%llu sats)\n",
                dest_idx, (unsigned long long)amount_sats);

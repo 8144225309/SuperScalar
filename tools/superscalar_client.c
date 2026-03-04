@@ -12,6 +12,8 @@
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/tor.h"
+#include "superscalar/bip39.h"
+#include "superscalar/hd_key.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1355,6 +1357,9 @@ static void usage(const char *prog) {
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
+        "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
+        "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
+        "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help                            Show this help\n",
         prog);
@@ -1389,6 +1394,9 @@ int main(int argc, char *argv[]) {
     const char *tor_proxy_arg = NULL;
     int tor_only = 0;
     int accept_risk = 0;
+    int generate_mnemonic = 0;
+    const char *from_mnemonic = NULL;
+    const char *mnemonic_passphrase = "";
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1479,12 +1487,57 @@ int main(int argc, char *argv[]) {
             tor_proxy_arg = argv[++i];
         } else if (strcmp(argv[i], "--tor-only") == 0) {
             tor_only = 1;
+        } else if (strcmp(argv[i], "--generate-mnemonic") == 0) {
+            generate_mnemonic = 1;
+        } else if (strcmp(argv[i], "--from-mnemonic") == 0 && i + 1 < argc) {
+            from_mnemonic = argv[++i];
+        } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
+            mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
         }
+    }
+
+    /* --- BIP39 Mnemonic (early exit) --- */
+    if (generate_mnemonic || from_mnemonic) {
+        if (!keyfile_path) {
+            fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
+            return 1;
+        }
+        unsigned char seed[64];
+        if (generate_mnemonic) {
+            char mnemonic[1024];
+            if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
+                fprintf(stderr, "Error: failed to generate mnemonic\n");
+                return 1;
+            }
+            printf("BIP39 Mnemonic (WRITE THIS DOWN!):\n\n  %s\n\n", mnemonic);
+            if (!bip39_mnemonic_to_seed(mnemonic, mnemonic_passphrase, seed)) {
+                fprintf(stderr, "Error: failed to derive seed\n");
+                secure_zero(mnemonic, sizeof(mnemonic));
+                return 1;
+            }
+            secure_zero(mnemonic, sizeof(mnemonic));
+        } else {
+            if (!bip39_validate(from_mnemonic)) {
+                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+                return 1;
+            }
+            if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
+                fprintf(stderr, "Error: failed to derive seed from mnemonic\n");
+                return 1;
+            }
+        }
+        unsigned char seckey[32];
+        int ok = keyfile_generate_from_seed(keyfile_path, seckey, passphrase,
+                                             seed, 64, NULL);
+        secure_zero(seed, sizeof(seed));
+        secure_zero(seckey, sizeof(seckey));
+        printf("Keyfile %s: %s\n", keyfile_path, ok ? "OK" : "FAILED");
+        return ok ? 0 : 1;
     }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */

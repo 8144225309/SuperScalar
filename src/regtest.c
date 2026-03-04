@@ -5,9 +5,64 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef _POSIX_VERSION
+#include <sys/wait.h>
+#endif
+
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
+#ifdef _POSIX_VERSION
+/* Execute argv via fork/execvp with no shell interpretation.
+   Captures combined stdout+stderr. Returns malloc'd string or NULL. */
+static char *run_command_exec(char *const argv[]) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout+stderr to pipe write end */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], argv);
+        _exit(127);  /* exec failed */
+    }
+
+    /* Parent: read from pipe */
+    close(pipefd[1]);
+
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+
+    while (1) {
+        ssize_t n = read(pipefd[0], buf + len, cap - len - 1);
+        if (n <= 0) break;
+        len += (size_t)n;
+        if (len >= cap - 1) {
+            cap *= 2;
+            char *tmp = (char *)realloc(buf, cap);
+            if (!tmp) { free(buf); close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+            buf = tmp;
+        }
+    }
+    buf[len] = '\0';
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+    return buf;
+}
+#endif /* _POSIX_VERSION */
+
+/* Execute shell command via popen (fallback / used for backward compat). */
 static char *run_command(const char *cmd) {
     FILE *fp = popen(cmd, "r");
     if (!fp) return NULL;
@@ -104,19 +159,8 @@ int regtest_init_network(regtest_t *rt, const char *network) {
     strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
     rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 1000;
 
-    /* Build verification command using rt->cli_path (not hardcoded) */
-    char cmd[512];
-    if (strcmp(rt->network, "mainnet") == 0) {
-        snprintf(cmd, sizeof(cmd),
-            "%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->cli_path, rt->rpcuser, rt->rpcpassword);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-            "%s -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
-    }
-
-    char *result = run_command(cmd);
+    /* Verify connection via regtest_exec (uses fork/execvp on POSIX) */
+    char *result = regtest_exec(rt, "getblockchaininfo", "");
     if (!result) return 0;
 
     int ok = (strstr(result, "\"chain\"") != NULL);
@@ -160,11 +204,115 @@ int regtest_init_full(regtest_t *rt, const char *network,
     return ok ? 1 : 0;
 }
 
+#ifdef _POSIX_VERSION
+/* Build argv array from regtest_t + method + params for execvp.
+   Tokenizes params on spaces (respecting double-quoted substrings).
+   Returns malloc'd argv (caller must free each element + the array), n_out set.
+   Returns NULL on error. */
+static char **build_argv(const regtest_t *rt, const char *method,
+                          const char *params, size_t *n_out) {
+    /* Max args: cli_path, -network, -rpcuser=X, -rpcpassword=X,
+       -datadir=X, -rpcport=X, -rpcwallet=X, method, + up to 32 param tokens, NULL */
+    char *args[48];
+    size_t n = 0;
+
+    args[n++] = strdup(rt->cli_path);
+
+    if (strcmp(rt->network, "mainnet") != 0) {
+        char net_flag[32];
+        snprintf(net_flag, sizeof(net_flag), "-%s", rt->network);
+        args[n++] = strdup(net_flag);
+    }
+
+    char rpcuser_arg[128];
+    snprintf(rpcuser_arg, sizeof(rpcuser_arg), "-rpcuser=%s", rt->rpcuser);
+    args[n++] = strdup(rpcuser_arg);
+
+    char rpcpass_arg[128];
+    snprintf(rpcpass_arg, sizeof(rpcpass_arg), "-rpcpassword=%s", rt->rpcpassword);
+    args[n++] = strdup(rpcpass_arg);
+
+    if (rt->datadir[0] != '\0') {
+        char dd_arg[512];
+        snprintf(dd_arg, sizeof(dd_arg), "-datadir=%s", rt->datadir);
+        args[n++] = strdup(dd_arg);
+    }
+    if (rt->rpcport > 0) {
+        char port_arg[32];
+        snprintf(port_arg, sizeof(port_arg), "-rpcport=%d", rt->rpcport);
+        args[n++] = strdup(port_arg);
+    }
+    if (rt->wallet[0] != '\0') {
+        char wallet_arg[128];
+        snprintf(wallet_arg, sizeof(wallet_arg), "-rpcwallet=%s", rt->wallet);
+        args[n++] = strdup(wallet_arg);
+    }
+
+    args[n++] = strdup(method);
+
+    /* Tokenize params on spaces, respecting double-quoted substrings */
+    if (params && params[0] != '\0') {
+        size_t plen = strlen(params);
+        char *pcopy = malloc(plen + 1);
+        if (pcopy) {
+            memcpy(pcopy, params, plen + 1);
+            char *p = pcopy;
+            while (*p && n < 46) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+
+                char *start;
+                if (*p == '"') {
+                    /* Quoted token: find closing quote */
+                    p++;
+                    start = p;
+                    while (*p && *p != '"') p++;
+                    if (*p == '"') *p++ = '\0';
+                } else {
+                    start = p;
+                    while (*p && *p != ' ') p++;
+                    if (*p) *p++ = '\0';
+                }
+                args[n++] = strdup(start);
+            }
+            free(pcopy);
+        }
+    }
+
+    /* Build NULL-terminated argv */
+    char **argv = malloc((n + 1) * sizeof(char *));
+    if (!argv) {
+        for (size_t i = 0; i < n; i++) free(args[i]);
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) argv[i] = args[i];
+    argv[n] = NULL;
+    *n_out = n;
+    return argv;
+}
+
+static void free_argv(char **argv, size_t n) {
+    for (size_t i = 0; i < n; i++) free(argv[i]);
+    free(argv);
+}
+#endif /* _POSIX_VERSION */
+
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params) {
     /* Reject shell metacharacters in method and params */
     if (!sanitize_rpc_param(method) || !sanitize_rpc_param(params))
         return NULL;
 
+#ifdef _POSIX_VERSION
+    /* Preferred path: fork/execvp with no shell interpretation */
+    size_t argc_n = 0;
+    char **argv = build_argv(rt, method, params, &argc_n);
+    if (!argv) return NULL;
+
+    char *result = run_command_exec(argv);
+    free_argv(argv, argc_n);
+    return result;
+#else
+    /* Fallback: popen (non-POSIX systems) */
     char prefix[512];
     build_cli_prefix(rt, prefix, sizeof(prefix));
     if (prefix[0] == '\0') return NULL;
@@ -177,6 +325,7 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
     }
 
     return run_command(cmd);
+#endif
 }
 
 int regtest_create_wallet(regtest_t *rt, const char *name) {

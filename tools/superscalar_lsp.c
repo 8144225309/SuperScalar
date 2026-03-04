@@ -12,6 +12,8 @@
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/backup.h"
+#include "superscalar/bip39.h"
+#include "superscalar/hd_key.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 #include <stdio.h>
@@ -96,6 +98,8 @@ static void usage(const char *prog) {
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
+        "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
+        "  --max-handshakes N  Max concurrent handshakes (default: 4)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
@@ -107,6 +111,9 @@ static void usage(const char *prog) {
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
         "  --onion               Create Tor hidden service on startup\n"
+        "  --generate-mnemonic Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
+        "  --from-mnemonic WORDS Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
+        "  --mnemonic-passphrase P BIP39 passphrase for seed derivation (default: empty)\n"
         "  --backup PATH       Create encrypted backup of --db and --keyfile to PATH, then exit\n"
         "  --restore PATH      Restore encrypted backup from PATH to --db and --keyfile, then exit\n"
         "  --backup-verify PATH  Verify encrypted backup integrity, then exit\n"
@@ -469,6 +476,8 @@ int main(int argc, char *argv[]) {
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
+    int max_conn_rate_arg = 10;      /* max connections per IP per minute */
+    int max_handshakes_arg = 4;      /* max concurrent handshakes */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
@@ -492,6 +501,9 @@ int main(int argc, char *argv[]) {
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
     int backup_verify_arg = 0;
+    int generate_mnemonic = 0;
+    const char *from_mnemonic = NULL;
+    const char *mnemonic_passphrase = "";
     int fee_bump_after = 6;       /* blocks before first bump */
     int fee_bump_max = 3;         /* max bump attempts */
     double fee_bump_multiplier = 1.5;
@@ -612,6 +624,10 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--max-conn-rate") == 0 && i + 1 < argc)
+            max_conn_rate_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-handshakes") == 0 && i + 1 < argc)
+            max_handshakes_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--accept-timeout") == 0 && i + 1 < argc) {
             accept_timeout_arg = atoi(argv[++i]);
             if (accept_timeout_arg <= 0) {
@@ -682,6 +698,12 @@ int main(int argc, char *argv[]) {
             fee_bump_max = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-multiplier") == 0 && i + 1 < argc)
             fee_bump_multiplier = atof(argv[++i]);
+        else if (strcmp(argv[i], "--generate-mnemonic") == 0)
+            generate_mnemonic = 1;
+        else if (strcmp(argv[i], "--from-mnemonic") == 0 && i + 1 < argc)
+            from_mnemonic = argv[++i];
+        else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc)
+            mnemonic_passphrase = argv[++i];
         else if (strcmp(argv[i], "--backup") == 0 && i + 1 < argc)
             backup_path_arg = argv[++i];
         else if (strcmp(argv[i], "--restore") == 0 && i + 1 < argc)
@@ -737,6 +759,45 @@ int main(int argc, char *argv[]) {
             printf("Backup restore: %s\n", ok ? "OK" : "FAILED");
             return ok ? 0 : 1;
         }
+    }
+
+    /* --- BIP39 Mnemonic (early exit) --- */
+    if (generate_mnemonic || from_mnemonic) {
+        if (!keyfile_path) {
+            fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
+            return 1;
+        }
+        unsigned char seed[64];
+        if (generate_mnemonic) {
+            char mnemonic[1024];
+            if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
+                fprintf(stderr, "Error: failed to generate mnemonic\n");
+                return 1;
+            }
+            printf("BIP39 Mnemonic (WRITE THIS DOWN!):\n\n  %s\n\n", mnemonic);
+            if (!bip39_mnemonic_to_seed(mnemonic, mnemonic_passphrase, seed)) {
+                fprintf(stderr, "Error: failed to derive seed\n");
+                secure_zero(mnemonic, sizeof(mnemonic));
+                return 1;
+            }
+            secure_zero(mnemonic, sizeof(mnemonic));
+        } else {
+            if (!bip39_validate(from_mnemonic)) {
+                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+                return 1;
+            }
+            if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
+                fprintf(stderr, "Error: failed to derive seed from mnemonic\n");
+                return 1;
+            }
+        }
+        unsigned char seckey[32];
+        int ok = keyfile_generate_from_seed(keyfile_path, seckey, passphrase,
+                                             seed, 64, NULL);
+        secure_zero(seed, sizeof(seed));
+        secure_zero(seckey, sizeof(seckey));
+        printf("Keyfile %s: %s\n", keyfile_path, ok ? "OK" : "FAILED");
+        return ok ? 0 : 1;
     }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
@@ -1324,6 +1385,7 @@ int main(int argc, char *argv[]) {
     lsp.accept_timeout_sec = accept_timeout_arg;
     if (max_connections_arg > 0)
         lsp.max_connections = max_connections_arg;
+    rate_limiter_init(&lsp.rate_limiter, max_conn_rate_arg, 60, max_handshakes_arg);
 
     /* Enable NK (server-authenticated) noise handshake */
     lsp.use_nk = 1;

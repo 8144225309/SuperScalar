@@ -587,6 +587,9 @@ extern int test_bridge_heartbeat_config(void);
 extern int test_backup_create_verify_restore(void);
 extern int test_backup_wrong_passphrase(void);
 extern int test_backup_corrupt_file(void);
+extern int test_backup_v2_roundtrip(void);
+extern int test_backup_v1_compat(void);
+extern int test_backup_v2_wrong_passphrase(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -604,6 +607,32 @@ extern int test_factory_config_default(void);
 extern int test_tlv_encode_decode(void);
 extern int test_tlv_decode_truncated(void);
 extern int test_wire_hello_tlv_negotiation(void);
+
+/* Mainnet Codepath Tests */
+extern int test_mainnet_cli_prefix_no_flag(void);
+extern int test_mainnet_scan_depth(void);
+
+/* Rate Limiting Tests */
+extern int test_rate_limit_under_limit(void);
+extern int test_rate_limit_over_limit(void);
+extern int test_rate_limit_window_config(void);
+extern int test_rate_limit_handshake_cap(void);
+
+/* Shell-Free Execution Tests */
+extern int test_regtest_exec_no_shell_interp(void);
+extern int test_regtest_argv_tokenization(void);
+
+/* BIP39 Mnemonic Support */
+extern int test_bip39_entropy_roundtrip_12(void);
+extern int test_bip39_entropy_roundtrip_24(void);
+extern int test_bip39_validate_good(void);
+extern int test_bip39_validate_bad_checksum(void);
+extern int test_bip39_validate_bad_word(void);
+extern int test_bip39_seed_derivation(void);
+extern int test_bip39_seed_no_passphrase(void);
+extern int test_bip39_vector_7f(void);
+extern int test_bip39_generate(void);
+extern int test_bip39_keyfile_integration(void);
 
 /* Mainnet Audit: Atomic DB Transactions */
 extern int test_persist_transaction_commit(void);
@@ -1150,6 +1179,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_wrong_passphrase);
     RUN_TEST(test_backup_corrupt_file);
 
+    printf("\n=== Backup KDF v2 (PBKDF2) ===\n");
+    RUN_TEST(test_backup_v2_roundtrip);
+    RUN_TEST(test_backup_v1_compat);
+    RUN_TEST(test_backup_v2_wrong_passphrase);
+
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
     RUN_TEST(test_coin_select_no_change);
@@ -1166,6 +1200,32 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tlv_encode_decode);
     RUN_TEST(test_tlv_decode_truncated);
     RUN_TEST(test_wire_hello_tlv_negotiation);
+
+    printf("\n=== Mainnet Codepath Tests ===\n");
+    RUN_TEST(test_mainnet_cli_prefix_no_flag);
+    RUN_TEST(test_mainnet_scan_depth);
+
+    printf("\n=== Rate Limiting ===\n");
+    RUN_TEST(test_rate_limit_under_limit);
+    RUN_TEST(test_rate_limit_over_limit);
+    RUN_TEST(test_rate_limit_window_config);
+    RUN_TEST(test_rate_limit_handshake_cap);
+
+    printf("\n=== Shell-Free Execution ===\n");
+    RUN_TEST(test_regtest_exec_no_shell_interp);
+    RUN_TEST(test_regtest_argv_tokenization);
+
+    printf("\n=== BIP39 Mnemonic Support ===\n");
+    RUN_TEST(test_bip39_entropy_roundtrip_12);
+    RUN_TEST(test_bip39_entropy_roundtrip_24);
+    RUN_TEST(test_bip39_validate_good);
+    RUN_TEST(test_bip39_validate_bad_checksum);
+    RUN_TEST(test_bip39_validate_bad_word);
+    RUN_TEST(test_bip39_seed_derivation);
+    RUN_TEST(test_bip39_seed_no_passphrase);
+    RUN_TEST(test_bip39_vector_7f);
+    RUN_TEST(test_bip39_generate);
+    RUN_TEST(test_bip39_keyfile_integration);
 
     printf("\n=== Mainnet Audit: Atomic DB Transactions ===\n");
     RUN_TEST(test_persist_transaction_commit);
