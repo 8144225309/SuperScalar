@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 435 tests (392 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 437 tests (394 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -69,7 +69,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-423 tests (380 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+437 tests (394 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 

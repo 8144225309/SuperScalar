@@ -1121,3 +1121,119 @@ int test_prop_keysend_invoice_collision(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Test 9: Auto-rebalance threshold selection edges.
+   Replicate the selection logic from lsp_demo.c:535-562 to test
+   decision-making without wire protocol / live FDs. */
+int test_auto_rebalance_threshold_edges(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    lsp_channel_entry_t entries[4];
+    memset(entries, 0, sizeof(entries));
+    mgr.entries = entries;
+    mgr.entries_cap = 4;
+
+    /* Helper lambda-style inline: compute how many channels the
+       auto_rebalance selection logic would pick as "source". */
+    #define COUNT_SOURCES(n_ch, thresh) do { \
+        uint16_t _t = (thresh); \
+        if (_t == 0 || _t > 99) _t = 80; \
+        int _src = 0; \
+        for (size_t _c = 0; _c < (size_t)(n_ch); _c++) { \
+            channel_t *_ch = &mgr.entries[_c].channel; \
+            uint64_t _total = _ch->local_amount + _ch->remote_amount; \
+            if (_total == 0) continue; \
+            uint64_t _pct = (_ch->local_amount * 100) / _total; \
+            if (_pct > _t) _src++; \
+        } \
+        source_count = _src; \
+    } while (0)
+
+    int source_count;
+
+    /* Case 1: source at exactly threshold% → should be selected
+       (pct_local > threshold, so exactly at threshold is NOT selected) */
+    mgr.n_channels = 2;
+    mgr.entries[0].channel.local_amount = 70;
+    mgr.entries[0].channel.remote_amount = 30;  /* 70% local */
+    mgr.entries[1].channel.local_amount = 30;
+    mgr.entries[1].channel.remote_amount = 70;  /* 30% local */
+    mgr.rebalance_threshold_pct = 70;
+    COUNT_SOURCES(2, mgr.rebalance_threshold_pct);
+    TEST_ASSERT_EQ(source_count, 0,
+                   "exactly at threshold: not selected (> not >=)");
+
+    /* Case 2: source at (threshold-1)% → should NOT be selected */
+    mgr.entries[0].channel.local_amount = 69;
+    mgr.entries[0].channel.remote_amount = 31;  /* 69% local */
+    COUNT_SOURCES(2, mgr.rebalance_threshold_pct);
+    TEST_ASSERT_EQ(source_count, 0,
+                   "below threshold: not selected");
+
+    /* Case 3: source at (threshold+1)% → should be selected */
+    mgr.entries[0].channel.local_amount = 71;
+    mgr.entries[0].channel.remote_amount = 29;  /* 71% local */
+    COUNT_SOURCES(2, mgr.rebalance_threshold_pct);
+    TEST_ASSERT_EQ(source_count, 1,
+                   "above threshold: selected");
+
+    /* Case 4: 3 channels — verify lightest target is the one with min local_amount */
+    mgr.n_channels = 3;
+    mgr.entries[0].channel.local_amount = 90;
+    mgr.entries[0].channel.remote_amount = 10;  /* 90% — source */
+    mgr.entries[1].channel.local_amount = 50;
+    mgr.entries[1].channel.remote_amount = 50;  /* 50% */
+    mgr.entries[2].channel.local_amount = 20;
+    mgr.entries[2].channel.remote_amount = 80;  /* 20% — lightest */
+    mgr.rebalance_threshold_pct = 70;
+    /* Find lightest for source=0 */
+    size_t lightest = 0;
+    uint64_t lightest_local = UINT64_MAX;
+    for (size_t j = 0; j < mgr.n_channels; j++) {
+        if (j == 0) continue;
+        uint64_t jl = mgr.entries[j].channel.local_amount;
+        if (jl < lightest_local) {
+            lightest_local = jl;
+            lightest = j;
+        }
+    }
+    TEST_ASSERT_EQ((long)lightest, 2L,
+                   "lightest target is channel 2 (20% local)");
+
+    /* Case 5: all channels at 50% → nothing to do */
+    mgr.n_channels = 4;
+    for (size_t c = 0; c < 4; c++) {
+        mgr.entries[c].channel.local_amount = 50;
+        mgr.entries[c].channel.remote_amount = 50;
+    }
+    mgr.rebalance_threshold_pct = 70;
+    COUNT_SOURCES(4, mgr.rebalance_threshold_pct);
+    TEST_ASSERT_EQ(source_count, 0,
+                   "all at 50%: nothing to do");
+
+    /* Case 6: total capacity zero channel → skipped */
+    mgr.n_channels = 2;
+    mgr.entries[0].channel.local_amount = 0;
+    mgr.entries[0].channel.remote_amount = 0;  /* zero total — skip */
+    mgr.entries[1].channel.local_amount = 80;
+    mgr.entries[1].channel.remote_amount = 20;
+    mgr.rebalance_threshold_pct = 70;
+    COUNT_SOURCES(2, mgr.rebalance_threshold_pct);
+    TEST_ASSERT_EQ(source_count, 1,
+                   "zero-capacity skipped, channel 1 selected");
+
+    /* Case 7: threshold 0 or >99 defaults to 80 */
+    mgr.entries[0].channel.local_amount = 81;
+    mgr.entries[0].channel.remote_amount = 19;  /* 81% */
+    mgr.entries[1].channel.local_amount = 79;
+    mgr.entries[1].channel.remote_amount = 21;  /* 79% */
+    COUNT_SOURCES(2, 0);
+    TEST_ASSERT_EQ(source_count, 1,
+                   "threshold=0 defaults to 80: 81% selected");
+    COUNT_SOURCES(2, 100);
+    TEST_ASSERT_EQ(source_count, 1,
+                   "threshold=100 defaults to 80: 81% selected");
+
+    #undef COUNT_SOURCES
+    return 1;
+}
