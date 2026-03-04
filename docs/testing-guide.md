@@ -6,10 +6,10 @@ How to build, run, and understand the full test suite.
 
 ## Prerequisites
 
-You need a Linux or macOS machine (or WSL on Windows). Install:
+You need a Linux or macOS machine. Install:
 
 ```bash
-# Ubuntu / Debian / WSL
+# Ubuntu / Debian
 sudo apt update
 sudo apt install build-essential cmake libsqlite3-dev python3
 
