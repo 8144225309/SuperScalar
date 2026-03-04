@@ -2471,3 +2471,43 @@ int test_rotation_retry_defaults(void) {
 
     return 1;
 }
+
+/* Rotation retry: factory_id % 8 slot collision overwrites prior state.
+   Documents the known design limitation that different factory IDs sharing
+   the same slot (factory_id % 8) will clobber each other's retry state. */
+int test_rotation_retry_factory_id_collision(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.rot_max_retries = 3;
+    mgr.rot_retry_base_delay = 10;
+
+    /* Record failure for factory_id=0 at block 100 */
+    mgr.rot_attempted_mask |= (1u << 0);
+    lsp_rotation_record_failure(&mgr, 0, 100);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[0 % 8], 1, "factory 0: count=1");
+    TEST_ASSERT_EQ(mgr.rot_last_attempt_block[0 % 8], 100,
+                   "factory 0: block=100");
+
+    /* Record failure for factory_id=8 at block 200 — same slot (8 % 8 = 0) */
+    mgr.rot_attempted_mask |= (1u << 8);
+    lsp_rotation_record_failure(&mgr, 8, 200);
+
+    /* Slot 0 now has factory_id=8's state (count=2, block=200) */
+    TEST_ASSERT_EQ(mgr.rot_retry_count[8 % 8], 2,
+                   "slot collision: count accumulated");
+    TEST_ASSERT_EQ(mgr.rot_last_attempt_block[8 % 8], 200,
+                   "slot collision: block overwritten to 200");
+
+    /* should_retry for factory_id=0 now uses the clobbered values:
+       delay = 10 * 2^2 = 40, so need block >= 200 + 40 = 240 */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 230), 0,
+                   "factory 0 uses clobbered delay (too early)");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 0, 240), 1,
+                   "factory 0 uses clobbered delay (ready)");
+
+    /* Success on factory_id=0 resets the shared slot */
+    lsp_rotation_record_success(&mgr, 0);
+    TEST_ASSERT_EQ(mgr.rot_retry_count[0], 0, "success resets shared slot");
+
+    return 1;
+}

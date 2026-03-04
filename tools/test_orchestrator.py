@@ -1588,6 +1588,75 @@ def scenario_watchtower_late_arrival(orch):
     return success
 
 
+def scenario_auto_rebalance(orch):
+    """Demo + auto-rebalance test: verify balance conservation."""
+    orch._log("=== SCENARIO: auto_rebalance ===")
+    orch._log("LSP runs demo then auto-rebalance test.")
+
+    orch.start_lsp(["--demo", "--test-rebalance"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    passed = "AUTO-REBALANCE TEST: PASS" in lsp_log
+
+    orch.stop_all()
+    orch._log(f"Result: {'PASS' if passed else 'FAIL'} — "
+              f"auto-rebalance {'passed' if passed else 'not found in log'}")
+    return passed
+
+
+def scenario_batch_rebalance(orch):
+    """Demo + batch-rebalance test: verify multi-transfer + conservation."""
+    orch._log("=== SCENARIO: batch_rebalance ===")
+    orch._log("LSP runs demo then batch-rebalance test.")
+
+    orch.start_lsp(["--demo", "--test-batch-rebalance"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    passed = "BATCH-REBALANCE TEST: PASS" in lsp_log
+
+    orch.stop_all()
+    orch._log(f"Result: {'PASS' if passed else 'FAIL'} — "
+              f"batch-rebalance {'passed' if passed else 'not found in log'}")
+    return passed
+
+
+def scenario_leaf_realloc(orch):
+    """Demo + leaf reallocation test: arity-2, 2 clients."""
+    orch._log("=== SCENARIO: leaf_realloc ===")
+    orch._log("LSP runs demo then leaf reallocation test (arity-2, 2 clients).")
+
+    # Override to 2 clients for this test
+    saved_n = orch.n_clients
+    orch.n_clients = 2
+    orch.start_lsp(["--demo", "--test-realloc", "--leaf-arity", "2",
+                    "--clients", "2"])
+    time.sleep(orch.timing["lsp_bind"])
+    for i in range(2):
+        orch.start_client(i)
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    passed = "LEAF REALLOC TEST: PASS" in lsp_log
+
+    orch.stop_all()
+    orch.n_clients = saved_n
+    orch._log(f"Result: {'PASS' if passed else 'FAIL'} — "
+              f"leaf realloc {'passed' if passed else 'not found in log'}")
+    return passed
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -1613,6 +1682,9 @@ SCENARIOS = {
     "routing_fee": lambda o, **kw: scenario_routing_fee(o),
     "cli_payments": lambda o, **kw: scenario_cli_payments(o),
     "profit_shared": lambda o, **kw: scenario_profit_shared(o),
+    "auto_rebalance": lambda o, **kw: scenario_auto_rebalance(o),
+    "batch_rebalance": lambda o, **kw: scenario_batch_rebalance(o),
+    "leaf_realloc": lambda o, **kw: scenario_leaf_realloc(o),
 }
 
 
@@ -1640,6 +1712,9 @@ def list_scenarios():
         "routing_fee": "Factory with routing fees; verify fee deduction in balances",
         "cli_payments": "Interactive CLI; pipe pay/status/close to LSP stdin",
         "profit_shared": "Profit-shared economics; fees accumulated, settled to clients",
+        "auto_rebalance": "Demo + auto-rebalance; verify balance conservation",
+        "batch_rebalance": "Demo + batch rebalance; multi-transfer + conservation",
+        "leaf_realloc": "Demo + leaf reallocation; arity-2 MuSig2 ceremony",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")

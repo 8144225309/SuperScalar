@@ -532,6 +532,7 @@ extern int test_funding_reserve_check(void);
 extern int test_rotation_retry_backoff(void);
 extern int test_rotation_retry_success_resets(void);
 extern int test_rotation_retry_defaults(void);
+extern int test_rotation_retry_factory_id_collision(void);
 
 /* Profit Settlement tests */
 extern int test_profit_settlement_calculation(void);
@@ -575,6 +576,7 @@ extern int test_prop_keysend_bridge_e2e(void);
 extern int test_prop_cli_command_fuzzing(void);
 extern int test_prop_batch_rebalance_partial_fail(void);
 extern int test_prop_keysend_invoice_collision(void);
+extern int test_auto_rebalance_threshold_edges(void);
 
 /* Bridge Reliability Tests (Roadmap Item #7) */
 extern int test_bridge_heartbeat_stale(void);
@@ -1095,6 +1097,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_retry_backoff);
     RUN_TEST(test_rotation_retry_success_resets);
     RUN_TEST(test_rotation_retry_defaults);
+    RUN_TEST(test_rotation_retry_factory_id_collision);
 
     printf("\n=== Profit Settlement ===\n");
     RUN_TEST(test_profit_settlement_calculation);
@@ -1128,6 +1131,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_prop_cli_command_fuzzing);
     RUN_TEST(test_prop_batch_rebalance_partial_fail);
     RUN_TEST(test_prop_keysend_invoice_collision);
+    RUN_TEST(test_auto_rebalance_threshold_edges);
 
     printf("\n=== Tor Safety ===\n");
     RUN_TEST(test_tor_only_refuses_clearnet);

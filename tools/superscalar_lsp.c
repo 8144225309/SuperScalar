@@ -485,6 +485,9 @@ int main(int argc, char *argv[]) {
     const char *bind_addr = NULL;
     int auto_rebalance = 0;
     int rebalance_threshold = 80;  /* default 80% imbalance threshold */
+    int test_rebalance = 0;
+    int test_batch_rebalance = 0;
+    int test_realloc = 0;
     int dynamic_fees = 0;
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
@@ -553,6 +556,12 @@ int main(int argc, char *argv[]) {
             test_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
+        else if (strcmp(argv[i], "--test-rebalance") == 0)
+            test_rebalance = 1;
+        else if (strcmp(argv[i], "--test-batch-rebalance") == 0)
+            test_batch_rebalance = 1;
+        else if (strcmp(argv[i], "--test-realloc") == 0)
+            test_realloc = 1;
         else if (strcmp(argv[i], "--active-blocks") == 0 && i + 1 < argc)
             active_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--dying-blocks") == 0 && i + 1 < argc)
@@ -1699,7 +1708,8 @@ int main(int argc, char *argv[]) {
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
-        test_distrib || test_turnover || test_rotation || force_close) {
+        test_distrib || test_turnover || test_rotation || force_close ||
+        test_rebalance || test_batch_rebalance || test_realloc) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = &fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -2757,6 +2767,233 @@ int main(int argc, char *argv[]) {
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
+    }
+
+    /* === Auto-Rebalance Test === */
+    if (test_rebalance && channels_active) {
+        printf("\n=== AUTO-REBALANCE TEST ===\n");
+        fflush(stdout);
+        int rebalance_pass = 1;
+
+        /* Record pre-rebalance balances */
+        uint64_t pre_total = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            pre_total += mgr->entries[c].channel.local_amount +
+                         mgr->entries[c].channel.remote_amount;
+        }
+
+        /* Deliberately imbalance: send large payment ch0 → ch1 */
+        if (mgr->n_channels >= 2) {
+            uint64_t imbalance_amt = mgr->entries[0].channel.local_amount / 3;
+            if (imbalance_amt > 0) {
+                printf("Imbalancing: %llu sats from ch0 → ch1\n",
+                       (unsigned long long)imbalance_amt);
+                lsp_channels_initiate_payment(mgr, &lsp, 0, 1, imbalance_amt);
+            }
+        }
+
+        /* Record heaviest channel local% before rebalance */
+        uint64_t heaviest_pct_before = 0;
+        size_t heaviest_idx = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            uint64_t tot = mgr->entries[c].channel.local_amount +
+                           mgr->entries[c].channel.remote_amount;
+            if (tot > 0) {
+                uint64_t pct = (mgr->entries[c].channel.local_amount * 100) / tot;
+                if (pct > heaviest_pct_before) {
+                    heaviest_pct_before = pct;
+                    heaviest_idx = c;
+                }
+            }
+        }
+
+        /* Set threshold and run auto-rebalance */
+        mgr->rebalance_threshold_pct = 70;
+        int rebal_count = lsp_channels_auto_rebalance(mgr, &lsp);
+        printf("Auto-rebalance moved %d channel(s)\n", rebal_count);
+
+        /* Verify: total balance conservation */
+        uint64_t post_total = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            post_total += mgr->entries[c].channel.local_amount +
+                          mgr->entries[c].channel.remote_amount;
+        }
+        if (post_total != pre_total) {
+            printf("  FAIL: balance conservation violated "
+                   "(pre=%llu post=%llu)\n",
+                   (unsigned long long)pre_total,
+                   (unsigned long long)post_total);
+            rebalance_pass = 0;
+        }
+
+        /* Verify: if rebalance happened, heaviest channel local% should decrease */
+        if (rebal_count > 0) {
+            uint64_t tot = mgr->entries[heaviest_idx].channel.local_amount +
+                           mgr->entries[heaviest_idx].channel.remote_amount;
+            uint64_t pct_after = (tot > 0) ?
+                (mgr->entries[heaviest_idx].channel.local_amount * 100) / tot : 0;
+            if (pct_after >= heaviest_pct_before) {
+                printf("  FAIL: heaviest channel local%% did not decrease "
+                       "(%llu → %llu)\n",
+                       (unsigned long long)heaviest_pct_before,
+                       (unsigned long long)pct_after);
+                rebalance_pass = 0;
+            }
+        }
+
+        printf("AUTO-REBALANCE TEST: %s\n", rebalance_pass ? "PASS" : "FAIL");
+        fflush(stdout);
+        if (!rebalance_pass) {
+            jit_channels_cleanup(mgr);
+            free(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
+    /* === Batch-Rebalance Test === */
+    if (test_batch_rebalance && channels_active) {
+        printf("\n=== BATCH-REBALANCE TEST ===\n");
+        fflush(stdout);
+        int batch_pass = 1;
+
+        /* Record pre-rebalance totals */
+        uint64_t pre_total = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            pre_total += mgr->entries[c].channel.local_amount +
+                         mgr->entries[c].channel.remote_amount;
+        }
+
+        /* Build batch entries */
+        int batch_count = 0;
+        if (mgr->n_channels >= 4) {
+            rebalance_entry_t entries[2];
+            entries[0].from = 0;
+            entries[0].to = 1;
+            entries[0].amount_sats = 2000;
+            entries[1].from = 2;
+            entries[1].to = 3;
+            entries[1].amount_sats = 1500;
+            batch_count = lsp_channels_batch_rebalance(mgr, &lsp, entries, 2);
+            printf("Batch rebalance: %d/2 succeeded\n", batch_count);
+        } else if (mgr->n_channels >= 2) {
+            rebalance_entry_t entries[1];
+            entries[0].from = 0;
+            entries[0].to = 1;
+            entries[0].amount_sats = 2000;
+            batch_count = lsp_channels_batch_rebalance(mgr, &lsp, entries, 1);
+            printf("Batch rebalance: %d/1 succeeded\n", batch_count);
+        }
+
+        /* Verify: total balance conservation */
+        uint64_t post_total = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            post_total += mgr->entries[c].channel.local_amount +
+                          mgr->entries[c].channel.remote_amount;
+        }
+        if (post_total != pre_total) {
+            printf("  FAIL: balance conservation violated "
+                   "(pre=%llu post=%llu)\n",
+                   (unsigned long long)pre_total,
+                   (unsigned long long)post_total);
+            batch_pass = 0;
+        }
+
+        if (batch_count <= 0) {
+            printf("  FAIL: no batch transfers succeeded\n");
+            batch_pass = 0;
+        }
+
+        printf("BATCH-REBALANCE TEST: %s\n", batch_pass ? "PASS" : "FAIL");
+        fflush(stdout);
+        if (!batch_pass) {
+            jit_channels_cleanup(mgr);
+            free(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
+    /* === Leaf Realloc Test === */
+    if (test_realloc && channels_active) {
+        printf("\n=== LEAF REALLOC TEST ===\n");
+        fflush(stdout);
+        int realloc_pass = 1;
+
+        if (leaf_arity != 2) {
+            printf("  SKIP: --test-realloc requires --leaf-arity 2\n");
+            printf("LEAF REALLOC TEST: SKIP\n");
+        } else if (n_clients < 2) {
+            printf("  SKIP: --test-realloc requires --clients >= 2\n");
+            printf("LEAF REALLOC TEST: SKIP\n");
+        } else {
+            /* Record current leaf funding amounts */
+            uint64_t orig_amounts[3]; /* LSP + 2 clients */
+            for (int k = 0; k < 3 && k < (int)mgr->n_channels + 1; k++) {
+                if (k == 0)
+                    orig_amounts[k] = mgr->entries[0].channel.funding_amount;
+                else if ((size_t)(k - 1) < mgr->n_channels)
+                    orig_amounts[k] = mgr->entries[k - 1].channel.funding_amount;
+            }
+            uint64_t orig_total = orig_amounts[0] + orig_amounts[1] + orig_amounts[2];
+
+            /* Build redistributed amounts: shift 20% from slot 1 to slot 2 */
+            uint64_t shift = orig_amounts[1] / 5;
+            uint64_t new_amounts[3];
+            new_amounts[0] = orig_amounts[0];
+            new_amounts[1] = orig_amounts[1] - shift;
+            new_amounts[2] = orig_amounts[2] + shift;
+
+            printf("Reallocating leaf 0: [%llu, %llu, %llu] → [%llu, %llu, %llu]\n",
+                   (unsigned long long)orig_amounts[0],
+                   (unsigned long long)orig_amounts[1],
+                   (unsigned long long)orig_amounts[2],
+                   (unsigned long long)new_amounts[0],
+                   (unsigned long long)new_amounts[1],
+                   (unsigned long long)new_amounts[2]);
+
+            int rc = lsp_realloc_leaf(mgr, &lsp, 0, new_amounts, 3);
+            if (rc != 1) {
+                printf("  FAIL: lsp_realloc_leaf returned %d (expected 1)\n", rc);
+                realloc_pass = 0;
+            }
+
+            /* Verify amounts updated */
+            if (realloc_pass) {
+                uint64_t post_total = 0;
+                for (int k = 0; k < 3 && k < (int)mgr->n_channels + 1; k++) {
+                    if (k == 0)
+                        post_total += mgr->entries[0].channel.funding_amount;
+                    else if ((size_t)(k - 1) < mgr->n_channels)
+                        post_total += mgr->entries[k - 1].channel.funding_amount;
+                }
+                if (post_total != orig_total) {
+                    printf("  FAIL: total funding changed "
+                           "(%llu → %llu)\n",
+                           (unsigned long long)orig_total,
+                           (unsigned long long)post_total);
+                    realloc_pass = 0;
+                }
+            }
+
+            printf("LEAF REALLOC TEST: %s\n", realloc_pass ? "PASS" : "FAIL");
+        }
+        fflush(stdout);
+        if (!realloc_pass) {
+            jit_channels_cleanup(mgr);
+            free(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* === Factory Rotation Test (Tier 3) === */
