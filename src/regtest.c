@@ -262,12 +262,13 @@ static char **build_argv(const regtest_t *rt, const char *method,
                 if (!*p) break;
 
                 char *start;
-                if (*p == '"') {
-                    /* Quoted token: find closing quote */
+                if (*p == '"' || *p == '\'') {
+                    /* Quoted token: find matching closing quote */
+                    char quote = *p;
                     p++;
                     start = p;
-                    while (*p && *p != '"') p++;
-                    if (*p == '"') *p++ = '\0';
+                    while (*p && *p != quote) p++;
+                    if (*p == quote) *p++ = '\0';
                 } else {
                     start = p;
                     while (*p && *p != ' ') p++;
