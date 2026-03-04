@@ -274,7 +274,7 @@ python3 tools/test_orchestrator.py --scenario mass_departure_jit   # Mass client
 python3 tools/test_orchestrator.py --scenario watchtower_late_arrival  # Clients restart after breach, detect before CSV
 ```
 
-The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail. 17 scenarios total.
+The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail. 23 scenarios total (run `--list` to see all).
 
 ---
 

@@ -1,10 +1,11 @@
 # SuperScalar
 
 [![CI](https://github.com/8144225309/SuperScalar/workflows/CI/badge.svg)](https://github.com/8144225309/SuperScalar/actions)
+[![Release](https://img.shields.io/github/v/release/8144225309/SuperScalar)](https://github.com/8144225309/SuperScalar/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 458 tests (415 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> v0.1.0 — 458 tests, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -454,6 +455,7 @@ superscalar_lsp [OPTIONS]
 | `--max-handshakes` | N | 4 | Max concurrent handshakes |
 | `--regtest` | — | off | Shorthand for --network regtest |
 | `--i-accept-the-risk` | — | off | Required for mainnet operation |
+| `--version` | — | — | Show version and exit |
 | `--help` | — | — | Show help and exit |
 
 ### superscalar_client
@@ -485,6 +487,9 @@ superscalar_client [OPTIONS]
 | `--generate-mnemonic` | — | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
 | `--from-mnemonic` | WORDS | — | Derive keyfile from BIP39 mnemonic words |
 | `--mnemonic-passphrase` | PASS | "" | Optional BIP39 passphrase for seed derivation |
+| `--i-accept-the-risk` | — | off | Required for mainnet operation |
+| `--version` | — | — | Show version and exit |
+| `--help` | — | — | Show help and exit |
 
 ### superscalar_bridge
 
@@ -499,6 +504,7 @@ superscalar_bridge [OPTIONS]
 | `--plugin-port` | PORT | 9736 | CLN plugin listen port |
 | `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
 | `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
+| `--version` | — | — | Show version and exit |
 
 ### superscalar_watchtower
 
@@ -518,6 +524,7 @@ superscalar_watchtower [OPTIONS]
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
 | `--datadir` | PATH | — | Bitcoin datadir |
 | `--rpcport` | PORT | — | Bitcoin RPC port |
+| `--version` | — | — | Show version and exit |
 
 The watchtower opens the database read-only (no write contention with the LSP) and broadcasts penalty transactions if it detects a breach. Run it on a separate machine for defense-in-depth.
 
@@ -685,6 +692,25 @@ CLN (lightningd)
 | **BOLT #11 encoding** | Delegated | Invoice creation handled by CLN; SuperScalar provides route hints |
 | **Hashlock burn** | By design | Enforced by `factory_build_burn_tx()`, not Script (would require covenant opcodes) |
 | **Wire protocol** | JSON + TLV | JSON framing with TLV codec available; full binary migration incremental |
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy.
+
+SuperScalar is pre-1.0 software. Mainnet requires `--i-accept-the-risk`. No external audit has been performed yet. An internal audit found 4 gaps — all fixed. See [docs/mainnet-audit.md](docs/mainnet-audit.md).
+
+## Get Involved
+
+SuperScalar needs real-world testing on signet and testnet over weeks and months — multi-party factories, reconnections, breach detection, factory rotation, long-lived daemon sessions.
+
+**How to help:**
+
+1. **Run a factory on signet** — Follow the [Running on Signet](#running-on-signet) guide above. Even a 2-client factory running for a few days produces valuable data.
+2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 23 multi-party scenarios.
+3. **Report bugs** — Open an issue at [github.com/8144225309/SuperScalar/issues](https://github.com/8144225309/SuperScalar/issues). Include logs, network, and steps to reproduce.
+4. **Review the code** — The [internal audit](docs/mainnet-audit.md) is a good starting point. Cryptography lives in `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c`.
+
+Join the [Discussions](https://github.com/8144225309/SuperScalar/discussions) for questions, ideas, and coordination.
 
 ## License
 
