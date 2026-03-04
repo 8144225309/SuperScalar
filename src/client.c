@@ -1660,6 +1660,150 @@ int client_run_reconnect(secp256k1_context *ctx,
     return 0;
 }
 
+int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                factory_t *factory,
+                                uint32_t my_index,
+                                const wire_msg_t *propose_msg) {
+    /* Parse REALLOC_PROPOSE */
+    int leaf_side;
+    uint64_t amounts[FACTORY_MAX_OUTPUTS];
+    size_t n_amounts;
+    unsigned char lsp_pubnonce_ser[66];
+
+    if (!wire_parse_leaf_realloc_propose(propose_msg->json, &leaf_side,
+                                          amounts, FACTORY_MAX_OUTPUTS,
+                                          &n_amounts, lsp_pubnonce_ser)) {
+        fprintf(stderr, "Client %u: failed to parse REALLOC_PROPOSE\n", my_index);
+        return 0;
+    }
+
+    /* Advance local DW + set amounts */
+    int rc = factory_advance_leaf_unsigned(factory, leaf_side);
+    if (rc <= 0) {
+        fprintf(stderr, "Client %u: leaf advance for realloc failed\n", my_index);
+        return 0;
+    }
+    if (!factory_set_leaf_amounts(factory, leaf_side, amounts, n_amounts)) {
+        fprintf(stderr, "Client %u: set_leaf_amounts failed\n", my_index);
+        return 0;
+    }
+
+    size_t node_idx = factory->leaf_node_indices[leaf_side];
+
+    /* Init session + set LSP nonce */
+    if (!factory_session_init_node(factory, node_idx)) return 0;
+
+    int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
+    if (lsp_slot < 0) return 0;
+
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser)) return 0;
+    if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot, &lsp_pubnonce))
+        return 0;
+
+    /* Generate own nonce */
+    int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
+    if (my_slot < 0) return 0;
+
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) return 0;
+
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    secp256k1_musig_secnonce my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+                               my_seckey, &my_pubkey,
+                               &factory->nodes[node_idx].keyagg.cache)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Send REALLOC_NONCE */
+    unsigned char my_pubnonce_ser[66];
+    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
+    cJSON *nonce_msg = wire_build_leaf_realloc_nonce(my_pubnonce_ser);
+    if (!wire_send(fd, MSG_LEAF_REALLOC_NONCE, nonce_msg)) {
+        cJSON_Delete(nonce_msg);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(nonce_msg);
+
+    /* Receive REALLOC_ALL_NONCES */
+    wire_msg_t all_msg;
+    if (!wire_recv(fd, &all_msg) || all_msg.msg_type != MSG_LEAF_REALLOC_ALL_NONCES) {
+        fprintf(stderr, "Client %u: expected REALLOC_ALL_NONCES, got 0x%02x\n",
+                my_index, all_msg.msg_type);
+        if (all_msg.json) cJSON_Delete(all_msg.json);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    size_t n_signers;
+    if (!wire_parse_leaf_realloc_all_nonces(all_msg.json, all_pubnonces,
+                                              FACTORY_MAX_SIGNERS, &n_signers)) {
+        cJSON_Delete(all_msg.json);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(all_msg.json);
+
+    /* Set all nonces */
+    for (size_t i = 0; i < n_signers; i++) {
+        secp256k1_musig_pubnonce pn;
+        if (!musig_pubnonce_parse(ctx, &pn, all_pubnonces[i])) {
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+        if (!factory_session_set_nonce(factory, node_idx, i, &pn)) {
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+    }
+
+    /* Finalize */
+    if (!factory_session_finalize_node(factory, node_idx)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Create partial sig */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+                                    &factory->nodes[node_idx].signing_session)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send REALLOC_PSIG */
+    unsigned char my_psig_ser[32];
+    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+    cJSON *psig_json = wire_build_leaf_realloc_psig(my_psig_ser);
+    if (!wire_send(fd, MSG_LEAF_REALLOC_PSIG, psig_json)) {
+        cJSON_Delete(psig_json);
+        return 0;
+    }
+    cJSON_Delete(psig_json);
+
+    /* Receive REALLOC_DONE */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_REALLOC_DONE) {
+        fprintf(stderr, "Client %u: expected REALLOC_DONE, got 0x%02x\n",
+                my_index, done_msg.msg_type);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        return 0;
+    }
+    cJSON_Delete(done_msg.json);
+
+    printf("Client %u: leaf %d realloc complete\n", my_index, leaf_side);
+    return 1;
+}
+
 int client_run_ceremony(secp256k1_context *ctx,
                         const secp256k1_keypair *keypair,
                         const char *host, int port) {

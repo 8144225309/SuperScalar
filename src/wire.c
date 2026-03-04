@@ -113,6 +113,11 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x59: return "LEAF_ADVANCE_PSIG";
     case 0x5A: return "LEAF_ADVANCE_DONE";
     case 0x5B: return "SCID_ASSIGN";
+    case 0x5C: return "LEAF_REALLOC_PROPOSE";
+    case 0x5D: return "LEAF_REALLOC_NONCE";
+    case 0x5E: return "LEAF_REALLOC_ALL_NONCES";
+    case 0x5F: return "LEAF_REALLOC_PSIG";
+    case 0x64: return "LEAF_REALLOC_DONE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1596,6 +1601,123 @@ int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
+    return 1;
+}
+
+/* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
+
+cJSON *wire_build_leaf_realloc_propose(int leaf_side,
+                                        const uint64_t *amounts, size_t n_amounts,
+                                        const unsigned char *pubnonce66) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    cJSON *arr = cJSON_AddArrayToObject(j, "amounts");
+    for (size_t i = 0; i < n_amounts; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)amounts[i]));
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
+                                      uint64_t *amounts, size_t max_amounts,
+                                      size_t *n_amounts_out,
+                                      unsigned char *pubnonce66) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    *leaf_side = (int)ls->valuedouble;
+
+    cJSON *arr = cJSON_GetObjectItem(json, "amounts");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max_amounts) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsNumber(item)) return 0;
+        amounts[i] = (uint64_t)item->valuedouble;
+    }
+    *n_amounts_out = n;
+
+    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_realloc_nonce(const unsigned char *pubnonce66) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_leaf_realloc_nonce(const cJSON *json, unsigned char *pubnonce66) {
+    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_realloc_all_nonces(const unsigned char pubnonces[][66],
+                                            size_t n_signers) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "pubnonces");
+    char hex[133];
+    for (size_t i = 0; i < n_signers; i++) {
+        hex_encode(pubnonces[i], 66, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+    return j;
+}
+
+int wire_parse_leaf_realloc_all_nonces(const cJSON *json,
+                                         unsigned char pubnonces_out[][66],
+                                         size_t max_signers, size_t *n_out) {
+    cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max_signers) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsString(item)) return 0;
+        if (hex_decode(item->valuestring, pubnonces_out[i], 66) != 66) return 0;
+    }
+    *n_out = n;
+    return 1;
+}
+
+cJSON *wire_build_leaf_realloc_psig(const unsigned char *partial_sig32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    return j;
+}
+
+int wire_parse_leaf_realloc_psig(const cJSON *json, unsigned char *partial_sig32) {
+    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_realloc_done(int leaf_side,
+                                      const uint64_t *amounts, size_t n_amounts) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    cJSON *arr = cJSON_AddArrayToObject(j, "amounts");
+    for (size_t i = 0; i < n_amounts; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)amounts[i]));
+    return j;
+}
+
+int wire_parse_leaf_realloc_done(const cJSON *json, int *leaf_side,
+                                   uint64_t *amounts, size_t max_amounts,
+                                   size_t *n_amounts_out) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    *leaf_side = (int)ls->valuedouble;
+
+    cJSON *arr = cJSON_GetObjectItem(json, "amounts");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max_amounts) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsNumber(item)) return 0;
+        amounts[i] = (uint64_t)item->valuedouble;
+    }
+    *n_amounts_out = n;
     return 1;
 }
 

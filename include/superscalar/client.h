@@ -106,6 +106,16 @@ int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
 
+/* Handle a LEAF_REALLOC_PROPOSE from the LSP.
+   Reads PROPOSE, sends NONCE, reads ALL_NONCES, sends PSIG, reads DONE.
+   Updates local factory amounts.
+   Returns 1 on success. */
+int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                factory_t *factory,
+                                uint32_t my_index,
+                                const wire_msg_t *propose_msg);
+
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
    If set (non-NULL), all future connections use Noise NK instead of NN.
    If NULL (default), falls back to NN with no server authentication. */

@@ -1255,6 +1255,42 @@ static int rebuild_node_tx(factory_t *f, size_t node_idx) {
     return 1;
 }
 
+/* Public wrapper for rebuild_node_tx. */
+int factory_rebuild_node_tx(factory_t *f, size_t node_idx) {
+    return rebuild_node_tx(f, node_idx);
+}
+
+#define DUST_LIMIT_SATS 546
+
+int factory_set_leaf_amounts(factory_t *f, int leaf_side,
+                              const uint64_t *amounts, size_t n_amounts) {
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    if (n_amounts != node->n_outputs) return 0;
+
+    /* Compute current output total */
+    uint64_t current_total = 0;
+    for (size_t i = 0; i < node->n_outputs; i++)
+        current_total += node->outputs[i].amount_sats;
+
+    /* Validate new amounts sum = current total (conservation of funds) */
+    uint64_t new_total = 0;
+    for (size_t i = 0; i < n_amounts; i++) {
+        if (amounts[i] < DUST_LIMIT_SATS) return 0;
+        new_total += amounts[i];
+    }
+    if (new_total != current_total) return 0;
+
+    /* Update amounts */
+    for (size_t i = 0; i < n_amounts; i++)
+        node->outputs[i].amount_sats = amounts[i];
+
+    /* Rebuild unsigned tx with new amounts */
+    return rebuild_node_tx(f, node_idx);
+}
+
 /* Sign a single node (local-only, all keypairs available). */
 int factory_sign_node(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;

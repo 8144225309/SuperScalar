@@ -80,6 +80,13 @@
 /* SCID assignment for route hints (4B) */
 #define MSG_SCID_ASSIGN         0x5B  /* LSP → Client: SCID + routing params */
 
+/* Leaf-Level Fund Reallocation (3-signer cooperative redistribution) */
+#define MSG_LEAF_REALLOC_PROPOSE    0x5C  /* LSP → Clients: propose new amounts + LSP nonce */
+#define MSG_LEAF_REALLOC_NONCE      0x5D  /* Client → LSP: client pubnonce */
+#define MSG_LEAF_REALLOC_ALL_NONCES 0x5E  /* LSP → Clients: all 3 pubnonces */
+#define MSG_LEAF_REALLOC_PSIG       0x5F  /* Client → LSP: partial sig */
+#define MSG_LEAF_REALLOC_DONE       0x64  /* LSP → Clients: reallocation complete */
+
 /* Path-scoped signing (subtree re-sign on leaf exhaustion) */
 #define MSG_PATH_NONCE_BUNDLE   0x60  /* Client -> LSP: nonces for path nodes */
 #define MSG_PATH_ALL_NONCES     0x61  /* LSP -> Clients: aggregated path nonces */
@@ -546,6 +553,44 @@ int wire_parse_leaf_advance_psig(const cJSON *json,
 cJSON *wire_build_leaf_advance_done(int leaf_side);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
+
+/* --- Leaf-Level Fund Reallocation message builders (Upgrade 3) --- */
+
+/* LSP → Clients: LEAF_REALLOC_PROPOSE {leaf_side, amounts[], pubnonce} */
+cJSON *wire_build_leaf_realloc_propose(int leaf_side,
+                                        const uint64_t *amounts, size_t n_amounts,
+                                        const unsigned char *pubnonce66);
+
+int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
+                                      uint64_t *amounts, size_t max_amounts,
+                                      size_t *n_amounts_out,
+                                      unsigned char *pubnonce66);
+
+/* Client → LSP: LEAF_REALLOC_NONCE {pubnonce} */
+cJSON *wire_build_leaf_realloc_nonce(const unsigned char *pubnonce66);
+
+int wire_parse_leaf_realloc_nonce(const cJSON *json, unsigned char *pubnonce66);
+
+/* LSP → Clients: LEAF_REALLOC_ALL_NONCES {pubnonces[3]} */
+cJSON *wire_build_leaf_realloc_all_nonces(const unsigned char pubnonces[][66],
+                                            size_t n_signers);
+
+int wire_parse_leaf_realloc_all_nonces(const cJSON *json,
+                                         unsigned char pubnonces_out[][66],
+                                         size_t max_signers, size_t *n_out);
+
+/* Client → LSP: LEAF_REALLOC_PSIG {partial_sig} */
+cJSON *wire_build_leaf_realloc_psig(const unsigned char *partial_sig32);
+
+int wire_parse_leaf_realloc_psig(const cJSON *json, unsigned char *partial_sig32);
+
+/* LSP → Clients: LEAF_REALLOC_DONE {leaf_side, amounts[]} */
+cJSON *wire_build_leaf_realloc_done(int leaf_side,
+                                      const uint64_t *amounts, size_t n_amounts);
+
+int wire_parse_leaf_realloc_done(const cJSON *json, int *leaf_side,
+                                   uint64_t *amounts, size_t max_amounts,
+                                   size_t *n_amounts_out);
 
 /* --- SCID assignment for route hints (4B) --- */
 

@@ -232,6 +232,15 @@ int factory_session_init_node(factory_t *f, size_t node_idx);
 int factory_session_finalize_node(factory_t *f, size_t node_idx);
 int factory_session_complete_node(factory_t *f, size_t node_idx);
 
+/* Set custom output amounts on a leaf state node.
+   leaf_side: 0..n_leaf_nodes-1.  amounts must sum to current output total.
+   No amount may be below dust (546 sats).  Rebuilds the unsigned tx. */
+int factory_set_leaf_amounts(factory_t *f, int leaf_side,
+                              const uint64_t *amounts, size_t n_amounts);
+
+/* Rebuild a single node's unsigned tx (public wrapper around internal helper). */
+int factory_rebuild_node_tx(factory_t *f, size_t node_idx);
+
 void factory_free(factory_t *f);
 
 /* Derive a short channel ID (SCID) for a factory leaf channel.
