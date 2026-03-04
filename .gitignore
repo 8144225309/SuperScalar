@@ -19,4 +19,6 @@ __pycache__/
 run_*.sh
 docs/plan-*.md
 signet-launch-*.md
+testnet4-launch-*.md
+v0.1.*-launch.md
 github-issue-drafts.md
