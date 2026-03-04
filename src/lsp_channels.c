@@ -2002,6 +2002,14 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                client_idx);
         return 1;
 
+    case MSG_ERROR: {
+        cJSON *m = msg->json ? cJSON_GetObjectItem(msg->json, "message") : NULL;
+        fprintf(stderr, "LSP: client %zu sent error: %s\n",
+                client_idx,
+                (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+        return 0;  /* close the connection */
+    }
+
     default:
         fprintf(stderr, "LSP: unexpected msg 0x%02x from client %zu\n",
                 msg->msg_type, client_idx);
@@ -2304,8 +2312,19 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Recv client's nonces */
     {
         wire_msg_t nonce_resp;
-        if (!wire_recv_timeout(new_fd, &nonce_resp, 30) ||
-            nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
+        if (!wire_recv_timeout(new_fd, &nonce_resp, 30)) {
+            fprintf(stderr, "LSP reconnect: expected CHANNEL_NONCES from client\n");
+            if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
+            return 0;
+        }
+        if (nonce_resp.msg_type == MSG_ERROR) {
+            cJSON *m = nonce_resp.json ? cJSON_GetObjectItem(nonce_resp.json, "message") : NULL;
+            fprintf(stderr, "LSP reconnect: client sent error: %s\n",
+                    (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+            cJSON_Delete(nonce_resp.json);
+            return 0;
+        }
+        if (nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
             fprintf(stderr, "LSP reconnect: expected CHANNEL_NONCES from client\n");
             if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
             return 0;
