@@ -68,7 +68,7 @@ jobs:
             -v "${{ github.workspace }}:/src" \
             -w /src \
             ubuntu:24.04 bash -c '
-              apt-get update && apt-get install -y cmake gcc g++ libsqlite3-dev libssl-dev
+              apt-get update && apt-get install -y cmake gcc g++ git libsqlite3-dev libssl-dev autoconf libtool
               cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
               cmake --build build --parallel
