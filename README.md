@@ -721,4 +721,10 @@ MIT
 
 ---
 
-Support development: `bc1qym7552af6exkn68zuqcv5nhstaktkgtvjwfvmm`
+## Support
+
+SuperScalar is building the infrastructure Bitcoin needs to scale to millions of self-custodial users — no soft fork required, no compromise on sovereignty. This is independent open-source work, built in public, funded entirely by the community it serves.
+
+Your contribution keeps development moving forward.
+
+Bitcoin: `bc1qym7552af6exkn68zuqcv5nhstaktkgtvjwfvmm`
