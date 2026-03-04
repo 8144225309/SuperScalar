@@ -5,6 +5,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
+#include "superscalar/regtest.h"
 #include "superscalar/types.h"
 #include <stdio.h>
 #include <string.h>
@@ -2645,5 +2646,117 @@ int test_reconnect_htlc_replay(void) {
     free(lsp.client_pubkeys);
     factory_free(&factory);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Mainnet codepath: build_cli_prefix omits -network flag for mainnet. */
+int test_mainnet_cli_prefix_no_flag(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "echo", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "testuser", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "testpass", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "mainnet", sizeof(rt.network) - 1);
+
+    /* regtest_exec builds: "<cli_path> [opts] <method> [params] 2>&1"
+       For mainnet, it must NOT include "-mainnet" flag. */
+    char *result = regtest_exec(&rt, "getblockchaininfo", "");
+    TEST_ASSERT(result != NULL, "regtest_exec returned NULL");
+
+    /* echo outputs the command args — verify no "-mainnet" present */
+    TEST_ASSERT(strstr(result, "-mainnet") == NULL,
+                "mainnet CLI prefix should not contain -mainnet flag");
+
+    /* Verify rpc credentials are present */
+    TEST_ASSERT(strstr(result, "-rpcuser=testuser") != NULL,
+                "should contain rpcuser");
+    TEST_ASSERT(strstr(result, "-rpcpassword=testpass") != NULL,
+                "should contain rpcpassword");
+
+    free(result);
+    return 1;
+}
+
+/* Mainnet codepath: non-regtest networks get scan_depth=1000. */
+int test_mainnet_scan_depth(void) {
+    regtest_t rt;
+
+    /* Regtest should get scan_depth=20 */
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+    rt.scan_depth = (strcmp(rt.network, "regtest") == 0) ? 20 : 1000;
+    TEST_ASSERT(rt.scan_depth == 20, "regtest scan_depth should be 20");
+
+    /* Mainnet should get scan_depth=1000 */
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.network, "mainnet", sizeof(rt.network) - 1);
+    rt.scan_depth = (strcmp(rt.network, "regtest") == 0) ? 20 : 1000;
+    TEST_ASSERT(rt.scan_depth == 1000, "mainnet scan_depth should be 1000");
+
+    /* Signet should also get scan_depth=1000 */
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.network, "signet", sizeof(rt.network) - 1);
+    rt.scan_depth = (strcmp(rt.network, "regtest") == 0) ? 20 : 1000;
+    TEST_ASSERT(rt.scan_depth == 1000, "signet scan_depth should be 1000");
+
+    return 1;
+}
+
+/* Shell injection via regtest_exec: $(echo pwned) should be treated as literal. */
+int test_regtest_exec_no_shell_interp(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "echo", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "u", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "p", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+
+    /* The sanitizer should reject $(echo pwned) because $ is not in
+       the allowed character set. regtest_exec returns NULL. */
+    char *result = regtest_exec(&rt, "getinfo", "$(echo pwned)");
+    TEST_ASSERT(result == NULL,
+                "params with $() should be rejected by sanitizer");
+
+    /* Also test backticks */
+    result = regtest_exec(&rt, "getinfo", "`whoami`");
+    TEST_ASSERT(result == NULL,
+                "params with backticks should be rejected by sanitizer");
+
+    /* Semicolons */
+    result = regtest_exec(&rt, "getinfo", "; rm -rf /");
+    TEST_ASSERT(result == NULL,
+                "params with semicolons should be rejected by sanitizer");
+
+    /* Pipe */
+    result = regtest_exec(&rt, "getinfo", "| cat /etc/passwd");
+    TEST_ASSERT(result == NULL,
+                "params with pipe should be rejected by sanitizer");
+
+    return 1;
+}
+
+/* Verify argv tokenization: quoted strings stay as single args. */
+int test_regtest_argv_tokenization(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "echo", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "u", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "p", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+
+    /* Test simple method with no params */
+    char *result = regtest_exec(&rt, "getblockcount", "");
+    TEST_ASSERT(result != NULL, "echo should succeed");
+    TEST_ASSERT(strstr(result, "getblockcount") != NULL,
+                "output should contain method name");
+    free(result);
+
+    /* Test method with quoted param */
+    result = regtest_exec(&rt, "createwallet", "\"testwallet\"");
+    TEST_ASSERT(result != NULL, "echo with params should succeed");
+    TEST_ASSERT(strstr(result, "createwallet") != NULL,
+                "output should contain method");
+    free(result);
+
     return 1;
 }

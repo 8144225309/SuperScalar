@@ -66,7 +66,8 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 
                 /* Load persisted HTLC output data for this commitment */
                 if (db && db->db) {
-                    watchtower_htlc_t tmp_htlcs[MAX_HTLCS];
+                    watchtower_htlc_t *tmp_htlcs = malloc(MAX_HTLCS * sizeof(watchtower_htlc_t));
+                    if (!tmp_htlcs) return 0;
                     size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
                         db, (uint32_t)c, commit_nums[i],
                         tmp_htlcs, MAX_HTLCS);
@@ -79,6 +80,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                             e->htlc_outputs_cap = n_loaded_htlcs;
                         }
                     }
+                    free(tmp_htlcs);
                 }
             }
         }
@@ -159,7 +161,9 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     uint64_t saved_local = ch->local_amount;
     uint64_t saved_remote = ch->remote_amount;
     size_t saved_n_htlcs = ch->n_htlcs;
-    htlc_t saved_htlcs[MAX_HTLCS];
+    htlc_t *saved_htlcs = saved_n_htlcs > 0
+        ? malloc(saved_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (saved_n_htlcs > 0 && !saved_htlcs) return;
     if (saved_n_htlcs > 0)
         memcpy(saved_htlcs, ch->htlcs, saved_n_htlcs * sizeof(htlc_t));
 
@@ -210,6 +214,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
 
     if (!ok) {
         tx_buf_free(&old_tx);
+        free(saved_htlcs);
         return;
     }
 
@@ -304,6 +309,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     }
 
     tx_buf_free(&old_tx);
+    free(saved_htlcs);
 }
 
 int watchtower_check(watchtower_t *wt) {

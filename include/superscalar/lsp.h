@@ -3,6 +3,7 @@
 
 #include "factory.h"
 #include "wire.h"
+#include "rate_limit.h"
 #include <secp256k1.h>
 
 #define LSP_MAX_CLIENTS 16
@@ -41,6 +42,9 @@ typedef struct {
        uses Noise NK with nk_seckey instead of NN. Default: 0 (NN). */
     int use_nk;
     unsigned char nk_seckey[32];
+
+    /* Per-IP connection rate limiter + concurrent handshake cap. */
+    rate_limiter_t rate_limiter;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

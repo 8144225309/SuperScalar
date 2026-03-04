@@ -4,6 +4,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -35,6 +38,9 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
 
     for (size_t i = 0; i < cap; i++)
         lsp->client_fds[i] = -1;
+
+    /* Initialize rate limiter with defaults (10/min, 4 concurrent handshakes) */
+    rate_limiter_init(&lsp->rate_limiter, 10, 60, 4);
     return 1;
 }
 
@@ -78,6 +84,30 @@ int lsp_accept_clients(lsp_t *lsp) {
             goto accept_fail;
         }
 
+        /* Rate limiting: check per-IP connection rate */
+        {
+            struct sockaddr_in peer;
+            socklen_t peer_len = sizeof(peer);
+            char ip_str[INET_ADDRSTRLEN] = "unknown";
+            if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) == 0)
+                inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str));
+
+            if (!rate_limiter_allow(&lsp->rate_limiter, ip_str)) {
+                fprintf(stderr, "LSP: rate limited connection from %s\n", ip_str);
+                wire_close(fd);
+                i--;  /* retry this slot */
+                continue;
+            }
+        }
+
+        /* Handshake cap check */
+        if (!rate_limiter_handshake_start(&lsp->rate_limiter)) {
+            fprintf(stderr, "LSP: too many concurrent handshakes, rejecting\n");
+            wire_close(fd);
+            i--;  /* retry this slot */
+            continue;
+        }
+
         /* Encrypted transport handshake (NK if configured, NN fallback) */
         int hs_ok;
         if (lsp->use_nk)
@@ -86,9 +116,11 @@ int lsp_accept_clients(lsp_t *lsp) {
             hs_ok = wire_noise_handshake_responder(fd, lsp->ctx);
         if (!hs_ok) {
             fprintf(stderr, "LSP: noise handshake failed for client %zu\n", i);
+            rate_limiter_handshake_end(&lsp->rate_limiter);
             wire_close(fd);
             goto accept_fail;
         }
+        rate_limiter_handshake_end(&lsp->rate_limiter);
 
         /* Receive HELLO */
         wire_msg_t msg;

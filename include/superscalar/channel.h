@@ -9,7 +9,8 @@
 #include <secp256k1_extrakeys.h>
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
-#define MAX_HTLCS 32
+#define MAX_HTLCS 483              /* BOLT #2 maximum */
+#define DEFAULT_HTLCS_CAP 64      /* initial allocation for dynamic htlc arrays */
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define ANCHOR_OUTPUT_AMOUNT     240   /* P2A anchor for CPFP fee bumping (sats) */

@@ -114,6 +114,8 @@ add_library(superscalar
     src/ceremony.c
     src/backup.c
     src/wire_tlv.c
+    src/bip39.c
+    src/rate_limit.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -151,6 +153,8 @@ add_executable(test_superscalar
     tests/test_property.c
     tests/test_backup.c
     tests/test_keyfile.c
+    tests/test_bip39.c
+    tests/test_rate_limit.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

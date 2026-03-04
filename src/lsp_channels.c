@@ -346,7 +346,8 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
         /* Load active HTLCs from DB */
         {
-            htlc_t loaded_htlcs[MAX_HTLCS];
+            htlc_t *loaded_htlcs = malloc(MAX_HTLCS * sizeof(htlc_t));
+            if (!loaded_htlcs) return 0;
             size_t n_loaded = persist_load_htlcs(pdb, (uint32_t)c,
                                                     loaded_htlcs, MAX_HTLCS);
             for (size_t h = 0; h < n_loaded; h++) {
@@ -357,6 +358,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
             if (n_loaded > 0)
                 printf("LSP recovery: loaded %zu HTLCs for channel %zu\n",
                        n_loaded, c);
+            free(loaded_htlcs);
         }
 
         /* Initialize nonce pool (fresh nonces — reconnect re-exchanges) */
@@ -642,7 +644,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_sender_local = sender_ch->local_amount;
     uint64_t old_sender_remote = sender_ch->remote_amount;
     size_t old_sender_n_htlcs = sender_ch->n_htlcs;
-    htlc_t old_sender_htlcs[MAX_HTLCS];
+    htlc_t *old_sender_htlcs = old_sender_n_htlcs > 0
+        ? malloc(old_sender_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_sender_n_htlcs > 0 && !old_sender_htlcs) return 0;
     if (old_sender_n_htlcs > 0)
         memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
 
@@ -656,6 +660,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON *fail = wire_build_update_fail_htlc(htlc_id, "insufficient funds");
         wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
         cJSON_Delete(fail);
+        free(old_sender_htlcs);
         return 1;  /* not a protocol error, just a payment failure */
     }
 
@@ -665,6 +670,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t nonce_idx;
         if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
             fprintf(stderr, "LSP: create partial sig failed for sender %zu\n", sender_idx);
+            free(old_sender_htlcs);
             return 0;
         }
         cJSON *cs = wire_build_commitment_signed(
@@ -672,6 +678,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             sender_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[sender_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
+            free(old_sender_htlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -684,6 +691,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from sender %zu\n", sender_idx);
+            free(old_sender_htlcs);
             return 0;
         }
         /* Parse and store revocation secret */
@@ -706,6 +714,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ack_msg.json);
     }
+    free(old_sender_htlcs);
 
     /* Persist sender channel balance + HTLC atomically (crash-state protection) */
     if (mgr->persist) {
@@ -806,7 +815,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_dest_local = dest_ch->local_amount;
     uint64_t old_dest_remote = dest_ch->remote_amount;
     size_t old_dest_n_htlcs = dest_ch->n_htlcs;
-    htlc_t old_dest_htlcs[MAX_HTLCS];
+    htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
+        ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_dest_n_htlcs > 0 && !old_dest_htlcs) return 0;
     if (old_dest_n_htlcs > 0)
         memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
@@ -817,11 +828,12 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t fee_msat = (amount_msat * mgr->routing_fee_ppm + 999999) / 1000000;
         if (fee_msat >= amount_msat) {
             fprintf(stderr, "LSP: routing fee exceeds payment amount\n");
+            free(old_dest_htlcs);
             return 0;
         }
         fwd_amount_msat = amount_msat - fee_msat;
         fwd_amount_sats = fwd_amount_msat / 1000;
-        if (fwd_amount_sats == 0) return 0;
+        if (fwd_amount_sats == 0) { free(old_dest_htlcs); return 0; }
         /* Track accumulated fees for profit settlement */
         uint64_t fee_sats = (fee_msat + 999) / 1000;
         mgr->accumulated_fees_sats += fee_sats;
@@ -832,6 +844,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry)) {
         fprintf(stderr, "LSP: cltv_expiry %u too low (need > %d)\n",
                 cltv_expiry, FACTORY_CLTV_DELTA);
+        free(old_dest_htlcs);
         return 0;
     }
 
@@ -840,6 +853,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
                            payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
         fprintf(stderr, "LSP: forward add_htlc failed to client %zu\n", dest_idx);
+        free(old_dest_htlcs);
         return 0;
     }
 
@@ -865,6 +879,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                    payment_hash, fwd_cltv_expiry);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
+            free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(fwd);
@@ -876,6 +891,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t nonce_idx;
         if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
             fprintf(stderr, "LSP: create partial sig failed for dest %zu\n", dest_idx);
+            free(old_dest_htlcs);
             return 0;
         }
         cJSON *cs = wire_build_commitment_signed(
@@ -883,6 +899,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             dest_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
+            free(old_dest_htlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -895,6 +912,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from dest %zu\n", dest_idx);
+            free(old_dest_htlcs);
             return 0;
         }
         uint32_t ack_chan_id;
@@ -917,6 +935,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ack_msg.json);
     }
+    free(old_dest_htlcs);
 
     /* Persist dest channel balance after successful revocation (Gap 2B) */
     if (mgr->persist)
@@ -1665,7 +1684,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_ch_local = ch->local_amount;
     uint64_t old_ch_remote = ch->remote_amount;
     size_t old_ch_n_htlcs = ch->n_htlcs;
-    htlc_t old_ch_htlcs[MAX_HTLCS];
+    htlc_t *old_ch_htlcs = old_ch_n_htlcs > 0
+        ? malloc(old_ch_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_ch_n_htlcs > 0 && !old_ch_htlcs) return 0;
     if (old_ch_n_htlcs > 0)
         memcpy(old_ch_htlcs, ch->htlcs, old_ch_n_htlcs * sizeof(htlc_t));
 
@@ -1673,6 +1694,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!channel_fulfill_htlc(ch, htlc_id, preimage)) {
         fprintf(stderr, "LSP: fulfill_htlc failed for client %zu htlc %llu\n",
                 client_idx, (unsigned long long)htlc_id);
+        free(old_ch_htlcs);
         return 0;
     }
 
@@ -1682,6 +1704,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t nonce_idx;
         if (!channel_create_commitment_partial_sig(ch, psig32, &nonce_idx)) {
             fprintf(stderr, "LSP: create partial sig failed for client %zu\n", client_idx);
+            free(old_ch_htlcs);
             return 0;
         }
         cJSON *cs = wire_build_commitment_signed(
@@ -1689,6 +1712,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[client_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
+            free(old_ch_htlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -1700,6 +1724,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[client_idx], &ack_msg, 30) ||
             ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
+            free(old_ch_htlcs);
             return 0;
         }
         uint32_t ack_chan_id;
@@ -1720,6 +1745,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ack_msg.json);
     }
+    free(old_ch_htlcs);
 
     /* Now back-propagate: find the sender's channel that has a matching HTLC.
        We search all other channels for a received HTLC with the same payment_hash. */
@@ -1781,11 +1807,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint64_t old_sender_local = sender_ch->local_amount;
             uint64_t old_sender_remote = sender_ch->remote_amount;
             size_t old_sender_n_htlcs = sender_ch->n_htlcs;
-            htlc_t old_sender_htlcs[MAX_HTLCS];
+            htlc_t *old_sender_htlcs = old_sender_n_htlcs > 0
+                ? malloc(old_sender_n_htlcs * sizeof(htlc_t)) : NULL;
+            if (old_sender_n_htlcs > 0 && !old_sender_htlcs) continue;
             if (old_sender_n_htlcs > 0)
                 memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
             if (!channel_fulfill_htlc(sender_ch, htlc->id, preimage)) {
                 fprintf(stderr, "LSP: back-fulfill failed\n");
+                free(old_sender_htlcs);
                 continue;
             }
 
@@ -1800,6 +1829,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t nonce_idx;
                 if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
                     fprintf(stderr, "LSP: create partial sig failed for back-propagation to %zu\n", s);
+                    free(old_sender_htlcs);
                     continue;
                 }
                 cJSON *cs = wire_build_commitment_signed(
@@ -1831,6 +1861,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
+            free(old_sender_htlcs);
 
             /* Persist sender balance + delete HTLC atomically */
             if (mgr->persist) {
@@ -2031,7 +2062,9 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             uint64_t old_dest_local = dest_ch->local_amount;
             uint64_t old_dest_remote = dest_ch->remote_amount;
             size_t old_dest_n_htlcs = dest_ch->n_htlcs;
-            htlc_t old_dest_htlcs[MAX_HTLCS];
+            htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
+                ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
+            if (old_dest_n_htlcs > 0 && !old_dest_htlcs) continue;
             if (old_dest_n_htlcs > 0)
                 memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
@@ -2041,6 +2074,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                                     htlc->cltv_expiry, &dest_htlc_id)) {
                 fprintf(stderr, "LSP: HTLC replay add failed for client %zu\n",
                         reconnected_idx);
+                free(old_dest_htlcs);
                 continue;
             }
 
@@ -2063,6 +2097,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                                                        htlc->payment_hash, htlc->cltv_expiry);
             if (!wire_send(lsp->client_fds[reconnected_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
                 cJSON_Delete(fwd);
+                free(old_dest_htlcs);
                 continue;
             }
             cJSON_Delete(fwd);
@@ -2074,6 +2109,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
                     fprintf(stderr, "LSP: replay partial sig failed for client %zu\n",
                             reconnected_idx);
+                    free(old_dest_htlcs);
                     continue;
                 }
                 cJSON *cs = wire_build_commitment_signed(
@@ -2081,6 +2117,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                     dest_ch->commitment_number, psig32, nonce_idx);
                 if (!wire_send(lsp->client_fds[reconnected_idx], MSG_COMMITMENT_SIGNED, cs)) {
                     cJSON_Delete(cs);
+                    free(old_dest_htlcs);
                     continue;
                 }
                 cJSON_Delete(cs);
@@ -2095,6 +2132,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                     if (ack_msg.json) cJSON_Delete(ack_msg.json);
                     fprintf(stderr, "LSP: replay REVOKE_AND_ACK timeout for client %zu\n",
                             reconnected_idx);
+                    free(old_dest_htlcs);
                     continue;
                 }
                 uint32_t ack_chan_id;
@@ -2125,6 +2163,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             printf("LSP: replayed HTLC to client %zu (amount=%llu, htlc_id=%llu)\n",
                    reconnected_idx, (unsigned long long)htlc->amount_sats,
                    (unsigned long long)dest_htlc_id);
+            free(old_dest_htlcs);
         }
     }
 }
