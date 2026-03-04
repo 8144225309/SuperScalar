@@ -318,7 +318,7 @@ int test_wire_close_unsigned(void) {
     unsigned char sighash[32];
 
     TEST_ASSERT(factory_build_cooperative_close_unsigned(&f, &unsigned_tx, sighash,
-                                                          outputs, 2, 800000),
+                                                          outputs, 2, 0),
                 "close unsigned");
     TEST_ASSERT(unsigned_tx.len > 0, "unsigned tx not empty");
 
@@ -774,7 +774,7 @@ int test_regtest_wire_factory(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 800000)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -989,7 +989,7 @@ int test_regtest_wire_factory_arity1(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 800000)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 0)) {
             fprintf(stderr, "LSP: cooperative close (arity-1) failed\n");
             lsp_ok = 0;
         } else {

@@ -1380,7 +1380,7 @@ int test_factory_cooperative_close(void) {
     tx_buf_init(&close_tx, 512);
     unsigned char close_txid[32];
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, close_txid,
-                                                  outputs, 5, 800000),
+                                                  outputs, 5, 0),
                 "build cooperative close");
 
     /* Verify: non-empty signed tx */
@@ -1396,7 +1396,7 @@ int test_factory_cooperative_close(void) {
     tx_buf_t close_unsigned;
     tx_buf_init(&close_unsigned, 256);
     build_unsigned_tx_with_locktime(&close_unsigned, NULL, f.funding_txid,
-                       f.funding_vout, 0xFFFFFFFEu, 800000, outputs, 5);
+                       f.funding_vout, 0xFFFFFFFEu, 0, outputs, 5);
 
     unsigned char sighash[32];
     TEST_ASSERT(compute_taproot_sighash(sighash,
@@ -1473,7 +1473,7 @@ int test_factory_cooperative_close_balances(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                  outputs, 5, 800000),
+                                                  outputs, 5, 0),
                 "build cooperative close (unequal)");
 
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
@@ -1623,7 +1623,7 @@ int test_regtest_factory_coop_close(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                  &close_output, 1, 800000),
+                                                  &close_output, 1, 0),
                 "build cooperative close");
 
     /* Broadcast (single tx, not the tree!) */
@@ -2454,7 +2454,7 @@ int test_factory_arity1_coop_close(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                 close_outs, 5, 800000),
+                                                 close_outs, 5, 0),
                 "cooperative close");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
@@ -3172,7 +3172,7 @@ int test_regtest_dw_exhaustion_close(void) {
     tx_buf_init(&close_tx, 512);
     unsigned char close_txid[32];
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, close_txid,
-                                                  close_outputs, 5, 800000),
+                                                  close_outputs, 5, 0),
                 "coop close after exhaustion");
 
     char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
