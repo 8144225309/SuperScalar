@@ -1188,7 +1188,7 @@ int test_persist_validate_channel_load(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "open");
 
-    /* Insert a channel with commitment_number exceeding CHANNEL_MAX_SECRETS */
+    /* High commitment numbers are now valid (no upper bound) */
     int rc = sqlite3_exec(db.db,
         "INSERT INTO channels (id, factory_id, slot, local_amount, remote_amount, "
         "funding_amount, commitment_number) VALUES (100, 0, 0, 50000, 50000, "
@@ -1198,7 +1198,8 @@ int test_persist_validate_channel_load(void) {
 
     uint64_t la, ra, cn;
     int loaded = persist_load_channel_state(&db, 100, &la, &ra, &cn);
-    TEST_ASSERT(loaded == 0, "commitment_number>256 rejected");
+    TEST_ASSERT(loaded == 1, "high commitment_number accepted");
+    TEST_ASSERT(cn == 999, "commitment_number is 999");
 
     /* Insert a channel with both balances zero */
     rc = sqlite3_exec(db.db,

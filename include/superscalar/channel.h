@@ -12,8 +12,6 @@
 #define MAX_HTLCS 32
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
-#define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */
-#define CHANNEL_SECRETS_WARNING_THRESHOLD 240  /* trigger rotation before exhaustion */
 #define ANCHOR_OUTPUT_AMOUNT     240   /* P2A anchor for CPFP fee bumping (sats) */
 
 /* P2A (Pay-to-Anchor) scriptPubKey: OP_1 OP_PUSHBYTES_2 4e73 (anyone-can-spend) */
@@ -68,9 +66,10 @@ typedef struct {
 
     uint64_t commitment_number;
 
-    /* Per-commitment state (flat storage — random per-commitment secrets) */
-    unsigned char local_pcs[CHANNEL_MAX_SECRETS][32];
-    size_t n_local_pcs;
+    /* Per-commitment secrets (dynamically allocated, grows as needed) */
+    unsigned char (*local_pcs)[32];    /* heap array of 32-byte secrets */
+    size_t n_local_pcs;                /* count of stored secrets */
+    size_t local_pcs_cap;              /* allocated capacity */
 
     /* Two-slot ring buffer for remote per-commitment points.
        Stores the two most recently received PCPs (e.g., cn=0 and cn=1 at init,
@@ -79,8 +78,9 @@ typedef struct {
     uint64_t remote_pcp_nums[2];
     uint8_t remote_pcp_valid[2];
 
-    unsigned char received_revocations[CHANNEL_MAX_SECRETS][32];
-    uint8_t received_revocation_valid[CHANNEL_MAX_SECRETS];
+    unsigned char (*received_revocations)[32];  /* heap array */
+    uint8_t *received_revocation_valid;         /* heap validity flags */
+    size_t revocations_cap;                     /* allocated capacity */
 
     /* Balance (satoshis) */
     uint64_t local_amount;
@@ -265,9 +265,6 @@ int channel_build_penalty_tx(const channel_t *ch,
 /* Set the fee rate (sat/kvB) used for penalty/HTLC transactions.
    Default is 1000 sat/kvB (1 sat/vB). */
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb);
-
-/* Returns 1 if commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD */
-int channel_near_exhaustion(const channel_t *ch);
 
 /* --- Cooperative close --- */
 

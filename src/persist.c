@@ -710,12 +710,6 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
     uint64_t cn = (uint64_t)sqlite3_column_int64(stmt, 2);
 
     /* Data validation (Phase 2: item 2.6) */
-    if (cn > CHANNEL_MAX_SECRETS) {
-        fprintf(stderr, "persist_load_channel_state: commitment_number %llu "
-                "exceeds max %d\n", (unsigned long long)cn, CHANNEL_MAX_SECRETS);
-        sqlite3_finalize(stmt);
-        return 0;
-    }
     if (la == 0 && ra == 0) {
         fprintf(stderr, "persist_load_channel_state: total balance is 0\n");
         sqlite3_finalize(stmt);
