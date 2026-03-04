@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "tx_builder.h"
 
 /* bitcoin-cli subprocess harness for regtest. */
 
@@ -83,5 +84,46 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
 int regtest_derive_p2tr_address(const regtest_t *rt,
                                 const unsigned char *tweaked_ser32,
                                 char *addr_out, size_t addr_len);
+
+/* --- RBF fee bumping (Mainnet Gap #2) --- */
+
+/* Bump fee on an unconfirmed wallet TX via bitcoin-cli bumpfee.
+   Returns 1 on success, 0 on error (e.g., already confirmed). */
+int regtest_bump_fee(regtest_t *rt, const char *txid_hex,
+                      uint64_t new_fee_rate_sat_vb);
+
+/* Wait for confirmation with auto fee-bumping.
+   If not confirmed after target_blocks blocks, bumps fee (rate *= multiplier).
+   Repeats up to max_bumps times. Returns confirmations or -1 on timeout. */
+int regtest_wait_confirmed_with_bump(regtest_t *rt, const char *txid_hex,
+                                      int target_blocks, int max_bumps,
+                                      uint64_t initial_fee_rate,
+                                      double fee_multiplier,
+                                      int timeout_secs);
+
+/* --- UTXO coin selection (Mainnet Gap #1) --- */
+
+typedef struct {
+    char txid[65];
+    int vout;
+    uint64_t amount_sats;
+} utxo_t;
+
+/* List confirmed wallet UTXOs. Caller frees *utxos_out. */
+int regtest_list_utxos(regtest_t *rt, utxo_t **utxos_out, size_t *n_out);
+
+/* Select UTXOs to cover target_sats + fees. Largest-first heuristic.
+   Change below dust is absorbed into fee. Caller frees *selected_out. */
+int regtest_coin_select(const utxo_t *utxos, size_t n_utxos,
+                        uint64_t target_sats, uint64_t fee_rate_sat_vb,
+                        utxo_t **selected_out, size_t *n_selected,
+                        uint64_t *change_sats);
+
+/* Create, sign, and broadcast a funded TX with coin selection.
+   Replaces manual UTXO management. Returns 1 on success. */
+int regtest_create_funded_tx(regtest_t *rt, const tx_output_t *outputs,
+                              size_t n_outputs, uint64_t fee_rate,
+                              char *txid_hex_out, char *signed_hex_out,
+                              size_t hex_max);
 
 #endif /* SUPERSCALAR_REGTEST_H */

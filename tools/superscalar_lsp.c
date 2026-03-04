@@ -11,6 +11,7 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
+#include "superscalar/backup.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 #include <stdio.h>
@@ -106,6 +107,9 @@ static void usage(const char *prog) {
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
         "  --onion               Create Tor hidden service on startup\n"
+        "  --backup PATH       Create encrypted backup of --db and --keyfile to PATH, then exit\n"
+        "  --restore PATH      Restore encrypted backup from PATH to --db and --keyfile, then exit\n"
+        "  --backup-verify PATH  Verify encrypted backup integrity, then exit\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
@@ -482,6 +486,13 @@ int main(int argc, char *argv[]) {
     int auto_rebalance = 0;
     int rebalance_threshold = 80;  /* default 80% imbalance threshold */
     int dynamic_fees = 0;
+    const char *backup_path_arg = NULL;
+    const char *restore_path_arg = NULL;
+    int backup_verify_arg = 0;
+    int fee_bump_after = 6;       /* blocks before first bump */
+    int fee_bump_max = 3;         /* max bump attempts */
+    double fee_bump_multiplier = 1.5;
+    (void)fee_bump_after; (void)fee_bump_max; (void)fee_bump_multiplier;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -656,6 +667,20 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--dynamic-fees") == 0)
             dynamic_fees = 1;
+        else if (strcmp(argv[i], "--fee-bump-after") == 0 && i + 1 < argc)
+            fee_bump_after = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fee-bump-max") == 0 && i + 1 < argc)
+            fee_bump_max = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fee-bump-multiplier") == 0 && i + 1 < argc)
+            fee_bump_multiplier = atof(argv[++i]);
+        else if (strcmp(argv[i], "--backup") == 0 && i + 1 < argc)
+            backup_path_arg = argv[++i];
+        else if (strcmp(argv[i], "--restore") == 0 && i + 1 < argc)
+            restore_path_arg = argv[++i];
+        else if (strcmp(argv[i], "--backup-verify") == 0 && i + 1 < argc) {
+            restore_path_arg = argv[++i];
+            backup_verify_arg = 1;
+        }
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -667,6 +692,43 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* --- Backup / Restore / Verify (early exit) --- */
+    if (backup_path_arg || restore_path_arg || backup_verify_arg) {
+        const char *bp_env = getenv("SUPERSCALAR_BACKUP_PASSPHRASE");
+        const char *bp = bp_env ? bp_env : passphrase;
+        size_t bp_len = strlen(bp);
+        if (bp_len == 0) {
+            fprintf(stderr, "Error: passphrase required for backup operations.\n"
+                    "Set SUPERSCALAR_BACKUP_PASSPHRASE env var or use --passphrase\n");
+            return 1;
+        }
+        if (backup_verify_arg && restore_path_arg) {
+            int ok = backup_verify(restore_path_arg, (const unsigned char *)bp, bp_len);
+            printf("Backup verify: %s\n", ok ? "OK" : "FAILED");
+            return ok ? 0 : 1;
+        }
+        if (backup_path_arg) {
+            if (!db_path || !keyfile_path) {
+                fprintf(stderr, "Error: --backup requires --db and --keyfile\n");
+                return 1;
+            }
+            int ok = backup_create(db_path, keyfile_path, backup_path_arg,
+                                    (const unsigned char *)bp, bp_len);
+            printf("Backup create: %s\n", ok ? "OK" : "FAILED");
+            return ok ? 0 : 1;
+        }
+        if (restore_path_arg) {
+            if (!db_path || !keyfile_path) {
+                fprintf(stderr, "Error: --restore requires --db and --keyfile (destination paths)\n");
+                return 1;
+            }
+            int ok = backup_restore(restore_path_arg, db_path, keyfile_path,
+                                     (const unsigned char *)bp, bp_len);
+            printf("Backup restore: %s\n", ok ? "OK" : "FAILED");
+            return ok ? 0 : 1;
+        }
+    }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
     if (strcmp(network, "mainnet") == 0 && !accept_risk) {

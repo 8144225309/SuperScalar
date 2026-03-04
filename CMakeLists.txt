@@ -111,6 +111,8 @@ add_library(superscalar
     src/jit_channel.c
     src/tor.c
     src/ceremony.c
+    src/backup.c
+    src/wire_tlv.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -146,6 +148,7 @@ add_executable(test_superscalar
     tests/test_jit.c
     tests/test_ceremony.c
     tests/test_property.c
+    tests/test_backup.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
@@ -184,6 +187,14 @@ target_include_directories(superscalar_bridge PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_bridge PRIVATE superscalar project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_bridge PRIVATE project_sanitizers)
+endif()
+
+add_executable(superscalar_watchtower tools/superscalar_watchtower.c)
+target_include_directories(superscalar_watchtower PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(superscalar_watchtower PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(superscalar_watchtower PRIVATE superscalar project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_watchtower PRIVATE project_sanitizers)
 endif()
 
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---

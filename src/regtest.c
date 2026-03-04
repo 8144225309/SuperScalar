@@ -810,3 +810,298 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
     cJSON_Delete(json);
     return signed_hex;
 }
+
+/* --- UTXO coin selection (Mainnet Gap #1) --- */
+
+#define DUST_THRESHOLD_SATS 546
+
+int regtest_list_utxos(regtest_t *rt, utxo_t **utxos_out, size_t *n_out) {
+    if (!rt || !utxos_out || !n_out) return 0;
+
+    char *result = regtest_exec(rt, "listunspent", "1 9999999");
+    if (!result) return 0;
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json || !cJSON_IsArray(json)) {
+        if (json) cJSON_Delete(json);
+        return 0;
+    }
+
+    int n = cJSON_GetArraySize(json);
+    if (n == 0) {
+        cJSON_Delete(json);
+        *utxos_out = NULL;
+        *n_out = 0;
+        return 1;
+    }
+
+    utxo_t *utxos = (utxo_t *)calloc((size_t)n, sizeof(utxo_t));
+    if (!utxos) { cJSON_Delete(json); return 0; }
+
+    size_t count = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(json, i);
+        cJSON *txid = cJSON_GetObjectItem(item, "txid");
+        cJSON *vout = cJSON_GetObjectItem(item, "vout");
+        cJSON *amount = cJSON_GetObjectItem(item, "amount");
+        if (!txid || !cJSON_IsString(txid) || !vout || !cJSON_IsNumber(vout) ||
+            !amount || !cJSON_IsNumber(amount))
+            continue;
+
+        strncpy(utxos[count].txid, txid->valuestring, 64);
+        utxos[count].txid[64] = '\0';
+        utxos[count].vout = vout->valueint;
+        utxos[count].amount_sats = (uint64_t)(amount->valuedouble * 100000000.0 + 0.5);
+        count++;
+    }
+
+    cJSON_Delete(json);
+    *utxos_out = utxos;
+    *n_out = count;
+    return 1;
+}
+
+/* Sort comparator: descending by amount (largest first). */
+static int utxo_cmp_desc(const void *a, const void *b) {
+    const utxo_t *ua = (const utxo_t *)a;
+    const utxo_t *ub = (const utxo_t *)b;
+    if (ub->amount_sats > ua->amount_sats) return 1;
+    if (ub->amount_sats < ua->amount_sats) return -1;
+    return 0;
+}
+
+int regtest_coin_select(const utxo_t *utxos, size_t n_utxos,
+                        uint64_t target_sats, uint64_t fee_rate_sat_vb,
+                        utxo_t **selected_out, size_t *n_selected,
+                        uint64_t *change_sats) {
+    if (!utxos || !selected_out || !n_selected || !change_sats || n_utxos == 0)
+        return 0;
+
+    /* Copy + sort descending */
+    utxo_t *sorted = (utxo_t *)malloc(n_utxos * sizeof(utxo_t));
+    if (!sorted) return 0;
+    memcpy(sorted, utxos, n_utxos * sizeof(utxo_t));
+    qsort(sorted, n_utxos, sizeof(utxo_t), utxo_cmp_desc);
+
+    /* Estimate fee: ~68 vB per input, ~43 vB per output, ~11 vB overhead.
+       We assume 2 outputs (target + change). Adjust as inputs grow. */
+    size_t sel_count = 0;
+    uint64_t sel_total = 0;
+
+    for (size_t i = 0; i < n_utxos; i++) {
+        sel_count = i + 1;
+        sel_total += sorted[i].amount_sats;
+
+        /* Estimate fee for current number of inputs + 2 outputs */
+        uint64_t est_vsize = 11 + sel_count * 68 + 2 * 43;
+        uint64_t est_fee = est_vsize * fee_rate_sat_vb;
+
+        if (sel_total >= target_sats + est_fee + DUST_THRESHOLD_SATS) {
+            /* We have enough including change */
+            uint64_t ch = sel_total - target_sats - est_fee;
+            if (ch < DUST_THRESHOLD_SATS) {
+                /* Change below dust: absorb into fee */
+                ch = 0;
+            }
+            *change_sats = ch;
+            *selected_out = (utxo_t *)malloc(sel_count * sizeof(utxo_t));
+            if (!*selected_out) { free(sorted); return 0; }
+            memcpy(*selected_out, sorted, sel_count * sizeof(utxo_t));
+            *n_selected = sel_count;
+            free(sorted);
+            return 1;
+        }
+
+        if (sel_total >= target_sats + est_fee) {
+            /* Enough without change (change would be dust) */
+            *change_sats = 0;
+            *selected_out = (utxo_t *)malloc(sel_count * sizeof(utxo_t));
+            if (!*selected_out) { free(sorted); return 0; }
+            memcpy(*selected_out, sorted, sel_count * sizeof(utxo_t));
+            *n_selected = sel_count;
+            free(sorted);
+            return 1;
+        }
+    }
+
+    /* Insufficient funds */
+    free(sorted);
+    return 0;
+}
+
+int regtest_create_funded_tx(regtest_t *rt, const tx_output_t *outputs,
+                              size_t n_outputs, uint64_t fee_rate,
+                              char *txid_hex_out, char *signed_hex_out,
+                              size_t hex_max) {
+    if (!rt || !outputs || n_outputs == 0) return 0;
+
+    /* Calculate total target */
+    uint64_t target = 0;
+    for (size_t i = 0; i < n_outputs; i++)
+        target += outputs[i].amount_sats;
+
+    /* List UTXOs and select coins */
+    utxo_t *all_utxos = NULL;
+    size_t n_all = 0;
+    if (!regtest_list_utxos(rt, &all_utxos, &n_all) || n_all == 0) {
+        free(all_utxos);
+        return 0;
+    }
+
+    utxo_t *selected = NULL;
+    size_t n_sel = 0;
+    uint64_t change = 0;
+    if (!regtest_coin_select(all_utxos, n_all, target, fee_rate,
+                              &selected, &n_sel, &change)) {
+        free(all_utxos);
+        return 0;
+    }
+    free(all_utxos);
+
+    /* Build inputs JSON array */
+    cJSON *inputs = cJSON_CreateArray();
+    for (size_t i = 0; i < n_sel; i++) {
+        cJSON *inp = cJSON_CreateObject();
+        cJSON_AddStringToObject(inp, "txid", selected[i].txid);
+        cJSON_AddNumberToObject(inp, "vout", selected[i].vout);
+        cJSON_AddItemToArray(inputs, inp);
+    }
+    free(selected);
+
+    /* Build outputs JSON array */
+    cJSON *outs_json = cJSON_CreateArray();
+    for (size_t i = 0; i < n_outputs; i++) {
+        /* Get address from scriptPubKey */
+        char spk_hex[69];
+        hex_encode(outputs[i].script_pubkey, outputs[i].script_pubkey_len, spk_hex);
+
+        cJSON *out = cJSON_CreateObject();
+        /* Use scriptPubKey hex as key — createrawtransaction handles it via "data" */
+        char amount_str[32];
+        snprintf(amount_str, sizeof(amount_str), "%.8f",
+                 (double)outputs[i].amount_sats / 100000000.0);
+        /* For createrawtransaction, we need address:amount pairs.
+           Fall back to "data" output if we can't derive address. */
+        cJSON_AddStringToObject(out, "data", spk_hex);
+        cJSON_AddItemToArray(outs_json, out);
+    }
+
+    /* Add change output if non-zero */
+    if (change > 0) {
+        char change_addr[128];
+        if (regtest_get_new_address(rt, change_addr, sizeof(change_addr))) {
+            cJSON *chg = cJSON_CreateObject();
+            char chg_str[32];
+            snprintf(chg_str, sizeof(chg_str), "%.8f",
+                     (double)change / 100000000.0);
+            cJSON_AddStringToObject(chg, change_addr, chg_str);
+            cJSON_AddItemToArray(outs_json, chg);
+        }
+    }
+
+    /* Call createrawtransaction */
+    char *inputs_str = cJSON_PrintUnformatted(inputs);
+    char *outs_str = cJSON_PrintUnformatted(outs_json);
+    cJSON_Delete(inputs);
+    cJSON_Delete(outs_json);
+
+    char *params = (char *)malloc(strlen(inputs_str) + strlen(outs_str) + 16);
+    if (!params) { free(inputs_str); free(outs_str); return 0; }
+    sprintf(params, "'%s' '%s'", inputs_str, outs_str);
+    free(inputs_str);
+    free(outs_str);
+
+    char *raw = regtest_exec(rt, "createrawtransaction", params);
+    free(params);
+    if (!raw) return 0;
+
+    /* Strip whitespace/quotes */
+    char *s = raw;
+    while (*s == '"' || *s == ' ' || *s == '\n') s++;
+    char *e = s + strlen(s) - 1;
+    while (e > s && (*e == '"' || *e == ' ' || *e == '\n')) *e-- = '\0';
+
+    /* Sign */
+    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, s, NULL);
+    free(raw);
+    if (!signed_hex) return 0;
+
+    /* Copy signed hex out */
+    if (signed_hex_out && hex_max > 0) {
+        strncpy(signed_hex_out, signed_hex, hex_max - 1);
+        signed_hex_out[hex_max - 1] = '\0';
+    }
+
+    /* Broadcast and get txid */
+    char txid_buf[65];
+    int ok = regtest_send_raw_tx(rt, signed_hex, txid_buf);
+    free(signed_hex);
+
+    if (ok && txid_hex_out)
+        strncpy(txid_hex_out, txid_buf, 65);
+
+    return ok;
+}
+
+/* --- RBF fee bumping (Mainnet Gap #2) --- */
+
+int regtest_bump_fee(regtest_t *rt, const char *txid_hex,
+                      uint64_t new_fee_rate_sat_vb) {
+    if (!rt || !txid_hex) return 0;
+
+    char params[256];
+    snprintf(params, sizeof(params),
+             "\"%s\" {\"fee_rate\": %llu}",
+             txid_hex, (unsigned long long)new_fee_rate_sat_vb);
+
+    char *result = regtest_exec(rt, "bumpfee", params);
+    if (!result) return 0;
+
+    /* Check for success: result should contain "txid" field */
+    int ok = (strstr(result, "\"txid\"") != NULL);
+    if (!ok)
+        fprintf(stderr, "regtest_bump_fee: %s\n", result);
+    free(result);
+    return ok;
+}
+
+int regtest_wait_confirmed_with_bump(regtest_t *rt, const char *txid_hex,
+                                      int target_blocks, int max_bumps,
+                                      uint64_t initial_fee_rate,
+                                      double fee_multiplier,
+                                      int timeout_secs) {
+    if (!rt || !txid_hex) return -1;
+
+    int bumps_done = 0;
+    uint64_t current_rate = initial_fee_rate;
+    int start_height = regtest_get_block_height(rt);
+    int elapsed = 0;
+    int poll_interval = (strcmp(rt->network, "regtest") == 0) ? 5 : 30;
+
+    while (elapsed < timeout_secs) {
+        /* Check confirmation */
+        int conf = regtest_get_confirmations(rt, txid_hex);
+        if (conf >= 1) return conf;
+
+        /* Check if enough blocks have passed for a bump */
+        int current_height = regtest_get_block_height(rt);
+        int blocks_passed = current_height - start_height;
+
+        if (blocks_passed >= target_blocks && bumps_done < max_bumps) {
+            current_rate = (uint64_t)((double)current_rate * fee_multiplier);
+            printf("  Fee bump #%d: new rate %llu sat/vB\n",
+                   bumps_done + 1, (unsigned long long)current_rate);
+
+            if (regtest_bump_fee(rt, txid_hex, current_rate)) {
+                bumps_done++;
+                start_height = current_height; /* reset block counter */
+            }
+        }
+
+        sleep(poll_interval);
+        elapsed += poll_interval;
+    }
+
+    return -1; /* timeout */
+}

@@ -1,5 +1,6 @@
 #include "superscalar/factory.h"
 #include "superscalar/wire.h"
+#include "superscalar/wire_tlv.h"
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/client.h"
@@ -1345,5 +1346,100 @@ int test_wire_scid_assign(void) {
     TEST_ASSERT_EQ(cd_out, cltv, "cltv_delta");
 
     cJSON_Delete(j);
+    return 1;
+}
+
+/* --- TLV codec tests (Mainnet Gap #8) --- */
+
+int test_tlv_encode_decode(void) {
+    unsigned char val1[] = { 0xDE, 0xAD };
+    unsigned char val2[] = { 0xBE, 0xEF, 0xCA, 0xFE };
+    unsigned char val3[] = { 0x42 };
+
+    tlv_t records[3] = {
+        { .type = 1, .length = 2, .value = val1 },
+        { .type = 100, .length = 4, .value = val2 },
+        { .type = 0xFFFF, .length = 1, .value = val3 },
+    };
+
+    unsigned char *buf = NULL;
+    size_t buf_len = 0;
+    TEST_ASSERT(wire_tlv_encode(records, 3, &buf, &buf_len), "encode 3 records");
+    TEST_ASSERT(buf_len == 4 + 2 + 4 + 4 + 4 + 1, "encoded length");
+
+    tlv_t *decoded = NULL;
+    size_t n_decoded = 0;
+    TEST_ASSERT(wire_tlv_decode(buf, buf_len, &decoded, &n_decoded), "decode");
+    TEST_ASSERT(n_decoded == 3, "decoded count");
+
+    TEST_ASSERT(decoded[0].type == 1, "rec0 type");
+    TEST_ASSERT(decoded[0].length == 2, "rec0 length");
+    TEST_ASSERT(memcmp(decoded[0].value, val1, 2) == 0, "rec0 value");
+
+    TEST_ASSERT(decoded[1].type == 100, "rec1 type");
+    TEST_ASSERT(decoded[1].length == 4, "rec1 length");
+    TEST_ASSERT(memcmp(decoded[1].value, val2, 4) == 0, "rec1 value");
+
+    TEST_ASSERT(decoded[2].type == 0xFFFF, "rec2 type");
+    TEST_ASSERT(decoded[2].length == 1, "rec2 length");
+    TEST_ASSERT(decoded[2].value[0] == 0x42, "rec2 value");
+
+    wire_tlv_free(decoded, n_decoded);
+    free(buf);
+    return 1;
+}
+
+int test_tlv_decode_truncated(void) {
+    /* Valid header but value extends beyond buffer */
+    unsigned char buf[] = {
+        0x00, 0x01,   /* type = 1 */
+        0x00, 0x08,   /* length = 8 */
+        0xAA, 0xBB    /* only 2 bytes, but said 8 */
+    };
+
+    tlv_t *decoded = NULL;
+    size_t n_decoded = 0;
+    int ok = wire_tlv_decode(buf, sizeof(buf), &decoded, &n_decoded);
+    TEST_ASSERT(ok == 0, "truncated value rejected");
+    TEST_ASSERT(decoded == NULL, "no records on error");
+
+    /* Truncated header (only 3 bytes) */
+    unsigned char buf2[] = { 0x00, 0x01, 0x00 };
+    ok = wire_tlv_decode(buf2, sizeof(buf2), &decoded, &n_decoded);
+    TEST_ASSERT(ok == 0, "truncated header rejected");
+
+    return 1;
+}
+
+int test_wire_hello_tlv_negotiation(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Generate a test keypair */
+    unsigned char seckey[32];
+    memset(seckey, 0x42, 32);
+    secp256k1_pubkey pubkey;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pubkey, seckey), "create pubkey");
+
+    /* Build HELLO — should include tlv_supported */
+    cJSON *hello = wire_build_hello(ctx, &pubkey);
+    TEST_ASSERT(hello != NULL, "build hello");
+    cJSON *tlv_flag = cJSON_GetObjectItem(hello, "tlv_supported");
+    TEST_ASSERT(tlv_flag != NULL, "hello has tlv_supported");
+    TEST_ASSERT(cJSON_IsTrue(tlv_flag), "hello tlv_supported is true");
+    cJSON_Delete(hello);
+
+    /* Build HELLO_ACK — should include tlv_supported */
+    secp256k1_pubkey all_pks[2];
+    memcpy(&all_pks[0], &pubkey, sizeof(secp256k1_pubkey));
+    memcpy(&all_pks[1], &pubkey, sizeof(secp256k1_pubkey));
+    cJSON *ack = wire_build_hello_ack(ctx, &pubkey, 0, all_pks, 2);
+    TEST_ASSERT(ack != NULL, "build hello_ack");
+    cJSON *tlv_flag2 = cJSON_GetObjectItem(ack, "tlv_supported");
+    TEST_ASSERT(tlv_flag2 != NULL, "hello_ack has tlv_supported");
+    TEST_ASSERT(cJSON_IsTrue(tlv_flag2), "hello_ack tlv_supported is true");
+    cJSON_Delete(ack);
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }

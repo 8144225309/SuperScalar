@@ -580,6 +580,28 @@ extern int test_bridge_heartbeat_stale(void);
 extern int test_bridge_reconnect(void);
 extern int test_bridge_heartbeat_config(void);
 
+/* Backup & Recovery (Mainnet Gap #7) */
+extern int test_backup_create_verify_restore(void);
+extern int test_backup_wrong_passphrase(void);
+extern int test_backup_corrupt_file(void);
+
+/* UTXO Coin Selection (Mainnet Gap #1) */
+extern int test_coin_select_basic(void);
+extern int test_coin_select_no_change(void);
+
+/* Standalone Watchtower (Mainnet Gap #3) */
+extern int test_watchtower_detect_stale_tx(void);
+extern int test_persist_open_readonly(void);
+
+/* Factory Config (Mainnet Gap #6) */
+extern int test_factory_config_custom(void);
+extern int test_factory_config_default(void);
+
+/* Wire TLV Foundation (Mainnet Gap #8) */
+extern int test_tlv_encode_decode(void);
+extern int test_tlv_decode_truncated(void);
+extern int test_wire_hello_tlv_negotiation(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -1097,6 +1119,28 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_heartbeat_stale);
     RUN_TEST(test_bridge_reconnect);
     RUN_TEST(test_bridge_heartbeat_config);
+
+    printf("\n=== Backup & Recovery (Mainnet Gap #7) ===\n");
+    RUN_TEST(test_backup_create_verify_restore);
+    RUN_TEST(test_backup_wrong_passphrase);
+    RUN_TEST(test_backup_corrupt_file);
+
+    printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
+    RUN_TEST(test_coin_select_basic);
+    RUN_TEST(test_coin_select_no_change);
+
+    printf("\n=== Standalone Watchtower (Mainnet Gap #3) ===\n");
+    RUN_TEST(test_watchtower_detect_stale_tx);
+    RUN_TEST(test_persist_open_readonly);
+
+    printf("\n=== Factory Config (Mainnet Gap #6) ===\n");
+    RUN_TEST(test_factory_config_custom);
+    RUN_TEST(test_factory_config_default);
+
+    printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");
+    RUN_TEST(test_tlv_encode_decode);
+    RUN_TEST(test_tlv_decode_truncated);
+    RUN_TEST(test_wire_hello_tlv_negotiation);
 }
 
 extern int regtest_init_faucet(void);

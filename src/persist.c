@@ -346,6 +346,22 @@ int persist_open(persist_t *p, const char *path) {
     return 1;
 }
 
+int persist_open_readonly(persist_t *p, const char *path) {
+    if (!p || !path) return 0;
+    memset(p, 0, sizeof(*p));
+    strncpy(p->path, path, sizeof(p->path) - 1);
+
+    int rc = sqlite3_open_v2(path, &p->db, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "persist_open_readonly: %s\n", sqlite3_errmsg(p->db));
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
+    sqlite3_busy_timeout(p->db, 5000);
+    return 1;
+}
+
 void persist_close(persist_t *p) {
     if (p && p->db) {
         sqlite3_close(p->db);

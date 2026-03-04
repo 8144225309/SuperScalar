@@ -23,6 +23,11 @@ typedef struct {
    Returns 1 on success, 0 on error. */
 int persist_open(persist_t *p, const char *path);
 
+/* Open database read-only. No schema creation or migration.
+   Writes will fail. For standalone watchtower / backup tools.
+   Returns 1 on success, 0 on error. */
+int persist_open_readonly(persist_t *p, const char *path);
+
 /* Get the current schema version from the database. Returns 0 if unknown. */
 int persist_schema_version(persist_t *p);
 

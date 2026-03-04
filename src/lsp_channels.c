@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <signal.h>
 #include <unistd.h>
@@ -382,16 +382,18 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     gettimeofday(&start, NULL);
 
     while (1) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(client_fd, &rfds);
-        int max_fd = client_fd;
+        struct pollfd pfds[2];
+        int nfds = 0;
 
-        /* Monitor bridge fd unless we're already inside a bridge handler */
+        pfds[nfds].fd = client_fd;
+        pfds[nfds].events = POLLIN;
+        int client_slot = nfds++;
+
+        int bridge_slot = -1;
         if (mgr->bridge_fd >= 0 && !servicing) {
-            FD_SET(mgr->bridge_fd, &rfds);
-            if (mgr->bridge_fd > max_fd)
-                max_fd = mgr->bridge_fd;
+            pfds[nfds].fd = mgr->bridge_fd;
+            pfds[nfds].events = POLLIN;
+            bridge_slot = nfds++;
         }
 
         gettimeofday(&now, NULL);
@@ -399,12 +401,11 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         int remaining = timeout_sec - elapsed;
         if (remaining <= 0) return 0;
 
-        struct timeval tv = { .tv_sec = remaining, .tv_usec = 0 };
-        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = poll(pfds, (nfds_t)nfds, remaining * 1000);
         if (ret <= 0) return 0;
 
         /* Service bridge if ready */
-        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+        if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
             wire_msg_t bmsg;
             if (!wire_recv(mgr->bridge_fd, &bmsg)) {
                 fprintf(stderr, "LSP: bridge disconnected during client wait\n");
@@ -415,13 +416,12 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 servicing = 0;
                 cJSON_Delete(bmsg.json);
             }
-            /* If client fd wasn't also ready, loop back to select */
-            if (!FD_ISSET(client_fd, &rfds))
+            if (!(pfds[client_slot].revents & POLLIN))
                 continue;
         }
 
         /* Client fd ready — read message */
-        if (FD_ISSET(client_fd, &rfds))
+        if (pfds[client_slot].revents & POLLIN)
             return wire_recv(client_fd, msg);
     }
 }
@@ -2423,39 +2423,44 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!mgr || !lsp) return 0;
 
     size_t handled = 0;
+
+    /* Allocate pollfd array: clients + optional bridge */
+    size_t max_pfds = mgr->n_channels + 1;
+    struct pollfd *pfds = (struct pollfd *)calloc(max_pfds, sizeof(struct pollfd));
+    if (!pfds) return 0;
+
     while (handled < expected_msgs) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int max_fd = -1;
+        int nfds = 0;
+
         for (size_t c = 0; c < mgr->n_channels; c++) {
-            int cfd = lsp->client_fds[c];
-            FD_SET(cfd, &rfds);
-            if (cfd > max_fd) max_fd = cfd;
+            pfds[nfds].fd = lsp->client_fds[c];
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
         }
 
-        /* Include bridge fd in select if connected */
+        int bridge_slot = -1;
         if (mgr->bridge_fd >= 0) {
-            FD_SET(mgr->bridge_fd, &rfds);
-            if (mgr->bridge_fd > max_fd) max_fd = mgr->bridge_fd;
+            pfds[nfds].fd = mgr->bridge_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            bridge_slot = nfds++;
         }
 
-        struct timeval tv;
-        tv.tv_sec = 30;
-        tv.tv_usec = 0;
-
-        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = poll(pfds, (nfds_t)nfds, 30000);
         if (ret <= 0) {
-            fprintf(stderr, "LSP event loop: select timeout/error (handled %zu/%zu)\n",
+            fprintf(stderr, "LSP event loop: poll timeout/error (handled %zu/%zu)\n",
                     handled, expected_msgs);
+            free(pfds);
             return 0;
         }
 
         /* Handle bridge messages */
-        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+        if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
             wire_msg_t msg;
             if (!wire_recv(mgr->bridge_fd, &msg)) {
                 fprintf(stderr, "LSP event loop: bridge recv failed\n");
-                mgr->bridge_fd = -1;  /* bridge disconnected */
+                mgr->bridge_fd = -1;
             } else {
                 if (!lsp_channels_handle_bridge_msg(mgr, lsp, &msg)) {
                     fprintf(stderr, "LSP event loop: bridge handle failed 0x%02x\n",
@@ -2467,11 +2472,12 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         for (size_t c = 0; c < mgr->n_channels; c++) {
-            if (!FD_ISSET(lsp->client_fds[c], &rfds)) continue;
+            if (!(pfds[c].revents & POLLIN)) continue;
 
             wire_msg_t msg;
             if (!wire_recv(lsp->client_fds[c], &msg)) {
                 fprintf(stderr, "LSP event loop: recv failed from client %zu\n", c);
+                free(pfds);
                 return 0;
             }
 
@@ -2479,6 +2485,7 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP event loop: handle_msg failed for client %zu "
                         "msg 0x%02x\n", c, msg.msg_type);
                 cJSON_Delete(msg.json);
+                free(pfds);
                 return 0;
             }
             cJSON_Delete(msg.json);
@@ -2486,6 +2493,7 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    free(pfds);
     return 1;
 }
 
@@ -2656,47 +2664,58 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             mgr->last_settlement_block = (uint32_t)h;
     }
 
+    /* Pre-allocate poll arrays (clients + bridge + listen + stdin) */
+    int max_pfds = (int)mgr->n_channels + 3;
+    struct pollfd *pfds = calloc(max_pfds, sizeof(struct pollfd));
+    int *client_slots = calloc(mgr->n_channels, sizeof(int));
+    if (!pfds || !client_slots) {
+        free(pfds);
+        free(client_slots);
+        return 0;
+    }
+
     while (!(*shutdown_flag)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int max_fd = -1;
+        int nfds = 0;
+        int listen_slot = -1, stdin_slot = -1, bridge_slot = -1;
+        for (size_t ci = 0; ci < mgr->n_channels; ci++)
+            client_slots[ci] = -1;
+
         for (size_t c = 0; c < mgr->n_channels; c++) {
             int cfd = lsp->client_fds[c];
             if (cfd < 0) continue;  /* skip disconnected clients */
-            FD_SET(cfd, &rfds);
-            if (cfd > max_fd) max_fd = cfd;
+            client_slots[c] = nfds;
+            pfds[nfds] = (struct pollfd){ .fd = cfd, .events = POLLIN };
+            nfds++;
         }
 
-        /* Include bridge fd in select if connected */
+        /* Include bridge fd if connected */
         if (mgr->bridge_fd >= 0) {
-            FD_SET(mgr->bridge_fd, &rfds);
-            if (mgr->bridge_fd > max_fd) max_fd = mgr->bridge_fd;
+            bridge_slot = nfds;
+            pfds[nfds] = (struct pollfd){ .fd = mgr->bridge_fd, .events = POLLIN };
+            nfds++;
         }
 
         /* Include listen_fd for reconnections (Phase 16) */
         if (lsp->listen_fd >= 0) {
-            FD_SET(lsp->listen_fd, &rfds);
-            if (lsp->listen_fd > max_fd) max_fd = lsp->listen_fd;
+            listen_slot = nfds;
+            pfds[nfds] = (struct pollfd){ .fd = lsp->listen_fd, .events = POLLIN };
+            nfds++;
         }
 
         /* Include stdin for interactive CLI */
         if (mgr->cli_enabled) {
-            FD_SET(STDIN_FILENO, &rfds);
-            if (STDIN_FILENO > max_fd) max_fd = STDIN_FILENO;
+            stdin_slot = nfds;
+            pfds[nfds] = (struct pollfd){ .fd = STDIN_FILENO, .events = POLLIN };
+            nfds++;
         }
 
-        if (max_fd < 0) {
+        if (nfds == 0) {
             /* No fds to watch — all clients disconnected, no listen socket */
-            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            select(0, NULL, NULL, NULL, &tv);
+            poll(NULL, 0, 5000);
             continue;
         }
 
-        struct timeval tv;
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-
-        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = poll(pfds, (nfds_t)nfds, 5000);
         if (ret < 0) {
             /* EINTR from signal — check shutdown flag */
             continue;
@@ -3046,7 +3065,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Handle new connections on listen_fd (bridge or client reconnect) */
-        if (lsp->listen_fd >= 0 && FD_ISSET(lsp->listen_fd, &rfds)) {
+        if (listen_slot >= 0 && (pfds[listen_slot].revents & POLLIN)) {
             int new_fd = wire_accept(lsp->listen_fd);
             if (new_fd >= 0) {
                 /* Noise handshake (NK if LSP has static key set) */
@@ -3093,7 +3112,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Handle stdin CLI commands */
-        if (mgr->cli_enabled && FD_ISSET(STDIN_FILENO, &rfds)) {
+        if (stdin_slot >= 0 && (pfds[stdin_slot].revents & POLLIN)) {
             char line[256];
             if (!fgets(line, sizeof(line), stdin)) {
                 /* EOF or error — disable CLI to prevent spin loop */
@@ -3109,7 +3128,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Handle bridge messages */
-        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+        if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
             wire_msg_t msg;
             if (!wire_recv(mgr->bridge_fd, &msg)) {
                 fprintf(stderr, "LSP daemon: bridge disconnected\n");
@@ -3124,8 +3143,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         for (size_t c = 0; c < mgr->n_channels; c++) {
-            if (lsp->client_fds[c] < 0) continue;
-            if (!FD_ISSET(lsp->client_fds[c], &rfds)) continue;
+            if (client_slots[c] < 0) continue;
+            if (!(pfds[client_slots[c]].revents & POLLIN)) continue;
 
             wire_msg_t msg;
             if (!wire_recv(lsp->client_fds[c], &msg)) {
@@ -3143,6 +3162,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    free(pfds);
+    free(client_slots);
     printf("LSP: daemon loop stopped (shutdown requested)\n");
     return 1;
 }

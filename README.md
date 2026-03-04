@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 411 tests (368 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 423 tests (380 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -24,9 +24,9 @@ A Bitcoin channel factory protocol combining:
 | **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
 | **Wire Protocol** | Factory lifecycle, channel ops, HTLCs, PTLC rotation, JIT channels, bridge relay, reconnection |
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
-| **Security** | Client + LSP watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles |
-| **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes) |
-| **Testing** | 368 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles, encrypted backup/restore |
+| **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
+| **Testing** | 380 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-403 tests (361 unit + 42 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+423 tests (380 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -441,6 +441,12 @@ superscalar_lsp [OPTIONS]
 | `--tor-only` | — | off | Refuse all non-.onion outbound connections |
 | `--bind` | ADDRESS | 0.0.0.0 | Restrict listen address (auto `127.0.0.1` with `--onion`) |
 | `--tor-password-file` | PATH | — | Read Tor control password from file (avoids argv exposure) |
+| `--backup` | PATH | — | Create encrypted backup of DB + keyfile and exit |
+| `--restore` | PATH | — | Restore from encrypted backup and exit |
+| `--backup-verify` | PATH | — | Verify backup integrity and exit |
+| `--fee-bump-after` | N | 6 | Blocks before first RBF fee bump |
+| `--fee-bump-max` | N | 3 | Maximum fee bump attempts |
+| `--fee-bump-multiplier` | F | 1.5 | Fee rate multiplier per bump |
 | `--regtest` | — | off | Shorthand for --network regtest |
 | `--i-accept-the-risk` | — | off | Required for mainnet operation |
 | `--help` | — | — | Show help and exit |
@@ -486,13 +492,34 @@ superscalar_bridge [OPTIONS]
 | `--lsp-pubkey` | HEX | — | LSP static pubkey (33-byte compressed hex) for NK authentication |
 | `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 
+### superscalar_watchtower
+
+Standalone watchtower that monitors the blockchain for stale-state broadcasts independently of the LSP.
+
+```
+superscalar_watchtower [OPTIONS]
+```
+
+| Flag | Argument | Default | Description |
+|------|----------|---------|-------------|
+| `--db` | PATH | **required** | Path to LSP SQLite database (opened read-only) |
+| `--network` | MODE | regtest | Bitcoin network |
+| `--poll-interval` | SECS | 30 | Seconds between block scans |
+| `--cli-path` | PATH | bitcoin-cli | Path to bitcoin-cli binary |
+| `--rpcuser` | USER | rpcuser | Bitcoin RPC username |
+| `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
+| `--datadir` | PATH | — | Bitcoin datadir |
+| `--rpcport` | PORT | — | Bitcoin RPC port |
+
+The watchtower opens the database read-only (no write contention with the LSP) and broadcasts penalty transactions if it detects a breach. Run it on a separate machine for defense-in-depth.
+
 ---
 
 ## Documentation
 
 | Guide | Audience | What It Covers |
 |-------|----------|----------------|
-| [LSP Operator Guide](docs/lsp-operator-guide.md) | LSP operators | Full deployment: Bitcoin Core setup, key management, all CLI flags, economics config, crash recovery, CLN bridge, monitoring |
+| [LSP Operator Guide](docs/lsp-operator-guide.md) | LSP operators | Full deployment: Bitcoin Core setup, key management, all CLI flags, economics config, backup/restore, crash recovery, CLN bridge, monitoring |
 | [Client User Guide](docs/client-user-guide.md) | End users | Connecting to an LSP, receiving payments, watchtower security, Tor, reconnection, troubleshooting |
 | [Demo Walkthrough](docs/demo-walkthrough.md) | Everyone | Step-by-step for every demo: automated (one-command), manual (subcommands), fully manual (individual binaries), test orchestrator |
 | [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
@@ -567,7 +594,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-54 message types over TCP with length-prefixed JSON framing:
+54 message types over TCP with length-prefixed JSON framing. TLV binary codec available for BOLT-compatible encoding (version negotiated via HELLO/HELLO_ACK):
 
 | Category | Messages |
 |----------|----------|
@@ -633,21 +660,20 @@ CLN (lightningd)
 | `crypto_aead` | crypto_aead.c | AEAD encryption primitives |
 | `report` | report.c | JSON diagnostic report generation |
 | `ceremony` | ceremony.c | Factory creation ceremony: parallel client collection, timeout handling, quorum |
-| `regtest` | regtest.c | bitcoin-cli subprocess harness |
+| `backup` | backup.c | Encrypted backup/restore of DB + keyfile (HKDF-SHA256 + ChaCha20-Poly1305) |
+| `wire_tlv` | wire_tlv.c | TLV (Type-Length-Value) binary codec for BOLT-compatible wire protocol |
+| `regtest` | regtest.c | bitcoin-cli subprocess harness, UTXO coin selection, RBF fee bumping |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
 ## Known Limitations
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Reconnect (BOLT #2)** | Implemented | Commitment reconciliation with DB rollback; HTLC replay after reconnect |
-| **AEAD crypto** | Implemented | OpenSSL EVP ChaCha20-Poly1305 (hardware-accelerated) |
-| **Capacity limits** | Dynamic | Pointer + count + capacity; defaults match previous compile-time constants |
-| **JIT migration** | Implemented | JIT channels cooperatively closed on-chain during rotation (Phase A.5) |
-| **Fee estimation** | Default-on | Dynamic `estimatesmartfee`; static 1000 sat/kvB fallback |
 | **Gossip (BOLT #7)** | Route hints | Full gossip impossible (off-chain); SCID + route hints in BOLT #11 invoices |
-| **Variable arity** | Implemented | Per-level branching factors via `--arity 1,1,2,2` |
+| **Onion routing** | By design | Single-hop hub-and-spoke; cross-factory routing goes through CLN bridge |
+| **BOLT #11 encoding** | Delegated | Invoice creation handled by CLN; SuperScalar provides route hints |
 | **Hashlock burn** | By design | Enforced by `factory_build_burn_tx()`, not Script (would require covenant opcodes) |
+| **Wire protocol** | JSON + TLV | JSON framing with TLV codec available; full binary migration incremental |
 
 ## License
 

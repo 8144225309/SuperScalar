@@ -52,9 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 368 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, property-based tests |
+| Unit tests | 380 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
 | Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| **Total** | **411** | | |
+| **Total** | **423** | | |
 
 ---
 
@@ -67,7 +67,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 368/368 passed`
+Expected output: `Results: 380/380 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
@@ -99,7 +99,7 @@ cd build
 ./test_superscalar --regtest
 ```
 
-Expected output: `Results: 42/42 passed`
+Expected output: `Results: 43/43 passed`
 
 ### Step 3: Stop bitcoind
 
@@ -245,6 +245,16 @@ sleep 3
 | Encrypted Keyfile | 3 | Encrypt, decrypt, wrong-passphrase rejection |
 | Edge Cases + Failure Modes | 10 | Boundary conditions, error paths, malformed input handling |
 | Phase 2: Testnet Ready | 13 | End-to-end testnet integration, multi-step scenarios |
+
+### Mainnet Readiness
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Backup & Recovery | 3 | Encrypted backup create/verify/restore round-trip, wrong passphrase rejection, corrupt file detection |
+| UTXO Coin Selection | 2 | Largest-first coin selection with change, dust absorption into fee |
+| Standalone Watchtower | 2 | Stale TX detection via watchtower entries, read-only DB access |
+| Factory Config | 2 | Custom runtime limits (max_signers, max_nodes, dust_limit), NULL config uses defaults |
+| Wire TLV Foundation | 3 | TLV encode/decode round-trip, truncated buffer rejection, HELLO/HELLO_ACK TLV negotiation |
 
 ---
 

@@ -523,6 +523,7 @@ cJSON *wire_build_hello(const secp256k1_context *ctx,
     char hex[67];
     pubkey_to_hex(ctx, pubkey, hex);
     cJSON_AddStringToObject(j, "pubkey", hex);
+    cJSON_AddBoolToObject(j, "tlv_supported", 1);
     return j;
 }
 
@@ -542,6 +543,7 @@ cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
         cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
     }
     cJSON_AddItemToObject(j, "all_pubkeys", arr);
+    cJSON_AddBoolToObject(j, "tlv_supported", 1);
     return j;
 }
 
