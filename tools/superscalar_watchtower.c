@@ -1,3 +1,4 @@
+#include "superscalar/version.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/persist.h"
 #include "superscalar/regtest.h"
@@ -32,6 +33,7 @@ static void usage(const char *prog) {
         "  --rpcpassword PASS  Bitcoin RPC password\n"
         "  --datadir PATH      Bitcoin datadir\n"
         "  --rpcport PORT      Bitcoin RPC port\n"
+        "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog);
 }
@@ -63,6 +65,10 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--version") == 0) {
+            printf("superscalar_watchtower %s\n", SUPERSCALAR_VERSION);
+            return 0;
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;

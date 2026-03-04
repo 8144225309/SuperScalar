@@ -1,3 +1,4 @@
+#include "superscalar/version.h"
 #include "superscalar/client.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
@@ -1361,6 +1362,7 @@ static void usage(const char *prog) {
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
+        "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -1495,6 +1497,9 @@ int main(int argc, char *argv[]) {
             mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("superscalar_client %s\n", SUPERSCALAR_VERSION);
+            return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;

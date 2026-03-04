@@ -1,3 +1,4 @@
+#include "superscalar/version.h"
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/jit_channel.h"
@@ -118,6 +119,7 @@ static void usage(const char *prog) {
         "  --restore PATH      Restore encrypted backup from PATH to --db and --keyfile, then exit\n"
         "  --backup-verify PATH  Verify encrypted backup integrity, then exit\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
+        "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
 }
@@ -714,6 +716,10 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
+        else if (strcmp(argv[i], "--version") == 0) {
+            printf("superscalar_lsp %s\n", SUPERSCALAR_VERSION);
+            return 0;
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;

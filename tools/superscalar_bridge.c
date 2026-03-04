@@ -1,3 +1,4 @@
+#include "superscalar/version.h"
 #include "superscalar/bridge.h"
 #include "superscalar/tor.h"
 #include <secp256k1.h>
@@ -15,6 +16,7 @@ static void usage(const char *prog) {
             "  --plugin-port PORT    Plugin listen port (default: 9736)\n"
             "  --lsp-pubkey HEX      LSP static pubkey (33-byte hex) for NK authentication\n"
             "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
+            "  --version             Show version and exit\n"
             "  --help                Show this help\n", prog);
 }
 
@@ -31,6 +33,7 @@ int main(int argc, char *argv[]) {
         {"plugin-port", required_argument, 0, 'p'},
         {"lsp-pubkey",  required_argument, 0, 'k'},
         {"tor-proxy",   required_argument, 0, 't'},
+        {"version",     no_argument,       0, 'v'},
         {"help",        no_argument,       0, '?'},
         {0, 0, 0, 0}
     };
@@ -43,6 +46,9 @@ int main(int argc, char *argv[]) {
         case 'p': plugin_port = atoi(optarg); break;
         case 'k': lsp_pubkey_hex = optarg; break;
         case 't': tor_proxy_arg = optarg; break;
+        case 'v':
+            printf("superscalar_bridge %s\n", SUPERSCALAR_VERSION);
+            return 0;
         default: usage(argv[0]); return 1;
         }
     }

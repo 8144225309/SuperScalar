@@ -2,7 +2,9 @@
 
 All notable changes to SuperScalar are documented here.
 
-## Unreleased
+## 0.1.0 — 2026-03-04
+
+First tagged release. Ready for signet/testnet collaborative testing.
 
 ### Security
 
@@ -14,6 +16,7 @@ All notable changes to SuperScalar are documented here.
 - **tx_buf OOM safety**: Sticky `oom` flag prevents heap buffer overflow on `realloc()` failure — all write functions bail out instead of writing past the buffer.
 - **SQLite PRAGMA error checking**: `persist_open()` now verifies `journal_mode=WAL`, `synchronous=FULL`, and `foreign_keys=ON` all succeed — previously failures were silently discarded.
 - **simulate_tree() stack guard**: Bounds check prevents stack overflow in tree simulation.
+- **Bidirectional MSG_ERROR**: Client sends error on ceremony failures; LSP checks for MSG_ERROR at all 6 reception points (4 ceremony steps, daemon loop, reconnect).
 
 ### Changed
 
@@ -23,6 +26,8 @@ All notable changes to SuperScalar are documented here.
 
 ### Added
 
+- `include/superscalar/version.h` — version string (`SUPERSCALAR_VERSION`)
+- `--version` flag on all 4 binaries (LSP, client, bridge, watchtower)
 - `src/bip39.c`, `include/superscalar/bip39.h` — BIP39 mnemonic implementation
 - `src/bip39_wordlist.h` — 2048-word English wordlist
 - `src/rate_limit.c`, `include/superscalar/rate_limit.h` — connection rate limiting
