@@ -7,17 +7,20 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 
 void tx_buf_write_u8(tx_buf_t *buf, uint8_t val) {
     tx_buf_ensure(buf, 1);
+    if (buf->oom) return;
     buf->data[buf->len++] = val;
 }
 
 void tx_buf_write_u16_le(tx_buf_t *buf, uint16_t val) {
     tx_buf_ensure(buf, 2);
+    if (buf->oom) return;
     buf->data[buf->len++] = (unsigned char)(val & 0xff);
     buf->data[buf->len++] = (unsigned char)((val >> 8) & 0xff);
 }
 
 void tx_buf_write_u32_le(tx_buf_t *buf, uint32_t val) {
     tx_buf_ensure(buf, 4);
+    if (buf->oom) return;
     buf->data[buf->len++] = (unsigned char)(val & 0xff);
     buf->data[buf->len++] = (unsigned char)((val >> 8) & 0xff);
     buf->data[buf->len++] = (unsigned char)((val >> 16) & 0xff);
@@ -26,6 +29,7 @@ void tx_buf_write_u32_le(tx_buf_t *buf, uint32_t val) {
 
 void tx_buf_write_u64_le(tx_buf_t *buf, uint64_t val) {
     tx_buf_ensure(buf, 8);
+    if (buf->oom) return;
     for (int i = 0; i < 8; i++)
         buf->data[buf->len++] = (unsigned char)((val >> (i * 8)) & 0xff);
 }
@@ -47,6 +51,7 @@ void tx_buf_write_varint(tx_buf_t *buf, uint64_t val) {
 
 void tx_buf_write_bytes(tx_buf_t *buf, const unsigned char *data, size_t len) {
     tx_buf_ensure(buf, len);
+    if (buf->oom) return;
     memcpy(buf->data + buf->len, data, len);
     buf->len += len;
 }
@@ -84,6 +89,8 @@ int build_unsigned_tx_with_locktime(
     }
 
     tx_buf_write_u32_le(out, nlocktime);
+
+    if (out->oom) return 0;
 
     if (txid_out32) {
         sha256_double(out->data, out->len, txid_out32);
@@ -211,5 +218,5 @@ int finalize_signed_tx(
     tx_buf_write_bytes(out, sig64, 64);
 
     tx_buf_write_bytes(out, unsigned_tx + unsigned_tx_len - 4, 4); /* nLockTime */
-    return 1;
+    return !out->oom;
 }

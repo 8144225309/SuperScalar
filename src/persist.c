@@ -278,12 +278,37 @@ int persist_open(persist_t *p, const char *path) {
     }
 
     /* Enable WAL mode for better concurrent performance */
-    sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    char *pragma_err = NULL;
+    rc = sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, &pragma_err);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "persist_open: PRAGMA journal_mode=WAL failed: %s\n",
+                pragma_err ? pragma_err : "unknown");
+        sqlite3_free(pragma_err);
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
     sqlite3_busy_timeout(p->db, 5000);
     /* FULL sync: WAL default NORMAL can lose data on OS crash */
-    sqlite3_exec(p->db, "PRAGMA synchronous=FULL;", NULL, NULL, NULL);
+    rc = sqlite3_exec(p->db, "PRAGMA synchronous=FULL;", NULL, NULL, &pragma_err);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "persist_open: PRAGMA synchronous=FULL failed: %s\n",
+                pragma_err ? pragma_err : "unknown");
+        sqlite3_free(pragma_err);
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
     /* Enforce foreign key constraints */
-    sqlite3_exec(p->db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    rc = sqlite3_exec(p->db, "PRAGMA foreign_keys=ON;", NULL, NULL, &pragma_err);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "persist_open: PRAGMA foreign_keys=ON failed: %s\n",
+                pragma_err ? pragma_err : "unknown");
+        sqlite3_free(pragma_err);
+        sqlite3_close(p->db);
+        p->db = NULL;
+        return 0;
+    }
 
     /* Create schema_version table first (always safe, idempotent) */
     char *errmsg = NULL;
