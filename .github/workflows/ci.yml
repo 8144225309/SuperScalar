@@ -130,6 +130,12 @@ jobs:
                --output-file filtered.info --ignore-errors unused
           genhtml filtered.info --output-directory coverage_report/ \
                --ignore-errors unused
+      - name: Coverage summary
+        run: |
+          cd build
+          lcov --summary filtered.info 2>&1 | tee coverage-summary.txt
+          LINES=$(grep 'lines' coverage-summary.txt | grep -oP '[\d.]+%' | head -1)
+          echo "### Coverage: $LINES" >> $GITHUB_STEP_SUMMARY
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:

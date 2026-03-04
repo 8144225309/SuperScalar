@@ -540,6 +540,7 @@ The watchtower opens the database read-only (no write contention with the LSP) a
 | [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
 | [Deployment & Coordination](docs/deployment-coordination.md) | Operators + Users | Multi-machine deployment, Tor setup, Lightning bridge, factory lifecycle, monitoring, security checklist |
 | [Mainnet Audit](docs/mainnet-audit.md) | Developers | Internal security audit: 4 gaps identified, all 4 now fixed (BIP39, PBKDF2, atomic DB, shell-free exec) |
+| [Contributing](CONTRIBUTING.md) | Contributors | How to help: test on signet, report bugs, review code, submit patches |
 
 ---
 

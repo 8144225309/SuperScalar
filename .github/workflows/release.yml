@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    name: Linux x86_64 binaries
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: Build (Release)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      - name: Package binaries
+        run: |
+          mkdir -p superscalar-${{ github.ref_name }}-linux-x86_64
+          cp build/superscalar_lsp \
+             build/superscalar_client \
+             build/superscalar_bridge \
+             build/superscalar_watchtower \
+             superscalar-${{ github.ref_name }}-linux-x86_64/
+          cp README.md LICENSE CHANGELOG.md SECURITY.md \
+             superscalar-${{ github.ref_name }}-linux-x86_64/
+          tar czf superscalar-${{ github.ref_name }}-linux-x86_64.tar.gz \
+             superscalar-${{ github.ref_name }}-linux-x86_64/
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            superscalar-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    name: macOS binaries
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (Release)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      - name: Package binaries
+        run: |
+          mkdir -p superscalar-${{ github.ref_name }}-macos
+          cp build/superscalar_lsp \
+             build/superscalar_client \
+             build/superscalar_bridge \
+             build/superscalar_watchtower \
+             superscalar-${{ github.ref_name }}-macos/
+          cp README.md LICENSE CHANGELOG.md SECURITY.md \
+             superscalar-${{ github.ref_name }}-macos/
+          tar czf superscalar-${{ github.ref_name }}-macos.tar.gz \
+             superscalar-${{ github.ref_name }}-macos/
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            superscalar-${{ github.ref_name }}-macos.tar.gz
