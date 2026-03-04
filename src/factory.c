@@ -1679,9 +1679,8 @@ int factory_build_cooperative_close(
        nLockTime = current_height for BIP anti-fee-sniping. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    unsigned char display_txid[32];
+    unsigned char display_txid[32] = {0};
 
-    /* cppcheck-suppress legacyUninitvar ; display_txid only passed when txid_out32 != NULL */
     if (!build_unsigned_tx_with_locktime(&unsigned_tx,
                             txid_out32 ? display_txid : NULL,
                             f->funding_txid, f->funding_vout,
@@ -1828,10 +1827,9 @@ int factory_build_distribution_tx(
        nSequence = 0xFFFFFFFE to enable nLockTime. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    unsigned char display_txid[32];
+    unsigned char display_txid[32] = {0};
 
     if (!build_unsigned_tx_with_locktime(&unsigned_tx,
-                                          /* cppcheck-suppress legacyUninitvar */
                                           txid_out32 ? display_txid : NULL,
                                           f->funding_txid, f->funding_vout,
                                           0xFFFFFFFEu, nlocktime,

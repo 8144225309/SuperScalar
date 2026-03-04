@@ -1333,9 +1333,8 @@ int channel_build_cooperative_close_tx(
     /* 1. Build unsigned tx spending the channel funding UTXO */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    unsigned char display_txid[32];
+    unsigned char display_txid[32] = {0};
 
-    /* cppcheck-suppress legacyUninitvar ; display_txid only passed when txid_out32 != NULL */
     if (!build_unsigned_tx(&unsigned_tx, txid_out32 ? display_txid : NULL,
                             ch->funding_txid, ch->funding_vout,
                             0xFFFFFFFEu,
