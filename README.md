@@ -171,6 +171,8 @@ python3 tools/test_orchestrator.py --scenario all                # Run all scena
 
 A real-time monitoring dashboard for SuperScalar deployments. Stdlib-only Python3 (no pip install needed).
 
+![SuperScalar Dashboard](docs/dashboard-screenshot.png)
+
 ### Launch
 
 ```bash
