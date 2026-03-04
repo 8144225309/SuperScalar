@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 403 tests (361 unit + 42 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 411 tests (368 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -26,7 +26,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes) |
-| **Testing** | 361 unit + 42 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 368 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 

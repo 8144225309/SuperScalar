@@ -52,9 +52,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 361 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, property-based tests |
-| Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| **Total** | **403** | | |
+| Unit tests | 368 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, property-based tests |
+| Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
+| **Total** | **411** | | |
 
 ---
 
@@ -67,7 +67,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 361/361 passed`
+Expected output: `Results: 368/368 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
