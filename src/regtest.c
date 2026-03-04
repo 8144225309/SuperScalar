@@ -47,6 +47,8 @@ static int sanitize_rpc_param(const char *s) {
         case '.': case '_': case ':': case '/': case '-':
         case ' ': case ',': case '"': case '\'':
         case '[': case ']': case '{': case '}':
+        case '(': case ')': case '#': case '*':
+        case '@': case '~':
         case '+': case '=': continue;
         default: return 0;  /* rejected */
         }

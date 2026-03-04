@@ -1349,6 +1349,8 @@ static int test_sanitize(const char *s) {
         case '.': case '_': case ':': case '/': case '-':
         case ' ': case ',': case '"': case '\'':
         case '[': case ']': case '{': case '}':
+        case '(': case ')': case '#': case '*':
+        case '@': case '~':
         case '+': case '=': continue;
         default: return 0;
         }
@@ -1368,6 +1370,11 @@ int test_regtest_param_sanitization(void) {
     TEST_ASSERT(test_sanitize("/home/user/.bitcoin"), "path");
     TEST_ASSERT(test_sanitize("key=value"), "key-value");
     TEST_ASSERT(test_sanitize(NULL), "NULL param");
+    /* Descriptor chars used by getdescriptorinfo/deriveaddresses */
+    TEST_ASSERT(test_sanitize("rawtr(abcdef)#checksum"), "descriptor");
+    TEST_ASSERT(test_sanitize("user@host"), "at-sign");
+    TEST_ASSERT(test_sanitize("~/path"), "tilde path");
+    TEST_ASSERT(test_sanitize("file*"), "asterisk");
     return 1;
 }
 
@@ -1383,10 +1390,6 @@ int test_regtest_exec_rejects_metacharacters(void) {
     TEST_ASSERT(!test_sanitize("<input"), "input redirect");
     TEST_ASSERT(!test_sanitize("test\\escape"), "backslash");
     TEST_ASSERT(!test_sanitize("test!bang"), "exclamation");
-    TEST_ASSERT(!test_sanitize("test#comment"), "hash");
-    TEST_ASSERT(!test_sanitize("test~home"), "tilde");
-    TEST_ASSERT(!test_sanitize("test*glob"), "asterisk");
     TEST_ASSERT(!test_sanitize("test?wildcard"), "question mark");
-    TEST_ASSERT(!test_sanitize("test(paren)"), "parenthesis");
     return 1;
 }
