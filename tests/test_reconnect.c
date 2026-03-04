@@ -1926,7 +1926,7 @@ int test_turnover_extract_and_close(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, outputs, 5, 800000),
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, outputs, 5, 0),
                 "ladder_build_close");
     TEST_ASSERT(close_tx.len > 0, "close TX non-empty");
 

@@ -885,7 +885,7 @@ int test_regtest_intra_factory_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 800000)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1257,7 +1257,7 @@ int test_regtest_multi_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close, 800000)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -2112,7 +2112,7 @@ int test_regtest_lsp_restart_recovery(void) {
         tx_buf_init(&close_tx, 512);
 
         if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs,
-                                        n_total, 800000)) {
+                                        n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -2684,7 +2684,7 @@ int test_regtest_crash_double_recovery(void) {
         tx_buf_init(&close_tx, 512);
 
         if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs,
-                                        n_total, 800000)) {
+                                        n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
