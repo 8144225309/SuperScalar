@@ -3773,6 +3773,74 @@ int test_placement_outward(void) {
     return 1;
 }
 
+int test_placement_timezone_cluster(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
+
+    /* Client 1: tz=14, Client 2: tz=2, Client 3: tz=15, Client 4: tz=3 */
+    f.profiles[0].participant_idx = 0;
+    f.profiles[0].timezone_bucket = 0;
+    f.profiles[0].uptime_score = 1.0f;
+
+    f.profiles[1].participant_idx = 1;
+    f.profiles[1].timezone_bucket = 14;
+    f.profiles[1].uptime_score = 0.8f;
+
+    f.profiles[2].participant_idx = 2;
+    f.profiles[2].timezone_bucket = 2;
+    f.profiles[2].uptime_score = 0.9f;
+
+    f.profiles[3].participant_idx = 3;
+    f.profiles[3].timezone_bucket = 15;
+    f.profiles[3].uptime_score = 0.7f;
+
+    f.profiles[4].participant_idx = 4;
+    f.profiles[4].timezone_bucket = 3;
+    f.profiles[4].uptime_score = 0.6f;
+
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree timezone cluster");
+
+    /* Sorted by tz ascending: [2(tz2), 4(tz3), 1(tz14), 3(tz15)]
+       Left leaf gets [2,4] (low-tz), Right leaf gets [1,3] (high-tz) */
+
+    /* Left leaf (node 3): should have clients 2 and 4 */
+    int left_has_c2 = 0, left_has_c4 = 0;
+    for (size_t s = 0; s < f.nodes[3].n_signers; s++) {
+        if (f.nodes[3].signer_indices[s] == 2) left_has_c2 = 1;
+        if (f.nodes[3].signer_indices[s] == 4) left_has_c4 = 1;
+    }
+    TEST_ASSERT(left_has_c2 && left_has_c4, "timezone: low-tz clients at left leaf");
+
+    /* Right leaf (node 5): should have clients 1 and 3 */
+    int right_has_c1 = 0, right_has_c3 = 0;
+    for (size_t s = 0; s < f.nodes[5].n_signers; s++) {
+        if (f.nodes[5].signer_indices[s] == 1) right_has_c1 = 1;
+        if (f.nodes[5].signer_indices[s] == 3) right_has_c3 = 1;
+    }
+    TEST_ASSERT(right_has_c1 && right_has_c3, "timezone: high-tz clients at right leaf");
+
+    /* Verify tree still signs correctly */
+    TEST_ASSERT(factory_sign_all(&f), "timezone cluster tree signs");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 int test_economic_mode_validation(void) {
     /* Test that profit_share_bps are preserved and can be validated */
     factory_t f;

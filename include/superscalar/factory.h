@@ -28,6 +28,7 @@ typedef enum {
     PLACEMENT_SEQUENTIAL = 0,  /* current: [1,2,3,...,N] */
     PLACEMENT_INWARD     = 1,  /* highest balance closest to root (lower exit cost) */
     PLACEMENT_OUTWARD    = 2,  /* lowest uptime at leaves (reduces operator exposure) */
+    PLACEMENT_TIMEZONE_CLUSTER = 3,  /* group same-timezone clients on same leaf */
 } placement_mode_t;
 
 /* Economic fee distribution model */
