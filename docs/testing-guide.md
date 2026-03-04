@@ -52,10 +52,10 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 394 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
+| Unit tests | 415 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
 | Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
 | Orchestrator scenarios | 23 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation |
-| **Total** | **437** | | |
+| **Total** | **458** | | |
 
 ---
 
@@ -68,7 +68,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 394/394 passed`
+Expected output: `Results: 415/415 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript, factory trees, channels
@@ -256,6 +256,16 @@ sleep 3
 | Standalone Watchtower | 2 | Stale TX detection via watchtower entries, read-only DB access |
 | Factory Config | 2 | Custom runtime limits (max_signers, max_nodes, dust_limit), NULL config uses defaults |
 | Wire TLV Foundation | 3 | TLV encode/decode round-trip, truncated buffer rejection, HELLO/HELLO_ACK TLV negotiation |
+
+### Mainnet Hardening
+
+| Suite | Tests | What's Tested |
+|-------|-------|---------------|
+| Backup KDF v2 (PBKDF2) | 3 | v2 roundtrip (header, iteration count, decrypt), v1 backward compat rejection, wrong passphrase |
+| Mainnet Codepath | 2 | CLI prefix omits `-mainnet` flag for mainnet, scan depth 1000 for non-regtest networks |
+| BIP39 Mnemonic Support | 10 | 12-word and 24-word entropy roundtrip, validate good/bad checksum/bad word, seed derivation (TREZOR vectors), empty and non-empty passphrase, 0x7f entropy vector, generate, keyfile integration |
+| Shell-Free Execution | 2 | Shell metacharacters rejected by sanitizer, argv tokenization with quoted strings |
+| Connection Rate Limiting | 4 | Under-limit allows, over-limit rejects, sliding window expiry, concurrent handshake cap |
 
 ---
 

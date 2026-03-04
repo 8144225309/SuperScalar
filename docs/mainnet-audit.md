@@ -1,86 +1,96 @@
 # Mainnet Audit — Verified Gaps
 
-Post-v0.1.0 security audit. Each item verified against source code.
+Internal security audit. Each item verified against source code.
 
-**Test baseline:** 392 unit + 43 regtest = 435 total, all passing.
+**Test baseline:** 415 unit + 43 regtest = 458 total, all passing.
 
----
-
-## Critical (fund-loss risk)
-
-### 1. No HD Key Derivation
-
-**Status:** Real limitation
-
-Keys are random 32-byte secrets from `/dev/urandom` (`src/keyfile.c:113-145`).
-No BIP32/BIP39/BIP86 support. If the keyfile is lost, funds are lost.
-
-The encrypted backup system (`src/backup.c`) bundles the DB + keyfile into a
-passphrase-protected archive, which mitigates total loss but does not provide
-deterministic seed-phrase recovery.
-
-**Files:** `src/keyfile.c`, `include/superscalar/keyfile.h`
-
-### 2. Weak Passphrase KDF
-
-**Status:** Confirmed
-
-`keyfile.c:26-35` derives the encryption key via HKDF-Extract (single
-HMAC-SHA256) + HKDF-Expand. HKDF is designed for high-entropy key material,
-not low-entropy passwords. An attacker with a stolen encrypted keyfile could
-brute-force common passphrases at ~millions of attempts per second.
-
-Production fix: replace with Argon2id or scrypt for the passphrase-to-key step.
-
-**Files:** `src/keyfile.c:26-35`, `src/noise.c:22-49` (HKDF implementation)
-
-### 3. No Atomic DB Transactions Around State Updates
-
-**Status:** Confirmed
-
-`persist_begin()` and `persist_commit()` exist in `src/persist.c:390-410` but
-are **not used** in `src/lsp_channels.c` around the HTLC + balance update
-sequence. Example at `lsp_channels.c:710-729`:
-
-```
-persist_update_channel_balance(...)   // ← no BEGIN
-...
-persist_save_htlc(...)                // ← separate statement
-```
-
-If the process crashes between these two calls, the database has the new
-balance but the HTLC is missing, corrupting recovery state.
-
-Production fix: wrap all related `persist_*` calls in
-`persist_begin()`/`persist_commit()` blocks.
-
-**Files:** `src/lsp_channels.c:710-729`, `src/persist.c:390-410`
+**Status: All 4 gaps identified in the original audit are now fixed.**
 
 ---
 
-## Serious (operational risk)
+## Fixed: Critical (fund-loss risk)
 
-### 4. Shell Command Injection Surface
+### 1. No HD Key Derivation — FIXED
 
-**Status:** Confirmed (low risk in practice)
+**Original gap:** Keys were random 32-byte secrets from `/dev/urandom`. No BIP32/BIP39
+support. If the keyfile was lost, funds were lost.
 
-`regtest_exec()` at `src/regtest.c:130-142` constructs shell commands via
-`snprintf` and passes them to `popen()` without sanitizing parameters:
+**Fix:** Full BIP39 mnemonic support (`src/bip39.c`) and BIP32 HD key derivation
+(`src/hd_key.c`). Users can generate 12/24-word seed phrases and derive deterministic
+keys via `--generate-mnemonic` and `--from-mnemonic` flags. Derivation path:
+`m/1039'/0'/0'`. 10 tests including official TREZOR test vectors.
 
-```c
-snprintf(cmd, sizeof(cmd), "%s %s %s 2>&1", prefix, method, params);
-return run_command(cmd);  // popen()
-```
+**Files:** `src/bip39.c`, `include/superscalar/bip39.h`, `src/hd_key.c`,
+`tools/superscalar_lsp.c`, `tools/superscalar_client.c`
 
-Currently all callers pass internally-generated strings (txids, addresses,
-amounts), not user input. However, a malicious bitcoind RPC response containing
-shell metacharacters (`;`, `` ` ``, `$()`) in a txid or address field could
-inject commands.
+### 2. Weak Passphrase KDF — FIXED
 
-Production fix: use `execvp()` with argument array instead of `popen()` with
-string interpolation, or sanitize all params against `[^a-zA-Z0-9._-]`.
+**Original gap:** `keyfile.c` derived encryption keys via HKDF-Extract (single HMAC-SHA256).
+Backup files used the same single-pass HKDF. An attacker with a stolen encrypted file
+could brute-force passphrases at millions of attempts per second.
 
-**Files:** `src/regtest.c:130-142`, `src/regtest.c:37-56` (prefix builder)
+**Fix:** Keyfile encryption upgraded to PBKDF2-HMAC-SHA256 with 600,000 iterations
+(`src/keyfile.c`). Backup encryption upgraded from HKDF to PBKDF2-HMAC-SHA256 with
+600,000 iterations (`src/backup.c`). Backup format v2 (`SSBK0002`) auto-detected
+alongside v1 (`SSBK0001`) for backward compatibility.
+
+**Files:** `src/keyfile.c`, `src/backup.c`, `include/superscalar/backup.h`
+
+### 3. No Atomic DB Transactions Around State Updates — FIXED
+
+**Original gap:** `persist_begin()` and `persist_commit()` existed but were not used
+around HTLC + balance update sequences in `lsp_channels.c`. A crash between calls
+could corrupt recovery state.
+
+**Fix:** All multi-statement persist sequences wrapped in `persist_begin()`/`persist_commit()`
+blocks. Verified across `lsp_channels.c`, `lsp_bridge.c`, and `lsp_demo.c`.
+
+**Files:** `src/lsp_channels.c`, `src/lsp_bridge.c`, `src/lsp_demo.c`
+
+---
+
+## Fixed: Serious (operational risk)
+
+### 4. Shell Command Injection Surface — FIXED
+
+**Original gap:** `regtest_exec()` constructed shell commands via `snprintf` and passed
+them to `popen()`. A malicious bitcoind RPC response containing shell metacharacters
+could inject commands.
+
+**Fix:** On POSIX systems, `popen()` replaced with `fork()/pipe()/execvp()` which
+passes arguments directly to the kernel with no shell interpretation. Input sanitizer
+retained as defense-in-depth. Non-POSIX fallback to `popen()` with sanitizer.
+
+**Files:** `src/regtest.c`
+
+---
+
+## Additional Hardening (beyond original audit)
+
+These items were not in the original audit but were added as part of mainnet hardening:
+
+### 5. Connection Rate Limiting
+
+Per-IP sliding-window rate limiting with configurable concurrent handshake cap.
+Prevents connection flooding DoS attacks against the LSP.
+
+**Files:** `src/rate_limit.c`, `include/superscalar/rate_limit.h`, `src/lsp.c`
+
+### 6. BOLT #2 HTLC Capacity
+
+`MAX_HTLCS` increased from 32 to 483 (BOLT #2 standard). Dynamic array growth from
+`DEFAULT_HTLCS_CAP=64` prevents stack overflow. All 13 stack-allocated HTLC arrays
+across 5 files converted to heap allocations.
+
+**Files:** `include/superscalar/channel.h`, `src/channel.c`, `src/lsp_channels.c`,
+`src/lsp_demo.c`, `src/lsp_bridge.c`, `src/watchtower.c`
+
+### 7. Mainnet Codepath Coverage
+
+Unit tests added for `strcmp(network, "mainnet")` branches in CLI prefix building
+and scan depth configuration. These codepaths were previously untested in CI.
+
+**Files:** `tests/test_reconnect.c`
 
 ---
 
@@ -96,7 +106,7 @@ properly handled:
   `--lsp-pubkey` is provided. NN fallback prints explicit stderr warning.
   Clients choose their security posture.
 
-- **Satoshi overflow**: `channel_update()` at `channel.c:1391-1403` has proper
+- **Satoshi overflow**: `channel_update()` at `channel.c` has proper
   bounds checks before arithmetic. Coin selection amounts are bounded by
   Bitcoin's 21M BTC supply (~51 bits), well within uint64_t range.
 
