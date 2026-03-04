@@ -524,6 +524,7 @@ The watchtower opens the database read-only (no write contention with the LSP) a
 | [Demo Walkthrough](docs/demo-walkthrough.md) | Everyone | Step-by-step for every demo: automated (one-command), manual (subcommands), fully manual (individual binaries), test orchestrator |
 | [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
 | [Deployment & Coordination](docs/deployment-coordination.md) | Operators + Users | Multi-machine deployment, Tor setup, Lightning bridge, factory lifecycle, monitoring, security checklist |
+| [Mainnet Audit](docs/mainnet-audit.md) | Developers | Verified gaps between current state and mainnet-safe operation (4 items, 3 critical + 1 serious) |
 
 ---
 
