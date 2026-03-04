@@ -40,6 +40,13 @@ static int check_msg_error(const wire_msg_t *msg) {
     return 0;
 }
 
+/* Send MSG_ERROR to LSP before disconnecting (best-effort, ignores send failures) */
+static void client_send_error(int fd, const char *reason) {
+    cJSON *err = wire_build_error(reason ? reason : "client error");
+    wire_send(fd, MSG_ERROR, err);
+    cJSON_Delete(err);
+}
+
 /* Initialize a client-side channel from factory leaf outputs.
    Mirrors the LSP's lsp_channels_init logic.
    remote_*_bp: remote (LSP) basepoint pubkeys received via MSG_CHANNEL_BASEPOINTS.
@@ -988,6 +995,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     if (!factory_build_tree(&factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
+        client_send_error(fd, "factory_build_tree failed");
         factory_free(&factory);
         wire_close(fd);
         return 0;
@@ -996,6 +1004,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* Initialize signing sessions */
     if (!factory_sessions_init(&factory)) {
         fprintf(stderr, "Client: factory_sessions_init failed\n");
+        client_send_error(fd, "factory_sessions_init failed");
         factory_free(&factory);
         wire_close(fd);
         return 0;
@@ -1012,6 +1021,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!musig_nonce_pool_generate(ctx, &my_pool, my_node_count,
                                     my_seckey, &my_pubkey, NULL)) {
         fprintf(stderr, "Client: nonce pool generation failed\n");
+        client_send_error(fd, "nonce pool generation failed");
         memset(my_seckey, 0, 32);
         factory_free(&factory);
         wire_close(fd);
@@ -1025,6 +1035,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     if (my_node_count > 0 && !nonce_entries) {
         fprintf(stderr, "Client: alloc failed\n");
+        client_send_error(fd, "allocation failed");
         free(nonce_entries);
         factory_free(&factory);
         wire_close(fd);

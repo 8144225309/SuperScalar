@@ -12,6 +12,18 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
+/* Log MSG_ERROR from a client during ceremony. Returns 1 if msg was error. */
+static int check_client_error(const wire_msg_t *msg, size_t client_idx) {
+    if (msg->msg_type == MSG_ERROR) {
+        cJSON *m = msg->json ? cJSON_GetObjectItem(msg->json, "message") : NULL;
+        fprintf(stderr, "LSP: client %zu sent error: %s\n",
+                client_idx,
+                (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+        return 1;
+    }
+    return 0;
+}
+
 int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
              const secp256k1_keypair *keypair, int port,
              size_t expected_clients) {
@@ -334,8 +346,9 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
                 wire_msg_t msg;
                 if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_NONCE_BUNDLE) {
-                    fprintf(stderr, "LSP: expected NONCE_BUNDLE from client %zu, got 0x%02x\n",
-                            c, msg.msg_type);
+                    if (msg.json && !check_client_error(&msg, c))
+                        fprintf(stderr, "LSP: expected NONCE_BUNDLE from client %zu, got 0x%02x\n",
+                                c, msg.msg_type);
                     if (msg.json) cJSON_Delete(msg.json);
                     ceremony.clients[c] = CLIENT_ERROR;
                     continue;
@@ -463,7 +476,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
                 wire_msg_t msg;
                 if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_PSIG_BUNDLE) {
-                    fprintf(stderr, "LSP: expected PSIG_BUNDLE from client %zu\n", c);
+                    if (msg.json && !check_client_error(&msg, c))
+                        fprintf(stderr, "LSP: expected PSIG_BUNDLE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     psig_ceremony.clients[c] = CLIENT_ERROR;
                     continue;
@@ -636,7 +650,8 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
                 wire_msg_t msg;
                 if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_NONCE) {
-                    fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
+                    if (msg.json && !check_client_error(&msg, c))
+                        fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     close_nonce_cer.clients[c] = CLIENT_ERROR;
                     continue;
@@ -732,7 +747,8 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
                 wire_msg_t msg;
                 if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_PSIG) {
-                    fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);
+                    if (msg.json && !check_client_error(&msg, c))
+                        fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     close_psig_cer.clients[c] = CLIENT_ERROR;
                     continue;
