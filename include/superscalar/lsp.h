@@ -66,7 +66,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
    Returns 1 on success, fills close_tx_out with signed tx. */
 int lsp_run_cooperative_close(lsp_t *lsp,
                                tx_buf_t *close_tx_out,
-                               const tx_output_t *outputs, size_t n_outputs);
+                               const tx_output_t *outputs, size_t n_outputs,
+                               uint32_t current_height);
 
 /* Accept a bridge daemon connection (Phase 14).
    Expects MSG_BRIDGE_HELLO, sends MSG_BRIDGE_HELLO_ACK.

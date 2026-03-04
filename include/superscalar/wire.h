@@ -191,8 +191,9 @@ cJSON *wire_build_psig_bundle(const wire_bundle_entry_t *entries, size_t n);
 /* LSP → Client: FACTORY_READY {signed_txs: [{node_idx, tx_hex}...]} */
 cJSON *wire_build_factory_ready(const factory_t *f);
 
-/* LSP → Client: CLOSE_PROPOSE {outputs: [{amount, spk_hex}...]} */
-cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n);
+/* LSP → Client: CLOSE_PROPOSE {outputs: [{amount, spk_hex}...], current_height} */
+cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n,
+                                uint32_t current_height);
 
 /* Client → LSP: CLOSE_NONCE {pubnonce_hex} */
 cJSON *wire_build_close_nonce(const unsigned char *pubnonce66);

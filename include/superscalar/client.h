@@ -54,7 +54,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_pubkey *my_pubkey,
                                factory_t *factory,
                                size_t n_participants,
-                               const wire_msg_t *initial_msg);
+                               const wire_msg_t *initial_msg,
+                               uint32_t current_height);
 
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives

@@ -170,7 +170,8 @@ int ladder_can_close(const ladder_t *lad, uint32_t factory_id)
 
 int ladder_build_close(ladder_t *lad, uint32_t factory_id,
                        tx_buf_t *close_tx_out,
-                       const tx_output_t *outputs, size_t n_outputs)
+                       const tx_output_t *outputs, size_t n_outputs,
+                       uint32_t current_height)
 {
     ladder_factory_t *lf = ladder_get_by_id(lad, factory_id);
     if (!lf)
@@ -204,7 +205,8 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
            f->n_participants * sizeof(secp256k1_keypair));
 
     int ok = factory_build_cooperative_close(f, close_tx_out, NULL,
-                                              outputs, n_outputs);
+                                              outputs, n_outputs,
+                                              current_height);
 
     /* Restore original keypairs */
     memcpy(f->keypairs, saved_keypairs,

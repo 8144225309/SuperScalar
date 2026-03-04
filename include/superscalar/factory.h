@@ -281,22 +281,26 @@ int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
                            uint64_t l_stock_amount,
                            uint32_t epoch);
 
-/* Cooperative close: single tx bypassing the entire tree */
+/* Cooperative close: single tx bypassing the entire tree.
+   current_height = tip block height for nLockTime anti-fee-sniping (BIP). */
 int factory_build_cooperative_close(
     factory_t *f,
     tx_buf_t *close_tx_out,
     unsigned char *txid_out32,   /* can be NULL */
     const tx_output_t *outputs,
-    size_t n_outputs);
+    size_t n_outputs,
+    uint32_t current_height);
 
 /* Build unsigned cooperative close tx + compute its sighash.
-   Used for distributed signing: each party signs their partial sig separately. */
+   Used for distributed signing: each party signs their partial sig separately.
+   current_height = tip block height for nLockTime anti-fee-sniping (BIP). */
 int factory_build_cooperative_close_unsigned(
     factory_t *f,
     tx_buf_t *unsigned_tx_out,
     unsigned char *sighash_out32,
     const tx_output_t *outputs,
-    size_t n_outputs);
+    size_t n_outputs,
+    uint32_t current_height);
 
 /* Split-round signing API (multi-party orchestration) */
 

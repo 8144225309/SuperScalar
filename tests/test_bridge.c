@@ -1360,7 +1360,7 @@ int test_regtest_bridge_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 800000)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1836,7 +1836,7 @@ int test_regtest_bridge_invoice_flow(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total)) {
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 800000)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {

@@ -2658,7 +2658,8 @@ int main(int argc, char *argv[]) {
         tx_buf_t turnover_close_tx;
         tx_buf_init(&turnover_close_tx, 512);
         if (!ladder_build_close(lad, 0, &turnover_close_tx,
-                                  to_outputs, n_total)) {
+                                  to_outputs, n_total,
+                                  (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "TURNOVER TEST: ladder_build_close failed\n");
             tx_buf_free(&turnover_close_tx);
             lsp_cleanup(&lsp);
@@ -2823,7 +2824,8 @@ int main(int argc, char *argv[]) {
 
         tx_buf_t rot_close_tx;
         tx_buf_init(&rot_close_tx, 512);
-        if (!ladder_build_close(lad, 0, &rot_close_tx, rot_outputs, n_total)) {
+        if (!ladder_build_close(lad, 0, &rot_close_tx, rot_outputs, n_total,
+                                  (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "ROTATION: ladder_build_close failed\n");
             tx_buf_free(&rot_close_tx);
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
@@ -2972,7 +2974,8 @@ int main(int argc, char *argv[]) {
                                                              NULL, 0);
         tx_buf_t close2_tx;
         tx_buf_init(&close2_tx, 512);
-        if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2)) {
+        if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2,
+                                          (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "ROTATION: cooperative close of Factory 1 failed\n");
             tx_buf_free(&close2_tx); free(mgr2);
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
@@ -3088,7 +3091,8 @@ int main(int argc, char *argv[]) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
 
-    if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close_outputs)) {
+    if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close_outputs,
+                                      (uint32_t)regtest_get_block_height(&rt))) {
         fprintf(stderr, "LSP: cooperative close failed\n");
         tx_buf_free(&close_tx);
         lsp_cleanup(&lsp);

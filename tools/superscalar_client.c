@@ -596,7 +596,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         case MSG_CLOSE_PROPOSE:
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
             client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg);
+                                      factory, n_participants, &msg, 0);
             cJSON_Delete(msg.json);
             return 2;  /* close already handled */
 

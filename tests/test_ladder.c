@@ -274,7 +274,7 @@ int test_ladder_key_turnover_close(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &output, 1),
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &output, 1, 800000),
                 "build close");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
@@ -633,7 +633,7 @@ int test_regtest_ladder_ptlc_migration(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1),
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1, 800000),
                 "build close tx");
 
     char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
@@ -1495,7 +1495,7 @@ int test_ladder_partial_departure_blocks_close(void) {
     output.script_pubkey_len = 34;
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(!ladder_build_close(&lad, 0, &close_tx, &output, 1),
+    TEST_ASSERT(!ladder_build_close(&lad, 0, &close_tx, &output, 1, 800000),
                 "build_close fails with partial departure");
     tx_buf_free(&close_tx);
 
@@ -1791,7 +1791,7 @@ int test_ladder_full_rotation_cycle(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1),
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1, 800000),
                 "build close tx");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
@@ -2021,7 +2021,7 @@ int test_regtest_funding_double_spend_rejected(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                  &close_output, 1),
+                                                  &close_output, 1, 800000),
                 "build cooperative close");
 
     char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
