@@ -108,6 +108,7 @@ add_library(superscalar
     src/crypto_aead.c
     src/noise.c
     src/keyfile.c
+    src/hd_key.c
     src/jit_channel.c
     src/tor.c
     src/ceremony.c
@@ -149,6 +150,7 @@ add_executable(test_superscalar
     tests/test_ceremony.c
     tests/test_property.c
     tests/test_backup.c
+    tests/test_keyfile.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
