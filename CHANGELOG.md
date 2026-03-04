@@ -2,6 +2,35 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.1 — 2026-03-04
+
+### Security
+
+- **RBF on penalty transactions**: Penalty and HTLC timeout/success transactions now signal BIP125 Replace-By-Fee (`nSequence = 0xFFFFFFFD`) so fee bumps can be broadcast if the initial penalty is stuck in the mempool.
+- **Zero-sat output guards**: Penalty and HTLC sweep transactions bail out when the output amount falls below the 546-sat dust limit, preventing invalid transactions.
+- **CLTV cap vs factory timeout**: `lsp_validate_cltv_for_forward()` now rejects HTLCs whose `cltv_expiry` meets or exceeds the factory's own timeout — prevents funds from being trapped when the factory expires.
+- **Watchtower HTLC timeout auto-sweep**: New `WATCH_FORCE_CLOSE` entry type enables the watchtower to automatically broadcast HTLC timeout transactions once `cltv_expiry` is reached after a force close.
+- **Enforce `--db` on mainnet**: LSP and client binaries now refuse to start on mainnet without `--db`, preventing loss of revocation secrets on crash.
+
+### Added
+
+- Linux ARM64 (Raspberry Pi) prebuilt binaries in releases
+- Dashboard screenshot in README
+- Bitcoin donation address and Support section in README
+- Release workflow: manual dispatch via `workflow_dispatch` (re-trigger without recreating release)
+
+### Fixed
+
+- Release workflow: ARM64 builds via QEMU emulation (replaces flaky cross-compile)
+- Release workflow: `--clobber` flag for re-run asset replacement
+- FUNDING.yml: use HTTPS URL for GitHub Sponsor button rendering
+
+### Test Count
+
+415 unit + 43 regtest = 458 total (unchanged from 0.1.0).
+
+---
+
 ## 0.1.0 — 2026-03-04
 
 First tagged release. Ready for signet/testnet collaborative testing.

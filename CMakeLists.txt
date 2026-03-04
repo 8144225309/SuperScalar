@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 # rejects.  This silences the error without patching the vendored dep.
 # Ignored on CMake < 3.31 (variable simply doesn't exist yet).
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-project(superscalar VERSION 0.1.0 LANGUAGES C)
+project(superscalar VERSION 0.1.1 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

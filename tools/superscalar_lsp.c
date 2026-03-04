@@ -815,6 +815,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Mainnet requires --db for revocation secret persistence */
+    if (strcmp(network, "mainnet") == 0 && !db_path) {
+        fprintf(stderr,
+            "Error: mainnet requires --db for persistent state.\n"
+            "Without a database, revocation secrets are lost on crash\n"
+            "and breach penalties cannot be constructed.\n");
+        return 1;
+    }
+
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
                                : (is_regtest ? 3600 : 7200);

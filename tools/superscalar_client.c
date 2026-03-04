@@ -1554,6 +1554,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Mainnet requires --db for revocation secret persistence */
+    if (strcmp(network, "mainnet") == 0 && !db_path) {
+        fprintf(stderr,
+            "Error: mainnet requires --db for persistent state.\n"
+            "Without a database, revocation secrets are lost on crash\n"
+            "and breach penalties cannot be constructed.\n");
+        return 1;
+    }
+
     /* Tor SOCKS5 proxy setup */
     if (tor_proxy_arg) {
         char proxy_host[256];

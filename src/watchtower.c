@@ -531,6 +531,79 @@ int watchtower_check(watchtower_t *wt) {
         /* Don't increment i — check the swapped entry */
     }
 
+    /* Force-close HTLC timeout sweep: check if any expired HTLCs can be swept */
+    int current_height = regtest_get_block_height(wt->rt);
+    if (current_height > 0) {
+        for (size_t i = 0; i < wt->n_entries; i++) {
+            watchtower_entry_t *e = &wt->entries[i];
+            if (e->type != WATCH_FORCE_CLOSE || e->n_htlc_outputs == 0)
+                continue;
+
+            channel_t *ch = NULL;
+            if (e->channel_id < wt->channels_cap)
+                ch = wt->channels[e->channel_id];
+            if (!ch) continue;
+
+            for (size_t h = 0; h < e->n_htlc_outputs; ) {
+                watchtower_htlc_t *htlc = &e->htlc_outputs[h];
+                if ((uint32_t)current_height < htlc->cltv_expiry) {
+                    h++;
+                    continue;
+                }
+
+                /* CLTV expired — build and broadcast timeout tx */
+                size_t saved_n = ch->n_htlcs;
+                htlc_t saved_h0 = {0};
+                if (saved_n > 0) saved_h0 = ch->htlcs[0];
+                ch->n_htlcs = 1;
+                memset(&ch->htlcs[0], 0, sizeof(htlc_t));
+                ch->htlcs[0].direction = htlc->direction;
+                memcpy(ch->htlcs[0].payment_hash, htlc->payment_hash, 32);
+                ch->htlcs[0].cltv_expiry = htlc->cltv_expiry;
+                ch->htlcs[0].amount_sats = htlc->htlc_amount;
+                ch->htlcs[0].state = HTLC_STATE_ACTIVE;
+
+                tx_buf_t timeout_tx;
+                tx_buf_init(&timeout_tx, 512);
+                if (channel_build_htlc_timeout_tx(ch, &timeout_tx,
+                        e->txid, htlc->htlc_vout, htlc->htlc_amount,
+                        htlc->htlc_spk, 34, 0)) {
+                    char *tx_hex = (char *)malloc(timeout_tx.len * 2 + 1);
+                    if (tx_hex) {
+                        hex_encode(timeout_tx.data, timeout_tx.len, tx_hex);
+                        char txid[65];
+                        if (regtest_send_raw_tx(wt->rt, tx_hex, txid)) {
+                            printf("  HTLC timeout sweep (vout %u, cltv %u): %s\n",
+                                   htlc->htlc_vout, htlc->cltv_expiry, txid);
+                            penalties_broadcast++;
+                            if (wt->db && wt->db->db)
+                                persist_log_broadcast(wt->db, txid,
+                                                      "htlc_timeout", tx_hex, "ok");
+                        }
+                        free(tx_hex);
+                    }
+                }
+                tx_buf_free(&timeout_tx);
+
+                ch->n_htlcs = saved_n;
+                if (saved_n > 0) ch->htlcs[0] = saved_h0;
+
+                /* Remove swept HTLC (swap with last) */
+                e->htlc_outputs[h] = e->htlc_outputs[e->n_htlc_outputs - 1];
+                e->n_htlc_outputs--;
+            }
+
+            /* If all HTLCs swept, remove the force-close entry */
+            if (e->n_htlc_outputs == 0) {
+                free(e->htlc_outputs);
+                e->htlc_outputs = NULL;
+                wt->entries[i] = wt->entries[wt->n_entries - 1];
+                wt->n_entries--;
+                i--;  /* recheck swapped entry */
+            }
+        }
+    }
+
     /* CPFP bump loop: check pending penalty txs and bump if stuck */
     for (size_t i = 0; i < wt->n_pending; ) {
         watchtower_pending_t *p = &wt->pending[i];
@@ -783,6 +856,38 @@ void watchtower_cleanup(watchtower_t *wt) {
     wt->pending = NULL;
     wt->n_entries = 0;
     wt->n_pending = 0;
+}
+
+int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
+                                  const unsigned char *commitment_txid,
+                                  const watchtower_htlc_t *htlcs, size_t n_htlcs) {
+    if (!wt || !commitment_txid || n_htlcs == 0) return 0;
+
+    /* Grow entries if needed */
+    if (wt->n_entries >= wt->entries_cap) {
+        size_t new_cap = wt->entries_cap ? wt->entries_cap * 2 : 16;
+        watchtower_entry_t *tmp = realloc(wt->entries,
+                                            new_cap * sizeof(watchtower_entry_t));
+        if (!tmp) return 0;
+        wt->entries = tmp;
+        wt->entries_cap = new_cap;
+    }
+
+    watchtower_entry_t *e = &wt->entries[wt->n_entries];
+    memset(e, 0, sizeof(*e));
+    e->type = WATCH_FORCE_CLOSE;
+    e->channel_id = channel_id;
+    memcpy(e->txid, commitment_txid, 32);
+
+    /* Copy HTLC outputs */
+    e->htlc_outputs = malloc(n_htlcs * sizeof(watchtower_htlc_t));
+    if (!e->htlc_outputs) return 0;
+    memcpy(e->htlc_outputs, htlcs, n_htlcs * sizeof(watchtower_htlc_t));
+    e->n_htlc_outputs = n_htlcs;
+    e->htlc_outputs_cap = n_htlcs;
+
+    wt->n_entries++;
+    return 1;
 }
 
 void watchtower_clear_entries(watchtower_t *wt) {

@@ -600,7 +600,7 @@ int test_channel_penalty_tx(void) {
                 "parse to-local output key");
 
     /* Build an unsigned version of the penalty tx to compute its sighash.
-       The penalty tx input spends local_txid:0 with nSequence=0xFFFFFFFE */
+       The penalty tx input spends local_txid:0 with nSequence=0xFFFFFFFD (RBF) */
     /* Penalty output amount = to_local_amount - computed fee
        Default fee_rate_sat_per_kvb=1000, penalty vsize=152 vB */
     uint64_t penalty_fee = (remote_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
@@ -628,13 +628,13 @@ int test_channel_penalty_tx(void) {
     tx_buf_t penalty_unsigned;
     tx_buf_init(&penalty_unsigned, 256);
     build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 0,
-                       0xFFFFFFFE, &penalty_output, 1);
+                       0xFFFFFFFD, &penalty_output, 1);
 
     unsigned char penalty_sighash[32];
     TEST_ASSERT(compute_taproot_sighash(penalty_sighash,
                                           penalty_unsigned.data, penalty_unsigned.len,
                                           0, to_local_spk, 34,
-                                          to_local_amount, 0xFFFFFFFE),
+                                          to_local_amount, 0xFFFFFFFD),
                 "compute penalty sighash");
 
     /* Extract sig: in the signed tx, witness starts after the inputs+outputs section.
@@ -1805,13 +1805,13 @@ int test_htlc_penalty(void) {
     tx_buf_t penalty_unsigned;
     tx_buf_init(&penalty_unsigned, 256);
     build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 2,
-                       0xFFFFFFFE, &penalty_output, 1);
+                       0xFFFFFFFD, &penalty_output, 1);
 
     unsigned char penalty_sighash[32];
     TEST_ASSERT(compute_taproot_sighash(penalty_sighash,
                                           penalty_unsigned.data, penalty_unsigned.len,
                                           0, htlc_spk, 34,
-                                          htlc_amount, 0xFFFFFFFE),
+                                          htlc_amount, 0xFFFFFFFD),
                 "compute penalty sighash");
 
     /* Extract sig from witness */
