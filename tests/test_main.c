@@ -602,6 +602,25 @@ extern int test_tlv_encode_decode(void);
 extern int test_tlv_decode_truncated(void);
 extern int test_wire_hello_tlv_negotiation(void);
 
+/* Mainnet Audit: Atomic DB Transactions */
+extern int test_persist_transaction_commit(void);
+extern int test_persist_transaction_rollback(void);
+
+/* Mainnet Audit: Shell Injection Fix */
+extern int test_regtest_param_sanitization(void);
+extern int test_regtest_exec_rejects_metacharacters(void);
+
+/* Mainnet Audit: Password-Hardened KDF */
+extern int test_keyfile_v2_roundtrip(void);
+extern int test_keyfile_v1_compat(void);
+extern int test_keyfile_wrong_passphrase_v2(void);
+
+/* Mainnet Audit: HD Key Derivation */
+extern int test_hd_master_from_seed(void);
+extern int test_hd_derive_child(void);
+extern int test_hd_derive_path(void);
+extern int test_keyfile_from_seed(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -1141,6 +1160,25 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tlv_encode_decode);
     RUN_TEST(test_tlv_decode_truncated);
     RUN_TEST(test_wire_hello_tlv_negotiation);
+
+    printf("\n=== Mainnet Audit: Atomic DB Transactions ===\n");
+    RUN_TEST(test_persist_transaction_commit);
+    RUN_TEST(test_persist_transaction_rollback);
+
+    printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
+    RUN_TEST(test_regtest_param_sanitization);
+    RUN_TEST(test_regtest_exec_rejects_metacharacters);
+
+    printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
+    RUN_TEST(test_keyfile_v2_roundtrip);
+    RUN_TEST(test_keyfile_v1_compat);
+    RUN_TEST(test_keyfile_wrong_passphrase_v2);
+
+    printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
+    RUN_TEST(test_hd_master_from_seed);
+    RUN_TEST(test_hd_derive_child);
+    RUN_TEST(test_hd_derive_path);
+    RUN_TEST(test_keyfile_from_seed);
 }
 
 extern int regtest_init_faucet(void);

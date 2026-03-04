@@ -1910,3 +1910,124 @@ int test_persist_htlc_bidirectional(void) {
     unlink(path);
     return 1;
 }
+
+/* ---- Test: Transaction commit — multi-statement atomic persistence ---- */
+
+int test_persist_transaction_commit(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey pk_local, pk_remote;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk_local, seckeys[0])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk_remote, seckeys[1])) return 0;
+
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xDD;
+    unsigned char fake_spk[34];
+    memset(fake_spk, 0xAA, 34);
+
+    /* Create channel with initial state */
+    channel_t ch;
+    TEST_ASSERT(channel_init(&ch, ctx, seckeys[0], &pk_local, &pk_remote,
+                              fake_txid, 1, 100000, fake_spk, 34,
+                              50000, 50000, 144), "channel_init");
+    TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "save channel");
+
+    /* Begin transaction, update balance + save HTLC, commit */
+    TEST_ASSERT(persist_begin(&db), "begin txn");
+    TEST_ASSERT(persist_in_transaction(&db), "in txn");
+
+    TEST_ASSERT(persist_update_channel_balance(&db, 0, 40000, 60000, 1),
+                "update balance in txn");
+
+    htlc_t h = {0};
+    h.id = 5;
+    h.direction = HTLC_OFFERED;
+    h.state = HTLC_STATE_ACTIVE;
+    h.amount_sats = 10000;
+    memset(h.payment_hash, 0xAB, 32);
+    h.cltv_expiry = 500;
+    TEST_ASSERT(persist_save_htlc(&db, 0, &h), "save htlc in txn");
+
+    TEST_ASSERT(persist_commit(&db), "commit txn");
+    TEST_ASSERT(!persist_in_transaction(&db), "not in txn after commit");
+
+    /* Verify both operations persisted */
+    uint64_t local, remote, commit;
+    TEST_ASSERT(persist_load_channel_state(&db, 0, &local, &remote, &commit),
+                "load after commit");
+    TEST_ASSERT_EQ(local, 40000, "local after commit");
+    TEST_ASSERT_EQ(remote, 60000, "remote after commit");
+    TEST_ASSERT_EQ(commit, 1, "commit_number after commit");
+
+    htlc_t loaded[16];
+    size_t count = persist_load_htlcs(&db, 0, loaded, 16);
+    TEST_ASSERT_EQ(count, 1, "htlc count after commit");
+    TEST_ASSERT_EQ(loaded[0].id, 5, "htlc id after commit");
+    TEST_ASSERT_EQ(loaded[0].amount_sats, 10000, "htlc amount after commit");
+
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: Transaction rollback — multi-statement atomic rollback ---- */
+
+int test_persist_transaction_rollback(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey pk_local, pk_remote;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk_local, seckeys[0])) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk_remote, seckeys[1])) return 0;
+
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xDD;
+    unsigned char fake_spk[34];
+    memset(fake_spk, 0xAA, 34);
+
+    /* Create channel with initial state */
+    channel_t ch;
+    TEST_ASSERT(channel_init(&ch, ctx, seckeys[0], &pk_local, &pk_remote,
+                              fake_txid, 1, 100000, fake_spk, 34,
+                              50000, 50000, 144), "channel_init");
+    TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "save channel");
+
+    /* Begin transaction, update balance + save HTLC, then ROLLBACK */
+    TEST_ASSERT(persist_begin(&db), "begin txn");
+
+    TEST_ASSERT(persist_update_channel_balance(&db, 0, 30000, 70000, 2),
+                "update balance in txn");
+
+    htlc_t h = {0};
+    h.id = 9;
+    h.direction = HTLC_RECEIVED;
+    h.state = HTLC_STATE_ACTIVE;
+    h.amount_sats = 20000;
+    memset(h.payment_hash, 0xCD, 32);
+    h.cltv_expiry = 600;
+    TEST_ASSERT(persist_save_htlc(&db, 0, &h), "save htlc in txn");
+
+    TEST_ASSERT(persist_rollback(&db), "rollback txn");
+    TEST_ASSERT(!persist_in_transaction(&db), "not in txn after rollback");
+
+    /* Verify original state preserved (balance unchanged, no HTLC) */
+    uint64_t local, remote, commit;
+    TEST_ASSERT(persist_load_channel_state(&db, 0, &local, &remote, &commit),
+                "load after rollback");
+    TEST_ASSERT_EQ(local, 50000, "local after rollback (original)");
+    TEST_ASSERT_EQ(remote, 50000, "remote after rollback (original)");
+    TEST_ASSERT_EQ(commit, 0, "commit_number after rollback (original)");
+
+    htlc_t loaded[16];
+    size_t count = persist_load_htlcs(&db, 0, loaded, 16);
+    TEST_ASSERT_EQ(count, 0, "no htlcs after rollback");
+
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
+    persist_close(&db);
+    return 1;
+}
