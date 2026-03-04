@@ -61,15 +61,23 @@ You need at least the factory funding amount plus ~5,000 sats for fees.
 The LSP needs a persistent 32-byte secret key. This key identifies the LSP and is used for MuSig2 signing and channel operations.
 
 ```bash
-# Option A: random key (save this!)
+# Option A: BIP39 mnemonic (recommended — write down the 24 words)
+./superscalar_lsp --generate-mnemonic --keyfile lsp.key --passphrase "your passphrase"
+# Prints 24 words. Write them down. Key derived via BIP32 m/1039'/0'/0'.
+
+# Option B: restore from existing mnemonic
+./superscalar_lsp --from-mnemonic "abandon abandon ... about" \
+  --keyfile lsp.key --passphrase "your passphrase"
+
+# Option C: random key (save this!)
 LSP_KEY=$(openssl rand -hex 32)
 echo "LSP_KEY=$LSP_KEY"
 
-# Option B: encrypted keyfile (prompted for passphrase on each startup)
+# Option D: encrypted keyfile without mnemonic
 ./superscalar_lsp --keyfile lsp.key --passphrase "your passphrase" ...
 ```
 
-**Keep your key safe.** If you lose it and have active factories, you'll need to wait for CLTV timeout to recover funds.
+**Keep your key safe.** With BIP39, you can recover from the 24 words. Without it, if the keyfile is lost and you have active factories, you'll need to wait for CLTV timeout to recover funds.
 
 ## 4. Start the LSP
 
@@ -175,6 +183,11 @@ Press **Ctrl+C**. The LSP will:
 | `--passphrase` | none | Keyfile decryption passphrase |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--tor-control` | none | Tor control port for hidden service creation |
+| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
+| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--mnemonic-passphrase` | "" | Optional BIP39 passphrase for seed derivation |
+| `--max-conn-rate` | 10 | Max inbound connections per minute per IP |
+| `--max-handshakes` | 4 | Max concurrent handshakes |
 | `--onion` | off | Create Tor hidden service on startup |
 
 ### JIT Channels
@@ -257,7 +270,7 @@ export SUPERSCALAR_BACKUP_PASSPHRASE="your-secure-passphrase"
 ./superscalar_lsp --restore /path/to/backup.bak
 ```
 
-Backup format: `[magic][version][salt][nonce][ciphertext][tag]` using HKDF-SHA256 key derivation and ChaCha20-Poly1305 AEAD encryption. The passphrase never touches disk.
+Backup format (v2): `[magic][version][salt][iterations][nonce][ciphertext][tag]` using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations) and ChaCha20-Poly1305 AEAD encryption. V1 backups (`SSBK0001`) are auto-detected and can still be decrypted. The passphrase never touches disk.
 
 Schedule regular backups in production. Keep backups on a separate machine.
 

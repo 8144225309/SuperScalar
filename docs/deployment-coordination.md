@@ -66,9 +66,9 @@ bitcoin-cli -signet -rpcuser=lsp_user -rpcpassword=lsp_pass \
   createwallet superscalar_lsp
 # Get address, send signet coins to it
 
-# 3. Generate LSP key
-LSP_KEY=$(openssl rand -hex 32)
-echo "SAVE THIS: $LSP_KEY"
+# 3. Generate LSP key (BIP39 mnemonic recommended)
+./superscalar_lsp --generate-mnemonic --keyfile lsp.key --passphrase "your passphrase"
+# Or random: LSP_KEY=$(openssl rand -hex 32)
 
 # 4. Start LSP (waiting for 2 clients)
 ./superscalar_lsp \
@@ -92,9 +92,9 @@ Each client needs:
 - Their own secret key
 
 ```bash
-# 1. Generate key
-MY_KEY=$(openssl rand -hex 32)
-echo "SAVE THIS: $MY_KEY"
+# 1. Generate key (BIP39 mnemonic recommended)
+./superscalar_client --generate-mnemonic --keyfile my.key --passphrase "my passphrase"
+# Or random: MY_KEY=$(openssl rand -hex 32)
 
 # 2. Connect (no local bitcoind needed for basic operation)
 ./superscalar_client \
@@ -292,7 +292,7 @@ sqlite3 -header -column lsp.db \
 - Use `--lsp-pubkey` for NK authentication (prevents MITM)
 - Use `--keyfile` instead of `--seckey` on the command line (avoids key in process list)
 - Set `--accept-timeout` to prevent indefinite blocking on slow clients
-- Use `iptables` rate limiting on port 9735 for DoS protection
+- Use built-in `--max-conn-rate` and `--max-handshakes` for DoS protection (plus `iptables` for defense-in-depth)
 
 ## Checklist
 

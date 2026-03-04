@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> 437 tests (394 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
+> 458 tests (415 unit + 43 regtest), 7-job CI, encrypted transport (Noise NK), SQLite persistence, signet/testnet/mainnet support.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -24,9 +24,9 @@ A Bitcoin channel factory protocol combining:
 | **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
 | **Wire Protocol** | Factory lifecycle, channel ops, HTLCs, PTLC rotation, JIT channels, bridge relay, reconnection |
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
-| **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles, encrypted backup/restore |
+| **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 392 unit + 43 regtest + 20 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 415 unit + 43 regtest + 23 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-437 tests (394 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+458 tests (415 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -447,6 +447,11 @@ superscalar_lsp [OPTIONS]
 | `--fee-bump-after` | N | 6 | Blocks before first RBF fee bump |
 | `--fee-bump-max` | N | 3 | Maximum fee bump attempts |
 | `--fee-bump-multiplier` | F | 1.5 | Fee rate multiplier per bump |
+| `--generate-mnemonic` | — | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
+| `--from-mnemonic` | WORDS | — | Derive keyfile from BIP39 mnemonic words |
+| `--mnemonic-passphrase` | PASS | "" | Optional BIP39 passphrase for seed derivation |
+| `--max-conn-rate` | N | 10 | Max inbound connections per minute per IP |
+| `--max-handshakes` | N | 4 | Max concurrent handshakes |
 | `--regtest` | — | off | Shorthand for --network regtest |
 | `--i-accept-the-risk` | — | off | Required for mainnet operation |
 | `--help` | — | — | Show help and exit |
@@ -477,6 +482,9 @@ superscalar_client [OPTIONS]
 | `--tor-proxy` | HOST:PORT | — | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--tor-only` | — | off | Refuse all non-.onion outbound connections |
 | `--auto-accept-jit` | — | off | Auto-accept JIT channel offers |
+| `--generate-mnemonic` | — | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
+| `--from-mnemonic` | WORDS | — | Derive keyfile from BIP39 mnemonic words |
+| `--mnemonic-passphrase` | PASS | "" | Optional BIP39 passphrase for seed derivation |
 
 ### superscalar_bridge
 
@@ -524,7 +532,7 @@ The watchtower opens the database read-only (no write contention with the LSP) a
 | [Demo Walkthrough](docs/demo-walkthrough.md) | Everyone | Step-by-step for every demo: automated (one-command), manual (subcommands), fully manual (individual binaries), test orchestrator |
 | [Testing Guide](docs/testing-guide.md) | Developers | Running tests, understanding each test suite, writing new tests, sanitizer builds, adversarial test explanations |
 | [Deployment & Coordination](docs/deployment-coordination.md) | Operators + Users | Multi-machine deployment, Tor setup, Lightning bridge, factory lifecycle, monitoring, security checklist |
-| [Mainnet Audit](docs/mainnet-audit.md) | Developers | Verified gaps between current state and mainnet-safe operation (4 items, 3 critical + 1 serious) |
+| [Mainnet Audit](docs/mainnet-audit.md) | Developers | Internal security audit: 4 gaps identified, all 4 now fixed (BIP39, PBKDF2, atomic DB, shell-free exec) |
 
 ---
 
@@ -661,9 +669,11 @@ CLN (lightningd)
 | `crypto_aead` | crypto_aead.c | AEAD encryption primitives |
 | `report` | report.c | JSON diagnostic report generation |
 | `ceremony` | ceremony.c | Factory creation ceremony: parallel client collection, timeout handling, quorum |
-| `backup` | backup.c | Encrypted backup/restore of DB + keyfile (HKDF-SHA256 + ChaCha20-Poly1305) |
+| `bip39` | bip39.c | BIP39 mnemonic generation, validation, entropy round-trip, PBKDF2-HMAC-SHA512 seed derivation |
+| `backup` | backup.c | Encrypted backup/restore of DB + keyfile (PBKDF2-HMAC-SHA256 600K iterations + ChaCha20-Poly1305), v1/v2 auto-detection |
 | `wire_tlv` | wire_tlv.c | TLV (Type-Length-Value) binary codec for BOLT-compatible wire protocol |
-| `regtest` | regtest.c | bitcoin-cli subprocess harness, UTXO coin selection, RBF fee bumping |
+| `rate_limit` | rate_limit.c | Per-IP sliding-window connection rate limiting with concurrent handshake cap |
+| `regtest` | regtest.c | bitcoin-cli subprocess harness (fork/execvp on POSIX, popen fallback), UTXO coin selection, RBF fee bumping |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
 ## Known Limitations

@@ -14,15 +14,23 @@ How to connect to a SuperScalar LSP and use your payment channel.
 Your secret key identifies you to the LSP and is used for signing. Keep it safe.
 
 ```bash
-# Generate a random key
+# Option A: BIP39 mnemonic (recommended — write down the 24 words)
+./superscalar_client --generate-mnemonic --keyfile my.key --passphrase "my passphrase"
+# Prints 24 words. Write them down on paper. Your key is derived from these words.
+
+# Option B: restore from existing mnemonic
+./superscalar_client --from-mnemonic "abandon abandon ... about" \
+  --keyfile my.key --passphrase "my passphrase"
+
+# Option C: random key (save this!)
 MY_KEY=$(openssl rand -hex 32)
 echo "Save this: $MY_KEY"
 
-# Or use an encrypted keyfile
+# Option D: encrypted keyfile without mnemonic
 ./superscalar_client --keyfile my.key --passphrase "my passphrase" ...
 ```
 
-If you lose your key, you lose access to your channel balance. The LSP cannot recover it for you — though your funds will eventually be recoverable via the CLTV timeout path.
+With BIP39, you can recover your key from the 24 words at any time. Without it, if you lose your key, you lose access to your channel balance. The LSP cannot recover it for you — though your funds will eventually be recoverable via the CLTV timeout path.
 
 ## 2. Connect to the LSP
 
@@ -189,6 +197,9 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--lsp-pubkey` | none | LSP static pubkey for NK authentication (33-byte hex) |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor connections |
 | `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
+| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--mnemonic-passphrase` | "" | Optional BIP39 passphrase for seed derivation |
 | `--send` | — | Send payment: `DEST:AMOUNT:PREIMAGE_HEX` (can repeat) |
 | `--recv` | — | Receive payment: `PREIMAGE_HEX` (can repeat) |
 | `--channels` | off | Expect channel phase (when LSP uses `--payments`) |
