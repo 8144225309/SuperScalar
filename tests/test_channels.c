@@ -1437,30 +1437,43 @@ int test_cltv_delta_enforcement(void) {
     uint32_t fwd;
 
     /* cltv_expiry below delta: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd, 0) == 0,
                 "cltv 30 should be rejected");
 
     /* cltv_expiry == delta: rejected (need strictly >) */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA, &fwd) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA, &fwd, 0) == 0,
                 "cltv == delta should be rejected");
 
     /* cltv_expiry == 0: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd, 0) == 0,
                 "cltv 0 should be rejected");
 
     /* cltv_expiry = delta + 1: passes, fwd = 1 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA + 1, &fwd) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA + 1, &fwd, 0) == 1,
                 "cltv delta+1 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)1, "fwd should be 1");
 
     /* cltv_expiry = 500: passes, fwd = 460 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0) == 1,
                 "cltv 500 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
 
     /* NULL fwd_cltv_out: just validates without writing */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL, 0) == 1,
                 "NULL out should still return 1");
+
+    /* cltv_expiry at factory timeout: rejected */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 1000) == 0,
+                "cltv at factory timeout should be rejected");
+
+    /* cltv_expiry past factory timeout: rejected */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1000) == 0,
+                "cltv past factory timeout should be rejected");
+
+    /* cltv_expiry below factory timeout: passes */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 1000) == 1,
+                "cltv below factory timeout should pass");
+    TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
 
     return 1;
 }

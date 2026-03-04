@@ -614,8 +614,12 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
 /* --- CLTV validation --- */
 
-int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out) {
+int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
+                                   uint32_t factory_cltv_timeout) {
     if (cltv_expiry <= FACTORY_CLTV_DELTA)
+        return 0;
+    /* Reject HTLCs that expire at or past factory timeout — funds would be trapped */
+    if (factory_cltv_timeout > 0 && cltv_expiry >= factory_cltv_timeout)
         return 0;
     if (fwd_cltv_out)
         *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA;
@@ -839,11 +843,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         mgr->accumulated_fees_sats += fee_sats;
     }
 
-    /* CLTV delta enforcement: subtract safety margin for factory close. */
+    /* CLTV delta enforcement: subtract safety margin for factory close.
+       Also reject HTLCs that expire at or past the factory timeout. */
     uint32_t fwd_cltv_expiry;
-    if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry)) {
-        fprintf(stderr, "LSP: cltv_expiry %u too low (need > %d)\n",
-                cltv_expiry, FACTORY_CLTV_DELTA);
+    if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
+                                        lsp->factory.cltv_timeout)) {
+        fprintf(stderr, "LSP: cltv_expiry %u rejected (delta %d, factory timeout %u)\n",
+                cltv_expiry, FACTORY_CLTV_DELTA, lsp->factory.cltv_timeout);
         free(old_dest_htlcs);
         return 0;
     }

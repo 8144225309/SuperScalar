@@ -15,8 +15,11 @@
 
 /* Validate and adjust cltv_expiry for HTLC forwarding through a factory channel.
    Returns 1 if cltv_expiry has enough room for the delta, 0 if too low.
+   Rejects HTLCs whose cltv_expiry >= factory_cltv_timeout (funds would be
+   trapped past factory expiry). Pass 0 for factory_cltv_timeout to skip check.
    On success, *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA. */
-int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out);
+int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
+                                   uint32_t factory_cltv_timeout);
 
 /* Per-client channel entry managed by the LSP */
 typedef struct {

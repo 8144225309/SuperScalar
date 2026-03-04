@@ -941,6 +941,13 @@ int channel_build_penalty_tx(const channel_t *ch,
     uint64_t deduction = penalty_fee + (has_anchor ? anchor_amount : 0);
     uint64_t penalty_amount = to_local_amount > deduction ? to_local_amount - deduction : 0;
 
+    /* Bail out if penalty output would be below dust — tx would be invalid */
+    if (penalty_amount < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Penalty: output %llu sats below dust limit, uneconomical to sweep\n",
+                (unsigned long long)penalty_amount);
+        return 0;
+    }
+
     tx_output_t outputs[2];
     size_t n_outputs = 1;
     build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
@@ -954,13 +961,13 @@ int channel_build_penalty_tx(const channel_t *ch,
         n_outputs = 2;
     }
 
-    /* 8. Build unsigned penalty tx */
+    /* 8. Build unsigned penalty tx (RBF-enabled via nSequence 0xFFFFFFFD) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char penalty_txid[32];
     if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
                             commitment_txid, to_local_vout,
-                            0xFFFFFFFE, outputs, n_outputs)) {
+                            0xFFFFFFFD, outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -969,7 +976,7 @@ int channel_build_penalty_tx(const channel_t *ch,
     unsigned char sighash[32];
     if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
                                   0, to_local_spk, to_local_spk_len,
-                                  to_local_amount, 0xFFFFFFFE)) {
+                                  to_local_amount, 0xFFFFFFFD)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1565,7 +1572,7 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
     if (h->direction == HTLC_RECEIVED) {
         nsequence = ch->to_self_delay;  /* CSV for broadcaster's claim */
     } else {
-        nsequence = 0xFFFFFFFE;  /* no CSV, but enable locktime */
+        nsequence = 0xFFFFFFFD;  /* no CSV, enable locktime + RBF */
     }
 
     /* Build destination output: P2TR(local_payment_basepoint) key-path-only */
@@ -1591,6 +1598,14 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
     uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
+
+    /* Bail out if output would be below dust — uneconomical to claim */
+    if (out_amount < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "HTLC success: output %llu sats below dust limit\n",
+                (unsigned long long)out_amount);
+        return 0;
+    }
+
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
     output.script_pubkey_len = 34;
@@ -1706,7 +1721,7 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
     if (h->direction == HTLC_OFFERED) {
         nsequence = ch->to_self_delay;  /* CSV for broadcaster's reclaim */
     } else {
-        nsequence = 0xFFFFFFFE;  /* no CSV, but enable locktime */
+        nsequence = 0xFFFFFFFD;  /* no CSV, enable locktime + RBF */
     }
 
     /* Build destination output */
@@ -1732,6 +1747,13 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
     uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
+
+    /* Bail out if output would be below dust — uneconomical to claim */
+    if (out_amount < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "HTLC timeout: output %llu sats below dust limit\n",
+                (unsigned long long)out_amount);
+        return 0;
+    }
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
     output.script_pubkey_len = 34;
@@ -1949,6 +1971,13 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     uint64_t deduction = htlc_penalty_fee + (has_anchor ? anchor_amount : 0);
     uint64_t penalty_amount = htlc_amount > deduction ? htlc_amount - deduction : 0;
 
+    /* Bail out if penalty output would be below dust */
+    if (penalty_amount < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "HTLC penalty: output %llu sats below dust limit, uneconomical\n",
+                (unsigned long long)penalty_amount);
+        return 0;
+    }
+
     tx_output_t outputs[2];
     size_t n_outputs = 1;
     build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
@@ -1962,13 +1991,13 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
         n_outputs = 2;
     }
 
-    /* 7. Build unsigned penalty tx */
+    /* 7. Build unsigned penalty tx (RBF-enabled via nSequence 0xFFFFFFFD) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char penalty_txid[32];
     if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
                             commitment_txid, htlc_vout,
-                            0xFFFFFFFE, outputs, n_outputs)) {
+                            0xFFFFFFFD, outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1977,7 +2006,7 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     unsigned char sighash[32];
     if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
                                   0, htlc_spk, htlc_spk_len,
-                                  htlc_amount, 0xFFFFFFFE)) {
+                                  htlc_amount, 0xFFFFFFFD)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }

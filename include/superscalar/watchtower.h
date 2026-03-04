@@ -11,7 +11,8 @@
 
 typedef enum {
     WATCH_COMMITMENT,      /* Channel commitment breach — build penalty tx */
-    WATCH_FACTORY_NODE     /* Factory state breach — broadcast latest state tx */
+    WATCH_FACTORY_NODE,    /* Factory state breach — broadcast latest state tx */
+    WATCH_FORCE_CLOSE      /* Force-close: sweep expired HTLC timeout outputs */
 } watchtower_entry_type_t;
 
 typedef struct watchtower_htlc {
@@ -123,6 +124,16 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     size_t response_tx_len,
                                     const unsigned char *burn_tx,
                                     size_t burn_tx_len);
+
+/* Register a force-closed commitment for HTLC timeout sweeping.
+   After a legitimate force-close (not breach), HTLCs need to be swept
+   via timeout txs once their CLTV expires. The watchtower monitors
+   block height and auto-broadcasts timeout txs.
+   commitment_txid: the on-chain commitment tx (internal byte order).
+   htlcs/n_htlcs: pending HTLCs on the commitment. */
+int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
+                                  const unsigned char *commitment_txid,
+                                  const watchtower_htlc_t *htlcs, size_t n_htlcs);
 
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
