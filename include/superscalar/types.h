@@ -18,6 +18,7 @@ typedef struct {
     unsigned char *data;
     size_t len;
     size_t cap;
+    int oom;  /* sticky flag: set on allocation failure */
 } tx_buf_t;
 
 void tx_buf_init(tx_buf_t *buf, size_t initial_cap);

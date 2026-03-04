@@ -551,6 +551,10 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
                 if (left_n > nc) left_n = nc;
                 right_n = nc - left_n;
             }
+            if (sp + 2 > 128) {
+                fprintf(stderr, "simulate_tree: stack overflow (sp=%d)\n", sp);
+                break;
+            }
             stack[sp++] = (typeof(stack[0])){left_n, d + 1};
             stack[sp++] = (typeof(stack[0])){right_n, d + 1};
         }
@@ -581,6 +585,10 @@ void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
                          const unsigned char *spk, size_t spk_len) {
+    if (spk_len > sizeof(f->funding_spk)) {
+        fprintf(stderr, "factory_set_funding: spk_len %zu exceeds buffer\n", spk_len);
+        return;
+    }
     memcpy(f->funding_txid, txid, 32);
     f->funding_vout = vout;
     f->funding_amount_sats = amount_sats;

@@ -15,7 +15,8 @@ void secure_zero(void *ptr, size_t len) {
 
 void tx_buf_init(tx_buf_t *buf, size_t initial_cap) {
     buf->data = (unsigned char *)malloc(initial_cap);
-    if (!buf->data) { buf->len = 0; buf->cap = 0; return; }
+    buf->oom = 0;
+    if (!buf->data) { buf->len = 0; buf->cap = 0; buf->oom = 1; return; }
     buf->len = 0;
     buf->cap = initial_cap;
 }
@@ -25,19 +26,22 @@ void tx_buf_free(tx_buf_t *buf) {
     buf->data = NULL;
     buf->len = 0;
     buf->cap = 0;
+    buf->oom = 0;
 }
 
 void tx_buf_reset(tx_buf_t *buf) {
     buf->len = 0;
+    buf->oom = 0;
 }
 
 void tx_buf_ensure(tx_buf_t *buf, size_t additional) {
+    if (buf->oom) return;
     if (buf->len + additional > buf->cap) {
         size_t new_cap = buf->cap * 2;
         if (new_cap < buf->len + additional)
             new_cap = buf->len + additional;
         unsigned char *new_data = (unsigned char *)realloc(buf->data, new_cap);
-        if (!new_data) return;
+        if (!new_data) { buf->oom = 1; return; }
         buf->data = new_data;
         buf->cap = new_cap;
     }

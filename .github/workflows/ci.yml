@@ -30,7 +30,7 @@ jobs:
         run: cmake --build build --parallel
       - name: Unit tests
         env:
-          ASAN_OPTIONS: detect_leaks=0
+          ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
