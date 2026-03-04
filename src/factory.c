@@ -19,6 +19,22 @@ static int cmp_balance_desc(const void *a, const void *b) {
     return 0;
 }
 
+/* Timezone cluster: group same-timezone clients, reliable clients first within group */
+static int cmp_timezone_cluster(const void *a, const void *b) {
+    uint32_t ia = *(const uint32_t *)a;
+    uint32_t ib = *(const uint32_t *)b;
+    uint8_t ta = g_sort_factory->profiles[ia].timezone_bucket;
+    uint8_t tb = g_sort_factory->profiles[ib].timezone_bucket;
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    /* Secondary: highest uptime first (descending) — reliable clients grouped first */
+    float ua = g_sort_factory->profiles[ia].uptime_score;
+    float ub = g_sort_factory->profiles[ib].uptime_score;
+    if (ua > ub) return -1;
+    if (ua < ub) return 1;
+    return 0;
+}
+
 /* Outward: lowest uptime first (ascending), then lowest contribution (ascending) */
 static int cmp_uptime_asc(const void *a, const void *b) {
     uint32_t ia = *(const uint32_t *)a;
@@ -423,6 +439,7 @@ int factory_init(factory_t *f, secp256k1_context *ctx,
     for (int i = 0; i < n_leaves; i++)
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
+    f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
     return 1;
 }
 
@@ -451,6 +468,7 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     for (int i = 0; i < n_leaves; i++)
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
+    f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -846,6 +864,10 @@ int factory_build_tree(factory_t *f) {
     } else if (f->placement_mode == PLACEMENT_OUTWARD && n_clients > 1) {
         g_sort_factory = f;
         qsort(clients, n_clients, sizeof(uint32_t), cmp_uptime_asc);
+        g_sort_factory = NULL;
+    } else if (f->placement_mode == PLACEMENT_TIMEZONE_CLUSTER && n_clients > 1) {
+        g_sort_factory = f;
+        qsort(clients, n_clients, sizeof(uint32_t), cmp_timezone_cluster);
         g_sort_factory = NULL;
     }
 

@@ -98,7 +98,7 @@ static void usage(const char *prog) {
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
-        "  --placement-mode M  Client placement: sequential, inward, outward (default: sequential)\n"
+        "  --placement-mode M  Client placement: sequential, inward, outward, timezone-cluster (default: timezone-cluster)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
         "  --settlement-interval N Blocks between profit settlements (default: 144)\n"
@@ -468,7 +468,7 @@ int main(int argc, char *argv[]) {
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
-    int placement_mode_arg = 0;      /* 0=sequential, 1=inward, 2=outward */
+    int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
@@ -627,7 +627,8 @@ int main(int argc, char *argv[]) {
             if (strcmp(argv[i], "sequential") == 0) placement_mode_arg = 0;
             else if (strcmp(argv[i], "inward") == 0) placement_mode_arg = 1;
             else if (strcmp(argv[i], "outward") == 0) placement_mode_arg = 2;
-            else { fprintf(stderr, "Error: unknown --placement-mode '%s' (options: sequential, inward, outward)\n", argv[i]); return 1; }
+            else if (strcmp(argv[i], "timezone-cluster") == 0) placement_mode_arg = 3;
+            else { fprintf(stderr, "Error: unknown --placement-mode '%s' (options: sequential, inward, outward, timezone-cluster)\n", argv[i]); return 1; }
         }
         else if (strcmp(argv[i], "--economic-mode") == 0 && i + 1 < argc) {
             i++;
