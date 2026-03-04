@@ -230,6 +230,16 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
                                        const factory_t *factory,
                                        size_t client_idx);
 
+/* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
+
+/* Cooperatively redistribute output amounts on an arity-2 leaf.
+   All 3 signers (LSP + 2 clients) must agree.  amounts[] must sum
+   to the current leaf output total; each amount >= 546 sats.
+   Performs a 2-round MuSig2 ceremony over the wire.
+   Returns 1 on success, 0 on failure. */
+int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                      int leaf_side, const uint64_t *amounts, size_t n_amounts);
+
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 
 /* Perform a full factory rotation: PTLC turnover → cooperative close →

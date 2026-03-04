@@ -1386,6 +1386,260 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     return 1;
 }
 
+/* Cooperatively redistribute output amounts on an arity-2 leaf (3-of-3).
+   LSP proposes new amounts; both clients agree via 2-round MuSig2 ceremony. */
+int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                      int leaf_side, const uint64_t *amounts, size_t n_amounts) {
+    factory_t *f = &lsp->factory;
+
+    /* Only for arity-2 (each leaf = 2 clients, 3-of-3 signing) */
+    if (f->leaf_arity != FACTORY_ARITY_2) {
+        fprintf(stderr, "LSP realloc: only supported for arity-2 leaves\n");
+        return 0;
+    }
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    if (node->n_signers != 3) {
+        fprintf(stderr, "LSP realloc: leaf node %zu has %zu signers, expected 3\n",
+                node_idx, node->n_signers);
+        return 0;
+    }
+
+    /* Get both client participant indices */
+    uint32_t clients[2];
+    size_t n_clients = factory_get_subtree_clients(f, (int)node_idx, clients, 2);
+    if (n_clients != 2) {
+        fprintf(stderr, "LSP realloc: expected 2 clients on leaf, got %zu\n", n_clients);
+        return 0;
+    }
+
+    /* Step 1: Advance DW counter + rebuild unsigned tx */
+    int rc = factory_advance_leaf_unsigned(f, leaf_side);
+    if (rc == 0) {
+        fprintf(stderr, "LSP realloc: leaf %d DW fully exhausted\n", leaf_side);
+        return 0;
+    }
+    if (rc == -1) {
+        printf("LSP realloc: leaf %d exhausted, root advanced — skipping realloc\n",
+               leaf_side);
+        return 1;
+    }
+
+    /* Step 2: Set new amounts */
+    if (!factory_set_leaf_amounts(f, leaf_side, amounts, n_amounts)) {
+        fprintf(stderr, "LSP realloc: set_leaf_amounts failed (bad amounts?)\n");
+        return 0;
+    }
+
+    /* Step 3: Init signing session for the leaf node */
+    if (!factory_session_init_node(f, node_idx)) {
+        fprintf(stderr, "LSP realloc: session init failed for node %zu\n", node_idx);
+        return 0;
+    }
+
+    /* Step 4: Generate LSP's nonce (participant 0) */
+    int lsp_slot = factory_find_signer_slot(f, node_idx, 0);
+    if (lsp_slot < 0) {
+        fprintf(stderr, "LSP realloc: LSP not signer on node %zu\n", node_idx);
+        return 0;
+    }
+
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+        return 0;
+
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
+                               lsp_seckey, &lsp->lsp_pubkey,
+                               &node->keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP realloc: nonce gen failed\n");
+        return 0;
+    }
+
+    if (!factory_session_set_nonce(f, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Step 5: Send REALLOC_PROPOSE to both clients */
+    unsigned char lsp_pubnonce_ser[66];
+    musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+    cJSON *propose = wire_build_leaf_realloc_propose(leaf_side, amounts, n_amounts,
+                                                      lsp_pubnonce_ser);
+    for (int ci = 0; ci < 2; ci++) {
+        /* client_fds indexed by client_idx - 1 (participant_idx 1-based) */
+        size_t fd_idx = (size_t)(clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_LEAF_REALLOC_PROPOSE, propose)) {
+            cJSON_Delete(propose);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+    }
+    cJSON_Delete(propose);
+
+    /* Step 6: Recv REALLOC_NONCE from both clients, set their nonces */
+    unsigned char all_pubnonces[3][66];
+    memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+
+    for (int ci = 0; ci < 2; ci++) {
+        size_t fd_idx = (size_t)(clients[ci] - 1);
+        wire_msg_t nonce_msg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &nonce_msg, 30) ||
+            nonce_msg.msg_type != MSG_LEAF_REALLOC_NONCE) {
+            fprintf(stderr, "LSP realloc: expected REALLOC_NONCE from client %u, got 0x%02x\n",
+                    clients[ci], nonce_msg.msg_type);
+            if (nonce_msg.json) cJSON_Delete(nonce_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+
+        unsigned char client_pn_ser[66];
+        if (!wire_parse_leaf_realloc_nonce(nonce_msg.json, client_pn_ser)) {
+            fprintf(stderr, "LSP realloc: failed to parse REALLOC_NONCE\n");
+            cJSON_Delete(nonce_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        cJSON_Delete(nonce_msg.json);
+
+        int client_slot = factory_find_signer_slot(f, node_idx, clients[ci]);
+        if (client_slot < 0) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+
+        secp256k1_musig_pubnonce client_pubnonce;
+        if (!musig_pubnonce_parse(lsp->ctx, &client_pubnonce, client_pn_ser)) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        if (!factory_session_set_nonce(f, node_idx, (size_t)client_slot, &client_pubnonce)) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        memcpy(all_pubnonces[client_slot], client_pn_ser, 66);
+    }
+
+    /* Step 7: Send REALLOC_ALL_NONCES to both clients */
+    cJSON *all_nonces = wire_build_leaf_realloc_all_nonces(
+        (const unsigned char (*)[66])all_pubnonces, node->n_signers);
+    for (int ci = 0; ci < 2; ci++) {
+        size_t fd_idx = (size_t)(clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_LEAF_REALLOC_ALL_NONCES, all_nonces)) {
+            cJSON_Delete(all_nonces);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+    }
+    cJSON_Delete(all_nonces);
+
+    /* Step 8: Finalize nonces */
+    if (!factory_session_finalize_node(f, node_idx)) {
+        fprintf(stderr, "LSP realloc: session finalize failed for node %zu\n", node_idx);
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Step 9: Create LSP's partial sig */
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    memset(lsp_seckey, 0, 32);
+
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
+                                    &node->signing_session)) {
+        fprintf(stderr, "LSP realloc: partial sig failed\n");
+        return 0;
+    }
+    if (!factory_session_set_partial_sig(f, node_idx, (size_t)lsp_slot, &lsp_psig))
+        return 0;
+
+    /* Step 10: Recv REALLOC_PSIG from both clients */
+    for (int ci = 0; ci < 2; ci++) {
+        size_t fd_idx = (size_t)(clients[ci] - 1);
+        wire_msg_t psig_msg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &psig_msg, 30) ||
+            psig_msg.msg_type != MSG_LEAF_REALLOC_PSIG) {
+            fprintf(stderr, "LSP realloc: expected REALLOC_PSIG from client %u, got 0x%02x\n",
+                    clients[ci], psig_msg.msg_type);
+            if (psig_msg.json) cJSON_Delete(psig_msg.json);
+            return 0;
+        }
+
+        unsigned char client_psig_ser[32];
+        if (!wire_parse_leaf_realloc_psig(psig_msg.json, client_psig_ser)) {
+            fprintf(stderr, "LSP realloc: failed to parse REALLOC_PSIG\n");
+            cJSON_Delete(psig_msg.json);
+            return 0;
+        }
+        cJSON_Delete(psig_msg.json);
+
+        int client_slot = factory_find_signer_slot(f, node_idx, clients[ci]);
+        if (client_slot < 0) return 0;
+
+        secp256k1_musig_partial_sig client_psig;
+        if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser))
+            return 0;
+        if (!factory_session_set_partial_sig(f, node_idx, (size_t)client_slot, &client_psig))
+            return 0;
+    }
+
+    /* Step 11: Aggregate + finalize */
+    if (!factory_session_complete_node(f, node_idx)) {
+        fprintf(stderr, "LSP realloc: session complete failed for node %zu\n", node_idx);
+        return 0;
+    }
+
+    /* Step 12: Update channel amounts in lsp_channel_entry_t */
+    for (int ci = 0; ci < 2; ci++) {
+        size_t fd_idx = (size_t)(clients[ci] - 1);
+        if (fd_idx < mgr->n_channels) {
+            lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
+            /* The leaf outputs map to: output 0 = channel A, output 1 = channel B,
+               output 2 = L-stock.  Update funding amount based on this client's output. */
+            entry->channel.funding_amount = amounts[ci] * 1000;  /* sats → msat */
+            /* Recalculate: LSP keeps the same fraction, client gets the rest */
+            entry->channel.local_amount = amounts[ci] * 1000 / 2;
+            entry->channel.remote_amount = amounts[ci] * 1000 - entry->channel.local_amount;
+        }
+    }
+
+    /* Step 13: Send REALLOC_DONE to both clients */
+    cJSON *done = wire_build_leaf_realloc_done(leaf_side, amounts, n_amounts);
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        wire_send(lsp->client_fds[i], MSG_LEAF_REALLOC_DONE, done);
+    cJSON_Delete(done);
+
+    /* Step 14: Persist per-leaf DW state */
+    if (mgr->persist) {
+        uint32_t leaf_states[8];
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
+        uint32_t layer_states[DW_MAX_LAYERS];
+        for (uint32_t i = 0; i < f->counter.n_layers; i++)
+            layer_states[i] = f->counter.layers[i].config.max_states;
+        persist_save_dw_counter_with_leaves(
+            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+            f->counter.n_layers, layer_states,
+            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+    }
+
+    printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
+    for (size_t i = 0; i < n_amounts; i++)
+        printf("%s%lu", i ? "," : "", (unsigned long)amounts[i]);
+    printf("]\n");
+
+    return 1;
+}
+
 /* Handle FULFILL_HTLC from a client (the payee reveals the preimage). */
 static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                  size_t client_idx, const cJSON *json) {
@@ -1668,6 +1922,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            (lsp_advance_leaf) uses recv_timeout_service_bridge() to read
            responses directly from the affected client. */
         printf("LSP: discarding stale LEAF_ADVANCE_PSIG from client %zu\n", client_idx);
+        return 1;
+
+    case MSG_LEAF_REALLOC_NONCE:
+    case MSG_LEAF_REALLOC_PSIG:
+        /* Stale realloc message outside of active ceremony — discard. */
+        printf("LSP: discarding stale LEAF_REALLOC msg 0x%02x from client %zu\n",
+               msg->msg_type, client_idx);
         return 1;
 
     case MSG_INVOICE_CREATED:

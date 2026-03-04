@@ -4666,3 +4666,158 @@ int test_factory_derive_scid(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- Leaf-Level Fund Reallocation tests (Upgrade 3) --- */
+
+int test_factory_set_leaf_amounts(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.placement_mode = PLACEMENT_SEQUENTIAL;
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Find left leaf (node 3 for arity-2 with 4 clients) */
+    size_t node_idx = f.leaf_node_indices[0];
+    factory_node_t *node = &f.nodes[node_idx];
+    size_t n_outs = node->n_outputs;
+    TEST_ASSERT(n_outs == 3, "arity-2 leaf has 3 outputs");
+
+    /* Compute current total */
+    uint64_t total = 0;
+    for (size_t i = 0; i < n_outs; i++)
+        total += node->outputs[i].amount_sats;
+
+    /* Set custom amounts: redistribute toward output 0 */
+    uint64_t new_amounts[3] = { total / 2, total / 4, total - total / 2 - total / 4 };
+    TEST_ASSERT(factory_set_leaf_amounts(&f, 0, new_amounts, 3),
+                "set_leaf_amounts valid");
+
+    /* Verify amounts are updated */
+    TEST_ASSERT_EQ((long)node->outputs[0].amount_sats, (long)new_amounts[0], "output[0] amount");
+    TEST_ASSERT_EQ((long)node->outputs[1].amount_sats, (long)new_amounts[1], "output[1] amount");
+    TEST_ASSERT_EQ((long)node->outputs[2].amount_sats, (long)new_amounts[2], "output[2] amount");
+
+    /* Sum must be conserved */
+    uint64_t check_total = 0;
+    for (size_t i = 0; i < n_outs; i++)
+        check_total += node->outputs[i].amount_sats;
+    TEST_ASSERT(check_total == total, "total conserved");
+
+    /* Wrong sum should fail */
+    uint64_t bad_amounts[3] = { total / 2, total / 4, total / 4 + 1 };
+    TEST_ASSERT(!factory_set_leaf_amounts(&f, 0, bad_amounts, 3),
+                "reject bad sum");
+
+    /* Below dust should fail */
+    uint64_t dust_amounts[3] = { 100, total - 200, 100 };
+    TEST_ASSERT(!factory_set_leaf_amounts(&f, 0, dust_amounts, 3),
+                "reject below dust");
+
+    /* Wrong count should fail */
+    uint64_t two_amounts[2] = { total / 2, total / 2 };
+    TEST_ASSERT(!factory_set_leaf_amounts(&f, 0, two_amounts, 2),
+                "reject wrong count");
+
+    /* Verify tree still signs correctly after amount change */
+    TEST_ASSERT(factory_sign_all(&f), "sign after set_leaf_amounts");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_leaf_realloc_signing(void) {
+    /* Full 3-signer flow: advance DW, set amounts, nonce exchange,
+       partial sig exchange, aggregate, verify signed tx */
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.placement_mode = PLACEMENT_SEQUENTIAL;
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "initial sign all");
+
+    /* Advance leaf 0 */
+    int rc = factory_advance_leaf_unsigned(&f, 0);
+    TEST_ASSERT(rc == 1, "advance leaf 0");
+
+    /* Set new amounts */
+    size_t node_idx = f.leaf_node_indices[0];
+    factory_node_t *node = &f.nodes[node_idx];
+    uint64_t total = 0;
+    for (size_t i = 0; i < node->n_outputs; i++)
+        total += node->outputs[i].amount_sats;
+
+    uint64_t new_amounts[3] = { total / 2, total / 3, total - total / 2 - total / 3 };
+    TEST_ASSERT(factory_set_leaf_amounts(&f, 0, new_amounts, 3), "set amounts");
+
+    /* Init signing session for this node */
+    TEST_ASSERT(factory_session_init_node(&f, node_idx), "session init");
+
+    /* Generate nonces for all 3 signers */
+    secp256k1_musig_secnonce secnonces[3];
+    for (size_t i = 0; i < node->n_signers; i++) {
+        uint32_t participant = node->signer_indices[i];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]), "get seckey");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]), "get pubkey");
+
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i], &pubnonce,
+                                           seckey, &pk, &node->keyagg.cache),
+                    "gen nonce");
+        TEST_ASSERT(factory_session_set_nonce(&f, node_idx, i, &pubnonce), "set nonce");
+        memset(seckey, 0, 32);
+    }
+
+    /* Finalize nonces */
+    TEST_ASSERT(factory_session_finalize_node(&f, node_idx), "finalize");
+
+    /* Create partial sigs for all 3 signers */
+    for (size_t i = 0; i < node->n_signers; i++) {
+        uint32_t participant = node->signer_indices[i];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[i],
+                                               &kps[participant],
+                                               &node->signing_session),
+                    "create psig");
+        TEST_ASSERT(factory_session_set_partial_sig(&f, node_idx, i, &psig), "set psig");
+    }
+
+    /* Aggregate */
+    TEST_ASSERT(factory_session_complete_node(&f, node_idx), "complete node");
+    TEST_ASSERT(node->is_signed, "node is signed");
+
+    /* Verify amounts are still correct */
+    TEST_ASSERT_EQ((long)node->outputs[0].amount_sats, (long)new_amounts[0], "final amt[0]");
+    TEST_ASSERT_EQ((long)node->outputs[1].amount_sats, (long)new_amounts[1], "final amt[1]");
+    TEST_ASSERT_EQ((long)node->outputs[2].amount_sats, (long)new_amounts[2], "final amt[2]");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

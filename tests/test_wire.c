@@ -1240,6 +1240,87 @@ int test_placement_profiles_wire_round_trip(void) {
     return 1;
 }
 
+/* --- Upgrade 3: Leaf Realloc wire round-trip --- */
+
+int test_wire_leaf_realloc(void) {
+    /* PROPOSE round-trip */
+    uint64_t amounts[3] = { 20000, 30000, 50000 };
+    unsigned char pubnonce[66];
+    memset(pubnonce, 0xAB, 66);
+
+    cJSON *propose = wire_build_leaf_realloc_propose(1, amounts, 3, pubnonce);
+    TEST_ASSERT(propose != NULL, "build realloc_propose");
+
+    int ls_out;
+    uint64_t amounts_out[8];
+    size_t n_out;
+    unsigned char pn_out[66];
+    TEST_ASSERT(wire_parse_leaf_realloc_propose(propose, &ls_out,
+                amounts_out, 8, &n_out, pn_out), "parse realloc_propose");
+    TEST_ASSERT_EQ(ls_out, 1, "leaf_side");
+    TEST_ASSERT_EQ((long)n_out, 3, "n_amounts");
+    TEST_ASSERT_EQ((long)amounts_out[0], 20000, "amount[0]");
+    TEST_ASSERT_EQ((long)amounts_out[1], 30000, "amount[1]");
+    TEST_ASSERT_EQ((long)amounts_out[2], 50000, "amount[2]");
+    TEST_ASSERT_MEM_EQ(pn_out, pubnonce, 66, "pubnonce round-trip");
+    cJSON_Delete(propose);
+
+    /* NONCE round-trip */
+    unsigned char nonce_in[66];
+    memset(nonce_in, 0xCD, 66);
+    cJSON *nonce = wire_build_leaf_realloc_nonce(nonce_in);
+    TEST_ASSERT(nonce != NULL, "build realloc_nonce");
+    unsigned char nonce_out[66];
+    TEST_ASSERT(wire_parse_leaf_realloc_nonce(nonce, nonce_out), "parse realloc_nonce");
+    TEST_ASSERT_MEM_EQ(nonce_out, nonce_in, 66, "nonce round-trip");
+    cJSON_Delete(nonce);
+
+    /* ALL_NONCES round-trip */
+    unsigned char pns[3][66];
+    memset(pns[0], 0x11, 66);
+    memset(pns[1], 0x22, 66);
+    memset(pns[2], 0x33, 66);
+    cJSON *all = wire_build_leaf_realloc_all_nonces(pns, 3);
+    TEST_ASSERT(all != NULL, "build realloc_all_nonces");
+    unsigned char pns_out[4][66];
+    size_t n_pns;
+    TEST_ASSERT(wire_parse_leaf_realloc_all_nonces(all, pns_out, 4, &n_pns),
+                "parse realloc_all_nonces");
+    TEST_ASSERT_EQ((long)n_pns, 3, "n_signers");
+    TEST_ASSERT_MEM_EQ(pns_out[0], pns[0], 66, "pubnonce[0]");
+    TEST_ASSERT_MEM_EQ(pns_out[1], pns[1], 66, "pubnonce[1]");
+    TEST_ASSERT_MEM_EQ(pns_out[2], pns[2], 66, "pubnonce[2]");
+    cJSON_Delete(all);
+
+    /* PSIG round-trip */
+    unsigned char psig_in[32];
+    memset(psig_in, 0xEE, 32);
+    cJSON *psig = wire_build_leaf_realloc_psig(psig_in);
+    TEST_ASSERT(psig != NULL, "build realloc_psig");
+    unsigned char psig_out[32];
+    TEST_ASSERT(wire_parse_leaf_realloc_psig(psig, psig_out), "parse realloc_psig");
+    TEST_ASSERT_MEM_EQ(psig_out, psig_in, 32, "psig round-trip");
+    cJSON_Delete(psig);
+
+    /* DONE round-trip */
+    uint64_t done_amounts[3] = { 25000, 25000, 50000 };
+    cJSON *done = wire_build_leaf_realloc_done(0, done_amounts, 3);
+    TEST_ASSERT(done != NULL, "build realloc_done");
+    int done_ls;
+    uint64_t done_amts[8];
+    size_t done_n;
+    TEST_ASSERT(wire_parse_leaf_realloc_done(done, &done_ls, done_amts, 8, &done_n),
+                "parse realloc_done");
+    TEST_ASSERT_EQ(done_ls, 0, "done leaf_side");
+    TEST_ASSERT_EQ((long)done_n, 3, "done n_amounts");
+    TEST_ASSERT_EQ((long)done_amts[0], 25000, "done amount[0]");
+    TEST_ASSERT_EQ((long)done_amts[1], 25000, "done amount[1]");
+    TEST_ASSERT_EQ((long)done_amts[2], 50000, "done amount[2]");
+    cJSON_Delete(done);
+
+    return 1;
+}
+
 /* --- 4B: SCID_ASSIGN wire round-trip --- */
 
 int test_wire_scid_assign(void) {
