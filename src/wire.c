@@ -621,7 +621,8 @@ cJSON *wire_build_factory_ready(const factory_t *f) {
     return j;
 }
 
-cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n) {
+cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n,
+                                uint32_t current_height) {
     cJSON *j = cJSON_CreateObject();
     cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < n; i++) {
@@ -632,6 +633,7 @@ cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n) {
         cJSON_AddItemToArray(arr, item);
     }
     cJSON_AddItemToObject(j, "outputs", arr);
+    cJSON_AddNumberToObject(j, "current_height", (double)current_height);
     return j;
 }
 

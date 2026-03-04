@@ -330,7 +330,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
         tx_buf_t rot_close_tx;
         tx_buf_init(&rot_close_tx, 512);
-        if (!ladder_build_close(lad, dying_id, &rot_close_tx, rot_outputs, n_close)) {
+        if (!ladder_build_close(lad, dying_id, &rot_close_tx, rot_outputs, n_close,
+                                  rt ? (uint32_t)regtest_get_block_height(rt) : 0)) {
             fprintf(stderr, "LSP rotate: ladder_build_close failed\n");
             tx_buf_free(&rot_close_tx);
             return 0;

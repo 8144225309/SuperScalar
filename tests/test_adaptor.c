@@ -448,7 +448,7 @@ int test_ptlc_factory_coop_close_after_turnover(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                  outputs, 1),
+                                                  outputs, 1, 800000),
                 "build coop close with extracted keys");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
@@ -637,7 +637,7 @@ int test_regtest_ptlc_turnover(void) {
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
     TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
-                                                  &close_output, 1),
+                                                  &close_output, 1, 800000),
                 "build coop close");
 
     /* Broadcast */

@@ -239,7 +239,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_pubkey *my_pubkey,
                                factory_t *factory,
                                size_t n_participants,
-                               const wire_msg_t *initial_msg) {
+                               const wire_msg_t *initial_msg,
+                               uint32_t current_height) {
     wire_msg_t msg;
     int got_propose = 0;
 
@@ -276,6 +277,12 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         if (!initial_msg) cJSON_Delete(msg.json);
         return 0;
     }
+
+    /* Extract nLockTime height from CLOSE_PROPOSE (anti-fee-sniping). */
+    cJSON *ht = cJSON_GetObjectItem(msg.json, "current_height");
+    uint32_t close_height = (ht && cJSON_IsNumber(ht))
+                            ? (uint32_t)ht->valuedouble : current_height;
+
     size_t n_outputs = (size_t)cJSON_GetArraySize(outputs_arr);
     if (n_outputs == 0 || n_outputs > 32) {
         fprintf(stderr, "Client: bad output count %zu\n", n_outputs);
@@ -310,7 +317,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
 
     if (!factory_build_cooperative_close_unsigned(factory, &close_unsigned,
                                                    close_sighash,
-                                                   close_outputs, n_outputs)) {
+                                                   close_outputs, n_outputs,
+                                                   close_height)) {
         fprintf(stderr, "Client: build close unsigned failed\n");
         tx_buf_free(&close_unsigned);
         free(close_outputs);
@@ -1363,7 +1371,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                    &factory, n_participants, NULL)) {
+                                    &factory, n_participants, NULL, 0)) {
         goto fail;
     }
 
@@ -1648,7 +1656,8 @@ int client_run_reconnect(secp256k1_context *ctx,
     if (cb_ret == 1) {
         /* Run close ceremony */
         int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                                  &factory, n_participants, NULL);
+                                                  &factory, n_participants,
+                                                  NULL, 0);
         factory_free(&factory);
         wire_close(fd);
         return close_ok;

@@ -1648,17 +1648,20 @@ int factory_build_cooperative_close(
     tx_buf_t *close_tx_out,
     unsigned char *txid_out32,
     const tx_output_t *outputs,
-    size_t n_outputs)
+    size_t n_outputs,
+    uint32_t current_height)
 {
-    /* 1. Build unsigned tx spending the funding UTXO */
+    /* 1. Build unsigned tx spending the funding UTXO.
+       nLockTime = current_height for BIP anti-fee-sniping. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char display_txid[32];
 
     /* cppcheck-suppress legacyUninitvar ; display_txid only passed when txid_out32 != NULL */
-    if (!build_unsigned_tx(&unsigned_tx, txid_out32 ? display_txid : NULL,
+    if (!build_unsigned_tx_with_locktime(&unsigned_tx,
+                            txid_out32 ? display_txid : NULL,
                             f->funding_txid, f->funding_vout,
-                            0xFFFFFFFEu,
+                            0xFFFFFFFEu, current_height,
                             outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
@@ -1703,12 +1706,13 @@ int factory_build_cooperative_close_unsigned(
     tx_buf_t *unsigned_tx_out,
     unsigned char *sighash_out32,
     const tx_output_t *outputs,
-    size_t n_outputs)
+    size_t n_outputs,
+    uint32_t current_height)
 {
     unsigned char display_txid[32];
-    if (!build_unsigned_tx(unsigned_tx_out, display_txid,
+    if (!build_unsigned_tx_with_locktime(unsigned_tx_out, display_txid,
                             f->funding_txid, f->funding_vout,
-                            0xFFFFFFFEu,
+                            0xFFFFFFFEu, current_height,
                             outputs, n_outputs))
         return 0;
 

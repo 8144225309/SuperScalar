@@ -78,7 +78,8 @@ int ladder_can_close(const ladder_t *lad, uint32_t factory_id);
    with extracted keys, then signs a cooperative close tx. */
 int ladder_build_close(ladder_t *lad, uint32_t factory_id,
                        tx_buf_t *close_tx_out,
-                       const tx_output_t *outputs, size_t n_outputs);
+                       const tx_output_t *outputs, size_t n_outputs,
+                       uint32_t current_height);
 
 /* Get client indices that completed PTLC key turnover (departed).
    Returns count written. */

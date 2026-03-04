@@ -516,7 +516,8 @@ fail:
 
 int lsp_run_cooperative_close(lsp_t *lsp,
                                tx_buf_t *close_tx_out,
-                               const tx_output_t *outputs, size_t n_outputs) {
+                               const tx_output_t *outputs, size_t n_outputs,
+                               uint32_t current_height) {
     factory_t *f = &lsp->factory;
     size_t n_total = 1 + lsp->n_clients;
     int clients_notified = 0;  /* set after CLOSE_PROPOSE sent */
@@ -527,7 +528,8 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     unsigned char sighash[32];
 
     if (!factory_build_cooperative_close_unsigned(f, &unsigned_tx, sighash,
-                                                   outputs, n_outputs)) {
+                                                   outputs, n_outputs,
+                                                   current_height)) {
         fprintf(stderr, "LSP: build close unsigned failed\n");
         tx_buf_free(&unsigned_tx);
         return 0;
@@ -558,7 +560,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     musig_session_set_pubnonce(&session, 0, &lsp_pubnonce);
 
     /* Send CLOSE_PROPOSE */
-    cJSON *propose = wire_build_close_propose(outputs, n_outputs);
+    cJSON *propose = wire_build_close_propose(outputs, n_outputs, current_height);
     for (size_t i = 0; i < lsp->n_clients; i++) {
         if (!wire_send(lsp->client_fds[i], MSG_CLOSE_PROPOSE, propose)) {
             fprintf(stderr, "LSP: failed to send CLOSE_PROPOSE\n");
