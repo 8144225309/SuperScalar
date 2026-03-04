@@ -411,3 +411,58 @@ int test_htlc_penalty_watch(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- Standalone Watchtower Tests (Mainnet Gap #3) --- */
+
+int test_watchtower_detect_stale_tx(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "persist_open");
+
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    wt.entries = (watchtower_entry_t *)calloc(4, sizeof(watchtower_entry_t));
+    wt.entries_cap = 4;
+    wt.n_entries = 0;
+    wt.db = &db;
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAB, 32);
+    unsigned char fake_spk[34];
+    memset(fake_spk, 0, 34);
+    fake_spk[0] = 0x51; fake_spk[1] = 0x20;
+
+    int ok = watchtower_watch(&wt, 0, 1, fake_txid, 0, 50000, fake_spk, 34);
+    TEST_ASSERT(ok == 1, "watchtower_watch should succeed");
+    TEST_ASSERT(wt.n_entries == 1, "should have 1 entry");
+    TEST_ASSERT(memcmp(wt.entries[0].txid, fake_txid, 32) == 0,
+                "stored txid should match");
+
+    free(wt.entries);
+    persist_close(&db);
+    return 1;
+}
+
+int test_persist_open_readonly(void) {
+    const char *path = "/tmp/test_readonly.sqlite";
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "persist_open");
+    persist_close(&db);
+
+    persist_t rodb;
+    TEST_ASSERT(persist_open_readonly(&rodb, path), "persist_open_readonly");
+
+    int ver = persist_schema_version(&rodb);
+    TEST_ASSERT(ver == PERSIST_SCHEMA_VERSION, "should read schema version");
+
+    char *errmsg = NULL;
+    int rc = sqlite3_exec(rodb.db,
+        "INSERT INTO factories (id, n_participants) VALUES (999, 2);",
+        NULL, NULL, &errmsg);
+    TEST_ASSERT(rc != SQLITE_OK, "write to readonly DB should fail");
+    if (errmsg) sqlite3_free(errmsg);
+
+    persist_close(&rodb);
+    remove(path);
+    return 1;
+}

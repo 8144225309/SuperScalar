@@ -4821,3 +4821,77 @@ int test_leaf_realloc_signing(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- Factory Config Tests (Mainnet Gap #6) --- */
+
+int test_factory_config_custom(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Generate 5 keypairs (LSP + 4 clients) */
+    secp256k1_keypair keypairs[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char seckey[32] = {0};
+        seckey[31] = (unsigned char)(i + 1);
+        seckey[0] = 0x42;
+        int kp_ok = secp256k1_keypair_create(ctx, &keypairs[i], seckey);
+        TEST_ASSERT(kp_ok, "keypair_create");
+    }
+
+    factory_config_t cfg;
+    factory_config_default(&cfg);
+    cfg.max_signers = 32;
+    cfg.max_nodes = 128;
+    cfg.dust_limit_sats = 1000;
+
+    factory_t f;
+    int ok = factory_init_with_config(&f, ctx, keypairs, 5, 10, 4, &cfg);
+    TEST_ASSERT(ok, "factory_init_with_config should succeed");
+
+    TEST_ASSERT(f.config.max_signers == 32, "config max_signers should be 32");
+    TEST_ASSERT(f.config.max_nodes == 128, "config max_nodes should be 128");
+    TEST_ASSERT(f.config.dust_limit_sats == 1000, "config dust_limit should be 1000");
+    TEST_ASSERT(f.n_participants == 5, "should have 5 participants");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_config_default(void) {
+    factory_config_t cfg;
+    factory_config_default(&cfg);
+
+    TEST_ASSERT(cfg.max_signers == FACTORY_MAX_SIGNERS,
+                "default max_signers should match #define");
+    TEST_ASSERT(cfg.max_nodes == FACTORY_MAX_NODES,
+                "default max_nodes should match #define");
+    TEST_ASSERT(cfg.max_leaves == FACTORY_MAX_LEAVES,
+                "default max_leaves should match #define");
+    TEST_ASSERT(cfg.max_outputs_per_node == FACTORY_MAX_OUTPUTS,
+                "default max_outputs should match #define");
+    TEST_ASSERT(cfg.dust_limit_sats == 546,
+                "default dust_limit should be 546");
+
+    /* factory_init with NULL config should use defaults */
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair keypairs[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char seckey[32] = {0};
+        seckey[31] = (unsigned char)(i + 1);
+        seckey[0] = 0x42;
+        int kp_ok = secp256k1_keypair_create(ctx, &keypairs[i], seckey);
+        TEST_ASSERT(kp_ok, "keypair_create");
+    }
+
+    factory_t f;
+    int ok = factory_init(&f, ctx, keypairs, 3, 10, 4);
+    TEST_ASSERT(ok, "factory_init should succeed");
+    TEST_ASSERT(f.config.max_signers == FACTORY_MAX_SIGNERS,
+                "NULL config should use defaults");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -207,6 +207,12 @@ Press **Ctrl+C**. The LSP will:
 | `--cltv-timeout` | auto | Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest) |
 | `--regtest` | off | Shorthand for `--network regtest` |
 | `--i-accept-the-risk` | off | Required for mainnet operation |
+| `--backup` | — | Create encrypted backup and exit (passphrase via `SUPERSCALAR_BACKUP_PASSPHRASE` env) |
+| `--restore` | — | Restore from encrypted backup and exit |
+| `--backup-verify` | — | Verify backup integrity and exit |
+| `--fee-bump-after` | 6 | Blocks before first RBF fee bump on funding TX |
+| `--fee-bump-max` | 3 | Maximum number of fee bump attempts |
+| `--fee-bump-multiplier` | 1.5 | Fee rate multiplier per bump |
 | `--help` | — | Show help and exit |
 
 ### Testing & Debug Flags
@@ -235,7 +241,27 @@ When `--cli` is enabled in daemon mode, the LSP reads commands from stdin:
 | `close` | Initiate cooperative close and shutdown |
 | `help` | Show available commands |
 
-## 6. Crash Recovery
+## 6. Backup & Restore
+
+Create encrypted backups of the database and keyfile:
+
+```bash
+# Create a backup (reads passphrase from SUPERSCALAR_BACKUP_PASSPHRASE env var)
+export SUPERSCALAR_BACKUP_PASSPHRASE="your-secure-passphrase"
+./superscalar_lsp --db lsp.db --keyfile lsp.key --backup /path/to/backup.bak
+
+# Verify a backup without restoring
+./superscalar_lsp --backup-verify /path/to/backup.bak
+
+# Restore from backup
+./superscalar_lsp --restore /path/to/backup.bak
+```
+
+Backup format: `[magic][version][salt][nonce][ciphertext][tag]` using HKDF-SHA256 key derivation and ChaCha20-Poly1305 AEAD encryption. The passphrase never touches disk.
+
+Schedule regular backups in production. Keep backups on a separate machine.
+
+## 7. Crash Recovery
 
 If the LSP process crashes (power failure, OOM, etc.):
 
@@ -246,7 +272,23 @@ If the LSP process crashes (power failure, OOM, etc.):
 
 Without `--db`, crash recovery is not possible — you'll need to wait for CLTV timeout.
 
-## 7. Monitoring
+## 8. Standalone Watchtower
+
+For defense-in-depth, run `superscalar_watchtower` on a separate machine. It opens the LSP database read-only and independently monitors the blockchain:
+
+```bash
+./superscalar_watchtower \
+  --db /path/to/lsp.db \
+  --network signet \
+  --poll-interval 30 \
+  --cli-path /path/to/bitcoin-cli \
+  --rpcuser YOUR_USER \
+  --rpcpassword YOUR_PASS
+```
+
+The watchtower prints heartbeat messages and broadcasts penalty transactions automatically if a breach is detected. It has no write access to the database, so it cannot interfere with the LSP.
+
+## 9. Monitoring
 
 ### Web Dashboard
 
@@ -281,7 +323,7 @@ sqlite3 -header -column lsp.db \
 
 Writes a JSON file with factory state, channel balances, and pending HTLCs.
 
-## 8. CLN Bridge (Lightning Network Integration)
+## 10. CLN Bridge (Lightning Network Integration)
 
 The CLN bridge connects the SuperScalar factory to the broader Lightning Network. External Lightning nodes pay a CLN invoice; the bridge relays the HTLC into the factory and returns the preimage once the client fulfills. This makes factory clients reachable by any LN wallet without the sender knowing about SuperScalar.
 
@@ -429,7 +471,7 @@ lightning-cli plugin list | grep cln_plugin
 | Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
 | "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |
 
-## 9. Factory Rotation
+## 11. Factory Rotation
 
 Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before expiry, the LSP rotates to a new factory:
 
@@ -440,7 +482,7 @@ Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before
 
 This happens automatically in daemon mode when `--active-blocks` is reached. You can also trigger it manually with `--test-rotation` for testing.
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 | Problem | Fix |
 |---------|-----|

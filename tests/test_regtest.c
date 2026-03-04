@@ -1286,3 +1286,52 @@ int test_regtest_fee_estimation_parsing(void) {
 
     return 1;
 }
+
+/* --- Coin Selection Unit Tests (Mainnet Gap #1) --- */
+
+int test_coin_select_basic(void) {
+    utxo_t utxos[5] = {
+        { .txid = "aaaa", .vout = 0, .amount_sats = 10000 },
+        { .txid = "bbbb", .vout = 0, .amount_sats = 50000 },
+        { .txid = "cccc", .vout = 0, .amount_sats = 20000 },
+        { .txid = "dddd", .vout = 0, .amount_sats = 5000 },
+        { .txid = "eeee", .vout = 0, .amount_sats = 100000 },
+    };
+
+    utxo_t *selected = NULL;
+    size_t n_sel = 0;
+    uint64_t change = 0;
+
+    /* Select 30000 sats at 1 sat/vB — largest-first picks 100000 first */
+    int ok = regtest_coin_select(utxos, 5, 30000, 1,
+                                  &selected, &n_sel, &change);
+    TEST_ASSERT(ok, "coin select should succeed");
+    TEST_ASSERT(n_sel == 1, "should select 1 UTXO (100k is enough)");
+    TEST_ASSERT(selected[0].amount_sats == 100000, "should pick largest UTXO");
+    TEST_ASSERT(change > 0, "should have change");
+
+    free(selected);
+    return 1;
+}
+
+int test_coin_select_no_change(void) {
+    /* Single UTXO just barely covers target + fee — change < dust, absorbed */
+    utxo_t utxos[1] = {
+        { .txid = "ffff", .vout = 0, .amount_sats = 1000 },
+    };
+
+    utxo_t *selected = NULL;
+    size_t n_sel = 0;
+    uint64_t change = 0;
+
+    /* Target 700 sats at 1 sat/vB. Fee ~154 vB. 700 + 154 = 854 < 1000.
+       Change = 1000 - 700 - 154 = 146 < 546 dust → absorbed. */
+    int ok = regtest_coin_select(utxos, 1, 700, 1,
+                                  &selected, &n_sel, &change);
+    TEST_ASSERT(ok, "coin select should succeed");
+    TEST_ASSERT(n_sel == 1, "should select 1 UTXO");
+    TEST_ASSERT(change == 0, "change should be absorbed (below dust)");
+
+    free(selected);
+    return 1;
+}

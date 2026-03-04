@@ -46,6 +46,19 @@ typedef struct {
     uint8_t  timezone_bucket;     /* 0-23 hour of peak activity */
 } participant_profile_t;
 
+/* Runtime-configurable limits (Mainnet Gap #6).
+   Pass to factory_init_with_config(). NULL = defaults (same as #define values). */
+typedef struct {
+    uint32_t max_signers;           /* default FACTORY_MAX_SIGNERS (16) */
+    uint32_t max_nodes;             /* default FACTORY_MAX_NODES (64) */
+    uint32_t max_leaves;            /* default FACTORY_MAX_LEAVES (16) */
+    uint32_t max_outputs_per_node;  /* default FACTORY_MAX_OUTPUTS (8) */
+    uint64_t dust_limit_sats;       /* default 546 */
+} factory_config_t;
+
+/* Fill config with compiled-in defaults. */
+void factory_config_default(factory_config_t *cfg);
+
 typedef enum { NODE_KICKOFF, NODE_STATE } factory_node_type_t;
 
 /* Factory lifecycle states (Phase 8) */
@@ -172,11 +185,20 @@ typedef struct {
     placement_mode_t placement_mode;  /* client ordering strategy */
     economic_mode_t  economic_mode;   /* fee distribution model */
     participant_profile_t profiles[FACTORY_MAX_SIGNERS];
+
+    /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
+    factory_config_t config;
 } factory_t;
 
 int factory_init(factory_t *f, secp256k1_context *ctx,
                   const secp256k1_keypair *keypairs, size_t n_participants,
                   uint16_t step_blocks, uint32_t states_per_layer);
+
+/* Initialize with custom config. NULL config = defaults. */
+int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
+                              const secp256k1_keypair *keypairs, size_t n_participants,
+                              uint16_t step_blocks, uint32_t states_per_layer,
+                              const factory_config_t *cfg);
 
 /* Initialize factory from pubkeys only (no keypairs).
    Used by clients who know all participants' pubkeys but only their own secret key.

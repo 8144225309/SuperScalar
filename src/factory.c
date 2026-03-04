@@ -412,15 +412,33 @@ static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
 
 /* ---- Public API ---- */
 
-int factory_init(factory_t *f, secp256k1_context *ctx,
-                 const secp256k1_keypair *keypairs, size_t n_participants,
-                 uint16_t step_blocks, uint32_t states_per_layer) {
+void factory_config_default(factory_config_t *cfg) {
+    cfg->max_signers = FACTORY_MAX_SIGNERS;
+    cfg->max_nodes = FACTORY_MAX_NODES;
+    cfg->max_leaves = FACTORY_MAX_LEAVES;
+    cfg->max_outputs_per_node = FACTORY_MAX_OUTPUTS;
+    cfg->dust_limit_sats = 546;
+}
+
+int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
+                              const secp256k1_keypair *keypairs, size_t n_participants,
+                              uint16_t step_blocks, uint32_t states_per_layer,
+                              const factory_config_t *cfg) {
     memset(f, 0, sizeof(*f));
     f->ctx = ctx;
     f->n_participants = n_participants;
     f->step_blocks = step_blocks;
     f->states_per_layer = states_per_layer;
-    f->fee_per_tx = 200;  /* 1 sat/vB floor for ~200 vB tx; overridden by factory_build_tree */
+    f->fee_per_tx = 200;
+
+    /* Store config */
+    if (cfg)
+        f->config = *cfg;
+    else
+        factory_config_default(&f->config);
+
+    if (n_participants > f->config.max_signers)
+        return 0;
 
     for (size_t i = 0; i < n_participants; i++) {
         f->keypairs[i] = keypairs[i];
@@ -428,7 +446,6 @@ int factory_init(factory_t *f, secp256k1_context *ctx,
             return 0;
     }
 
-    /* Default arity-2: compute layers/leaves from n_participants */
     f->leaf_arity = FACTORY_ARITY_2;
     size_t nc = (n_participants > 1) ? n_participants - 1 : 1;
     int n_leaves = compute_leaf_count(nc, FACTORY_ARITY_2);
@@ -441,6 +458,13 @@ int factory_init(factory_t *f, secp256k1_context *ctx,
     f->per_leaf_enabled = 0;
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
     return 1;
+}
+
+int factory_init(factory_t *f, secp256k1_context *ctx,
+                 const secp256k1_keypair *keypairs, size_t n_participants,
+                 uint16_t step_blocks, uint32_t states_per_layer) {
+    return factory_init_with_config(f, ctx, keypairs, n_participants,
+                                     step_blocks, states_per_layer, NULL);
 }
 
 void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
