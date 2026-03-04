@@ -2,7 +2,7 @@
 
 Post-v0.1.0 security audit. Each item verified against source code.
 
-**Test baseline:** 380 unit + 43 regtest = 423 total, all passing.
+**Test baseline:** 392 unit + 43 regtest = 435 total, all passing.
 
 ---
 
@@ -89,9 +89,8 @@ string interpolation, or sanitize all params against `[^a-zA-Z0-9._-]`.
 The following items from the initial audit were investigated and found to be
 properly handled:
 
-- **256-commitment limit** (`CHANNEL_MAX_SECRETS = 256`): Warning threshold at
-  240 (`channel_near_exhaustion()`), hard validation at 256, factory rotation
-  handles lifecycle. Not a gap.
+- **Channel commitment storage**: Dynamic arrays (malloc/realloc) with no upper
+  bound. Channels grow storage as needed — no fixed limit, no forced rotation.
 
 - **NN handshake fallback**: Intentional design — NK authentication works when
   `--lsp-pubkey` is provided. NN fallback prints explicit stderr warning.

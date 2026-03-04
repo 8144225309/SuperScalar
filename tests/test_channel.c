@@ -2609,37 +2609,23 @@ int test_commitment_number_overflow(void) {
                                           &local_fund_pk, &remote_fund_pk),
                 "setup channel");
 
-    /* Manually push commitment_number near the limit */
-    ch.commitment_number = CHANNEL_MAX_SECRETS - 2;
-
+    /* With dynamic storage, operations well past 256 should succeed */
     unsigned char preimage[32] = { [0 ... 31] = 0x42 };
     unsigned char payment_hash[32];
     sha256(preimage, 32, payment_hash);
 
-    /* This should succeed (commitment_number becomes MAX_SECRETS-1) */
-    uint64_t htlc_id;
-    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 1000, payment_hash,
-                                   500000, &htlc_id),
-                "add htlc near limit should succeed");
-    TEST_ASSERT_EQ(ch.commitment_number, CHANNEL_MAX_SECRETS - 1,
-                   "commitment at MAX_SECRETS-1");
+    /* Add and fulfill HTLC repeatedly, pushing past old 256 limit */
+    for (int i = 0; i < 300; i++) {
+        uint64_t htlc_id;
+        TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 1000, payment_hash,
+                                       500000, &htlc_id),
+                    "add htlc past old limit");
+        TEST_ASSERT(channel_fulfill_htlc(&ch, htlc_id, preimage),
+                    "fulfill htlc past old limit");
+    }
 
-    /* Next add should be rejected (would push to MAX_SECRETS) */
-    unsigned char preimage2[32] = { [0 ... 31] = 0x43 };
-    unsigned char payment_hash2[32];
-    sha256(preimage2, 32, payment_hash2);
-
-    TEST_ASSERT(!channel_add_htlc(&ch, HTLC_OFFERED, 1000, payment_hash2,
-                                    500001, NULL),
-                "add htlc at limit must be rejected");
-
-    /* Fulfill should also be rejected at the limit */
-    TEST_ASSERT(!channel_fulfill_htlc(&ch, htlc_id, preimage),
-                "fulfill at limit must be rejected");
-
-    /* Fail should also be rejected at the limit */
-    TEST_ASSERT(!channel_fail_htlc(&ch, htlc_id),
-                "fail at limit must be rejected");
+    /* Commitment number should reflect all the updates (init=1 + 300*2) */
+    TEST_ASSERT(ch.commitment_number > 256, "commitment_number exceeded old limit");
 
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
@@ -4213,7 +4199,7 @@ int test_regtest_htlc_timeout_race(void) {
     return 1;
 }
 
-int test_channel_near_exhaustion(void) {
+int test_channel_unlimited_commitments(void) {
     secp256k1_context *ctx = test_ctx();
 
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
@@ -4230,28 +4216,85 @@ int test_channel_near_exhaustion(void) {
 
     channel_t ch;
     TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
-                                100000, 70000, 30000,
+                                10000000, 7000000, 3000000,
                                 local_funding_secret,
                                 &local_fund_pk, &remote_fund_pk),
                 "setup channel");
 
-    /* Fresh channel: commitment_number = 0 — not near exhaustion */
-    TEST_ASSERT(!channel_near_exhaustion(&ch), "fresh channel not exhausted");
+    /* Run 512 channel_update cycles — well past old 256 limit */
+    for (int i = 0; i < 512; i++) {
+        int delta = (i % 2 == 0) ? 100 : -100;
+        TEST_ASSERT(channel_update(&ch, delta), "update past old limit");
+    }
 
-    /* Simulate advancing to just below threshold */
-    ch.commitment_number = CHANNEL_SECRETS_WARNING_THRESHOLD - 1;
-    TEST_ASSERT(!channel_near_exhaustion(&ch), "below threshold not exhausted");
+    TEST_ASSERT_EQ((long)ch.commitment_number, 512,
+                   "commitment_number reached 512");
 
-    /* At threshold */
-    ch.commitment_number = CHANNEL_SECRETS_WARNING_THRESHOLD;
-    TEST_ASSERT(channel_near_exhaustion(&ch), "at threshold is exhausted");
+    /* Verify per-commitment secrets are still retrievable */
+    unsigned char secret[32];
+    TEST_ASSERT(channel_get_local_pcs(&ch, 0, secret), "get pcs at 0");
+    TEST_ASSERT(channel_get_local_pcs(&ch, 255, secret), "get pcs at 255");
+    TEST_ASSERT(channel_get_local_pcs(&ch, 511, secret), "get pcs at 511");
 
-    /* Above threshold */
-    ch.commitment_number = CHANNEL_MAX_SECRETS - 1;
-    TEST_ASSERT(channel_near_exhaustion(&ch), "at max is exhausted");
+    secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
+    return 1;
+}
 
-    /* NULL channel */
-    TEST_ASSERT(!channel_near_exhaustion(NULL), "NULL channel not exhausted");
+int test_channel_dynamic_growth(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xEE, 32);
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                10000000, 7000000, 3000000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+
+    /* Initial capacity should be 512 */
+    TEST_ASSERT_EQ((long)ch.local_pcs_cap, 512, "initial pcs cap is 512");
+    TEST_ASSERT_EQ((long)ch.revocations_cap, 512, "initial rev cap is 512");
+
+    /* Store a secret at index 0 for later verification */
+    unsigned char secret0[32];
+    TEST_ASSERT(channel_get_local_pcs(&ch, 0, secret0), "get initial secret 0");
+
+    /* Push past 512 to trigger growth */
+    for (int i = 0; i < 520; i++) {
+        int delta = (i % 2 == 0) ? 100 : -100;
+        TEST_ASSERT(channel_update(&ch, delta), "update to trigger growth");
+    }
+
+    /* Capacity should have doubled */
+    TEST_ASSERT(ch.local_pcs_cap >= 1024, "pcs cap grew to >= 1024");
+
+    /* Old secret at index 0 should still be intact */
+    unsigned char secret0_check[32];
+    TEST_ASSERT(channel_get_local_pcs(&ch, 0, secret0_check), "get secret 0 after growth");
+    TEST_ASSERT_MEM_EQ(secret0, secret0_check, 32, "secret 0 preserved after realloc");
+
+    /* Verify revocations grow too */
+    unsigned char rev_secret[32] = { [0 ... 31] = 0xAA };
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 600, rev_secret),
+                "receive revocation at 600");
+    TEST_ASSERT(ch.revocations_cap >= 1024, "rev cap grew to >= 1024");
+
+    unsigned char rev_out[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 600, rev_out),
+                "get revocation at 600");
+    TEST_ASSERT_MEM_EQ(rev_secret, rev_out, 32, "revocation 600 matches");
 
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);

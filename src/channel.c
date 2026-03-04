@@ -192,6 +192,21 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->htlcs = calloc(MAX_HTLCS, sizeof(htlc_t));
     if (!ch->htlcs) return 0;
     ch->htlcs_cap = MAX_HTLCS;
+
+    /* Allocate dynamic per-commitment secret storage */
+    ch->local_pcs = calloc(512, 32);
+    ch->received_revocations = calloc(512, 32);
+    ch->received_revocation_valid = calloc(512, 1);
+    if (!ch->local_pcs || !ch->received_revocations || !ch->received_revocation_valid) {
+        free(ch->htlcs);
+        free(ch->local_pcs);
+        free(ch->received_revocations);
+        free(ch->received_revocation_valid);
+        return 0;
+    }
+    ch->local_pcs_cap = 512;
+    ch->revocations_cap = 512;
+
     ch->ctx = ctx;
 
     ch->local_funding_pubkey = *local_funding_pubkey;
@@ -278,6 +293,17 @@ void channel_cleanup(channel_t *ch) {
     ch->htlcs = NULL;
     ch->htlcs_cap = 0;
     ch->n_htlcs = 0;
+
+    free(ch->local_pcs);
+    ch->local_pcs = NULL;
+    ch->local_pcs_cap = 0;
+    ch->n_local_pcs = 0;
+
+    free(ch->received_revocations);
+    ch->received_revocations = NULL;
+    free(ch->received_revocation_valid);
+    ch->received_revocation_valid = NULL;
+    ch->revocations_cap = 0;
 }
 
 int channel_set_local_basepoints(channel_t *ch,
@@ -378,6 +404,38 @@ int channel_generate_random_basepoints(channel_t *ch) {
 
 /* ---- Per-commitment secret flat storage ---- */
 
+static int channel_ensure_pcs_cap(channel_t *ch, size_t needed) {
+    if (needed <= ch->local_pcs_cap) return 1;
+    size_t new_cap = ch->local_pcs_cap ? ch->local_pcs_cap * 2 : 512;
+    while (new_cap < needed) new_cap *= 2;
+    unsigned char (*new_pcs)[32] = realloc(ch->local_pcs, new_cap * 32);
+    if (!new_pcs) return 0;
+    memset(new_pcs + ch->local_pcs_cap, 0, (new_cap - ch->local_pcs_cap) * 32);
+    ch->local_pcs = new_pcs;
+    ch->local_pcs_cap = new_cap;
+    return 1;
+}
+
+static int channel_ensure_revocations_cap(channel_t *ch, size_t needed) {
+    if (needed <= ch->revocations_cap) return 1;
+    size_t new_cap = ch->revocations_cap ? ch->revocations_cap * 2 : 512;
+    while (new_cap < needed) new_cap *= 2;
+    unsigned char (*new_rev)[32] = realloc(ch->received_revocations, new_cap * 32);
+    uint8_t *new_valid = realloc(ch->received_revocation_valid, new_cap);
+    if (!new_rev || !new_valid) {
+        /* On partial failure, keep whichever pointer succeeded */
+        if (new_rev) ch->received_revocations = new_rev;
+        if (new_valid) ch->received_revocation_valid = new_valid;
+        return 0;
+    }
+    memset(new_rev + ch->revocations_cap, 0, (new_cap - ch->revocations_cap) * 32);
+    memset(new_valid + ch->revocations_cap, 0, new_cap - ch->revocations_cap);
+    ch->received_revocations = new_rev;
+    ch->received_revocation_valid = new_valid;
+    ch->revocations_cap = new_cap;
+    return 1;
+}
+
 int channel_read_random_bytes(unsigned char *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return 0;
@@ -387,7 +445,7 @@ int channel_read_random_bytes(unsigned char *buf, size_t len) {
 }
 
 int channel_generate_local_pcs(channel_t *ch, uint64_t commitment_num) {
-    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (!channel_ensure_pcs_cap(ch, (size_t)(commitment_num + 1))) return 0;
     if (!channel_read_random_bytes(ch->local_pcs[commitment_num], 32))
         return 0;
     if (commitment_num + 1 > ch->n_local_pcs)
@@ -397,7 +455,7 @@ int channel_generate_local_pcs(channel_t *ch, uint64_t commitment_num) {
 
 int channel_get_local_pcs(const channel_t *ch, uint64_t commitment_num,
                            unsigned char *secret_out32) {
-    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (commitment_num >= ch->local_pcs_cap) return 0;
     if (commitment_num >= ch->n_local_pcs) return 0;
     memcpy(secret_out32, ch->local_pcs[commitment_num], 32);
     return 1;
@@ -405,7 +463,7 @@ int channel_get_local_pcs(const channel_t *ch, uint64_t commitment_num,
 
 void channel_set_local_pcs(channel_t *ch, uint64_t commitment_num,
                             const unsigned char *secret32) {
-    if (commitment_num >= CHANNEL_MAX_SECRETS) return;
+    if (!channel_ensure_pcs_cap(ch, (size_t)(commitment_num + 1))) return;
     memcpy(ch->local_pcs[commitment_num], secret32, 32);
     if (commitment_num + 1 > ch->n_local_pcs)
         ch->n_local_pcs = (size_t)(commitment_num + 1);
@@ -464,7 +522,7 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
 
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
                                       const unsigned char *secret32) {
-    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (!channel_ensure_revocations_cap(ch, (size_t)(commitment_num + 1))) return 0;
     memcpy(ch->received_revocations[commitment_num], secret32, 32);
     ch->received_revocation_valid[commitment_num] = 1;
     return 1;
@@ -472,7 +530,7 @@ int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
 
 int channel_get_received_revocation(const channel_t *ch, uint64_t commitment_num,
                                       unsigned char *secret_out32) {
-    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (commitment_num >= ch->revocations_cap) return 0;
     if (!ch->received_revocation_valid[commitment_num]) return 0;
     memcpy(secret_out32, ch->received_revocations[commitment_num], 32);
     return 1;
@@ -767,11 +825,6 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb) {
     if (!ch) return;
     ch->fee_rate_sat_per_kvb = fee_rate_sat_per_kvb;
-}
-
-int channel_near_exhaustion(const channel_t *ch) {
-    if (!ch) return 0;
-    return ch->commitment_number >= CHANNEL_SECRETS_WARNING_THRESHOLD;
 }
 
 int channel_build_penalty_tx(const channel_t *ch,
@@ -1181,8 +1234,6 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
     if (ch->n_htlcs >= ch->htlcs_cap)
         return 0;
-    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
-        return 0;  /* commitment number would overflow storage */
 
     /* Reject HTLC amount below dust */
     if (amount_sats < CHANNEL_DUST_LIMIT_SATS)
@@ -1233,8 +1284,6 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
 
 int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
                            const unsigned char *preimage32) {
-    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
-        return 0;
     /* Find HTLC by id */
     htlc_t *h = NULL;
     for (size_t i = 0; i < ch->n_htlcs; i++) {
@@ -1274,8 +1323,6 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
 }
 
 int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
-    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
-        return 0;
     /* Find HTLC by id */
     htlc_t *h = NULL;
     for (size_t i = 0; i < ch->n_htlcs; i++) {

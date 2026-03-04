@@ -2985,19 +2985,6 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
-            /* Check if any channel is near commitment secret exhaustion */
-            if (mgr->rot_auto_rotate) {
-                for (size_t c = 0; c < mgr->n_channels; c++) {
-                    if (channel_near_exhaustion(&mgr->entries[c].channel)) {
-                        printf("LSP: channel %zu near exhaustion (cn=%llu) — "
-                               "triggering rotation\n", c,
-                               (unsigned long long)mgr->entries[c].channel.commitment_number);
-                        lsp_channels_rotate_factory(mgr, lsp);
-                        break;
-                    }
-                }
-            }
-
             /* Offline detection: mark clients with no message for 120s */
             {
                 time_t now = time(NULL);
