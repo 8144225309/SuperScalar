@@ -318,8 +318,27 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 
         /* Store LSP's next per-commitment point */
         secp256k1_pubkey next_pcp;
-        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33))
+        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33)) {
             channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+            /* Persist both current and next remote PCPs for crash recovery */
+            if (cbd && cbd->db) {
+                unsigned char ser[33];
+                size_t slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &next_pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0,
+                    ch->commitment_number + 1, ser);
+                /* Also persist the current PCP (may have just been set) */
+                secp256k1_pubkey cur_pcp;
+                if (channel_get_remote_pcp(ch, ch->commitment_number, &cur_pcp)) {
+                    slen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &cur_pcp,
+                                                   SECP256K1_EC_COMPRESSED);
+                    persist_save_remote_pcp(cbd->db, 0,
+                        ch->commitment_number, ser);
+                }
+            }
+        }
 
         memset(lsp_rev_secret, 0, 32);
     }

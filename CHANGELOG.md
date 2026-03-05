@@ -9,6 +9,8 @@ All notable changes to SuperScalar are documented here.
 - **Cooperative close now works from daemon mode**: The CLI `close` command previously set the shutdown flag which caused Phase 5 to abort instead of running the cooperative close ceremony. The close transaction is now properly built, signed (MuSig2), and broadcast.
 - **Client reconnection after crash**: Restarting a client process with `--db` now correctly detects persisted factory state and sends `MSG_RECONNECT` (0x48) instead of `MSG_HELLO` (0x01). Previously, `first_run` was hardcoded to 1 on every process start, causing the LSP to reject the reconnecting client.
 - **Consistent 0-indexed client numbering in payment logs**: `lsp_demo.c` payment log now uses 0-indexed client numbers, matching the CLI `pay` command and daemon HTLC logs.
+- **Post-reconnect payments work**: Remote per-commitment points are now persisted on every `REVOKE_AND_ACK` and restored during reconnect. Previously, the persist functions existed but were never called, leaving the PCP ring buffer empty after reconnect — the channel couldn't verify commitment signatures, so payments silently failed.
+- **CLN plugin BOLT11 invoice creation**: Fixed `fallbacks` argument passed to `lightning-cli invoice` from `"null"` (invalid string) to `"[]"` (empty JSON array). CLN v25+ rejected the malformed argument, resulting in empty BOLT11 strings for bridge-routed payments.
 
 ### Test Count
 
