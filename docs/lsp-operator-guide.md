@@ -226,6 +226,7 @@ Press **Ctrl+C**. The LSP will:
 | `--fee-bump-after` | 6 | Blocks before first RBF fee bump on funding TX |
 | `--fee-bump-max` | 3 | Maximum number of fee bump attempts |
 | `--fee-bump-multiplier` | 1.5 | Fee rate multiplier per bump |
+| `--version` | — | Print version and exit |
 | `--help` | — | Show help and exit |
 
 ### Testing & Debug Flags
@@ -249,6 +250,8 @@ When `--cli` is enabled in daemon mode, the LSP reads commands from stdin:
 | Command | Description |
 |---------|-------------|
 | `pay <from> <to> <amount>` | Send a payment between factory clients |
+| `rebalance <from> <to> <amount>` | Rebalance channels within the factory |
+| `invoice <client> <amount>` | Create a BOLT11 invoice for a client (requires bridge) |
 | `status` | Print channel balances, factory state, ladder info |
 | `rotate` | Trigger manual factory rotation |
 | `close` | Initiate cooperative close and shutdown |
