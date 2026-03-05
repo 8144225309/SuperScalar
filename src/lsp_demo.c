@@ -236,6 +236,52 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ack_msg.json);
     }
+    free(old_sender_htlcs);
+    old_sender_htlcs = NULL;
+
+    /* Persist sender channel balance + HTLC + PCS/PCP */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+
+        persist_update_channel_balance(db, (uint32_t)from_client,
+            sender_ch->local_amount, sender_ch->remote_amount,
+            sender_ch->commitment_number);
+
+        htlc_t sp;
+        memset(&sp, 0, sizeof(sp));
+        sp.id = sender_htlc_id;
+        sp.direction = HTLC_RECEIVED;
+        sp.state = HTLC_STATE_ACTIVE;
+        sp.amount_sats = amount_sats;
+        memcpy(sp.payment_hash, payment_hash, 32);
+        sp.cltv_expiry = 500;
+        persist_save_htlc(db, (uint32_t)from_client, &sp);
+
+        unsigned char pcs[32];
+        if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number, pcs))
+            persist_save_local_pcs(db, (uint32_t)from_client,
+                sender_ch->commitment_number, pcs);
+        if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number + 1, pcs))
+            persist_save_local_pcs(db, (uint32_t)from_client,
+                sender_ch->commitment_number + 1, pcs);
+        memset(pcs, 0, 32);
+
+        {
+            unsigned char ser[33];
+            size_t slen = 33;
+            secp256k1_pubkey saved_pcp;
+            if (channel_get_remote_pcp(sender_ch,
+                    sender_ch->commitment_number + 1, &saved_pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                    &saved_pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)from_client,
+                    sender_ch->commitment_number + 1, ser);
+        }
+
+        if (own_txn) persist_commit(db);
+    }
 
     /* 7. Forward HTLC to destination client */
     channel_t *dest_ch = &mgr->entries[to_client].channel;
@@ -246,7 +292,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     size_t old_dest_n_htlcs = dest_ch->n_htlcs;
     htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
         ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
-    if (old_dest_n_htlcs > 0 && !old_dest_htlcs) { free(old_sender_htlcs); return 0; }
+    if (old_dest_n_htlcs > 0 && !old_dest_htlcs) return 0;
     if (old_dest_n_htlcs > 0)
         memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
@@ -312,6 +358,52 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             lsp_send_revocation(mgr, lsp, to_client, old_cn);
         }
         cJSON_Delete(ack_msg.json);
+    }
+    free(old_dest_htlcs);
+    old_dest_htlcs = NULL;
+
+    /* Persist dest channel balance + HTLC + PCS/PCP */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+
+        persist_update_channel_balance(db, (uint32_t)to_client,
+            dest_ch->local_amount, dest_ch->remote_amount,
+            dest_ch->commitment_number);
+
+        htlc_t dp;
+        memset(&dp, 0, sizeof(dp));
+        dp.id = dest_htlc_id;
+        dp.direction = HTLC_OFFERED;
+        dp.state = HTLC_STATE_ACTIVE;
+        dp.amount_sats = amount_sats;
+        memcpy(dp.payment_hash, payment_hash, 32);
+        dp.cltv_expiry = 500;
+        persist_save_htlc(db, (uint32_t)to_client, &dp);
+
+        unsigned char pcs[32];
+        if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+            persist_save_local_pcs(db, (uint32_t)to_client,
+                dest_ch->commitment_number, pcs);
+        if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+            persist_save_local_pcs(db, (uint32_t)to_client,
+                dest_ch->commitment_number + 1, pcs);
+        memset(pcs, 0, 32);
+
+        {
+            unsigned char ser[33];
+            size_t slen = 33;
+            secp256k1_pubkey saved_pcp;
+            if (channel_get_remote_pcp(dest_ch,
+                    dest_ch->commitment_number + 1, &saved_pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                    &saved_pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)to_client,
+                    dest_ch->commitment_number + 1, ser);
+        }
+
+        if (own_txn) persist_commit(db);
     }
 
     /* 9. Wait for FULFILL_HTLC from dest (client fulfills with real preimage) */
@@ -386,6 +478,43 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 cJSON_Delete(ack.json);
             }
         }
+        free(old_dest_ful_htlcs);
+        old_dest_ful_htlcs = NULL;
+
+        /* Persist dest channel after fulfill + PCS/PCP */
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+
+            persist_update_channel_balance(db, (uint32_t)to_client,
+                dest_ch->local_amount, dest_ch->remote_amount,
+                dest_ch->commitment_number);
+            persist_delete_htlc(db, (uint32_t)to_client, ful_htlc_id);
+
+            unsigned char pcs[32];
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+                persist_save_local_pcs(db, (uint32_t)to_client,
+                    dest_ch->commitment_number, pcs);
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+                persist_save_local_pcs(db, (uint32_t)to_client,
+                    dest_ch->commitment_number + 1, pcs);
+            memset(pcs, 0, 32);
+
+            {
+                unsigned char ser[33];
+                size_t slen = 33;
+                secp256k1_pubkey saved_pcp;
+                if (channel_get_remote_pcp(dest_ch,
+                        dest_ch->commitment_number + 1, &saved_pcp) &&
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                        &saved_pcp, SECP256K1_EC_COMPRESSED))
+                    persist_save_remote_pcp(db, (uint32_t)to_client,
+                        dest_ch->commitment_number + 1, ser);
+            }
+
+            if (own_txn) persist_commit(db);
+        }
 
         /* 10. Back-propagate fulfill to sender */
         uint64_t old_sender_ful_local = sender_ch->local_amount;
@@ -444,8 +573,42 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 cJSON_Delete(ack.json);
             }
         }
-        free(old_dest_ful_htlcs);
         free(old_sender_ful_htlcs);
+
+        /* Persist sender channel after fulfill + PCS/PCP */
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+
+            persist_update_channel_balance(db, (uint32_t)from_client,
+                sender_ch->local_amount, sender_ch->remote_amount,
+                sender_ch->commitment_number);
+            persist_delete_htlc(db, (uint32_t)from_client, sender_htlc_id);
+
+            unsigned char pcs[32];
+            if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number, pcs))
+                persist_save_local_pcs(db, (uint32_t)from_client,
+                    sender_ch->commitment_number, pcs);
+            if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number + 1, pcs))
+                persist_save_local_pcs(db, (uint32_t)from_client,
+                    sender_ch->commitment_number + 1, pcs);
+            memset(pcs, 0, 32);
+
+            {
+                unsigned char ser[33];
+                size_t slen = 33;
+                secp256k1_pubkey saved_pcp;
+                if (channel_get_remote_pcp(sender_ch,
+                        sender_ch->commitment_number + 1, &saved_pcp) &&
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                        &saved_pcp, SECP256K1_EC_COMPRESSED))
+                    persist_save_remote_pcp(db, (uint32_t)from_client,
+                        sender_ch->commitment_number + 1, ser);
+            }
+
+            if (own_txn) persist_commit(db);
+        }
     }
 
     free(old_sender_htlcs);
