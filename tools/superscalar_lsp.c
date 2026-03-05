@@ -3115,27 +3115,19 @@ int main(int argc, char *argv[]) {
         /* --- Phase A: PTLC key turnover over wire --- */
         printf("Phase A: PTLC key turnover for Factory 0\n");
 
-        /* Build demo keypairs (same as --test-turnover) */
+        /* Build keypair/pubkey arrays matching production pattern
+           (lsp_rotation.c:94-111): real LSP keypair + actual client
+           pubkeys with LSP placeholder keypairs for signing slots. */
         secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
-        rot_kps[0] = lsp_kp;
-        {
-            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
-            for (int ci = 0; ci < n_clients; ci++) {
-                unsigned char ds[32];
-                memset(ds, fill[ci], 32);
-                if (!secp256k1_keypair_create(ctx, &rot_kps[ci + 1], ds)) {
-                    fprintf(stderr, "rotation: keypair_create failed for client %d\n", ci);
-                    return 1;
-                }
-            }
-        }
-
         secp256k1_pubkey rot_pks[FACTORY_MAX_SIGNERS];
-        for (size_t ti = 0; ti < n_total; ti++) {
-            if (!secp256k1_keypair_pub(ctx, &rot_pks[ti], &rot_kps[ti])) {
-                fprintf(stderr, "rotation: keypair_pub failed for participant %zu\n", ti);
-                return 1;
-            }
+        rot_kps[0] = lsp_kp;
+        if (!secp256k1_keypair_pub(ctx, &rot_pks[0], &lsp_kp)) {
+            fprintf(stderr, "rotation: keypair_pub failed for LSP\n");
+            return 1;
+        }
+        for (int ci = 0; ci < n_clients; ci++) {
+            rot_pks[ci + 1] = lsp.client_pubkeys[ci];
+            rot_kps[ci + 1] = lsp_kp;  /* placeholder — not used for signing */
         }
 
         musig_keyagg_t rot_ka;
