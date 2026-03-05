@@ -892,8 +892,18 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
 
 void watchtower_clear_entries(watchtower_t *wt) {
     if (!wt) return;
-    /* Free any factory node response/burn data, then reset count */
-    watchtower_cleanup(wt);
+    /* Free per-entry heap data (HTLC outputs, response/burn txs) but
+       preserve the channels and pending arrays — they outlive entries. */
+    for (size_t i = 0; i < wt->n_entries; i++) {
+        free(wt->entries[i].htlc_outputs);
+        wt->entries[i].htlc_outputs = NULL;
+        if (wt->entries[i].type == WATCH_FACTORY_NODE) {
+            free(wt->entries[i].response_tx);
+            wt->entries[i].response_tx = NULL;
+            free(wt->entries[i].burn_tx);
+            wt->entries[i].burn_tx = NULL;
+        }
+    }
     wt->n_entries = 0;
 }
 
