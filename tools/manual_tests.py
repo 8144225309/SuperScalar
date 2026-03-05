@@ -31,7 +31,7 @@ def fresh_regtest():
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
     # Find bitcoind next to bitcoin-cli
     btcd = os.path.join(os.path.dirname(btc), 'bitcoind') if '/' in btc else 'bitcoind'
-    btcd_cmd = [btcd, '-daemon']
+    btcd_cmd = [btcd, '-daemon', '-fallbackfee=0.00001']
     if _btcconf != '':
         btcd_cmd.extend(['-regtest', '-conf=' + (
             _btcconf or os.path.expanduser('~/bitcoin-regtest/bitcoin.conf'))])
