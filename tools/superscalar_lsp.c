@@ -97,6 +97,7 @@ static void usage(const char *prog) {
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1 or 2 (default 2). Comma-separated for per-level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
+        "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
@@ -475,6 +476,7 @@ int main(int argc, char *argv[]) {
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
     int force_close = 0;
+    int test_burn = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
@@ -612,6 +614,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
+        else if (strcmp(argv[i], "--test-burn") == 0)
+            test_burn = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
@@ -1653,6 +1657,15 @@ int main(int argc, char *argv[]) {
         lsp.factory.profiles[pi].timezone_bucket = 0;
     }
 
+    /* If --test-burn, enable shachain-based L-stock before tree construction.
+       The seed is preserved across factory_init_from_pubkeys() in lsp.c. */
+    if (test_burn) {
+        unsigned char burn_seed[32];
+        memset(burn_seed, 0xBB, 32);  /* deterministic test seed */
+        factory_set_shachain_seed(&lsp.factory, burn_seed);
+        printf("LSP: shachain seed set for burn test\n");
+    }
+
     printf("LSP: starting factory creation ceremony...\n");
     if (!lsp_run_factory_creation(&lsp,
                                    funding_txid, funding_vout,
@@ -1777,7 +1790,7 @@ int main(int argc, char *argv[]) {
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
-        test_distrib || test_turnover || test_rotation || force_close ||
+        test_distrib || test_turnover || test_rotation || force_close || test_burn ||
         test_rebalance || test_batch_rebalance || test_realloc) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = &fee_est;
@@ -2063,6 +2076,92 @@ int main(int argc, char *argv[]) {
 
             /* Skip cooperative close — factory already spent */
             report_add_string(&rpt, "result", "force_close_complete");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+
+        /* === Burn TX Test: broadcast tree + burn L-stock via shachain === */
+        if (test_burn) {
+            printf("\n=== BURN TX TEST ===\n");
+
+            if (!lsp.factory.has_shachain) {
+                fprintf(stderr, "BURN TEST: factory has no shachain (internal error)\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Identify first leaf node and its L-stock output */
+            size_t leaf_idx = lsp.factory.leaf_node_indices[0];
+            factory_node_t *leaf = &lsp.factory.nodes[leaf_idx];
+            uint32_t l_stock_vout = (uint32_t)(leaf->n_outputs - 1);
+            uint64_t l_stock_amount = leaf->outputs[l_stock_vout].amount_sats;
+
+            printf("Leaf node[%zu]: %zu outputs, L-stock at vout %u (%llu sats)\n",
+                   leaf_idx, (size_t)leaf->n_outputs, l_stock_vout,
+                   (unsigned long long)l_stock_amount);
+
+            /* Step 1: Broadcast full factory tree */
+            printf("Broadcasting factory tree (%zu nodes) on %s...\n",
+                   lsp.factory.n_nodes, network);
+
+            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "BURN TEST: tree broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("All %zu tree nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+
+            /* Step 2: Build burn TX for epoch 0 L-stock */
+            tx_buf_t burn_tx;
+            tx_buf_init(&burn_tx, 256);
+            if (!factory_build_burn_tx(&lsp.factory, &burn_tx,
+                                         leaf->txid, l_stock_vout,
+                                         l_stock_amount, 0)) {
+                fprintf(stderr, "BURN TEST: factory_build_burn_tx failed\n");
+                tx_buf_free(&burn_tx);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Step 3: Broadcast burn TX */
+            char *burn_hex = malloc(burn_tx.len * 2 + 1);
+            hex_encode(burn_tx.data, burn_tx.len, burn_hex);
+            char burn_txid[65];
+            int sent = regtest_send_raw_tx(&rt, burn_hex, burn_txid);
+            free(burn_hex);
+            tx_buf_free(&burn_tx);
+
+            if (!sent) {
+                fprintf(stderr, "BURN TEST: burn TX broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            if (is_regtest)
+                regtest_mine_blocks(&rt, 1, mine_addr);
+
+            printf("Burn TX broadcast: %s\n", burn_txid);
+            printf("L-stock at leaf[%zu]:vout %u burned (%llu sats revoked)\n",
+                   leaf_idx, l_stock_vout, (unsigned long long)l_stock_amount);
+
+            printf("\n=== BURN TX TEST PASSED ===\n");
+
+            report_add_string(&rpt, "result", "burn_test_complete");
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
