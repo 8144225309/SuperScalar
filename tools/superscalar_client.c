@@ -1014,12 +1014,13 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             cJSON_Delete(msg.json);
 
-            /* Clear old watchtower entries (old factory is closed) and
-               re-register channel pointer for the new factory */
+            /* Clear old watchtower entries — the old factory is closed.
+               Don't call watchtower_set_channel after clear: clear_entries
+               frees the channels array (via watchtower_cleanup), so
+               set_channel would write through a NULL pointer.
+               The reconnect path will re-register the channel. */
             if (cbd && cbd->wt)
                 watchtower_clear_entries(cbd->wt);
-            if (cbd && cbd->wt)
-                watchtower_set_channel(cbd->wt, 0, ch);
 
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
