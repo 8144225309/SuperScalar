@@ -259,6 +259,53 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         free(old_dest_htlcs);
 
+        /* Persist dest channel balance + HTLC + PCS/PCP after commitment exchange */
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+
+            persist_update_channel_balance(db,
+                (uint32_t)dest_idx,
+                dest_ch->local_amount, dest_ch->remote_amount,
+                dest_ch->commitment_number);
+
+            htlc_t persist_htlc;
+            memset(&persist_htlc, 0, sizeof(persist_htlc));
+            persist_htlc.id = dest_htlc_id;
+            persist_htlc.direction = HTLC_OFFERED;
+            persist_htlc.state = HTLC_STATE_ACTIVE;
+            persist_htlc.amount_sats = amount_sats;
+            memcpy(persist_htlc.payment_hash, payment_hash, 32);
+            persist_htlc.cltv_expiry = cltv_expiry;
+            persist_save_htlc(db, (uint32_t)dest_idx, &persist_htlc);
+
+            /* Save remote PCP received in REVOKE_AND_ACK */
+            {
+                unsigned char ser[33];
+                size_t slen = 33;
+                secp256k1_pubkey saved_pcp;
+                if (channel_get_remote_pcp(dest_ch,
+                        dest_ch->commitment_number + 1, &saved_pcp) &&
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                        &saved_pcp, SECP256K1_EC_COMPRESSED))
+                    persist_save_remote_pcp(db, (uint32_t)dest_idx,
+                        dest_ch->commitment_number + 1, ser);
+            }
+
+            /* Save LSP's local PCS for crash recovery */
+            unsigned char pcs[32];
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+                persist_save_local_pcs(db, (uint32_t)dest_idx,
+                    dest_ch->commitment_number, pcs);
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+                persist_save_local_pcs(db, (uint32_t)dest_idx,
+                    dest_ch->commitment_number + 1, pcs);
+            memset(pcs, 0, 32);
+
+            if (own_txn) persist_commit(db);
+        }
+
         printf("LSP: bridge HTLC forwarded to client %zu (%llu sats)\n",
                dest_idx, (unsigned long long)amount_sats);
         return 1;
@@ -289,11 +336,17 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_t *ch = &mgr->entries[client_idx].channel;
 
             if (success) {
+                /* Capture pre-fulfill state for watchtower */
+                uint64_t old_local = ch->local_amount;
+                uint64_t old_remote = ch->remote_amount;
+                size_t old_n_htlcs = ch->n_htlcs;
+                htlc_t *old_htlcs = old_n_htlcs > 0
+                    ? malloc(old_n_htlcs * sizeof(htlc_t)) : NULL;
+                if (old_n_htlcs > 0 && old_htlcs)
+                    memcpy(old_htlcs, ch->htlcs, old_n_htlcs * sizeof(htlc_t));
+
                 /* Fulfill the HTLC on the client's channel */
                 channel_fulfill_htlc(ch, htlc_id_val, preimage);
-                if (mgr->persist)
-                    persist_delete_htlc((persist_t *)mgr->persist,
-                                        (uint32_t)client_idx, htlc_id_val);
 
                 cJSON *ful = wire_build_update_fulfill_htlc(htlc_id_val, preimage);
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FULFILL_HTLC, ful);
@@ -310,18 +363,90 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     cJSON_Delete(cs);
                 }
 
+                /* Wait for REVOKE_AND_ACK from client */
+                {
+                    wire_msg_t ack_msg;
+                    if (wire_recv_timeout(lsp->client_fds[client_idx], &ack_msg, 30) &&
+                        ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
+                        uint32_t ack_chan_id;
+                        unsigned char rev_secret[32], next_point[33];
+                        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                                        rev_secret, next_point)) {
+                            uint64_t old_cn = ch->commitment_number - 1;
+                            channel_receive_revocation(ch, old_cn, rev_secret);
+                            watchtower_watch_revoked_commitment(mgr->watchtower, ch,
+                                (uint32_t)client_idx, old_cn,
+                                old_local, old_remote,
+                                old_htlcs, old_n_htlcs);
+                            secp256k1_pubkey next_pcp;
+                            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp,
+                                                            next_point, 33))
+                                channel_set_remote_pcp(ch,
+                                    ch->commitment_number + 1, &next_pcp);
+                            lsp_send_revocation(mgr, lsp, client_idx, old_cn);
+                        }
+                        cJSON_Delete(ack_msg.json);
+                    } else {
+                        if (ack_msg.json) cJSON_Delete(ack_msg.json);
+                        fprintf(stderr, "LSP: bridge pay fulfill — "
+                                "no REVOKE_AND_ACK from client %zu\n", client_idx);
+                    }
+                }
+                free(old_htlcs);
+
+                /* Persist balance + commitment_number + PCS/PCP */
+                if (mgr->persist) {
+                    persist_t *db = (persist_t *)mgr->persist;
+                    int own_txn = !persist_in_transaction(db);
+                    if (own_txn) persist_begin(db);
+
+                    persist_update_channel_balance(db,
+                        (uint32_t)client_idx,
+                        ch->local_amount, ch->remote_amount,
+                        ch->commitment_number);
+                    persist_delete_htlc(db, (uint32_t)client_idx, htlc_id_val);
+
+                    unsigned char pcs[32];
+                    if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
+                        persist_save_local_pcs(db, (uint32_t)client_idx,
+                            ch->commitment_number, pcs);
+                    if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
+                        persist_save_local_pcs(db, (uint32_t)client_idx,
+                            ch->commitment_number + 1, pcs);
+                    memset(pcs, 0, 32);
+
+                    if (own_txn) persist_commit(db);
+                }
+
+                if (mgr->persist)
+                    persist_deactivate_htlc_origin((persist_t *)mgr->persist,
+                        mgr->htlc_origins[i].payment_hash);
+
                 printf("LSP: bridge pay fulfilled for client %zu htlc %llu\n",
                        client_idx, (unsigned long long)htlc_id_val);
             } else {
                 /* Fail the HTLC */
                 channel_fail_htlc(ch, htlc_id_val);
-                /* Delete failed HTLC from persistence */
-                if (mgr->persist)
-                    persist_delete_htlc((persist_t *)mgr->persist,
-                                          (uint32_t)client_idx, htlc_id_val);
                 cJSON *fail = wire_build_update_fail_htlc(htlc_id_val, "bridge_pay_failed");
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FAIL_HTLC, fail);
                 cJSON_Delete(fail);
+
+                /* Persist balance + delete HTLC atomically */
+                if (mgr->persist) {
+                    persist_t *db = (persist_t *)mgr->persist;
+                    int own_txn = !persist_in_transaction(db);
+                    if (own_txn) persist_begin(db);
+
+                    persist_update_channel_balance(db,
+                        (uint32_t)client_idx,
+                        ch->local_amount, ch->remote_amount,
+                        ch->commitment_number);
+                    persist_delete_htlc(db, (uint32_t)client_idx, htlc_id_val);
+                    persist_deactivate_htlc_origin(db,
+                        mgr->htlc_origins[i].payment_hash);
+
+                    if (own_txn) persist_commit(db);
+                }
 
                 printf("LSP: bridge pay failed for client %zu htlc %llu\n",
                        client_idx, (unsigned long long)htlc_id_val);
