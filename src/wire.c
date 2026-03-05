@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -156,8 +157,11 @@ int wire_accept(int listen_fd) {
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);
     int fd = accept(listen_fd, (struct sockaddr *)&addr, &len);
-    if (fd >= 0)
+    if (fd >= 0) {
         wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+        int nodelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    }
     return fd;
 }
 
@@ -220,6 +224,8 @@ int wire_connect_direct_internal(const char *host, int port) {
     }
     freeaddrinfo(res);
     wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     return fd;
 }
 
