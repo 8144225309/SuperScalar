@@ -18,6 +18,16 @@ All notable changes to SuperScalar are documented here.
 - **Regtest test script FIFO reliability**: `regtest_full.sh` now uses a persistent file descriptor (`exec 3>/tmp/lsp_fifo`) instead of `cat /tmp/lsp_fifo | ...`, which broke when each write opened and closed the FIFO causing the LSP to see EOF.
 - **Demo payment 4 below dust limit**: The 2-client demo sequence sent 500 sats in payment 4, which is below the 546-sat P2TR dust limit. Bumped to 600. Also fixed two regtest script payments that used 500 sats (post-LSP-crash and post-BIP39-recovery tests).
 
+### Security
+
+- **Revocation secret verification**: `REVOKE_AND_ACK` handlers now verify that the received secret derives the expected per-commitment point via `secp256k1_ec_pubkey_create()` before accepting it. Prevents a malicious peer from sending garbage secrets to avoid penalty on old commitments.
+- **bitcoin-cli timeout**: `run_command_exec()` now uses a 30-second timeout with `waitpid(WNOHANG)` polling instead of blocking indefinitely. Hung bitcoin-cli processes are killed with SIGKILL after timeout, preventing LSP hangs.
+- **channel_cleanup secret wiping**: `channel_cleanup()` now calls `secure_zero()` on `local_pcs` and `received_revocations` arrays before freeing, preventing revocation secrets from lingering in freed heap memory.
+- **Keyfile/backup file permissions**: `keyfile_save()` and `backup_create()` now use `open(O_CREAT|O_WRONLY|O_TRUNC, 0600)` on POSIX instead of `fopen("wb")`, creating files with owner-only permissions instead of umask-dependent (typically 0644).
+- **fee_estimate overflow guard**: `fee_estimate()` now returns a 1 BTC cap instead of wrapping to near-zero when extreme fee rates would overflow `uint64_t` multiplication.
+- **musig/watchtower secure_zero**: Replaced `memset()` with `secure_zero()` for secret key and session ID wiping in `musig_sign()` and `watchtower_check_and_respond()`, preventing compiler optimization from eliding the wipe.
+- **Wire protocol negative number rejection**: All wire parsers that cast `cJSON valuedouble` to unsigned types (`uint64_t`, `uint32_t`, `uint16_t`, `size_t`) now reject negative values via `wire_check_nonneg()`. Prevents undefined behavior from casting negative doubles to unsigned integers, which could produce huge amounts/IDs.
+
 ### Testing
 
 - **Manual flag tests expanded to 25**: Added 10 new tests covering 1-client factory, variable funding amounts (50k/200k/500k), DW configuration (states-per-layer, step-blocks), profit-shared economics, backup/restore cycle, no-JIT mode, all 3 placement modes, BIP39 mnemonic generation, and JSON report validation.

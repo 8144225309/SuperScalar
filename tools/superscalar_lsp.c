@@ -3360,17 +3360,11 @@ int main(int argc, char *argv[]) {
         }
         printf("  Factory 1 channels ready\n");
 
-        /* --- Phase D: Payment + cooperative close on Factory 1 --- */
-        printf("Phase D: Payment on Factory 1\n");
-
-        /* Run one payment: client 0 → client 1 */
-        if (!lsp_channels_initiate_payment(mgr2, &lsp, 0, 1, 1000)) {
-            fprintf(stderr, "ROTATION: payment on Factory 1 failed\n");
-            /* Non-fatal — continue to close */
-        } else {
-            printf("  Payment: client 1 -> client 2: 1000 sats\n");
-            lsp_channels_print_balances(mgr2);
-        }
+        /* --- Phase D: Cooperative close on Factory 1 --- */
+        /* Note: payment test skipped here because clients disconnect after
+           rotation to reconnect from persisted state (see client.c:1067).
+           Payment on rotated factories is tested via daemon mode + orchestrator. */
+        printf("Phase D: Cooperative close of Factory 1\n");
 
         /* Cooperative close of Factory 1 */
         tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];

@@ -759,6 +759,12 @@ cJSON *wire_build_channel_nonces(uint32_t channel_id,
     return j;
 }
 
+/* Reject negative JSON numbers before casting to unsigned.
+   Returns 0 if any field is negative. */
+static int wire_check_nonneg(const cJSON *field) {
+    return field && cJSON_IsNumber(field) && field->valuedouble >= 0;
+}
+
 /* --- Channel operation message parsers (Phase 10) --- */
 
 int wire_parse_channel_ready(const cJSON *json, uint32_t *channel_id,
@@ -767,8 +773,8 @@ int wire_parse_channel_ready(const cJSON *json, uint32_t *channel_id,
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
     cJSON *bl = cJSON_GetObjectItem(json, "balance_local_msat");
     cJSON *br = cJSON_GetObjectItem(json, "balance_remote_msat");
-    if (!ci || !cJSON_IsNumber(ci) || !bl || !cJSON_IsNumber(bl) ||
-        !br || !cJSON_IsNumber(br))
+    if (!wire_check_nonneg(ci) || !wire_check_nonneg(bl) ||
+        !wire_check_nonneg(br))
         return 0;
     *channel_id = (uint32_t)ci->valuedouble;
     *balance_local_msat = (uint64_t)bl->valuedouble;
@@ -783,8 +789,8 @@ int wire_parse_update_add_htlc(const cJSON *json, uint64_t *htlc_id,
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *ce = cJSON_GetObjectItem(json, "cltv_expiry");
-    if (!hi || !cJSON_IsNumber(hi) || !am || !cJSON_IsNumber(am) ||
-        !ce || !cJSON_IsNumber(ce))
+    if (!wire_check_nonneg(hi) || !wire_check_nonneg(am) ||
+        !wire_check_nonneg(ce))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -801,8 +807,8 @@ int wire_parse_commitment_signed(const cJSON *json, uint32_t *channel_id,
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
     cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
     cJSON *ni = cJSON_GetObjectItem(json, "nonce_index");
-    if (!ci || !cJSON_IsNumber(ci) || !cn || !cJSON_IsNumber(cn) ||
-        !ni || !cJSON_IsNumber(ni))
+    if (!wire_check_nonneg(ci) || !wire_check_nonneg(cn) ||
+        !wire_check_nonneg(ni))
         return 0;
     if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32)
         return 0;
@@ -816,7 +822,7 @@ int wire_parse_revoke_and_ack(const cJSON *json, uint32_t *channel_id,
                                 unsigned char *revocation_secret32,
                                 unsigned char *next_point33) {
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
-    if (!ci || !cJSON_IsNumber(ci)) return 0;
+    if (!wire_check_nonneg(ci)) return 0;
     if (wire_json_get_hex(json, "revocation_secret", revocation_secret32, 32) != 32)
         return 0;
     if (next_point33) {
@@ -831,7 +837,7 @@ int wire_parse_revoke_and_ack(const cJSON *json, uint32_t *channel_id,
 int wire_parse_update_fulfill_htlc(const cJSON *json, uint64_t *htlc_id,
                                      unsigned char *preimage32) {
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
-    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (!wire_check_nonneg(hi)) return 0;
     if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
         return 0;
     *htlc_id = (uint64_t)hi->valuedouble;
@@ -842,7 +848,7 @@ int wire_parse_update_fail_htlc(const cJSON *json, uint64_t *htlc_id,
                                   char *reason, size_t reason_len) {
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
     cJSON *re = cJSON_GetObjectItem(json, "reason");
-    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (!wire_check_nonneg(hi)) return 0;
     *htlc_id = (uint64_t)hi->valuedouble;
     if (reason && reason_len > 0) {
         if (re && cJSON_IsString(re)) {
@@ -860,7 +866,7 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 size_t max_nonces, size_t *count_out) {
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
     cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
-    if (!ci || !cJSON_IsNumber(ci) || !arr || !cJSON_IsArray(arr))
+    if (!wire_check_nonneg(ci) || !arr || !cJSON_IsArray(arr))
         return 0;
     *channel_id = (uint32_t)ci->valuedouble;
     size_t count = 0;
@@ -979,7 +985,7 @@ int wire_parse_register_invoice(const cJSON *json,
                                   uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
-    if (!am || !cJSON_IsNumber(am) || !dc || !cJSON_IsNumber(dc))
+    if (!wire_check_nonneg(am) || !wire_check_nonneg(dc))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -999,8 +1005,8 @@ int wire_parse_bridge_add_htlc(const cJSON *json,
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *ce = cJSON_GetObjectItem(json, "cltv_expiry");
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
-    if (!am || !cJSON_IsNumber(am) || !ce || !cJSON_IsNumber(ce) ||
-        !hi || !cJSON_IsNumber(hi))
+    if (!wire_check_nonneg(am) || !wire_check_nonneg(ce) ||
+        !wire_check_nonneg(hi))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -1025,7 +1031,7 @@ int wire_parse_bridge_add_htlc_keysend(const cJSON *json,
         if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
             return 0;
         cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
-        *dest_client_out = dc && cJSON_IsNumber(dc) ? (size_t)dc->valuedouble : 0;
+        *dest_client_out = wire_check_nonneg(dc) ? (size_t)dc->valuedouble : 0;
         *is_keysend_out = 1;
     } else {
         *is_keysend_out = 0;
@@ -1038,7 +1044,7 @@ int wire_parse_bridge_fulfill_htlc(const cJSON *json,
                                      unsigned char *preimage32,
                                      uint64_t *htlc_id) {
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
-    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (!wire_check_nonneg(hi)) return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
@@ -1052,7 +1058,7 @@ int wire_parse_bridge_fail_htlc(const cJSON *json,
                                   char *reason, size_t reason_len,
                                   uint64_t *htlc_id) {
     cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
-    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (!wire_check_nonneg(hi)) return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     *htlc_id = (uint64_t)hi->valuedouble;
@@ -1074,7 +1080,7 @@ int wire_parse_bridge_send_pay(const cJSON *json,
                                  uint64_t *request_id) {
     cJSON *b = cJSON_GetObjectItem(json, "bolt11");
     cJSON *ri = cJSON_GetObjectItem(json, "request_id");
-    if (!b || !cJSON_IsString(b) || !ri || !cJSON_IsNumber(ri))
+    if (!b || !cJSON_IsString(b) || !wire_check_nonneg(ri))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -1091,7 +1097,7 @@ int wire_parse_bridge_pay_result(const cJSON *json,
                                    unsigned char *preimage32) {
     cJSON *ri = cJSON_GetObjectItem(json, "request_id");
     cJSON *su = cJSON_GetObjectItem(json, "success");
-    if (!ri || !cJSON_IsNumber(ri) || !su || !cJSON_IsBool(su))
+    if (!wire_check_nonneg(ri) || !su || !cJSON_IsBool(su))
         return 0;
     *request_id = (uint64_t)ri->valuedouble;
     *success = cJSON_IsTrue(su) ? 1 : 0;
@@ -1106,7 +1112,7 @@ int wire_parse_bridge_register(const cJSON *json,
                                  uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
-    if (!am || !cJSON_IsNumber(am) || !dc || !cJSON_IsNumber(dc))
+    if (!wire_check_nonneg(am) || !wire_check_nonneg(dc))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -1161,7 +1167,7 @@ int wire_parse_reconnect(const cJSON *json, const secp256k1_context *ctx,
                            uint64_t *commitment_number_out) {
     cJSON *pk = cJSON_GetObjectItem(json, "pubkey");
     cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
-    if (!pk || !cJSON_IsString(pk) || !cn || !cJSON_IsNumber(cn))
+    if (!pk || !cJSON_IsString(pk) || !wire_check_nonneg(cn))
         return 0;
     if (!hex_to_pubkey(ctx, pubkey_out, pk->valuestring))
         return 0;
@@ -1189,8 +1195,8 @@ int wire_parse_reconnect_ack(const cJSON *json, uint32_t *channel_id,
     cJSON *la = cJSON_GetObjectItem(json, "local_amount_msat");
     cJSON *ra = cJSON_GetObjectItem(json, "remote_amount_msat");
     cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
-    if (!ci || !cJSON_IsNumber(ci) || !la || !cJSON_IsNumber(la) ||
-        !ra || !cJSON_IsNumber(ra) || !cn || !cJSON_IsNumber(cn))
+    if (!wire_check_nonneg(ci) || !wire_check_nonneg(la) ||
+        !wire_check_nonneg(ra) || !wire_check_nonneg(cn))
         return 0;
     *channel_id = (uint32_t)ci->valuedouble;
     *local_amount_msat = (uint64_t)la->valuedouble;
@@ -1209,7 +1215,7 @@ cJSON *wire_build_create_invoice(uint64_t amount_msat) {
 
 int wire_parse_create_invoice(const cJSON *json, uint64_t *amount_msat) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
-    if (!am || !cJSON_IsNumber(am))
+    if (!wire_check_nonneg(am))
         return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     return 1;
@@ -1227,7 +1233,7 @@ int wire_parse_invoice_created(const cJSON *json,
                                  unsigned char *payment_hash32,
                                  uint64_t *amount_msat) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
-    if (!am || !cJSON_IsNumber(am))
+    if (!wire_check_nonneg(am))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
@@ -1318,7 +1324,7 @@ int wire_parse_channel_basepoints(
     secp256k1_pubkey *first_pcp_out,
     secp256k1_pubkey *second_pcp_out) {
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
-    if (!ci || !cJSON_IsNumber(ci)) return 0;
+    if (!wire_check_nonneg(ci)) return 0;
     *channel_id_out = (uint32_t)ci->valuedouble;
 
     cJSON *pb = cJSON_GetObjectItem(json, "payment_basepoint");
@@ -1377,7 +1383,7 @@ int wire_parse_jit_offer(const cJSON *json, const secp256k1_context *ctx,
     cJSON *fa = cJSON_GetObjectItem(json, "funding_amount");
     cJSON *re = cJSON_GetObjectItem(json, "reason");
     cJSON *pk = cJSON_GetObjectItem(json, "lsp_pubkey");
-    if (!ci || !cJSON_IsNumber(ci) || !fa || !cJSON_IsNumber(fa))
+    if (!wire_check_nonneg(ci) || !wire_check_nonneg(fa))
         return 0;
     *client_idx = (size_t)ci->valuedouble;
     *funding_amount = (uint64_t)fa->valuedouble;
@@ -1410,7 +1416,7 @@ int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
                             secp256k1_pubkey *client_pubkey) {
     cJSON *ci = cJSON_GetObjectItem(json, "client_idx");
     cJSON *pk = cJSON_GetObjectItem(json, "client_pubkey");
-    if (!ci || !cJSON_IsNumber(ci))
+    if (!wire_check_nonneg(ci))
         return 0;
     *client_idx = (size_t)ci->valuedouble;
     if (client_pubkey && pk && cJSON_IsString(pk) && ctx) {
@@ -1444,9 +1450,9 @@ int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
     cJSON *am = cJSON_GetObjectItem(json, "amount");
     cJSON *la = cJSON_GetObjectItem(json, "local_amount");
     cJSON *ra = cJSON_GetObjectItem(json, "remote_amount");
-    if (!ji || !cJSON_IsNumber(ji) || !tx || !cJSON_IsString(tx) ||
-        !vo || !cJSON_IsNumber(vo) || !am || !cJSON_IsNumber(am) ||
-        !la || !cJSON_IsNumber(la) || !ra || !cJSON_IsNumber(ra))
+    if (!wire_check_nonneg(ji) || !tx || !cJSON_IsString(tx) ||
+        !wire_check_nonneg(vo) || !wire_check_nonneg(am) ||
+        !wire_check_nonneg(la) || !wire_check_nonneg(ra))
         return 0;
     *jit_channel_id = (uint32_t)ji->valuedouble;
     if (funding_txid_hex && hex_len > 0) {
@@ -1478,8 +1484,8 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
     cJSON *tf = cJSON_GetObjectItem(json, "target_factory_id");
     cJSON *lb = cJSON_GetObjectItem(json, "local_balance");
     cJSON *rb = cJSON_GetObjectItem(json, "remote_balance");
-    if (!ji || !cJSON_IsNumber(ji) || !tf || !cJSON_IsNumber(tf) ||
-        !lb || !cJSON_IsNumber(lb) || !rb || !cJSON_IsNumber(rb))
+    if (!wire_check_nonneg(ji) || !wire_check_nonneg(tf) ||
+        !wire_check_nonneg(lb) || !wire_check_nonneg(rb))
         return 0;
     *jit_channel_id = (uint32_t)ji->valuedouble;
     *target_factory_id = (uint32_t)tf->valuedouble;
@@ -1636,7 +1642,7 @@ int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
     if (n > max_amounts) return 0;
     for (size_t i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(arr, (int)i);
-        if (!item || !cJSON_IsNumber(item)) return 0;
+        if (!wire_check_nonneg(item)) return 0;
         amounts[i] = (uint64_t)item->valuedouble;
     }
     *n_amounts_out = n;
@@ -1718,7 +1724,7 @@ int wire_parse_leaf_realloc_done(const cJSON *json, int *leaf_side,
     if (n > max_amounts) return 0;
     for (size_t i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(arr, (int)i);
-        if (!item || !cJSON_IsNumber(item)) return 0;
+        if (!wire_check_nonneg(item)) return 0;
         amounts[i] = (uint64_t)item->valuedouble;
     }
     *n_amounts_out = n;
@@ -1750,9 +1756,9 @@ int wire_parse_scid_assign(const cJSON *json, uint32_t *channel_id,
     cJSON *fb = cJSON_GetObjectItem(json, "fee_base_msat");
     cJSON *fp = cJSON_GetObjectItem(json, "fee_ppm");
     cJSON *cd = cJSON_GetObjectItem(json, "cltv_delta");
-    if (!ci || !cJSON_IsNumber(ci) || !si || !cJSON_IsString(si) ||
-        !fb || !cJSON_IsNumber(fb) || !fp || !cJSON_IsNumber(fp) ||
-        !cd || !cJSON_IsNumber(cd))
+    if (!wire_check_nonneg(ci) || !si || !cJSON_IsString(si) ||
+        !wire_check_nonneg(fb) || !wire_check_nonneg(fp) ||
+        !wire_check_nonneg(cd))
         return 0;
     *channel_id = (uint32_t)ci->valuedouble;
     *scid = (uint64_t)strtoull(si->valuestring, NULL, 16);

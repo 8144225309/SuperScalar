@@ -21,6 +21,30 @@
 
 /* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
 
+/* Verify that a revocation secret matches the per-commitment point stored for
+   the given commitment number.  Returns 1 if valid (or if no stored PCP to
+   check against), 0 if the secret is demonstrably wrong. */
+static int verify_revocation_secret(const secp256k1_context *ctx,
+                                     const channel_t *ch,
+                                     uint64_t commitment_num,
+                                     const unsigned char *secret32) {
+    secp256k1_pubkey derived;
+    if (!secp256k1_ec_pubkey_create(ctx, &derived, secret32))
+        return 0;  /* not a valid scalar */
+
+    secp256k1_pubkey stored;
+    if (!channel_get_remote_pcp(ch, commitment_num, &stored))
+        return 1;  /* no PCP stored — can't verify, accept on trust */
+
+    unsigned char d_ser[33], s_ser[33];
+    size_t dlen = 33, slen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, d_ser, &dlen, &derived,
+                                   SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, s_ser, &slen, &stored,
+                                   SECP256K1_EC_COMPRESSED);
+    return memcmp(d_ser, s_ser, 33) == 0;
+}
+
 /* Send the LSP's own revocation secret to a client after each commitment update.
    This enables bidirectional revocation so clients can detect LSP breaches.
    old_cn: the commitment number whose secret is being revealed. */
@@ -700,12 +724,21 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             free(old_sender_htlcs);
             return 0;
         }
-        /* Parse and store revocation secret */
+        /* Parse and verify revocation secret */
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
+            if (!verify_revocation_secret(mgr->ctx, sender_ch, old_cn, rev_secret)) {
+                fprintf(stderr, "LSP: INVALID revocation secret from sender %zu "
+                        "(commitment %lu) — rejecting\n",
+                        sender_idx, (unsigned long)old_cn);
+                secure_zero(rev_secret, 32);
+                cJSON_Delete(ack_msg.json);
+                free(old_sender_htlcs);
+                return 0;
+            }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
@@ -958,6 +991,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
+            if (!verify_revocation_secret(mgr->ctx, dest_ch, old_cn, rev_secret)) {
+                fprintf(stderr, "LSP: INVALID revocation secret from dest %zu "
+                        "(commitment %lu) — rejecting\n",
+                        dest_idx, (unsigned long)old_cn);
+                secure_zero(rev_secret, 32);
+                cJSON_Delete(ack_msg.json);
+                free(old_dest_htlcs);
+                return 0;
+            }
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             uint32_t wt_chan_id = dest_is_jit ?
                 (uint32_t)(mgr->n_channels + dest_idx) : (uint32_t)dest_idx;
@@ -2218,6 +2260,15 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
+                    if (!verify_revocation_secret(mgr->ctx, dest_ch, old_cn, rev_secret)) {
+                        fprintf(stderr, "LSP: INVALID revocation secret from reconnected "
+                                "client %zu (commitment %lu)\n",
+                                reconnected_idx, (unsigned long)old_cn);
+                        secure_zero(rev_secret, 32);
+                        cJSON_Delete(ack_msg.json);
+                        free(old_dest_htlcs);
+                        continue;
+                    }
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)reconnected_idx, old_cn,

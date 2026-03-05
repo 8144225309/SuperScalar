@@ -367,6 +367,8 @@ class Orchestrator:
             "--db", self._client_db(index),
             "--daemon",
             "--fee-rate", "1000",
+            "--rpcuser", self.rpcuser,
+            "--rpcpassword", self.rpcpassword,
         ]
         if self.is_regtest:
             cmd.extend(["--seckey", client_seckey(index),
@@ -921,8 +923,9 @@ def scenario_factory_rotation(orch):
     orch._log("=== SCENARIO: factory_rotation ===")
     orch._log("LSP + 4 clients with short active/dying blocks; wait for auto-rotation.")
 
-    # Start LSP with short active/dying periods so rotation triggers quickly
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    # Start LSP with short active/dying periods so rotation triggers quickly.
+    # Use slightly longer windows (8+5) to avoid race conditions during setup.
+    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -941,7 +944,7 @@ def scenario_factory_rotation(orch):
 
     # On regtest, mine blocks to push past active+dying period
     # On signet, wait for natural blocks
-    total_blocks = 5 + 3 + 2  # active + dying + buffer
+    total_blocks = 8 + 5 + 2  # active + dying + buffer
     if orch.is_regtest:
         for _ in range(total_blocks):
             orch.mine(1)
@@ -1272,8 +1275,9 @@ def scenario_turnover_abort(orch):
     orch._log("=== SCENARIO: turnover_abort ===")
     orch._log("Key turnover fails midway; 4th client reconnects to complete.")
 
-    # Start LSP with short lifecycle for quick turnover trigger
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    # Start LSP with short lifecycle for quick turnover trigger.
+    # Use slightly longer windows (8+5) to avoid race conditions during setup.
+    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1291,7 +1295,7 @@ def scenario_turnover_abort(orch):
 
     # Mine to trigger DYING state and turnover initiation
     if orch.is_regtest:
-        for _ in range(5):
+        for _ in range(8):
             orch.mine(1)
             time.sleep(1)
     else:

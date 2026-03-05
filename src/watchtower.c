@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/types.h"
 #include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -195,7 +196,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
             if (secp256k1_ec_pubkey_create(ch->ctx, &old_pcp, old_rev_secret)) {
                 channel_set_remote_pcp(ch, old_commit_num, &old_pcp);
             }
-            memset(old_rev_secret, 0, 32);
+            secure_zero(old_rev_secret, 32);
         }
     }
 

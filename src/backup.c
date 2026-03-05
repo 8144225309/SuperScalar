@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _POSIX_VERSION
+#include <fcntl.h>
+#endif
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -143,7 +146,12 @@ int backup_create(const char *db_path, const char *keyfile_path,
     if (!enc_ok) { free(ciphertext); return 0; }
 
     /* Write backup file (v2: magic + version + iters_BE + salt + nonce + ct + tag) */
+#ifdef _POSIX_VERSION
+    int fd = open(backup_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
+#else
     FILE *fp = fopen(backup_path, "wb");
+#endif
     if (!fp) { free(ciphertext); return 0; }
 
     size_t written = 0;
