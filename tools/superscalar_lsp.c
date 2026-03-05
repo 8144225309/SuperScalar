@@ -835,13 +835,9 @@ int main(int argc, char *argv[]) {
                 "--test-turnover, and --test-rotation require --network regtest\n");
         return 1;
     }
-    /* --breach-test (mode 1) mines for tree broadcast — regtest only */
-    if (!is_regtest && breach_test == 1) {
-        fprintf(stderr, "Error: --breach-test requires --network regtest "
-                "(it mines blocks for tree broadcast)\n");
-        return 1;
-    }
-    /* --cheat-daemon (mode 2) only broadcasts + sleeps — allowed on any network */
+    /* --cheat-daemon (mode 2) only broadcasts + sleeps — allowed on any network.
+       --breach-test (mode 1) uses broadcast_factory_tree_any_network() on
+       non-regtest networks (polls for confirmation instead of mining). */
 
     /* Resolve active/dying block defaults */
     uint32_t active_blocks = (active_blocks_arg > 0) ? (uint32_t)active_blocks_arg
@@ -2239,7 +2235,13 @@ int main(int argc, char *argv[]) {
         if (is_regtest) {
             regtest_mine_blocks(&rt, 1, mine_addr);
         } else {
-            printf("Waiting for revoked commitments to confirm...\n");
+            int rc_start_h = regtest_get_block_height(&rt);
+            printf("Waiting for revoked commitments to confirm (height %d)...\n",
+                   rc_start_h);
+            for (int w = 0; w < confirm_timeout_secs && !g_shutdown; w++) {
+                if (regtest_get_block_height(&rt) > rc_start_h) break;
+                sleep(1);
+            }
         }
 
         if (breach_test == 2) {
@@ -2281,7 +2283,17 @@ int main(int argc, char *argv[]) {
             if (detected > 0) {
                 printf("BREACH DETECTED! Watchtower broadcast %d penalty tx(s)\n",
                        detected);
-                regtest_mine_blocks(&rt, 1, mine_addr);
+                if (is_regtest) {
+                    regtest_mine_blocks(&rt, 1, mine_addr);
+                } else {
+                    int pen_start_h = regtest_get_block_height(&rt);
+                    printf("Waiting for penalty to confirm (height %d)...\n",
+                           pen_start_h);
+                    for (int w = 0; w < confirm_timeout_secs && !g_shutdown; w++) {
+                        if (regtest_get_block_height(&rt) > pen_start_h) break;
+                        sleep(1);
+                    }
+                }
                 printf("BREACH TEST PASSED — penalty confirmed on-chain\n");
             } else {
                 fprintf(stderr, "BREACH TEST FAILED: watchtower did not detect breach\n");
