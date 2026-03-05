@@ -20,6 +20,7 @@ All notable changes to SuperScalar are documented here.
 - **HTLC cltv_expiry on real networks**: All internal payment paths hardcoded `cltv_expiry = 500` (absolute block height), which works on regtest but is expired on testnet4/mainnet. Now derived from `factory.cltv_timeout - FACTORY_CLTV_DELTA`. Client-side payments also use factory-derived cltv.
 - **Leaf reallocation ceremony completes**: Client daemon loop was missing the `MSG_LEAF_REALLOC_PROPOSE` dispatch case — the handler existed but was never called, causing the LSP to time out waiting for client nonces. Added case handler.
 - **Client watchtower late-arrival breach detection**: Clients now call `watchtower_check()` immediately on startup (before the daemon loop) when reconnecting from persisted state. Previously, breach scanning only ran between reconnect retries, so a client coming online after a confirmed breach would never detect it.
+- **fallbackfee in fresh_regtest()**: `manual_tests.py` now passes `-fallbackfee=0.00001` to bitcoind on startup. `regtest_fund_address()` now prints the actual bitcoin-cli error and a hint about fallbackfee when `sendtoaddress` fails, instead of silently returning 0.
 
 ### Security
 
