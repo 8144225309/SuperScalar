@@ -221,6 +221,9 @@ int lsp_run_factory_creation(lsp_t *lsp,
     economic_mode_t saved_econ = f->economic_mode;
     participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
     memcpy(saved_profiles, f->profiles, sizeof(saved_profiles));
+    int saved_has_shachain = f->has_shachain;
+    unsigned char saved_shachain_seed[32];
+    memcpy(saved_shachain_seed, f->shachain_seed, 32);
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
     if (saved_arity == FACTORY_ARITY_1)
@@ -229,6 +232,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
     memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
+    if (saved_has_shachain)
+        factory_set_shachain_seed(f, saved_shachain_seed);
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);
 

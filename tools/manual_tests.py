@@ -26,6 +26,8 @@ def rpc(*args, wallet=None):
 
 def fresh_regtest():
     """Wipe and restart regtest."""
+    # Unload wallet first to prevent stale UTXO conflicts between runs
+    subprocess.run([btc] + conf + [f'-rpcwallet={WALLET}', 'unloadwallet'], capture_output=True)
     subprocess.run([btc] + conf + ['stop'], capture_output=True)
     time.sleep(3)
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
@@ -540,6 +542,24 @@ def test_backup_restore():
     return ok
 
 
+def test_demo_burn():
+    """--demo --test-burn: broadcast tree + burn L-stock via shachain revocation."""
+    print("\n=== TEST: --demo --test-burn ===")
+    addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
+    rc, log = run_lsp(['--demo', '--test-burn'], mine_addr=addr, timeout=180)
+    has_tree = 'tree nodes confirmed' in log.lower() or 'confirmed on-chain' in log.lower()
+    has_burn = 'burn tx' in log.lower()
+    has_pass = 'BURN TX TEST PASSED' in log
+    ok = rc == 0 and has_pass
+    print(f"  Exit: {rc}, TreeBroadcast: {has_tree}, BurnTx: {has_burn}, Passed: {has_pass}")
+    for line in log.split('\n'):
+        ll = line.lower()
+        if any(kw in ll for kw in ['burn', 'l-stock', 'shachain', 'broadcast', 'confirmed', 'revoked']):
+            print(f"    {line.strip()}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def test_report_json():
     """--report generates valid JSON diagnostic report."""
     print("\n=== TEST: --report JSON ===")
@@ -587,6 +607,7 @@ if __name__ == '__main__':
         'placement': test_placement_modes,
         'mnemonic': test_generate_mnemonic,
         'backup': test_backup_restore,
+        'burn': test_demo_burn,
         'report': test_report_json,
     }
 
