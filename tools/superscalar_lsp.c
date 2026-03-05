@@ -2085,6 +2085,14 @@ int main(int argc, char *argv[]) {
             lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
         }
 
+        /* The daemon loop exits when g_shutdown is set — either by the
+           CLI "close" command or by SIGINT/SIGTERM.  For "close", we want
+           Phase 5 to run the cooperative close ceremony.  For signals,
+           we want the abort path.  Clear g_shutdown here so Phase 5
+           proceeds; if a signal arrives *after* this point the handler
+           will set it again and Phase 5's abort guard will catch it. */
+        g_shutdown = 0;
+
         channels_active = 1;
 
         /* Persist updated channel balances */

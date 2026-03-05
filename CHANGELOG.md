@@ -2,6 +2,20 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.2 — 2026-03-05
+
+### Fixed
+
+- **Cooperative close now works from daemon mode**: The CLI `close` command previously set the shutdown flag which caused Phase 5 to abort instead of running the cooperative close ceremony. The close transaction is now properly built, signed (MuSig2), and broadcast.
+- **Client reconnection after crash**: Restarting a client process with `--db` now correctly detects persisted factory state and sends `MSG_RECONNECT` (0x48) instead of `MSG_HELLO` (0x01). Previously, `first_run` was hardcoded to 1 on every process start, causing the LSP to reject the reconnecting client.
+- **Consistent 0-indexed client numbering in payment logs**: `lsp_demo.c` payment log now uses 0-indexed client numbers, matching the CLI `pay` command and daemon HTLC logs.
+
+### Test Count
+
+415 unit + 43 regtest = 458 total (unchanged).
+
+---
+
 ## 0.1.1 — 2026-03-04
 
 ### Security

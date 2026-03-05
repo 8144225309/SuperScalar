@@ -529,6 +529,18 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     return 1;
 }
 
+int persist_has_factory(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT 1 FROM factories WHERE id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
