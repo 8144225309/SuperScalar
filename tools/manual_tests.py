@@ -376,8 +376,8 @@ def test_payments_flag():
 
 def test_1client():
     """--demo with 1 client: factory creation only (no payment targets)."""
-    print("\n=== TEST: --demo --clients 1 ===")
-    rc, log = run_lsp(['--demo'], n_clients=1)
+    print("\n=== TEST: --demo --clients 1 --arity 1 ===")
+    rc, log = run_lsp(['--demo', '--arity', '1'], n_clients=1)
     has_factory = 'factory creation complete' in log
     print(f"  Exit: {rc}, FactoryCreated: {has_factory}")
     print(f"  Note: demo payments skip (single client, no destinations)")
