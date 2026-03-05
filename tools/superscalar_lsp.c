@@ -2037,8 +2037,9 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "LSP: demo sequence failed\n");
             }
 
-            /* DW counter tracking after demo payments */
-            if (dw_counter_advance(&lsp.factory.counter)) {
+            /* Advance DW state: update counter, rebuild L-stock outputs,
+               rebuild unsigned TXs, and re-sign the entire tree. */
+            if (factory_advance(&lsp.factory)) {
                 uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
                 for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {
@@ -2048,8 +2049,6 @@ int main(int argc, char *argv[]) {
                     printf(" L%u=%u", li, d);
                 }
                 printf(" blocks)\n");
-                printf("  Note: In production, factory tree would be re-signed "
-                       "via split-round MuSig2.\n");
                 if (use_db) {
                     uint32_t layer_states[DW_MAX_LAYERS];
                     for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
