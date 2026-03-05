@@ -1386,6 +1386,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             break;
         }
 
+        case MSG_LEAF_REALLOC_PROPOSE: {
+            /* LSP proposes leaf reallocation — run the full ceremony
+               (nonce exchange + partial sig exchange + done confirmation). */
+            wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
+            if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
+                                              my_index, &propose_msg)) {
+                fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         default:
             fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
                     my_index, msg.msg_type);
@@ -1877,6 +1889,12 @@ int main(int argc, char *argv[]) {
         /* If the DB already has a persisted factory from a previous run,
            skip the fresh HELLO handshake and go straight to reconnect. */
         int first_run = (use_db && persist_has_factory(&db, 0)) ? 0 : 1;
+
+        /* Scan for breaches that may have occurred while we were offline.
+           watchtower_init() loaded old commitments from DB — check if any
+           are now confirmed on-chain (late-arrival breach detection). */
+        if (!first_run && cbd.wt)
+            watchtower_check(cbd.wt);
 
         while (!g_shutdown) {
             if (first_run || !use_db) {

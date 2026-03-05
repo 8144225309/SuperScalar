@@ -17,6 +17,9 @@ All notable changes to SuperScalar are documented here.
 - **Client survives factory rotation**: After rotation, the client now disconnects cleanly and reconnects from persisted state instead of continuing in the same daemon loop with replaced factory/channel objects. The rotation persist block also now saves initial PCS and remote PCPs for the new channel, preventing post-rotation reconnect failures. Also fixed a segfault where `watchtower_clear_entries()` freed the channels array but left `channels_cap` non-zero, causing `watchtower_set_channel()` to write through NULL.
 - **Regtest test script FIFO reliability**: `regtest_full.sh` now uses a persistent file descriptor (`exec 3>/tmp/lsp_fifo`) instead of `cat /tmp/lsp_fifo | ...`, which broke when each write opened and closed the FIFO causing the LSP to see EOF.
 - **Demo payment 4 below dust limit**: The 2-client demo sequence sent 500 sats in payment 4, which is below the 546-sat P2TR dust limit. Bumped to 600. Also fixed two regtest script payments that used 500 sats (post-LSP-crash and post-BIP39-recovery tests).
+- **HTLC cltv_expiry on real networks**: All internal payment paths hardcoded `cltv_expiry = 500` (absolute block height), which works on regtest but is expired on testnet4/mainnet. Now derived from `factory.cltv_timeout - FACTORY_CLTV_DELTA`. Client-side payments also use factory-derived cltv.
+- **Leaf reallocation ceremony completes**: Client daemon loop was missing the `MSG_LEAF_REALLOC_PROPOSE` dispatch case — the handler existed but was never called, causing the LSP to time out waiting for client nonces. Added case handler.
+- **Client watchtower late-arrival breach detection**: Clients now call `watchtower_check()` immediately on startup (before the daemon loop) when reconnecting from persisted state. Previously, breach scanning only ran between reconnect retries, so a client coming online after a confirmed breach would never detect it.
 
 ### Security
 
@@ -35,6 +38,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Performance
 
+- **TCP_NODELAY on all sockets**: Disabled Nagle's algorithm on accept and connect paths, eliminating 200ms+ coalescing delays on small wire protocol messages. Critical for testnet4/mainnet where latency matters.
 - **DB write batching**: Per-payment persist calls (PCS, PCP, balance, HTLC) are now batched into a single SQLite transaction per side (sender and dest), reducing fsyncs from ~9 to 3 per internal payment.
 - **Bridge buffered reads**: `bridge_read_plugin_line()` now reads 4KB chunks instead of 1 byte at a time, reducing syscalls by ~1000x per JSON message from the CLN plugin.
 - **Plugin send/recv lock separation**: CLN plugin uses a dedicated `send_lock` for `sendall()` instead of the shared `lock`, so bridge reads and writes no longer block each other.
