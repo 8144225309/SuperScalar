@@ -461,6 +461,10 @@ int regtest_fund_address(regtest_t *rt, const char *address,
     }
 
     if (strlen(start) != 64) {
+        fprintf(stderr, "regtest_fund_address: unexpected result: %s\n", start);
+        if (strstr(result, "Fee estimation failed") ||
+            strstr(result, "fallbackfee"))
+            fprintf(stderr, "  hint: set fallbackfee=0.00001 in bitcoin.conf\n");
         free(result);
         return 0;
     }
