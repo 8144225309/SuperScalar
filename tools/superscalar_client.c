@@ -1028,8 +1028,28 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
                         persist_save_basepoints(cbd->db, rot_client_idx, ch)) {
+                        /* Save initial PCS for the new rotated channel so they
+                           survive crash before first payment on the new factory */
+                        for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+                            unsigned char pcs[32];
+                            if (channel_get_local_pcs(ch, cn, pcs)) {
+                                persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                                memset(pcs, 0, 32);
+                            }
+                        }
+                        /* Save remote PCPs (LSP's per-commitment points) */
+                        for (uint64_t cn = 0; cn <= ch->commitment_number + 1; cn++) {
+                            secp256k1_pubkey pcp;
+                            if (channel_get_remote_pcp(ch, cn, &pcp)) {
+                                unsigned char ser[33];
+                                size_t slen = 33;
+                                if (secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
+                                        &pcp, SECP256K1_EC_COMPRESSED))
+                                    persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                            }
+                        }
                         persist_commit(cbd->db);
-                        printf("Client %u: persisted rotated factory + channel + basepoints\n", my_index);
+                        printf("Client %u: persisted rotated factory + channel + basepoints + PCS\n", my_index);
                     } else {
                         fprintf(stderr, "Client %u: rotation persist failed, rolling back\n", my_index);
                         persist_rollback(cbd->db);
@@ -1038,7 +1058,13 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     fprintf(stderr, "Client %u: persist_begin failed for rotation\n", my_index);
                 }
             }
-            break;
+
+            /* Disconnect and let main() reconnect from DB with the new
+               factory.  Continuing in the same daemon loop after replacing
+               factory + channel in-place causes subtle state corruption
+               (Bug 11).  The reconnect path loads cleanly from DB. */
+            printf("Client %u: rotation complete, reconnecting with new factory\n", my_index);
+            return 0;
         }
 
         case MSG_EPOCH_RESET_PROPOSE: {
