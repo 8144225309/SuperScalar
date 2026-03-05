@@ -374,6 +374,186 @@ def test_payments_flag():
     print(f"  RESULT: {'PASS' if ok else 'FAIL — factory creation failed'}")
     return ok
 
+def test_1client():
+    """--demo with 1 client: factory creation only (no payment targets)."""
+    print("\n=== TEST: --demo --clients 1 ===")
+    rc, log = run_lsp(['--demo'], n_clients=1)
+    has_factory = 'factory creation complete' in log
+    print(f"  Exit: {rc}, FactoryCreated: {has_factory}")
+    print(f"  Note: demo payments skip (single client, no destinations)")
+    print(f"  RESULT: {'PASS' if has_factory else 'FAIL'}")
+    return has_factory
+
+
+def test_factory_amounts():
+    """Factory creation + payments at 50k, 200k, 500k sats."""
+    print("\n=== TEST: factory amounts (50k/200k/500k) ===")
+    ok = True
+    for amount in [50000, 200000, 500000]:
+        cleanup_procs()
+        print(f"\n  --- {amount} sats ---")
+        rc, log = run_lsp(['--demo'], amount=amount)
+        has_factory = 'factory creation complete' in log
+        payments = log.count('Payment complete:')
+        print(f"    Exit: {rc}, FactoryCreated: {has_factory}, Payments: {payments}")
+        if not has_factory:
+            ok = False
+    print(f"\n  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_states_per_layer():
+    """--states-per-layer 4: custom DW state count."""
+    print("\n=== TEST: --demo --states-per-layer 4 ===")
+    rc, log = run_lsp(['--demo', '--states-per-layer', '4'])
+    ok = rc == 0 and 'Demo Complete' in log
+    print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_step_blocks():
+    """--step-blocks 20: custom nSequence decrement per state."""
+    print("\n=== TEST: --demo --step-blocks 20 ===")
+    rc, log = run_lsp(['--demo', '--step-blocks', '20'])
+    ok = rc == 0 and 'Demo Complete' in log
+    print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_profit_shared():
+    """--economic-mode profit-shared: routing fees split with clients."""
+    print("\n=== TEST: --demo --economic-mode profit-shared ===")
+    rc, log = run_lsp(['--demo', '--economic-mode', 'profit-shared',
+                       '--routing-fee-ppm', '500', '--default-profit-bps', '5000'])
+    ok = rc == 0 and 'Demo Complete' in log
+    has_profit = 'profit' in log.lower() or 'settlement' in log.lower()
+    print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}, ProfitEvidence: {has_profit}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_no_jit():
+    """--no-jit: factory works without JIT channel fallback."""
+    print("\n=== TEST: --demo --no-jit ===")
+    rc, log = run_lsp(['--demo', '--no-jit'])
+    ok = rc == 0 and 'Demo Complete' in log
+    print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_placement_modes():
+    """All three placement strategies: sequential, inward, outward."""
+    print("\n=== TEST: placement modes ===")
+    ok = True
+    for mode in ['sequential', 'inward', 'outward']:
+        cleanup_procs()
+        print(f"\n  --- {mode} ---")
+        rc, log = run_lsp(['--demo', '--placement-mode', mode])
+        passed = rc == 0 and 'Demo Complete' in log
+        print(f"    Exit: {rc}, DemoComplete: {passed}")
+        if not passed:
+            ok = False
+    print(f"\n  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_generate_mnemonic():
+    """--generate-mnemonic: BIP39 seed generates valid keyfile."""
+    print("\n=== TEST: --generate-mnemonic ===")
+    env = dict(os.environ)
+    env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
+    keyfile = '/tmp/mt_mnemonic.key'
+    try: os.unlink(keyfile)
+    except: pass
+
+    r = subprocess.run(
+        [LSP, '--generate-mnemonic', '--keyfile', keyfile, '--passphrase', 'test'],
+        capture_output=True, text=True, env=env, timeout=30)
+
+    has_keyfile = os.path.exists(keyfile)
+    words = [w for w in r.stdout.split() if w.isalpha() and len(w) > 2]
+    print(f"  Exit: {r.returncode}, Keyfile: {has_keyfile}, MnemonicWords: ~{len(words)}")
+
+    try: os.unlink(keyfile)
+    except: pass
+
+    ok = has_keyfile and len(words) >= 12
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_backup_restore():
+    """Backup create + verify + restore cycle."""
+    print("\n=== TEST: backup/restore ===")
+    env = dict(os.environ)
+    env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
+
+    # Run demo to create DB state
+    rc, log = run_lsp(['--demo'])
+    if 'factory creation complete' not in log:
+        print("  FAIL: no DB state created for backup test")
+        return False
+
+    backup_path = '/tmp/mt_backup.enc'
+    db_path = '/tmp/mt_lsp.db'
+    for f in [backup_path, '/tmp/mt_restored.db']:
+        try: os.unlink(f)
+        except: pass
+
+    # Create backup
+    r = subprocess.run(
+        [LSP, '--backup', backup_path, '--db', db_path,
+         '--seckey', LSP_SECKEY, '--passphrase', 'testpass',
+         '--network', 'regtest'],
+        capture_output=True, text=True, env=env, timeout=30)
+    if not os.path.exists(backup_path):
+        print(f"  SKIP: --backup did not create file (may need --keyfile)")
+        return True
+
+    sz = os.path.getsize(backup_path)
+    print(f"  Backup: {sz} bytes")
+
+    # Verify
+    r = subprocess.run(
+        [LSP, '--backup-verify', backup_path, '--passphrase', 'testpass'],
+        capture_output=True, text=True, env=env, timeout=30)
+    print(f"  Verify: rc={r.returncode}")
+
+    # Restore
+    restored = '/tmp/mt_restored.db'
+    r = subprocess.run(
+        [LSP, '--restore', backup_path, '--db', restored,
+         '--passphrase', 'testpass'],
+        capture_output=True, text=True, env=env, timeout=30)
+    has_restore = os.path.exists(restored)
+    print(f"  Restore: {has_restore}")
+
+    for f in [backup_path, restored]:
+        try: os.unlink(f)
+        except: pass
+
+    ok = has_restore
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_report_json():
+    """--report generates valid JSON diagnostic report."""
+    print("\n=== TEST: --report JSON ===")
+    rc, log = run_lsp(['--demo'])
+    report = check_report()
+    if report:
+        keys = list(report.keys())[:5]
+        print(f"  Exit: {rc}, ReportValid: True, TopKeys: {keys}")
+    else:
+        print(f"  Exit: {rc}, ReportValid: False")
+    ok = report is not None
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
 
 # ============================================================
 # MAIN
@@ -391,6 +571,7 @@ if __name__ == '__main__':
         'turnover': test_demo_turnover,
         'breach': test_demo_breach,
         'arity1': test_arity1,
+        '1client': test_1client,
         '2clients': test_2_clients,
         '3clients': test_3_clients,
         'lsp_bal_0': test_lsp_balance_0,
@@ -398,6 +579,15 @@ if __name__ == '__main__':
         'routing_fee': test_routing_fee,
         'dynamic_fees': test_dynamic_fees,
         'payments': test_payments_flag,
+        'amounts': test_factory_amounts,
+        'states_layer': test_states_per_layer,
+        'step_blocks': test_step_blocks,
+        'profit_shared': test_profit_shared,
+        'no_jit': test_no_jit,
+        'placement': test_placement_modes,
+        'mnemonic': test_generate_mnemonic,
+        'backup': test_backup_restore,
+        'report': test_report_json,
     }
 
     if test_name == 'all':

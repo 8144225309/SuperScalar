@@ -55,7 +55,8 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 | Unit tests | 415 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
 | Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
 | Orchestrator scenarios | 23 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation |
-| **Total** | **458** | | |
+| Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
+| **Total** | **458 + 25 manual** | | |
 
 ---
 
@@ -407,6 +408,66 @@ The LSP registers the invoice locally (so future inbound HTLCs can be routed) bu
 **Q: What if the BOLT11 invoice arrives before the client registers?**
 
 The LSP receives `MSG_INVOICE_BOLT11` from the bridge but `lsp_channels_lookup_invoice` fails because no matching payment_hash exists in the registry. The LSP logs "INVOICE_BOLT11 for unknown hash" and drops the message. The client must register first.
+
+---
+
+## Manual Flag Tests
+
+25 tests covering every LSP flag and subcommand. These launch real LSP + client
+processes on regtest and verify end-to-end behavior.
+
+### Running
+
+```bash
+# All 25 tests (wipes regtest between each)
+python3 tools/manual_tests.py all
+
+# Single test
+python3 tools/manual_tests.py demo
+python3 tools/manual_tests.py backup
+python3 tools/manual_tests.py placement
+
+# List available tests
+python3 tools/manual_tests.py help
+```
+
+### Tests
+
+| Test | What it covers |
+|------|---------------|
+| `demo` | Basic --demo: factory + 4 payments + cooperative close |
+| `rotation` | --test-rotation: full PTLC turnover + factory rotation |
+| `force_close` | --force-close: broadcast full DW tree on-chain |
+| `expiry` | --test-expiry: mine past CLTV, recover via timeout |
+| `distrib` | --test-distrib: broadcast pre-signed distribution TX |
+| `turnover` | --test-turnover: PTLC key turnover for all clients |
+| `breach` | --breach-test: broadcast revoked commitment + watchtower |
+| `arity1` | --arity 1: per-client leaves (200k funding) |
+| `1client` | 1-client factory creation (no payment targets) |
+| `2clients` | 2-client factory |
+| `3clients` | 3-client factory |
+| `lsp_bal_0` | --lsp-balance-pct 0: all capacity to clients |
+| `lsp_bal_100` | --lsp-balance-pct 100: all capacity to LSP |
+| `routing_fee` | --routing-fee-ppm 1000: 0.1% routing fee |
+| `dynamic_fees` | --dynamic-fees: poll fee estimation |
+| `payments` | --payments 2: explicit payment count |
+| `amounts` | Factory at 50k, 200k, 500k sats |
+| `states_layer` | --states-per-layer 4: custom DW state count |
+| `step_blocks` | --step-blocks 20: custom nSequence step |
+| `profit_shared` | --economic-mode profit-shared: fee splits |
+| `no_jit` | --no-jit: factory without JIT channel fallback |
+| `placement` | All 3 placement modes (sequential/inward/outward) |
+| `mnemonic` | --generate-mnemonic: BIP39 keyfile creation |
+| `backup` | Backup create + verify + restore cycle |
+| `report` | --report: JSON diagnostic report validation |
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SUPERSCALAR_BTC` | `/home/pirq/bin/bitcoin-cli` | Path to bitcoin-cli |
+| `SUPERSCALAR_BTCCONF` | `~/bitcoin-regtest/bitcoin.conf` | Bitcoin config file (empty string to omit) |
+| `SUPERSCALAR_BUILD` | `/home/pirq/superscalar-build` | Build directory with binaries |
 
 ---
 
