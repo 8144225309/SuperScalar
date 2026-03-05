@@ -45,6 +45,8 @@ cln_lock = threading.Lock()  # serializes writes to CLN stdout
 KEYSEND_TLV_TYPE = "5482373484"
 
 
+_KNOWN_NETWORKS = {"bitcoin", "testnet", "signet", "regtest", "testnet4", "liquidv1"}
+
 def cli_cmd(*args):
     """Build a lightning-cli command with proper --lightning-dir and --network.
     CLN v25 sets lightning-dir to the network-specific subdir (e.g., .../cln/regtest),
@@ -53,15 +55,33 @@ def cli_cmd(*args):
     cmd = [LIGHTNING_CLI]
     if LIGHTNING_DIR:
         import os
-        parent = os.path.dirname(LIGHTNING_DIR)
-        network = os.path.basename(LIGHTNING_DIR)
-        cmd.extend(["--lightning-dir", parent, "--network", network])
+        tail = os.path.basename(LIGHTNING_DIR)
+        if tail in _KNOWN_NETWORKS:
+            # CLN v25+: lightning-dir includes network subdir — split it
+            cmd.extend(["--lightning-dir", os.path.dirname(LIGHTNING_DIR),
+                         "--network", tail])
+        else:
+            # Older CLN or custom dir — pass as-is
+            cmd.extend(["--lightning-dir", LIGHTNING_DIR])
     cmd.extend(args)
     return cmd
 
 
+_can_log_to_cln = False
+
 def log(msg):
-    """Write to CLN's log via stderr."""
+    """Write to CLN's log via JSON-RPC notification (after init) or stderr."""
+    if _can_log_to_cln:
+        # CLN captures 'log' notifications and shows them in its log file
+        try:
+            send_to_cln({
+                "jsonrpc": "2.0",
+                "method": "log",
+                "params": {"level": "info", "message": f"superscalar: {msg}"}
+            })
+            return
+        except Exception:
+            pass
     sys.stderr.write(f"superscalar: {msg}\n")
     sys.stderr.flush()
 
@@ -252,16 +272,16 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
     label = f"superscalar-{payment_hash[:16]}-{int(time.time())}"
     try:
         cmd = cli_cmd(
-            "invoice",
-            str(amount_msat),
-            label,
-            "SuperScalar factory payment",
-            "3600",    # expiry seconds
-            "[]",      # fallbacks (empty array)
-            preimage_hex
+            "-k", "invoice",
+            f"amount_msat={amount_msat}",
+            f"label={label}",
+            "description=SuperScalar factory payment",
+            "expiry=3600",
+            f"preimage={preimage_hex}"
         )
         if ROUTE_HINT:
-            cmd.extend(["--exposeprivatechannels", ROUTE_HINT])
+            cmd.append(f"exposeprivatechannels={ROUTE_HINT}")
+        log(f"invoice cmd: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             inv_result = json.loads(result.stdout)
@@ -276,7 +296,8 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
                 "bolt11": bolt11
             })
         else:
-            log(f"CLN invoice creation failed: {result.stderr[:200]}")
+            log(f"CLN invoice creation failed (rc={result.returncode}): "
+                f"stderr={result.stderr[:200]} stdout={result.stdout[:200]}")
             # Notify bridge of failure so client doesn't wait forever
             send_to_bridge({
                 "method": "invoice_bolt11",
@@ -564,6 +585,9 @@ def main():
                 "id": request["id"],
                 "result": {}
             })
+
+            global _can_log_to_cln
+            _can_log_to_cln = True
             log(f"Plugin initialized (bridge={'connected' if connected else 'disconnected'}, "
                 f"cli={LIGHTNING_CLI}, dir={LIGHTNING_DIR})")
 
