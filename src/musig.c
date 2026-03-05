@@ -156,12 +156,14 @@ int musig_sign_taproot(
     if (!compute_taptweak(ctx, tweak, &keyagg->agg_pubkey, merkle_root))
         return 0;
 
+    /* Tweak a local copy — don't modify caller's cache in place */
+    musig_keyagg_t tweaked_ka = *keyagg;
     secp256k1_pubkey tweaked_agg;
     if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_agg,
-                                                 &keyagg->cache, tweak))
+                                                 &tweaked_ka.cache, tweak))
         return 0;
 
-    return musig_sign_all_local(ctx, sig64_out, msg32, keypairs, n_signers, keyagg);
+    return musig_sign_all_local(ctx, sig64_out, msg32, keypairs, n_signers, &tweaked_ka);
 }
 
 /* --- Nonce pool --- */
@@ -312,22 +314,29 @@ int musig_session_finalize_nonces(
     if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers))
         return 0;
 
-    /* Apply taproot tweak to session's cache copy */
+    /* Apply taproot tweak to a LOCAL copy of the cache.
+       Do not modify session->cache in-place before nonce_process succeeds —
+       in-place modification corrupts the cache on error, and can cause
+       subtle issues when the same keyagg is reused across iterations
+       (e.g., rotation PTLC presig loop). */
     unsigned char tweak[32];
     if (!compute_taptweak(ctx, tweak, &session->agg_pubkey, merkle_root))
         return 0;
 
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, NULL, &session->cache, tweak))
+    secp256k1_musig_keyagg_cache tweaked_cache = session->cache;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, NULL, &tweaked_cache, tweak))
         return 0;
 
     /* Store message */
     memcpy(session->msg32, msg32, 32);
 
-    /* Create MuSig2 session (nonce_process) */
+    /* Create MuSig2 session using tweaked cache */
     if (!secp256k1_musig_nonce_process(ctx, &session->session, &session->aggnonce,
-                                        msg32, &session->cache, adaptor))
+                                        msg32, &tweaked_cache, adaptor))
         return 0;
 
+    /* Store tweaked cache for partial_sign/verify (must match nonce_process) */
+    session->cache = tweaked_cache;
     session->session_ready = 1;
     return 1;
 }

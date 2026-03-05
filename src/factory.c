@@ -835,8 +835,8 @@ int factory_build_tree(factory_t *f) {
     size_t n_clients = f->n_participants - 1;
 
     /* Validate participant count */
-    if (f->n_participants < 3 || f->n_participants > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "factory_build_tree: invalid participant count %zu (need 3..%d)\n",
+    if (f->n_participants < 2 || f->n_participants > FACTORY_MAX_SIGNERS) {
+        fprintf(stderr, "factory_build_tree: invalid participant count %zu (need 2..%d)\n",
                 f->n_participants, FACTORY_MAX_SIGNERS);
         return 0;
     }

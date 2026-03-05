@@ -1744,27 +1744,17 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
 
     size_t node_idx = factory->leaf_node_indices[leaf_side];
 
-    /* Init session + set LSP nonce */
+    /* Init signing session for this node */
     if (!factory_session_init_node(factory, node_idx)) {
         fprintf(stderr, "Client %u: realloc session_init_node failed (node %zu)\n", my_index, node_idx);
         return 0;
     }
 
-    int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
-    if (lsp_slot < 0) {
-        fprintf(stderr, "Client %u: realloc LSP not signer on node %zu\n", my_index, node_idx);
-        return 0;
-    }
-
-    secp256k1_musig_pubnonce lsp_pubnonce;
-    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser)) {
-        fprintf(stderr, "Client %u: realloc parse LSP pubnonce failed\n", my_index);
-        return 0;
-    }
-    if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
-        fprintf(stderr, "Client %u: realloc set LSP nonce failed\n", my_index);
-        return 0;
-    }
+    /* NOTE: Do NOT set the LSP nonce here.  The ALL_NONCES message
+       (received after we send our nonce) contains ALL signers' nonces
+       including the LSP's.  Setting the LSP nonce early would increment
+       nonces_collected, and the ALL_NONCES loop would set it again,
+       pushing nonces_collected past n_signers and failing finalize. */
 
     /* Generate own nonce */
     int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
