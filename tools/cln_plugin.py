@@ -39,6 +39,7 @@ pending_htlcs = {}   # payment_hash -> rpc_id for resolving
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
 lock = threading.Lock()
+send_lock = threading.Lock()  # serializes sendall to bridge socket
 cln_lock = threading.Lock()  # serializes writes to CLN stdout
 
 # Keysend TLV type used by CLN/LND for spontaneous payments (BOLT TLV)
@@ -103,7 +104,7 @@ def send_to_bridge(msg):
         return False
     try:
         data = json.dumps(msg) + "\n"
-        with lock:
+        with send_lock:
             sock.sendall(data.encode())
         return True
     except Exception as e:

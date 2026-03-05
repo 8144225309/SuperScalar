@@ -47,6 +47,7 @@ capture_lsp_output() {
 
 start_factory() {
   local label=$1 amount=${2:-150000} extra_lsp_flags="${3:-}"
+  local active_blocks=${4:-4320} dying_blocks=${5:-432}
   echo ""
   echo "=========================================="
   echo "  STARTING FACTORY: $label ($amount sats)"
@@ -68,7 +69,7 @@ start_factory() {
     --keyfile lsp.key --passphrase test --daemon --db lsp.db \
     --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
     --wallet superscalar_launch --cli --confirm-timeout 60 \
-    --active-blocks 4320 --dying-blocks 432 \
+    --active-blocks $active_blocks --dying-blocks $dying_blocks \
     $extra_lsp_flags \
     </tmp/lsp_fifo >lsp.log 2>&1 &
   LSP_PID=$!
@@ -227,8 +228,8 @@ echo "--- Status after LSP restart ---"
 capture_lsp_output "status"
 
 echo ""
-echo "--- Payment after LSP crash: 1 -> 2, 500 ---"
-capture_lsp_output "pay 1 2 500"
+echo "--- Payment after LSP crash: 1 -> 2, 1000 ---"
+capture_lsp_output "pay 1 2 1000"
 
 echo ""
 echo "--- Closing test 2 ---"
@@ -278,7 +279,8 @@ cleanup
 echo ""
 echo "########## TEST 4: Factory Rotation ##########"
 
-start_factory "test4-rotation"
+# Use short active/dying blocks so factory reaches DYING state quickly
+start_factory "test4-rotation" 150000 "" 10 5
 
 echo "--- Payments before rotation ---"
 capture_lsp_output "pay 0 1 5000"
@@ -287,6 +289,15 @@ capture_lsp_output "pay 1 2 3000"
 echo ""
 echo "--- Status before rotation ---"
 capture_lsp_output "status"
+
+# Mine blocks to push factory into DYING state (active_blocks=10)
+echo ""
+echo "--- Mining blocks to trigger DYING state ---"
+for i in $(seq 1 12); do
+  mine 1
+  sleep 1
+done
+sleep 3
 
 echo ""
 echo "--- Sending rotate command ---"
@@ -363,8 +374,8 @@ else
   capture_lsp_output "status"
 
   echo ""
-  echo "--- Payment after recovery: 0 -> 2, 500 ---"
-  capture_lsp_output "pay 0 2 500"
+  echo "--- Payment after recovery: 0 -> 2, 1000 ---"
+  capture_lsp_output "pay 0 2 1000"
 fi
 
 echo ""
