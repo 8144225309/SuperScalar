@@ -27,7 +27,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 415 unit + 43 regtest + 23 orchestrator scenarios, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 415 unit + 43 regtest + 23 orchestrator + 25 manual flag tests, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -70,7 +70,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-458 tests (415 unit + 43 regtest integration, including 11 adversarial/edge-case tests). CI runs all suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+458 automated tests (415 unit + 43 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 23 orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -88,6 +88,12 @@ bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 
 # All tests
 ./test_superscalar --all
+
+# Manual flag tests (25 tests, needs bitcoind running)
+python3 tools/manual_tests.py all
+
+# Test orchestrator (23 multi-process scenarios)
+python3 tools/test_orchestrator.py --scenario all
 ```
 
 ---
