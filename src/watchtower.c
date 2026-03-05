@@ -37,9 +37,11 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     memcpy(wt->anchor_spk, P2A_SPK, P2A_SPK_LEN);
     wt->anchor_spk_len = P2A_SPK_LEN;
 
-    /* Load old commitments from DB if available */
+    /* Load old commitments from DB if available.
+       Loop up to channels_cap (not n_channels) so we also reload entries
+       for JIT channels which are stored at indices >= n_channels. */
     if (db && db->db) {
-        for (size_t c = 0; c < wt->n_channels; c++) {
+        for (size_t c = 0; c < wt->channels_cap; c++) {
             uint64_t commit_nums[WATCHTOWER_MAX_WATCH];
             unsigned char txids[WATCHTOWER_MAX_WATCH][32];
             uint32_t vouts[WATCHTOWER_MAX_WATCH];

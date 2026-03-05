@@ -312,10 +312,12 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         uint64_t old_cn = ch->commitment_number - 1;
         channel_receive_revocation(ch, old_cn, lsp_rev_secret);
 
-        /* Register with client watchtower using the OLD commitment's amounts */
+        /* Register with client watchtower using the OLD commitment's amounts.
+           Use local channel index 0 (not the LSP's factory-wide rev_chan_id)
+           because the client watchtower has only one channel at index 0. */
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
-                rev_chan_id, old_cn,
+                0, old_cn,
                 old_local, old_remote,
                 old_htlcs, old_n_htlcs);
         }
