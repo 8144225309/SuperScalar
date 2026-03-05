@@ -1,4 +1,5 @@
 #include "superscalar/musig.h"
+#include "superscalar/types.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -76,8 +77,8 @@ int musig_sign_all_local(
                                         &keyagg->cache, NULL))
             goto cleanup;
 
-        memset(seckey, 0, 32);
-        memset(session_id, 0, 32);
+        secure_zero(seckey, 32);
+        secure_zero(session_id, 32);
         pubnonce_ptrs[i] = &pubnonces[i];
     }
 

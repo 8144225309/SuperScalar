@@ -294,11 +294,15 @@ void channel_cleanup(channel_t *ch) {
     ch->htlcs_cap = 0;
     ch->n_htlcs = 0;
 
+    if (ch->local_pcs && ch->n_local_pcs > 0)
+        secure_zero(ch->local_pcs, ch->n_local_pcs * 32);
     free(ch->local_pcs);
     ch->local_pcs = NULL;
     ch->local_pcs_cap = 0;
     ch->n_local_pcs = 0;
 
+    if (ch->received_revocations && ch->revocations_cap > 0)
+        secure_zero(ch->received_revocations, ch->revocations_cap * 32);
     free(ch->received_revocations);
     ch->received_revocations = NULL;
     free(ch->received_revocation_valid);

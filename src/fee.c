@@ -48,6 +48,10 @@ int fee_update_from_node(fee_estimator_t *fe, void *rt_ptr, int target_blocks) {
 
 uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes) {
     if (!fe || fe->fee_rate_sat_per_kvb == 0) return 0;
+    /* Overflow guard: cap at 1 BTC (100M sats) to prevent wrap-around
+       at extreme fee rates (rate * vsize could exceed UINT64_MAX). */
+    if (fe->fee_rate_sat_per_kvb > UINT64_MAX / (vsize_bytes + 1))
+        return 100000000ULL;
     /* Round up: (rate * vsize + 999) / 1000 */
     return (fe->fee_rate_sat_per_kvb * vsize_bytes + 999) / 1000;
 }

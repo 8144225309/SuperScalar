@@ -7,12 +7,35 @@
 
 #ifdef _POSIX_VERSION
 #include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #endif
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
 #ifdef _POSIX_VERSION
+
+/* Default timeout for bitcoin-cli commands (seconds). */
+#ifndef REGTEST_CMD_TIMEOUT_SECS
+#define REGTEST_CMD_TIMEOUT_SECS 30
+#endif
+
+/* Wait for child with timeout. Returns 0 on normal exit, -1 on timeout (child killed). */
+static int waitpid_timeout(pid_t pid, int timeout_secs) {
+    time_t deadline = time(NULL) + timeout_secs;
+    while (time(NULL) < deadline) {
+        int status;
+        pid_t ret = waitpid(pid, &status, WNOHANG);
+        if (ret == pid) return 0;    /* child exited */
+        if (ret < 0) return 0;       /* error (already exited) */
+        usleep(50000);               /* 50ms poll interval */
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);  /* reap zombie */
+    return -1;
+}
+
 /* Execute argv via fork/execvp with no shell interpretation.
    Captures combined stdout+stderr. Returns malloc'd string or NULL. */
 static char *run_command_exec(char *const argv[]) {
@@ -42,7 +65,7 @@ static char *run_command_exec(char *const argv[]) {
     size_t cap = 4096;
     size_t len = 0;
     char *buf = (char *)malloc(cap);
-    if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+    if (!buf) { close(pipefd[0]); waitpid_timeout(pid, REGTEST_CMD_TIMEOUT_SECS); return NULL; }
 
     while (1) {
         ssize_t n = read(pipefd[0], buf + len, cap - len - 1);
@@ -51,13 +74,17 @@ static char *run_command_exec(char *const argv[]) {
         if (len >= cap - 1) {
             cap *= 2;
             char *tmp = (char *)realloc(buf, cap);
-            if (!tmp) { free(buf); close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+            if (!tmp) { free(buf); close(pipefd[0]); waitpid_timeout(pid, REGTEST_CMD_TIMEOUT_SECS); return NULL; }
             buf = tmp;
         }
     }
     buf[len] = '\0';
     close(pipefd[0]);
-    waitpid(pid, NULL, 0);
+
+    if (waitpid_timeout(pid, REGTEST_CMD_TIMEOUT_SECS) < 0) {
+        free(buf);
+        return NULL;  /* child killed after timeout */
+    }
     return buf;
 }
 #endif /* _POSIX_VERSION */
