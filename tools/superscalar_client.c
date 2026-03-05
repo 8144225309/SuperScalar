@@ -451,7 +451,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         wire_msg_t msg;
         if (!wire_recv(fd, &msg)) {
             fprintf(stderr, "Client %u: daemon recv failed (disconnected)\n", my_index);
-            break;
+            return 0;  /* signal disconnect — main() will retry */
         }
 
         switch (msg.msg_type) {
