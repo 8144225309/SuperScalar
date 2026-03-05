@@ -339,6 +339,7 @@ class Orchestrator:
             "--db", self._lsp_db(),
             "--report", self._lsp_report(),
             "--fee-rate", "1000",
+            "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,
             "--rpcpassword", self.rpcpassword,
         ]
@@ -367,6 +368,7 @@ class Orchestrator:
             "--db", self._client_db(index),
             "--daemon",
             "--fee-rate", "1000",
+            "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,
             "--rpcpassword", self.rpcpassword,
         ]
