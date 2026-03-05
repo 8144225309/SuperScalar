@@ -204,6 +204,8 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--recv` | — | Receive payment: `PREIMAGE_HEX` (can repeat) |
 | `--channels` | off | Expect channel phase (when LSP uses `--payments`) |
 | `--report` | — | Write diagnostic JSON report to PATH |
+| `--i-accept-the-risk` | off | Required for mainnet operation |
+| `--version` | — | Print version and exit |
 
 ## 9. Troubleshooting
 
