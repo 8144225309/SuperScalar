@@ -1021,12 +1021,8 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    if (wallet_name) {
-        /* Use existing wallet — just set the name, don't create */
-        strncpy(rt.wallet, wallet_name, sizeof(rt.wallet) - 1);
-    } else {
-        regtest_create_wallet(&rt, "superscalar_lsp");
-    }
+    /* Auto-create/load wallet (handles "already exists" gracefully) */
+    regtest_create_wallet(&rt, wallet_name ? wallet_name : "superscalar_lsp");
 
     /* Initialize fee estimator (dynamic fees always enabled; --dynamic-fees kept for compat) */
     (void)dynamic_fees;
@@ -3039,15 +3035,15 @@ int main(int argc, char *argv[]) {
             printf("  SKIP: --test-realloc requires --clients >= 2\n");
             printf("LEAF REALLOC TEST: SKIP\n");
         } else {
-            /* Record current leaf funding amounts */
-            uint64_t orig_amounts[3]; /* LSP + 2 clients */
-            for (int k = 0; k < 3 && k < (int)mgr->n_channels + 1; k++) {
-                if (k == 0)
-                    orig_amounts[k] = mgr->entries[0].channel.funding_amount;
-                else if ((size_t)(k - 1) < mgr->n_channels)
-                    orig_amounts[k] = mgr->entries[k - 1].channel.funding_amount;
+            /* Record current leaf node output amounts (authoritative source) */
+            size_t leaf_node_idx = lsp.factory.leaf_node_indices[0];
+            factory_node_t *leaf_node = &lsp.factory.nodes[leaf_node_idx];
+            uint64_t orig_amounts[3];
+            uint64_t orig_total = 0;
+            for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++) {
+                orig_amounts[k] = leaf_node->outputs[k].amount_sats;
+                orig_total += orig_amounts[k];
             }
-            uint64_t orig_total = orig_amounts[0] + orig_amounts[1] + orig_amounts[2];
 
             /* Build redistributed amounts: shift 20% from slot 1 to slot 2 */
             uint64_t shift = orig_amounts[1] / 5;
@@ -3070,15 +3066,11 @@ int main(int argc, char *argv[]) {
                 realloc_pass = 0;
             }
 
-            /* Verify amounts updated */
+            /* Verify amounts updated (read from leaf node outputs) */
             if (realloc_pass) {
                 uint64_t post_total = 0;
-                for (int k = 0; k < 3 && k < (int)mgr->n_channels + 1; k++) {
-                    if (k == 0)
-                        post_total += mgr->entries[0].channel.funding_amount;
-                    else if ((size_t)(k - 1) < mgr->n_channels)
-                        post_total += mgr->entries[k - 1].channel.funding_amount;
-                }
+                for (size_t k = 0; k < leaf_node->n_outputs; k++)
+                    post_total += leaf_node->outputs[k].amount_sats;
                 if (post_total != orig_total) {
                     printf("  FAIL: total funding changed "
                            "(%llu → %llu)\n",

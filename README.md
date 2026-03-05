@@ -31,13 +31,17 @@ A Bitcoin channel factory protocol combining:
 
 ## Quick Start
 
-[Build the project](#build), then:
+From a fresh Ubuntu machine to a running demo in 5 commands:
 
 ```bash
-bash tools/run_demo.sh --basic
+sudo apt install build-essential cmake libsqlite3-dev python3  # dependencies
+git clone https://github.com/8144225309/SuperScalar.git && cd SuperScalar
+mkdir -p build && cd build && cmake .. && make -j$(nproc) && cd ..
+source tools/setup_regtest.sh                                   # starts bitcoind, funds wallet
+bash tools/run_demo.sh --basic                                  # factory + payments + close (~30s)
 ```
 
-Creates a 5-of-5 factory, opens 4 channels, runs payments, and cooperative-closes in ~30 seconds. If `bitcoind` isn't running, the script starts one for you.
+Creates a 5-of-5 factory, opens 4 channels, runs payments, and cooperative-closes. If `bitcoind` is already running, `run_demo.sh` detects it.
 
 ## Build
 
