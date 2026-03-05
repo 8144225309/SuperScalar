@@ -257,7 +257,7 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             label,
             "SuperScalar factory payment",
             "3600",    # expiry seconds
-            "null",    # fallbacks
+            "[]",      # fallbacks (empty array)
             preimage_hex
         )
         if ROUTE_HINT:

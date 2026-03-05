@@ -711,8 +711,19 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 old_sender_htlcs, old_sender_n_htlcs);
             /* Store next per-commitment point from peer */
             secp256k1_pubkey next_pcp;
-            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+                /* Persist remote PCPs for crash recovery */
+                if (mgr->persist) {
+                    unsigned char ser[33];
+                    size_t slen = 33;
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen, &next_pcp,
+                                                   SECP256K1_EC_COMPRESSED);
+                    persist_save_remote_pcp((persist_t *)mgr->persist,
+                        (uint32_t)sender_idx,
+                        sender_ch->commitment_number + 1, ser);
+                }
+            }
             /* Bidirectional: send LSP's own revocation to sender */
             lsp_send_revocation(mgr, lsp, sender_idx, old_cn);
         }
@@ -934,8 +945,18 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 old_dest_local, old_dest_remote,
                 old_dest_htlcs, old_dest_n_htlcs);
             secp256k1_pubkey next_pcp;
-            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                if (mgr->persist) {
+                    unsigned char ser[33];
+                    size_t slen = 33;
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen, &next_pcp,
+                                                   SECP256K1_EC_COMPRESSED);
+                    persist_save_remote_pcp((persist_t *)mgr->persist,
+                        (uint32_t)dest_idx,
+                        dest_ch->commitment_number + 1, ser);
+                }
+            }
             /* Bidirectional: send LSP's own revocation to dest */
             lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
         }
@@ -2283,6 +2304,20 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Reset offline detection on reconnect */
     mgr->entries[c].last_message_time = time(NULL);
     mgr->entries[c].offline_detected = 0;
+
+    /* 6b. Restore remote per-commitment points from DB */
+    if (mgr->persist) {
+        unsigned char pcp_ser[33];
+        secp256k1_pubkey pcp;
+        if (persist_load_remote_pcp((persist_t *)mgr->persist, (uint32_t)c,
+                ch->commitment_number, pcp_ser) &&
+            secp256k1_ec_pubkey_parse(mgr->ctx, &pcp, pcp_ser, 33))
+            channel_set_remote_pcp(ch, ch->commitment_number, &pcp);
+        if (persist_load_remote_pcp((persist_t *)mgr->persist, (uint32_t)c,
+                ch->commitment_number + 1, pcp_ser) &&
+            secp256k1_ec_pubkey_parse(mgr->ctx, &pcp, pcp_ser, 33))
+            channel_set_remote_pcp(ch, ch->commitment_number + 1, &pcp);
+    }
 
     /* 7. Re-init nonce pool */
     if (!channel_init_nonce_pool(ch, MUSIG_NONCE_POOL_MAX)) {

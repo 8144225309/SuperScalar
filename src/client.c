@@ -1531,6 +1531,19 @@ int client_run_reconnect(secp256k1_context *ctx,
            we need to generate PCS for the current and next commitment. */
         for (uint64_t cn = channel.n_local_pcs; cn <= commitment_number + 1; cn++)
             channel_generate_local_pcs(&channel, cn);
+
+        /* Restore remote per-commitment points from DB so the channel
+           can verify commitment signatures after reconnect. */
+        if (db) {
+            unsigned char pcp_ser[33];
+            secp256k1_pubkey pcp;
+            if (persist_load_remote_pcp(db, 0, commitment_number, pcp_ser) &&
+                secp256k1_ec_pubkey_parse(ctx, &pcp, pcp_ser, 33))
+                channel_set_remote_pcp(&channel, commitment_number, &pcp);
+            if (persist_load_remote_pcp(db, 0, commitment_number + 1, pcp_ser) &&
+                secp256k1_ec_pubkey_parse(ctx, &pcp, pcp_ser, 33))
+                channel_set_remote_pcp(&channel, commitment_number + 1, &pcp);
+        }
     }
 
     /* 8. Nonce exchange — LSP sends CHANNEL_NONCES before RECONNECT_ACK */
