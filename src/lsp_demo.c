@@ -103,6 +103,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint64_t amount_msat = amount_sats * 1000;
 
+    /* Compute HTLC cltv_expiry from factory timeout: must be before the factory
+       expires so the HTLC can be resolved on-chain if needed.  Subtract
+       FACTORY_CLTV_DELTA as safety margin. */
+    uint32_t htlc_cltv = lsp->factory.cltv_timeout > FACTORY_CLTV_DELTA
+                        ? lsp->factory.cltv_timeout - FACTORY_CLTV_DELTA
+                        : 500;  /* fallback for tests without cltv_timeout */
+
     /* 1. Send MSG_CREATE_INVOICE to receiving client */
     {
         cJSON *inv_req = wire_build_create_invoice(amount_msat);
@@ -171,7 +178,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint64_t sender_htlc_id;
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
-                           payment_hash, 500, &sender_htlc_id)) {
+                           payment_hash, htlc_cltv, &sender_htlc_id)) {
         fprintf(stderr, "LSP demo: add_htlc on sender failed\n");
         fflush(stderr);
         free(old_sender_htlcs);
@@ -181,7 +188,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 5. Send ADD_HTLC + COMMITMENT_SIGNED to sender */
     {
         cJSON *add = wire_build_update_add_htlc(sender_htlc_id, amount_msat,
-                                                   payment_hash, 500);
+                                                   payment_hash, htlc_cltv);
         /* Add dest_client field so sender knows where it's going */
         cJSON_AddNumberToObject(add, "dest_client", (double)to_client);
         if (!wire_send(lsp->client_fds[from_client], MSG_UPDATE_ADD_HTLC, add)) {
@@ -256,7 +263,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         sp.state = HTLC_STATE_ACTIVE;
         sp.amount_sats = amount_sats;
         memcpy(sp.payment_hash, payment_hash, 32);
-        sp.cltv_expiry = 500;
+        sp.cltv_expiry = htlc_cltv;
         persist_save_htlc(db, (uint32_t)from_client, &sp);
 
         unsigned char pcs[32];
@@ -298,7 +305,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
-                           payment_hash, 500, &dest_htlc_id)) {
+                           payment_hash, htlc_cltv, &dest_htlc_id)) {
         fprintf(stderr, "LSP demo: forward add_htlc failed\n");
         free(old_sender_htlcs); free(old_dest_htlcs);
         return 0;
@@ -306,7 +313,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     {
         cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
-                                                   payment_hash, 500);
+                                                   payment_hash, htlc_cltv);
         if (!wire_send(lsp->client_fds[to_client], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
             free(old_sender_htlcs); free(old_dest_htlcs);
@@ -379,7 +386,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         dp.state = HTLC_STATE_ACTIVE;
         dp.amount_sats = amount_sats;
         memcpy(dp.payment_hash, payment_hash, 32);
-        dp.cltv_expiry = 500;
+        dp.cltv_expiry = htlc_cltv;
         persist_save_htlc(db, (uint32_t)to_client, &dp);
 
         unsigned char pcs[32];

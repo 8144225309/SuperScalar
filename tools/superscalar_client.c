@@ -62,8 +62,12 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                    factory_t *factory,
                                    size_t n_participants,
                                    void *user_data) {
-    (void)keypair; (void)factory; (void)n_participants;
+    (void)keypair; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
+
+    /* Derive HTLC cltv from factory timeout (must expire before factory) */
+    uint32_t htlc_cltv = factory->cltv_timeout > 40
+                        ? factory->cltv_timeout - 40 : 500;
 
     for (size_t i = 0; i < data->n_actions; i++) {
         scripted_action_t *act = &data->actions[i];
@@ -73,7 +77,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                    my_index, (unsigned long long)act->amount_sats, act->dest_client);
 
             if (!client_send_payment(fd, ch, act->amount_sats, act->payment_hash,
-                                       500, act->dest_client)) {
+                                       htlc_cltv, act->dest_client)) {
                 fprintf(stderr, "Client %u: send_payment failed\n", my_index);
                 return 0;
             }
