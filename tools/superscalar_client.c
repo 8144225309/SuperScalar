@@ -1802,7 +1802,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        int first_run = 1;
+        /* If the DB already has a persisted factory from a previous run,
+           skip the fresh HELLO handshake and go straight to reconnect. */
+        int first_run = (use_db && persist_has_factory(&db, 0)) ? 0 : 1;
 
         while (!g_shutdown) {
             if (first_run || !use_db) {

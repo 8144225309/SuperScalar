@@ -451,7 +451,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     free(old_sender_htlcs);
     free(old_dest_htlcs);
     printf("  Payment complete: client %zu -> client %zu (%llu sats)\n",
-           from_client + 1, to_client + 1, (unsigned long long)amount_sats);
+           from_client, to_client, (unsigned long long)amount_sats);
     fflush(stdout);
     return 1;
 }

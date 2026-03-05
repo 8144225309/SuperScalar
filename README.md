@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.1 — 458 tests, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
+> v0.1.2 — 458 tests, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
