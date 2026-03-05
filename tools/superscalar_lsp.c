@@ -2037,9 +2037,12 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "LSP: demo sequence failed\n");
             }
 
-            /* Advance DW state: update counter, rebuild L-stock outputs,
-               rebuild unsigned TXs, and re-sign the entire tree. */
-            if (factory_advance(&lsp.factory)) {
+            /* Advance DW counter and track new epoch.  We only advance
+               the counter here — in production the tree would be re-signed
+               via split-round MuSig2 with all participants.  Skip when
+               --test-burn is set so the burn test can broadcast the
+               correctly-signed epoch-0 tree. */
+            if (!test_burn && dw_counter_advance(&lsp.factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
                 for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {

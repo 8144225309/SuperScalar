@@ -84,7 +84,7 @@ $BCLI stop 2>/dev/null || true
 sleep 1
 rm -rf "$HOME/.bitcoin/regtest"
 bitcoind -regtest -conf="$REGTEST_CONF" -daemon
-sleep 2
+for i in $(seq 1 30); do $BCLI getblockchaininfo &>/dev/null && break; sleep 1; done
 
 # Create wallet and mine initial blocks
 $BCLI createwallet "test" 2>/dev/null || $BCLI loadwallet "test" 2>/dev/null || true

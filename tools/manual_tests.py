@@ -99,6 +99,9 @@ def start_clients(n=4, port=9745, daemon=True, extra_flags=None):
 
 def run_lsp(extra_flags, n_clients=4, timeout=120, wait_for=None, mine_addr=None, amount=100000):
     """Run LSP with given flags, wait for completion or keyword."""
+    # Kill stale processes from previous test runs (timeout/crash leftovers)
+    cleanup_procs()
+
     env = dict(os.environ)
     env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
 
