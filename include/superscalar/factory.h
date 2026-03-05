@@ -161,6 +161,12 @@ typedef struct {
     size_t n_revocation_secrets;
     int use_flat_secrets;  /* 1 = flat, 0 = shachain (legacy) */
 
+    /* L-stock hashlock hashes: SHA256(revocation_secret) per epoch.
+       Sent to clients in FACTORY_PROPOSE so both sides build identical
+       L-stock taptrees without sharing the actual secrets. */
+    unsigned char l_stock_hashes[FACTORY_MAX_EPOCHS][32];
+    size_t n_l_stock_hashes;
+
     /* Per-leaf DW layers (for independent leaf advance) */
     dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
     int n_leaf_nodes;              /* number of leaf state nodes */
@@ -291,6 +297,12 @@ int factory_generate_flat_secrets(factory_t *f, size_t n_epochs);
 void factory_set_flat_secrets(factory_t *f,
                                const unsigned char secrets[][32],
                                size_t n_secrets);
+
+/* Set L-stock hashlock hashes (client side — no secrets needed).
+   Enables clients to build matching L-stock taptrees. */
+void factory_set_l_stock_hashes(factory_t *f,
+                                 const unsigned char hashes[][32],
+                                 size_t n_hashes);
 
 /* Get the revocation secret for a given epoch (for sharing with clients). */
 int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,

@@ -225,20 +225,26 @@ static int add_node(
    If not: simple P2TR of LSP key. */
 static int build_l_stock_spk(const factory_t *f, unsigned char *spk_out34) {
     if (f->has_shachain) {
-        /* Get current epoch's revocation secret and compute SHA256 hash */
-        unsigned char secret[32];
-        if (f->use_flat_secrets) {
-            uint32_t epoch = f->counter.current_epoch;
-            if (epoch >= f->n_revocation_secrets) return 0;
-            memcpy(secret, f->revocation_secrets[epoch], 32);
-        } else {
-            uint64_t sc_index = shachain_epoch_to_index(f->counter.current_epoch);
-            shachain_from_seed(f->shachain_seed, sc_index, secret);
-        }
-
         unsigned char hash[32];
-        sha256(secret, 32, hash);
-        memset(secret, 0, 32);
+        uint32_t epoch = f->counter.current_epoch;
+
+        /* Use pre-computed hash if available (client side has hashes
+           but not secrets), otherwise derive from secret (LSP side). */
+        if (f->n_l_stock_hashes > 0) {
+            if (epoch >= f->n_l_stock_hashes) return 0;
+            memcpy(hash, f->l_stock_hashes[epoch], 32);
+        } else {
+            unsigned char secret[32];
+            if (f->use_flat_secrets) {
+                if (epoch >= f->n_revocation_secrets) return 0;
+                memcpy(secret, f->revocation_secrets[epoch], 32);
+            } else {
+                uint64_t sc_index = shachain_epoch_to_index(epoch);
+                shachain_from_seed(f->shachain_seed, sc_index, secret);
+            }
+            sha256(secret, 32, hash);
+            memset(secret, 0, 32);
+        }
 
         /* Build hashlock leaf */
         tapscript_leaf_t hashlock_leaf;
@@ -1547,6 +1553,13 @@ int factory_generate_flat_secrets(factory_t *f, size_t n_epochs) {
     f->n_revocation_secrets = n_epochs;
     f->use_flat_secrets = 1;
     f->has_shachain = 1;  /* reuse shachain infrastructure for L-stock */
+
+    /* Pre-compute L-stock hashlock hashes: SHA256(secret) per epoch.
+       These are sent to clients so they can build matching taptrees. */
+    for (size_t i = 0; i < n_epochs; i++)
+        sha256(f->revocation_secrets[i], 32, f->l_stock_hashes[i]);
+    f->n_l_stock_hashes = n_epochs;
+
     return 1;
 }
 
@@ -1559,6 +1572,20 @@ void factory_set_flat_secrets(factory_t *f,
     f->n_revocation_secrets = n_secrets;
     f->use_flat_secrets = 1;
     f->has_shachain = 1;
+    /* Also compute hashes for wire protocol / client matching */
+    for (size_t i = 0; i < n_secrets; i++)
+        sha256(f->revocation_secrets[i], 32, f->l_stock_hashes[i]);
+    f->n_l_stock_hashes = n_secrets;
+}
+
+void factory_set_l_stock_hashes(factory_t *f,
+                                 const unsigned char hashes[][32],
+                                 size_t n_hashes) {
+    if (!f || !hashes || n_hashes == 0) return;
+    if (n_hashes > FACTORY_MAX_EPOCHS) n_hashes = FACTORY_MAX_EPOCHS;
+    memcpy(f->l_stock_hashes, hashes, n_hashes * 32);
+    f->n_l_stock_hashes = n_hashes;
+    f->has_shachain = 1;  /* enable hashlock taptree in build_l_stock_spk */
 }
 
 int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
