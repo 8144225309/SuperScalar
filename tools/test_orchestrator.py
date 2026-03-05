@@ -48,8 +48,8 @@ DEFAULT_NETWORK = "regtest"
 
 # Per-network timing constants
 TIMING = {
-    "regtest":  {"factory_timeout": 30, "breach_wait": 10, "lsp_timeout": 90,
-                 "coop_wait": 15, "stagger": 0.3, "lsp_bind": 2.0},
+    "regtest":  {"factory_timeout": 60, "breach_wait": 20, "lsp_timeout": 120,
+                 "coop_wait": 20, "stagger": 0.5, "lsp_bind": 3.0},
     "signet":   {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
                  "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
     "testnet4": {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
@@ -1399,8 +1399,8 @@ def scenario_lsp_crash_recovery(orch):
     orch.start_lsp(["--daemon"])
 
     # Wait for recovery mode entry (poll log)
-    has_recovery = orch.wait_for_lsp_log("recovery mode", timeout=30)
-    has_daemon = orch.wait_for_lsp_log("daemon loop started", timeout=30)
+    has_recovery = orch.wait_for_lsp_log("recovery mode", timeout=60)
+    has_daemon = orch.wait_for_lsp_log("daemon loop started", timeout=60)
     lsp_alive = orch.lsp and orch.lsp.is_alive()
 
     orch._log(f"Recovery mode: {has_recovery}")

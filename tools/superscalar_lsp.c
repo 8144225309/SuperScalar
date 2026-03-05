@@ -2174,10 +2174,24 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            /* Verify local PCP for commitment #0 is still available.
+               The local_pcs array retains all entries (no pruning), so this
+               should always succeed.  Log diagnostic if it doesn't. */
+            {
+                secp256k1_pubkey local_pcp_check;
+                if (!channel_get_per_commitment_point(chX, 0, &local_pcp_check)) {
+                    fprintf(stderr, "BREACH TEST: local PCP for commitment 0 unavailable "
+                            "(channel %zu, n_local_pcs=%zu) — build will fail\n",
+                            ci, chX->n_local_pcs);
+                }
+            }
+
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            int built = channel_build_commitment_tx_for_remote(chX, &old_commit_tx, old_txid);
+            /* Build the LSP's OWN old commitment (not the client's).
+               Client watchtowers watch for the LSP's commitment txid. */
+            int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
 
             /* Restore current state */
             chX->commitment_number = saved_num;
@@ -3352,10 +3366,46 @@ int main(int argc, char *argv[]) {
         }
         printf("  Factory 1 channels ready\n");
 
+        /* --- Phase C.5: Wait for client reconnections --- */
+        /* Clients disconnect after rotation to reload cleanly from DB
+           (Bug 11 fix in superscalar_client.c:1067-1072), then reconnect.
+           We must accept those reconnections before cooperative close,
+           otherwise lsp_run_cooperative_close sends to stale FDs. */
+        {
+            size_t reconnected = 0;
+            printf("  Waiting for client reconnections...\n");
+            for (int attempt = 0; attempt < 30 && reconnected < (size_t)n_clients; attempt++) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(lsp.listen_fd, &rfds);
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                int sel = select(lsp.listen_fd + 1, &rfds, NULL, NULL, &tv);
+                if (sel <= 0) continue;
+
+                int new_fd = wire_accept(lsp.listen_fd);
+                if (new_fd < 0) continue;
+
+                /* Noise handshake */
+                int hs;
+                if (lsp.use_nk)
+                    hs = wire_noise_handshake_nk_responder(new_fd, ctx, lsp.nk_seckey);
+                else
+                    hs = wire_noise_handshake_responder(new_fd, ctx);
+                if (!hs) { wire_close(new_fd); continue; }
+
+                if (lsp_channels_handle_reconnect(mgr2, &lsp, new_fd))
+                    reconnected++;
+            }
+            if (reconnected < (size_t)n_clients) {
+                fprintf(stderr, "ROTATION: only %zu/%d clients reconnected\n",
+                        reconnected, n_clients);
+                free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            printf("  All %d clients reconnected\n", n_clients);
+        }
+
         /* --- Phase D: Cooperative close on Factory 1 --- */
-        /* Note: payment test skipped here because clients disconnect after
-           rotation to reconnect from persisted state (see client.c:1067).
-           Payment on rotated factories is tested via daemon mode + orchestrator. */
         printf("Phase D: Cooperative close of Factory 1\n");
 
         /* Cooperative close of Factory 1 */
