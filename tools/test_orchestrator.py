@@ -573,7 +573,11 @@ def scenario_all_watch(orch):
     rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
 
-    # Give clients a moment to process watchtower + CPFP cycles
+    # Mine blocks to confirm the breach TX — watchtowers scan blocks, not mempool.
+    # Without this, the revoked commitment sits unconfirmed and clients miss it.
+    orch.advance_chain(2)
+
+    # Give clients time to poll the new blocks and detect the breach
     time.sleep(orch.timing["breach_wait"])
 
     # Check which clients detected the breach and broadcast CPFP
@@ -1776,11 +1780,19 @@ def main():
     scenarios_to_run = list(SCENARIOS.keys()) if args.scenario == "all" else [args.scenario]
     results = {}
 
-    for name in scenarios_to_run:
+    for idx, name in enumerate(scenarios_to_run):
         if name not in SCENARIOS:
             print(f"Unknown scenario: {name}")
             list_scenarios()
             return 1
+
+        # Kill stale processes between scenarios to avoid port conflicts
+        if idx > 0:
+            subprocess.run(["pkill", "-9", "-f", "superscalar_lsp"],
+                           capture_output=True, timeout=5)
+            subprocess.run(["pkill", "-9", "-f", "superscalar_client"],
+                           capture_output=True, timeout=5)
+            time.sleep(2)
 
         orch = Orchestrator(
             n_clients=args.clients,
