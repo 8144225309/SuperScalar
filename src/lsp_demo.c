@@ -828,8 +828,8 @@ int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         lsp_channels_print_balances(mgr);
 
-        printf("--- Payment 4: Client 2 -> Client 1 (500 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 1, 0, 500)) {
+        printf("--- Payment 4: Client 2 -> Client 1 (600 sats) ---\n");
+        if (!lsp_channels_initiate_payment(mgr, lsp, 1, 0, 600)) {
             fprintf(stderr, "LSP demo: payment 4 failed\n");
             return 0;
         }

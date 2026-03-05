@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <time.h>
 
-#define BRIDGE_MAX_PENDING 32
+#define BRIDGE_MAX_PENDING 256
 
 /* Pending inbound HTLC (from CLN plugin, waiting for LSP resolution) */
 typedef struct {
@@ -39,6 +39,11 @@ typedef struct {
     char lsp_host[256];                 /* saved for reconnect */
     int lsp_port;                       /* saved for reconnect */
     int reconnect_attempts;             /* consecutive failed attempts */
+
+    /* Plugin read buffer (avoids 1-byte-at-a-time syscalls) */
+    char plugin_read_buf[4096];
+    size_t plugin_read_len;             /* valid bytes in buffer */
+    size_t plugin_read_pos;             /* current scan position */
 } bridge_t;
 
 /* Initialize bridge state. */

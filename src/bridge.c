@@ -155,33 +155,42 @@ int bridge_send_plugin_json(bridge_t *br, cJSON *json) {
     return w == 1;
 }
 
-/* Read one newline-delimited line from plugin_fd */
+/* Read one newline-delimited line from plugin_fd (buffered) */
 char *bridge_read_plugin_line(bridge_t *br) {
     if (br->plugin_fd < 0) return NULL;
 
     size_t cap = 4096;
     size_t len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) return NULL;
+    char *line = (char *)malloc(cap);
+    if (!line) return NULL;
 
     while (1) {
-        char c;
-        ssize_t n = read(br->plugin_fd, &c, 1);
+        /* Scan buffered data for newline */
+        while (br->plugin_read_pos < br->plugin_read_len) {
+            char c = br->plugin_read_buf[br->plugin_read_pos++];
+            if (c == '\n') {
+                line[len] = '\0';
+                return line;
+            }
+            if (len + 1 >= cap) {
+                cap *= 2;
+                char *tmp = (char *)realloc(line, cap);
+                if (!tmp) { free(line); return NULL; }
+                line = tmp;
+            }
+            line[len++] = c;
+        }
+
+        /* Buffer exhausted — refill from fd */
+        ssize_t n = read(br->plugin_fd, br->plugin_read_buf,
+                         sizeof(br->plugin_read_buf));
         if (n <= 0) {
-            free(buf);
+            free(line);
             return NULL;
         }
-        if (c == '\n') break;
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *tmp = (char *)realloc(buf, cap);
-            if (!tmp) { free(buf); return NULL; }
-            buf = tmp;
-        }
-        buf[len++] = c;
+        br->plugin_read_len = (size_t)n;
+        br->plugin_read_pos = 0;
     }
-    buf[len] = '\0';
-    return buf;
 }
 
 /* Handle a wire message from the LSP */
@@ -457,6 +466,8 @@ int bridge_run(bridge_t *br) {
                 fprintf(stderr, "Bridge: plugin connection lost\n");
                 wire_close(br->plugin_fd);
                 br->plugin_fd = -1;
+                br->plugin_read_len = 0;
+                br->plugin_read_pos = 0;
                 continue;
             }
             if (!bridge_handle_plugin_msg(br, line)) {

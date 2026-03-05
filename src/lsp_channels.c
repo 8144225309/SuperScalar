@@ -688,6 +688,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(cs);
     }
 
+    int sender_batch = 0;
+
     /* Wait for REVOKE_AND_ACK from sender */
     {
         wire_msg_t ack_msg;
@@ -713,6 +715,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+                /* Begin batch for sender-side persists (PCS/PCP + balance + HTLC) */
+                if (mgr->persist && !persist_in_transaction((persist_t *)mgr->persist)) {
+                    persist_begin((persist_t *)mgr->persist);
+                    sender_batch = 1;
+                }
                 /* Persist remote PCPs for crash recovery */
                 if (mgr->persist) {
                     unsigned char ser[33];
@@ -763,6 +770,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         if (own_txn) persist_commit(db);
     }
+    /* Commit sender batch (PCS/PCP + balance + HTLC in one fsync) */
+    if (sender_batch)
+        persist_commit((persist_t *)mgr->persist);
 
     /* Find destination: check dest_client field, then bolt11 for bridge routing */
     cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
@@ -931,6 +941,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(cs);
     }
 
+    int dest_batch = 0;
+
     /* Wait for REVOKE_AND_ACK from dest */
     {
         wire_msg_t ack_msg;
@@ -956,6 +968,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                /* Begin batch for dest-side persists (PCS/PCP + balance) */
+                if (mgr->persist && !persist_in_transaction((persist_t *)mgr->persist)) {
+                    persist_begin((persist_t *)mgr->persist);
+                    dest_batch = 1;
+                }
                 if (mgr->persist) {
                     unsigned char ser[33];
                     size_t slen = 33;
@@ -982,12 +999,20 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     free(old_dest_htlcs);
 
-    /* Persist dest channel balance after successful revocation (Gap 2B) */
-    if (mgr->persist)
-        persist_update_channel_balance((persist_t *)mgr->persist,
+    /* Persist dest channel balance after successful revocation */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+        persist_update_channel_balance(db,
             (uint32_t)dest_idx,
             dest_ch->local_amount, dest_ch->remote_amount,
             dest_ch->commitment_number);
+        if (own_txn) persist_commit(db);
+    }
+    /* Commit dest batch (PCS/PCP + balance in one fsync) */
+    if (dest_batch)
+        persist_commit((persist_t *)mgr->persist);
 
     printf("LSP: HTLC %llu forwarded: client %zu -> client %zu (%llu sats)\n",
            (unsigned long long)new_htlc_id, sender_idx, dest_idx,
