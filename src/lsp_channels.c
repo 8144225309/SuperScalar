@@ -723,6 +723,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         (uint32_t)sender_idx,
                         sender_ch->commitment_number + 1, ser);
                 }
+                /* Persist LSP's own local PCS for sender channel */
+                unsigned char pcs[32];
+                if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number, pcs))
+                    persist_save_local_pcs((persist_t *)mgr->persist,
+                        (uint32_t)sender_idx, sender_ch->commitment_number, pcs);
+                if (channel_get_local_pcs(sender_ch, sender_ch->commitment_number + 1, pcs))
+                    persist_save_local_pcs((persist_t *)mgr->persist,
+                        (uint32_t)sender_idx, sender_ch->commitment_number + 1, pcs);
+                memset(pcs, 0, 32);
             }
             /* Bidirectional: send LSP's own revocation to sender */
             lsp_send_revocation(mgr, lsp, sender_idx, old_cn);
@@ -956,6 +965,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         (uint32_t)dest_idx,
                         dest_ch->commitment_number + 1, ser);
                 }
+                /* Persist LSP's own local PCS for dest channel */
+                unsigned char pcs[32];
+                if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+                    persist_save_local_pcs((persist_t *)mgr->persist,
+                        (uint32_t)dest_idx, dest_ch->commitment_number, pcs);
+                if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+                    persist_save_local_pcs((persist_t *)mgr->persist,
+                        (uint32_t)dest_idx, dest_ch->commitment_number + 1, pcs);
+                memset(pcs, 0, 32);
             }
             /* Bidirectional: send LSP's own revocation to dest */
             lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
@@ -2317,6 +2335,29 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 ch->commitment_number + 1, pcp_ser) &&
             secp256k1_ec_pubkey_parse(mgr->ctx, &pcp, pcp_ser, 33))
             channel_set_remote_pcp(ch, ch->commitment_number + 1, &pcp);
+    }
+
+    /* 6c. Restore LSP's own local PCS from DB */
+    if (mgr->persist) {
+        size_t pcs_max = (size_t)(ch->commitment_number + 2);
+        unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
+        if (pcs_arr) {
+            size_t pcs_loaded = 0;
+            persist_load_local_pcs((persist_t *)mgr->persist, (uint32_t)c,
+                                    pcs_arr, pcs_max, &pcs_loaded);
+            for (uint64_t cn = 0; cn < pcs_max; cn++) {
+                int nonzero = 0;
+                for (int j = 0; j < 32; j++)
+                    if (pcs_arr[cn][j]) { nonzero = 1; break; }
+                if (nonzero)
+                    channel_set_local_pcs(ch, cn, pcs_arr[cn]);
+            }
+            memset(pcs_arr, 0, pcs_max * 32);
+            free(pcs_arr);
+        }
+        /* Generate PCS for any missing commitment numbers */
+        for (uint64_t cn = ch->n_local_pcs; cn <= ch->commitment_number + 1; cn++)
+            channel_generate_local_pcs(ch, cn);
     }
 
     /* 7. Re-init nonce pool */

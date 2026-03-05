@@ -1526,9 +1526,29 @@ int client_run_reconnect(secp256k1_context *ctx,
         channel.remote_amount = remote_amount;
         channel.commitment_number = commitment_number;
 
-        /* Ensure local PCS exist for the restored commitment number.
-           channel_init generated PCS for cn=0 and cn=1; if commitment_number > 1,
-           we need to generate PCS for the current and next commitment. */
+        /* Restore local per-commitment secrets from DB.  These MUST match
+           the per-commitment points the LSP has stored as our remote PCPs,
+           otherwise commitment signature verification fails post-reconnect. */
+        if (db) {
+            size_t pcs_max = (size_t)(commitment_number + 2);
+            unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
+            if (pcs_arr) {
+                size_t pcs_loaded = 0;
+                persist_load_local_pcs(db, 0, pcs_arr, pcs_max, &pcs_loaded);
+                for (uint64_t cn = 0; cn < pcs_max; cn++) {
+                    /* Check if entry was loaded (non-zero) */
+                    int nonzero = 0;
+                    for (int j = 0; j < 32; j++)
+                        if (pcs_arr[cn][j]) { nonzero = 1; break; }
+                    if (nonzero)
+                        channel_set_local_pcs(&channel, cn, pcs_arr[cn]);
+                }
+                memset(pcs_arr, 0, pcs_max * 32);
+                free(pcs_arr);
+            }
+        }
+
+        /* Generate random PCS only for commitment numbers not restored from DB */
         for (uint64_t cn = channel.n_local_pcs; cn <= commitment_number + 1; cn++)
             channel_generate_local_pcs(&channel, cn);
 

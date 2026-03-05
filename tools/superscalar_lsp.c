@@ -1904,6 +1904,15 @@ int main(int argc, char *argv[]) {
                         ch_ok = 0;
                         break;
                     }
+                    /* Save initial local PCS */
+                    channel_t *ch = &mgr->entries[c].channel;
+                    for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+                        unsigned char pcs[32];
+                        if (channel_get_local_pcs(ch, cn, pcs)) {
+                            persist_save_local_pcs(&db, (uint32_t)c, cn, pcs);
+                            memset(pcs, 0, 32);
+                        }
+                    }
                 }
                 if (ch_ok)
                     persist_commit(&db);
