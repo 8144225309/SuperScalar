@@ -1657,13 +1657,19 @@ int main(int argc, char *argv[]) {
         lsp.factory.profiles[pi].timezone_bucket = 0;
     }
 
-    /* If --test-burn, enable shachain-based L-stock before tree construction.
-       The seed is preserved across factory_init_from_pubkeys() in lsp.c. */
+    /* If --test-burn, enable L-stock revocation before tree construction.
+       Uses flat secrets (per ZmnSCPxj: no multi-party shachain method exists,
+       just store all revocation keys independently).
+       State is preserved across factory_init_from_pubkeys() in lsp.c. */
     if (test_burn) {
-        unsigned char burn_seed[32];
-        memset(burn_seed, 0xBB, 32);  /* deterministic test seed */
-        factory_set_shachain_seed(&lsp.factory, burn_seed);
-        printf("LSP: shachain seed set for burn test\n");
+        if (!factory_generate_flat_secrets(&lsp.factory, 16)) {
+            fprintf(stderr, "LSP: failed to generate flat revocation secrets\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("LSP: flat revocation secrets generated for burn test (%zu epochs)\n",
+               lsp.factory.n_revocation_secrets);
     }
 
     printf("LSP: starting factory creation ceremony...\n");
