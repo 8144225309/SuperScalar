@@ -592,6 +592,19 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
         cJSON_AddItemToArray(profiles, item);
     }
     cJSON_AddItemToObject(j, "profiles", profiles);
+
+    /* L-stock hashlock hashes: SHA256(revocation_secret) per epoch.
+       Clients need these to build matching L-stock taptrees. */
+    if (f->n_l_stock_hashes > 0) {
+        cJSON *hashes = cJSON_CreateArray();
+        for (size_t i = 0; i < f->n_l_stock_hashes; i++) {
+            char hex[65];
+            hex_encode(f->l_stock_hashes[i], 32, hex);
+            cJSON_AddItemToArray(hashes, cJSON_CreateString(hex));
+        }
+        cJSON_AddItemToObject(j, "l_stock_hashes", hashes);
+    }
+
     return j;
 }
 

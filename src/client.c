@@ -516,6 +516,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         }
     }
 
+    /* Parse L-stock hashlock hashes (optional) */
+    unsigned char rot_hashes[FACTORY_MAX_EPOCHS][32];
+    size_t rot_n_hashes = 0;
+    cJSON *rlsh_arr = cJSON_GetObjectItem(pj, "l_stock_hashes");
+    if (rlsh_arr && cJSON_IsArray(rlsh_arr)) {
+        int rlsh_n = cJSON_GetArraySize(rlsh_arr);
+        for (int rhi = 0; rhi < rlsh_n && rhi < FACTORY_MAX_EPOCHS; rhi++) {
+            cJSON *rh = cJSON_GetArrayItem(rlsh_arr, rhi);
+            if (rh && cJSON_IsString(rh) &&
+                hex_decode(rh->valuestring, rot_hashes[rot_n_hashes], 32) == 32)
+                rot_n_hashes++;
+        }
+    }
+
     /* Build factory locally */
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
@@ -528,6 +542,8 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
     else if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
+    if (rot_n_hashes > 0)
+        factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
@@ -975,6 +991,21 @@ int client_run_with_channels(secp256k1_context *ctx,
             if (v && cJSON_IsNumber(v)) profiles[pi].timezone_bucket = (uint8_t)v->valuedouble;
         }
     }
+    /* Parse L-stock hashlock hashes (optional — present when LSP has
+       revocation secrets for burn TX enforcement). */
+    unsigned char parsed_l_stock_hashes[FACTORY_MAX_EPOCHS][32];
+    size_t n_parsed_hashes = 0;
+    cJSON *lsh_arr = cJSON_GetObjectItem(msg.json, "l_stock_hashes");
+    if (lsh_arr && cJSON_IsArray(lsh_arr)) {
+        int lsh_n = cJSON_GetArraySize(lsh_arr);
+        for (int hi = 0; hi < lsh_n && hi < FACTORY_MAX_EPOCHS; hi++) {
+            cJSON *h = cJSON_GetArrayItem(lsh_arr, hi);
+            if (h && cJSON_IsString(h) &&
+                hex_decode(h->valuestring, parsed_l_stock_hashes[n_parsed_hashes], 32) == 32)
+                n_parsed_hashes++;
+        }
+    }
+
     cJSON_Delete(msg.json);
 
     /* Build factory locally */
@@ -990,6 +1021,8 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_level_arity(&factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
         factory_set_arity(&factory, FACTORY_ARITY_1);
+    if (n_parsed_hashes > 0)
+        factory_set_l_stock_hashes(&factory, parsed_l_stock_hashes, n_parsed_hashes);
     factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
