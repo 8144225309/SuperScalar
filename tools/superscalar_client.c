@@ -340,6 +340,20 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
             }
         }
 
+        /* Persist our own local PCS so they survive crash/reconnect.
+           Without this, reconnect generates new random PCS that don't
+           match the PCPs the LSP has stored, breaking sig verification. */
+        if (cbd && cbd->db) {
+            unsigned char pcs[32];
+            if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
+                persist_save_local_pcs(cbd->db, 0,
+                    ch->commitment_number, pcs);
+            if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
+                persist_save_local_pcs(cbd->db, 0,
+                    ch->commitment_number + 1, pcs);
+            memset(pcs, 0, 32);
+        }
+
         memset(lsp_rev_secret, 0, 32);
     }
     cJSON_Delete(rev_msg.json);
@@ -361,6 +375,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch)) {
+                /* Save initial local PCS so they survive crash before first payment */
+                for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+                    unsigned char pcs[32];
+                    if (channel_get_local_pcs(ch, cn, pcs)) {
+                        persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                        memset(pcs, 0, 32);
+                    }
+                }
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);

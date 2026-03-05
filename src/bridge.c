@@ -398,7 +398,17 @@ int bridge_run(bridge_t *br) {
                 if (!wire_send(br->lsp_fd, MSG_BRIDGE_HELLO, ping)) {
                     cJSON_Delete(ping);
                     fprintf(stderr, "Bridge: ping failed, attempting reconnect\n");
-                    if (!bridge_reconnect_lsp(br))
+                    int reconnected = 0;
+                    for (int attempt = 0; attempt < 12; attempt++) {
+                        if (bridge_reconnect_lsp(br)) {
+                            reconnected = 1;
+                            break;
+                        }
+                        int delay = (attempt < 3) ? 2 : (attempt < 6) ? 5 : 10;
+                        fprintf(stderr, "Bridge: reconnect failed, retrying in %ds...\n", delay);
+                        sleep(delay);
+                    }
+                    if (!reconnected)
                         return 0;
                 } else {
                     cJSON_Delete(ping);
@@ -418,9 +428,18 @@ int bridge_run(bridge_t *br) {
             wire_msg_t msg;
             if (!wire_recv(br->lsp_fd, &msg)) {
                 fprintf(stderr, "Bridge: LSP connection lost\n");
-                /* Attempt reconnect */
-                if (bridge_reconnect_lsp(br))
-                    continue;
+                /* Attempt reconnect with retry */
+                int reconnected = 0;
+                for (int attempt = 0; attempt < 12; attempt++) {
+                    if (bridge_reconnect_lsp(br)) {
+                        reconnected = 1;
+                        break;
+                    }
+                    int delay = (attempt < 3) ? 2 : (attempt < 6) ? 5 : 10;
+                    fprintf(stderr, "Bridge: reconnect failed, retrying in %ds...\n", delay);
+                    sleep(delay);
+                }
+                if (reconnected) continue;
                 return 0;
             }
             br->last_lsp_activity = time(NULL);
