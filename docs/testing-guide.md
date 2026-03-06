@@ -52,11 +52,11 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 415 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
+| Unit tests | 418 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
 | Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
 | Orchestrator scenarios | 23 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation |
 | Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
-| **Total** | **458 + 25 manual** | | |
+| **Total** | **461 + 25 manual** | | |
 
 ---
 
@@ -69,14 +69,16 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 415/415 passed`
+Expected output: `Results: 418/418 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
-MuSig2 signing, transaction building, tapscript, factory trees, channels
-with HTLCs, penalty construction, wire protocol serialization, SQLite
-persistence, watchtower logic, CLN bridge messages, Tor SOCKS5 protocol,
-NK-authenticated Noise handshakes, client placement strategies, ceremony
-state machines, distributed state advances, and profit settlement.
+MuSig2 signing, transaction building, tapscript (including 2-leaf taptree
+with revocation checksig leaf), factory trees, channels with HTLCs,
+penalty construction (key-path and script-path), wire protocol
+serialization, SQLite persistence, watchtower logic, CLN bridge messages,
+Tor SOCKS5 protocol, NK-authenticated Noise handshakes, client placement
+strategies, ceremony state machines, distributed state advances, and
+profit settlement.
 
 ---
 
