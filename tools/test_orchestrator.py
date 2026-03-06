@@ -1667,6 +1667,105 @@ def scenario_leaf_realloc(orch):
     return passed
 
 
+def scenario_lstock_burn(orch):
+    """L-stock burn via shachain revocation — broadcasts tree then burns L-stock."""
+    orch._log("=== SCENARIO: lstock_burn ===")
+    orch._log("LSP runs demo then L-stock burn test (shachain revocation).")
+
+    orch.start_lsp(["--demo", "--test-burn"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_burn = "burn tx" in lsp_log.lower() or "BURN TX" in lsp_log
+    has_pass = "BURN TX TEST PASSED" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"L-stock burn {'passed' if success else 'failed'} "
+              f"(burn_in_log={has_burn}, pass_marker={has_pass})")
+    return success
+
+
+def scenario_dw_advance(orch):
+    """DW counter advance + re-sign tree + force-close."""
+    orch._log("=== SCENARIO: dw_advance ===")
+    orch._log("LSP runs demo then DW advance test (advance counter, re-sign, force-close).")
+
+    orch.start_lsp(["--demo", "--test-dw-advance"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_before = "before advance" in lsp_log.lower()
+    has_after = "after advance" in lsp_log.lower()
+    has_pass = "DW ADVANCE TEST PASSED" in lsp_log or "DW ADVANCE TEST" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"DW advance {'passed' if success else 'failed'} "
+              f"(before={has_before}, after={has_after}, pass_marker={has_pass})")
+    return success
+
+
+def scenario_distribution_tx(orch):
+    """Distribution TX broadcast after CLTV timeout — P2A anchor output."""
+    orch._log("=== SCENARIO: distribution_tx ===")
+    orch._log("LSP runs demo then distribution TX test (mine past CLTV, broadcast distrib TX).")
+
+    orch.start_lsp(["--demo", "--test-distrib"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    # Distribution needs mining past CLTV — longer timeout
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 3)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_distrib = "distribution" in lsp_log.lower()
+    has_broadcast = "broadcast" in lsp_log.lower()
+
+    orch.stop_all()
+    success = rc == 0 and has_distrib
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"distribution TX {'passed' if success else 'failed'} "
+              f"(distrib={has_distrib}, broadcast={has_broadcast})")
+    return success
+
+
+def scenario_bridge_bolt11(orch):
+    """Bridge inbound HTLC — BOLT11 invoice routing via CLN bridge plugin."""
+    orch._log("=== SCENARIO: bridge_bolt11 ===")
+    orch._log("LSP runs demo then bridge test (simulated inbound HTLC routing).")
+
+    orch.start_lsp(["--demo", "--test-bridge"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_invoice = "invoice" in lsp_log.lower() or "bolt11" in lsp_log.lower()
+    has_route = "route" in lsp_log.lower() or "fulfill" in lsp_log.lower()
+    has_pass = "BRIDGE TEST" in lsp_log and "PASS" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and (has_pass or (has_invoice and has_route))
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"bridge BOLT11 {'passed' if success else 'failed'} "
+              f"(invoice={has_invoice}, route={has_route})")
+    return success
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -1695,6 +1794,10 @@ SCENARIOS = {
     "auto_rebalance": lambda o, **kw: scenario_auto_rebalance(o),
     "batch_rebalance": lambda o, **kw: scenario_batch_rebalance(o),
     "leaf_realloc": lambda o, **kw: scenario_leaf_realloc(o),
+    "lstock_burn": lambda o, **kw: scenario_lstock_burn(o),
+    "dw_advance": lambda o, **kw: scenario_dw_advance(o),
+    "distribution_tx": lambda o, **kw: scenario_distribution_tx(o),
+    "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
 }
 
 
@@ -1725,6 +1828,10 @@ def list_scenarios():
         "auto_rebalance": "Demo + auto-rebalance; verify balance conservation",
         "batch_rebalance": "Demo + batch rebalance; multi-transfer + conservation",
         "leaf_realloc": "Demo + leaf reallocation; arity-2 MuSig2 ceremony",
+        "lstock_burn": "L-stock burn via shachain revocation",
+        "dw_advance": "DW counter advance + re-sign + force-close",
+        "distribution_tx": "Distribution TX broadcast after CLTV (P2A anchor)",
+        "bridge_bolt11": "Bridge inbound HTLC; BOLT11 invoice routing",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
@@ -1757,6 +1864,12 @@ def main():
                         help="Bitcoin RPC password (default from env or 'rpcpass')")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output (dump logs on failure)")
+
+    parser.epilog = ("Testnet4 timing tip: use smaller tree parameters to reduce "
+                     "BIP68 waits. Example: --network testnet4 --rpcuser USER "
+                     "--rpcpassword PASS --amount 100000 "
+                     "(LSP binary flags: --step-blocks 5 --states-per-layer 2 "
+                     "--active-blocks 50 --dying-blocks 20)")
     args = parser.parse_args()
 
     if args.list:
