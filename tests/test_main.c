@@ -84,6 +84,7 @@ extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
 extern int test_tapscript_control_block(void);
 extern int test_tapscript_sighash(void);
+extern int test_revocation_checksig_leaf(void);
 extern int test_factory_tree_with_timeout(void);
 extern int test_multi_level_timeout_unit(void);
 extern int test_regtest_timeout_spend(void);
@@ -102,6 +103,8 @@ extern int test_channel_sign_commitment(void);
 extern int test_channel_update(void);
 extern int test_channel_revocation(void);
 extern int test_channel_penalty_tx(void);
+extern int test_penalty_tx_script_path(void);
+extern int test_penalty_tx_key_path_2leaf(void);
 extern int test_regtest_channel_unilateral(void);
 extern int test_regtest_channel_penalty(void);
 
@@ -700,6 +703,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tapscript_tweak_with_tree);
     RUN_TEST(test_tapscript_control_block);
     RUN_TEST(test_tapscript_sighash);
+    RUN_TEST(test_revocation_checksig_leaf);
     RUN_TEST(test_factory_tree_with_timeout);
     RUN_TEST(test_multi_level_timeout_unit);
 
@@ -719,6 +723,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_channel_update);
     RUN_TEST(test_channel_revocation);
     RUN_TEST(test_channel_penalty_tx);
+    RUN_TEST(test_penalty_tx_script_path);
+    RUN_TEST(test_penalty_tx_key_path_2leaf);
 
     printf("\n=== HTLC (Phase 6) ===\n");
     RUN_TEST(test_htlc_offered_scripts);

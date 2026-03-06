@@ -4527,3 +4527,248 @@ int test_regtest_htlc_wrong_preimage_rejected(void) {
     channel_cleanup(&ch);
     return 1;
 }
+
+/* ---- Penalty TX with 2-leaf taptree (script-path revocation) ---- */
+
+int test_penalty_tx_script_path(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    /* LOCAL channel with use_revocation_leaf=1 */
+    channel_t local_ch;
+    TEST_ASSERT(setup_channel(&local_ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup local channel");
+    local_ch.use_revocation_leaf = 1;
+
+    /* REMOTE channel (mirror perspective) with use_revocation_leaf=1 */
+    channel_t remote_ch;
+    TEST_ASSERT(channel_init(&remote_ch, ctx, remote_funding_secret,
+                               &remote_fund_pk, &local_fund_pk,
+                               fake_txid, 0, 100000, fund_spk, 34,
+                               30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
+                "init remote channel");
+    remote_ch.funder_is_local = 0;
+    remote_ch.use_revocation_leaf = 1;
+
+    secp256k1_pubkey lp, ld, lr;
+    if (!secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret)) return 0;
+
+    channel_set_local_basepoints(&remote_ch, remote_payment_secret,
+                                   remote_delayed_secret,
+                                   remote_revocation_secret);
+    channel_set_remote_basepoints(&remote_ch, &lp, &ld, &lr);
+
+    /* Exchange initial per-commitment points */
+    {
+        secp256k1_pubkey lp0, rp0;
+        channel_get_per_commitment_point(&local_ch, 0, &lp0);
+        channel_get_per_commitment_point(&remote_ch, 0, &rp0);
+        channel_set_remote_pcp(&local_ch, 0, &rp0);
+        channel_set_remote_pcp(&remote_ch, 0, &lp0);
+    }
+
+    /* Build local's commitment tx #0 */
+    tx_buf_t local_unsigned;
+    tx_buf_init(&local_unsigned, 256);
+    unsigned char local_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&local_ch, &local_unsigned, local_txid),
+                "build local commitment #0");
+
+    /* Advance local to #1 */
+    TEST_ASSERT(channel_update(&local_ch, 10000), "local update");
+
+    /* Exchange revocation: local reveals secret for #0 */
+    unsigned char secret0[32];
+    TEST_ASSERT(channel_get_revocation_secret(&local_ch, 0, secret0),
+                "get revocation secret #0");
+    TEST_ASSERT(channel_receive_revocation(&remote_ch, 0, secret0),
+                "remote receive revocation #0");
+
+    /* Extract to-local SPK from local's old commitment tx #0 */
+    unsigned char to_local_spk[34];
+    memcpy(to_local_spk, local_unsigned.data + 47 + 8 + 1, 34);
+    uint64_t to_local_amount = 70000;
+
+    /* Build script-path penalty tx */
+    tx_buf_t penalty_tx;
+    tx_buf_init(&penalty_tx, 512);
+    TEST_ASSERT(channel_build_penalty_tx_script_path(&remote_ch, &penalty_tx,
+                                                       local_txid, 0,
+                                                       to_local_amount, to_local_spk, 34,
+                                                       0, NULL, 0),
+                "build script-path penalty tx");
+
+    TEST_ASSERT(penalty_tx.len > 0, "script-path penalty tx non-empty");
+
+    /* Verify: the penalty output amount should be reasonable */
+    /* Script-path vsize ~185 vB, fee_rate=1000 sat/kvB -> fee ~185 sats */
+    uint64_t sp_vsize = 185;
+    uint64_t sp_fee = (remote_ch.fee_rate_sat_per_kvb * sp_vsize + 999) / 1000;
+    uint64_t expected_amount = to_local_amount - sp_fee;
+    TEST_ASSERT(expected_amount > CHANNEL_DUST_LIMIT_SATS, "penalty above dust");
+
+    tx_buf_free(&local_unsigned);
+    tx_buf_free(&penalty_tx);
+    channel_cleanup(&local_ch);
+    channel_cleanup(&remote_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_penalty_tx_key_path_2leaf(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    /* LOCAL channel with use_revocation_leaf=1 */
+    channel_t local_ch;
+    TEST_ASSERT(setup_channel(&local_ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup local channel");
+    local_ch.use_revocation_leaf = 1;
+
+    /* REMOTE channel (mirror perspective) with use_revocation_leaf=1 */
+    channel_t remote_ch;
+    TEST_ASSERT(channel_init(&remote_ch, ctx, remote_funding_secret,
+                               &remote_fund_pk, &local_fund_pk,
+                               fake_txid, 0, 100000, fund_spk, 34,
+                               30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
+                "init remote channel");
+    remote_ch.funder_is_local = 0;
+    remote_ch.use_revocation_leaf = 1;
+
+    secp256k1_pubkey lp, ld, lr;
+    if (!secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret)) return 0;
+
+    channel_set_local_basepoints(&remote_ch, remote_payment_secret,
+                                   remote_delayed_secret,
+                                   remote_revocation_secret);
+    channel_set_remote_basepoints(&remote_ch, &lp, &ld, &lr);
+
+    /* Exchange initial per-commitment points */
+    {
+        secp256k1_pubkey lp0, rp0;
+        channel_get_per_commitment_point(&local_ch, 0, &lp0);
+        channel_get_per_commitment_point(&remote_ch, 0, &rp0);
+        channel_set_remote_pcp(&local_ch, 0, &rp0);
+        channel_set_remote_pcp(&remote_ch, 0, &lp0);
+    }
+
+    /* Build local's commitment tx #0 */
+    tx_buf_t local_unsigned;
+    tx_buf_init(&local_unsigned, 256);
+    unsigned char local_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&local_ch, &local_unsigned, local_txid),
+                "build local commitment #0");
+
+    secp256k1_keypair remote_kp;
+    if (!secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret)) return 0;
+
+    tx_buf_t local_signed;
+    tx_buf_init(&local_signed, 512);
+    TEST_ASSERT(channel_sign_commitment(&local_ch, &local_signed, &local_unsigned,
+                                          &remote_kp),
+                "sign local commitment #0");
+
+    /* Advance local to #1 */
+    TEST_ASSERT(channel_update(&local_ch, 10000), "local update");
+
+    /* Exchange revocation */
+    unsigned char secret0[32];
+    TEST_ASSERT(channel_get_revocation_secret(&local_ch, 0, secret0),
+                "get revocation secret #0");
+    TEST_ASSERT(channel_receive_revocation(&remote_ch, 0, secret0),
+                "remote receive revocation #0");
+
+    unsigned char to_local_spk[34];
+    memcpy(to_local_spk, local_unsigned.data + 47 + 8 + 1, 34);
+    uint64_t to_local_amount = 70000;
+
+    /* Key-path penalty should still work with 2-leaf taptree */
+    tx_buf_t penalty_tx;
+    tx_buf_init(&penalty_tx, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&remote_ch, &penalty_tx,
+                                           local_txid, 0,
+                                           to_local_amount, to_local_spk, 34,
+                                           0, NULL, 0),
+                "build key-path penalty tx with 2-leaf taptree");
+
+    TEST_ASSERT(penalty_tx.len > 0, "key-path penalty tx non-empty");
+
+    /* Verify signature is valid against the to-local output key */
+    secp256k1_xonly_pubkey to_local_output_key;
+    TEST_ASSERT(secp256k1_xonly_pubkey_parse(ctx, &to_local_output_key,
+                                               to_local_spk + 2),
+                "parse to-local output key");
+
+    /* Rebuild unsigned penalty for sighash verification */
+    uint64_t penalty_fee = (remote_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    uint64_t penalty_output_amount = to_local_amount - penalty_fee;
+
+    unsigned char penalty_out_spk[34];
+    memcpy(penalty_out_spk, penalty_tx.data + 58, 34);
+
+    tx_output_t penalty_output;
+    memcpy(penalty_output.script_pubkey, penalty_out_spk, 34);
+    penalty_output.script_pubkey_len = 34;
+    penalty_output.amount_sats = penalty_output_amount;
+
+    tx_buf_t penalty_unsigned;
+    tx_buf_init(&penalty_unsigned, 256);
+    build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 0,
+                       0xFFFFFFFD, &penalty_output, 1);
+
+    unsigned char penalty_sighash[32];
+    TEST_ASSERT(compute_taproot_sighash(penalty_sighash,
+                                          penalty_unsigned.data, penalty_unsigned.len,
+                                          0, to_local_spk, 34,
+                                          to_local_amount, 0xFFFFFFFD),
+                "compute penalty sighash");
+
+    size_t witness_offset = penalty_unsigned.len - 2;
+    unsigned char penalty_sig[64];
+    memcpy(penalty_sig, penalty_tx.data + witness_offset + 2, 64);
+
+    int valid = secp256k1_schnorrsig_verify(ctx, penalty_sig, penalty_sighash, 32,
+                                              &to_local_output_key);
+    TEST_ASSERT(valid, "key-path penalty sig valid with 2-leaf taptree");
+
+    tx_buf_free(&local_unsigned);
+    tx_buf_free(&local_signed);
+    tx_buf_free(&penalty_tx);
+    tx_buf_free(&penalty_unsigned);
+    channel_cleanup(&local_ch);
+    channel_cleanup(&remote_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -396,6 +396,27 @@ int finalize_script_path_tx(
     return 1;
 }
 
+/* --- Revocation checksig leaf --- */
+
+int tapscript_build_revocation_checksig(
+    tapscript_leaf_t *leaf,
+    const secp256k1_xonly_pubkey *revocation_pubkey,
+    const secp256k1_context *ctx)
+{
+    size_t pos = 0;
+
+    /* <revocation_xonly_key> OP_CHECKSIG */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    if (!secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, revocation_pubkey))
+        return 0;
+    pos += 32;
+    leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
+
+    leaf->script_len = pos;  /* 34 bytes */
+    tapscript_compute_leaf_hash(leaf);
+    return 1;
+}
+
 /* --- HTLC script builders --- */
 
 int tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,

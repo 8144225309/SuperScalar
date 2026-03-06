@@ -207,6 +207,7 @@ for i in 0 1 2 3; do
         --network regtest \
         --lsp-pubkey "$LSP_PUBKEY" \
         --daemon \
+        --db "$TMPDIR/client_${i}.db" \
         --cli-path "$(which bitcoin-cli)" \
         --rpcuser rpcuser \
         --rpcpassword rpcpass \
@@ -367,6 +368,19 @@ fi
 echo ""
 echo "=== PASS: CLN Bridge Integration Infrastructure ==="
 echo "All components running, bridge connected, factory created."
+
+# Wait for plugin→bridge connection
+echo "Waiting for CLN plugin to connect to bridge..."
+for attempt in $(seq 1 30); do
+    if grep -q "plugin connected" "$TMPDIR/bridge.log" 2>/dev/null; then
+        echo "Bridge: plugin connected (after ${attempt}s)"
+        break
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "WARNING: Plugin may not be connected to bridge"
+    fi
+    sleep 1
+done
 
 # --- Step 8b: Start second CLN node (sender) ---
 echo ""

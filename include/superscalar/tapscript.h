@@ -92,6 +92,12 @@ int finalize_script_path_tx(
     const unsigned char *control_block, size_t control_block_len
 );
 
+/* Build revocation checksig leaf: <revocation_xonly_key> OP_CHECKSIG */
+int tapscript_build_revocation_checksig(
+    tapscript_leaf_t *leaf,
+    const secp256k1_xonly_pubkey *revocation_pubkey,
+    const secp256k1_context *ctx);
+
 /* --- HTLC script builders --- */
 
 /* Offered HTLC success leaf (remote claims with preimage, no CSV):
