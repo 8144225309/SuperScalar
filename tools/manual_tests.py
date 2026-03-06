@@ -128,6 +128,7 @@ def run_lsp(extra_flags, n_clients=4, timeout=120, wait_for=None, mine_addr=None
             except: pass
 
     cmd = lsp_base_cmd(extra_flags, n_clients=n_clients, amount=amount)
+    print(f"  CMD: {' '.join(cmd)}")
     lsp_log = open('/tmp/mt_lsp.log', 'w')
     lsp = subprocess.Popen(cmd, stdout=lsp_log, stderr=subprocess.STDOUT, env=env)
     time.sleep(2)
