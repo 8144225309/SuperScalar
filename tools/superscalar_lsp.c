@@ -2367,6 +2367,9 @@ int main(int argc, char *argv[]) {
             hex_encode(burn_tx.data, burn_tx.len, burn_hex);
             char burn_txid[65];
             int sent = regtest_send_raw_tx(&rt, burn_hex, burn_txid);
+            if (g_db)
+                persist_log_broadcast(g_db, sent ? burn_txid : "?",
+                    "burn_tx", burn_hex, sent ? "ok" : "failed");
             free(burn_hex);
             tx_buf_free(&burn_tx);
 
@@ -2491,6 +2494,9 @@ int main(int argc, char *argv[]) {
             hex_encode(commit_signed.data, commit_signed.len, commit_hex);
             char commit_txid_str[65];
             int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
+            if (g_db)
+                persist_log_broadcast(g_db, sent ? commit_txid_str : "?",
+                    "htlc_commitment", commit_hex, sent ? "ok" : "failed");
             free(commit_hex);
             tx_buf_free(&commit_signed);
 
@@ -2608,6 +2614,9 @@ int main(int argc, char *argv[]) {
             hex_encode(timeout_tx.data, timeout_tx.len, timeout_hex);
             char timeout_txid_str[65];
             int timeout_sent = regtest_send_raw_tx(&rt, timeout_hex, timeout_txid_str);
+            if (g_db)
+                persist_log_broadcast(g_db, timeout_sent ? timeout_txid_str : "?",
+                    "htlc_timeout", timeout_hex, timeout_sent ? "ok" : "failed");
             free(timeout_hex);
             tx_buf_free(&timeout_tx);
 
@@ -2794,6 +2803,12 @@ int main(int argc, char *argv[]) {
             hex_encode(old_signed.data, old_signed.len, old_hex);
             char old_txid_str[65];
             int sent = regtest_send_raw_tx(&rt, old_hex, old_txid_str);
+            if (g_db) {
+                char src[48];
+                snprintf(src, sizeof(src), "breach_revoked_ch%zu", ci);
+                persist_log_broadcast(g_db, sent ? old_txid_str : "?",
+                    src, old_hex, sent ? "ok" : "failed");
+            }
             free(old_hex);
             tx_buf_free(&old_signed);
 
@@ -2903,11 +2918,17 @@ int main(int argc, char *argv[]) {
             hex_encode(kickoff_root->signed_tx.data, kickoff_root->signed_tx.len, kr_hex);
             char kr_txid_str[65];
             if (!regtest_send_raw_tx(&rt, kr_hex, kr_txid_str)) {
+                if (g_db)
+                    persist_log_broadcast(g_db, "?", "expiry_kickoff_root",
+                        kr_hex, "failed");
                 fprintf(stderr, "EXPIRY TEST: kickoff_root broadcast failed\n");
                 free(kr_hex);
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
+            if (g_db)
+                persist_log_broadcast(g_db, kr_txid_str,
+                    "expiry_kickoff_root", kr_hex, "ok");
             free(kr_hex);
             regtest_mine_blocks(&rt, 1, mine_addr);
             printf("1. kickoff_root broadcast: %s\n", kr_txid_str);
@@ -2926,11 +2947,17 @@ int main(int argc, char *argv[]) {
             hex_encode(state_root->signed_tx.data, state_root->signed_tx.len, sr_hex);
             char sr_txid_str[65];
             if (!regtest_send_raw_tx(&rt, sr_hex, sr_txid_str)) {
+                if (g_db)
+                    persist_log_broadcast(g_db, "?", "expiry_state_root",
+                        sr_hex, "failed");
                 fprintf(stderr, "EXPIRY TEST: state_root broadcast failed\n");
                 free(sr_hex);
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
+            if (g_db)
+                persist_log_broadcast(g_db, sr_txid_str,
+                    "expiry_state_root", sr_hex, "ok");
             free(sr_hex);
             regtest_mine_blocks(&rt, 1, mine_addr);
             printf("2. state_root broadcast: %s (nSeq blocks: %d)\n",
@@ -2973,10 +3000,20 @@ int main(int argc, char *argv[]) {
             hex_encode(nd->signed_tx.data, nd->signed_tx.len, hex);
             char txid_str[65];
             if (!regtest_send_raw_tx(&rt, hex, txid_str)) {
+                if (g_db) {
+                    char src[48];
+                    snprintf(src, sizeof(src), "expiry_node_%d", chain[ci]);
+                    persist_log_broadcast(g_db, "?", src, hex, "failed");
+                }
                 fprintf(stderr, "EXPIRY TEST: node[%d] broadcast failed\n", chain[ci]);
                 free(hex);
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
+            }
+            if (g_db) {
+                char src[48];
+                snprintf(src, sizeof(src), "expiry_node_%d", chain[ci]);
+                persist_log_broadcast(g_db, txid_str, src, hex, "ok");
             }
             free(hex);
             regtest_mine_blocks(&rt, 1, mine_addr);
@@ -3075,6 +3112,9 @@ int main(int argc, char *argv[]) {
             hex_encode(ts.data, ts.len, hex);
             char txid_str[65];
             int sent = regtest_send_raw_tx(&rt, hex, txid_str);
+            if (g_db)
+                persist_log_broadcast(g_db, sent ? txid_str : "?",
+                    "expiry_leaf_timeout", hex, sent ? "ok" : "failed");
             free(hex);
             tx_buf_free(&ts);
 
@@ -3159,6 +3199,9 @@ int main(int argc, char *argv[]) {
             hex_encode(ts.data, ts.len, hex);
             char txid_str[65];
             int sent = regtest_send_raw_tx(&rt, hex, txid_str);
+            if (g_db)
+                persist_log_broadcast(g_db, sent ? txid_str : "?",
+                    "expiry_mid_timeout", hex, sent ? "ok" : "failed");
             free(hex);
             tx_buf_free(&ts);
 
@@ -3256,6 +3299,9 @@ int main(int argc, char *argv[]) {
         hex_encode(dist_tx.data, dist_tx.len, dt_hex);
         char dt_txid_str[65];
         int dt_sent = regtest_send_raw_tx(&rt, dt_hex, dt_txid_str);
+        if (g_db)
+            persist_log_broadcast(g_db, dt_sent ? dt_txid_str : "?",
+                "distribution_tx", dt_hex, dt_sent ? "ok" : "failed");
         free(dt_hex);
 
         if (!dt_sent) {
@@ -3429,6 +3475,9 @@ int main(int argc, char *argv[]) {
         hex_encode(turnover_close_tx.data, turnover_close_tx.len, tc_hex);
         char tc_txid_str[65];
         int tc_sent = regtest_send_raw_tx(&rt, tc_hex, tc_txid_str);
+        if (g_db)
+            persist_log_broadcast(g_db, tc_sent ? tc_txid_str : "?",
+                "turnover_close", tc_hex, tc_sent ? "ok" : "failed");
         free(tc_hex);
         tx_buf_free(&turnover_close_tx);
 
@@ -3807,6 +3856,9 @@ int main(int argc, char *argv[]) {
         hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
         char rc_txid[65];
         int rc_sent = regtest_send_raw_tx(&rt, rc_hex, rc_txid);
+        if (g_db)
+            persist_log_broadcast(g_db, rc_sent ? rc_txid : "?",
+                "rotation_close_f0", rc_hex, rc_sent ? "ok" : "failed");
         free(rc_hex);
         tx_buf_free(&rot_close_tx);
 
@@ -3987,6 +4039,9 @@ int main(int argc, char *argv[]) {
         hex_encode(close2_tx.data, close2_tx.len, c2_hex);
         char c2_txid[65];
         int c2_sent = regtest_send_raw_tx(&rt, c2_hex, c2_txid);
+        if (g_db)
+            persist_log_broadcast(g_db, c2_sent ? c2_txid : "?",
+                "rotation_close_f1", c2_hex, c2_sent ? "ok" : "failed");
         free(c2_hex);
         tx_buf_free(&close2_tx);
 
@@ -4106,12 +4161,18 @@ int main(int argc, char *argv[]) {
     hex_encode(close_tx.data, close_tx.len, close_hex);
     char close_txid[65];
     if (!regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+        if (g_db)
+            persist_log_broadcast(g_db, "?", "cooperative_close",
+                close_hex, "failed");
         fprintf(stderr, "LSP: broadcast close tx failed\n");
         tx_buf_free(&close_tx);
         lsp_cleanup(&lsp);
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    if (g_db)
+        persist_log_broadcast(g_db, close_txid, "cooperative_close",
+            close_hex, "ok");
     if (is_regtest) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
