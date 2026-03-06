@@ -164,6 +164,29 @@ static int ensure_funded(regtest_t *rt, const char *mine_addr) {
     return 0;
 }
 
+/* Advance chain by N blocks: mine on regtest, poll on non-regtest.
+   Returns 1 on success, 0 on timeout. */
+static int advance_chain(regtest_t *rt, int n, const char *mine_addr,
+                          int is_regtest, int timeout_secs) {
+    if (n <= 0) return 1;
+    if (is_regtest) {
+        regtest_mine_blocks(rt, n, mine_addr);
+        return 1;
+    }
+    /* Poll for N new blocks */
+    int start_h = regtest_get_block_height(rt);
+    int target_h = start_h + n;
+    printf("Waiting for %d block(s) (height %d -> %d)...\n",
+           n, start_h, target_h);
+    for (int waited = 0; waited < timeout_secs; waited += 10) {
+        if (regtest_get_block_height(rt) >= target_h) return 1;
+        sleep(10);
+    }
+    fprintf(stderr, "advance_chain: timed out waiting for %d blocks "
+            "(height %d / %d)\n", n, regtest_get_block_height(rt), target_h);
+    return 0;
+}
+
 /* Report all factory tree nodes */
 static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
                                  const factory_t *f) {
@@ -845,13 +868,10 @@ int main(int argc, char *argv[]) {
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
                                : (is_regtest ? 3600 : 259200);
 
-    /* Test flags that mine blocks require regtest */
-    if (!is_regtest && (test_expiry || test_distrib ||
-                        test_turnover || test_rotation)) {
-        fprintf(stderr, "Error: --test-expiry, --test-distrib, "
-                "--test-turnover, and --test-rotation require --network regtest\n");
-        return 1;
-    }
+    /* Convenience macro: advance chain by N blocks (mine on regtest, poll on
+       non-regtest).  Relies on local variables: rt, mine_addr, is_regtest,
+       confirm_timeout_secs — all of which are in scope throughout main(). */
+    #define ADVANCE(n) advance_chain(&rt, (n), mine_addr, is_regtest, confirm_timeout_secs)
     /* --cheat-daemon (mode 2) only broadcasts + sleeps — allowed on any network.
        --breach-test (mode 1) uses broadcast_factory_tree_any_network() on
        non-regtest networks (polls for confirmation instead of mining). */
@@ -2381,8 +2401,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
-            if (is_regtest)
-                regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
 
             printf("Burn TX broadcast: %s\n", burn_txid);
             printf("L-stock at leaf[%zu]:vout %u burned (%llu sats revoked)\n",
@@ -2508,8 +2527,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
-            if (is_regtest)
-                regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             printf("Commitment TX broadcast: %s\n", commit_txid_str);
 
             /* Step 4: HTLC output is at vout 2 (after to_local and to_remote).
@@ -2585,14 +2603,14 @@ int main(int argc, char *argv[]) {
             uint32_t now_height = (uint32_t)regtest_get_block_height(&rt);
             if (now_height < htlc_cltv) {
                 uint32_t blocks_needed = htlc_cltv - now_height;
-                printf("Mining %u blocks to reach CLTV expiry %u...\n",
+                printf("Advancing %u blocks to reach CLTV expiry %u...\n",
                        blocks_needed, htlc_cltv);
-                regtest_mine_blocks(&rt, (int)blocks_needed, mine_addr);
+                ADVANCE((int)blocks_needed);
             }
 
             /* Also mine to_self_delay blocks for CSV on the timeout TX */
-            printf("Mining %u blocks for CSV delay...\n", ch0->to_self_delay);
-            regtest_mine_blocks(&rt, (int)ch0->to_self_delay, mine_addr);
+            printf("Advancing %u blocks for CSV delay...\n", ch0->to_self_delay);
+            ADVANCE((int)ch0->to_self_delay);
 
             /* Step 6: Build and broadcast HTLC timeout TX */
             size_t htlc_index = ch0->n_htlcs - 1;  /* last HTLC */
@@ -2628,8 +2646,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
-            if (is_regtest)
-                regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
 
             printf("HTLC timeout TX broadcast: %s\n", timeout_txid_str);
             printf("\n=== HTLC FORCE-CLOSE TEST PASSED ===\n");
@@ -2930,7 +2947,7 @@ int main(int argc, char *argv[]) {
                 persist_log_broadcast(g_db, kr_txid_str,
                     "expiry_kickoff_root", kr_hex, "ok");
             free(kr_hex);
-            regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             printf("1. kickoff_root broadcast: %s\n", kr_txid_str);
         }
 
@@ -2941,7 +2958,7 @@ int main(int argc, char *argv[]) {
             int nseq_blocks = (state_nseq == NSEQUENCE_DISABLE_BIP68)
                 ? 0 : (int)(state_nseq & 0xFFFF);
             if (nseq_blocks > 0)
-                regtest_mine_blocks(&rt, nseq_blocks, mine_addr);
+                ADVANCE(nseq_blocks);
 
             char *sr_hex = malloc(state_root->signed_tx.len * 2 + 1);
             hex_encode(state_root->signed_tx.data, state_root->signed_tx.len, sr_hex);
@@ -2959,7 +2976,7 @@ int main(int argc, char *argv[]) {
                 persist_log_broadcast(g_db, sr_txid_str,
                     "expiry_state_root", sr_hex, "ok");
             free(sr_hex);
-            regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             printf("2. state_root broadcast: %s (nSeq blocks: %d)\n",
                    sr_txid_str, nseq_blocks);
         }
@@ -2994,7 +3011,7 @@ int main(int argc, char *argv[]) {
             uint32_t nseq = nd->nsequence;
             int nseq_blocks = (nseq == NSEQUENCE_DISABLE_BIP68) ? 0 : (int)(nseq & 0xFFFF);
             if (nseq_blocks > 0)
-                regtest_mine_blocks(&rt, nseq_blocks, mine_addr);
+                ADVANCE(nseq_blocks);
 
             char *hex = malloc(nd->signed_tx.len * 2 + 1);
             hex_encode(nd->signed_tx.data, nd->signed_tx.len, hex);
@@ -3016,7 +3033,7 @@ int main(int argc, char *argv[]) {
                 persist_log_broadcast(g_db, txid_str, src, hex, "ok");
             }
             free(hex);
-            regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             printf("%d. node[%d] (%s) broadcast: %s%s\n", step++, chain[ci],
                    nd->type == NODE_KICKOFF ? "kickoff" : "state", txid_str,
                    nseq_blocks > 0 ? " (waited nSeq)" : "");
@@ -3049,9 +3066,9 @@ int main(int argc, char *argv[]) {
             int height = regtest_get_block_height(&rt);
             int needed = (int)leaf_cltv - height;
             if (needed > 0) {
-                printf("%d. Mining %d blocks to reach leaf CLTV %u...\n",
+                printf("%d. Advancing %d blocks to reach leaf CLTV %u...\n",
                        step++, needed, leaf_cltv);
-                regtest_mine_blocks(&rt, needed, mine_addr);
+                ADVANCE(needed);
             }
         }
 
@@ -3123,7 +3140,7 @@ int main(int argc, char *argv[]) {
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
-            regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             leaf_recovered = tout.amount_sats;
             printf("%d. Leaf recovery: %llu sats (node[%zu] timeout) txid: %s\n",
                    step++, (unsigned long long)leaf_recovered, first_leaf_idx, txid_str);
@@ -3137,9 +3154,9 @@ int main(int argc, char *argv[]) {
             int height = regtest_get_block_height(&rt);
             int needed = (int)mid_cltv - height;
             if (needed > 0) {
-                printf("%d. Mining %d blocks to reach mid CLTV %u...\n",
+                printf("%d. Advancing %d blocks to reach mid CLTV %u...\n",
                        step++, needed, mid_cltv);
-                regtest_mine_blocks(&rt, needed, mine_addr);
+                ADVANCE(needed);
             }
         }
 
@@ -3210,7 +3227,7 @@ int main(int argc, char *argv[]) {
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
-            regtest_mine_blocks(&rt, 1, mine_addr);
+            ADVANCE(1);
             mid_recovered = tout.amount_sats;
             printf("%d. Mid recovery: %llu sats (kickoff_right timeout) txid: %s\n",
                    step++, (unsigned long long)mid_recovered, txid_str);
@@ -3289,9 +3306,9 @@ int main(int argc, char *argv[]) {
         int cur_h = regtest_get_block_height(&rt);
         int blocks_to_cltv = (int)lsp.factory.cltv_timeout - cur_h;
         if (blocks_to_cltv > 0) {
-            printf("Mining %d blocks to reach CLTV timeout %u...\n",
+            printf("Advancing %d blocks to reach CLTV timeout %u...\n",
                    blocks_to_cltv, lsp.factory.cltv_timeout);
-            regtest_mine_blocks(&rt, blocks_to_cltv, mine_addr);
+            ADVANCE(blocks_to_cltv);
         }
 
         /* Broadcast distribution TX */
@@ -3312,7 +3329,7 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        regtest_mine_blocks(&rt, 1, mine_addr);
+        ADVANCE(1);
 
         printf("Distribution TX broadcast: %s\n", dt_txid_str);
         printf("=== DISTRIBUTION TX TEST PASSED ===\n\n");
@@ -3488,7 +3505,7 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        regtest_mine_blocks(&rt, 1, mine_addr);
+        ADVANCE(1);
 
         printf("Close TX broadcast: %s\n", tc_txid_str);
         printf("=== PTLC KEY TURNOVER TEST PASSED ===\n\n");
@@ -3867,7 +3884,7 @@ int main(int argc, char *argv[]) {
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        regtest_mine_blocks(&rt, 1, mine_addr);
+        ADVANCE(1);
         printf("  Factory 0 closed: %s\n", rc_txid);
 
         /* --- Phase C: Create Factory 1 --- */
@@ -4050,7 +4067,7 @@ int main(int argc, char *argv[]) {
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        regtest_mine_blocks(&rt, 1, mine_addr);
+        ADVANCE(1);
 
         printf("  Factory 1 closed: %s\n", c2_txid);
         printf("\n=== FACTORY ROTATION TEST PASSED ===\n");
