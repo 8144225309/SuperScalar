@@ -40,7 +40,7 @@ The [internal audit](docs/mainnet-audit.md) is a good starting point. High-value
 1. Fork the repo
 2. Create a branch (`git checkout -b fix-description`)
 3. Make your changes
-4. Run tests: `cd build && ./test_superscalar --unit` (all 415 must pass)
+4. Run tests: `cd build && ./test_superscalar --unit` (all 418 must pass)
 5. Run with sanitizers: `cmake .. -DENABLE_SANITIZERS=ON && make -j$(nproc) && ./test_superscalar --unit`
 6. Open a pull request
 
@@ -59,7 +59,7 @@ git clone https://github.com/8144225309/SuperScalar.git
 cd SuperScalar
 mkdir -p build && cd build
 cmake .. && make -j$(nproc)
-./test_superscalar --unit    # 415 tests, all must pass
+./test_superscalar --unit    # 418 tests, all must pass
 ```
 
 ## Questions
