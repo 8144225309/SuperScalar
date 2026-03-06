@@ -13,13 +13,21 @@ Tests:
 
 import subprocess, time, os, sys, threading
 
+def ts():
+    return time.strftime("[%H:%M:%S]")
+
+def clean_files(*paths):
+    for f in paths:
+        try: os.unlink(f)
+        except OSError: pass
+
 # Auto-detect paths: env vars → PATH lookup
 btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
 if _btcconf:
     conf = ["-regtest", f"-conf={_btcconf}"]
 else:
-    conf = ["-regtest"]
+    conf = ["-regtest", "-rpcuser=rpcuser", "-rpcpassword=rpcpass"]
 build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
@@ -45,12 +53,21 @@ def rpc(*args, wallet=None):
 
 def fresh_regtest():
     subprocess.run([btc] + conf + ["stop"], capture_output=True)
-    time.sleep(3)
+    for _ in range(15):
+        r = subprocess.run([btc] + conf + ["ping"], capture_output=True)
+        if r.returncode != 0:
+            break
+        time.sleep(1)
+    else:
+        subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+        time.sleep(2)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
     btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
     btcd_cmd = [btcd, "-daemon", "-regtest", "-fallbackfee=0.00001"]
     if _btcconf:
         btcd_cmd.append(f"-conf={_btcconf}")
+    else:
+        btcd_cmd.extend(["-rpcuser=rpcuser", "-rpcpassword=rpcpass"])
     subprocess.Popen(btcd_cmd)
     time.sleep(5)
     # Retry wallet creation — bitcoind may not be ready yet
@@ -111,13 +128,9 @@ print("=" * 60)
 # Setup factory with 4 clients and generous funding
 addr = fresh_regtest()
 
-for f in ["/tmp/stress_lsp.db", "/tmp/stress_report.json", "/tmp/stress_lsp.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/stress_lsp.db", "/tmp/stress_report.json", "/tmp/stress_lsp.log")
 for i in range(4):
-    for f in [f"/tmp/stress_client_{i}.db", f"/tmp/stress_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/stress_client_{i}.db", f"/tmp/stress_client_{i}.log")
 
 print("\nStarting LSP with 1M funding...")
 lsp_log = open("/tmp/stress_lsp.log", "w")
@@ -201,7 +214,7 @@ def wait_daemon_ready(timeout=60):
 # ============================================================
 # Stress Test 1: 10 paced sequential payments
 # ============================================================
-print("\n--- Stress 1: 10 paced sequential payments (0->1, 1000 sats each) ---")
+print(f"\n{ts()} --- Stress 1: 10 paced sequential payments (0->1, 1000 sats each) ---")
 log_pos = len(read_log("/tmp/stress_lsp.log"))
 start_time = time.time()
 succeeded = 0
@@ -225,12 +238,12 @@ for i in range(10):
 elapsed = time.time() - start_time
 results["paced_10"] = succeeded >= 6
 print(f"  Succeeded: {succeeded}, Failed: {failed}, Time: {elapsed:.1f}s")
-print(f"  RESULT: {'PASS' if results['paced_10'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['paced_10'] else 'FAIL'}")
 
 # ============================================================
 # Stress Test 2: All-pairs payments
 # ============================================================
-print("\n--- Stress 2: All-pairs payments (4 clients, 12 payments) ---")
+print(f"\n{ts()} --- Stress 2: All-pairs payments (4 clients, 12 payments) ---")
 succeeded = 0
 failed = 0
 
@@ -247,7 +260,7 @@ for src in range(4):
 
 results["all_pairs"] = succeeded >= 4  # Some timeouts expected under load
 print(f"  Succeeded: {succeeded}/12, Failed: {failed}")
-print(f"  RESULT: {'PASS' if results['all_pairs'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['all_pairs'] else 'FAIL'}")
 
 # Wait for daemon to settle after heavy all-pairs load
 print("  Waiting for daemon to settle...")
@@ -258,10 +271,10 @@ if not wait_daemon_ready(timeout=120):
 # Stress Test 3: Large payment then reverse (using channels 2->3)
 # ============================================================
 if lsp.poll() is not None:
-    print("\n--- Stress 3: Large payment (SKIP: LSP exited) ---")
+    print(f"\n{ts()} --- Stress 3: Large payment (SKIP: LSP exited) ---")
     results["drain_refill"] = False
 else:
-    print("\n--- Stress 3: Large payment (drain + refill) ---")
+    print(f"\n{ts()} --- Stress 3: Large payment (drain + refill) ---")
     # Use channels 2->3 (less likely depleted by all-pairs)
     cmd_pos = len(read_log("/tmp/stress_lsp.log"))
     send_cmd("pay 2 3 5000")
@@ -274,7 +287,7 @@ else:
     print(f"  Reverse pay 3->2 3000: {'OK' if reverse_ok else 'FAIL'}")
 
     results["drain_refill"] = large_ok and reverse_ok
-    print(f"  RESULT: {'PASS' if results['drain_refill'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['drain_refill'] else 'FAIL'}")
 
 # Wait for daemon to settle
 if lsp.poll() is None:
@@ -284,10 +297,10 @@ if lsp.poll() is None:
 # Stress Test 4: Rebalance chain (0->1, 1->2, 2->3)
 # ============================================================
 if lsp.poll() is not None:
-    print("\n--- Stress 4: Rebalance chain (SKIP: LSP exited) ---")
+    print(f"\n{ts()} --- Stress 4: Rebalance chain (SKIP: LSP exited) ---")
     results["rebal_chain"] = False
 else:
-    print("\n--- Stress 4: Rebalance chain (0->1->2->3) ---")
+    print(f"\n{ts()} --- Stress 4: Rebalance chain (0->1->2->3) ---")
     rebal_ok = 0
     for src, dst in [(0, 1), (1, 2), (2, 3)]:
         cmd_pos = len(read_log("/tmp/stress_lsp.log"))
@@ -299,7 +312,7 @@ else:
 
     results["rebal_chain"] = rebal_ok >= 1
     print(f"  Rebalance chain succeeded: {rebal_ok}/3")
-    print(f"  RESULT: {'PASS' if results['rebal_chain'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['rebal_chain'] else 'FAIL'}")
 
 # Wait for daemon to settle before rotation
 if lsp.poll() is None:
@@ -309,12 +322,12 @@ if lsp.poll() is None:
 # Stress Test 5: Rotate command
 # ============================================================
 if lsp.poll() is not None:
-    print("\n--- Stress 5: CLI rotate command (SKIP: LSP exited) ---")
+    print(f"\n{ts()} --- Stress 5: CLI rotate command (SKIP: LSP exited) ---")
     results["cli_rotate"] = False
     results["post_rotate_status"] = False
     results["pay_after_rotate"] = False
 else:
-    print("\n--- Stress 5: CLI rotate command ---")
+    print(f"\n{ts()} --- Stress 5: CLI rotate command ---")
     # Let any in-flight HTLC protocol operations settle before rotation.
     # Without this, client_recv_lsp_revocation's blocking read can eat
     # the PTLC_PRESIG message, causing rotation to fail.
@@ -349,7 +362,7 @@ else:
         ll = line.lower()
         if any(kw in ll for kw in ["rotat", "close", "new factory", "coop"]):
             print(f"  {line.strip()}")
-    print(f"  RESULT: {'PASS' if results['cli_rotate'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['cli_rotate'] else 'FAIL'}")
 
     # Wait for clients to reconnect after rotation (reconnection + replay may block)
     time.sleep(30)
@@ -377,18 +390,18 @@ else:
     # Stress Test 6: Payment after rotation
     # ============================================================
     if post_rot_status and "fd=-1" not in new:
-        print("\n--- Stress 6: Payment after rotation ---")
+        print(f"\n{ts()} --- Stress 6: Payment after rotation ---")
         time.sleep(5)  # Let clients fully settle into daemon loop after rotation
         cmd_pos = len(read_log("/tmp/stress_lsp.log"))
         send_cmd("pay 0 1 1000")
         ok, out, _ = wait_for_result(cmd_pos, timeout=30)
         results["pay_after_rotate"] = ok
         print(f"  Pay after rotation: {'OK' if ok else 'FAIL'}")
-        print(f"  RESULT: {'PASS' if results['pay_after_rotate'] else 'FAIL'}")
+        print(f"  {ts()} RESULT: {'PASS' if results['pay_after_rotate'] else 'FAIL'}")
     else:
         results["pay_after_rotate"] = False
         reason = "clients offline" if "fd=-1" in new else "no status"
-        print(f"\n--- Stress 6: Payment after rotation (SKIP: {reason}) ---")
+        print(f"\n{ts()} --- Stress 6: Payment after rotation (SKIP: {reason}) ---")
 
 # ============================================================
 # Stress Test 7: Alternating bidirectional payments (channels 2<->3)
@@ -398,7 +411,7 @@ if lsp.poll() is None:
     print("  Waiting for daemon to settle after rotation...")
     wait_daemon_ready(timeout=60)
 
-print("\n--- Stress 7: 10 alternating payments (ch2 <-> ch3) ---")
+print(f"\n{ts()} --- Stress 7: 10 alternating payments (ch2 <-> ch3) ---")
 succeeded = 0
 failed = 0
 
@@ -431,12 +444,12 @@ if "Channels:" in new:
     for line in new.strip().split("\n"):
         if "Channel" in line and "local=" in line:
             print(f"    {line.strip()}")
-print(f"  RESULT: {'PASS' if results['alternating_10'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['alternating_10'] else 'FAIL'}")
 
 # ============================================================
 # Cleanup
 # ============================================================
-print("\n--- Cleaning up ---")
+print(f"\n{ts()} --- Cleaning up ---")
 cleanup_all(lsp, lsp_log, clients)
 time.sleep(1)
 

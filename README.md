@@ -94,10 +94,14 @@ bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 ./test_superscalar --all
 
 # Manual flag tests (25 tests, needs bitcoind running)
-python3 tools/manual_tests.py all
+python3 tools/manual_tests.py all           # run all tests
+python3 tools/manual_tests.py demo          # run a single test
+python3 tools/manual_tests.py --list        # list available tests
+# Logs: /tmp/mt_lsp.log, /tmp/mt_client_*.log
 
 # Test orchestrator (23 multi-process scenarios)
 python3 tools/test_orchestrator.py --scenario all
+python3 tools/test_orchestrator.py --list   # list scenarios
 ```
 
 ---

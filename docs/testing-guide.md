@@ -468,7 +468,7 @@ python3 tools/manual_tests.py help
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SUPERSCALAR_BTC` | `bitcoin-cli` (PATH lookup) | Path to bitcoin-cli |
-| `SUPERSCALAR_BTCCONF` | *(unset — uses cookie auth)* | Bitcoin config file (set to custom path if needed) |
+| `SUPERSCALAR_BTCCONF` | *(unset — uses rpcuser/rpcpass)* | Bitcoin config file (set to custom path if needed) |
 | `SUPERSCALAR_BUILD` | `../build` (relative to tools/) | Build directory with binaries |
 
 ---
