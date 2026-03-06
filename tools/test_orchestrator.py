@@ -1788,9 +1788,9 @@ def main():
 
         # Kill stale processes between scenarios to avoid port conflicts
         if idx > 0:
-            subprocess.run(["pkill", "-9", "-f", "superscalar_lsp"],
+            subprocess.run(["pkill", "-9", "-f", "superscalar_lsp.*--network regtest"],
                            capture_output=True, timeout=5)
-            subprocess.run(["pkill", "-9", "-f", "superscalar_client"],
+            subprocess.run(["pkill", "-9", "-f", "superscalar_client.*--network regtest"],
                            capture_output=True, timeout=5)
             time.sleep(2)
 

@@ -29,15 +29,16 @@ def fresh_regtest():
     # Unload wallet first to prevent stale UTXO conflicts between runs
     subprocess.run([btc] + conf + [f'-rpcwallet={WALLET}', 'unloadwallet'], capture_output=True)
     subprocess.run([btc] + conf + ['stop'], capture_output=True)
-    # Wait for bitcoind to fully exit before wiping data
+    # Wait for regtest bitcoind to fully exit before wiping data.
+    # Use bitcoin-cli ping instead of pidof to avoid killing non-regtest instances.
     for _ in range(15):
-        r = subprocess.run(['pidof', 'bitcoind'], capture_output=True)
+        r = subprocess.run([btc] + conf + ['ping'], capture_output=True)
         if r.returncode != 0:
             break
         time.sleep(1)
     else:
-        # Force kill if still running after 15 seconds
-        subprocess.run(['pkill', '-9', 'bitcoind'], capture_output=True)
+        # Force kill only the regtest instance
+        subprocess.run(['pkill', '-f', 'bitcoind.*-regtest'], capture_output=True)
         time.sleep(2)
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
     # Find bitcoind next to bitcoin-cli
@@ -60,9 +61,10 @@ def fresh_regtest():
     return addr
 
 def cleanup_procs():
-    subprocess.run(['pkill', '-f', 'superscalar_lsp'], capture_output=True)
-    subprocess.run(['pkill', '-f', 'superscalar_client'], capture_output=True)
-    # Also stop bitcoind to prevent stale state between test runs
+    # Kill only test-started processes (regtest, port 9735) — not production instances
+    subprocess.run(['pkill', '-f', 'superscalar_lsp.*--network regtest'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'superscalar_client.*--network regtest'], capture_output=True)
+    # Also stop regtest bitcoind to prevent stale state between test runs
     subprocess.run([btc] + conf + ['stop'], capture_output=True)
     time.sleep(2)
 

@@ -12,7 +12,9 @@ cleanup() {
   echo "=== CLEANUP ==="
   # Close persistent FIFO writer (fd 3) if open
   exec 3>&- 2>/dev/null || true
-  killall superscalar_lsp superscalar_client superscalar_watchtower 2>/dev/null || true
+  pkill -f 'superscalar_lsp.*--network regtest' 2>/dev/null || true
+  pkill -f 'superscalar_client.*--network regtest' 2>/dev/null || true
+  pkill -f 'superscalar_watchtower' 2>/dev/null || true
   kill $(jobs -p) 2>/dev/null || true
   rm -f /tmp/lsp_fifo
   sleep 2
@@ -53,7 +55,8 @@ start_factory() {
   echo "  STARTING FACTORY: $label ($amount sats)"
   echo "=========================================="
 
-  killall superscalar_lsp superscalar_client 2>/dev/null || true
+  pkill -f 'superscalar_lsp.*--network regtest' 2>/dev/null || true
+  pkill -f 'superscalar_client.*--network regtest' 2>/dev/null || true
   sleep 2
   rm -f lsp.db client0.db client1.db client2.db lsp.log client0.log client1.log client2.log
   rm -f /tmp/lsp_fifo
@@ -203,7 +206,7 @@ capture_lsp_output "pay 0 1 1000"
 echo ""
 echo "--- Killing LSP ---"
 exec 3>&- 2>/dev/null || true  # close old FIFO writer
-kill -9 $(pgrep -f "superscalar_lsp") 2>/dev/null || true
+pkill -9 -f 'superscalar_lsp.*--network regtest' 2>/dev/null || true
 sleep 3
 
 # Re-create FIFO for new LSP
