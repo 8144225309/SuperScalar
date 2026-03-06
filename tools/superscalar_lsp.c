@@ -2089,9 +2089,25 @@ int main(int argc, char *argv[]) {
                        ni, node->nsequence, node->nsequence);
             }
 
-            /* factory_advance(): advances DW counter + rebuilds unsigned TXs
-               (picking up new nSequence values) + re-signs all nodes.
-               In demo mode the LSP has all keys, so this is valid. */
+            /* Populate keypairs — factory_init_from_pubkeys() leaves them
+               zeroed, but factory_sign_all() needs them to generate nonces.
+               In demo mode the LSP has all keys (same pattern as distrib/turnover tests). */
+            {
+                secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+                all_kps[0] = lsp_kp;
+                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+                for (int ci = 0; ci < n_clients; ci++) {
+                    unsigned char ds[32];
+                    memset(ds, fill[ci], 32);
+                    if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
+                        fprintf(stderr, "DW ADVANCE TEST: keypair create failed\n");
+                        return 1;
+                    }
+                }
+                memcpy(lsp.factory.keypairs, all_kps,
+                       n_total * sizeof(secp256k1_keypair));
+            }
+
             if (!factory_advance(&lsp.factory)) {
                 fprintf(stderr, "DW ADVANCE TEST: factory_advance failed\n");
                 lsp_cleanup(&lsp);
