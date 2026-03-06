@@ -320,6 +320,14 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Returns 1 on success. */
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
+/* Add a pending HTLC on a channel without fulfilling it.
+   Used by --test-htlc-force-close to leave an HTLC in-flight for
+   on-chain resolution testing.  Returns 1 on success. */
+int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                    size_t from_client, uint64_t amount_sats,
+                                    const unsigned char *payment_hash,
+                                    uint32_t cltv_expiry);
+
 /* Check all channels for imbalance (>threshold% on one side) and rebalance.
    Returns number of rebalance operations performed. */
 int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp);

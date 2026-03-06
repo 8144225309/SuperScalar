@@ -159,6 +159,7 @@ stdbuf -oL $LSP_BIN \
     --rpcuser rpcuser \
     --rpcpassword rpcpass \
     --amount 100000 \
+    --active-blocks 500 \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
