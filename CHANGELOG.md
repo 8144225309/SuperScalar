@@ -6,7 +6,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
-- **DW advance crash (secp256k1 illegal argument)**: `factory_advance()` called `factory_sign_all()` which tried to generate MuSig2 nonces from zeroed keypairs. `factory_init_from_pubkeys()` intentionally leaves keypairs empty (signing uses the split-round API), but the `--test-dw-advance` code path called `factory_advance()` without populating them first. The zero keypairs produced the point at infinity, rejected by secp256k1 (`!secp256k1_fe_is_zero(&ge->x)` → SIGABRT). Fixed by copying demo keypairs into the factory before advancing, matching the pattern already used by the distribution TX and turnover tests.
+- **DW advance crash**: `--test-dw-advance` crashed with `secp256k1 illegal argument` because the factory's keypairs were zeroed (`factory_init_from_pubkeys()` only sets pubkeys). Populated demo keypairs before calling `factory_advance()`, matching the pattern used by the distribution TX and turnover tests.
 
 ---
 
