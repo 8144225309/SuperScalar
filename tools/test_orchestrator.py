@@ -1706,7 +1706,7 @@ def scenario_dw_advance(orch):
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     has_before = "before advance" in lsp_log.lower()
     has_after = "after advance" in lsp_log.lower()
-    has_pass = "DW ADVANCE TEST PASSED" in lsp_log or "DW ADVANCE TEST" in lsp_log
+    has_pass = "DW ADVANCE TEST PASSED" in lsp_log or "DW ADVANCE TEST: PASS" in lsp_log
 
     orch.stop_all()
     success = rc == 0 and has_pass
