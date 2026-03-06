@@ -21,6 +21,21 @@ All notable changes to SuperScalar are documented here.
 - **Leaf reallocation ceremony completes**: Client daemon loop was missing the `MSG_LEAF_REALLOC_PROPOSE` dispatch case — the handler existed but was never called, causing the LSP to time out waiting for client nonces. Added case handler.
 - **Client watchtower late-arrival breach detection**: Clients now call `watchtower_check()` immediately on startup (before the daemon loop) when reconnecting from persisted state. Previously, breach scanning only ran between reconnect retries, so a client coming online after a confirmed breach would never detect it.
 - **fallbackfee in fresh_regtest()**: `manual_tests.py` now passes `-fallbackfee=0.00001` to bitcoind on startup. `regtest_fund_address()` now prints the actual bitcoin-cli error and a hint about fallbackfee when `sendtoaddress` fails, instead of silently returning 0.
+- **Penalty TX never broadcast**: Client used the LSP's factory-wide channel_id (0,1,2,3) when registering revoked commitments with its watchtower, but each client only has one channel at local index 0. Clients 1+ stored entries at indices the watchtower couldn't find, causing "no channel N for penalty" and skipping penalty broadcast entirely. Also fixed watchtower DB reload to iterate all persisted indices, not just factory channel count.
+- **Rotation PTLC adaptor verification**: The test-rotation path created demo keypairs and used their pubkeys as adaptor points, but actual client processes adapt with real secret keys from keyfiles. The extracted secret never matched the demo pubkey, causing "verify failed client 0". Now uses real client pubkeys from `lsp.client_pubkeys[]`.
+- **All_watch breach test reliability**: Mine 2 blocks after broadcasting revoked commitment so watchtowers scanning blocks (not mempool) can detect the breach. Also added inter-scenario process cleanup (`pkill`) to prevent stale processes causing port conflicts and factory creation timeouts.
+- **MuSig2 double nonce in leaf reallocation**: The leaf realloc signing path set the LSP nonce early, but the ALL_NONCES loop already sets all signers' nonces. The early set pushed `nonces_collected` past `n_signers`, failing MuSig2 session finalize.
+- **2-participant factory support**: Lowered minimum participant count from 3 to 2, enabling `--clients 1 --arity 1` (single leaf with LSP + 1 client).
+- **MuSig2 keyagg cache corruption**: `musig_session_finalize_nonces()` and `musig_sign_taproot()` modified the session's keyagg cache in-place before `nonce_process`, corrupting state on failure. Now tweaks a local copy and stores only on success.
+- **Breach test PCP availability check**: Verify local per-commitment point availability before building old commitment in breach test. Also wait for client reconnections after rotation before cooperative close.
+- **Leaf realloc amount calculation**: `--test-realloc` now reads leaf node output amounts from the factory tree instead of a buggy channel manager loop that duplicated channel 0's amount for all leaves.
+- **Orchestrator --cli-path passthrough**: Now passes `--cli-path` to LSP and client processes so watchtower breach detection finds `bitcoin-cli` in all orchestrator scenarios.
+- **LSP wallet auto-load**: LSP auto-creates and loads its wallet on startup even when `--wallet` is specified, eliminating the multi-wallet foot-gun where a missing wallet caused silent failures.
+- **--breach-test on testnet4/signet**: Removed regtest-only guard. Added block-height polling for revoked commitment and penalty TX confirmation on non-regtest networks, matching the pattern already used by `--cheat-daemon`.
+- **L-stock taptree mismatch in distributed signing**: LSP set `has_shachain=1` to build L-stock outputs with hashlock taptrees, but `FACTORY_PROPOSE` never sent the hashlock hashes to clients. Clients built simple P2TR outputs instead, producing a different sighash. The aggregated MuSig2 signature was invalid on any leaf node with L-stock. Fixed by adding `l_stock_hashes` (SHA256 of each epoch's revocation secret) to the wire protocol. Clients now call `factory_set_l_stock_hashes()` before `factory_build_tree()`, producing identical taptrees on both sides.
+- **DW advance after demo invalidated tree for burn test**: After demo payments, `dw_counter_advance()` bumped the epoch but never re-signed the tree (can't re-sign without all participants' keys). The burn test then broadcast a tree with stale signatures. Fixed by skipping the DW advance when `--test-burn` is set.
+- **Bridge test bitcoind startup race**: `test_bridge_regtest.sh` used `sleep 2` after `bitcoind -daemon`, which wasn't enough on slow machines. Replaced with a poll loop waiting for `getblockchaininfo`.
+- **Stale process cleanup between manual tests**: `manual_tests.py` now kills stale `superscalar_lsp`/`superscalar_client` processes before each test run, preventing port conflicts from timed-out or crashed tests.
 
 ### Security
 
@@ -31,6 +46,16 @@ All notable changes to SuperScalar are documented here.
 - **fee_estimate overflow guard**: `fee_estimate()` now returns a 1 BTC cap instead of wrapping to near-zero when extreme fee rates would overflow `uint64_t` multiplication.
 - **musig/watchtower secure_zero**: Replaced `memset()` with `secure_zero()` for secret key and session ID wiping in `musig_sign()` and `watchtower_check_and_respond()`, preventing compiler optimization from eliding the wipe.
 - **Wire protocol negative number rejection**: All wire parsers that cast `cJSON valuedouble` to unsigned types (`uint64_t`, `uint32_t`, `uint16_t`, `size_t`) now reject negative values via `wire_check_nonneg()`. Prevents undefined behavior from casting negative doubles to unsigned integers, which could produce huge amounts/IDs.
+
+### Added
+
+- **`--test-burn` flag**: New test mode broadcasts the factory tree then builds and broadcasts a burn TX spending L-stock via flat secrets revocation (hashlock script-path spend). Uses `factory_generate_flat_secrets()` per ZmnSCPxj's Delving Bitcoin post #34 recommendation to store all revocation keys independently rather than using shachain.
+- **`tools/setup_regtest.sh`**: One-command regtest environment setup that exports `SUPERSCALAR_BTC`/`BUILD`/`BTCCONF`, starts bitcoind, and funds the wallet.
+- **README quickstart**: 5-line copy-paste from fresh Ubuntu to running demo.
+
+### Changed
+
+- **Operator and client user guides updated**: Added missing CLI flags and commands to `docs/lsp-operator-guide.md` and `docs/client-user-guide.md`.
 
 ### Testing
 
