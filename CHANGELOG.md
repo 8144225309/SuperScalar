@@ -49,10 +49,6 @@ All notable changes to SuperScalar are documented here.
 - **Inconsistent `fresh_regtest()` across test scripts**: `test_boundary.py`, `test_stress.py`, `test_cli_cmds.py`, and `test_persist_recovery.py` used fixed `sleep 2-3` instead of ping polling, and some skipped wallet creation retry. All now use the robust pattern from `manual_tests.py` (ping polling with pkill fallback, 10-retry wallet creation).
 - **Rotation test pass/fail too lenient**: `test_demo_rotation()` computed `has_close` but only checked exit code. Now also requires `has_close` (rotation must actually complete, not just exit 0).
 
-### Changed
-
-- **Non-regtest confirmation timeout raised to 3 days**: The default polling timeout for factory funding confirmation on testnet4/signet/mainnet was 7200s (2 hours), far too short for BIP68 relative timelocks (testnet4 `active-blocks=4320` can take ~30 days). Raised to 259200s (3 days). Regtest default remains 3600s.
-
 ### Security
 
 - **Revocation secret verification**: `REVOKE_AND_ACK` handlers now verify that the received secret derives the expected per-commitment point via `secp256k1_ec_pubkey_create()` before accepting it. Prevents a malicious peer from sending garbage secrets to avoid penalty on old commitments.
@@ -73,6 +69,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Changed
 
+- **Non-regtest confirmation timeout raised to 3 days**: The default polling timeout for factory funding confirmation on testnet4/signet/mainnet was 7200s (2 hours), far too short for BIP68 relative timelocks (testnet4 `active-blocks=4320` can take ~30 days). Raised to 259200s (3 days). Regtest default remains 3600s.
 - **Operator and client user guides updated**: Added missing CLI flags and commands to `docs/lsp-operator-guide.md` and `docs/client-user-guide.md`.
 
 ### Testing
