@@ -862,7 +862,8 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint64_t amount_msat = amount_sats * 1000;
 
-    /* Add HTLC on sender's channel (HTLC_RECEIVED from LSP perspective) */
+    /* Add HTLC on target channel (HTLC_OFFERED from LSP perspective —
+       the LSP is offering an HTLC to the client) */
     channel_t *sender_ch = &mgr->entries[from_client].channel;
 
     /* Capture pre-HTLC state for watchtower */
@@ -876,7 +877,7 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         memcpy(old_htlcs, sender_ch->htlcs, old_n_htlcs * sizeof(htlc_t));
 
     uint64_t htlc_id;
-    if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
+    if (!channel_add_htlc(sender_ch, HTLC_OFFERED, amount_sats,
                            payment_hash, cltv_expiry, &htlc_id)) {
         fprintf(stderr, "add_pending_htlc: channel_add_htlc failed\n");
         free(old_htlcs);
