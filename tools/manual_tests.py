@@ -703,17 +703,37 @@ if __name__ == '__main__':
         'report': test_report_json,
     }
 
+    if test_name == '--list':
+        print("Available tests:")
+        for name, func in tests.items():
+            print(f"  {name:20s} {func.__doc__ or ''}")
+        sys.exit(0)
+
     if test_name == 'all':
         results = {}
+        durations = {}
         for name, func in tests.items():
             cleanup_procs()
             fresh_regtest()
+            t0 = time.time()
             try:
                 results[name] = func()
             except Exception as e:
                 print(f"  EXCEPTION: {e}")
                 results[name] = False
+            durations[name] = time.time() - t0
+            # On failure, print last 30 lines of LSP log for remote debugging
+            if not results[name]:
+                try:
+                    with open('/tmp/mt_lsp.log') as f:
+                        lines = f.readlines()
+                    print("  --- LSP log (last 30 lines) ---")
+                    for line in lines[-30:]:
+                        print(f"    {line.rstrip()}")
+                except:
+                    pass
 
+        total_time = sum(durations.values())
         print("\n" + "=" * 60)
         print("SUMMARY")
         print("=" * 60)
@@ -721,13 +741,26 @@ if __name__ == '__main__':
         total = len(results)
         for name, ok in results.items():
             status = "PASS" if ok else "FAIL"
-            print(f"  {name:20s} {status}")
-        print(f"\n  {passed}/{total} passed")
+            print(f"  {name:20s} {status}  ({durations[name]:.0f}s)")
+        print(f"\n  {passed}/{total} passed in {total_time:.0f}s")
     else:
         if test_name in tests:
             cleanup_procs()
             fresh_regtest()
-            tests[test_name]()
+            t0 = time.time()
+            ok = tests[test_name]()
+            elapsed = time.time() - t0
+            print(f"  Duration: {elapsed:.0f}s")
+            if not ok:
+                try:
+                    with open('/tmp/mt_lsp.log') as f:
+                        lines = f.readlines()
+                    print("  --- LSP log (last 30 lines) ---")
+                    for line in lines[-30:]:
+                        print(f"    {line.rstrip()}")
+                except:
+                    pass
         else:
             print(f"Unknown test: {test_name}")
             print(f"Available: {', '.join(tests.keys())}")
+            print("Use --list for descriptions")
