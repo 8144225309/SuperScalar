@@ -41,6 +41,13 @@ All notable changes to SuperScalar are documented here.
 - **Bridge test plugin→bridge race**: The test verified the bridge→LSP connection but not the CLN plugin→bridge connection. If the invoice command was sent before the plugin connected, the bridge exited. Added a poll loop waiting for "plugin connected" in the bridge log.
 - **manual_tests.py regtest teardown**: `fresh_regtest()` used a fixed `sleep 3` after `bitcoind stop`, which wasn't enough on slow machines. Replaced with a poll loop waiting for the bitcoind process to exit.
 - **HTLC force-close test direction mismatch**: `add_pending_htlc` used `HTLC_RECEIVED` but the LSP is offering the HTLC to the client. The client (with no `dest_client` field) also added `HTLC_RECEIVED`, causing a commitment TX mismatch — the LSP's sig was for the wrong transaction, `verify_and_aggregate` failed, and `REVOKE_AND_ACK` was never sent. Fixed to `HTLC_OFFERED`.
+- **Test process kills scoped to regtest**: `manual_tests.py`, `test_orchestrator.py`, `test_cli_cmds.py`, and `regtest_full.sh` all used broad `pkill bitcoind` / `pkill superscalar_lsp` / `killall` that could kill non-regtest instances (testnet4, signet). All process kills now use `pkill -f '...--network regtest'` or `bitcoin-cli -regtest ping` polling to target only regtest processes.
+- **reset_regtest.sh hardcoded PATH**: Removed `$HOME/bitcoin-28.0/bin` PATH addition and replaced the fixed `sleep` with `bitcoin-cli -regtest ping` polling to wait for bitcoind to exit.
+- **Hardcoded `/home/pirq/` paths in all test scripts**: All 5 Python test scripts (`manual_tests.py`, `test_cli_cmds.py`, `test_boundary.py`, `test_persist_recovery.py`, `test_stress.py`) hardcoded `/home/pirq/bin/bitcoin-cli`, `/home/pirq/bitcoin-regtest/bitcoin.conf`, and `/home/pirq/superscalar-build`. Defaults now use PATH lookup for `bitcoin-cli`, cookie auth (no conf file needed) for regtest, and `../build` relative to the script. Custom paths still work via `SUPERSCALAR_BTC`, `SUPERSCALAR_BTCCONF`, `SUPERSCALAR_BUILD` env vars.
+
+### Changed
+
+- **Non-regtest confirmation timeout raised to 3 days**: The default polling timeout for factory funding confirmation on testnet4/signet/mainnet was 7200s (2 hours), far too short for BIP68 relative timelocks (testnet4 `active-blocks=4320` can take ~30 days). Raised to 259200s (3 days). Regtest default remains 3600s.
 
 ### Security
 
@@ -67,7 +74,9 @@ All notable changes to SuperScalar are documented here.
 ### Testing
 
 - **Manual flag tests expanded to 25**: Added 10 new tests covering 1-client factory, variable funding amounts (50k/200k/500k), DW configuration (states-per-layer, step-blocks), profit-shared economics, backup/restore cycle, no-JIT mode, all 3 placement modes, BIP39 mnemonic generation, and JSON report validation.
+- **Manual test runner improvements**: `manual_tests.py` now prints the exact LSP command before each test, shows per-test timing in the summary, auto-tails the last 30 log lines on failure, and supports `--list` for test discovery without running anything.
 - **Removed redundant test scripts**: Deleted `regtest_extended.sh`, `testnet4_full.sh`, and `verify_onchain.sh` — all genuinely new test coverage integrated into `manual_tests.py`, redundant orchestrator wrappers and duplicate tests eliminated.
+- **Removed dead scripts**: Deleted `tools/bitcoin-cli-wrapper.sh` (superseded by shell-free `run_command_exec`), `tools/check_wallets.sh` (debug-only wallet lister), and `tools/run_penalty_test.sh` (superseded by `manual_tests.py` penalty test).
 
 ### Performance
 

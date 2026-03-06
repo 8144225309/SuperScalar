@@ -3,11 +3,14 @@
 
 import subprocess, json, time, os, sys, signal
 
-# Auto-detect paths: env vars (Docker) → hardcoded (WSL dev)
-btc = os.environ.get('SUPERSCALAR_BTC', '/home/pirq/bin/bitcoin-cli')
+# Auto-detect paths: env vars → PATH lookup
+btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
-conf = ['-regtest'] if _btcconf == '' else ['-regtest', f'-conf={_btcconf or "/home/pirq/bitcoin-regtest/bitcoin.conf"}']
-build = os.environ.get('SUPERSCALAR_BUILD', '/home/pirq/superscalar-build')
+if _btcconf:
+    conf = ['-regtest', f'-conf={_btcconf}']
+else:
+    conf = ['-regtest']
+build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f'{build}/superscalar_lsp'
 CLIENT = f'{build}/superscalar_client'
 
@@ -43,10 +46,9 @@ def fresh_regtest():
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
     # Find bitcoind next to bitcoin-cli
     btcd = os.path.join(os.path.dirname(btc), 'bitcoind') if '/' in btc else 'bitcoind'
-    btcd_cmd = [btcd, '-daemon', '-fallbackfee=0.00001']
-    if _btcconf != '':
-        btcd_cmd.extend(['-regtest', '-conf=' + (
-            _btcconf or os.path.expanduser('~/bitcoin-regtest/bitcoin.conf'))])
+    btcd_cmd = [btcd, '-daemon', '-regtest', '-fallbackfee=0.00001']
+    if _btcconf:
+        btcd_cmd.append(f'-conf={_btcconf}')
     subprocess.Popen(btcd_cmd)
     time.sleep(5)
     # Retry wallet creation — bitcoind may not be ready yet
@@ -61,12 +63,10 @@ def fresh_regtest():
     return addr
 
 def cleanup_procs():
-    # Kill only test-started processes (regtest, port 9735) — not production instances
+    # Kill only superscalar test processes — bitcoind lifecycle is managed by fresh_regtest()
     subprocess.run(['pkill', '-f', 'superscalar_lsp.*--network regtest'], capture_output=True)
     subprocess.run(['pkill', '-f', 'superscalar_client.*--network regtest'], capture_output=True)
-    # Also stop regtest bitcoind to prevent stale state between test runs
-    subprocess.run([btc] + conf + ['stop'], capture_output=True)
-    time.sleep(2)
+    time.sleep(1)
 
 def lsp_base_cmd(extra_flags=None, n_clients=4, amount=100000, port=9745):
     cmd = [LSP,
