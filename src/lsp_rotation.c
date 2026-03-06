@@ -763,10 +763,26 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         int ch_ok = 1;
         for (size_t c = 0; c < mgr->n_channels; c++) {
-            if (!persist_save_channel(db, &mgr->entries[c].channel, 0, (uint32_t)c)) {
+            channel_t *ch = &mgr->entries[c].channel;
+            if (!persist_save_channel(db, ch, 0, (uint32_t)c) ||
+                !persist_save_basepoints(db, (uint32_t)c, ch)) {
                 ch_ok = 0;
                 break;
             }
+            /* Persist remote PCPs (cn=0,1) so reconnect doesn't load
+               stale values from the old channel at the same slot. */
+            unsigned char pcp_ser[33];
+            size_t pcp_len = 33;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, 0, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 0, pcp_ser);
+            pcp_len = 33;
+            if (channel_get_remote_pcp(ch, 1, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
         }
         if (ch_ok) {
             persist_commit(db);
