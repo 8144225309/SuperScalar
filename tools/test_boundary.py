@@ -13,13 +13,21 @@ Each test gets a fresh regtest to avoid cross-contamination.
 
 import subprocess, time, os, sys, threading, json, signal
 
+def ts():
+    return time.strftime("[%H:%M:%S]")
+
+def clean_files(*paths):
+    for f in paths:
+        try: os.unlink(f)
+        except OSError: pass
+
 # Auto-detect paths: env vars → PATH lookup
 btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
 if _btcconf:
     conf = ["-regtest", f"-conf={_btcconf}"]
 else:
-    conf = ["-regtest"]
+    conf = ["-regtest", "-rpcuser=rpcuser", "-rpcpassword=rpcpass"]
 build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
@@ -46,15 +54,23 @@ def rpc(*args, wallet=None):
 def fresh_regtest():
     """Wipe and restart regtest."""
     subprocess.run([btc] + conf + ["stop"], capture_output=True)
-    time.sleep(3)
+    for _ in range(15):
+        r = subprocess.run([btc] + conf + ["ping"], capture_output=True)
+        if r.returncode != 0:
+            break
+        time.sleep(1)
+    else:
+        subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+        time.sleep(2)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
     btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
     btcd_cmd = [btcd, "-daemon", "-regtest", "-fallbackfee=0.00001"]
     if _btcconf:
         btcd_cmd.append(f"-conf={_btcconf}")
+    else:
+        btcd_cmd.extend(["-rpcuser=rpcuser", "-rpcpassword=rpcpass"])
     subprocess.Popen(btcd_cmd)
     time.sleep(5)
-    # Retry wallet creation — bitcoind may not be ready yet
     for attempt in range(10):
         result = rpc("createwallet", WALLET)
         if "error" not in result.lower() and result != "":
@@ -79,9 +95,7 @@ def run_lsp_quick(extra_args, timeout=5):
 
 def run_lsp_daemon(extra_args, port, log_path, n_clients=4, amount=100000):
     """Start LSP in daemon mode, return Popen + log file."""
-    for f in [log_path, "/tmp/boundary_test.db", "/tmp/boundary_report.json"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(log_path, "/tmp/boundary_test.db", "/tmp/boundary_report.json")
     log = open(log_path, "w")
     cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", str(amount), "--clients", str(n_clients),
            "--wallet", WALLET, "--port", str(port), "--network", "regtest",
@@ -97,9 +111,7 @@ def start_clients(n, port, prefix="boundary"):
     for i in range(n):
         db = f"/tmp/{prefix}_client_{i}.db"
         logpath = f"/tmp/{prefix}_client_{i}.log"
-        for f in [db, logpath]:
-            try: os.unlink(f)
-            except: pass
+        clean_files(db, logpath)
         clog = open(logpath, "w")
         cmd = [CLIENT, "--seckey", CLIENT_KEYS[i], "--port", str(port), "--host", "127.0.0.1",
                "--network", "regtest", "--db", db, "--fee-rate", "1000",
@@ -158,139 +170,139 @@ print("=" * 60)
 addr = fresh_regtest()
 
 # Test 1.1: --arity 0 (invalid)
-print("\n--- 1.1: --arity 0 (should reject) ---")
+print(f"\n{ts()} --- 1.1: --arity 0 (should reject) ---")
 rc, out, err = run_lsp_quick(["--arity", "0", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["arity_0"] = rc != 0 and "arity" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['arity_0'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['arity_0'] else 'FAIL'}")
 
 # Test 1.2: --arity 3 (invalid)
-print("\n--- 1.2: --arity 3 (should reject) ---")
+print(f"\n{ts()} --- 1.2: --arity 3 (should reject) ---")
 rc, out, err = run_lsp_quick(["--arity", "3", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["arity_3"] = rc != 0 and "arity" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['arity_3'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['arity_3'] else 'FAIL'}")
 
 # Test 1.3: --arity -1 (invalid)
-print("\n--- 1.3: --arity -1 (should reject) ---")
+print(f"\n{ts()} --- 1.3: --arity -1 (should reject) ---")
 rc, out, err = run_lsp_quick(["--arity", "-1", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["arity_neg1"] = rc != 0 and "arity" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['arity_neg1'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['arity_neg1'] else 'FAIL'}")
 
 # Test 1.4: --clients 0 (invalid)
-print("\n--- 1.4: --clients 0 (should reject) ---")
+print(f"\n{ts()} --- 1.4: --clients 0 (should reject) ---")
 rc, out, err = run_lsp_quick(["--clients", "0", "--amount", "100000", "--port", str(TEST_PORT)])
 results["clients_0"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['clients_0'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['clients_0'] else 'FAIL'}")
 
 # Test 1.5: --clients 9 (over max 8)
-print("\n--- 1.5: --clients 9 (should reject) ---")
+print(f"\n{ts()} --- 1.5: --clients 9 (should reject) ---")
 rc, out, err = run_lsp_quick(["--clients", "9", "--amount", "100000", "--port", str(TEST_PORT)])
 results["clients_9"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['clients_9'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['clients_9'] else 'FAIL'}")
 
 # Test 1.6: --states-per-layer 1 (below min 2)
-print("\n--- 1.6: --states-per-layer 1 (should reject) ---")
+print(f"\n{ts()} --- 1.6: --states-per-layer 1 (should reject) ---")
 rc, out, err = run_lsp_quick(["--states-per-layer", "1", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["spl_1"] = rc != 0 and "states-per-layer" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['spl_1'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['spl_1'] else 'FAIL'}")
 
 # Test 1.7: --states-per-layer 257 (above max 256)
-print("\n--- 1.7: --states-per-layer 257 (should reject) ---")
+print(f"\n{ts()} --- 1.7: --states-per-layer 257 (should reject) ---")
 rc, out, err = run_lsp_quick(["--states-per-layer", "257", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["spl_257"] = rc != 0 and "states-per-layer" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['spl_257'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['spl_257'] else 'FAIL'}")
 
 # Test 1.8: --lsp-balance-pct 101 (over max 100)
-print("\n--- 1.8: --lsp-balance-pct 101 (should reject) ---")
+print(f"\n{ts()} --- 1.8: --lsp-balance-pct 101 (should reject) ---")
 rc, out, err = run_lsp_quick(["--lsp-balance-pct", "101", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["bal_101"] = rc != 0 and "lsp-balance-pct" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['bal_101'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['bal_101'] else 'FAIL'}")
 
 # Test 1.9: --confirm-timeout 0 (should reject)
-print("\n--- 1.9: --confirm-timeout 0 (should reject) ---")
+print(f"\n{ts()} --- 1.9: --confirm-timeout 0 (should reject) ---")
 rc, out, err = run_lsp_quick(["--confirm-timeout", "0", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["ctimeout_0"] = rc != 0 and "confirm-timeout" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['ctimeout_0'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['ctimeout_0'] else 'FAIL'}")
 
 # Test 1.10: --confirm-timeout -5 (should reject)
-print("\n--- 1.10: --confirm-timeout -5 (should reject) ---")
+print(f"\n{ts()} --- 1.10: --confirm-timeout -5 (should reject) ---")
 rc, out, err = run_lsp_quick(["--confirm-timeout", "-5", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["ctimeout_neg"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['ctimeout_neg'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['ctimeout_neg'] else 'FAIL'}")
 
 # Test 1.11: --rebalance-threshold 50 (below min 51)
-print("\n--- 1.11: --rebalance-threshold 50 (should reject) ---")
+print(f"\n{ts()} --- 1.11: --rebalance-threshold 50 (should reject) ---")
 rc, out, err = run_lsp_quick(["--rebalance-threshold", "50", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["rebal_50"] = rc != 0 and "rebalance-threshold" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['rebal_50'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['rebal_50'] else 'FAIL'}")
 
 # Test 1.12: --rebalance-threshold 100 (above max 99)
-print("\n--- 1.12: --rebalance-threshold 100 (should reject) ---")
+print(f"\n{ts()} --- 1.12: --rebalance-threshold 100 (should reject) ---")
 rc, out, err = run_lsp_quick(["--rebalance-threshold", "100", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["rebal_100"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['rebal_100'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['rebal_100'] else 'FAIL'}")
 
 # Test 1.13: --placement-mode invalid
-print("\n--- 1.13: --placement-mode badvalue (should reject) ---")
+print(f"\n{ts()} --- 1.13: --placement-mode badvalue (should reject) ---")
 rc, out, err = run_lsp_quick(["--placement-mode", "badvalue", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["placement_bad"] = rc != 0 and "placement-mode" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['placement_bad'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['placement_bad'] else 'FAIL'}")
 
 # Test 1.14: --default-profit-bps 10001 (above max)
-print("\n--- 1.14: --default-profit-bps 10001 (should reject) ---")
+print(f"\n{ts()} --- 1.14: --default-profit-bps 10001 (should reject) ---")
 rc, out, err = run_lsp_quick(["--default-profit-bps", "10001", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["bps_10001"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['bps_10001'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['bps_10001'] else 'FAIL'}")
 
 # Test 1.15: --accept-timeout 0 (should reject - must be positive)
-print("\n--- 1.15: --accept-timeout 0 (should reject) ---")
+print(f"\n{ts()} --- 1.15: --accept-timeout 0 (should reject) ---")
 rc, out, err = run_lsp_quick(["--accept-timeout", "0", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 # Note: accept_timeout_arg default is 0 (block forever), but explicit --accept-timeout 0 hits the <=0 check
 results["atimeout_0"] = rc != 0
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['atimeout_0'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['atimeout_0'] else 'FAIL'}")
 
 # Test 1.16: --mainnet without risk flag (should reject)
-print("\n--- 1.16: --network mainnet without --i-accept-the-risk ---")
+print(f"\n{ts()} --- 1.16: --network mainnet without --i-accept-the-risk ---")
 rc, out, err = run_lsp_quick(["--network", "mainnet", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["mainnet_guard"] = rc != 0 and "mainnet" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['mainnet_guard'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['mainnet_guard'] else 'FAIL'}")
 
 # Test 1.17: --test-expiry on non-regtest (should reject)
-print("\n--- 1.17: --test-expiry on signet (should reject) ---")
+print(f"\n{ts()} --- 1.17: --test-expiry on signet (should reject) ---")
 rc, out, err = run_lsp_quick(["--network", "signet", "--test-expiry", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["test_nonregtest"] = rc != 0 and "regtest" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['test_nonregtest'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['test_nonregtest'] else 'FAIL'}")
 
 # Test 1.18: Valid boundary - --states-per-layer 2 (minimum)
-print("\n--- 1.18: --states-per-layer 2 (valid minimum) ---")
+print(f"\n{ts()} --- 1.18: --states-per-layer 2 (valid minimum) ---")
 rc, out, err = run_lsp_quick(["--states-per-layer", "2", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 # Should NOT reject for states-per-layer (may fail for other reasons like no clients connecting)
 results["spl_2_valid"] = "states-per-layer" not in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['spl_2_valid'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['spl_2_valid'] else 'FAIL'}")
 
 # Test 1.19: Valid boundary - --states-per-layer 256 (maximum)
-print("\n--- 1.19: --states-per-layer 256 (valid maximum) ---")
+print(f"\n{ts()} --- 1.19: --states-per-layer 256 (valid maximum) ---")
 rc, out, err = run_lsp_quick(["--states-per-layer", "256", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
 results["spl_256_valid"] = "states-per-layer" not in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
-print(f"  RESULT: {'PASS' if results['spl_256_valid'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['spl_256_valid'] else 'FAIL'}")
 
 # ============================================================
 # SECTION 2: FACTORY CREATION EDGE CASES (need regtest)
@@ -301,7 +313,7 @@ print("SECTION 2: FACTORY CREATION EDGE CASES")
 print("=" * 60)
 
 # Test 2.1: 1 client, arity-1 (should fail: factory ceremony needs >=2 clients)
-print("\n--- 2.1: 1 client, arity-1 (factory creation expected to fail) ---")
+print(f"\n{ts()} --- 2.1: 1 client, arity-1 (factory creation expected to fail) ---")
 addr = fresh_regtest()
 
 lsp, lsp_log = run_lsp_daemon(["--arity", "1"], TEST_PORT, "/tmp/bound_2_1.log",
@@ -321,18 +333,16 @@ if "daemon loop started" in log.lower():
     print(f"  Factory created successfully (unexpected but OK)")
 else:
     print(f"  Factory creation failed as expected (1-client edge case)")
-print(f"  RESULT: {'PASS' if results['1client_arity1'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['1client_arity1'] else 'FAIL'}")
 
 cleanup_procs(lsp, *cl)
 time.sleep(1)
 
 # Test 2.2: 8 clients (maximum), arity-2
-print("\n--- 2.2: 8 clients, arity-2, 1M sats ---")
+print(f"\n{ts()} --- 2.2: 8 clients, arity-2, 1M sats ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_2_2.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_2_2.log")
 
 lsp, lsp_log = run_lsp_daemon([], TEST_PORT+1, "/tmp/bound_2_2.log",
                                 n_clients=8, amount=1000000)
@@ -348,25 +358,23 @@ print(f"  Daemon loop started: {ok}")
 if not ok:
     for line in log.split("\n")[-10:]:
         print(f"    {line.strip()}")
-print(f"  RESULT: {'PASS' if results['8client_arity2'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['8client_arity2'] else 'FAIL'}")
 
 cleanup_procs(lsp, *cl)
 time.sleep(1)
 
 # Test 2.3: 1 client, arity-2 (should be rejected at startup)
-print("\n--- 2.3: 1 client, arity-2 (should reject: arity-2 needs >=2 clients) ---")
+print(f"\n{ts()} --- 2.3: 1 client, arity-2 (should reject: arity-2 needs >=2 clients) ---")
 rc, out, err = run_lsp_quick(["--arity", "2", "--clients", "1", "--amount", "100000", "--port", str(TEST_PORT+2)])
 results["1client_arity2"] = rc != 0 and "arity 2 requires at least 2" in err.lower()
 print(f"  rc={rc}, stderr={err.strip()[:120]}")
-print(f"  RESULT: {'PASS' if results['1client_arity2'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['1client_arity2'] else 'FAIL'}")
 
 # Test 2.4: 3 clients, arity-2 (odd count with pair grouping)
-print("\n--- 2.4: 3 clients, arity-2 (odd count) ---")
+print(f"\n{ts()} --- 2.4: 3 clients, arity-2 (odd count) ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_2_4.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_2_4.log")
 
 lsp, lsp_log = run_lsp_daemon([], TEST_PORT+3, "/tmp/bound_2_4.log",
                                 n_clients=3, amount=300000)
@@ -382,7 +390,7 @@ print(f"  Daemon loop started: {ok}")
 if not ok:
     for line in log.split("\n")[-10:]:
         print(f"    {line.strip()}")
-print(f"  RESULT: {'PASS' if results['3client_arity2'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['3client_arity2'] else 'FAIL'}")
 
 cleanup_procs(lsp, *cl)
 time.sleep(1)
@@ -396,16 +404,12 @@ print("SECTION 3: PAYMENT BOUNDARY CONDITIONS")
 print("=" * 60)
 
 # Need a working factory for payment tests
-print("\n--- Setting up factory for payment tests ---")
+print(f"\n{ts()} --- Setting up factory for payment tests ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_pay.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_pay.log")
 for i in range(4):
-    for f in [f"/tmp/boundpay_client_{i}.db", f"/tmp/boundpay_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/boundpay_client_{i}.db", f"/tmp/boundpay_client_{i}.log")
 
 lsp, lsp_log = run_lsp_daemon([], TEST_PORT+4, "/tmp/bound_pay.log",
                                 n_clients=4, amount=200000)
@@ -433,78 +437,78 @@ else:
         return log[since_len:]
 
     # Test 3.1: Pay exactly dust limit (546 sats)
-    print("\n--- 3.1: pay 0 1 546 (exact dust limit) ---")
+    print(f"\n{ts()} --- 3.1: pay 0 1 546 (exact dust limit) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 546")
     time.sleep(10)
     new = get_new_output(log_before)
     results["pay_dust_exact"] = "succeeded" in new
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_dust_exact'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_dust_exact'] else 'FAIL'}")
 
     # Test 3.2: Pay below dust limit (545 sats - should fail)
-    print("\n--- 3.2: pay 0 1 545 (below dust - should fail) ---")
+    print(f"\n{ts()} --- 3.2: pay 0 1 545 (below dust - should fail) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 545")
     time.sleep(5)
     new = get_new_output(log_before)
     results["pay_below_dust"] = "failed" in new.lower() or "dust" in new.lower() or "error" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_below_dust'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_below_dust'] else 'FAIL'}")
 
     # Test 3.3: Pay 1 sat (well below dust - should fail)
-    print("\n--- 3.3: pay 0 1 1 (1 sat - should fail) ---")
+    print(f"\n{ts()} --- 3.3: pay 0 1 1 (1 sat - should fail) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 1")
     time.sleep(5)
     new = get_new_output(log_before)
     results["pay_1_sat"] = "failed" in new.lower() or "dust" in new.lower() or "error" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_1_sat'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_1_sat'] else 'FAIL'}")
 
     # Test 3.4: Pay 0 sats (should fail)
-    print("\n--- 3.4: pay 0 1 0 (0 sats - should fail) ---")
+    print(f"\n{ts()} --- 3.4: pay 0 1 0 (0 sats - should fail) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 0")
     time.sleep(5)
     new = get_new_output(log_before)
     results["pay_0_sats"] = "failed" in new.lower() or "error" in new.lower() or "0" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_0_sats'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_0_sats'] else 'FAIL'}")
 
     # Test 3.5: Large payment that should exceed channel balance
-    print("\n--- 3.5: pay 0 1 99999999 (exceeds balance) ---")
+    print(f"\n{ts()} --- 3.5: pay 0 1 99999999 (exceeds balance) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 99999999")
     time.sleep(5)
     new = get_new_output(log_before)
     results["pay_too_large"] = "failed" in new.lower() or "error" in new.lower() or "insufficient" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_too_large'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_too_large'] else 'FAIL'}")
 
     # Test 3.6: Rebalance same channel (should fail)
-    print("\n--- 3.6: rebalance 0 0 1000 (same channel) ---")
+    print(f"\n{ts()} --- 3.6: rebalance 0 0 1000 (same channel) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("rebalance 0 0 1000")
     time.sleep(5)
     new = get_new_output(log_before)
     results["rebal_self"] = "cannot" in new.lower() or "same" in new.lower() or "error" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['rebal_self'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['rebal_self'] else 'FAIL'}")
 
     # Test 3.7: Rebalance with invalid indices
-    print("\n--- 3.7: rebalance 99 0 1000 (bad index) ---")
+    print(f"\n{ts()} --- 3.7: rebalance 99 0 1000 (bad index) ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("rebalance 99 0 1000")
     time.sleep(5)
     new = get_new_output(log_before)
     results["rebal_badidx"] = "invalid" in new.lower() or "error" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['rebal_badidx'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['rebal_badidx'] else 'FAIL'}")
 
     # Test 3.8: Check status shows correct channel count
     # (Run before blocking tests so daemon is responsive)
-    print("\n--- 3.8: status shows all 4 channels ---")
+    print(f"\n{ts()} --- 3.8: status shows all 4 channels ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("status")
     time.sleep(8)
@@ -513,20 +517,20 @@ else:
     for line in new.strip().split("\n"):
         if "Channel" in line or "Factory" in line or "Channels" in line:
             print(f"  {line.strip()}")
-    print(f"  RESULT: {'PASS' if results['status_4ch'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['status_4ch'] else 'FAIL'}")
 
     # Test 3.9: Pay with missing arguments
-    print("\n--- 3.9: pay with missing args ---")
+    print(f"\n{ts()} --- 3.9: pay with missing args ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1")
     time.sleep(8)
     new = get_new_output(log_before)
     results["pay_missing_args"] = "usage" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_missing_args'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_missing_args'] else 'FAIL'}")
 
     # Test 3.10: Pay with non-numeric arguments
-    print("\n--- 3.10: pay abc def ghi ---")
+    print(f"\n{ts()} --- 3.10: pay abc def ghi ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay abc def ghi")
     time.sleep(8)
@@ -534,10 +538,10 @@ else:
     # Should handle gracefully (invalid index or parse to 0)
     results["pay_nonnumeric"] = "invalid" in new.lower() or "error" in new.lower() or "failed" in new.lower() or "usage" in new.lower()
     print(f"  Output: {repr(new[:200])}")
-    print(f"  RESULT: {'PASS' if results['pay_nonnumeric'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['pay_nonnumeric'] else 'FAIL'}")
 
     # Test 3.11: Multiple rapid payments
-    print("\n--- 3.11: 5 rapid sequential payments ---")
+    print(f"\n{ts()} --- 3.11: 5 rapid sequential payments ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     for i in range(5):
         send_cmd(f"pay 0 1 1000")
@@ -547,13 +551,13 @@ else:
     succeeded_count = new.count("succeeded")
     results["rapid_payments"] = succeeded_count >= 3  # At least 3 of 5 should succeed
     print(f"  Succeeded: {succeeded_count}/5")
-    print(f"  RESULT: {'PASS' if results['rapid_payments'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['rapid_payments'] else 'FAIL'}")
 
     # Test 3.12: Bidirectional payments (0->1 then 1->0)
     # Run last: reverse payment can block daemon for up to 120s on failure
     # Cooldown after rapid payments to let daemon fully settle
     time.sleep(5)
-    print("\n--- 3.12: bidirectional payments ---")
+    print(f"\n{ts()} --- 3.12: bidirectional payments ---")
     log_before = len(read_log("/tmp/bound_pay.log"))
     send_cmd("pay 0 1 2000")
     time.sleep(20)
@@ -563,7 +567,7 @@ else:
     succeeded_count = new.count("succeeded")
     results["bidirectional"] = succeeded_count >= 1  # At least forward should succeed
     print(f"  Succeeded: {succeeded_count}/2")
-    print(f"  RESULT: {'PASS' if results['bidirectional'] else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if results['bidirectional'] else 'FAIL'}")
 
     # Cleanup payment factory
     send_cmd("close")
@@ -588,16 +592,12 @@ print("SECTION 4: ROTATION AND LIFECYCLE")
 print("=" * 60)
 
 # Test 4.1: Rotation with --active-blocks 5 (very short)
-print("\n--- 4.1: Rotation with active-blocks=5 ---")
+print(f"\n{ts()} --- 4.1: Rotation with active-blocks=5 ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_rot.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_rot.log")
 for i in range(2):
-    for f in [f"/tmp/boundrot_client_{i}.db", f"/tmp/boundrot_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/boundrot_client_{i}.db", f"/tmp/boundrot_client_{i}.log")
 
 lsp_rot_log = open("/tmp/bound_rot.log", "w")
 lsp_rot_cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", "200000", "--clients", "2",
@@ -630,7 +630,7 @@ else:
     results["short_rotation"] = False
     print("  FAIL: factory never started")
 
-print(f"  RESULT: {'PASS' if results['short_rotation'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['short_rotation'] else 'FAIL'}")
 
 # Cleanup
 lsp_rot.stdin.write(b"close\n")
@@ -648,16 +648,12 @@ for c, clog in cl_rot:
 time.sleep(2)
 
 # Test 4.2: Force close via --force-close flag
-print("\n--- 4.2: Force close (--force-close) ---")
+print(f"\n{ts()} --- 4.2: Force close (--force-close) ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_fc.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_fc.log")
 for i in range(2):
-    for f in [f"/tmp/boundfc_client_{i}.db", f"/tmp/boundfc_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/boundfc_client_{i}.db", f"/tmp/boundfc_client_{i}.log")
 
 lsp_fc_log = open("/tmp/bound_fc.log", "w")
 lsp_fc_cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", "100000", "--clients", "2",
@@ -683,7 +679,7 @@ results["force_close"] = "force" in log.lower() or "broadcast" in log.lower() or
 print(f"  Exit code: {lsp_fc.returncode}")
 for line in log.split("\n")[-10:]:
     print(f"  {line.strip()}")
-print(f"  RESULT: {'PASS' if results['force_close'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['force_close'] else 'FAIL'}")
 
 lsp_fc_log.close()
 for c, clog in cl_fc:
@@ -703,13 +699,9 @@ for mode_name, mode_arg in [("inward", "inward"), ("outward", "outward")]:
     print(f"\n--- 5.x: placement-mode {mode_name}, 4 clients ---")
     addr = fresh_regtest()
 
-    for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", f"/tmp/bound_pm_{mode_name}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", f"/tmp/bound_pm_{mode_name}.log")
     for i in range(4):
-        for f in [f"/tmp/boundpm{mode_name}_client_{i}.db", f"/tmp/boundpm{mode_name}_client_{i}.log"]:
-            try: os.unlink(f)
-            except: pass
+        clean_files(f"/tmp/boundpm{mode_name}_client_{i}.db", f"/tmp/boundpm{mode_name}_client_{i}.log")
 
     lsp_pm, lsp_pm_log = run_lsp_daemon(["--placement-mode", mode_arg], TEST_PORT+7,
                                           f"/tmp/bound_pm_{mode_name}.log", n_clients=4)
@@ -723,23 +715,19 @@ for mode_name, mode_arg in [("inward", "inward"), ("outward", "outward")]:
         log = read_log(f"/tmp/bound_pm_{mode_name}.log")
         for line in log.split("\n")[-5:]:
             print(f"  {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
 
     cleanup_procs(lsp_pm, *cl_pm)
     TEST_PORT += 1  # Avoid port conflicts
     time.sleep(2)
 
 # Test 5.3: profit-shared economic mode
-print("\n--- 5.3: economic-mode profit-shared ---")
+print(f"\n{ts()} --- 5.3: economic-mode profit-shared ---")
 addr = fresh_regtest()
 
-for f in ["/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_econ.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/boundary_test.db", "/tmp/boundary_report.json", "/tmp/bound_econ.log")
 for i in range(2):
-    for f in [f"/tmp/boundecon_client_{i}.db", f"/tmp/boundecon_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/boundecon_client_{i}.db", f"/tmp/boundecon_client_{i}.log")
 
 lsp_ec, lsp_ec_log = run_lsp_daemon(["--economic-mode", "profit-shared", "--default-profit-bps", "500"],
                                       TEST_PORT+10, "/tmp/bound_econ.log", n_clients=2)
@@ -753,7 +741,7 @@ if not ok:
     log = read_log("/tmp/bound_econ.log")
     for line in log.split("\n")[-5:]:
         print(f"  {line.strip()}")
-print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
 
 cleanup_procs(lsp_ec, *cl_ec)
 time.sleep(1)

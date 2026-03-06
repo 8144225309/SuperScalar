@@ -3,13 +3,21 @@
 
 import subprocess, time, os, sys, signal, json
 
+def ts():
+    return time.strftime("[%H:%M:%S]")
+
+def clean_files(*paths):
+    for f in paths:
+        try: os.unlink(f)
+        except OSError: pass
+
 # Auto-detect paths: env vars → PATH lookup
 btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
 if _btcconf:
     conf = ["-regtest", f"-conf={_btcconf}"]
 else:
-    conf = ["-regtest"]
+    conf = ["-regtest", "-rpcuser=rpcuser", "-rpcpassword=rpcpass"]
 build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
@@ -49,15 +57,28 @@ def read_log(path="/tmp/persist_lsp.log"):
 
 # Fresh regtest
 subprocess.run([btc] + conf + ["stop"], capture_output=True)
-time.sleep(2)
+for _ in range(15):
+    r = subprocess.run([btc] + conf + ["ping"], capture_output=True)
+    if r.returncode != 0:
+        break
+    time.sleep(1)
+else:
+    subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+    time.sleep(2)
 subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
 btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
 btcd_cmd = [btcd, "-daemon", "-regtest", "-fallbackfee=0.00001"]
 if _btcconf:
     btcd_cmd.append(f"-conf={_btcconf}")
+else:
+    btcd_cmd.extend(["-rpcuser=rpcuser", "-rpcpassword=rpcpass"])
 subprocess.Popen(btcd_cmd)
 time.sleep(3)
-rpc("createwallet", WALLET)
+for attempt in range(10):
+    result = rpc("createwallet", WALLET)
+    if "error" not in result.lower() and result != "":
+        break
+    time.sleep(1)
 addr = rpc("getnewaddress", "", "bech32m", wallet=WALLET)
 rpc("generatetoaddress", "201", addr, wallet=WALLET)
 time.sleep(1)
@@ -67,15 +88,11 @@ env = dict(os.environ)
 env["PATH"] = os.path.dirname(btc) + ":" + env.get("PATH", "")
 
 # Clean old files
-for f in [DB_PATH, "/tmp/persist_lsp.log", "/tmp/persist_report.json"]:
-    try: os.unlink(f)
-    except: pass
+clean_files(DB_PATH, "/tmp/persist_lsp.log", "/tmp/persist_report.json")
 for i in range(4):
-    for f in [f"/tmp/persist_client_{i}.db", f"/tmp/persist_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/persist_client_{i}.db", f"/tmp/persist_client_{i}.log")
 
-print("\n=== PHASE 1: Start LSP + clients, create factory, enter daemon mode ===")
+print(f"\n{ts()} === PHASE 1: Start LSP + clients, create factory, enter daemon mode ===")
 
 lsp_log = open("/tmp/persist_lsp.log", "w")
 lsp_cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", "100000", "--clients", "4",
@@ -135,7 +152,7 @@ db_check = subprocess.run(["sqlite3", DB_PATH,
     capture_output=True, text=True)
 print(f"  DB state before kill: {db_check.stdout.strip()}")
 
-print("\n=== PHASE 2: KILL LSP (SIGKILL - simulate crash) ===")
+print(f"\n{ts()} === PHASE 2: KILL LSP (SIGKILL - simulate crash) ===")
 lsp.kill()
 lsp.wait()
 lsp_log.close()
@@ -162,7 +179,7 @@ htlc_check = subprocess.run(["sqlite3", DB_PATH,
     capture_output=True, text=True)
 print(f"  HTLCs in DB: {htlc_check.stdout.strip()}")
 
-print("\n=== PHASE 3: Restart LSP from DB (recovery) ===")
+print(f"\n{ts()} === PHASE 3: Restart LSP from DB (recovery) ===")
 
 # Restart LSP — it should detect the DB and recover
 lsp_log2 = open("/tmp/persist_lsp2.log", "w")
@@ -271,5 +288,5 @@ print("=" * 50)
 passed = sum(1 for v in results.values() if v)
 total = len(results)
 for name, ok in results.items():
-    print(f"  {name:30s} {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} {name:30s} {'PASS' if ok else 'FAIL'}")
 print(f"\n  {passed}/{total} passed")

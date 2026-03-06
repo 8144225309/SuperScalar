@@ -3,13 +3,23 @@
 
 import subprocess, json, time, os, sys, signal
 
+def ts():
+    return time.strftime("[%H:%M:%S]")
+
+def clean_files(*paths):
+    for f in paths:
+        try: os.unlink(f)
+        except OSError: pass
+
 # Auto-detect paths: env vars → PATH lookup
 btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
 if _btcconf:
     conf = ['-regtest', f'-conf={_btcconf}']
 else:
-    conf = ['-regtest']
+    # No conf file — use explicit rpcuser/rpcpassword to match what lsp_base_cmd() passes.
+    # The LSP binary doesn't support cookie auth, so bitcoind must accept password auth.
+    conf = ['-regtest', '-rpcuser=rpcuser', '-rpcpassword=rpcpass']
 build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f'{build}/superscalar_lsp'
 CLIENT = f'{build}/superscalar_client'
@@ -49,6 +59,8 @@ def fresh_regtest():
     btcd_cmd = [btcd, '-daemon', '-regtest', '-fallbackfee=0.00001']
     if _btcconf:
         btcd_cmd.append(f'-conf={_btcconf}')
+    else:
+        btcd_cmd.extend(['-rpcuser=rpcuser', '-rpcpassword=rpcpass'])
     subprocess.Popen(btcd_cmd)
     time.sleep(5)
     # Retry wallet creation — bitcoind may not be ready yet
@@ -119,13 +131,9 @@ def run_lsp(extra_flags, n_clients=4, timeout=120, wait_for=None, mine_addr=None
     env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
 
     # Clean old files
-    for f in ['/tmp/mt_lsp.db', '/tmp/mt_report.json', '/tmp/mt_lsp.log']:
-        try: os.unlink(f)
-        except: pass
+    clean_files('/tmp/mt_lsp.db', '/tmp/mt_report.json', '/tmp/mt_lsp.log')
     for i in range(4):
-        for f in [f'/tmp/mt_client_{i}.db', f'/tmp/mt_client_{i}.log']:
-            try: os.unlink(f)
-            except: pass
+        clean_files(f'/tmp/mt_client_{i}.db', f'/tmp/mt_client_{i}.log')
 
     cmd = lsp_base_cmd(extra_flags, n_clients=n_clients, amount=amount)
     print(f"  CMD: {' '.join(cmd)}")
@@ -183,34 +191,34 @@ def check_report():
 
 def test_demo_basic():
     """Basic --demo: factory creation + 4 payments + cooperative close."""
-    print("\n=== TEST: --demo (basic) ===")
+    print(f"\n{ts()} === TEST: --demo (basic) ===")
     rc, log = run_lsp(['--demo'], timeout=180)
     ok = rc == 0 and 'Demo Complete' in log and 'cooperative close confirmed' in log
     payments = log.count('Payment complete:')
     print(f"  Exit: {rc}, Payments: {payments}, Close: {'cooperative close confirmed' in log}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_rotation():
     """--demo --test-rotation: full rotation cycle."""
-    print("\n=== TEST: --demo --test-rotation ===")
+    print(f"\n{ts()} === TEST: --demo --test-rotation ===")
     rc, log = run_lsp(['--demo', '--test-rotation'], timeout=240)
     has_turnover = 'turnover' in log.lower() or 'PTLC' in log
     has_close = 'rotation complete' in log.lower() or 'cooperative close' in log.lower() or 'close confirmed' in log.lower()
     has_new = 'new factory' in log.lower() or 'Factory 1' in log
-    ok = rc == 0
+    ok = rc == 0 and has_close
     print(f"  Exit: {rc}, Turnover: {has_turnover}, Close: {has_close}, NewFactory: {has_new}")
     # Print key rotation lines
     for line in log.split('\n'):
         ll = line.lower()
         if any(kw in ll for kw in ['turnover', 'ptlc', 'rotation', 'new factory', 'close']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_force_close():
     """--demo --force-close: broadcast full DW tree."""
-    print("\n=== TEST: --demo --force-close ===")
+    print(f"\n{ts()} === TEST: --demo --force-close ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--force-close'], mine_addr=addr)
     has_tree = 'broadcasting factory tree' in log.lower() or 'kickoff' in log.lower()
@@ -221,12 +229,12 @@ def test_demo_force_close():
         ll = line.lower()
         if any(kw in ll for kw in ['broadcast', 'kickoff', 'confirmed', 'tree', 'leaf', 'timeout']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_bridge():
     """--demo --test-bridge: simulate bridge inbound HTLC, verify routing + fulfillment."""
-    print("\n=== TEST: --demo --test-bridge ===")
+    print(f"\n{ts()} === TEST: --demo --test-bridge ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--test-bridge'], mine_addr=addr, timeout=120)
     has_bridge = 'bridge' in log.lower() and 'simulated' in log.lower()
@@ -239,12 +247,12 @@ def test_bridge():
         ll = line.lower()
         if any(kw in ll for kw in ['bridge', 'htlc', 'fulfill', 'invoice', 'routing']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_dw_advance():
     """--demo --test-dw-advance: advance DW counter, re-sign tree, force-close."""
-    print("\n=== TEST: --demo --test-dw-advance ===")
+    print(f"\n{ts()} === TEST: --demo --test-dw-advance ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--test-dw-advance'], mine_addr=addr, timeout=180)
     has_before = 'before advance' in log.lower()
@@ -258,12 +266,12 @@ def test_dw_advance():
         ll = line.lower()
         if any(kw in ll for kw in ['nsequence', 'advance', 'epoch', 'node ']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_expiry():
     """--demo --test-expiry: mine past CLTV, recover via timeout."""
-    print("\n=== TEST: --demo --test-expiry ===")
+    print(f"\n{ts()} === TEST: --demo --test-expiry ===")
     rc, log = run_lsp(['--demo', '--test-expiry'])
     has_expiry = 'expiry' in log.lower() or 'timeout' in log.lower()
     has_recover = 'recovery' in log.lower() or 'reclaim' in log.lower()
@@ -273,12 +281,12 @@ def test_demo_expiry():
         ll = line.lower()
         if any(kw in ll for kw in ['expiry', 'timeout', 'recover', 'reclaim', 'cltv']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_distrib():
     """--demo --test-distrib: broadcast distribution TX after CLTV."""
-    print("\n=== TEST: --demo --test-distrib ===")
+    print(f"\n{ts()} === TEST: --demo --test-distrib ===")
     rc, log = run_lsp(['--demo', '--test-distrib'])
     has_distrib = 'distribution' in log.lower()
     ok = rc == 0
@@ -287,12 +295,12 @@ def test_demo_distrib():
         ll = line.lower()
         if any(kw in ll for kw in ['distribution', 'nlocktim', 'broadcast', 'timeout']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_turnover():
     """--demo --test-turnover: PTLC key turnover for all clients."""
-    print("\n=== TEST: --demo --test-turnover ===")
+    print(f"\n{ts()} === TEST: --demo --test-turnover ===")
     rc, log = run_lsp(['--demo', '--test-turnover'])
     turnover_count = log.lower().count('turnover')
     key_count = log.count('key extracted')
@@ -302,14 +310,14 @@ def test_demo_turnover():
         ll = line.lower()
         if any(kw in ll for kw in ['turnover', 'key extract', 'ptlc', 'adaptor']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_demo_breach():
     """--demo --breach-test: LSP broadcasts own revoked state + runs watchtower check.
     LSP watchtower correctly does NOT self-detect (cheater doesn't catch itself).
     Clients would detect it — verified by orchestrator factory_breach scenario."""
-    print("\n=== TEST: --demo --breach-test ===")
+    print(f"\n{ts()} === TEST: --demo --breach-test ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--breach-test'], mine_addr=addr, timeout=180)
     has_revoked = 'revoked' in log.lower()
@@ -324,44 +332,44 @@ def test_demo_breach():
         if any(kw in ll for kw in ['breach', 'revoked', 'penalty', 'watchtower', 'fraud']):
             print(f"    {line.strip()}")
     print(f"  Note: LSP watchtower not self-detecting is correct behavior")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_arity1():
     """--demo --arity 1: per-client leaves. Needs 200k for reserve headroom."""
-    print("\n=== TEST: --demo --arity 1 (200k funding) ===")
+    print(f"\n{ts()} === TEST: --demo --arity 1 (200k funding) ===")
     rc, log = run_lsp(['--demo', '--arity', '1'], amount=200000)
     ok = rc == 0 and 'Demo Complete' in log
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
     for line in log.split('\n'):
         if 'Initial' in line or 'Channel |' in line or '|' in line and 'sats' in line.lower():
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_2_clients():
     """--demo with 2 clients."""
-    print("\n=== TEST: --demo --clients 2 ===")
+    print(f"\n{ts()} === TEST: --demo --clients 2 ===")
     rc, log = run_lsp(['--demo'], n_clients=2)
     ok = rc == 0 and 'factory creation complete' in log
     payments = log.count('Payment complete:')
     print(f"  Exit: {rc}, FactoryCreated: {'factory creation complete' in log}, Payments: {payments}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_3_clients():
     """--demo with 3 clients."""
-    print("\n=== TEST: --demo --clients 3 ===")
+    print(f"\n{ts()} === TEST: --demo --clients 3 ===")
     rc, log = run_lsp(['--demo'], n_clients=3)
     ok = rc == 0 and 'factory creation complete' in log
     payments = log.count('Payment complete:')
     print(f"  Exit: {rc}, FactoryCreated: {'factory creation complete' in log}, Payments: {payments}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_lsp_balance_0():
     """--lsp-balance-pct 0: all capacity to clients."""
-    print("\n=== TEST: --demo --lsp-balance-pct 0 ===")
+    print(f"\n{ts()} === TEST: --demo --lsp-balance-pct 0 ===")
     rc, log = run_lsp(['--demo', '--lsp-balance-pct', '0'])
     # With 0% LSP balance, LSP local should be ~0 and remote should be max
     ok = rc == 0
@@ -371,12 +379,12 @@ def test_lsp_balance_0():
             print(f"    {line.strip()}")
         if 'Initial' in line:
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_lsp_balance_100():
     """--lsp-balance-pct 100: all capacity to LSP. Demo payments expected to fail (clients have 0)."""
-    print("\n=== TEST: --demo --lsp-balance-pct 100 ===")
+    print(f"\n{ts()} === TEST: --demo --lsp-balance-pct 100 ===")
     rc, log = run_lsp(['--demo', '--lsp-balance-pct', '100'])
     # With 100% LSP balance, clients have 0 sats — demo payments can't work.
     # Success = factory created, channels initialized with correct balance split.
@@ -391,33 +399,33 @@ def test_lsp_balance_100():
         if 'Initial' in ll or 'payment' in ll.lower():
             print(f"    {ll}")
     print(f"  Note: demo payments fail as expected (clients have 0 remote balance)")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_routing_fee():
     """--demo --routing-fee-ppm 1000: 0.1% routing fee."""
-    print("\n=== TEST: --demo --routing-fee-ppm 1000 ===")
+    print(f"\n{ts()} === TEST: --demo --routing-fee-ppm 1000 ===")
     rc, log = run_lsp(['--demo', '--routing-fee-ppm', '1000'])
     ok = rc == 0 and 'Demo Complete' in log
     # Check if fee deduction is visible in balances
     has_fee = 'fee' in log.lower()
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}, FeeEvidence: {has_fee}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_dynamic_fees():
     """--demo --dynamic-fees: poll fee estimation."""
-    print("\n=== TEST: --demo --dynamic-fees ===")
+    print(f"\n{ts()} === TEST: --demo --dynamic-fees ===")
     rc, log = run_lsp(['--demo', '--dynamic-fees'])
     ok = rc == 0
     has_fee_poll = 'fee' in log.lower()
     print(f"  Exit: {rc}, FeeEvidence: {has_fee_poll}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 def test_payments_flag():
     """--payments 2: separate payment phase."""
-    print("\n=== TEST: --payments 2 ===")
+    print(f"\n{ts()} === TEST: --payments 2 ===")
     # Clients need --channels and --send/--recv flags for --payments mode
     # This is complex, just check if it starts
     rc, log = run_lsp(['--payments', '2'], timeout=60)
@@ -432,7 +440,7 @@ def test_payments_flag():
 
 def test_1client():
     """--demo with 1 client: factory creation only (no payment targets)."""
-    print("\n=== TEST: --demo --clients 1 --arity 1 ===")
+    print(f"\n{ts()} === TEST: --demo --clients 1 --arity 1 ===")
     rc, log = run_lsp(['--demo', '--arity', '1'], n_clients=1)
     has_factory = 'factory creation complete' in log
     print(f"  Exit: {rc}, FactoryCreated: {has_factory}")
@@ -443,7 +451,7 @@ def test_1client():
 
 def test_factory_amounts():
     """Factory creation + payments at 50k, 200k, 500k sats."""
-    print("\n=== TEST: factory amounts (50k/200k/500k) ===")
+    print(f"\n{ts()} === TEST: factory amounts (50k/200k/500k) ===")
     ok = True
     for amount in [50000, 200000, 500000]:
         cleanup_procs()
@@ -460,49 +468,49 @@ def test_factory_amounts():
 
 def test_states_per_layer():
     """--states-per-layer 4: custom DW state count."""
-    print("\n=== TEST: --demo --states-per-layer 4 ===")
+    print(f"\n{ts()} === TEST: --demo --states-per-layer 4 ===")
     rc, log = run_lsp(['--demo', '--states-per-layer', '4'])
     ok = rc == 0 and 'Demo Complete' in log
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_step_blocks():
     """--step-blocks 20: custom nSequence decrement per state."""
-    print("\n=== TEST: --demo --step-blocks 20 ===")
+    print(f"\n{ts()} === TEST: --demo --step-blocks 20 ===")
     rc, log = run_lsp(['--demo', '--step-blocks', '20'])
     ok = rc == 0 and 'Demo Complete' in log
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_profit_shared():
     """--economic-mode profit-shared: routing fees split with clients."""
-    print("\n=== TEST: --demo --economic-mode profit-shared ===")
+    print(f"\n{ts()} === TEST: --demo --economic-mode profit-shared ===")
     rc, log = run_lsp(['--demo', '--economic-mode', 'profit-shared',
                        '--routing-fee-ppm', '500', '--default-profit-bps', '5000'])
     ok = rc == 0 and 'Demo Complete' in log
     has_profit = 'profit' in log.lower() or 'settlement' in log.lower()
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}, ProfitEvidence: {has_profit}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_no_jit():
     """--no-jit: factory works without JIT channel fallback."""
-    print("\n=== TEST: --demo --no-jit ===")
+    print(f"\n{ts()} === TEST: --demo --no-jit ===")
     rc, log = run_lsp(['--demo', '--no-jit'])
     ok = rc == 0 and 'Demo Complete' in log
     print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_placement_modes():
     """All three placement strategies: sequential, inward, outward."""
-    print("\n=== TEST: placement modes ===")
+    print(f"\n{ts()} === TEST: placement modes ===")
     ok = True
     for mode in ['sequential', 'inward', 'outward']:
         cleanup_procs()
@@ -518,12 +526,11 @@ def test_placement_modes():
 
 def test_generate_mnemonic():
     """--generate-mnemonic: BIP39 seed generates valid keyfile."""
-    print("\n=== TEST: --generate-mnemonic ===")
+    print(f"\n{ts()} === TEST: --generate-mnemonic ===")
     env = dict(os.environ)
     env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
     keyfile = '/tmp/mt_mnemonic.key'
-    try: os.unlink(keyfile)
-    except: pass
+    clean_files(keyfile)
 
     r = subprocess.run(
         [LSP, '--generate-mnemonic', '--keyfile', keyfile, '--passphrase', 'test'],
@@ -533,17 +540,16 @@ def test_generate_mnemonic():
     words = [w for w in r.stdout.split() if w.isalpha() and len(w) > 2]
     print(f"  Exit: {r.returncode}, Keyfile: {has_keyfile}, MnemonicWords: ~{len(words)}")
 
-    try: os.unlink(keyfile)
-    except: pass
+    clean_files(keyfile)
 
     ok = has_keyfile and len(words) >= 12
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_backup_restore():
     """Backup create + verify + restore cycle."""
-    print("\n=== TEST: backup/restore ===")
+    print(f"\n{ts()} === TEST: backup/restore ===")
     env = dict(os.environ)
     env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
 
@@ -558,9 +564,7 @@ def test_backup_restore():
 
     backup_path = '/tmp/mt_backup.enc'
     db_path = '/tmp/mt_lsp.db'
-    for f in [backup_path, '/tmp/mt_restored.db', restored_keyfile]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(backup_path, '/tmp/mt_restored.db', restored_keyfile)
 
     # Create backup (requires --db and --keyfile)
     r = subprocess.run(
@@ -602,18 +606,16 @@ def test_backup_restore():
     else:
         keys_match = False
 
-    for f in [backup_path, restored, keyfile_path, restored_keyfile]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(backup_path, restored, keyfile_path, restored_keyfile)
 
     ok = has_restore and has_keyfile and keys_match
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_demo_burn():
     """--demo --test-burn: broadcast tree + burn L-stock via shachain revocation."""
-    print("\n=== TEST: --demo --test-burn ===")
+    print(f"\n{ts()} === TEST: --demo --test-burn ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--test-burn'], mine_addr=addr, timeout=180)
     has_tree = 'tree nodes confirmed' in log.lower() or 'confirmed on-chain' in log.lower()
@@ -625,13 +627,13 @@ def test_demo_burn():
         ll = line.lower()
         if any(kw in ll for kw in ['burn', 'l-stock', 'shachain', 'broadcast', 'confirmed', 'revoked']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_htlc_force_close():
     """--demo --test-htlc-force-close: add pending HTLC, force-close, broadcast HTLC timeout TX."""
-    print("\n=== TEST: --demo --test-htlc-force-close ===")
+    print(f"\n{ts()} === TEST: --demo --test-htlc-force-close ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
     rc, log = run_lsp(['--demo', '--test-htlc-force-close'], mine_addr=addr, timeout=180)
     has_htlc = 'pending htlc added' in log.lower()
@@ -645,13 +647,13 @@ def test_htlc_force_close():
         ll = line.lower()
         if any(kw in ll for kw in ['htlc', 'broadcast', 'confirmed', 'timeout', 'cltv']):
             print(f"    {line.strip()}")
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test_report_json():
     """--report generates valid JSON diagnostic report."""
-    print("\n=== TEST: --report JSON ===")
+    print(f"\n{ts()} === TEST: --report JSON ===")
     rc, log = run_lsp(['--demo'])
     report = check_report()
     if report:
@@ -660,7 +662,7 @@ def test_report_json():
     else:
         print(f"  Exit: {rc}, ReportValid: False")
     ok = report is not None
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
 

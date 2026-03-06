@@ -4,13 +4,21 @@ Uses a simple approach: pipe commands via stdin with delays, log to file."""
 
 import subprocess, time, os, sys, threading
 
+def ts():
+    return time.strftime("[%H:%M:%S]")
+
+def clean_files(*paths):
+    for f in paths:
+        try: os.unlink(f)
+        except OSError: pass
+
 # Auto-detect paths: env vars → PATH lookup
 btc = os.environ.get('SUPERSCALAR_BTC', 'bitcoin-cli')
 _btcconf = os.environ.get('SUPERSCALAR_BTCCONF')
 if _btcconf:
     conf = ["-regtest", f"-conf={_btcconf}"]
 else:
-    conf = ["-regtest"]
+    conf = ["-regtest", "-rpcuser=rpcuser", "-rpcpassword=rpcpass"]
 build = os.environ.get('SUPERSCALAR_BUILD', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build'))
 LSP = f"{build}/superscalar_lsp"
 CLIENT = f"{build}/superscalar_client"
@@ -42,15 +50,28 @@ def wait_for_in_file(path, keyword, timeout=120):
 
 # Fresh regtest
 subprocess.run([btc] + conf + ["stop"], capture_output=True)
-time.sleep(2)
+for _ in range(15):
+    r = subprocess.run([btc] + conf + ["ping"], capture_output=True)
+    if r.returncode != 0:
+        break
+    time.sleep(1)
+else:
+    subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+    time.sleep(2)
 subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
 btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
 btcd_cmd = [btcd, "-daemon", "-regtest", "-fallbackfee=0.00001"]
 if _btcconf:
     btcd_cmd.append(f"-conf={_btcconf}")
+else:
+    btcd_cmd.extend(["-rpcuser=rpcuser", "-rpcpassword=rpcpass"])
 subprocess.Popen(btcd_cmd)
 time.sleep(3)
-rpc("createwallet", WALLET)
+for attempt in range(10):
+    result = rpc("createwallet", WALLET)
+    if "error" not in result.lower() and result != "":
+        break
+    time.sleep(1)
 addr = rpc("getnewaddress", "", "bech32m", wallet=WALLET)
 rpc("generatetoaddress", "201", addr, wallet=WALLET)
 time.sleep(1)
@@ -60,13 +81,9 @@ print("Regtest ready")
 subprocess.run(["pkill", "-f", "superscalar_lsp.*--network regtest"], capture_output=True)
 subprocess.run(["pkill", "-f", "superscalar_client.*--network regtest"], capture_output=True)
 time.sleep(1)
-for f in ["/tmp/cli_lsp.db", "/tmp/cli_report.json", "/tmp/cli_lsp.log"]:
-    try: os.unlink(f)
-    except: pass
+clean_files("/tmp/cli_lsp.db", "/tmp/cli_report.json", "/tmp/cli_lsp.log")
 for i in range(4):
-    for f in [f"/tmp/cli_client_{i}.db", f"/tmp/cli_client_{i}.log"]:
-        try: os.unlink(f)
-        except: pass
+    clean_files(f"/tmp/cli_client_{i}.db", f"/tmp/cli_client_{i}.log")
 
 env = dict(os.environ)
 env["PATH"] = os.path.dirname(btc) + ":" + env.get("PATH", "")
@@ -127,23 +144,23 @@ def get_log():
 results = {}
 
 # Test 1: help
-print("\n=== CLI TEST: help ===")
+print(f"\n{ts()} === CLI TEST: help ===")
 send_cmd("help")
 time.sleep(2)
 log = get_log()
 results["help"] = "Commands:" in log and "pay <from>" in log
-print(f"  RESULT: {'PASS' if results['help'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['help'] else 'FAIL'}")
 
 # Test 2: status
-print("\n=== CLI TEST: status ===")
+print(f"\n{ts()} === CLI TEST: status ===")
 send_cmd("status")
 time.sleep(2)
 log = get_log()
 results["status"] = "Channels: 4" in log and "Factory state:" in log
-print(f"  RESULT: {'PASS' if results['status'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['status'] else 'FAIL'}")
 
 # Test 3: pay (valid, must be above dust limit 546 sats)
-print("\n=== CLI TEST: pay 0 1 1000 ===")
+print(f"\n{ts()} === CLI TEST: pay 0 1 1000 ===")
 log_before = len(get_log())
 send_cmd("pay 0 1 1000")
 time.sleep(10)
@@ -151,10 +168,10 @@ log = get_log()
 new_output = log[log_before:]
 results["pay"] = "succeeded" in new_output
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['pay'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['pay'] else 'FAIL'}")
 
 # Test 4: pay (self - error)
-print("\n=== CLI TEST: pay 0 0 1000 ===")
+print(f"\n{ts()} === CLI TEST: pay 0 0 1000 ===")
 log_before = len(get_log())
 send_cmd("pay 0 0 1000")
 time.sleep(2)
@@ -162,10 +179,10 @@ log = get_log()
 new_output = log[log_before:]
 results["pay_self"] = "cannot" in new_output.lower()
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['pay_self'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['pay_self'] else 'FAIL'}")
 
 # Test 5: pay (bad index)
-print("\n=== CLI TEST: pay 99 0 1000 ===")
+print(f"\n{ts()} === CLI TEST: pay 99 0 1000 ===")
 log_before = len(get_log())
 send_cmd("pay 99 0 1000")
 time.sleep(2)
@@ -173,10 +190,10 @@ log = get_log()
 new_output = log[log_before:]
 results["pay_badidx"] = "invalid" in new_output.lower()
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['pay_badidx'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['pay_badidx'] else 'FAIL'}")
 
 # Test 6: rebalance (must be above dust limit 546 sats)
-print("\n=== CLI TEST: rebalance 1 2 1000 ===")
+print(f"\n{ts()} === CLI TEST: rebalance 1 2 1000 ===")
 log_before = len(get_log())
 send_cmd("rebalance 1 2 1000")
 time.sleep(10)
@@ -184,10 +201,10 @@ log = get_log()
 new_output = log[log_before:]
 results["rebalance"] = "succeeded" in new_output
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['rebalance'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['rebalance'] else 'FAIL'}")
 
 # Test 7: invoice (no bridge)
-print("\n=== CLI TEST: invoice 0 100000 ===")
+print(f"\n{ts()} === CLI TEST: invoice 0 100000 ===")
 log_before = len(get_log())
 send_cmd("invoice 0 100000")
 time.sleep(2)
@@ -195,10 +212,10 @@ log = get_log()
 new_output = log[log_before:]
 results["invoice_nobridge"] = "no bridge" in new_output.lower()
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['invoice_nobridge'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['invoice_nobridge'] else 'FAIL'}")
 
 # Test 8: unknown command
-print("\n=== CLI TEST: foobar ===")
+print(f"\n{ts()} === CLI TEST: foobar ===")
 log_before = len(get_log())
 send_cmd("foobar")
 time.sleep(2)
@@ -206,10 +223,10 @@ log = get_log()
 new_output = log[log_before:]
 results["unknown"] = "unknown" in new_output.lower()
 print(f"  New output: {repr(new_output[:200])}")
-print(f"  RESULT: {'PASS' if results['unknown'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['unknown'] else 'FAIL'}")
 
 # Test 9: status (post-pay balances changed)
-print("\n=== CLI TEST: status (post-pay) ===")
+print(f"\n{ts()} === CLI TEST: status (post-pay) ===")
 log_before = len(get_log())
 send_cmd("status")
 time.sleep(2)
@@ -219,10 +236,10 @@ results["status_post"] = "Channels: 4" in new_output
 # Print the status block
 for line in new_output.strip().split("\n"):
     print(f"  {line}")
-print(f"  RESULT: {'PASS' if results['status_post'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['status_post'] else 'FAIL'}")
 
 # Test 10: close
-print("\n=== CLI TEST: close ===")
+print(f"\n{ts()} === CLI TEST: close ===")
 send_cmd("close")
 try:
     lsp.wait(timeout=30)
@@ -232,7 +249,7 @@ except:
 log = get_log()
 results["close"] = "triggering shutdown" in log.lower() or "cooperative close" in log.lower()
 print(f"  LSP exit code: {lsp.returncode}")
-print(f"  RESULT: {'PASS' if results['close'] else 'FAIL'}")
+print(f"  {ts()} RESULT: {'PASS' if results['close'] else 'FAIL'}")
 
 # Cleanup
 lsp_log.close()
