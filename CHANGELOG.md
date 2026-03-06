@@ -36,6 +36,10 @@ All notable changes to SuperScalar are documented here.
 - **DW advance after demo invalidated tree for burn test**: After demo payments, `dw_counter_advance()` bumped the epoch but never re-signed the tree (can't re-sign without all participants' keys). The burn test then broadcast a tree with stale signatures. Fixed by skipping the DW advance when `--test-burn` is set.
 - **Bridge test bitcoind startup race**: `test_bridge_regtest.sh` used `sleep 2` after `bitcoind -daemon`, which wasn't enough on slow machines. Replaced with a poll loop waiting for `getblockchaininfo`.
 - **Stale process cleanup between manual tests**: `manual_tests.py` now kills stale `superscalar_lsp`/`superscalar_client` processes before each test run, preventing port conflicts from timed-out or crashed tests.
+- **MSG_HELLO reconnect hardcoded cn=0**: When a known client sent `MSG_HELLO` (lost state), the LSP synthesized a `MSG_RECONNECT` with `commitment_number=0`. If the channel had advanced past the initial state, the reconnect handler rejected the connection as irreconcilable. Now uses the channel's actual commitment number from the slot.
+- **Bridge test clients missing `--db`**: All 4 factory clients in `test_bridge_regtest.sh` started without `--db`, so channel state (invoices, preimages, balances) existed only in memory. Added `--db "$TMPDIR/client_${i}.db"` to each client.
+- **Bridge test plugin→bridge race**: The test verified the bridge→LSP connection but not the CLN plugin→bridge connection. If the invoice command was sent before the plugin connected, the bridge exited. Added a poll loop waiting for "plugin connected" in the bridge log.
+- **manual_tests.py regtest teardown**: `fresh_regtest()` used a fixed `sleep 3` after `bitcoind stop`, which wasn't enough on slow machines. Replaced with a poll loop waiting for the bitcoind process to exit.
 
 ### Security
 
@@ -52,6 +56,8 @@ All notable changes to SuperScalar are documented here.
 - **`--test-burn` flag**: New test mode broadcasts the factory tree then builds and broadcasts a burn TX spending L-stock via flat secrets revocation (hashlock script-path spend). Uses `factory_generate_flat_secrets()` per ZmnSCPxj's Delving Bitcoin post #34 recommendation to store all revocation keys independently rather than using shachain.
 - **`tools/setup_regtest.sh`**: One-command regtest environment setup that exports `SUPERSCALAR_BTC`/`BUILD`/`BTCCONF`, starts bitcoind, and funds the wallet.
 - **README quickstart**: 5-line copy-paste from fresh Ubuntu to running demo.
+- **Script-path revocation penalty TX**: New `channel_build_penalty_tx_script_path()` spends the to-local output via a revocation checksig leaf (`<key> OP_CHECKSIG`) in a 2-leaf taptree, providing an alternative to key-path penalty. Enabled by `use_revocation_leaf=1` on the channel. Key-path penalty also works correctly with the 2-leaf taptree.
+- **`tapscript_build_revocation_checksig()`**: Builds a 34-byte revocation script leaf for the 2-leaf to-local taptree.
 
 ### Changed
 
@@ -72,7 +78,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Test Count
 
-415 unit + 43 regtest = 458 automated + 25 manual flag tests + 23 orchestrator scenarios.
+418 unit + 43 regtest = 461 automated + 25 manual flag tests + 23 orchestrator scenarios.
 
 ---
 
