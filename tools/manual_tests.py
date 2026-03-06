@@ -563,6 +563,26 @@ def test_demo_burn():
     return ok
 
 
+def test_htlc_force_close():
+    """--demo --test-htlc-force-close: add pending HTLC, force-close, broadcast HTLC timeout TX."""
+    print("\n=== TEST: --demo --test-htlc-force-close ===")
+    addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
+    rc, log = run_lsp(['--demo', '--test-htlc-force-close'], mine_addr=addr, timeout=180)
+    has_htlc = 'pending htlc added' in log.lower()
+    has_tree = 'tree nodes confirmed' in log.lower() or 'confirmed on-chain' in log.lower()
+    has_timeout = 'htlc timeout tx broadcast' in log.lower()
+    has_pass = 'HTLC FORCE-CLOSE TEST PASSED' in log
+    ok = rc == 0 and has_pass
+    print(f"  Exit: {rc}, PendingHTLC: {has_htlc}, TreeBroadcast: {has_tree}, "
+          f"TimeoutTx: {has_timeout}, Passed: {has_pass}")
+    for line in log.split('\n'):
+        ll = line.lower()
+        if any(kw in ll for kw in ['htlc', 'broadcast', 'confirmed', 'timeout', 'cltv']):
+            print(f"    {line.strip()}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def test_report_json():
     """--report generates valid JSON diagnostic report."""
     print("\n=== TEST: --report JSON ===")
@@ -611,6 +631,7 @@ if __name__ == '__main__':
         'mnemonic': test_generate_mnemonic,
         'backup': test_backup_restore,
         'burn': test_demo_burn,
+        'htlc_force_close': test_htlc_force_close,
         'report': test_report_json,
     }
 

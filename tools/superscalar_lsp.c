@@ -98,6 +98,7 @@ static void usage(const char *prog) {
         "  --arity N|N,N,...   Leaf arity: 1 or 2 (default 2). Comma-separated for per-level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
+        "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
@@ -477,6 +478,7 @@ int main(int argc, char *argv[]) {
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
     int force_close = 0;
     int test_burn = 0;
+    int test_htlc_force_close = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
@@ -616,6 +618,8 @@ int main(int argc, char *argv[]) {
             force_close = 1;
         else if (strcmp(argv[i], "--test-burn") == 0)
             test_burn = 1;
+        else if (strcmp(argv[i], "--test-htlc-force-close") == 0)
+            test_htlc_force_close = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
@@ -1797,7 +1801,7 @@ int main(int argc, char *argv[]) {
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
-        test_rebalance || test_batch_rebalance || test_realloc) {
+        test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = &fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -2170,6 +2174,244 @@ int main(int argc, char *argv[]) {
             printf("\n=== BURN TX TEST PASSED ===\n");
 
             report_add_string(&rpt, "result", "burn_test_complete");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+
+        /* === HTLC Force-Close Test: pending HTLC + tree broadcast + timeout TX === */
+        if (test_htlc_force_close) {
+            printf("\n=== HTLC FORCE-CLOSE TEST ===\n");
+
+            if (mgr->n_channels < 2) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: need at least 2 channels\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Step 1: Add a pending HTLC on channel 0 (low CLTV for quick timeout) */
+            uint32_t current_height = (uint32_t)regtest_get_block_height(&rt);
+            uint32_t htlc_cltv = current_height + 10;  /* expires in ~10 blocks */
+            unsigned char dummy_hash[32];
+            memset(dummy_hash, 0xAA, 32);  /* dummy payment hash */
+            uint64_t htlc_amount = 1000;
+
+            printf("Adding pending HTLC on channel 0 (amount=%llu sats, cltv=%u, "
+                   "current_height=%u)\n",
+                   (unsigned long long)htlc_amount, htlc_cltv, current_height);
+
+            if (!lsp_channels_add_pending_htlc(mgr, &lsp, 0, htlc_amount,
+                                                 dummy_hash, htlc_cltv)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: add_pending_htlc failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Step 2: Broadcast the factory tree */
+            printf("Broadcasting factory tree (%zu nodes) on %s...\n",
+                   lsp.factory.n_nodes, network);
+
+            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: tree broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("All %zu tree nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+
+            /* Step 3: Build and broadcast the commitment TX (has HTLC output) */
+            channel_t *ch0 = &mgr->entries[0].channel;
+            tx_buf_t commit_unsigned;
+            tx_buf_init(&commit_unsigned, 512);
+            unsigned char commit_txid[32];
+
+            if (!channel_build_commitment_tx(ch0, &commit_unsigned, commit_txid)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: build commitment TX failed\n");
+                tx_buf_free(&commit_unsigned);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Sign with both LSP + client keys (test key 0x22..22) */
+            unsigned char cli_sec[32];
+            memset(cli_sec, 0x22, 32);
+            secp256k1_keypair cli_kp;
+            if (!secp256k1_keypair_create(ctx, &cli_kp, cli_sec)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: client keypair failed\n");
+                memset(cli_sec, 0, 32);
+                tx_buf_free(&commit_unsigned);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            memset(cli_sec, 0, 32);
+
+            tx_buf_t commit_signed;
+            tx_buf_init(&commit_signed, 512);
+            if (!channel_sign_commitment(ch0, &commit_signed, &commit_unsigned, &cli_kp)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: sign commitment failed\n");
+                tx_buf_free(&commit_signed);
+                tx_buf_free(&commit_unsigned);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            tx_buf_free(&commit_unsigned);
+
+            char *commit_hex = malloc(commit_signed.len * 2 + 1);
+            hex_encode(commit_signed.data, commit_signed.len, commit_hex);
+            char commit_txid_str[65];
+            int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
+            free(commit_hex);
+            tx_buf_free(&commit_signed);
+
+            if (!sent) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: commitment broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            if (is_regtest)
+                regtest_mine_blocks(&rt, 1, mine_addr);
+            printf("Commitment TX broadcast: %s\n", commit_txid_str);
+
+            /* Step 4: HTLC output is at vout 2 (after to_local and to_remote).
+               Get the script pubkey from the commitment TX output. */
+            uint32_t htlc_vout = 2;
+            /* Re-build commitment to extract output script pubkeys */
+            tx_buf_t commit_rebuild;
+            tx_buf_init(&commit_rebuild, 512);
+            unsigned char rebuild_txid[32];
+            channel_build_commitment_tx(ch0, &commit_rebuild, rebuild_txid);
+
+            /* Parse the commitment TX to get the HTLC output script pubkey.
+               In our serialization, outputs start after the input section.
+               We can use the channel's HTLC amount directly. */
+            /* For the HTLC timeout TX, we need the HTLC output's scriptPubKey.
+               Build it from the channel state (same as commitment_tx_impl does). */
+            unsigned char htlc_spk[34];
+            size_t htlc_spk_len = 0;
+            {
+                /* Derive the HTLC output scriptPubKey by rebuilding the taproot key */
+                secp256k1_pubkey pcp;
+                channel_get_per_commitment_point(ch0, ch0->commitment_number, &pcp);
+
+                secp256k1_pubkey revocation_pubkey;
+                channel_derive_revocation_pubkey(ch0->ctx, &revocation_pubkey,
+                    &ch0->remote_revocation_basepoint, &pcp);
+                secp256k1_xonly_pubkey revocation_xonly;
+                secp256k1_xonly_pubkey_from_pubkey(ch0->ctx, &revocation_xonly, NULL,
+                    &revocation_pubkey);
+
+                secp256k1_pubkey local_htlc_pub, remote_htlc_pub;
+                channel_derive_pubkey(ch0->ctx, &local_htlc_pub,
+                    &ch0->local_htlc_basepoint, &pcp);
+                channel_derive_pubkey(ch0->ctx, &remote_htlc_pub,
+                    &ch0->remote_htlc_basepoint, &pcp);
+                secp256k1_xonly_pubkey local_htlc_xonly, remote_htlc_xonly;
+                secp256k1_xonly_pubkey_from_pubkey(ch0->ctx, &local_htlc_xonly, NULL,
+                    &local_htlc_pub);
+                secp256k1_xonly_pubkey_from_pubkey(ch0->ctx, &remote_htlc_xonly, NULL,
+                    &remote_htlc_pub);
+
+                /* Build the HTLC taptree leaves (same as commitment TX builder) */
+                tapscript_leaf_t success_leaf, timeout_leaf;
+                htlc_t *h = &ch0->htlcs[ch0->n_htlcs - 1]; /* last HTLC = ours */
+                if (h->direction == HTLC_OFFERED) {
+                    tapscript_build_htlc_offered_success(&success_leaf,
+                        h->payment_hash, &remote_htlc_xonly, ch0->ctx);
+                    tapscript_build_htlc_offered_timeout(&timeout_leaf,
+                        h->cltv_expiry, ch0->to_self_delay,
+                        &local_htlc_xonly, ch0->ctx);
+                } else {
+                    tapscript_build_htlc_received_success(&success_leaf,
+                        h->payment_hash, ch0->to_self_delay,
+                        &local_htlc_xonly, ch0->ctx);
+                    tapscript_build_htlc_received_timeout(&timeout_leaf,
+                        h->cltv_expiry, &remote_htlc_xonly, ch0->ctx);
+                }
+
+                tapscript_leaf_t htlc_leaves[2] = { success_leaf, timeout_leaf };
+                unsigned char htlc_merkle[32];
+                tapscript_merkle_root(htlc_merkle, htlc_leaves, 2);
+
+                secp256k1_xonly_pubkey htlc_tweaked;
+                tapscript_tweak_pubkey(ch0->ctx, &htlc_tweaked, NULL,
+                    &revocation_xonly, htlc_merkle);
+
+                build_p2tr_script_pubkey(htlc_spk, &htlc_tweaked);
+                htlc_spk_len = 34;
+            }
+            tx_buf_free(&commit_rebuild);
+
+            /* Step 5: Mine blocks to reach CLTV expiry */
+            uint32_t now_height = (uint32_t)regtest_get_block_height(&rt);
+            if (now_height < htlc_cltv) {
+                uint32_t blocks_needed = htlc_cltv - now_height;
+                printf("Mining %u blocks to reach CLTV expiry %u...\n",
+                       blocks_needed, htlc_cltv);
+                regtest_mine_blocks(&rt, (int)blocks_needed, mine_addr);
+            }
+
+            /* Also mine to_self_delay blocks for CSV on the timeout TX */
+            printf("Mining %u blocks for CSV delay...\n", ch0->to_self_delay);
+            regtest_mine_blocks(&rt, (int)ch0->to_self_delay, mine_addr);
+
+            /* Step 6: Build and broadcast HTLC timeout TX */
+            size_t htlc_index = ch0->n_htlcs - 1;  /* last HTLC */
+            tx_buf_t timeout_tx;
+            tx_buf_init(&timeout_tx, 256);
+
+            if (!channel_build_htlc_timeout_tx(ch0, &timeout_tx,
+                    commit_txid, htlc_vout, htlc_amount,
+                    htlc_spk, htlc_spk_len, htlc_index)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: build timeout TX failed\n");
+                tx_buf_free(&timeout_tx);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            char *timeout_hex = malloc(timeout_tx.len * 2 + 1);
+            hex_encode(timeout_tx.data, timeout_tx.len, timeout_hex);
+            char timeout_txid_str[65];
+            int timeout_sent = regtest_send_raw_tx(&rt, timeout_hex, timeout_txid_str);
+            free(timeout_hex);
+            tx_buf_free(&timeout_tx);
+
+            if (!timeout_sent) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: timeout TX broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            if (is_regtest)
+                regtest_mine_blocks(&rt, 1, mine_addr);
+
+            printf("HTLC timeout TX broadcast: %s\n", timeout_txid_str);
+            printf("\n=== HTLC FORCE-CLOSE TEST PASSED ===\n");
+
+            report_add_string(&rpt, "result", "htlc_force_close_complete");
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);

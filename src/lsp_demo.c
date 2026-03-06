@@ -852,3 +852,96 @@ int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     return 1;
 }
+
+int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                    size_t from_client, uint64_t amount_sats,
+                                    const unsigned char *payment_hash,
+                                    uint32_t cltv_expiry) {
+    if (!mgr || !lsp) return 0;
+    if (from_client >= mgr->n_channels) return 0;
+
+    uint64_t amount_msat = amount_sats * 1000;
+
+    /* Add HTLC on sender's channel (HTLC_RECEIVED from LSP perspective) */
+    channel_t *sender_ch = &mgr->entries[from_client].channel;
+
+    /* Capture pre-HTLC state for watchtower */
+    uint64_t old_local = sender_ch->local_amount;
+    uint64_t old_remote = sender_ch->remote_amount;
+    size_t old_n_htlcs = sender_ch->n_htlcs;
+    htlc_t *old_htlcs = old_n_htlcs > 0
+        ? malloc(old_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_n_htlcs > 0 && !old_htlcs) return 0;
+    if (old_n_htlcs > 0)
+        memcpy(old_htlcs, sender_ch->htlcs, old_n_htlcs * sizeof(htlc_t));
+
+    uint64_t htlc_id;
+    if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
+                           payment_hash, cltv_expiry, &htlc_id)) {
+        fprintf(stderr, "add_pending_htlc: channel_add_htlc failed\n");
+        free(old_htlcs);
+        return 0;
+    }
+
+    /* Send ADD_HTLC + COMMITMENT_SIGNED to sender */
+    {
+        cJSON *add = wire_build_update_add_htlc(htlc_id, amount_msat,
+                                                   payment_hash, cltv_expiry);
+        if (!wire_send(lsp->client_fds[from_client], MSG_UPDATE_ADD_HTLC, add)) {
+            cJSON_Delete(add);
+            free(old_htlcs);
+            return 0;
+        }
+        cJSON_Delete(add);
+    }
+    {
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+            free(old_htlcs);
+            return 0;
+        }
+        cJSON *cs = wire_build_commitment_signed(
+            mgr->entries[from_client].channel_id,
+            sender_ch->commitment_number, psig32, nonce_idx);
+        if (!wire_send(lsp->client_fds[from_client], MSG_COMMITMENT_SIGNED, cs)) {
+            cJSON_Delete(cs);
+            free(old_htlcs);
+            return 0;
+        }
+        cJSON_Delete(cs);
+    }
+
+    /* Wait for REVOKE_AND_ACK from sender */
+    {
+        wire_msg_t ack_msg;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
+                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
+            fprintf(stderr, "add_pending_htlc: timeout waiting for REVOKE_AND_ACK\n");
+            free(old_htlcs);
+            return 0;
+        }
+        uint32_t ack_chan_id;
+        unsigned char rev_secret[32], next_point[33];
+        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                        rev_secret, next_point)) {
+            uint64_t old_cn = sender_ch->commitment_number - 1;
+            channel_receive_revocation(sender_ch, old_cn, rev_secret);
+            watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
+                (uint32_t)from_client, old_cn,
+                old_local, old_remote,
+                old_htlcs, old_n_htlcs);
+            secp256k1_pubkey next_pcp;
+            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+                channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+            lsp_send_revocation(mgr, lsp, from_client, old_cn);
+        }
+        cJSON_Delete(ack_msg.json);
+    }
+    free(old_htlcs);
+
+    printf("Pending HTLC added on channel %zu (htlc_id=%llu, amount=%llu sats, "
+           "cltv=%u)\n", from_client, (unsigned long long)htlc_id,
+           (unsigned long long)amount_sats, cltv_expiry);
+    return 1;
+}

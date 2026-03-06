@@ -2297,6 +2297,27 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
     }
 }
 
+/* Find client slot by pubkey. Returns index or -1 if not found. */
+static int find_client_slot_by_pubkey(const lsp_t *lsp,
+                                       const secp256k1_context *ctx,
+                                       const secp256k1_pubkey *pk) {
+    unsigned char pk_ser[33], cmp_ser[33];
+    size_t len1 = 33, len2 = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, pk_ser, &len1, pk,
+                                        SECP256K1_EC_COMPRESSED))
+        return -1;
+    for (size_t c = 0; c < lsp->n_clients; c++) {
+        len2 = 33;
+        if (!secp256k1_ec_pubkey_serialize(ctx, cmp_ser, &len2,
+                                            &lsp->client_pubkeys[c],
+                                            SECP256K1_EC_COMPRESSED))
+            continue;
+        if (memcmp(pk_ser, cmp_ser, 33) == 0)
+            return (int)c;
+    }
+    return -1;
+}
+
 /* Core reconnect handler that takes an already-read MSG_RECONNECT message. */
 static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        int new_fd, const wire_msg_t *msg) {
@@ -3321,6 +3342,33 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             cJSON_Delete(peek.json);
                             if (!ret) {
                                 fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
+                            }
+                        } else if (peek.msg_type == MSG_HELLO) {
+                            /* Client reconnecting without state — check if known pubkey */
+                            unsigned char pk_buf[33];
+                            secp256k1_pubkey pk;
+                            if (wire_json_get_hex(peek.json, "pubkey", pk_buf, 33) == 33 &&
+                                secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
+                                int slot = find_client_slot_by_pubkey(lsp, mgr->ctx, &pk);
+                                if (slot >= 0) {
+                                    fprintf(stderr, "LSP daemon: MSG_HELLO from known client %d "
+                                            "(lost state?), attempting reconnect\n", slot);
+                                    cJSON_Delete(peek.json);
+                                    peek.json = wire_build_reconnect(mgr->ctx, &pk, 0);
+                                    peek.msg_type = MSG_RECONNECT;
+                                    int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
+                                    cJSON_Delete(peek.json);
+                                    if (!ret) {
+                                        fprintf(stderr, "LSP daemon: HELLO->reconnect failed for "
+                                                "slot %d (state mismatch — client needs --db)\n", slot);
+                                    }
+                                } else {
+                                    cJSON_Delete(peek.json);
+                                    wire_close(new_fd);
+                                }
+                            } else {
+                                cJSON_Delete(peek.json);
+                                wire_close(new_fd);
                             }
                         } else {
                             fprintf(stderr, "LSP daemon: unexpected msg 0x%02x from new connection\n",
