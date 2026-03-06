@@ -55,8 +55,8 @@ time.sleep(1)
 print("Regtest ready")
 
 # Clean up
-subprocess.run(["pkill", "-f", "superscalar_lsp"], capture_output=True)
-subprocess.run(["pkill", "-f", "superscalar_client"], capture_output=True)
+subprocess.run(["pkill", "-f", "superscalar_lsp.*--network regtest"], capture_output=True)
+subprocess.run(["pkill", "-f", "superscalar_client.*--network regtest"], capture_output=True)
 time.sleep(1)
 for f in ["/tmp/cli_lsp.db", "/tmp/cli_report.json", "/tmp/cli_lsp.log"]:
     try: os.unlink(f)
