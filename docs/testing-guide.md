@@ -467,9 +467,9 @@ python3 tools/manual_tests.py help
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SUPERSCALAR_BTC` | `/home/pirq/bin/bitcoin-cli` | Path to bitcoin-cli |
-| `SUPERSCALAR_BTCCONF` | `~/bitcoin-regtest/bitcoin.conf` | Bitcoin config file (empty string to omit) |
-| `SUPERSCALAR_BUILD` | `/home/pirq/superscalar-build` | Build directory with binaries |
+| `SUPERSCALAR_BTC` | `bitcoin-cli` (PATH lookup) | Path to bitcoin-cli |
+| `SUPERSCALAR_BTCCONF` | *(unset — uses cookie auth)* | Bitcoin config file (set to custom path if needed) |
+| `SUPERSCALAR_BUILD` | `../build` (relative to tools/) | Build directory with binaries |
 
 ---
 
