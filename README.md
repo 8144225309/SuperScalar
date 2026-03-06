@@ -386,6 +386,29 @@ python3 tools/dashboard.py \
 
 Open http://localhost:8080 for real-time factory, channel, and payment status.
 
+### Testnet4 Timing
+
+Default factory parameters are production-grade (4320-block active period ≈ 30 days). For initial testnet4 testing, use shorter cycles to iterate faster:
+
+```bash
+./superscalar_lsp \
+  --network testnet4 \
+  --active-blocks 50 --dying-blocks 20 \
+  --step-blocks 5 --states-per-layer 2 \
+  --confirm-timeout 7200 \
+  ...
+```
+
+| Parameter | Default (non-regtest) | Recommended (testnet4 testing) | Effect |
+|-----------|----------------------|-------------------------------|--------|
+| `--active-blocks` | 4320 (~30 days) | 50 (~8 hours) | Factory active period |
+| `--dying-blocks` | 432 (~3 days) | 20 (~3 hours) | Factory dying period |
+| `--step-blocks` | 10 | 5 | BIP68 relative lock per DW layer |
+| `--states-per-layer` | 4 | 2 | DW states per tree layer |
+| `--confirm-timeout` | 7200 (2 hours) | 7200 | Max wait for TX confirmation |
+
+With `--step-blocks 5`, a full DW tree force-close takes ~30 blocks (~5 hours) instead of ~300 blocks (~2 days).
+
 ### Troubleshooting
 
 | Problem | Fix |
