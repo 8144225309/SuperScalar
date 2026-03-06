@@ -44,6 +44,7 @@ PORT_BASE=9750
 declare -A STRUCTURE_PORTS=(
     [1]=9750 [2]=9751 [3]=9752 [4]=9753 [5]=9754
     [6]=9755 [7]=9756 [8]=9757 [9]=9758 [10]=9759
+    [11]=9760
 )
 
 # Track results
@@ -266,6 +267,16 @@ structure_10_distribution_tx() {
     fi
 }
 
+structure_11_jit_channel() {
+    if python3 "$ORCHESTRATOR" --list 2>&1 | grep -q "jit_lifecycle"; then
+        run_orchestrator "11_jit_channel" "${STRUCTURE_PORTS[11]}" \
+            --scenario jit_lifecycle
+    else
+        log "WARNING: scenario_jit_lifecycle not yet in orchestrator. Skipping."
+        RESULTS["11_jit_channel"]="SKIP"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Inspection report
 # ---------------------------------------------------------------------------
@@ -346,7 +357,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --structure N    Run only structure N (1-10)"
+    echo "  --structure N    Run only structure N (1-11)"
     echo "  --all            Run all structures sequentially"
     echo "  --parallel       Run independent structures in parallel (2,3,7)"
     echo "  --report-dir DIR Output directory (default: /tmp/exhibition_testnet4)"
@@ -359,11 +370,12 @@ usage() {
     echo "  3  L-stock burn"
     echo "  4  BOLT11 bridge payment"
     echo "  5  Factory rotation"
-    echo "  6  DW advance + force close (BLOCKED by P0)"
+    echo "  6  DW advance + force close"
     echo "  7  Breach + penalty"
     echo "  8  CLTV timeout recovery"
     echo "  9  Remote client (manual)"
     echo "  10 Distribution TX (P2A anchor)"
+    echo "  11 JIT channel (late-arriving client)"
 }
 
 STRUCTURE=""
@@ -405,10 +417,11 @@ if [[ -n "$STRUCTURE" ]]; then
         8) structure_8_cltv_timeout ;;
         9) structure_9_remote_client ;;
         10) structure_10_distribution_tx ;;
+        11) structure_11_jit_channel ;;
         *) echo "Unknown structure: $STRUCTURE"; exit 1 ;;
     esac
 elif $RUN_ALL; then
-    log "=== Running all 10 structures sequentially ==="
+    log "=== Running all 11 structures sequentially ==="
 
     if $RUN_PARALLEL; then
         log "Running structures 2, 3, 7 in parallel..."
@@ -434,6 +447,7 @@ elif $RUN_ALL; then
         structure_8_cltv_timeout || true
         structure_9_remote_client || true
         structure_10_distribution_tx || true
+        structure_11_jit_channel || true
     else
         structure_1_cooperative || true
         structure_2_full_dw_tree || true
@@ -445,6 +459,7 @@ elif $RUN_ALL; then
         structure_8_cltv_timeout || true
         structure_9_remote_client || true
         structure_10_distribution_tx || true
+        structure_11_jit_channel || true
     fi
 else
     echo "Specify --structure N, --all, or --list"
