@@ -1,10 +1,13 @@
 #!/bin/bash
 # Reset regtest chain to get fresh block subsidies
-export PATH="$HOME/bitcoin-28.0/bin:$PATH"
 
 echo "=== Stopping bitcoind ==="
 bitcoin-cli -regtest stop 2>/dev/null
-sleep 2
+# Wait for regtest bitcoind to exit (don't kill non-regtest instances)
+for i in $(seq 1 15); do
+    bitcoin-cli -regtest ping 2>/dev/null || break
+    sleep 1
+done
 
 echo "=== Removing regtest data ==="
 rm -rf "$HOME/.bitcoin/regtest"
