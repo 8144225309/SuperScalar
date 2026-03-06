@@ -29,7 +29,16 @@ def fresh_regtest():
     # Unload wallet first to prevent stale UTXO conflicts between runs
     subprocess.run([btc] + conf + [f'-rpcwallet={WALLET}', 'unloadwallet'], capture_output=True)
     subprocess.run([btc] + conf + ['stop'], capture_output=True)
-    time.sleep(3)
+    # Wait for bitcoind to fully exit before wiping data
+    for _ in range(15):
+        r = subprocess.run(['pidof', 'bitcoind'], capture_output=True)
+        if r.returncode != 0:
+            break
+        time.sleep(1)
+    else:
+        # Force kill if still running after 15 seconds
+        subprocess.run(['pkill', '-9', 'bitcoind'], capture_output=True)
+        time.sleep(2)
     subprocess.run(['rm', '-rf', os.path.expanduser('~/.bitcoin/regtest')])
     # Find bitcoind next to bitcoin-cli
     btcd = os.path.join(os.path.dirname(btc), 'bitcoind') if '/' in btc else 'bitcoind'
@@ -53,7 +62,9 @@ def fresh_regtest():
 def cleanup_procs():
     subprocess.run(['pkill', '-f', 'superscalar_lsp'], capture_output=True)
     subprocess.run(['pkill', '-f', 'superscalar_client'], capture_output=True)
-    time.sleep(1)
+    # Also stop bitcoind to prevent stale state between test runs
+    subprocess.run([btc] + conf + ['stop'], capture_output=True)
+    time.sleep(2)
 
 def lsp_base_cmd(extra_flags=None, n_clients=4, amount=100000, port=9745):
     cmd = [LSP,
@@ -206,6 +217,43 @@ def test_demo_force_close():
     for line in log.split('\n'):
         ll = line.lower()
         if any(kw in ll for kw in ['broadcast', 'kickoff', 'confirmed', 'tree', 'leaf', 'timeout']):
+            print(f"    {line.strip()}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+def test_bridge():
+    """--demo --test-bridge: simulate bridge inbound HTLC, verify routing + fulfillment."""
+    print("\n=== TEST: --demo --test-bridge ===")
+    addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
+    rc, log = run_lsp(['--demo', '--test-bridge'], mine_addr=addr, timeout=120)
+    has_bridge = 'bridge' in log.lower() and 'simulated' in log.lower()
+    has_route = 'routed htlc' in log.lower()
+    has_fulfill = 'fulfill' in log.lower()
+    has_pass = 'BRIDGE TEST PASSED' in log
+    ok = rc == 0 and has_pass
+    print(f"  Exit: {rc}, Bridge: {has_bridge}, Routed: {has_route}, Fulfill: {has_fulfill}")
+    for line in log.split('\n'):
+        ll = line.lower()
+        if any(kw in ll for kw in ['bridge', 'htlc', 'fulfill', 'invoice', 'routing']):
+            print(f"    {line.strip()}")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+def test_dw_advance():
+    """--demo --test-dw-advance: advance DW counter, re-sign tree, force-close."""
+    print("\n=== TEST: --demo --test-dw-advance ===")
+    addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
+    rc, log = run_lsp(['--demo', '--test-dw-advance'], mine_addr=addr, timeout=180)
+    has_before = 'before advance' in log.lower()
+    has_after = 'after advance' in log.lower()
+    has_confirm = 'confirmed' in log.lower()
+    has_pass = 'DW ADVANCE TEST PASSED' in log or 'DW ADVANCE TEST' in log
+    ok = rc == 0 and has_pass
+    print(f"  Exit: {rc}, Before: {has_before}, After: {has_after}, Confirmed: {has_confirm}")
+    # Show nSequence lines to verify decrease
+    for line in log.split('\n'):
+        ll = line.lower()
+        if any(kw in ll for kw in ['nsequence', 'advance', 'epoch', 'node ']):
             print(f"    {line.strip()}")
     print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
@@ -496,27 +544,32 @@ def test_backup_restore():
     env = dict(os.environ)
     env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
 
-    # Run demo to create DB state
-    rc, log = run_lsp(['--demo'])
+    keyfile_path = '/tmp/mt_lsp.key'
+    restored_keyfile = '/tmp/mt_restored.key'
+
+    # Run demo to create DB state (with --keyfile so key material is generated)
+    rc, log = run_lsp(['--demo', '--keyfile', keyfile_path])
     if 'factory creation complete' not in log:
         print("  FAIL: no DB state created for backup test")
         return False
 
     backup_path = '/tmp/mt_backup.enc'
     db_path = '/tmp/mt_lsp.db'
-    for f in [backup_path, '/tmp/mt_restored.db']:
+    for f in [backup_path, '/tmp/mt_restored.db', restored_keyfile]:
         try: os.unlink(f)
         except: pass
 
-    # Create backup
+    # Create backup (requires --db and --keyfile)
     r = subprocess.run(
         [LSP, '--backup', backup_path, '--db', db_path,
+         '--keyfile', keyfile_path,
          '--seckey', LSP_SECKEY, '--passphrase', 'testpass',
          '--network', 'regtest'],
         capture_output=True, text=True, env=env, timeout=30)
     if not os.path.exists(backup_path):
-        print(f"  SKIP: --backup did not create file (may need --keyfile)")
-        return True
+        print(f"  FAIL: --backup did not create file (rc={r.returncode})")
+        print(f"  stderr: {r.stderr.strip()}")
+        return False
 
     sz = os.path.getsize(backup_path)
     print(f"  Backup: {sz} bytes")
@@ -527,20 +580,30 @@ def test_backup_restore():
         capture_output=True, text=True, env=env, timeout=30)
     print(f"  Verify: rc={r.returncode}")
 
-    # Restore
+    # Restore (requires --db and --keyfile for destination paths)
     restored = '/tmp/mt_restored.db'
     r = subprocess.run(
         [LSP, '--restore', backup_path, '--db', restored,
+         '--keyfile', restored_keyfile,
          '--passphrase', 'testpass'],
         capture_output=True, text=True, env=env, timeout=30)
     has_restore = os.path.exists(restored)
-    print(f"  Restore: {has_restore}")
+    has_keyfile = os.path.exists(restored_keyfile)
+    print(f"  Restore: db={has_restore}, keyfile={has_keyfile}")
 
-    for f in [backup_path, restored]:
+    # Verify restored keyfile matches original
+    if has_keyfile and os.path.exists(keyfile_path):
+        with open(keyfile_path, 'rb') as f1, open(restored_keyfile, 'rb') as f2:
+            keys_match = f1.read() == f2.read()
+        print(f"  Keyfile match: {keys_match}")
+    else:
+        keys_match = False
+
+    for f in [backup_path, restored, keyfile_path, restored_keyfile]:
         try: os.unlink(f)
         except: pass
 
-    ok = has_restore
+    ok = has_restore and has_keyfile and keys_match
     print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -609,6 +672,8 @@ if __name__ == '__main__':
         'demo': test_demo_basic,
         'rotation': test_demo_rotation,
         'force_close': test_demo_force_close,
+        'dw_advance': test_dw_advance,
+        'bridge': test_bridge,
         'expiry': test_demo_expiry,
         'distrib': test_demo_distrib,
         'turnover': test_demo_turnover,

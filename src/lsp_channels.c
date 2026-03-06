@@ -3354,7 +3354,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     fprintf(stderr, "LSP daemon: MSG_HELLO from known client %d "
                                             "(lost state?), attempting reconnect\n", slot);
                                     cJSON_Delete(peek.json);
-                                    peek.json = wire_build_reconnect(mgr->ctx, &pk, 0);
+                                    uint64_t cn = mgr->entries[slot].channel.commitment_number;
+                                    peek.json = wire_build_reconnect(mgr->ctx, &pk, cn);
                                     peek.msg_type = MSG_RECONNECT;
                                     int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
                                     cJSON_Delete(peek.json);

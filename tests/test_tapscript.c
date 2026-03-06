@@ -799,3 +799,38 @@ int test_multi_level_timeout_unit(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Revocation checksig leaf test ---- */
+
+int test_revocation_checksig_leaf(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    TEST_ASSERT(make_keypairs(ctx, kps), "make keypairs");
+
+    /* Use first keypair as revocation key */
+    secp256k1_pubkey rev_pub;
+    secp256k1_keypair_pub(ctx, &rev_pub, &kps[0]);
+    secp256k1_xonly_pubkey rev_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &rev_xonly, NULL, &rev_pub);
+
+    tapscript_leaf_t leaf;
+    TEST_ASSERT(tapscript_build_revocation_checksig(&leaf, &rev_xonly, ctx),
+                "build revocation checksig leaf");
+
+    /* Script: OP_PUSHBYTES_32(0x20) || key(32) || OP_CHECKSIG(0xac) = 34 bytes */
+    TEST_ASSERT_EQ(leaf.script_len, 34, "script length");
+    TEST_ASSERT_EQ(leaf.script[0], 0x20, "OP_PUSHBYTES_32");
+    TEST_ASSERT_EQ(leaf.script[33], 0xac, "OP_CHECKSIG");
+
+    /* Verify key bytes match serialized xonly key */
+    unsigned char key_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, key_ser, &rev_xonly);
+    TEST_ASSERT(memcmp(leaf.script + 1, key_ser, 32) == 0, "key matches");
+
+    /* Leaf hash should be non-zero */
+    unsigned char zero[32] = {0};
+    TEST_ASSERT(memcmp(leaf.leaf_hash, zero, 32) != 0, "leaf hash non-zero");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -606,7 +606,16 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         return 0;
 
     unsigned char merkle_root[32];
-    tapscript_merkle_root(merkle_root, &csv_leaf, 1);
+    if (ch->use_revocation_leaf) {
+        tapscript_leaf_t leaves[2];
+        leaves[0] = csv_leaf;
+        if (!tapscript_build_revocation_checksig(&leaves[1], &revocation_xonly,
+                                                  ch->ctx))
+            return 0;
+        tapscript_merkle_root(merkle_root, leaves, 2);
+    } else {
+        tapscript_merkle_root(merkle_root, &csv_leaf, 1);
+    }
 
     secp256k1_xonly_pubkey to_local_tweaked;
     if (!tapscript_tweak_pubkey(ch->ctx, &to_local_tweaked, NULL,
@@ -884,10 +893,7 @@ int channel_build_penalty_tx(const channel_t *ch,
                                     ch->ctx))
         return 0;
 
-    unsigned char merkle_root[32];
-    tapscript_merkle_root(merkle_root, &csv_leaf, 1);
-
-    /* 6. Compute taproot tweak for the revocation key */
+    /* 5b. Rebuild merkle root (must match commitment TX taptree) */
     secp256k1_pubkey revocation_pubkey;
     if (!secp256k1_ec_pubkey_create(ch->ctx, &revocation_pubkey, revocation_privkey))
         return 0;
@@ -897,6 +903,19 @@ int channel_build_penalty_tx(const channel_t *ch,
                                              &revocation_pubkey))
         return 0;
 
+    unsigned char merkle_root[32];
+    if (ch->use_revocation_leaf) {
+        tapscript_leaf_t leaves[2];
+        leaves[0] = csv_leaf;
+        if (!tapscript_build_revocation_checksig(&leaves[1], &revocation_xonly,
+                                                  ch->ctx))
+            return 0;
+        tapscript_merkle_root(merkle_root, leaves, 2);
+    } else {
+        tapscript_merkle_root(merkle_root, &csv_leaf, 1);
+    }
+
+    /* 6. Compute taproot tweak for the revocation key */
     unsigned char internal_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly))
         return 0;
@@ -994,6 +1013,190 @@ int channel_build_penalty_tx(const channel_t *ch,
     /* 10. Finalize */
     if (!finalize_signed_tx(penalty_tx_out, unsigned_tx.data, unsigned_tx.len,
                               sig64)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    tx_buf_free(&unsigned_tx);
+    secure_zero(revocation_privkey, 32);
+    secure_zero(pcp_secret, 32);
+    return 1;
+}
+
+int channel_build_penalty_tx_script_path(const channel_t *ch,
+                                           tx_buf_t *penalty_tx_out,
+                                           const unsigned char *commitment_txid,
+                                           uint32_t to_local_vout,
+                                           uint64_t to_local_amount,
+                                           const unsigned char *to_local_spk,
+                                           size_t to_local_spk_len,
+                                           uint64_t old_commitment_num,
+                                           const unsigned char *anchor_spk,
+                                           size_t anchor_spk_len) {
+    if (!ch->use_revocation_leaf)
+        return 0;  /* script-path penalty requires 2-leaf taptree */
+
+    /* 1. Retrieve per_commitment_secret from received revocations */
+    unsigned char pcp_secret[32];
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+        return 0;
+
+    /* 2. Compute per_commitment_point from secret */
+    secp256k1_pubkey pcp;
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &pcp, pcp_secret))
+        return 0;
+
+    /* 3. Derive revocation privkey */
+    unsigned char revocation_privkey[32];
+    if (!channel_derive_revocation_privkey(ch->ctx, revocation_privkey,
+                                             ch->local_revocation_basepoint_secret,
+                                             pcp_secret,
+                                             &ch->local_revocation_basepoint, &pcp))
+        return 0;
+
+    /* 4. Derive delayed_payment pubkey (needed for csv_leaf) */
+    secp256k1_pubkey delayed_pubkey;
+    if (!channel_derive_pubkey(ch->ctx, &delayed_pubkey,
+                                &ch->remote_delayed_payment_basepoint, &pcp))
+        return 0;
+
+    secp256k1_xonly_pubkey delayed_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &delayed_xonly, NULL,
+                                             &delayed_pubkey))
+        return 0;
+
+    /* 5. Build 2-leaf taptree: [csv_leaf, revocation_leaf] */
+    secp256k1_pubkey revocation_pubkey;
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &revocation_pubkey, revocation_privkey))
+        return 0;
+
+    secp256k1_xonly_pubkey revocation_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL,
+                                             &revocation_pubkey))
+        return 0;
+
+    tapscript_leaf_t csv_leaf;
+    if (!tapscript_build_csv_delay(&csv_leaf, ch->to_self_delay, &delayed_xonly,
+                                    ch->ctx))
+        return 0;
+
+    tapscript_leaf_t revocation_leaf;
+    if (!tapscript_build_revocation_checksig(&revocation_leaf, &revocation_xonly,
+                                              ch->ctx))
+        return 0;
+
+    tapscript_leaf_t leaves[2];
+    leaves[0] = csv_leaf;
+    leaves[1] = revocation_leaf;
+
+    unsigned char merkle_root[32];
+    tapscript_merkle_root(merkle_root, leaves, 2);
+
+    /* 6. Compute tweaked output key (to get parity for control block) */
+    secp256k1_xonly_pubkey tweaked_output;
+    int output_parity = 0;
+    if (!tapscript_tweak_pubkey(ch->ctx, &tweaked_output, &output_parity,
+                                 &revocation_xonly, merkle_root))
+        return 0;
+
+    /* 7. Build penalty tx output: P2TR(local_payment_basepoint) key-path-only */
+    secp256k1_xonly_pubkey local_pay_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
+
+    unsigned char out_internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, out_internal_ser, &local_pay_xonly))
+        return 0;
+    unsigned char out_tweak[32];
+    sha256_tagged("TapTweak", out_internal_ser, 32, out_tweak);
+
+    secp256k1_pubkey out_tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &out_tweaked_full,
+                                            &local_pay_xonly, out_tweak))
+        return 0;
+    secp256k1_xonly_pubkey out_tweaked;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
+                                             &out_tweaked_full))
+        return 0;
+
+    /* 8. Fee calculation (script-path witness is larger: ~198 vB with 2-leaf control block) */
+    int has_anchor = (anchor_spk && anchor_spk_len == P2A_SPK_LEN);
+    uint64_t vsize = has_anchor ? 200 : 185;
+    uint64_t anchor_amount = ANCHOR_OUTPUT_AMOUNT;
+    uint64_t penalty_fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
+    uint64_t deduction = penalty_fee + (has_anchor ? anchor_amount : 0);
+    uint64_t penalty_amount = to_local_amount > deduction ? to_local_amount - deduction : 0;
+
+    if (penalty_amount < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Penalty script-path: output %llu sats below dust limit\n",
+                (unsigned long long)penalty_amount);
+        return 0;
+    }
+
+    tx_output_t outputs[2];
+    size_t n_outputs = 1;
+    build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
+    outputs[0].script_pubkey_len = 34;
+    outputs[0].amount_sats = penalty_amount;
+
+    if (has_anchor) {
+        memcpy(outputs[1].script_pubkey, anchor_spk, P2A_SPK_LEN);
+        outputs[1].script_pubkey_len = P2A_SPK_LEN;
+        outputs[1].amount_sats = anchor_amount;
+        n_outputs = 2;
+    }
+
+    /* 9. Build unsigned penalty tx */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char penalty_txid[32];
+    if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
+                            commitment_txid, to_local_vout,
+                            0xFFFFFFFD, outputs, n_outputs)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 10. Compute tapscript sighash for revocation_leaf */
+    unsigned char sighash[32];
+    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                    0, to_local_spk, to_local_spk_len,
+                                    to_local_amount, 0xFFFFFFFD,
+                                    &revocation_leaf)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 11. Sign with untweaked revocation privkey */
+    secp256k1_keypair rev_kp;
+    if (!secp256k1_keypair_create(ch->ctx, &rev_kp, revocation_privkey)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char sig64[64];
+    if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &rev_kp, NULL)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 12. Build control block for revocation_leaf (sibling = csv_leaf) */
+    unsigned char control_block[65];
+    size_t cb_len = 0;
+    if (!tapscript_build_control_block_2leaf(control_block, &cb_len,
+                                              output_parity,
+                                              &revocation_xonly,
+                                              &csv_leaf, ch->ctx)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 13. Finalize with script-path witness: [sig, revocation_script, control_block] */
+    if (!finalize_script_path_tx(penalty_tx_out, unsigned_tx.data, unsigned_tx.len,
+                                   sig64, revocation_leaf.script,
+                                   revocation_leaf.script_len,
+                                   control_block, cb_len)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }

@@ -97,6 +97,7 @@ typedef struct {
     uint32_t to_self_delay;
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
+    int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
 
     /* MuSig2 signer index: 0 or 1 in the canonical 2-of-2 keyagg order.
        Needed for distributed signing (Phase 12). */
@@ -262,6 +263,19 @@ int channel_build_penalty_tx(const channel_t *ch,
                                uint64_t old_commitment_num,
                                const unsigned char *anchor_spk,
                                size_t anchor_spk_len);
+
+/* Build penalty tx via script-path revocation (requires use_revocation_leaf=1).
+   Uses the revocation checksig leaf in the 2-leaf taptree. */
+int channel_build_penalty_tx_script_path(const channel_t *ch,
+                                           tx_buf_t *penalty_tx_out,
+                                           const unsigned char *commitment_txid,
+                                           uint32_t to_local_vout,
+                                           uint64_t to_local_amount,
+                                           const unsigned char *to_local_spk,
+                                           size_t to_local_spk_len,
+                                           uint64_t old_commitment_num,
+                                           const unsigned char *anchor_spk,
+                                           size_t anchor_spk_len);
 
 /* Set the fee rate (sat/kvB) used for penalty/HTLC transactions.
    Default is 1000 sat/kvB (1 sat/vB). */
