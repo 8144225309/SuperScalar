@@ -102,7 +102,7 @@ static void usage(const char *prog) {
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
-        "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 7200 non-regtest)\n"
+        "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
         "  --max-handshakes N  Max concurrent handshakes (default: 4)\n"
@@ -484,7 +484,7 @@ int main(int argc, char *argv[]) {
     int test_htlc_force_close = 0;
     int test_dw_advance = 0;
     int test_bridge = 0;
-    int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 7200 non-regtest) */
+    int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 259200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
     int max_conn_rate_arg = 10;      /* max connections per IP per minute */
@@ -843,7 +843,7 @@ int main(int argc, char *argv[]) {
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
-                               : (is_regtest ? 3600 : 7200);
+                               : (is_regtest ? 3600 : 259200);
 
     /* Test flags that mine blocks require regtest */
     if (!is_regtest && (test_expiry || test_distrib ||
