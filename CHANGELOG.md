@@ -40,6 +40,7 @@ All notable changes to SuperScalar are documented here.
 - **Bridge test clients missing `--db`**: All 4 factory clients in `test_bridge_regtest.sh` started without `--db`, so channel state (invoices, preimages, balances) existed only in memory. Added `--db "$TMPDIR/client_${i}.db"` to each client.
 - **Bridge test plugin→bridge race**: The test verified the bridge→LSP connection but not the CLN plugin→bridge connection. If the invoice command was sent before the plugin connected, the bridge exited. Added a poll loop waiting for "plugin connected" in the bridge log.
 - **manual_tests.py regtest teardown**: `fresh_regtest()` used a fixed `sleep 3` after `bitcoind stop`, which wasn't enough on slow machines. Replaced with a poll loop waiting for the bitcoind process to exit.
+- **HTLC force-close test direction mismatch**: `add_pending_htlc` used `HTLC_RECEIVED` but the LSP is offering the HTLC to the client. The client (with no `dest_client` field) also added `HTLC_RECEIVED`, causing a commitment TX mismatch — the LSP's sig was for the wrong transaction, `verify_and_aggregate` failed, and `REVOKE_AND_ACK` was never sent. Fixed to `HTLC_OFFERED`.
 
 ### Security
 
