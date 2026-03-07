@@ -103,6 +103,7 @@ static void usage(const char *prog) {
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
+        "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
@@ -521,6 +522,7 @@ int main(int argc, char *argv[]) {
     int test_dw_advance = 0;
     int test_leaf_advance = 0;
     int test_dual_factory = 0;
+    int test_dw_exhibition = 0;
     int test_bridge = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 259200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
@@ -670,6 +672,8 @@ int main(int argc, char *argv[]) {
             test_leaf_advance = 1;
         else if (strcmp(argv[i], "--test-dual-factory") == 0)
             test_dual_factory = 1;
+        else if (strcmp(argv[i], "--test-dw-exhibition") == 0)
+            test_dw_exhibition = 1;
         else if (strcmp(argv[i], "--test-bridge") == 0)
             test_bridge = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
@@ -1854,7 +1858,7 @@ int main(int argc, char *argv[]) {
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
-        test_dual_factory) {
+        test_dual_factory || test_dw_exhibition) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = &fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -2203,6 +2207,391 @@ int main(int argc, char *argv[]) {
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
+        }
+
+        /* === DW Exhibition Test: multi-advance + PTLC close + cross-factory contrast === */
+        if (test_dw_exhibition && channels_active) {
+            printf("\n=== DW EXHIBITION TEST ===\n\n");
+            int exhibition_pass = 1;
+            char exhibition_close_txid[65] = {0};
+
+            /* --- Phase 1: Multiple DW Advances — nSequence Countdown to Zero --- */
+            printf("--- Phase 1: nSequence Countdown ---\n");
+
+            /* Populate keypairs (demo mode: LSP has all keys) */
+            secp256k1_keypair exh_kps[FACTORY_MAX_SIGNERS];
+            exh_kps[0] = lsp_kp;
+            {
+                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+                for (int ci = 0; ci < n_clients; ci++) {
+                    unsigned char ds[32];
+                    memset(ds, fill[ci], 32);
+                    if (!secp256k1_keypair_create(ctx, &exh_kps[ci + 1], ds)) {
+                        fprintf(stderr, "DW EXHIBITION: keypair create failed\n");
+                        return 1;
+                    }
+                }
+            }
+            memcpy(lsp.factory.keypairs, exh_kps,
+                   n_total * sizeof(secp256k1_keypair));
+
+            /* Record initial nSequence for all nodes */
+            uint32_t initial_nseq[256];
+            for (size_t ni = 0; ni < lsp.factory.n_nodes && ni < 256; ni++)
+                initial_nseq[ni] = lsp.factory.nodes[ni].nsequence;
+
+            printf("Epoch 0 (initial):\n");
+            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++)
+                printf("  Node %zu: nSequence=%u\n", ni, lsp.factory.nodes[ni].nsequence);
+
+            /* Advance states_per_layer - 1 times to reach zero */
+            int max_advances = states_per_layer - 1;
+            int any_zero = 0;
+            int all_decreased = 1;
+            for (int adv = 0; adv < max_advances; adv++) {
+                if (!factory_advance(&lsp.factory)) {
+                    fprintf(stderr, "DW EXHIBITION: factory_advance failed at step %d\n", adv + 1);
+                    exhibition_pass = 0;
+                    break;
+                }
+                printf("Epoch %u (advance %d/%d):\n",
+                       dw_counter_epoch(&lsp.factory.counter), adv + 1, max_advances);
+                for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
+                    uint32_t cur = lsp.factory.nodes[ni].nsequence;
+                    int32_t delta = (int32_t)cur - (int32_t)initial_nseq[ni];
+                    printf("  Node %zu: nSequence=%u (delta=%d)\n", ni, cur, delta);
+                    if (cur == 0) any_zero = 1;
+                }
+            }
+
+            /* Verify: all state nodes decreased from initial AND at least one reached 0 */
+            for (size_t ni = 0; ni < lsp.factory.n_nodes && ni < 256; ni++) {
+                if (initial_nseq[ni] > 0 &&
+                    lsp.factory.nodes[ni].nsequence >= initial_nseq[ni])
+                    all_decreased = 0;
+            }
+
+            if (!all_decreased || !any_zero) {
+                fprintf(stderr, "DW EXHIBITION Phase 1: countdown check failed "
+                        "(all_decreased=%d, any_zero=%d)\n", all_decreased, any_zero);
+                exhibition_pass = 0;
+            }
+            printf("Phase 1: %s (all_decreased=%d, any_zero=%d)\n\n",
+                   (all_decreased && any_zero) ? "PASS" : "FAIL",
+                   all_decreased, any_zero);
+
+            /* Record Factory 0 final nSequence for Phase 3 comparison */
+            uint32_t f0_final_nseq = 0;
+            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
+                if (lsp.factory.nodes[ni].nsequence > f0_final_nseq)
+                    f0_final_nseq = lsp.factory.nodes[ni].nsequence;
+            }
+
+            /* --- Phase 2: PTLC-Assisted Exit — Close Without Clients --- */
+            printf("--- Phase 2: PTLC-Assisted Close ---\n");
+
+            /* Build pubkey array and aggregate */
+            secp256k1_pubkey exh_pks[FACTORY_MAX_SIGNERS];
+            for (size_t ti = 0; ti < n_total; ti++) {
+                if (!secp256k1_keypair_pub(ctx, &exh_pks[ti], &exh_kps[ti])) {
+                    fprintf(stderr, "DW EXHIBITION: keypair pub failed\n");
+                    return 1;
+                }
+            }
+            musig_keyagg_t exh_ka;
+            musig_aggregate_keys(ctx, &exh_ka, exh_pks, n_total);
+
+            /* Turnover message hash */
+            unsigned char exh_msg[32];
+            sha256_tagged("turnover", (const unsigned char *)"turnover", 8, exh_msg);
+
+            /* For each client: adaptor presig -> adapt -> extract -> verify -> record */
+            for (int ci = 0; ci < n_clients; ci++) {
+                uint32_t participant_idx = (uint32_t)(ci + 1);
+                secp256k1_pubkey client_pk = exh_pks[participant_idx];
+
+                unsigned char presig[64];
+                int nonce_parity;
+                musig_keyagg_t ka_copy = exh_ka;
+                if (!adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                                                      exh_msg, exh_kps, n_total,
+                                                      &ka_copy, NULL, &client_pk)) {
+                    fprintf(stderr, "DW EXHIBITION: presig failed for client %d\n", ci);
+                    exhibition_pass = 0;
+                    break;
+                }
+
+                unsigned char client_sec[32];
+                if (!secp256k1_keypair_sec(ctx, client_sec, &exh_kps[participant_idx])) {
+                    fprintf(stderr, "DW EXHIBITION: keypair sec failed\n");
+                    return 1;
+                }
+                unsigned char adapted_sig[64];
+                if (!adaptor_adapt(ctx, adapted_sig, presig, client_sec, nonce_parity)) {
+                    fprintf(stderr, "DW EXHIBITION: adapt failed for client %d\n", ci);
+                    memset(client_sec, 0, 32);
+                    exhibition_pass = 0;
+                    break;
+                }
+
+                unsigned char extracted[32];
+                if (!adaptor_extract_secret(ctx, extracted, adapted_sig, presig,
+                                              nonce_parity)) {
+                    fprintf(stderr, "DW EXHIBITION: extract failed for client %d\n", ci);
+                    memset(client_sec, 0, 32);
+                    exhibition_pass = 0;
+                    break;
+                }
+
+                if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
+                    fprintf(stderr, "DW EXHIBITION: verify failed for client %d\n", ci);
+                    memset(client_sec, 0, 32);
+                    exhibition_pass = 0;
+                    break;
+                }
+
+                ladder_record_key_turnover(lad, 0, participant_idx, extracted);
+                if (use_db)
+                    persist_save_departed_client(&db, 0, participant_idx, extracted);
+                printf("  Client %d: key extracted and verified\n", ci + 1);
+                memset(client_sec, 0, 32);
+            }
+
+            /* Verify all clients departed */
+            int can_close = ladder_can_close(lad, 0);
+            if (!can_close) {
+                fprintf(stderr, "DW EXHIBITION Phase 2: ladder_can_close returned false\n");
+                exhibition_pass = 0;
+            }
+
+            /* Build close outputs (equal split minus 500 sat fee) */
+            tx_output_t exh_outputs[FACTORY_MAX_SIGNERS];
+            uint64_t exh_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+            for (size_t ti = 0; ti < n_total; ti++) {
+                exh_outputs[ti].amount_sats = exh_per;
+                memcpy(exh_outputs[ti].script_pubkey, fund_spk, 34);
+                exh_outputs[ti].script_pubkey_len = 34;
+            }
+            exh_outputs[n_total - 1].amount_sats =
+                lsp.factory.funding_amount_sats - 500 - exh_per * (n_total - 1);
+
+            /* Build cooperative close using extracted keys */
+            tx_buf_t exh_close_tx;
+            tx_buf_init(&exh_close_tx, 512);
+            int close_built = ladder_build_close(lad, 0, &exh_close_tx,
+                                                   exh_outputs, n_total,
+                                                   (uint32_t)regtest_get_block_height(&rt));
+            if (!close_built) {
+                fprintf(stderr, "DW EXHIBITION Phase 2: ladder_build_close failed\n");
+                tx_buf_free(&exh_close_tx);
+                exhibition_pass = 0;
+            }
+
+            /* Broadcast close TX */
+            int close_confirmed = 0;
+            if (close_built) {
+                char *ec_hex = malloc(exh_close_tx.len * 2 + 1);
+                hex_encode(exh_close_tx.data, exh_close_tx.len, ec_hex);
+                int ec_sent = regtest_send_raw_tx(&rt, ec_hex, exhibition_close_txid);
+                if (g_db)
+                    persist_log_broadcast(g_db, ec_sent ? exhibition_close_txid : "?",
+                        "exhibition_close", ec_hex, ec_sent ? "ok" : "failed");
+                free(ec_hex);
+                tx_buf_free(&exh_close_tx);
+
+                if (!ec_sent) {
+                    fprintf(stderr, "DW EXHIBITION Phase 2: close TX broadcast failed\n");
+                    exhibition_pass = 0;
+                } else {
+                    ADVANCE(1);
+                    close_confirmed = 1;
+                    printf("  Close TX broadcast: %s\n", exhibition_close_txid);
+                }
+            }
+            printf("Phase 2: %s\n\n",
+                   (can_close && close_confirmed) ? "PASS" : "FAIL");
+
+            /* --- Phase 3: Cross-Factory nSequence Contrast --- */
+            printf("--- Phase 3: Cross-Factory nSequence Contrast ---\n");
+
+            /* Check wallet balance (non-regtest only) */
+            if (!is_regtest) {
+                double bal = regtest_get_balance(&rt);
+                double needed = (double)funding_sats / 100000000.0;
+                if (bal < needed) {
+                    fprintf(stderr, "DW EXHIBITION Phase 3: insufficient balance "
+                            "(%.8f < %.8f)\n", bal, needed);
+                    exhibition_pass = 0;
+                }
+            }
+
+            /* Fund Factory 1 */
+            double exh_funding_btc = (double)funding_sats / 100000000.0;
+            char exh_fund_txid[65];
+            int f1_funded = 0;
+            if (exhibition_pass) {
+                if (!regtest_fund_address(&rt, fund_addr, exh_funding_btc, exh_fund_txid)) {
+                    fprintf(stderr, "DW EXHIBITION Phase 3: fund Factory 1 failed\n");
+                    exhibition_pass = 0;
+                } else {
+                    if (is_regtest) {
+                        regtest_mine_blocks(&rt, 1, mine_addr);
+                    } else {
+                        printf("Waiting for Factory 1 funding confirmation on %s...\n",
+                               network);
+                        fflush(stdout);
+                        int conf = regtest_wait_for_confirmation(&rt, exh_fund_txid,
+                                                                  confirm_timeout_secs);
+                        if (conf < 1) {
+                            fprintf(stderr, "DW EXHIBITION Phase 3: funding not confirmed\n");
+                            exhibition_pass = 0;
+                        }
+                    }
+                    if (exhibition_pass) {
+                        f1_funded = 1;
+                        printf("  Factory 1 funded: %s\n", exh_fund_txid);
+                    }
+                }
+            }
+
+            /* Find funding output */
+            factory_t exh_f1;
+            memset(&exh_f1, 0, sizeof(exh_f1));
+            int f1_built = 0;
+            uint32_t f1_initial_nseq = 0;
+
+            if (f1_funded) {
+                unsigned char exh_fund_txid_bytes[32];
+                hex_decode(exh_fund_txid, exh_fund_txid_bytes, 32);
+                reverse_bytes(exh_fund_txid_bytes, 32);
+
+                uint64_t exh_fund_amount = 0;
+                unsigned char exh_fund_spk[256];
+                size_t exh_fund_spk_len = 0;
+                uint32_t exh_fund_vout = 0;
+                for (uint32_t v = 0; v < 4; v++) {
+                    regtest_get_tx_output(&rt, exh_fund_txid, v,
+                                          &exh_fund_amount, exh_fund_spk, &exh_fund_spk_len);
+                    if (exh_fund_spk_len == 34 && memcmp(exh_fund_spk, fund_spk, 34) == 0) {
+                        exh_fund_vout = v;
+                        break;
+                    }
+                }
+                if (exh_fund_amount == 0) {
+                    fprintf(stderr, "DW EXHIBITION Phase 3: no funding output found\n");
+                    exhibition_pass = 0;
+                } else {
+                    /* Build Factory 1 locally */
+                    if (n_level_arity > 0)
+                        factory_set_level_arity(&exh_f1, level_arities, n_level_arity);
+                    else if (leaf_arity == 1)
+                        factory_set_arity(&exh_f1, FACTORY_ARITY_1);
+
+                    if (!factory_init(&exh_f1, ctx, exh_kps, n_total,
+                                      step_blocks, states_per_layer)) {
+                        fprintf(stderr, "DW EXHIBITION Phase 3: factory_init failed\n");
+                        exhibition_pass = 0;
+                    } else {
+                        int cur_h = regtest_get_block_height(&rt);
+                        if (cltv_timeout_arg > 0) {
+                            exh_f1.cltv_timeout = (uint32_t)cltv_timeout_arg;
+                        } else if (cur_h > 0) {
+                            int offset = is_regtest ? 35 : 1008;
+                            exh_f1.cltv_timeout = (uint32_t)cur_h + offset;
+                        }
+
+                        factory_set_funding(&exh_f1, exh_fund_txid_bytes, exh_fund_vout,
+                                            exh_fund_amount, fund_spk, 34);
+
+                        if (!factory_build_tree(&exh_f1)) {
+                            fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed\n");
+                            factory_free(&exh_f1);
+                            exhibition_pass = 0;
+                        } else if (!factory_sign_all(&exh_f1)) {
+                            fprintf(stderr, "DW EXHIBITION Phase 3: factory_sign_all failed\n");
+                            factory_free(&exh_f1);
+                            exhibition_pass = 0;
+                        } else {
+                            f1_built = 1;
+                            /* Set lifecycle for Factory 1 */
+                            if (cur_h > 0)
+                                factory_set_lifecycle(&exh_f1, (uint32_t)cur_h,
+                                                      active_blocks, dying_blocks);
+                            exh_f1.fee = &fee_est;
+
+                            /* Record Factory 1 initial (max) nSequence */
+                            for (size_t ni = 0; ni < exh_f1.n_nodes; ni++) {
+                                if (exh_f1.nodes[ni].nsequence > f1_initial_nseq)
+                                    f1_initial_nseq = exh_f1.nodes[ni].nsequence;
+                            }
+
+                            /* Store in ladder slot 1 */
+                            ladder_factory_t *lf1 = &lad->factories[1];
+                            lf1->factory = exh_f1;
+                            factory_detach_txbufs(&lf1->factory);
+                            lf1->factory_id = lad->next_factory_id++;
+                            lf1->is_initialized = 1;
+                            lf1->is_funded = 1;
+                            lf1->cached_state = FACTORY_ACTIVE;
+                            tx_buf_init(&lf1->distribution_tx, 256);
+                            lad->n_factories = 2;
+
+                            printf("\n--- nSequence Contrast ---\n");
+                            printf("  Factory 0 (epoch %u, fully advanced): "
+                                   "max state node nSequence=%u\n",
+                                   dw_counter_epoch(&lsp.factory.counter), f0_final_nseq);
+                            printf("  Factory 1 (epoch 0, fresh):           "
+                                   "max state node nSequence=%u\n", f1_initial_nseq);
+                            printf("  Delta: %u blocks\n",
+                                   f1_initial_nseq > f0_final_nseq ?
+                                   f1_initial_nseq - f0_final_nseq : 0);
+                            printf("---\n\n");
+
+                            /* Force-close Factory 1 (Factory 0 was closed by PTLC in Phase 2) */
+                            printf("Broadcasting Factory 1 tree (%zu nodes) on %s...\n",
+                                   exh_f1.n_nodes, network);
+                            fflush(stdout);
+
+                            if (!broadcast_factory_tree_any_network(&exh_f1, &rt,
+                                                                      mine_addr, is_regtest,
+                                                                      confirm_timeout_secs)) {
+                                fprintf(stderr, "DW EXHIBITION Phase 3: "
+                                        "Factory 1 tree broadcast failed\n");
+                                exhibition_pass = 0;
+                            } else {
+                                printf("Factory 1 tree confirmed.\n");
+                            }
+                        }
+                    }
+                }
+            }
+
+            int phase3_pass = f1_built && (f0_final_nseq < f1_initial_nseq);
+            if (!phase3_pass) exhibition_pass = 0;
+            printf("Phase 3: %s\n\n", phase3_pass ? "PASS" : "FAIL");
+
+            /* --- Final Verdict --- */
+            printf("=== DW EXHIBITION TEST %s ===\n",
+                   exhibition_pass ? "PASSED" : "FAILED");
+            if (exhibition_pass) {
+                printf("  Phase 1: nSequence countdown %u -> 0 over %d advances\n",
+                       initial_nseq[0], max_advances);
+                printf("  Phase 2: PTLC-assisted close confirmed (txid: %s)\n",
+                       exhibition_close_txid);
+                printf("  Phase 3: Cross-factory contrast (%u vs %u blocks)\n",
+                       f0_final_nseq, f1_initial_nseq);
+            }
+
+            report_add_string(&rpt, "result",
+                              exhibition_pass ? "dw_exhibition_pass" : "dw_exhibition_fail");
+            report_close(&rpt);
+            if (f1_built) factory_free(&exh_f1);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return exhibition_pass ? 0 : 1;
         }
 
         /* === Leaf Advance Test: advance left leaf only, show per-leaf independence === */
