@@ -224,7 +224,7 @@ def test_demo_force_close():
     rc, log = run_lsp(['--demo', '--force-close'], mine_addr=addr)
     has_tree = 'broadcasting factory tree' in log.lower() or 'kickoff' in log.lower()
     has_confirm = 'confirmed' in log.lower()
-    ok = rc == 0
+    ok = rc == 0 and has_tree
     print(f"  Exit: {rc}, TreeBroadcast: {has_tree}, Confirmed: {has_confirm}")
     for line in log.split('\n'):
         ll = line.lower()
@@ -276,7 +276,7 @@ def test_demo_expiry():
     rc, log = run_lsp(['--demo', '--test-expiry'])
     has_expiry = 'expiry' in log.lower() or 'timeout' in log.lower()
     has_recover = 'recovery' in log.lower() or 'reclaim' in log.lower()
-    ok = rc == 0
+    ok = rc == 0 and (has_expiry or has_recover)
     print(f"  Exit: {rc}, Expiry: {has_expiry}, Recovery: {has_recover}")
     for line in log.split('\n'):
         ll = line.lower()
@@ -290,7 +290,7 @@ def test_demo_distrib():
     print(f"\n{ts()} === TEST: --demo --test-distrib ===")
     rc, log = run_lsp(['--demo', '--test-distrib'])
     has_distrib = 'distribution' in log.lower()
-    ok = rc == 0
+    ok = rc == 0 and has_distrib
     print(f"  Exit: {rc}, Distribution: {has_distrib}")
     for line in log.split('\n'):
         ll = line.lower()
@@ -305,7 +305,7 @@ def test_demo_turnover():
     rc, log = run_lsp(['--demo', '--test-turnover'])
     turnover_count = log.lower().count('turnover')
     key_count = log.count('key extracted')
-    ok = rc == 0
+    ok = rc == 0 and key_count > 0
     print(f"  Exit: {rc}, TurnoverMentions: {turnover_count}, KeysExtracted: {key_count}")
     for line in log.split('\n'):
         ll = line.lower()
