@@ -138,6 +138,11 @@ typedef struct {
     uint32_t last_rebalance_block;  /* block height of last auto-rebalance */
     uint16_t rebalance_threshold_pct; /* imbalance threshold 0-100 (default 80) */
 
+    /* Daemon heartbeat */
+    int heartbeat_interval;             /* seconds between status lines (0 = disabled) */
+    time_t last_heartbeat;              /* timestamp of last heartbeat output */
+    time_t daemon_start_time;           /* timestamp when daemon loop started */
+
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
     uint64_t locked_in_factories_sats;   /* capital in active factories */

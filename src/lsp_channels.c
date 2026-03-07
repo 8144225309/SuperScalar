@@ -2908,7 +2908,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!mgr || !lsp || !shutdown_flag) return 0;
 
     printf("LSP: daemon loop started (Ctrl+C to stop)\n");
+    if (mgr->heartbeat_interval > 0)
+        printf("LSP: heartbeat every %ds\n", mgr->heartbeat_interval);
     fflush(stdout);
+    mgr->daemon_start_time = time(NULL);
+    mgr->last_heartbeat = mgr->daemon_start_time;
 
     /* Initialize profit settlement baseline height */
     if (mgr->last_settlement_block == 0 &&
@@ -3304,6 +3308,33 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 int bh = regtest_get_block_height(mgr->watchtower->rt);
                 if (bh > 0)
                     lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
+            }
+
+            /* Heartbeat: periodic daemon status line */
+            if (mgr->heartbeat_interval > 0) {
+                time_t now = time(NULL);
+                if (now - mgr->last_heartbeat >= mgr->heartbeat_interval) {
+                    mgr->last_heartbeat = now;
+                    int uptime_s = (int)(now - mgr->daemon_start_time);
+                    int online = 0;
+                    for (size_t c = 0; c < mgr->n_channels; c++)
+                        if (lsp->client_fds[c] >= 0) online++;
+                    int hb_height = 0;
+                    const char *fstate_str = "?";
+                    if (mgr->watchtower && mgr->watchtower->rt) {
+                        hb_height = regtest_get_block_height(mgr->watchtower->rt);
+                        factory_state_t fs = factory_get_state(
+                            &lsp->factory, (uint32_t)hb_height);
+                        fstate_str = (fs == FACTORY_ACTIVE) ? "ACTIVE" :
+                                     (fs == FACTORY_DYING)  ? "DYING"  :
+                                                              "EXPIRED";
+                    }
+                    printf("[heartbeat] height=%d, factory=%s, "
+                           "clients=%d/%zu online, uptime=%dh%02dm%02ds\n",
+                           hb_height, fstate_str, online, mgr->n_channels,
+                           uptime_s / 3600, (uptime_s / 60) % 60, uptime_s % 60);
+                    fflush(stdout);
+                }
             }
 
             continue;
