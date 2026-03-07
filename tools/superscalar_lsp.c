@@ -2236,8 +2236,8 @@ int main(int argc, char *argv[]) {
                    n_total * sizeof(secp256k1_keypair));
 
             /* Record initial nSequence for all nodes */
-            uint32_t initial_nseq[256];
-            for (size_t ni = 0; ni < lsp.factory.n_nodes && ni < 256; ni++)
+            uint32_t initial_nseq[FACTORY_MAX_NODES];
+            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++)
                 initial_nseq[ni] = lsp.factory.nodes[ni].nsequence;
 
             printf("Epoch 0 (initial):\n");
@@ -2265,7 +2265,7 @@ int main(int argc, char *argv[]) {
             }
 
             /* Verify: all state nodes decreased from initial AND at least one reached 0 */
-            for (size_t ni = 0; ni < lsp.factory.n_nodes && ni < 256; ni++) {
+            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
                 if (initial_nseq[ni] > 0 &&
                     lsp.factory.nodes[ni].nsequence >= initial_nseq[ni])
                     all_decreased = 0;
