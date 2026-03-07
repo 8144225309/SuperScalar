@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.2 — 461 tests, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
+> v0.1.3 — 517 tests, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -27,7 +27,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 418 unit + 43 regtest + 23 orchestrator + 25 manual flag tests, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 418 unit + 43 regtest + 27 orchestrator + 29 manual flag tests, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -74,7 +74,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-461 automated tests (418 unit + 43 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 23 orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+461 automated tests (418 unit + 43 regtest integration, including 11 adversarial/edge-case tests) plus 29 manual flag tests and 27 orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -93,13 +93,13 @@ bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 # All tests
 ./test_superscalar --all
 
-# Manual flag tests (25 tests, needs bitcoind running)
+# Manual flag tests (29 tests, needs bitcoind running)
 python3 tools/manual_tests.py all           # run all tests
 python3 tools/manual_tests.py demo          # run a single test
 python3 tools/manual_tests.py --list        # list available tests
 # Logs: /tmp/mt_lsp.log, /tmp/mt_client_*.log
 
-# Test orchestrator (23 multi-process scenarios)
+# Test orchestrator (27 multi-process scenarios)
 python3 tools/test_orchestrator.py --scenario all
 python3 tools/test_orchestrator.py --list   # list scenarios
 ```
@@ -746,7 +746,7 @@ SuperScalar needs real-world testing on signet and testnet over weeks and months
 **How to help:**
 
 1. **Run a factory on signet** — Follow the [Running on Signet](#running-on-signet) guide above. Even a 2-client factory running for a few days produces valuable data.
-2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 23 multi-party scenarios.
+2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 27 multi-party scenarios.
 3. **Report bugs** — Open an issue at [github.com/8144225309/SuperScalar/issues](https://github.com/8144225309/SuperScalar/issues). Include logs, network, and steps to reproduce.
 4. **Review the code** — The [internal audit](docs/mainnet-audit.md) is a good starting point. Cryptography lives in `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c`.
 
