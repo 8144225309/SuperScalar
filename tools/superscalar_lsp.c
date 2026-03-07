@@ -101,6 +101,7 @@ static void usage(const char *prog) {
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
+        "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
@@ -517,6 +518,7 @@ int main(int argc, char *argv[]) {
     int test_burn = 0;
     int test_htlc_force_close = 0;
     int test_dw_advance = 0;
+    int test_leaf_advance = 0;
     int test_bridge = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 259200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
@@ -662,6 +664,8 @@ int main(int argc, char *argv[]) {
             test_htlc_force_close = 1;
         else if (strcmp(argv[i], "--test-dw-advance") == 0)
             test_dw_advance = 1;
+        else if (strcmp(argv[i], "--test-leaf-advance") == 0)
+            test_leaf_advance = 1;
         else if (strcmp(argv[i], "--test-bridge") == 0)
             test_bridge = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
@@ -2194,6 +2198,96 @@ int main(int argc, char *argv[]) {
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
+        }
+
+        /* === Leaf Advance Test: advance left leaf only, show per-leaf independence === */
+        if (test_leaf_advance) {
+            printf("\n=== LEAF ADVANCE TEST ===\n");
+
+            if (lsp.factory.n_leaf_nodes < 2) {
+                fprintf(stderr, "LEAF ADVANCE TEST: need >= 2 leaf nodes\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Record nSequence for both leaves before */
+            size_t left_ni = lsp.factory.leaf_node_indices[0];
+            size_t right_ni = lsp.factory.leaf_node_indices[1];
+            uint32_t left_nseq_before = lsp.factory.nodes[left_ni].nsequence;
+            uint32_t right_nseq_before = lsp.factory.nodes[right_ni].nsequence;
+
+            printf("Before leaf advance:\n");
+            printf("  Left  leaf (node %zu): nSequence=0x%X\n", left_ni, left_nseq_before);
+            printf("  Right leaf (node %zu): nSequence=0x%X\n", right_ni, right_nseq_before);
+
+            /* Populate keypairs (same pattern as dw_advance test) */
+            {
+                secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+                all_kps[0] = lsp_kp;
+                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+                for (int ci = 0; ci < n_clients; ci++) {
+                    unsigned char ds[32];
+                    memset(ds, fill[ci], 32);
+                    if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
+                        fprintf(stderr, "LEAF ADVANCE TEST: keypair create failed\n");
+                        return 1;
+                    }
+                }
+                memcpy(lsp.factory.keypairs, all_kps,
+                       n_total * sizeof(secp256k1_keypair));
+            }
+
+            /* Advance LEFT leaf only */
+            if (!factory_advance_leaf(&lsp.factory, 0)) {
+                fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(0) failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            uint32_t left_nseq_after = lsp.factory.nodes[left_ni].nsequence;
+            uint32_t right_nseq_after = lsp.factory.nodes[right_ni].nsequence;
+
+            printf("After advancing LEFT leaf only:\n");
+            printf("  Left  leaf (node %zu): nSequence=0x%X (was 0x%X)\n",
+                   left_ni, left_nseq_after, left_nseq_before);
+            printf("  Right leaf (node %zu): nSequence=0x%X (was 0x%X)\n",
+                   right_ni, right_nseq_after, right_nseq_before);
+
+            int left_changed = (left_nseq_after != left_nseq_before);
+            int right_unchanged = (right_nseq_after == right_nseq_before);
+
+            /* Force-close with the re-signed tree */
+            printf("\nBroadcasting tree with per-leaf advance on %s...\n", network);
+
+            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "LEAF ADVANCE TEST: tree broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            int pass = left_changed && right_unchanged;
+            printf("\n=== LEAF ADVANCE TEST %s ===\n", pass ? "PASSED" : "FAILED");
+            printf("Left leaf nSequence %s (0x%X → 0x%X)\n",
+                   left_changed ? "decreased" : "UNCHANGED", left_nseq_before, left_nseq_after);
+            printf("Right leaf nSequence %s (0x%X → 0x%X)\n",
+                   right_unchanged ? "unchanged" : "CHANGED", right_nseq_before, right_nseq_after);
+
+            report_add_string(&rpt, "result", pass ? "leaf_advance_pass" : "leaf_advance_fail");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return pass ? 0 : 1;
         }
 
         /* === Bridge Test: simulate inbound HTLC via bridge === */

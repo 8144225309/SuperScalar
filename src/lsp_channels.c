@@ -1747,9 +1747,17 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* The leaf outputs map to: output 0 = channel A, output 1 = channel B,
                output 2 = L-stock.  Update funding amount based on this client's output. */
             entry->channel.funding_amount = amounts[ci] * 1000;  /* sats → msat */
-            /* Recalculate: LSP keeps the same fraction, client gets the rest */
-            entry->channel.local_amount = amounts[ci] * 1000 / 2;
-            entry->channel.remote_amount = amounts[ci] * 1000 - entry->channel.local_amount;
+            /* Recalculate using lsp_balance_pct (matching channel init logic) */
+            uint16_t pct = mgr->lsp_balance_pct;
+            if (pct == 0) pct = 50;
+            if (pct > 100) pct = 100;
+            fee_estimator_t _fe_realloc;
+            const fee_estimator_t *_fe_ra = mgr->fee ? (const fee_estimator_t *)mgr->fee : NULL;
+            if (!_fe_ra) { fee_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc; }
+            uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
+            uint64_t usable_ra = amounts[ci] * 1000 > commit_fee_ra ? amounts[ci] * 1000 - commit_fee_ra : 0;
+            entry->channel.local_amount = (usable_ra * pct) / 100;
+            entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
         }
     }
 
@@ -1778,6 +1786,73 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("%s%lu", i ? "," : "", (unsigned long)amounts[i]);
     printf("]\n");
 
+    return 1;
+}
+
+/* Buy inbound liquidity from L-stock for a client (arity-2 only).
+   Moves amount_sats from L-stock (output 2) to client's channel output,
+   then adjusts channel balance so purchased sats become LSP local_amount
+   (= client's inbound capacity). Returns 1 on success. */
+int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                size_t client_idx, uint64_t amount_sats) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+    if (f->leaf_arity != FACTORY_ARITY_2) {
+        fprintf(stderr, "buy_liquidity: only supported for arity-2\n");
+        return 0;
+    }
+    if (client_idx >= mgr->n_channels || amount_sats == 0) {
+        fprintf(stderr, "buy_liquidity: invalid client %zu or amount 0\n", client_idx);
+        return 0;
+    }
+
+    /* Map client to leaf */
+    size_t node_idx;
+    uint32_t vout;
+    client_to_leaf(client_idx, f, &node_idx, &vout);
+    factory_node_t *ln = &f->nodes[node_idx];
+    if (ln->n_outputs < 3) {
+        fprintf(stderr, "buy_liquidity: leaf has %zu outputs, need 3\n", ln->n_outputs);
+        return 0;
+    }
+
+    /* Validate L-stock has enough (keep >= 546 dust) */
+    uint64_t lstock = ln->outputs[2].amount_sats;
+    if (lstock < 546 + amount_sats) {
+        fprintf(stderr, "buy_liquidity: amount %llu exceeds L-stock %llu (dust limit)\n",
+                (unsigned long long)amount_sats, (unsigned long long)lstock);
+        return 0;
+    }
+
+    /* Build new amounts: add to client's output, subtract from L-stock */
+    int leaf_side = (int)(client_idx / 2);
+    uint64_t new_amounts[3];
+    for (size_t k = 0; k < 3; k++)
+        new_amounts[k] = ln->outputs[k].amount_sats;
+    new_amounts[vout] += amount_sats;
+    new_amounts[2] -= amount_sats;
+
+    /* Perform the reallocation (DW advance + MuSig2 re-sign) */
+    if (!lsp_realloc_leaf(mgr, lsp, leaf_side, new_amounts, 3)) {
+        fprintf(stderr, "buy_liquidity: realloc failed\n");
+        return 0;
+    }
+
+    /* Override balance split: purchased sats go to LSP local_amount
+       (= client's inbound capacity) */
+    size_t fd_idx = client_idx;
+    if (fd_idx < mgr->n_channels) {
+        lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
+        uint64_t add_msat = amount_sats * 1000;
+        entry->channel.local_amount += add_msat;
+        if (entry->channel.remote_amount >= add_msat)
+            entry->channel.remote_amount -= add_msat;
+        else
+            entry->channel.remote_amount = 0;
+    }
+
+    printf("LSP: buy_liquidity client %zu: +%llu sats inbound from L-stock\n",
+           client_idx, (unsigned long long)amount_sats);
     return 1;
 }
 
@@ -2807,6 +2882,33 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             printf("  DW epoch: states_per_layer=%u, step_blocks=%u\n",
                    lsp->factory.states_per_layer, lsp->factory.step_blocks);
         }
+        /* Per-leaf DW state */
+        {
+            factory_t *f = &lsp->factory;
+            for (int li = 0; li < f->n_leaf_nodes; li++) {
+                size_t ni = f->leaf_node_indices[li];
+                printf("  Leaf %d: nSeq=0x%X", li, f->nodes[ni].nsequence);
+                if (f->per_leaf_enabled)
+                    printf(" state=%u", f->leaf_layers[li].current_state);
+                factory_node_t *ln = &f->nodes[ni];
+                printf(" outputs=[");
+                for (size_t k = 0; k < ln->n_outputs; k++)
+                    printf("%s%llu", k ? "," : "",
+                           (unsigned long long)ln->outputs[k].amount_sats);
+                printf("]\n");
+            }
+            if (f->leaf_arity == FACTORY_ARITY_2) {
+                uint64_t total_lstock = 0;
+                for (int li = 0; li < f->n_leaf_nodes; li++) {
+                    size_t ni = f->leaf_node_indices[li];
+                    factory_node_t *ln = &f->nodes[ni];
+                    if (ln->n_outputs >= 3)
+                        total_lstock += ln->outputs[ln->n_outputs - 1].amount_sats;
+                }
+                printf("  L-stock available: %llu sats\n",
+                       (unsigned long long)total_lstock);
+            }
+        }
         /* Bridge connection status */
         printf("  Bridge: %s\n", mgr->bridge_fd >= 0 ? "connected" : "disconnected");
         /* Invoice registry */
@@ -2893,7 +2995,28 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  status                       Show factory/channel/bridge state\n");
         printf("  rotate                       Force factory rotation\n");
         printf("  close                        Cooperative close and shutdown\n");
+        printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
         printf("  help                         Show this help\n");
+    } else if (strncmp(line, "buy_liquidity ", 14) == 0) {
+        unsigned int client;
+        unsigned long long amt;
+        if (sscanf(line + 14, "%u %llu", &client, &amt) == 2) {
+            if (client >= mgr->n_channels) {
+                printf("CLI: invalid client index (max %zu)\n",
+                       mgr->n_channels - 1);
+            } else if (amt == 0) {
+                printf("CLI: amount must be > 0\n");
+            } else {
+                printf("CLI: buying %llu sats inbound for client %u\n", amt, client);
+                fflush(stdout);
+                if (lsp_channels_buy_liquidity(mgr, lsp, (size_t)client, (uint64_t)amt))
+                    printf("CLI: buy_liquidity succeeded\n");
+                else
+                    printf("CLI: buy_liquidity FAILED\n");
+            }
+        } else {
+            printf("CLI: usage: buy_liquidity <client> <amount_sats>\n");
+        }
     } else if (len > 0) {
         printf("CLI: unknown command '%s' (type 'help')\n", line);
         fflush(stdout);

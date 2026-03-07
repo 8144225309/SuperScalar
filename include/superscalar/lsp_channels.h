@@ -248,6 +248,12 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts);
 
+/* Buy inbound liquidity from L-stock for a client (arity-2 only).
+   Moves amount_sats from L-stock to client's channel, increasing inbound capacity.
+   Returns 1 on success. */
+int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                size_t client_idx, uint64_t amount_sats);
+
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 
 /* Perform a full factory rotation: PTLC turnover → cooperative close →
