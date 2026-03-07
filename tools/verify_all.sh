@@ -82,12 +82,7 @@ if "$BUILD_DIR/test_superscalar" --unit 2>&1; then
     record "Unit tests" "PASS" "$ELAPSED"
 else
     ELAPSED=$(( $(date +%s) - START ))
-    # Try without --unit flag (in case the binary doesn't support it)
-    if "$BUILD_DIR/test_superscalar" 2>&1 | grep -q "PASS"; then
-        record "Unit tests" "PASS" "$ELAPSED"
-    else
-        record "Unit tests" "FAIL" "$ELAPSED"
-    fi
+    record "Unit tests" "FAIL" "$ELAPSED"
 fi
 
 # ---------------------------------------------------------------------------

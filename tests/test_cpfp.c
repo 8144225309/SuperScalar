@@ -389,11 +389,10 @@ int test_cpfp_sign_complete_check(void) {
     strncpy(rt.rpcpassword, "rpcpass", sizeof(rt.rpcpassword) - 1);
     strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
 
-    /* With invalid hex, the function should return NULL (can't sign) */
+    /* With invalid hex, the function should return NULL (can't sign —
+       bitcoin-cli not running in unit tests) */
     char *result = regtest_sign_raw_tx_with_wallet(&rt, "deadbeef", NULL);
-    /* Expected: NULL because bitcoin-cli either isn't running or returns error.
-       If bitcoin-cli IS running, complete=false still returns NULL. */
-    /* We accept both outcomes — the key thing is it doesn't crash. */
+    TEST_ASSERT(result == NULL, "invalid hex without bitcoind should return NULL");
     if (result) free(result);
 
     /* Test with NULL input */

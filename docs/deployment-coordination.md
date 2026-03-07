@@ -184,38 +184,85 @@ If the LSP publishes their static pubkey, clients can verify identity:
   --daemon
 ```
 
-## Adding the Lightning Bridge
+## CLN Bridge Setup
 
-To receive payments from the broader Lightning Network:
+The bridge connects a SuperScalar factory to the Lightning Network. It has three components:
 
-### On the LSP Machine
+| Component | What it is | Starts as |
+|-----------|-----------|-----------|
+|  | Relay daemon between LSP and CLN plugin | Standalone binary |
+|  | CLN plugin that intercepts HTLCs | Loaded by lightningd |
+| CLN peer node | Any standard LN node with a channel to the bridge node | Separate lightningd |
+
+### Plugin Installation
+
+The plugin is a single Python file with no external dependencies (uses CLN's built-in plugin framework). No pip install needed.
 
 ```bash
-# 1. Start bridge daemon
-./superscalar_bridge \
-  --lsp-host 127.0.0.1 \
-  --lsp-port 9735 \
-  --plugin-port 9736
-
-# 2. Start CLN with the plugin
-lightningd \
-  --network=signet \
-  --plugin=/path/to/tools/cln_plugin.py \
-  --superscalar-bridge-port=9736
+# The plugin ships with the repo — no separate install step.
+# Just point CLN at it:
+chmod +x tools/cln_plugin.py
 ```
 
-### Payment Flow
+### Reference Configs
+
+Example CLN configurations are in `tools/deploy/`:
+
+- **`cln-bridge.conf.example`** — CLN node with the SuperScalar plugin loaded
+- **`cln-peer.conf.example`** — Vanilla CLN peer for testing payments
+
+Copy and edit for your environment:
+
+```bash
+cp tools/deploy/cln-bridge.conf.example /var/lib/cln/config
+# Edit: network, RPC credentials, plugin path, bridge port
+```
+
+### Start Order
 
 ```
-External payer (any LN node)
-  → CLN (htlc_accepted hook)
-    → cln_plugin.py
-      → superscalar_bridge (port 9736)
-        → superscalar_lsp (port 9735)
-          → destination client's channel
+1. bitcoind          (must be synced)
+2. superscalar_lsp   (listening on --port)
+3. superscalar_bridge --lsp-host 127.0.0.1 --lsp-port 9735 --plugin-port 9737
+4. lightningd        (loads cln_plugin.py, connects to bridge on port 9737)
 ```
 
-Factory clients can now receive payments from anyone on the Lightning Network.
+If lightningd starts before the bridge daemon, the plugin retries the connection every 5 seconds — no manual intervention needed.
+
+### Port Map
+
+```
+LSP port (--port 9735)  <----  superscalar_bridge --lsp-port 9735
+                                                   --plugin-port 9737  ---->  CLN plugin (superscalar-bridge-port=9737)
+```
+
+The LSP's `--port` is the same port clients connect to. The bridge connects to it as a regular client. There is no separate bridge port on the LSP.
+
+### Opening a Channel
+
+The bridge CLN node needs at least one funded channel with a peer to route payments:
+
+```bash
+# On the bridge node, connect to the peer
+lightning-cli --lightning-dir=/var/lib/cln connect PEER_NODE_ID@HOST:PORT
+
+# Fund a channel (amount in satoshis)
+lightning-cli --lightning-dir=/var/lib/cln fundchannel PEER_NODE_ID 500000
+
+# Wait for on-chain confirmation, then verify
+lightning-cli --lightning-dir=/var/lib/cln listchannels
+```
+
+### Testing the Bridge
+
+```bash
+# On regtest (automated)
+bash tools/test_bridge_regtest.sh build
+
+# On testnet4 (via exhibition script)
+bash tools/exhibition_testnet4.sh --structure 4
+```
+
 
 ## Factory Lifecycle
 

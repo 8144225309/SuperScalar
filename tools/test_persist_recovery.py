@@ -221,10 +221,10 @@ except:
     pass
 
 # Check recovery indicators
-has_recovery = "recovery" in log2.lower() or "loaded" in log2.lower() or "restored" in log2.lower()
-has_factory = "factory" in log2.lower()
-has_channels = "channel" in log2.lower()
-has_daemon = "daemon" in log2.lower()
+has_recovery = "recovery mode" in log2.lower() or "loaded factory" in log2.lower() or "restored" in log2.lower()
+has_factory = "factory" in log2.lower() and ("loaded" in log2.lower() or "found" in log2.lower())
+has_channels = "channels ready" in log2.lower() or "channel" in log2.lower()
+has_daemon = "daemon loop started" in log2
 
 print(f"  Recovery detected: {has_recovery}")
 print(f"  Factory info: {has_factory}")

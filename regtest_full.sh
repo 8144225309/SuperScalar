@@ -168,7 +168,11 @@ mine 6
 sleep 3
 
 echo "--- Close result ---"
-grep -iE "close|broadcast|txid|shut" lsp.log || echo "(no close messages)"
+if grep -q "Close TX broadcast\|close confirmed\|cooperative close" lsp.log; then
+    echo "TEST 1: PASS (close confirmed)"
+else
+    echo "TEST 1: FAIL (no close evidence in log)"
+fi
 
 cleanup
 
@@ -225,7 +229,11 @@ exec 3>/tmp/lsp_fifo  # re-open persistent writer
 sleep 5
 
 echo "--- LSP recovery log ---"
-grep -iE "recovery|restore|found existing|channels ready|resume" lsp.log || echo "(no recovery messages)"
+if grep -qiE "recovery|restore|found existing|channels ready|resume" lsp.log; then
+    grep -iE "recovery|restore|found existing|channels ready|resume" lsp.log
+else
+    echo "WARN: no recovery messages found in log"
+fi
 
 echo ""
 echo "--- Status after LSP restart ---"
@@ -404,7 +412,6 @@ echo "  3. Watchtower (no-breach baseline)"
 echo "  4. Factory Rotation"
 echo "  5. BIP39 Key Recovery"
 echo ""
+echo "Note: tests above print PASS/FAIL for each section."
 echo "Not testable on regtest (no CLN):"
 echo "  - CLN Bridge (inbound/outbound Lightning)"
-echo "  - Breach Detection (--demo mode has DB bug)"
-echo "  - CLTV Timeout Recovery (--demo dependency)"

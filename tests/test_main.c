@@ -5,6 +5,7 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static int tests_skipped = 0;
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -28,11 +29,18 @@ static int tests_failed = 0;
     } \
 } while(0)
 
+#define TEST_SKIP_CODE 2
+
 #define RUN_TEST(fn) do { \
     tests_run++; \
     printf("  %s...", #fn); \
     fflush(stdout); \
-    if (fn()) { \
+    int _rc = fn(); \
+    if (_rc == TEST_SKIP_CODE) { \
+        tests_skipped++; \
+        tests_run--; \
+        printf(" SKIP\n"); \
+    } else if (_rc) { \
         tests_passed++; \
         printf(" OK\n"); \
     } else { \
@@ -1355,6 +1363,8 @@ int main(int argc, char *argv[]) {
     printf("Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
         printf(" (%d FAILED)", tests_failed);
+    if (tests_skipped > 0)
+        printf(" (%d skipped)", tests_skipped);
     printf("\n");
 
     return tests_failed > 0 ? 1 : 0;

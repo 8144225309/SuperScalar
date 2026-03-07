@@ -2129,11 +2129,13 @@ int main(int argc, char *argv[]) {
         if (test_dw_advance) {
             printf("\n=== DW ADVANCE TEST ===\n");
 
-            /* Record epoch-0 nSequence values for comparison */
+            /* Record epoch-0 nSequence values for before/after comparison */
+            uint32_t dwa_initial[FACTORY_MAX_NODES];
             printf("Before advance (epoch %u):\n",
                    dw_counter_epoch(&lsp.factory.counter));
             for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
                 factory_node_t *node = &lsp.factory.nodes[ni];
+                dwa_initial[ni] = node->nsequence;
                 printf("  Node %zu: nSequence=0x%X (%u blocks)\n",
                        ni, node->nsequence, node->nsequence);
             }
@@ -2170,13 +2172,11 @@ int main(int argc, char *argv[]) {
             int saw_decrease = 0;
             for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
                 factory_node_t *node = &lsp.factory.nodes[ni];
-                printf("  Node %zu: nSequence=0x%X (%u blocks)\n",
-                       ni, node->nsequence, node->nsequence);
-                /* State nodes (odd indices) should show decrease */
-                if (ni > 0 && (ni % 2 == 0) && node->nsequence < 0x1E)
-                    saw_decrease = 1;
-                /* Also check any node with decreased nSequence */
-                if (node->nsequence > 0 && node->nsequence < 0x1E)
+                printf("  Node %zu: nSequence=0x%X (%u blocks, was 0x%X)\n",
+                       ni, node->nsequence, node->nsequence, dwa_initial[ni]);
+                /* Compare before/after: any node that had nSequence > 0
+                   and now has a lower value counts as a decrease */
+                if (dwa_initial[ni] > 0 && node->nsequence < dwa_initial[ni])
                     saw_decrease = 1;
             }
 
@@ -2195,18 +2195,22 @@ int main(int argc, char *argv[]) {
             }
 
             printf("\n=== DW ADVANCE TEST %s ===\n",
-                   saw_decrease ? "PASSED" : "PASSED (nSequence visible on-chain)");
-            printf("All %zu nodes confirmed with advanced DW counter.\n",
-                   lsp.factory.n_nodes);
+                   saw_decrease ? "PASSED" : "FAILED");
+            if (saw_decrease)
+                printf("All %zu nodes confirmed with advanced DW counter.\n",
+                       lsp.factory.n_nodes);
+            else
+                fprintf(stderr, "DW ADVANCE TEST: no nSequence decrease detected\n");
 
-            report_add_string(&rpt, "result", "dw_advance_complete");
+            report_add_string(&rpt, "result",
+                              saw_decrease ? "dw_advance_pass" : "dw_advance_fail");
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
-            return 0;
+            return saw_decrease ? 0 : 1;
         }
 
         /* === DW Exhibition Test: multi-advance + PTLC close + cross-factory contrast === */
@@ -3061,8 +3065,8 @@ int main(int argc, char *argv[]) {
                 cJSON_Delete(fulfill_msg.json);
             } else {
                 printf("Bridge: no FULFILL received (client may not have auto-fulfilled)\n");
-                printf("\n=== BRIDGE TEST PASSED (routing verified) ===\n");
-                printf("HTLC was routed to client — client would fulfill in daemon mode.\n");
+                printf("\n=== BRIDGE TEST FAILED (no fulfill) ===\n");
+                printf("HTLC was routed to client but no FULFILL_HTLC was returned.\n");
                 if (fulfill_msg.json) cJSON_Delete(fulfill_msg.json);
             }
 
@@ -3652,7 +3656,17 @@ int main(int argc, char *argv[]) {
         /* Watchtower check: should detect breach and broadcast penalty */
         printf("Running watchtower check...\n");
         watchtower_t *wt = mgr->watchtower;
-        if (wt) {
+        if (!wt) {
+            fprintf(stderr, "BREACH TEST FAILED: no watchtower configured\n");
+            report_add_string(&rpt, "result", "breach_test_no_watchtower");
+            report_close(&rpt);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        {
             int detected = watchtower_check(wt);
             if (detected > 0) {
                 printf("BREACH DETECTED! Watchtower broadcast %d penalty tx(s)\n",
@@ -4004,16 +4018,23 @@ int main(int argc, char *argv[]) {
 
         printf("\nLeaf recovery: %llu sats\n", (unsigned long long)leaf_recovered);
         printf("Mid recovery:  %llu sats\n", (unsigned long long)mid_recovered);
-        printf("=== EXPIRY TEST PASSED ===\n\n");
+        int expiry_pass = (leaf_recovered > 0 && mid_recovered > 0);
+        if (!expiry_pass)
+            fprintf(stderr, "EXPIRY TEST: recovered amounts are zero "
+                    "(leaf=%llu, mid=%llu)\n",
+                    (unsigned long long)leaf_recovered,
+                    (unsigned long long)mid_recovered);
+        printf("=== EXPIRY TEST %s ===\n\n", expiry_pass ? "PASSED" : "FAILED");
 
         /* Skip cooperative close — factory already spent */
-        report_add_string(&rpt, "result", "expiry_test_complete");
+        report_add_string(&rpt, "result",
+                          expiry_pass ? "expiry_test_pass" : "expiry_test_fail");
         report_close(&rpt);
         if (use_db) persist_close(&db);
         lsp_cleanup(&lsp);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
-        return 0;
+        return expiry_pass ? 0 : 1;
     }
 
     /* === Distribution TX Test: mine past CLTV, broadcast distribution TX === */
@@ -4345,8 +4366,11 @@ int main(int argc, char *argv[]) {
             rebalance_pass = 0;
         }
 
-        /* Verify: if rebalance happened, heaviest channel local% should decrease */
-        if (rebal_count > 0) {
+        /* Verify: rebalance must have happened, and heaviest channel should decrease */
+        if (rebal_count == 0) {
+            printf("  FAIL: no channels were rebalanced\n");
+            rebalance_pass = 0;
+        } else {
             uint64_t tot = mgr->entries[heaviest_idx].channel.local_amount +
                            mgr->entries[heaviest_idx].channel.remote_amount;
             uint64_t pct_after = (tot > 0) ?
