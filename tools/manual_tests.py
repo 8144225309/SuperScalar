@@ -122,7 +122,8 @@ def start_clients(n=4, port=9745, daemon=True, extra_flags=None):
         time.sleep(0.5)
     return clients
 
-def run_lsp(extra_flags, n_clients=4, timeout=120, wait_for=None, mine_addr=None, amount=100000):
+def run_lsp(extra_flags, n_clients=4, timeout=120, wait_for=None, mine_addr=None,
+            amount=100000):
     """Run LSP with given flags, wait for completion or keyword."""
     # Kill stale processes from previous test runs (timeout/crash leftovers)
     cleanup_procs()
@@ -555,22 +556,35 @@ def test_backup_restore():
 
     keyfile_path = '/tmp/mt_lsp.key'
     restored_keyfile = '/tmp/mt_restored.key'
+    backup_path = '/tmp/mt_backup.enc'
+    db_path = '/tmp/mt_lsp.db'
+    passphrase = 'testpass'
 
-    # Run demo to create DB state (with --keyfile so key material is generated)
-    rc, log = run_lsp(['--demo', '--keyfile', keyfile_path])
+    # Step 1: Run demo normally (with --seckey) to create DB state.
+    rc, log = run_lsp(['--demo'])
     if 'factory creation complete' not in log:
         print("  FAIL: no DB state created for backup test")
         return False
 
-    backup_path = '/tmp/mt_backup.enc'
-    db_path = '/tmp/mt_lsp.db'
+    # Step 2: Generate a keyfile using --generate-mnemonic.
+    # This creates an encrypted keyfile on disk that backup can bundle.
+    clean_files(keyfile_path)
+    r = subprocess.run(
+        [LSP, '--generate-mnemonic', '--keyfile', keyfile_path,
+         '--passphrase', passphrase, '--network', 'regtest'],
+        capture_output=True, text=True, env=env, timeout=30)
+    if not os.path.exists(keyfile_path):
+        print(f"  FAIL: --generate-mnemonic did not create keyfile (rc={r.returncode})")
+        print(f"  stderr: {r.stderr.strip()}")
+        return False
+
     clean_files(backup_path, '/tmp/mt_restored.db', restored_keyfile)
 
-    # Create backup (requires --db and --keyfile)
+    # Step 3: Create backup (requires --db and --keyfile on disk)
     r = subprocess.run(
         [LSP, '--backup', backup_path, '--db', db_path,
          '--keyfile', keyfile_path,
-         '--seckey', LSP_SECKEY, '--passphrase', 'testpass',
+         '--passphrase', passphrase,
          '--network', 'regtest'],
         capture_output=True, text=True, env=env, timeout=30)
     if not os.path.exists(backup_path):
@@ -581,18 +595,18 @@ def test_backup_restore():
     sz = os.path.getsize(backup_path)
     print(f"  Backup: {sz} bytes")
 
-    # Verify
+    # Step 4: Verify backup integrity
     r = subprocess.run(
-        [LSP, '--backup-verify', backup_path, '--passphrase', 'testpass'],
+        [LSP, '--backup-verify', backup_path, '--passphrase', passphrase],
         capture_output=True, text=True, env=env, timeout=30)
     print(f"  Verify: rc={r.returncode}")
 
-    # Restore (requires --db and --keyfile for destination paths)
+    # Step 5: Restore to new paths
     restored = '/tmp/mt_restored.db'
     r = subprocess.run(
         [LSP, '--restore', backup_path, '--db', restored,
          '--keyfile', restored_keyfile,
-         '--passphrase', 'testpass'],
+         '--passphrase', passphrase],
         capture_output=True, text=True, env=env, timeout=30)
     has_restore = os.path.exists(restored)
     has_keyfile = os.path.exists(restored_keyfile)
