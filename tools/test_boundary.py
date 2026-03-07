@@ -87,10 +87,14 @@ def run_lsp_quick(extra_args, timeout=5):
            "--rpcuser", "rpcuser", "--rpcpassword", "rpcpass",
            "--wallet", WALLET, "--report", "/tmp/boundary_report.json",
            "--db", "/tmp/boundary_test.db"] + extra_args
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=env)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        return r.returncode, r.stdout, r.stderr
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out, err
     except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
         return -1, "", "TIMEOUT"
 
 def run_lsp_daemon(extra_args, port, log_path, n_clients=4, amount=100000):
@@ -430,8 +434,11 @@ else:
     time.sleep(3)
 
     def send_cmd(cmd_str):
-        lsp.stdin.write((cmd_str + "\n").encode())
-        lsp.stdin.flush()
+        try:
+            lsp.stdin.write((cmd_str + "\n").encode())
+            lsp.stdin.flush()
+        except (BrokenPipeError, OSError):
+            print(f"  WARNING: LSP stdin broken, skipping command: {cmd_str}")
 
     def get_new_output(since_len):
         lsp_log.flush()
