@@ -501,6 +501,10 @@ int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
 
     if (strstr(result, "error") != NULL) {
         fprintf(stderr, "sendrawtransaction error: %s\n", result);
+        if (strstr(result, "min relay fee not met") ||
+            strstr(result, "insufficient fee"))
+            fprintf(stderr, "  hint: increase --fee-rate (current may be "
+                    "below mempool minimum)\n");
         free(result);
         return 0;
     }
@@ -875,7 +879,21 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
             return -1;
         }
 
-        printf("  waiting for confirmation... (%ds/%ds)\n", elapsed, timeout_secs);
+        int height = regtest_get_block_height(rt);
+        int mins = elapsed / 60;
+        if (mins > 0)
+            printf("  waiting for confirmation of %.16s... "
+                   "(height=%d, %dm %ds / %ds)\n",
+                   txid, height, mins, elapsed % 60, timeout_secs);
+        else
+            printf("  waiting for confirmation of %.16s... "
+                   "(height=%d, %ds / %ds)\n",
+                   txid, height, elapsed, timeout_secs);
+        /* Stuck TX warning: if unconfirmed for >1 hour on non-regtest */
+        if (!is_regtest && elapsed == 3600)
+            fprintf(stderr, "  WARNING: TX %.16s... unconfirmed for 1 hour. "
+                    "Consider CPFP bump: bitcoin-cli bumpfee %s\n", txid, txid);
+        fflush(stdout);
         sleep(interval);
         elapsed += interval;
         /* Exponential backoff, capped */

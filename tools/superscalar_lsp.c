@@ -103,6 +103,7 @@ static void usage(const char *prog) {
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
+        "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
         "  --max-handshakes N  Max concurrent handshakes (default: 4)\n"
@@ -374,8 +375,11 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
            to reach sufficient depth before this tx is valid */
         if (node->nsequence != NSEQUENCE_DISABLE_BIP68 && node->nsequence > 0) {
             uint32_t required_depth = (node->nsequence & 0xFFFF);
-            printf("  node[%zu] requires %u-block relative timelock, waiting...\n",
-                   i, required_depth);
+            int est_mins = (int)required_depth * 10; /* ~10 min/block */
+            printf("  node[%zu/%zu] requires %u-block relative timelock "
+                   "(~%dh%02dm), waiting...\n",
+                   i, f->n_nodes, required_depth,
+                   est_mins / 60, est_mins % 60);
 
             if (is_regtest) {
                 /* Mine the required blocks */
@@ -396,9 +400,13 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
                     }
                     sleep(10);
                     waited += 10;
-                    printf("    height: %d / %d (%ds/%ds)\n",
-                           regtest_get_block_height(rt), target_height,
-                           waited, confirm_timeout);
+                    int cur_h = regtest_get_block_height(rt);
+                    int blocks_left = target_height - cur_h;
+                    int est_mins = blocks_left * 10;
+                    printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
+                           cur_h, target_height, waited,
+                           est_mins / 60, est_mins % 60);
+                    fflush(stdout);
                 }
             }
         }
@@ -439,7 +447,10 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
         if (is_regtest) {
             regtest_mine_blocks(rt, 1, mine_addr);
         } else {
-            printf("  node[%zu] broadcast OK, waiting for confirmation...\n", i);
+            printf("  node[%zu/%zu] broadcast OK (txid=%.16s...), "
+                   "waiting for confirmation...\n",
+                   i, f->n_nodes, txid_out);
+            fflush(stdout);
             regtest_wait_for_confirmation(rt, txid_out, confirm_timeout);
         }
 
@@ -532,6 +543,7 @@ int main(int argc, char *argv[]) {
     int test_batch_rebalance = 0;
     int test_realloc = 0;
     int dynamic_fees = 0;
+    int heartbeat_interval = 0;  /* 0 = disabled; seconds between daemon status lines */
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
     int backup_verify_arg = 0;
@@ -734,6 +746,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--dynamic-fees") == 0)
             dynamic_fees = 1;
+        else if (strcmp(argv[i], "--heartbeat-interval") == 0 && i + 1 < argc)
+            heartbeat_interval = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-after") == 0 && i + 1 < argc)
             fee_bump_after = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-max") == 0 && i + 1 < argc)
@@ -1171,6 +1185,7 @@ int main(int argc, char *argv[]) {
             }
             mgr->persist = &db;
             mgr->confirm_timeout_secs = confirm_timeout_secs;
+            mgr->heartbeat_interval = heartbeat_interval;
 
             /* Load persisted state: invoices, HTLC origins, request_id */
             mgr->next_request_id = persist_load_counter(&db, "next_request_id", 1);
@@ -1880,6 +1895,7 @@ int main(int argc, char *argv[]) {
 
         /* Set configurable confirmation timeout */
         mgr->confirm_timeout_secs = confirm_timeout_secs;
+        mgr->heartbeat_interval = heartbeat_interval;
 
         /* Load persisted state (Phase 23) */
         if (use_db) {
