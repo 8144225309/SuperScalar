@@ -10,8 +10,11 @@ All notable changes to SuperScalar are documented here.
 - **Pay after rotate**: After factory rotation, `lsp_channels_rotate_factory` persisted channel amounts and commitment number but not basepoints or remote per-commitment points (PCPs). When clients reconnected, `handle_reconnect_with_msg` loaded stale PCPs from the old channel's DB rows (same slot, same cn), corrupting commitment state and failing all subsequent payments. Added `persist_save_basepoints()` and `persist_save_remote_pcp()` calls inside the existing transaction in `lsp_rotation.c`.
 - **Backup test keyfile missing**: The backup manual test passed `--seckey` to the demo run, which bypasses `--keyfile` entirely. The keyfile was never written to disk, so `backup_create()` failed on `read_file()`. Fixed by generating a keyfile via `--generate-mnemonic` after the demo run.
 - **DW advance scenario pass marker**: The orchestrator matched "DW ADVANCE TEST" which also matched failure messages. Changed to match only "DW ADVANCE TEST PASSED" or "DW ADVANCE TEST: PASS".
-- **Boundary test failures**: `run_lsp_quick` switched to `Popen` so timed-out LSP processes are killed instead of leaving stale processes holding the port. `send_cmd` now catches `BrokenPipeError` instead of crashing the test harness.
+- **Boundary test failures**: `run_lsp_quick` switched to `Popen` so timed-out LSP processes are killed instead of leaving stale processes holding the port. `send_cmd` now catches `BrokenPipeError` instead of crashing the test harness. Safe regtest bitcoind kill now reads `/proc/PID/cmdline` to target only `-regtest` processes instead of using `pkill -f` which matched SSH sessions.
 - **Non-regtest test flags**: `test_nonregtest` manual test updated to reflect that `--test-*` flags are now allowed on all networks (per e433c8d).
+- **1-client arity-1 test**: Updated to accept factory creation success (LSP + 1 client = 2 MuSig2 signers is valid since 0.1.2's 2-participant support).
+- **Short rotation test timing**: Added more time for daemon DYING detection and extra mining for rotation close + new factory funding confirmations.
+- **Pay-after-rotate stress test**: Added 15s channel settle wait after rotation, status polling to verify channels are online, and a retry on first payment failure.
 
 ### Added
 
