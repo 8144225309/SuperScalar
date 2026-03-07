@@ -7,6 +7,35 @@ All notable changes to SuperScalar are documented here.
 ### Fixed
 
 - **DW advance crash**: `--test-dw-advance` crashed with `secp256k1 illegal argument` because the factory's keypairs were zeroed (`factory_init_from_pubkeys()` only sets pubkeys). Populated demo keypairs before calling `factory_advance()`, matching the pattern used by the distribution TX and turnover tests.
+- **Pay after rotate**: After factory rotation, `lsp_channels_rotate_factory` persisted channel amounts and commitment number but not basepoints or remote per-commitment points (PCPs). When clients reconnected, `handle_reconnect_with_msg` loaded stale PCPs from the old channel's DB rows (same slot, same cn), corrupting commitment state and failing all subsequent payments. Added `persist_save_basepoints()` and `persist_save_remote_pcp()` calls inside the existing transaction in `lsp_rotation.c`.
+- **Backup test keyfile missing**: The backup manual test passed `--seckey` to the demo run, which bypasses `--keyfile` entirely. The keyfile was never written to disk, so `backup_create()` failed on `read_file()`. Fixed by generating a keyfile via `--generate-mnemonic` after the demo run.
+- **DW advance scenario pass marker**: The orchestrator matched "DW ADVANCE TEST" which also matched failure messages. Changed to match only "DW ADVANCE TEST PASSED" or "DW ADVANCE TEST: PASS".
+- **Boundary test failures**: `run_lsp_quick` switched to `Popen` so timed-out LSP processes are killed instead of leaving stale processes holding the port. `send_cmd` now catches `BrokenPipeError` instead of crashing the test harness.
+- **Non-regtest test flags**: `test_nonregtest` manual test updated to reflect that `--test-*` flags are now allowed on all networks (per e433c8d).
+
+### Added
+
+- **`--test-*` flags on non-regtest networks**: Replaced bare `regtest_mine_blocks()` calls in test paths with an `ADVANCE(n)` macro that calls `advance_chain()` — mines on regtest, polls `getblockcount` on signet/testnet4. Removed the gate that blocked `--test-expiry`, `--test-distrib`, `--test-turnover`, and `--test-rotation` on non-regtest networks.
+- **TXID broadcast logging**: Added `persist_log_broadcast()` calls at all 15+ TX broadcast sites (burn, HTLC commitment/timeout, breach, expiry, distribution, turnover close, rotation close, cooperative close). Enables post-run inspection tools to look up TXIDs from the database.
+- **JIT channel exhibition**: Late-arriving client creates a separate JIT channel funding TX + close TX, producing a distinct on-chain artifact (exhibition structure 11).
+- **4 new orchestrator scenarios**: `lstock_burn` (L-stock burn via shachain revocation), `dw_advance` (DW counter advance + re-sign + force-close), `distribution_tx` (distribution TX broadcast after CLTV with P2A anchor), `bridge_bolt11` (bridge inbound HTLC / BOLT11 invoice routing).
+- **Testnet4 quickstart guide**: `docs/testnet4-quickstart.md` with prerequisites, recommended flags, per-structure time estimates, environment variable configuration, and common failure modes.
+- **Testnet4 operational improvements**: Enhanced confirmation wait logging with TXID/block height/elapsed time, fee-rate floor hint on `sendrawtransaction` min relay fee error, force-close tree broadcast logging with BIP68 wait time estimates, stuck TX warning after 1 hour unconfirmed, daemon heartbeat (`--heartbeat-interval N`).
+- **Exhibition tooling**: `inspect_factory.py` (on-chain TX tree inspector with witness analysis and nSequence/nLockTime interpretation), `exhibition_testnet4.sh` (master script for all on-chain structures), `run_remote_client.sh` (remote MuSig2 signing helper).
+
+### Changed
+
+- **Testnet4 timing guidance in README**: Documented recommended `--active-blocks`, `--dying-blocks`, `--step-blocks`, `--states-per-layer` values for faster testnet4 iteration with comparison table.
+- **Environment-specific artifacts removed**: `regtest_full.sh` uses relative paths, `exhibition_testnet4.sh` uses configurable env vars instead of hardcoded credentials and IPs, removed WSL-specific `docker-install-wsl.sh`.
+
+### Testing
+
+- **Manual flag tests expanded to 29**: Added 4 new tests (backup/restore cycle fix, DW advance, JIT exhibition, non-regtest flag validation).
+- **Orchestrator scenarios expanded to 27**: Added `lstock_burn`, `dw_advance`, `distribution_tx`, `bridge_bolt11`.
+
+### Test Count
+
+418 unit + 43 regtest = 461 automated + 29 manual flag tests + 27 orchestrator scenarios.
 
 ---
 
