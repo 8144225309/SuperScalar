@@ -26,6 +26,10 @@ Run all 11 SuperScalar on-chain structures on Bitcoin testnet4.
    - CLN-A with the SuperScalar bridge plugin
    - CLN-B as a vanilla peer
    - Funded channel between them (~500k sats)
+   - See `tools/deploy/cln-bridge.conf.example` for CLN config
+   - Full setup: [CLN Bridge Setup](deployment-coordination.md#cln-bridge-setup)
+   - See  for CLN config
+   - Full setup: [CLN Bridge Setup](deployment-coordination.md#cln-bridge-setup)
 
 ---
 
