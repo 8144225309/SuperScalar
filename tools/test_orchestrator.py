@@ -1766,6 +1766,32 @@ def scenario_bridge_bolt11(orch):
     return success
 
 
+def scenario_dual_factory(orch):
+    """Two simultaneously ACTIVE factories via --test-dual-factory."""
+    orch._log("=== SCENARIO: dual_factory ===")
+    orch._log("LSP creates two factories, both ACTIVE, then force-closes both.")
+
+    orch.start_lsp(["--demo", "--test-dual-factory"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_both = "Factories in ladder: 2" in lsp_log
+    has_pass = "DUAL FACTORY TEST PASSED" in lsp_log
+    has_f0 = "Factory 0 tree confirmed" in lsp_log
+    has_f1 = "Factory 1 tree confirmed" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass and has_both and has_f0 and has_f1
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"dual factory {'passed' if success else 'failed'} "
+              f"(both_active={has_both}, f0={has_f0}, f1={has_f1})")
+    return success
+
+
 def scenario_buy_liquidity(orch):
     """Buy inbound liquidity from L-stock via CLI command."""
     orch._log("=== SCENARIO: buy_liquidity ===")
@@ -1857,6 +1883,7 @@ SCENARIOS = {
     "distribution_tx": lambda o, **kw: scenario_distribution_tx(o),
     "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
     "buy_liquidity": lambda o, **kw: scenario_buy_liquidity(o),
+    "dual_factory": lambda o, **kw: scenario_dual_factory(o),
 }
 
 
@@ -1892,6 +1919,7 @@ def list_scenarios():
         "distribution_tx": "Distribution TX broadcast after CLTV (P2A anchor)",
         "bridge_bolt11": "Bridge inbound HTLC; BOLT11 invoice routing",
         "buy_liquidity": "Buy inbound liquidity from L-stock via CLI",
+        "dual_factory": "Two simultaneously ACTIVE factories in ladder",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
