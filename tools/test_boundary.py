@@ -60,7 +60,18 @@ def fresh_regtest():
             break
         time.sleep(1)
     else:
-        subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+        # Kill only the regtest bitcoind — avoid pkill -f which matches SSH sessions
+        r = subprocess.run(["pgrep", "-x", "bitcoind"], capture_output=True, text=True)
+        for pid in r.stdout.strip().split("\n"):
+            if not pid:
+                continue
+            # Check if this PID's cmdline contains -regtest
+            try:
+                cmdline = open(f"/proc/{pid}/cmdline").read()
+                if "-regtest" in cmdline:
+                    subprocess.run(["kill", "-9", pid], capture_output=True)
+            except (FileNotFoundError, PermissionError):
+                pass
         time.sleep(2)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
     btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
