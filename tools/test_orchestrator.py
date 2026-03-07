@@ -523,7 +523,9 @@ class Orchestrator:
         """Check if a client's log contains penalty broadcast evidence."""
         if self.clients[client_idx]:
             log = self.clients[client_idx].read_log()
-            return "BREACH DETECTED" in log or "penalty" in log.lower()
+            return ("BREACH DETECTED" in log or
+                    "penalty broadcast" in log.lower() or
+                    "penalty tx" in log.lower())
         return False
 
     def mine(self, n=1):
@@ -599,7 +601,7 @@ def scenario_all_watch(orch):
 
     orch.stop_all()
 
-    success = n_detected == orch.n_clients
+    success = rc == 0 and n_detected == orch.n_clients
     orch._log(f"Result: {n_detected}/{orch.n_clients} detected breach, "
               f"{n_cpfp}/{orch.n_clients} broadcast CPFP child — "
               f"{'PASS' if success else 'FAIL'}")
@@ -651,7 +653,7 @@ def scenario_partial_watch(orch, k=2):
 
     orch.stop_all()
 
-    success = n_detected == k
+    success = rc == 0 and n_detected == k
     orch._log(f"Result: {n_detected}/{k} online clients detected — "
               f"{'PASS' if success else 'FAIL'}")
     return success
@@ -688,14 +690,18 @@ def scenario_nobody_home(orch):
     rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
 
+    # Verify the breach TX actually happened (LSP log should confirm)
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    breach_happened = "BREACH TEST" in lsp_log and "revoked" in lsp_log.lower()
+
     # No clients running — check mempool for penalty txs (there should be none)
     mempool = orch.chain.get_mempool()
     has_penalty = len(mempool) > 0
-    orch._log(f"Mempool has {len(mempool)} txs (expected 0 penalty)")
+    orch._log(f"Breach happened: {breach_happened}, Mempool has {len(mempool)} txs")
 
     orch.stop_all()
 
-    success = not has_penalty
+    success = rc == 0 and breach_happened and not has_penalty
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"breach {'undetected' if success else 'detected unexpectedly'}")
     return success
@@ -754,10 +760,10 @@ def scenario_late_arrival(orch, k=2):
 
     orch.stop_all()
 
-    # Late arrival detection depends on client reconnect loading watchtower state
+    success = n_detected == k
     orch._log(f"Result: {n_detected}/{k} late clients detected — "
-              f"{'PASS' if n_detected > 0 else 'PARTIAL (needs reconnect watchtower)'}")
-    return n_detected > 0
+              f"{'PASS' if success else 'FAIL'}")
+    return success
 
 
 def scenario_cooperative_close(orch):
@@ -780,13 +786,15 @@ def scenario_cooperative_close(orch):
 
     # Check LSP log for cooperative close evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_close = "cooperative close" in lsp_log.lower() or "Close outputs" in lsp_log
+    has_close = ("Close TX broadcast" in lsp_log or
+                 "cooperative close" in lsp_log.lower())
 
     orch.stop_all()
 
-    orch._log(f"Result: {'PASS' if has_close else 'FAIL'} — "
-              f"cooperative close {'confirmed' if has_close else 'not found in log'}")
-    return has_close
+    success = rc == 0 and has_close
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"cooperative close {'confirmed' if success else 'not found in log'}")
+    return success
 
 
 def scenario_timeout_expiry(orch):
@@ -810,8 +818,7 @@ def scenario_timeout_expiry(orch):
 
     # Check LSP log
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_expiry = ("TIMEOUT" in lsp_log or "expiry" in lsp_log.lower()
-                  or "reclaim" in lsp_log.lower() or "EXPIRY TEST" in lsp_log)
+    has_expiry = "EXPIRY TEST PASSED" in lsp_log
 
     orch.stop_all()
 
@@ -839,7 +846,8 @@ def scenario_factory_breach(orch):
     # Check LSP log for breach detection (LSP watchtower catches its own breach)
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     lsp_breach = "BREACH DETECTED" in lsp_log
-    lsp_penalty = "Penalty tx broadcast" in lsp_log or "penalty" in lsp_log.lower()
+    lsp_penalty = ("penalty broadcast" in lsp_log.lower() or
+                   "penalty tx" in lsp_log.lower())
 
     orch._log(f"LSP breach detection: {lsp_breach}, penalty: {lsp_penalty}")
 
@@ -918,7 +926,8 @@ def scenario_jit_lifecycle(orch):
 
     # JIT triggers when factory expired; rotation pre-empts by creating new factory.
     # Either outcome verifies daemon loop lifecycle management works.
-    success = lsp_jit or lsp_rotation or lsp_expired
+    # Require at least one concrete lifecycle event (not just loose string matching).
+    success = (lsp_jit and lsp_expired) or (lsp_rotation and lsp_dying)
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"lifecycle {'managed' if success else 'not detected in logs'}")
     return success
@@ -979,7 +988,7 @@ def scenario_factory_rotation(orch):
     orch.advance_chain(1)
     orch.stop_all()
 
-    success = has_turnover or has_new_factory or has_rotation
+    success = (has_turnover or has_rotation) and (has_new_factory or has_dying)
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"factory rotation {'completed' if success else 'not detected'}")
     return success
@@ -1006,16 +1015,13 @@ def scenario_timeout_recovery(orch):
 
     # Check logs for timeout/reclaim evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_timeout = "timeout" in lsp_log.lower() or "reclaim" in lsp_log.lower()
-    has_expiry = ("TIMEOUT" in lsp_log or "expiry" in lsp_log.lower()
-                  or "EXPIRY TEST" in lsp_log)
+    has_expiry = "EXPIRY TEST PASSED" in lsp_log
 
-    orch._log(f"Timeout evidence: {has_timeout}")
-    orch._log(f"Expiry evidence: {has_expiry}")
+    orch._log(f"Expiry pass marker: {has_expiry}")
 
     orch.stop_all()
 
-    success = rc == 0 and (has_timeout or has_expiry)
+    success = rc == 0 and has_expiry
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"timeout recovery {'completed' if success else 'not detected'}")
     return success
@@ -1044,11 +1050,10 @@ def scenario_full_lifecycle(orch):
     # Check that channels have been updated (commitment_number > 0)
     states = orch.get_channel_states()
     lsp_channels = states.get("lsp", [])
+    max_commit = 0
     if lsp_channels:
         max_commit = max(ch.get("commitment_number", 0) for ch in lsp_channels)
-        orch._log(f"Max commitment number: {max_commit}")
-    else:
-        orch._log("Warning: no LSP channels found in DB")
+    orch._log(f"Max commitment number: {max_commit} ({len(lsp_channels)} channels)")
 
     # Phase 2: Check watchtower entries exist
     orch._log("Phase 2: Verifying watchtower state...")
@@ -1058,14 +1063,15 @@ def scenario_full_lifecycle(orch):
 
     # Check LSP log for close evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_close = ("cooperative close" in lsp_log.lower() or "CLOSE" in lsp_log
-                 or "close confirmed" in lsp_log.lower())
+    has_close = ("Close TX broadcast" in lsp_log or
+                 "cooperative close" in lsp_log.lower())
 
     orch.stop_all()
 
-    success = rc == 0 and has_close
+    success = rc == 0 and has_close and max_commit > 0
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
-              f"full lifecycle {'completed' if success else 'cooperative close not found'}")
+              f"full lifecycle {'completed' if success else 'incomplete'} "
+              f"(close={has_close}, max_commit={max_commit})")
     return success
 
 
@@ -1097,11 +1103,11 @@ def scenario_routing_fee(orch):
 
     # Check LSP log for fee deduction evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_fee = "routing fee" in lsp_log.lower() or "fee" in lsp_log.lower()
+    has_fee = "routing_fee_ppm" in lsp_log or "routing fee" in lsp_log.lower()
 
     orch.stop_all()
 
-    success = rc == 0 and has_fee
+    success = rc == 0 and routing_fee == 100 and has_fee
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"routing fee {'applied' if success else 'not detected'}")
     return success
@@ -1143,7 +1149,7 @@ def scenario_cli_payments(orch):
     # Check LSP log for CLI evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     has_status = "--- Factory Status ---" in lsp_log
-    has_pay = "CLI: payment succeeded" in lsp_log or "CLI: pay" in lsp_log
+    has_pay = "CLI: payment succeeded" in lsp_log
     has_close = "CLI: triggering shutdown" in lsp_log
 
     orch._log(f"Status command: {has_status}")
@@ -1193,16 +1199,15 @@ def scenario_profit_shared(orch):
     # Check LSP log for settlement evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     has_settlement = ("settled profits" in lsp_log.lower() or
-                      "settlement" in lsp_log.lower() or
-                      "profit" in lsp_log.lower())
-    has_fees = "accumulated" in lsp_log.lower() or "fee" in lsp_log.lower()
+                      "settlement" in lsp_log.lower())
+    has_mode = "profit-shared" in lsp_log.lower() or "economic_mode" in lsp_log
 
     orch._log(f"Settlement evidence: {has_settlement}")
-    orch._log(f"Fee evidence: {has_fees}")
+    orch._log(f"Mode evidence: {has_mode}")
 
     orch.stop_all()
 
-    success = has_settlement or has_fees
+    success = has_settlement and has_mode
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"profit sharing {'working' if success else 'not detected'}")
     return success
@@ -1353,8 +1358,8 @@ def scenario_turnover_abort(orch):
 
     orch.stop_all()
 
-    # Success: rotation was attempted (DYING detected), client 3 crash caused partial failure
-    success = has_rotation_start
+    # Success: rotation was attempted (DYING detected) AND reconnect observed
+    success = has_rotation_start and (has_rotation_complete or has_reconnect)
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"turnover abort {'recoverable' if success else 'not detected'}")
     return success
@@ -1529,7 +1534,8 @@ def scenario_mass_departure_jit(orch):
 
     orch.stop_all()
 
-    success = client0_alive
+    lsp_alive = orch.lsp and orch.lsp.is_alive()
+    success = client0_alive and lsp_alive
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"mass departure {'handled' if success else 'failed'}")
     return success
@@ -1734,7 +1740,7 @@ def scenario_distribution_tx(orch):
     has_broadcast = "broadcast" in lsp_log.lower()
 
     orch.stop_all()
-    success = rc == 0 and has_distrib
+    success = rc == 0 and has_distrib and has_broadcast
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"distribution TX {'passed' if success else 'failed'} "
               f"(distrib={has_distrib}, broadcast={has_broadcast})")
@@ -1756,10 +1762,10 @@ def scenario_bridge_bolt11(orch):
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     has_invoice = "invoice" in lsp_log.lower() or "bolt11" in lsp_log.lower()
     has_route = "route" in lsp_log.lower() or "fulfill" in lsp_log.lower()
-    has_pass = "BRIDGE TEST" in lsp_log and "PASS" in lsp_log
+    has_pass = "BRIDGE TEST PASSED" in lsp_log or "BRIDGE TEST: PASS" in lsp_log
 
     orch.stop_all()
-    success = rc == 0 and (has_pass or (has_invoice and has_route))
+    success = rc == 0 and has_pass
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"bridge BOLT11 {'passed' if success else 'failed'} "
               f"(invoice={has_invoice}, route={has_route})")
@@ -1805,13 +1811,13 @@ def scenario_dw_exhibition(orch):
     orch._log(f"LSP exited with code {rc}")
 
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_phase1 = "Phase 1:" in lsp_log and "PASS" in lsp_log
-    has_phase2 = "Phase 2:" in lsp_log and "PTLC" in lsp_log
-    has_phase3 = "Phase 3:" in lsp_log and "Contrast" in lsp_log
+    has_phase1 = "Phase 1: PASS" in lsp_log or "Phase 1:" in lsp_log and "nSequence" in lsp_log
+    has_phase2 = "Phase 2: PASS" in lsp_log or "Phase 2:" in lsp_log and "PTLC" in lsp_log
+    has_phase3 = "Phase 3: PASS" in lsp_log or "Phase 3:" in lsp_log and "Contrast" in lsp_log
     has_pass = "DW EXHIBITION TEST PASSED" in lsp_log
 
     orch.stop_all()
-    success = rc == 0 and has_pass
+    success = rc == 0 and has_pass and has_phase1 and has_phase2 and has_phase3
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
               f"dw_exhibition {'passed' if success else 'failed'} "
               f"(p1={has_phase1}, p2={has_phase2}, p3={has_phase3})")

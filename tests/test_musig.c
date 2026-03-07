@@ -59,6 +59,31 @@ int test_musig_aggregate_keys(void) {
     }
     TEST_ASSERT(!all_zero, "aggregate key should not be zero");
 
+    /* Verify aggregation is deterministic — same inputs produce same output */
+    musig_keyagg_t keyagg2;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &keyagg2, pubkeys, 2),
+                "second key aggregation");
+    unsigned char agg_ser2[32];
+    TEST_ASSERT(secp256k1_xonly_pubkey_serialize(ctx, agg_ser2, &keyagg2.agg_pubkey),
+                "serialize second aggregate key");
+    TEST_ASSERT(memcmp(agg_ser, agg_ser2, 32) == 0,
+                "aggregate key should be deterministic");
+
+    /* Verify aggregate differs from either individual key */
+    unsigned char pk1_ser[32], pk2_ser[32];
+    secp256k1_xonly_pubkey xpk1, xpk2;
+    int pk1_par, pk2_par;
+    TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk1, &pk1_par, &pubkeys[0]),
+                "xonly from pk1");
+    TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk2, &pk2_par, &pubkeys[1]),
+                "xonly from pk2");
+    secp256k1_xonly_pubkey_serialize(ctx, pk1_ser, &xpk1);
+    secp256k1_xonly_pubkey_serialize(ctx, pk2_ser, &xpk2);
+    TEST_ASSERT(memcmp(agg_ser, pk1_ser, 32) != 0,
+                "aggregate should differ from key 1");
+    TEST_ASSERT(memcmp(agg_ser, pk2_ser, 32) != 0,
+                "aggregate should differ from key 2");
+
     secp256k1_context_destroy(ctx);
     return 1;
 }

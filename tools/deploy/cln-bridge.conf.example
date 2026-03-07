@@ -1,0 +1,58 @@
+# Core Lightning — SuperScalar bridge node
+#
+# This node runs the SuperScalar CLN plugin, which intercepts inbound
+# HTLCs and forwards them to SuperScalar factory clients via the bridge
+# daemon. It connects the SuperScalar factory to the Lightning Network.
+#
+# Prerequisites:
+#   1. superscalar_bridge must be running (start it first, or the plugin
+#      will retry every 5 seconds until it connects)
+#   2. cln_plugin.py requires Python 3
+#   3. The bridge port here must match --plugin-port on superscalar_bridge
+#
+# Start order: bitcoind -> superscalar_lsp -> superscalar_bridge -> lightningd
+
+# --- Network ---
+# Change to match your deployment (bitcoin, testnet4, signet, regtest)
+network=testnet4
+
+# --- Logging ---
+log-file=/var/lib/cln/cln.log
+log-level=info
+
+# --- Bitcoin Core RPC ---
+bitcoin-rpcuser=YOUR_RPC_USER
+bitcoin-rpcpassword=YOUR_RPC_PASSWORD
+bitcoin-rpcport=48332
+bitcoin-rpcconnect=127.0.0.1
+bitcoin-cli=/usr/local/bin/bitcoin-cli
+bitcoin-datadir=/var/lib/bitcoind
+
+# --- Lightning listener ---
+# This is the standard LN port where other LN nodes connect.
+# You need at least one channel with a peer for bridge payments to work.
+addr=0.0.0.0:9735
+
+# --- Node identity ---
+alias=my-superscalar-bridge
+
+# --- SuperScalar bridge plugin ---
+# Path to the plugin script (shipped in tools/cln_plugin.py)
+plugin=/path/to/SuperScalar/tools/cln_plugin.py
+
+# Host and port where superscalar_bridge listens for the plugin.
+# Must match --plugin-port passed to superscalar_bridge.
+superscalar-bridge-host=127.0.0.1
+superscalar-bridge-port=9737
+
+# Path to lightning-cli for the plugin to call back into CLN.
+# Include --lightning-dir if your CLN data isn't in the default location.
+superscalar-lightning-cli=lightning-cli --lightning-dir=/var/lib/cln
+
+# (Optional) Default destination client index for keysend payments.
+# 0 = first client in the factory.
+# superscalar-keysend-client=0
+
+# (Optional) Route hint for private channels. If your channel with the
+# broader LN is private, set this so invoices include the hint.
+# superscalar-route-hint=SHORT_CHANNEL_ID

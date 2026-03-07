@@ -17,5 +17,10 @@ bitcoind -regtest -daemon -txindex -fallbackfee=0.00001
 sleep 2
 
 echo "=== Verifying ==="
-bitcoin-cli -regtest getblockchaininfo | grep -E '"chain"|"blocks"'
-echo "=== Done ==="
+if bitcoin-cli -regtest getblockchaininfo | grep -q '"chain"'; then
+    bitcoin-cli -regtest getblockchaininfo | grep -E '"chain"|"blocks"'
+    echo "=== Done ==="
+else
+    echo "FAIL: bitcoind did not start"
+    exit 1
+fi
