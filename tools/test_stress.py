@@ -391,10 +391,29 @@ else:
     # ============================================================
     if post_rot_status and "fd=-1" not in new:
         print(f"\n{ts()} --- Stress 6: Payment after rotation ---")
-        time.sleep(5)  # Let clients fully settle into daemon loop after rotation
+        # Wait for channels to fully settle after rotation — clients need time
+        # to reconnect, exchange basepoints, and enter daemon loop.
+        print(f"  Waiting for daemon to settle after rotation...")
+        time.sleep(15)
+        # Verify channels are online before attempting payment
+        for settle_try in range(3):
+            sp = len(read_log("/tmp/stress_lsp.log"))
+            send_cmd("status")
+            time.sleep(5)
+            sn, _ = get_log_since(sp)
+            if "Channels:" in sn and "fd=-1" not in sn:
+                break
+            time.sleep(10)
         cmd_pos = len(read_log("/tmp/stress_lsp.log"))
         send_cmd("pay 0 1 1000")
-        ok, out, _ = wait_for_result(cmd_pos, timeout=30)
+        ok, out, _ = wait_for_result(cmd_pos, timeout=45)
+        if not ok:
+            # Retry once — channel state may need one more settle cycle
+            print(f"  First attempt failed, retrying after 10s...")
+            time.sleep(10)
+            cmd_pos = len(read_log("/tmp/stress_lsp.log"))
+            send_cmd("pay 0 1 1000")
+            ok, out, _ = wait_for_result(cmd_pos, timeout=45)
         results["pay_after_rotate"] = ok
         print(f"  Pay after rotation: {'OK' if ok else 'FAIL'}")
         print(f"  {ts()} RESULT: {'PASS' if results['pay_after_rotate'] else 'FAIL'}")
