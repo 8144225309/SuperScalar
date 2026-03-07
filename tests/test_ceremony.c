@@ -92,27 +92,28 @@ int test_ceremony_state_transitions(void) {
     ceremony_t c;
     ceremony_init(&c, 3, 10, 2);
 
-    /* Walk through state machine */
+    /* Walk through state machine — verify counts at each stage */
     c.state = CEREMONY_COLLECTING_NONCES;
-    TEST_ASSERT_EQ(c.state, CEREMONY_COLLECTING_NONCES, "collecting nonces");
+    TEST_ASSERT_EQ(ceremony_count_in_state(&c, CLIENT_WAITING), 3,
+                   "all clients waiting initially");
 
-    /* All send nonces */
+    /* Simulate nonce receipt */
     for (size_t i = 0; i < 3; i++)
         c.clients[i] = CLIENT_NONCE_RECEIVED;
+    TEST_ASSERT_EQ(ceremony_count_in_state(&c, CLIENT_NONCE_RECEIVED), 3,
+                   "all 3 sent nonces");
 
     c.state = CEREMONY_DISTRIBUTING_NONCES;
-    TEST_ASSERT_EQ(c.state, CEREMONY_DISTRIBUTING_NONCES, "distributing");
-
     c.state = CEREMONY_COLLECTING_PSIGS;
-    /* All send psigs */
+
+    /* Simulate partial sig receipt */
     for (size_t i = 0; i < 3; i++)
         c.clients[i] = CLIENT_PSIG_RECEIVED;
+    TEST_ASSERT_EQ(ceremony_count_in_state(&c, CLIENT_PSIG_RECEIVED), 3,
+                   "all 3 sent psigs");
 
     c.state = CEREMONY_FINALIZING;
-    TEST_ASSERT_EQ(ceremony_count_in_state(&c, CLIENT_PSIG_RECEIVED), 3, "all psigs");
-
     c.state = CEREMONY_DONE;
-    TEST_ASSERT_EQ(c.state, CEREMONY_DONE, "done");
 
     /* Test error client doesn't affect quorum count */
     ceremony_init(&c, 3, 10, 2);
