@@ -1766,6 +1766,64 @@ def scenario_bridge_bolt11(orch):
     return success
 
 
+def scenario_buy_liquidity(orch):
+    """Buy inbound liquidity from L-stock via CLI command."""
+    orch._log("=== SCENARIO: buy_liquidity ===")
+    orch._log("LSP started with --daemon --cli --arity 2; buy_liquidity via CLI.")
+
+    # Override to 4 clients for arity-2
+    saved_n = orch.n_clients
+    orch.n_clients = 4
+    orch.start_lsp(["--demo", "--daemon", "--cli", "--arity", "2",
+                     "--clients", "4"], stdin_pipe=True)
+    time.sleep(orch.timing["lsp_bind"])
+    for i in range(4):
+        orch.start_client(i)
+
+    # Wait for daemon loop
+    if not orch.wait_for_lsp_log("daemon loop started",
+                                  timeout=orch.timing["lsp_timeout"]):
+        orch._log("FAIL: daemon never entered")
+        orch.stop_all()
+        orch.n_clients = saved_n
+        return False
+
+    time.sleep(2)
+
+    # Get initial status
+    orch.lsp.write_stdin("status\n")
+    time.sleep(1)
+
+    # Buy liquidity for client 0
+    orch.lsp.write_stdin("buy_liquidity 0 5000\n")
+    time.sleep(3)
+
+    # Get status after buy
+    orch.lsp.write_stdin("status\n")
+    time.sleep(1)
+
+    # Cooperative close
+    orch.lsp.write_stdin("close\n")
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
+    orch.advance_chain(1)
+    time.sleep(2)
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_buy = "buy_liquidity succeeded" in lsp_log or "buy_liquidity client 0" in lsp_log
+    has_status = "L-stock available" in lsp_log
+
+    orch.stop_all()
+    orch.n_clients = saved_n
+
+    success = has_buy and has_status
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"buy_liquidity={'found' if has_buy else 'missing'}, "
+              f"L-stock status={'found' if has_status else 'missing'}")
+    return success
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -1798,6 +1856,7 @@ SCENARIOS = {
     "dw_advance": lambda o, **kw: scenario_dw_advance(o),
     "distribution_tx": lambda o, **kw: scenario_distribution_tx(o),
     "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
+    "buy_liquidity": lambda o, **kw: scenario_buy_liquidity(o),
 }
 
 
@@ -1832,6 +1891,7 @@ def list_scenarios():
         "dw_advance": "DW counter advance + re-sign + force-close",
         "distribution_tx": "Distribution TX broadcast after CLTV (P2A anchor)",
         "bridge_bolt11": "Bridge inbound HTLC; BOLT11 invoice routing",
+        "buy_liquidity": "Buy inbound liquidity from L-stock via CLI",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
