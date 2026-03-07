@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-cd /root/SuperScalar/build
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/build"
 
 BTC="bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass -rpcport=18443"
 WALLET="$BTC -rpcwallet=superscalar_launch"

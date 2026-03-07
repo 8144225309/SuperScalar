@@ -20,15 +20,15 @@ BUILD_DIR="$PROJECT_DIR/build"
 ORCHESTRATOR="$SCRIPT_DIR/test_orchestrator.py"
 INSPECTOR="$SCRIPT_DIR/inspect_factory.py"
 
-# Testnet4 RPC defaults (match VPS config)
-NETWORK="testnet4"
-RPCUSER="testnet4rpc"
-RPCPASS="testnet4rpcpass123"
-RPCPORT="48332"
+# Testnet4 RPC defaults (override via environment)
+NETWORK="${SS_NETWORK:-testnet4}"
+RPCUSER="${SS_RPCUSER:-testnet4rpc}"
+RPCPASS="${SS_RPCPASS:-testnet4rpcpass123}"
+RPCPORT="${SS_RPCPORT:-48332}"
 
-# Testnet4 CLN dirs
-CLN_A_DIR="/var/lib/cln-testnet4"
-CLN_B_DIR="/var/lib/cln-testnet4-b"
+# Testnet4 CLN dirs (override via environment)
+CLN_A_DIR="${SS_CLN_A_DIR:-/var/lib/cln-testnet4}"
+CLN_B_DIR="${SS_CLN_B_DIR:-/var/lib/cln-testnet4-b}"
 
 # Exhibition output
 REPORT_DIR="/tmp/exhibition_testnet4"
@@ -253,7 +253,7 @@ structure_9_remote_client() {
     # This is a manual/interactive test — just log instructions
     log "Structure 9 (remote client) requires running run_remote_client.sh from a separate machine."
     log "  On VPS: python3 $ORCHESTRATOR $ORCH_BASE_ARGS --port ${STRUCTURE_PORTS[9]} --scenario cooperative_close"
-    log "  On laptop: bash tools/run_remote_client.sh --host 68.168.216.243 --port ${STRUCTURE_PORTS[9]} --network testnet4"
+    log "  On laptop: bash tools/run_remote_client.sh --host <LSP_HOST> --port ${STRUCTURE_PORTS[9]} --network testnet4"
     RESULTS["09_remote_client"]="MANUAL"
 }
 
