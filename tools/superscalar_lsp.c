@@ -102,6 +102,7 @@ static void usage(const char *prog) {
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
+        "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
@@ -519,6 +520,7 @@ int main(int argc, char *argv[]) {
     int test_htlc_force_close = 0;
     int test_dw_advance = 0;
     int test_leaf_advance = 0;
+    int test_dual_factory = 0;
     int test_bridge = 0;
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 259200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
@@ -666,6 +668,8 @@ int main(int argc, char *argv[]) {
             test_dw_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
             test_leaf_advance = 1;
+        else if (strcmp(argv[i], "--test-dual-factory") == 0)
+            test_dual_factory = 1;
         else if (strcmp(argv[i], "--test-bridge") == 0)
             test_bridge = 1;
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
@@ -1849,7 +1853,8 @@ int main(int argc, char *argv[]) {
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
-        test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc) {
+        test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
+        test_dual_factory) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = &fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -2288,6 +2293,271 @@ int main(int argc, char *argv[]) {
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return pass ? 0 : 1;
+        }
+
+        /* === Dual Factory Test: create second factory, both ACTIVE, force-close both === */
+        if (test_dual_factory && channels_active) {
+            printf("\n=== DUAL FACTORY TEST ===\n");
+            printf("Creating Factory 1 while Factory 0 is still ACTIVE...\n\n");
+
+            /* Build keypairs array (demo mode: LSP has all keys) */
+            secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+            all_kps[0] = lsp_kp;
+            {
+                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+                for (int ci = 0; ci < n_clients; ci++) {
+                    unsigned char ds[32];
+                    memset(ds, fill[ci], 32);
+                    if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
+                        fprintf(stderr, "DUAL FACTORY TEST: keypair create failed\n");
+                        return 1;
+                    }
+                }
+            }
+
+            /* Verify Factory 0 is ACTIVE */
+            {
+                int cur_h = regtest_get_block_height(&rt);
+                if (cur_h > 0) ladder_advance_block(lad, (uint32_t)cur_h);
+            }
+            factory_state_t f0_state = lad->factories[0].cached_state;
+            printf("Factory 0: state=%s, %zu nodes\n",
+                   f0_state == FACTORY_ACTIVE ? "ACTIVE" :
+                   f0_state == FACTORY_DYING ? "DYING" : "EXPIRED",
+                   lad->factories[0].factory.n_nodes);
+
+            /* Check wallet balance for second funding */
+            if (!is_regtest) {
+                double bal = regtest_get_balance(&rt);
+                double needed = (double)funding_sats / 100000000.0;
+                if (bal < needed) {
+                    fprintf(stderr, "DUAL FACTORY TEST: insufficient balance (%.8f < %.8f)\n",
+                            bal, needed);
+                    fprintf(stderr, "  Fund wallet and retry.\n");
+                    jit_channels_cleanup(mgr);
+                    if (use_db) persist_close(&db);
+                    lsp_cleanup(&lsp);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                printf("Wallet balance: %.8f BTC (sufficient for Factory 1)\n", bal);
+            }
+
+            /* Fund Factory 1 */
+            double funding_btc2 = (double)funding_sats / 100000000.0;
+            char fund2_txid_hex[65];
+            if (!regtest_fund_address(&rt, fund_addr, funding_btc2, fund2_txid_hex)) {
+                fprintf(stderr, "DUAL FACTORY TEST: fund Factory 1 failed\n");
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            if (is_regtest) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+            } else {
+                printf("Waiting for Factory 1 funding confirmation on %s...\n", network);
+                fflush(stdout);
+                int conf = regtest_wait_for_confirmation(&rt, fund2_txid_hex,
+                                                          confirm_timeout_secs);
+                if (conf < 1) {
+                    fprintf(stderr, "DUAL FACTORY TEST: funding not confirmed\n");
+                    jit_channels_cleanup(mgr);
+                    if (use_db) persist_close(&db);
+                    lsp_cleanup(&lsp);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+            }
+            printf("Factory 1 funded: %s\n", fund2_txid_hex);
+
+            /* Find funding output */
+            unsigned char fund2_txid[32];
+            hex_decode(fund2_txid_hex, fund2_txid, 32);
+            reverse_bytes(fund2_txid, 32);
+
+            uint64_t fund2_amount = 0;
+            unsigned char fund2_spk[256];
+            size_t fund2_spk_len = 0;
+            uint32_t fund2_vout = 0;
+            for (uint32_t v = 0; v < 4; v++) {
+                regtest_get_tx_output(&rt, fund2_txid_hex, v,
+                                      &fund2_amount, fund2_spk, &fund2_spk_len);
+                if (fund2_spk_len == 34 && memcmp(fund2_spk, fund_spk, 34) == 0) {
+                    fund2_vout = v;
+                    break;
+                }
+            }
+            if (fund2_amount == 0) {
+                fprintf(stderr, "DUAL FACTORY TEST: no funding output found\n");
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Build Factory 1 locally (demo mode: we have all keypairs,
+               no wire ceremony needed) */
+            factory_t f1;
+            memset(&f1, 0, sizeof(f1));
+            if (n_level_arity > 0)
+                factory_set_level_arity(&f1, level_arities, n_level_arity);
+            else if (leaf_arity == 1)
+                factory_set_arity(&f1, FACTORY_ARITY_1);
+
+            if (!factory_init(&f1, ctx, all_kps, n_total, step_blocks, 4)) {
+                fprintf(stderr, "DUAL FACTORY TEST: factory_init failed\n");
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Compute cltv_timeout for Factory 1 */
+            {
+                int cur_h = regtest_get_block_height(&rt);
+                if (cltv_timeout_arg > 0) {
+                    f1.cltv_timeout = (uint32_t)cltv_timeout_arg;
+                } else if (cur_h > 0) {
+                    int offset = is_regtest ? 35 : 1008;
+                    f1.cltv_timeout = (uint32_t)cur_h + offset;
+                }
+            }
+
+            factory_set_funding(&f1, fund2_txid, fund2_vout, fund2_amount,
+                                fund_spk, 34);
+
+            if (!factory_build_tree(&f1)) {
+                fprintf(stderr, "DUAL FACTORY TEST: factory_build_tree failed\n");
+                factory_free(&f1);
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            if (!factory_sign_all(&f1)) {
+                fprintf(stderr, "DUAL FACTORY TEST: factory_sign_all failed\n");
+                factory_free(&f1);
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Set lifecycle for Factory 1 */
+            {
+                int cur_h = regtest_get_block_height(&rt);
+                if (cur_h > 0)
+                    factory_set_lifecycle(&f1, (uint32_t)cur_h,
+                                          active_blocks, dying_blocks);
+            }
+            f1.fee = &fee_est;
+
+            printf("Factory 1 created: %zu nodes signed\n", f1.n_nodes);
+
+            /* Store Factory 1 in ladder slot 1 */
+            {
+                ladder_factory_t *lf1 = &lad->factories[1];
+                lf1->factory = f1;
+                factory_detach_txbufs(&lf1->factory);
+                lf1->factory_id = lad->next_factory_id++;
+                lf1->is_initialized = 1;
+                lf1->is_funded = 1;
+                lf1->cached_state = FACTORY_ACTIVE;
+                tx_buf_init(&lf1->distribution_tx, 256);
+                lad->n_factories = 2;
+            }
+
+            /* Update ladder block height */
+            {
+                int cur_h = regtest_get_block_height(&rt);
+                if (cur_h > 0) ladder_advance_block(lad, (uint32_t)cur_h);
+            }
+
+            /* Report: both factories ACTIVE */
+            printf("\n--- Ladder Status ---\n");
+            printf("  Factories in ladder: %zu\n", lad->n_factories);
+            for (size_t fi = 0; fi < lad->n_factories; fi++) {
+                ladder_factory_t *lf = &lad->factories[fi];
+                const char *st = lf->cached_state == FACTORY_ACTIVE ? "ACTIVE" :
+                                 lf->cached_state == FACTORY_DYING ? "DYING" : "EXPIRED";
+                printf("  Factory %u: state=%s, nodes=%zu, cltv=%u\n",
+                       lf->factory_id, st, lf->factory.n_nodes,
+                       lf->factory.cltv_timeout);
+            }
+            printf("---\n\n");
+
+            int both_active = (lad->factories[0].cached_state == FACTORY_ACTIVE &&
+                               lad->factories[1].cached_state == FACTORY_ACTIVE);
+
+            /* Force-close both trees to show two independent factory trees on-chain */
+            printf("Broadcasting Factory 0 tree (%zu nodes) on %s...\n",
+                   lad->factories[0].factory.n_nodes, network);
+            fflush(stdout);
+
+            /* Populate keypairs for Factory 0 (ladder copy may not have them) */
+            memcpy(lad->factories[0].factory.keypairs, all_kps,
+                   n_total * sizeof(secp256k1_keypair));
+
+            if (!broadcast_factory_tree_any_network(&lad->factories[0].factory, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "DUAL FACTORY TEST: Factory 0 tree broadcast failed\n");
+                factory_free(&f1);
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Factory 0 tree confirmed.\n\n");
+
+            printf("Broadcasting Factory 1 tree (%zu nodes) on %s...\n",
+                   f1.n_nodes, network);
+            fflush(stdout);
+
+            if (!broadcast_factory_tree_any_network(&f1, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "DUAL FACTORY TEST: Factory 1 tree broadcast failed\n");
+                factory_free(&f1);
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Factory 1 tree confirmed.\n\n");
+
+            printf("=== DUAL FACTORY TEST %s ===\n",
+                   both_active ? "PASSED" : "FAILED (not both ACTIVE)");
+            printf("Two independent factory trees broadcast and confirmed on %s.\n",
+                   network);
+
+            report_add_string(&rpt, "result",
+                              both_active ? "dual_factory_pass" : "dual_factory_fail");
+            report_close(&rpt);
+            factory_free(&f1);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return both_active ? 0 : 1;
         }
 
         /* === Bridge Test: simulate inbound HTLC via bridge === */
