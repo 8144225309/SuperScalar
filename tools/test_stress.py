@@ -404,16 +404,19 @@ else:
             if "Channels:" in sn and "fd=-1" not in sn:
                 break
             time.sleep(10)
-        cmd_pos = len(read_log("/tmp/stress_lsp.log"))
+        # Count "pay succeeded" before and after to detect success reliably.
+        # This avoids log-position races where daemon output shifts offsets.
+        pre_count = read_log("/tmp/stress_lsp.log").count("pay succeeded")
         send_cmd("pay 0 1 1000")
-        ok, out, _ = wait_for_result(cmd_pos, timeout=45)
-        if not ok:
-            # Retry once — channel state may need one more settle cycle
-            print(f"  First attempt failed, retrying after 10s...")
-            time.sleep(10)
-            cmd_pos = len(read_log("/tmp/stress_lsp.log"))
-            send_cmd("pay 0 1 1000")
-            ok, out, _ = wait_for_result(cmd_pos, timeout=45)
+        ok = False
+        for _ in range(60):  # poll for up to 60s
+            time.sleep(1)
+            cur = read_log("/tmp/stress_lsp.log")
+            if cur.count("pay succeeded") > pre_count:
+                ok = True
+                break
+            if "pay FAILED" in cur[-(len(cur) - cur.rfind("pay 0")):] if "pay 0" in cur else False:
+                break
         results["pay_after_rotate"] = ok
         print(f"  Pay after rotation: {'OK' if ok else 'FAIL'}")
         print(f"  {ts()} RESULT: {'PASS' if results['pay_after_rotate'] else 'FAIL'}")
