@@ -22,6 +22,10 @@ All notable changes to SuperScalar are documented here.
 - **TXID broadcast logging**: Added `persist_log_broadcast()` calls at all 15+ TX broadcast sites (burn, HTLC commitment/timeout, breach, expiry, distribution, turnover close, rotation close, cooperative close). Enables post-run inspection tools to look up TXIDs from the database.
 - **JIT channel exhibition**: Late-arriving client creates a separate JIT channel funding TX + close TX, producing a distinct on-chain artifact (exhibition structure 11).
 - **4 new orchestrator scenarios**: `lstock_burn` (L-stock burn via shachain revocation), `dw_advance` (DW counter advance + re-sign + force-close), `distribution_tx` (distribution TX broadcast after CLTV with P2A anchor), `bridge_bolt11` (bridge inbound HTLC / BOLT11 invoice routing).
+- **`--test-dw-exhibition`**: Full Decker-Wattenhofer lifecycle on-chain demonstration — Phase 1: nSequence countdown to zero over multiple DW advances, Phase 2: PTLC-assisted cooperative close (adaptor sigs + key extraction), Phase 3: cross-factory nSequence contrast (advanced vs fresh factory).
+- **`--test-dual-factory`**: Creates a second factory while the first is still ACTIVE, stores both in the ladder, then force-closes both trees independently on-chain.
+- **`--test-leaf-advance`**: Advances only the left leaf's DW counter and force-closes, proving per-leaf independence (right leaf nSequence unchanged).
+- **`buy_liquidity` CLI command**: Interactive CLI command to purchase inbound liquidity from L-stock reserves.
 - **Testnet4 quickstart guide**: `docs/testnet4-quickstart.md` with prerequisites, recommended flags, per-structure time estimates, environment variable configuration, and common failure modes.
 - **Testnet4 operational improvements**: Enhanced confirmation wait logging with TXID/block height/elapsed time, fee-rate floor hint on `sendrawtransaction` min relay fee error, force-close tree broadcast logging with BIP68 wait time estimates, stuck TX warning after 1 hour unconfirmed, daemon heartbeat (`--heartbeat-interval N`).
 - **Exhibition tooling**: `inspect_factory.py` (on-chain TX tree inspector with witness analysis and nSequence/nLockTime interpretation), `exhibition_testnet4.sh` (master script for all on-chain structures), `run_remote_client.sh` (remote MuSig2 signing helper).
@@ -34,11 +38,11 @@ All notable changes to SuperScalar are documented here.
 ### Testing
 
 - **Manual flag tests expanded to 29**: Added 4 new tests (backup/restore cycle fix, DW advance, JIT exhibition, non-regtest flag validation).
-- **Orchestrator scenarios expanded to 27**: Added `lstock_burn`, `dw_advance`, `distribution_tx`, `bridge_bolt11`.
+- **Orchestrator scenarios expanded to 30**: Added `lstock_burn`, `dw_advance`, `distribution_tx`, `bridge_bolt11`, `buy_liquidity`, `dual_factory`, `dw_exhibition`.
 
 ### Test Count
 
-418 unit + 43 regtest = 461 automated + 29 manual flag tests + 27 orchestrator scenarios.
+418 unit + 43 regtest = 461 automated + 29 manual flag tests + 30 orchestrator scenarios.
 
 ---
 
