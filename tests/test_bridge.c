@@ -673,7 +673,7 @@ int test_wire_connect_hostname(void) {
     int listen_fd = wire_listen("127.0.0.1", 19876);
     if (listen_fd < 0) {
         printf("  SKIP: cannot bind port 19876\n");
-        return 1;
+        return 2;
     }
 
     /* Connect via IP string (verifies getaddrinfo with numeric host) */
@@ -768,7 +768,7 @@ int test_tor_socks5_mock(void) {
     int listen_fd = wire_listen("127.0.0.1", mock_port);
     if (listen_fd < 0) {
         printf("  SKIP: cannot bind port %d\n", mock_port);
-        return 1;
+        return 2;
     }
 
     pid_t pid = fork();
@@ -788,7 +788,7 @@ int test_tor_socks5_mock(void) {
     listen_fd = wire_listen("127.0.0.1", mock_port + 1);
     if (listen_fd < 0) {
         printf("  SKIP: cannot bind port %d\n", mock_port + 1);
-        return 1;
+        return 2;
     }
 
     pid = fork();
@@ -885,7 +885,7 @@ int test_regtest_bridge_nk_handshake(void) {
     if (listen_fd < 0) {
         printf("  SKIP: cannot bind port %d\n", port);
         secp256k1_context_destroy(ctx);
-        return 1;
+        return 2;
     }
 
     pid_t pid = fork();
@@ -2020,7 +2020,7 @@ int test_bridge_reconnect(void) {
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         printf("  SKIP: socketpair not available\n");
-        return 1;
+        return 2;
     }
 
     bridge_t br;

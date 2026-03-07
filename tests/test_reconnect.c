@@ -497,7 +497,7 @@ int test_preimage_fulfills_htlc(void) {
     return 1;
 }
 
-/* Test: Balance reporting doesn't crash */
+/* Test: Balance reporting produces valid output */
 int test_balance_reporting(void) {
     secp256k1_context *ctx = test_ctx();
 
@@ -525,11 +525,19 @@ int test_balance_reporting(void) {
     memset(&mgr, 0, sizeof(mgr));
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &factory, lsp_sec, 4),
                 "lsp_channels_init");
+    TEST_ASSERT(mgr.n_channels > 0, "channels were initialized");
 
-    /* This should print without crashing */
+    /* Verify balances are set (each channel should have non-zero capacity) */
+    for (size_t c = 0; c < mgr.n_channels; c++) {
+        uint64_t total = mgr.entries[c].channel.local_amount +
+                         mgr.entries[c].channel.remote_amount;
+        TEST_ASSERT(total > 0, "channel has non-zero capacity");
+    }
+
+    /* Print should not crash */
     lsp_channels_print_balances(&mgr);
 
-    /* Also test with NULL (should be a no-op) */
+    /* NULL should be a no-op */
     lsp_channels_print_balances(NULL);
 
     factory_free(&factory);
@@ -1532,10 +1540,9 @@ int test_regtest_get_balance(void) {
 
     /* regtest_get_balance calls regtest_exec which runs:
        printf -regtest -rpcuser=x -rpcpassword=x getbalance
-       This will output the literal arguments, but atof("") = 0.0
-       which is a valid return. The important thing is it doesn't crash. */
+       This will output the literal arguments. atof on non-numeric = 0.0 */
     double bal = regtest_get_balance(&rt);
-    TEST_ASSERT(bal >= -1.0, "get_balance returns valid double");
+    TEST_ASSERT(bal == 0.0, "fake cli returns 0.0 balance");
 
     return 1;
 }
