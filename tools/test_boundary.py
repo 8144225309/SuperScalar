@@ -637,9 +637,12 @@ mine_n(addr, 5)
 ok = wait_for_in_file("/tmp/bound_rot.log", "daemon loop started", timeout=90)
 if ok:
     print("  Factory created, mining to trigger rotation...")
-    # Mine enough blocks to pass active period
+    # Mine past active period to trigger DYING
     mine_n(addr, 8)
-    time.sleep(10)
+    time.sleep(15)  # Let daemon detect DYING transition
+    # Mine more blocks for rotation close + new factory funding confirmations
+    mine_n(addr, 6)
+    time.sleep(30)  # Let rotation complete (close old + fund new + ceremony)
     log = read_log("/tmp/bound_rot.log")
     has_rotation = "rotation" in log.lower()
     results["short_rotation"] = has_rotation
