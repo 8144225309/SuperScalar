@@ -1,0 +1,30 @@
+# Core Lightning — vanilla LN peer (no SuperScalar plugin)
+#
+# A standard CLN node for testing interoperability with SuperScalar.
+# Open a channel between this node and the bridge node, then send
+# payments to/from SuperScalar factory clients via BOLT11 invoices.
+#
+# This config has nothing SuperScalar-specific — it is a plain CLN node.
+
+# --- Network ---
+# Must match the bridge node's network.
+network=testnet4
+
+# --- Logging ---
+log-file=/var/lib/cln-peer/cln.log
+log-level=info
+
+# --- Bitcoin Core RPC ---
+bitcoin-rpcuser=YOUR_RPC_USER
+bitcoin-rpcpassword=YOUR_RPC_PASSWORD
+bitcoin-rpcport=48332
+bitcoin-rpcconnect=127.0.0.1
+bitcoin-cli=/usr/local/bin/bitcoin-cli
+bitcoin-datadir=/var/lib/bitcoind
+
+# --- Lightning listener ---
+# Use a different port than the bridge node if on the same machine.
+addr=0.0.0.0:9736
+
+# --- Node identity ---
+alias=my-ln-peer
