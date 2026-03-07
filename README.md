@@ -99,7 +99,7 @@ python3 tools/manual_tests.py demo          # run a single test
 python3 tools/manual_tests.py --list        # list available tests
 # Logs: /tmp/mt_lsp.log, /tmp/mt_client_*.log
 
-# Test orchestrator (27 multi-process scenarios)
+# Test orchestrator (30 multi-process scenarios)
 python3 tools/test_orchestrator.py --scenario all
 python3 tools/test_orchestrator.py --list   # list scenarios
 ```
@@ -746,7 +746,7 @@ SuperScalar needs real-world testing on signet and testnet over weeks and months
 **How to help:**
 
 1. **Run a factory on signet** — Follow the [Running on Signet](#running-on-signet) guide above. Even a 2-client factory running for a few days produces valuable data.
-2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 27 multi-party scenarios.
+2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 30 multi-party scenarios.
 3. **Report bugs** — Open an issue at [github.com/8144225309/SuperScalar/issues](https://github.com/8144225309/SuperScalar/issues). Include logs, network, and steps to reproduce.
 4. **Review the code** — The [internal audit](docs/mainnet-audit.md) is a good starting point. Cryptography lives in `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c`.
 
