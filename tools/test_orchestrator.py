@@ -1792,6 +1792,32 @@ def scenario_dual_factory(orch):
     return success
 
 
+def scenario_dw_exhibition(orch):
+    """DW exhibition: multi-advance + PTLC close + cross-factory contrast."""
+    orch._log("=== SCENARIO: dw_exhibition ===")
+    orch._log("LSP runs full DW lifecycle: multi-advance, PTLC close, cross-factory contrast.")
+
+    orch.start_lsp(["--demo", "--test-dw-exhibition"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 3)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_phase1 = "Phase 1:" in lsp_log and "PASS" in lsp_log
+    has_phase2 = "Phase 2:" in lsp_log and "PTLC" in lsp_log
+    has_phase3 = "Phase 3:" in lsp_log and "Contrast" in lsp_log
+    has_pass = "DW EXHIBITION TEST PASSED" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"dw_exhibition {'passed' if success else 'failed'} "
+              f"(p1={has_phase1}, p2={has_phase2}, p3={has_phase3})")
+    return success
+
+
 def scenario_buy_liquidity(orch):
     """Buy inbound liquidity from L-stock via CLI command."""
     orch._log("=== SCENARIO: buy_liquidity ===")
@@ -1884,6 +1910,7 @@ SCENARIOS = {
     "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
     "buy_liquidity": lambda o, **kw: scenario_buy_liquidity(o),
     "dual_factory": lambda o, **kw: scenario_dual_factory(o),
+    "dw_exhibition": lambda o, **kw: scenario_dw_exhibition(o),
 }
 
 
@@ -1920,6 +1947,7 @@ def list_scenarios():
         "bridge_bolt11": "Bridge inbound HTLC; BOLT11 invoice routing",
         "buy_liquidity": "Buy inbound liquidity from L-stock via CLI",
         "dual_factory": "Two simultaneously ACTIVE factories in ladder",
+        "dw_exhibition": "Full DW lifecycle: multi-advance + PTLC close + cross-factory contrast",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
