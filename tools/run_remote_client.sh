@@ -2,8 +2,8 @@
 # SuperScalar remote client — connects to a remote LSP over the internet.
 #
 # Usage:
-#   bash tools/run_remote_client.sh --host 68.168.216.243 --port 9735 --network testnet4
-#   bash tools/run_remote_client.sh --host <VPS_IP> --port 9735 --network testnet4 --keyfile client.key
+#   bash tools/run_remote_client.sh --host <LSP_HOST> --port 9735 --network testnet4
+#   bash tools/run_remote_client.sh --host <LSP_HOST> --port 9735 --network testnet4 --keyfile client.key
 #
 # Prerequisites:
 #   - superscalar_client binary in ../build/ (or specify --build-dir)
