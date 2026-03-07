@@ -282,10 +282,12 @@ results["mainnet_guard"] = rc != 0 and "mainnet" in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
 print(f"  {ts()} RESULT: {'PASS' if results['mainnet_guard'] else 'FAIL'}")
 
-# Test 1.17: --test-expiry on non-regtest (should reject)
-print(f"\n{ts()} --- 1.17: --test-expiry on signet (should reject) ---")
+# Test 1.17: --test-expiry on non-regtest (allowed since 105b05b)
+print(f"\n{ts()} --- 1.17: --test-expiry on signet (allowed on all networks) ---")
 rc, out, err = run_lsp_quick(["--network", "signet", "--test-expiry", "--clients", "2", "--amount", "100000", "--port", str(TEST_PORT)])
-results["test_nonregtest"] = rc != 0 and "regtest" in err.lower()
+# Since 105b05b, test flags work on all networks. LSP should start (rc may be nonzero
+# because no clients connect, but it should NOT reject due to network).
+results["test_nonregtest"] = "only supported on regtest" not in err.lower()
 print(f"  rc={rc}, stderr={err[:100]}")
 print(f"  {ts()} RESULT: {'PASS' if results['test_nonregtest'] else 'FAIL'}")
 
