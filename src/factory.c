@@ -1138,6 +1138,31 @@ int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
     return (int)f->leaf_node_indices[leaf_side];
 }
 
+
+int factory_verify_all(factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (!node->is_signed) continue;
+
+        unsigned char sighash[32];
+        if (!compute_node_sighash(f, node, sighash))
+            return 0;
+
+        /* Sig is 64 bytes before the 4-byte nLockTime */
+        if (node->signed_tx.len < 70) return 0;
+        unsigned char sig[64];
+        memcpy(sig, node->signed_tx.data + node->signed_tx.len - 68, 64);
+
+        if (!secp256k1_schnorrsig_verify(f->ctx, sig, sighash, 32,
+                                          &node->tweaked_pubkey)) {
+            fprintf(stderr, "factory_verify_all: node %zu sig INVALID\n", i);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
 int factory_sign_all(factory_t *f) {
     /* Step 1: Initialize sessions */
     if (!factory_sessions_init(f))
