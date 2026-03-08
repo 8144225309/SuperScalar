@@ -279,13 +279,13 @@ class Actor:
             try:
                 return self.proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                return None
-        return None
+                return "SKIP"
+        return "SKIP"
 
     def returncode(self):
         if self.proc:
             return self.proc.returncode
-        return None
+        return "SKIP"
 
     def read_log(self):
         try:
@@ -417,7 +417,7 @@ class Orchestrator:
     def start_client(self, index, extra_flags=None):
         """Start a single client process."""
         if index >= self.n_clients:
-            return None
+            return "SKIP"
         cmd = [
             CLIENT_BIN,
             "--port", str(self.port),
@@ -483,7 +483,7 @@ class Orchestrator:
         """Wait for LSP process to exit."""
         if self.lsp:
             return self.lsp.wait(timeout=timeout)
-        return None
+        return "SKIP"
 
     def wait_for_factory(self, timeout=30):
         """Poll LSP DB until a factory row appears."""
@@ -1695,7 +1695,7 @@ def scenario_auto_rebalance(orch):
     orch._log("=== SCENARIO: auto_rebalance ===")
     orch._log("LSP runs demo then auto-rebalance test.")
 
-    orch.start_lsp(["--demo", "--test-rebalance"])
+    orch.start_lsp(["--demo", "--test-rebalance", "--amount", "1000000"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1900,7 +1900,6 @@ def scenario_dw_exhibition(orch):
 def scenario_buy_liquidity(orch):
     """Buy inbound liquidity from L-stock via CLI command."""
     orch._log("=== SCENARIO: buy_liquidity ===")
-    orch._log("LSP started with --daemon --cli --arity 2; buy_liquidity via CLI.")
 
     # Override to 4 clients for arity-2
     saved_n = orch.n_clients
@@ -1987,9 +1986,9 @@ SCENARIOS = {
     "dw_advance": lambda o, **kw: scenario_dw_advance(o),
     "distribution_tx": lambda o, **kw: scenario_distribution_tx(o),
     "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
+    "dw_exhibition": lambda o, **kw: scenario_dw_exhibition(o),
     "buy_liquidity": lambda o, **kw: scenario_buy_liquidity(o),
     "dual_factory": lambda o, **kw: scenario_dual_factory(o),
-    "dw_exhibition": lambda o, **kw: scenario_dw_exhibition(o),
 }
 
 

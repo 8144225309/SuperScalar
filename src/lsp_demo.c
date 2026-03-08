@@ -761,8 +761,8 @@ int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             }
             if (lightest != c && excess > 0) {
                 printf("Auto-rebalance: client %zu -> client %zu (%llu sats)\n",
-                       c, lightest, (unsigned long long)excess);
-                if (lsp_channels_initiate_payment(mgr, lsp, c, lightest, excess))
+                       lightest, c, (unsigned long long)excess);
+                if (lsp_channels_initiate_payment(mgr, lsp, lightest, c, excess))
                     rebalanced++;
             }
         }
