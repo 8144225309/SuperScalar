@@ -638,8 +638,14 @@ def scenario_all_watch(orch):
     # Without this, the revoked commitment sits unconfirmed and clients miss it.
     orch.advance_chain(2)
 
-    # Give clients time to poll the new blocks and detect the breach
-    time.sleep(orch.timing["breach_wait"])
+    # Mine one block every 5 seconds during the wait window. Each new block
+    # triggers a fresh watchtower scan, eliminating the race between the
+    # advance_chain call and each client poll cycle. A fixed sleep alone
+    # is flaky in full-suite runs where process startup adds latency.
+    poll_interval = 5
+    for _ in range(orch.timing["breach_wait"] // poll_interval):
+        time.sleep(poll_interval)
+        orch.advance_chain(1)
 
     # Check which clients detected the breach and broadcast CPFP
     n_detected = 0
