@@ -3090,7 +3090,7 @@ int main(int argc, char *argv[]) {
                 wire_msg_t drain;
                 while (wire_recv_timeout(lsp.client_fds[dest_client], &drain, 1)) {
                     if (drain.msg_type == MSG_REGISTER_INVOICE) {
-                        unsigned char rh[32], rp[32];
+                        unsigned char rh[32] = {0}, rp[32] = {0};
                         cJSON *rhj = cJSON_GetObjectItem(drain.json, "payment_hash");
                         cJSON *rpj = cJSON_GetObjectItem(drain.json, "preimage");
                         if (rhj && rhj->valuestring) hex_decode(rhj->valuestring, rh, 32);
