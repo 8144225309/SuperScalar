@@ -153,3 +153,6 @@ The daemon auto-reconnects clients. If a MuSig2 ceremony was in progress, the op
 
 **"estimatesmartfee" returns -1:**
 Fresh testnet4 nodes have no fee data. Use explicit `--fee-rate 1000` until the node has seen enough blocks.
+
+**"dw_advance" or "dw_exhibition" fails immediately:**
+Ensure you are on v0.1.4+. Both structures required a MuSig2 keypair ordering fix that was introduced in v0.1.4. Earlier versions silently produced invalid signatures.
