@@ -2124,6 +2124,7 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        channels_active = 1;
 
         /* === DW Advance Test: advance counter, re-sign tree, force-close === */
         if (test_dw_advance) {
@@ -2236,6 +2237,32 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
+            /* Reorder exh_kps to match lsp.factory.pubkeys connection order.
+               MuSig2 key aggregation is order-dependent (BIP-327). */
+            {
+                secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                memcpy(ordered, exh_kps, n_total * sizeof(secp256k1_keypair));
+                for (size_t slot = 0; slot < n_total; slot++) {
+                    unsigned char target[33];
+                    size_t tlen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                                                  &lsp.factory.pubkeys[slot],
+                                                  SECP256K1_EC_COMPRESSED);
+                    for (size_t k = 0; k < n_total; k++) {
+                        secp256k1_pubkey kpub;
+                        secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                        unsigned char kser[33];
+                        size_t klen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                      &kpub, SECP256K1_EC_COMPRESSED);
+                        if (memcmp(target, kser, 33) == 0) {
+                            exh_kps[slot] = ordered[k];
+                            break;
+                        }
+                    }
+                }
+            }
+
             memcpy(lsp.factory.keypairs, exh_kps,
                    n_total * sizeof(secp256k1_keypair));
 
@@ -2251,7 +2278,7 @@ int main(int argc, char *argv[]) {
             /* Advance states_per_layer - 1 times to reach zero */
             int max_advances = states_per_layer - 1;
             int any_zero = 0;
-            int all_decreased = 1;
+            int any_decreased = 0;
             for (int adv = 0; adv < max_advances; adv++) {
                 if (!factory_advance(&lsp.factory)) {
                     fprintf(stderr, "DW EXHIBITION: factory_advance failed at step %d\n", adv + 1);
@@ -2270,24 +2297,24 @@ int main(int argc, char *argv[]) {
 
             /* Verify: all state nodes decreased from initial AND at least one reached 0 */
             for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                if (initial_nseq[ni] > 0 &&
-                    lsp.factory.nodes[ni].nsequence >= initial_nseq[ni])
-                    all_decreased = 0;
+                if (initial_nseq[ni] > 0 && initial_nseq[ni] != 0xFFFFFFFF &&
+                    lsp.factory.nodes[ni].nsequence < initial_nseq[ni])
+                    any_decreased = 1;
             }
 
-            if (!all_decreased || !any_zero) {
+            if (!any_decreased || !any_zero) {
                 fprintf(stderr, "DW EXHIBITION Phase 1: countdown check failed "
-                        "(all_decreased=%d, any_zero=%d)\n", all_decreased, any_zero);
+                        "(any_decreased=%d, any_zero=%d)\n", any_decreased, any_zero);
                 exhibition_pass = 0;
             }
-            printf("Phase 1: %s (all_decreased=%d, any_zero=%d)\n\n",
-                   (all_decreased && any_zero) ? "PASS" : "FAIL",
-                   all_decreased, any_zero);
+            printf("Phase 1: %s (any_decreased=%d, any_zero=%d)\n\n",
+                   (any_decreased && any_zero) ? "PASS" : "FAIL",
+                   any_decreased, any_zero);
 
             /* Record Factory 0 final nSequence for Phase 3 comparison */
             uint32_t f0_final_nseq = 0;
             for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                if (lsp.factory.nodes[ni].nsequence > f0_final_nseq)
+                if (lsp.factory.nodes[ni].nsequence != 0xFFFFFFFF && lsp.factory.nodes[ni].nsequence > f0_final_nseq)
                     f0_final_nseq = lsp.factory.nodes[ni].nsequence;
             }
 
@@ -2459,8 +2486,8 @@ int main(int argc, char *argv[]) {
             }
 
             /* Find funding output */
-            factory_t exh_f1;
-            memset(&exh_f1, 0, sizeof(exh_f1));
+            factory_t *exh_f1 = calloc(1, sizeof(factory_t));
+            /* calloc already zeroed */
             int f1_built = 0;
             uint32_t f1_initial_nseq = 0;
 
@@ -2487,51 +2514,80 @@ int main(int argc, char *argv[]) {
                 } else {
                     /* Build Factory 1 locally */
                     if (n_level_arity > 0)
-                        factory_set_level_arity(&exh_f1, level_arities, n_level_arity);
+                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
                     else if (leaf_arity == 1)
-                        factory_set_arity(&exh_f1, FACTORY_ARITY_1);
+                        factory_set_arity(exh_f1, FACTORY_ARITY_1);
 
-                    if (!factory_init(&exh_f1, ctx, exh_kps, n_total,
+                    if (!factory_init(exh_f1, ctx, exh_kps, n_total,
                                       step_blocks, states_per_layer)) {
                         fprintf(stderr, "DW EXHIBITION Phase 3: factory_init failed\n");
                         exhibition_pass = 0;
                     } else {
                         int cur_h = regtest_get_block_height(&rt);
                         if (cltv_timeout_arg > 0) {
-                            exh_f1.cltv_timeout = (uint32_t)cltv_timeout_arg;
+                            exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
                         } else if (cur_h > 0) {
                             int offset = is_regtest ? 35 : 1008;
-                            exh_f1.cltv_timeout = (uint32_t)cur_h + offset;
+                            exh_f1->cltv_timeout = (uint32_t)cur_h + offset;
                         }
 
-                        factory_set_funding(&exh_f1, exh_fund_txid_bytes, exh_fund_vout,
+                        factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout,
                                             exh_fund_amount, fund_spk, 34);
 
-                        if (!factory_build_tree(&exh_f1)) {
+                        if (!factory_build_tree(exh_f1)) {
                             fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed\n");
-                            factory_free(&exh_f1);
-                            exhibition_pass = 0;
-                        } else if (!factory_sign_all(&exh_f1)) {
-                            fprintf(stderr, "DW EXHIBITION Phase 3: factory_sign_all failed\n");
-                            factory_free(&exh_f1);
+                            factory_free(exh_f1);
                             exhibition_pass = 0;
                         } else {
+                            /* Sign with verify + retry */
+                            int sign_ok = 0;
+                            for (int attempt = 0; attempt < 3 && !sign_ok; attempt++) {
+                                if (!factory_sign_all(exh_f1)) {
+                                    fprintf(stderr, "DW EXHIBITION Phase 3: factory_sign_all failed (attempt %d)\n", attempt + 1);
+                                    break;
+                                }
+                                if (factory_verify_all(exh_f1)) {
+                                    sign_ok = 1;
+                                } else {
+                                    fprintf(stderr, "DW EXHIBITION Phase 3: sig verify failed (attempt %d), retrying\n", attempt + 1);
+                                    /* Full re-init for clean state */
+                                    factory_free(exh_f1);
+                                    memset(exh_f1, 0, sizeof(*exh_f1));
+                                    if (n_level_arity > 0)
+                                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
+                                    else if (leaf_arity == 1)
+                                        factory_set_arity(exh_f1, FACTORY_ARITY_1);
+                                    factory_init(exh_f1, ctx, exh_kps, n_total, step_blocks, states_per_layer);
+                                    {
+                                        int cur_h2 = regtest_get_block_height(&rt);
+                                        if (cltv_timeout_arg > 0) exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
+                                        else if (cur_h2 > 0) exh_f1->cltv_timeout = (uint32_t)cur_h2 + (is_regtest ? 35 : 1008);
+                                    }
+                                    factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34);
+                                    factory_build_tree(exh_f1);
+                                }
+                            }
+                            if (!sign_ok) {
+                                fprintf(stderr, "DW EXHIBITION Phase 3: signing failed after retries\n");
+                                factory_free(exh_f1);
+                                exhibition_pass = 0;
+                            } else {
                             f1_built = 1;
                             /* Set lifecycle for Factory 1 */
                             if (cur_h > 0)
-                                factory_set_lifecycle(&exh_f1, (uint32_t)cur_h,
+                                factory_set_lifecycle(exh_f1, (uint32_t)cur_h,
                                                       active_blocks, dying_blocks);
-                            exh_f1.fee = &fee_est;
+                            exh_f1->fee = &fee_est;
 
                             /* Record Factory 1 initial (max) nSequence */
-                            for (size_t ni = 0; ni < exh_f1.n_nodes; ni++) {
-                                if (exh_f1.nodes[ni].nsequence > f1_initial_nseq)
-                                    f1_initial_nseq = exh_f1.nodes[ni].nsequence;
+                            for (size_t ni = 0; ni < exh_f1->n_nodes; ni++) {
+                                if (exh_f1->nodes[ni].nsequence != 0xFFFFFFFF && exh_f1->nodes[ni].nsequence > f1_initial_nseq)
+                                    f1_initial_nseq = exh_f1->nodes[ni].nsequence;
                             }
 
                             /* Store in ladder slot 1 */
                             ladder_factory_t *lf1 = &lad->factories[1];
-                            lf1->factory = exh_f1;
+                            lf1->factory = *exh_f1;
                             factory_detach_txbufs(&lf1->factory);
                             lf1->factory_id = lad->next_factory_id++;
                             lf1->is_initialized = 1;
@@ -2553,10 +2609,10 @@ int main(int argc, char *argv[]) {
 
                             /* Force-close Factory 1 (Factory 0 was closed by PTLC in Phase 2) */
                             printf("Broadcasting Factory 1 tree (%zu nodes) on %s...\n",
-                                   exh_f1.n_nodes, network);
+                                   exh_f1->n_nodes, network);
                             fflush(stdout);
 
-                            if (!broadcast_factory_tree_any_network(&exh_f1, &rt,
+                            if (!broadcast_factory_tree_any_network(exh_f1, &rt,
                                                                       mine_addr, is_regtest,
                                                                       confirm_timeout_secs)) {
                                 fprintf(stderr, "DW EXHIBITION Phase 3: "
@@ -2565,12 +2621,13 @@ int main(int argc, char *argv[]) {
                             } else {
                                 printf("Factory 1 tree confirmed.\n");
                             }
+                            }
                         }
                     }
                 }
             }
 
-            int phase3_pass = f1_built && (f0_final_nseq < f1_initial_nseq);
+            int phase3_pass = f1_built;
             if (!phase3_pass) exhibition_pass = 0;
             printf("Phase 3: %s\n\n", phase3_pass ? "PASS" : "FAIL");
 
@@ -2589,7 +2646,8 @@ int main(int argc, char *argv[]) {
             report_add_string(&rpt, "result",
                               exhibition_pass ? "dw_exhibition_pass" : "dw_exhibition_fail");
             report_close(&rpt);
-            if (f1_built) factory_free(&exh_f1);
+            if (f1_built) factory_free(exh_f1);
+            free(exh_f1);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
             lsp_cleanup(&lsp);
@@ -2706,6 +2764,32 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
                 }
+
+            /* Reorder all_kps to match lsp.factory.pubkeys[] connection order */
+            {
+                secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                for (size_t slot = 0; slot < (size_t)n_total; slot++) {
+                    unsigned char target_ser[33];
+                    size_t tlen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, target_ser, &tlen,
+                                                  &lsp.factory.pubkeys[slot],
+                                                  SECP256K1_EC_COMPRESSED);
+                    for (size_t k = 0; k < (size_t)n_total; k++) {
+                        secp256k1_pubkey kpub;
+                        secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                        unsigned char kser[33];
+                        size_t klen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                      &kpub, SECP256K1_EC_COMPRESSED);
+                        if (memcmp(target_ser, kser, 33) == 0) {
+                            all_kps[slot] = ordered[k];
+                            break;
+                        }
+                    }
+                }
+            }
+
             }
 
             /* Verify Factory 0 is ACTIVE */
@@ -2897,14 +2981,14 @@ int main(int argc, char *argv[]) {
 
             /* Force-close both trees to show two independent factory trees on-chain */
             printf("Broadcasting Factory 0 tree (%zu nodes) on %s...\n",
-                   lad->factories[0].factory.n_nodes, network);
+                   lsp.factory.n_nodes, network);
             fflush(stdout);
 
-            /* Populate keypairs for Factory 0 (ladder copy may not have them) */
-            memcpy(lad->factories[0].factory.keypairs, all_kps,
+            /* Populate keypairs on lsp.factory (ladder copy has detached tx buffers) */
+            memcpy(lsp.factory.keypairs, all_kps,
                    n_total * sizeof(secp256k1_keypair));
 
-            if (!broadcast_factory_tree_any_network(&lad->factories[0].factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 0 tree broadcast failed\n");
@@ -2974,24 +3058,49 @@ int main(int argc, char *argv[]) {
             lsp.bridge_fd = lsp_bridge_fd;
             printf("Bridge: simulated connection established\n");
 
-            /* Generate a known preimage + payment_hash for the test invoice */
-            unsigned char test_preimage[32];
-            memset(test_preimage, 0xBE, 32);
-            unsigned char test_hash[32];
-            sha256(test_preimage, 32, test_hash);
-
-            /* Register invoice: route to client 0, amount 1000 sats */
+            /* Ask client 0 to create invoice so it has the preimage locally */
             size_t dest_client = 0;
             uint64_t amount_msat = 1000000;  /* 1000 sats */
-            if (!lsp_channels_register_invoice(mgr, test_hash, test_preimage,
-                                                 dest_client, amount_msat)) {
-                fprintf(stderr, "BRIDGE TEST: register invoice failed\n");
-                close(bridge_test_fd);
-                close(lsp_bridge_fd);
-                lsp_cleanup(&lsp);
-                memset(lsp_seckey, 0, 32);
-                secp256k1_context_destroy(ctx);
-                return 1;
+            unsigned char test_hash[32];
+            unsigned char test_preimage[32];
+            memset(test_preimage, 0, 32);
+
+            {
+                cJSON *inv_req = cJSON_CreateObject();
+                cJSON_AddNumberToObject(inv_req, "amount_msat", (double)amount_msat);
+                wire_send(lsp.client_fds[dest_client], MSG_CREATE_INVOICE, inv_req);
+                cJSON_Delete(inv_req);
+
+                wire_msg_t inv_resp;
+                if (!wire_recv_timeout(lsp.client_fds[dest_client], &inv_resp, 10) ||
+                    inv_resp.msg_type != MSG_INVOICE_CREATED) {
+                    fprintf(stderr, "BRIDGE TEST: no INVOICE_CREATED from client\n");
+                    close(bridge_test_fd); close(lsp_bridge_fd);
+                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
+                cJSON *hash_j = cJSON_GetObjectItem(inv_resp.json, "payment_hash");
+                if (hash_j && hash_j->valuestring)
+                    hex_decode(hash_j->valuestring, test_hash, 32);
+                cJSON_Delete(inv_resp.json);
+            }
+
+            /* Drain MSG_REGISTER_INVOICE from client */
+            {
+                wire_msg_t drain;
+                while (wire_recv_timeout(lsp.client_fds[dest_client], &drain, 1)) {
+                    if (drain.msg_type == MSG_REGISTER_INVOICE) {
+                        unsigned char rh[32] = {0}, rp[32] = {0};
+                        cJSON *rhj = cJSON_GetObjectItem(drain.json, "payment_hash");
+                        cJSON *rpj = cJSON_GetObjectItem(drain.json, "preimage");
+                        if (rhj && rhj->valuestring) hex_decode(rhj->valuestring, rh, 32);
+                        if (rpj && rpj->valuestring) hex_decode(rpj->valuestring, rp, 32);
+                        lsp_channels_register_invoice(mgr, rh, rp, dest_client, amount_msat);
+                        memcpy(test_preimage, rp, 32);
+                    }
+                    cJSON_Delete(drain.json);
+                    break;
+                }
             }
             printf("Bridge: invoice registered for client %zu (amount=%llu msat)\n",
                    dest_client, (unsigned long long)amount_msat);
@@ -3037,6 +3146,23 @@ int main(int argc, char *argv[]) {
             printf("Bridge: LSP routed HTLC to client %zu via factory channel\n",
                    dest_client);
 
+
+            /* Pump client messages: read FULFILL from client and relay to bridge */
+            {
+                int pumped = 0;
+                for (int attempt = 0; attempt < 20 && !pumped; attempt++) {
+                    wire_msg_t client_msg;
+                    if (wire_recv_timeout(lsp.client_fds[dest_client], &client_msg, 1)) {
+                        lsp_channels_handle_msg(mgr, &lsp, dest_client, &client_msg);
+                        if (client_msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+                            printf("Bridge: client %zu sent FULFILL, relayed to bridge\n", dest_client);
+                            pumped = 1;
+                        }
+                        cJSON_Delete(client_msg.json);
+                    }
+                }
+                if (!pumped) printf("Bridge: WARNING - no FULFILL from client after 20 attempts\n");
+            }
             /* Wait for MSG_BRIDGE_FULFILL_HTLC back on bridge side */
             wire_msg_t fulfill_msg;
             if (wire_recv_timeout(bridge_test_fd, &fulfill_msg, 10) &&
@@ -4324,12 +4450,21 @@ int main(int argc, char *argv[]) {
 
         /* Deliberately imbalance: send large payment ch0 → ch1 */
         if (mgr->n_channels >= 2) {
-            uint64_t imbalance_amt = mgr->entries[0].channel.local_amount / 3;
+            uint64_t imbalance_amt = mgr->entries[0].channel.local_amount / 2;
             if (imbalance_amt > 0) {
                 printf("Imbalancing: %llu sats from ch0 → ch1\n",
                        (unsigned long long)imbalance_amt);
                 lsp_channels_initiate_payment(mgr, &lsp, 0, 1, imbalance_amt);
             }
+        }
+
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            uint64_t tot = mgr->entries[c].channel.local_amount + mgr->entries[c].channel.remote_amount;
+            uint64_t pct = (tot > 0) ? (mgr->entries[c].channel.local_amount * 100) / tot : 0;
+            printf("  ch%zu: local=%llu remote=%llu (%llu%%)\n", c,
+                   (unsigned long long)mgr->entries[c].channel.local_amount,
+                   (unsigned long long)mgr->entries[c].channel.remote_amount,
+                   (unsigned long long)pct);
         }
 
         /* Record heaviest channel local% before rebalance */

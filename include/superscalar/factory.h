@@ -229,6 +229,7 @@ void factory_set_funding(factory_t *f,
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
+int factory_verify_all(factory_t *f);
 int factory_advance(factory_t *f);
 
 /* Reset DW counter to epoch 0, rebuild all unsigned txs, re-sign.
