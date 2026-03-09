@@ -54,9 +54,9 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 |----------|-------|-----------------|----------------|
 | Unit tests | 418 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
 | Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| Orchestrator scenarios | 23 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation |
+| Orchestrator scenarios | 30 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation, DW exhibition, dual factory, BOLT11 bridge |
 | Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
-| **Total** | **461 + 25 manual** | | |
+| **Total** | **516 (461 automated + 25 manual + 30 orchestrator)** | | |
 
 ---
 
@@ -164,6 +164,7 @@ sleep 3
 | Placement + Economics | 5 | Sequential/inward/outward placement, profile wire round-trip, bps validation |
 | Nonce Pool Integration | 3 | Pool-based factory creation, exhaustion handling, participant node counts |
 | Subtree-Scoped Signing | 4 | Path session init, path rebuild, path signing, advance+rebuild path |
+| Factory Verify | 1 | `factory_verify_all()` — Schnorr signature verification across all signed tree nodes |
 
 ### Channels
 
