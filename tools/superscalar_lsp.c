@@ -2764,6 +2764,32 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
                 }
+
+            /* Reorder all_kps to match lsp.factory.pubkeys[] connection order */
+            {
+                secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                for (size_t slot = 0; slot < (size_t)n_total; slot++) {
+                    unsigned char target_ser[33];
+                    size_t tlen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, target_ser, &tlen,
+                                                  &lsp.factory.pubkeys[slot],
+                                                  SECP256K1_EC_COMPRESSED);
+                    for (size_t k = 0; k < (size_t)n_total; k++) {
+                        secp256k1_pubkey kpub;
+                        secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                        unsigned char kser[33];
+                        size_t klen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                      &kpub, SECP256K1_EC_COMPRESSED);
+                        if (memcmp(target_ser, kser, 33) == 0) {
+                            all_kps[slot] = ordered[k];
+                            break;
+                        }
+                    }
+                }
+            }
+
             }
 
             /* Verify Factory 0 is ACTIVE */
