@@ -68,7 +68,7 @@ DEFAULT_NETWORK = "regtest"
 
 # Per-network timing constants
 TIMING = {
-    "regtest":  {"factory_timeout": 60, "breach_wait": 20, "lsp_timeout": 120,
+    "regtest":  {"factory_timeout": 60, "breach_wait": 30, "lsp_timeout": 120,
                  "coop_wait": 20, "stagger": 0.5, "lsp_bind": 3.0},
     "signet":   {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
                  "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
@@ -2093,10 +2093,13 @@ def main():
             list_scenarios()
             return 1
 
-        # Kill stale processes between scenarios to avoid port conflicts
+        # Kill stale processes and clean state between scenarios
         if idx > 0:
-            safe_pkill("superscalar_lsp.*--network regtest", "-9")
-            safe_pkill("superscalar_client.*--network regtest", "-9")
+            safe_pkill("superscalar_lsp", "-9")
+            safe_pkill("superscalar_client", "-9")
+            time.sleep(1)
+            # Clean state directory
+            shutil.rmtree("/tmp/superscalar_test", ignore_errors=True)
             # Wait for port to be released (up to 10s)
             for _ in range(20):
                 try:
