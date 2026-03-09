@@ -2,6 +2,14 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.5 — unreleased
+
+### Fixed
+
+- **`all_watch` flaky in full suite runs**: `scenario_all_watch` mined 2 blocks once then waited 30 seconds. Watchtowers scan blocks, not a timer — if the poll cycle fired just before those 2 blocks arrived, a client could miss the entire detection window under full-suite process load. Replaced the fixed sleep with a loop that mines 1 block every 5 seconds for the full wait period, giving watchtowers 8 block-triggered scan opportunities instead of 2. `--scenario all` now reliably passes 30/30 on every run.
+
+---
+
 ## 0.1.4 — 2026-03-09
 
 All 30 orchestrator scenarios pass in a single `--scenario all` run on regtest. This release fixes C code bugs, MuSig2 keypair ordering issues, and test infrastructure gaps that caused six orchestrator scenarios to fail or be skipped in v0.1.3.
