@@ -11,7 +11,23 @@ Tests:
 7. Alternating bidirectional payments
 """
 
-import subprocess, time, os, sys, threading
+import subprocess, time, os, sys, threading, re
+
+def safe_pkill(pattern, sig="-15"):
+    """Kill processes matching pattern without hitting SSH sessions.
+    Uses /proc/PID/cmdline to verify the match before killing."""
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    for pid in r.stdout.strip().split("\n"):
+        if not pid:
+            continue
+        try:
+            cmdline = open(f"/proc/{pid}/cmdline").read().replace("\0", " ")
+            if any(x in cmdline for x in ["sshd", "ssh ", "/bin/bash -c"]):
+                continue
+            if re.search(pattern, cmdline):
+                subprocess.run(["kill", sig, pid], capture_output=True)
+        except (FileNotFoundError, PermissionError):
+            pass
 
 def ts():
     return time.strftime("[%H:%M:%S]")
@@ -59,7 +75,7 @@ def fresh_regtest():
             break
         time.sleep(1)
     else:
-        subprocess.run(["pkill", "-f", "bitcoind.*-regtest"], capture_output=True)
+        safe_pkill("bitcoind.*-regtest", "-9")
         time.sleep(2)
     subprocess.run(["rm", "-rf", os.path.expanduser("~/.bitcoin/regtest")])
     btcd = os.path.join(os.path.dirname(btc), "bitcoind") if "/" in btc else "bitcoind"
