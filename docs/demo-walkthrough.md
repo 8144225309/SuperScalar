@@ -274,7 +274,19 @@ python3 tools/test_orchestrator.py --scenario mass_departure_jit   # Mass client
 python3 tools/test_orchestrator.py --scenario watchtower_late_arrival  # Clients restart after breach, detect before CSV
 ```
 
-The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail. 23 scenarios total (run `--list` to see all).
+The orchestrator manages process lifecycles, waits for expected outcomes, and reports pass/fail. 30 scenarios total (run `--list` to see all).
+
+### Rebalance & Exhibition Scenarios
+
+```bash
+python3 tools/test_orchestrator.py --scenario auto_rebalance      # LSP auto-rebalances over-funded channel
+python3 tools/test_orchestrator.py --scenario batch_rebalance     # Batch rebalance across multiple channels
+python3 tools/test_orchestrator.py --scenario leaf_realloc        # Per-leaf DW state reallocation
+python3 tools/test_orchestrator.py --scenario bridge_bolt11       # BOLT11 invoice routed through factory bridge
+python3 tools/test_orchestrator.py --scenario dw_exhibition       # Full DW lifecycle: nSequence countdown + cross-factory contrast
+python3 tools/test_orchestrator.py --scenario dual_factory        # Two concurrent factories, each force-closed independently
+python3 tools/test_orchestrator.py --scenario buy_liquidity       # Purchase inbound liquidity from L-stock reserves
+```
 
 ---
 
