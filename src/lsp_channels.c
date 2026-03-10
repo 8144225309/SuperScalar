@@ -2628,7 +2628,7 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
 
     /* Read MSG_RECONNECT */
     wire_msg_t msg;
-    if (!wire_recv_timeout(new_fd, &msg, 10) || msg.msg_type != MSG_RECONNECT) {
+    if (!wire_recv_timeout(new_fd, &msg, 30) || msg.msg_type != MSG_RECONNECT) {
         fprintf(stderr, "LSP reconnect: expected MSG_RECONNECT, got 0x%02x\n",
                 msg.msg_type);
         if (msg.json) cJSON_Delete(msg.json);
@@ -3478,7 +3478,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 } else {
                     /* Peek at first message to distinguish bridge vs client */
                     wire_msg_t peek;
-                    if (wire_recv_timeout(new_fd, &peek, 10)) {
+                    if (wire_recv_timeout(new_fd, &peek, 30)) {
                         if (peek.msg_type == MSG_BRIDGE_HELLO) {
                             /* Bridge connection */
                             cJSON_Delete(peek.json);

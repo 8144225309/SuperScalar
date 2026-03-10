@@ -155,7 +155,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         /* Wait for PTLC_ADAPTED_SIG (15s timeout per client) */
         wire_msg_t resp;
         memset(&resp, 0, sizeof(resp));
-        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 15) ||
+        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 60) ||
             resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
             if (resp.json) cJSON_Delete(resp.json);
             fprintf(stderr, "LSP rotate: no adapted_sig from client %zu, skipping\n", ci);

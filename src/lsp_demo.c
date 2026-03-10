@@ -69,7 +69,7 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 continue;
         }
 
-        if (!wire_recv_timeout(fd, msg, 15)) return 0;
+        if (!wire_recv_timeout(fd, msg, 5)) return 0;
 
         if (msg->msg_type == expected_type)
             return 1;
@@ -126,7 +126,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t inv_resp;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
-                            MSG_INVOICE_CREATED, &inv_resp, 10)) {
+                            MSG_INVOICE_CREATED, &inv_resp, 60)) {
             fprintf(stderr, "LSP demo: timeout waiting for INVOICE_CREATED\n");
             return 0;
         }
@@ -220,7 +220,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t ack_msg;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
-                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
+                            MSG_REVOKE_AND_ACK, &ack_msg, 60)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from sender\n");
             free(old_sender_htlcs);
             return 0;
@@ -343,7 +343,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t ack_msg;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
-                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
+                            MSG_REVOKE_AND_ACK, &ack_msg, 60)) {
             fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from dest\n");
             free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
@@ -417,7 +417,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t ful_msg;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
-                            MSG_UPDATE_FULFILL_HTLC, &ful_msg, 10)) {
+                            MSG_UPDATE_FULFILL_HTLC, &ful_msg, 60)) {
             fprintf(stderr, "LSP demo: expected FULFILL from dest\n");
             free(old_sender_htlcs); free(old_dest_htlcs);
             return 0;
@@ -465,7 +465,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             wire_msg_t ack;
             if (wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
-                               MSG_REVOKE_AND_ACK, &ack, 10)) {
+                               MSG_REVOKE_AND_ACK, &ack, 60)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
@@ -560,7 +560,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             wire_msg_t ack;
             if (wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
-                               MSG_REVOKE_AND_ACK, &ack, 10)) {
+                               MSG_REVOKE_AND_ACK, &ack, 60)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
@@ -647,7 +647,7 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t inv_resp;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[client_idx],
-                            MSG_INVOICE_CREATED, &inv_resp, 10)) {
+                            MSG_INVOICE_CREATED, &inv_resp, 60)) {
             fprintf(stderr, "LSP: timeout waiting for INVOICE_CREATED\n");
             return 0;
         }
@@ -917,7 +917,7 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     {
         wire_msg_t ack_msg;
         if (!wait_for_msg(mgr, lsp, lsp->client_fds[from_client],
-                            MSG_REVOKE_AND_ACK, &ack_msg, 10)) {
+                            MSG_REVOKE_AND_ACK, &ack_msg, 60)) {
             fprintf(stderr, "add_pending_htlc: timeout waiting for REVOKE_AND_ACK\n");
             free(old_htlcs);
             return 0;
