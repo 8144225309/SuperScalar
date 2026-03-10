@@ -1,6 +1,6 @@
 #!/bin/bash
 # Docker entrypoint for SuperScalar
-# Modes: demo (default), demo-all, test, stress, unit, bash
+# Modes: demo (default), demo-all, test, stress, unit, dashboard, dashboard-live, orchestrator, bash
 set -e
 
 export PATH="/usr/local/bin:$PATH"
@@ -58,6 +58,23 @@ case "${1:-demo}" in
         ;;
     unit)
         exec /superscalar/build/test_superscalar --unit
+        ;;
+    dashboard)
+        setup_regtest
+        cd /superscalar
+        exec python3 tools/dashboard.py --demo --port 8080
+        ;;
+    dashboard-live)
+        setup_regtest
+        cd /superscalar
+        exec python3 tools/dashboard.py --port 8080 \
+            --btc-cli bitcoin-cli --btc-network regtest \
+            --btc-rpcuser rpcuser --btc-rpcpassword rpcpass
+        ;;
+    orchestrator)
+        setup_regtest
+        cd /superscalar
+        exec python3 tools/test_orchestrator.py "$@"
         ;;
     bash)
         setup_regtest
