@@ -23,3 +23,20 @@ testnet4-launch-*.md
 v0.1.*-launch.md
 github-issue-drafts.md
 TODO-local.md
+
+# Local-only tools and internal docs — not for release
+bitcoin-cli-wrapper.sh
+docs/internal/
+testnet4-onchain-firsts.md
+lost-coordination-branch/
+
+# WIP subsystems — not yet in build system, target v0.1.6+
+src/lsp_queue.c
+src/notify.c
+src/readiness.c
+include/superscalar/lsp_queue.h
+include/superscalar/notify.h
+include/superscalar/readiness.h
+tests/test_notify.c
+tests/test_queue.c
+tests/test_readiness.c

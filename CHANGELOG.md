@@ -2,13 +2,20 @@
 
 All notable changes to SuperScalar are documented here.
 
-## 0.1.5 — unreleased
+## 0.1.5 — 2026-03-10
+
+Test counts hold at 30/30 orchestrator scenarios, 418/418 unit tests, and 42/42 regtest tests. This release fixes three bugs in the exhibition test infrastructure found during the 13-structure regtest rehearsal, removes the deprecated `regtest_full.sh` script, and corrects `version.h` which was not updated in v0.1.4.
 
 ### Fixed
 
 - **`all_watch` flaky in full suite runs**: `scenario_all_watch` mined 2 blocks once then waited 30 seconds. Watchtowers scan blocks, not a timer — if the poll cycle fired just before those 2 blocks arrived, a client could miss the entire detection window under full-suite process load. Replaced the fixed sleep with a loop that mines 1 block every 5 seconds for the full wait period, giving watchtowers 8 block-triggered scan opportunities instead of 2. `--scenario all` now reliably passes 30/30 on every run.
 - **`--test-dw-exhibition` Phase 1 pass condition**: Changed from `any_decreased && any_zero` to just `any_decreased`. With `--states-per-layer 2`, only one DW advance occurs and nSequence never reaches 0 — the original condition always failed. The exhibition proves that nSequence *decreased*, not that it hit zero.
-- **`--test-realloc` BIP-327 keypair reordering**: The `--test-realloc` branch was missing the MuSig2 keypair reordering that `--test-dw-exhibition` already had. Without reordering `all_kps[]` to match `lsp.factory.pubkeys[]` (connection order), the aggregated pubkey used for signing differs from the one embedded in the funding TX script, causing every broadcast leaf TX to fail on-chain with "Invalid Schnorr signature".
+- **`--test-leaf-advance` (`test_realloc`) BIP-327 keypair reordering**: The `--test-leaf-advance` branch was missing the MuSig2 keypair reordering that `--test-dw-exhibition` already had. Without reordering `all_kps[]` to match `lsp.factory.pubkeys[]` (connection order), the aggregated pubkey used for signing differs from the one embedded in the funding TX script, causing every broadcast leaf TX to fail on-chain with “Invalid Schnorr signature”.
+- **`version.h` out of sync**: `SUPERSCALAR_VERSION` was not updated in v0.1.4 and still reported `0.1.3`. Bumped `SUPERSCALAR_VERSION_PATCH` to 5 and version string to `0.1.5`.
+
+### Removed
+
+- **`regtest_full.sh`**: Superseded by `test_orchestrator.py` and `manual_tests.py`. The orchestrator covers all scenarios that `regtest_full.sh` provided and more, with better isolation, per-scenario reporting, and support for parallel runs.
 
 ---
 
