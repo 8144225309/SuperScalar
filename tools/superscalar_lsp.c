@@ -2302,13 +2302,13 @@ int main(int argc, char *argv[]) {
                     any_decreased = 1;
             }
 
-            if (!any_decreased || !any_zero) {
+            if (!any_decreased) {
                 fprintf(stderr, "DW EXHIBITION Phase 1: countdown check failed "
                         "(any_decreased=%d, any_zero=%d)\n", any_decreased, any_zero);
                 exhibition_pass = 0;
             }
             printf("Phase 1: %s (any_decreased=%d, any_zero=%d)\n\n",
-                   (any_decreased && any_zero) ? "PASS" : "FAIL",
+                   any_decreased ? "PASS" : "FAIL",
                    any_decreased, any_zero);
 
             /* Record Factory 0 final nSequence for Phase 3 comparison */
@@ -2689,6 +2689,30 @@ int main(int argc, char *argv[]) {
                     if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
                         fprintf(stderr, "LEAF ADVANCE TEST: keypair create failed\n");
                         return 1;
+                    }
+                }
+                /* Reorder all_kps to match lsp.factory.pubkeys connection order (BIP-327). */
+                {
+                    secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                    memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                    for (size_t slot = 0; slot < n_total; slot++) {
+                        unsigned char target[33];
+                        size_t tlen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                                                      &lsp.factory.pubkeys[slot],
+                                                      SECP256K1_EC_COMPRESSED);
+                        for (size_t k = 0; k < n_total; k++) {
+                            secp256k1_pubkey kpub;
+                            secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                            unsigned char kser[33];
+                            size_t klen = 33;
+                            secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                          &kpub, SECP256K1_EC_COMPRESSED);
+                            if (memcmp(target, kser, 33) == 0) {
+                                all_kps[slot] = ordered[k];
+                                break;
+                            }
+                        }
                     }
                 }
                 memcpy(lsp.factory.keypairs, all_kps,

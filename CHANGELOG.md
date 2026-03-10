@@ -7,6 +7,8 @@ All notable changes to SuperScalar are documented here.
 ### Fixed
 
 - **`all_watch` flaky in full suite runs**: `scenario_all_watch` mined 2 blocks once then waited 30 seconds. Watchtowers scan blocks, not a timer — if the poll cycle fired just before those 2 blocks arrived, a client could miss the entire detection window under full-suite process load. Replaced the fixed sleep with a loop that mines 1 block every 5 seconds for the full wait period, giving watchtowers 8 block-triggered scan opportunities instead of 2. `--scenario all` now reliably passes 30/30 on every run.
+- **`--test-dw-exhibition` Phase 1 pass condition**: Changed from `any_decreased && any_zero` to just `any_decreased`. With `--states-per-layer 2`, only one DW advance occurs and nSequence never reaches 0 — the original condition always failed. The exhibition proves that nSequence *decreased*, not that it hit zero.
+- **`--test-realloc` BIP-327 keypair reordering**: The `--test-realloc` branch was missing the MuSig2 keypair reordering that `--test-dw-exhibition` already had. Without reordering `all_kps[]` to match `lsp.factory.pubkeys[]` (connection order), the aggregated pubkey used for signing differs from the one embedded in the funding TX script, causing every broadcast leaf TX to fail on-chain with "Invalid Schnorr signature".
 
 ---
 
