@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.4 — 516 tests, 30/30 orchestrator scenarios, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Ready for signet/testnet collaborative testing.**
+> v0.1.5 — 520 tests, 30/30 orchestrator scenarios, 7-job CI, encrypted transport (Noise NK), SQLite persistence. **Testnet4 on-chain exhibition in progress — 13 structures, all validated on regtest.**
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -27,7 +27,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 418 unit + 43 regtest + 30 orchestrator (all passing) + 25 manual flag tests, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 418 unit + 42 regtest + 30 orchestrator (all passing) + 25 manual flag tests, CI on every push (Linux, macOS, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -74,7 +74,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-461 automated tests (418 unit + 43 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 30 orchestrator scenarios (all passing). CI runs automated suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+460 automated tests (418 unit + 42 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 30 orchestrator scenarios (all passing). CI runs automated suites on every push — Linux, macOS, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -161,6 +161,27 @@ These flags run after the `--demo` payment sequence completes:
 
 # Full factory rotation (PTLC wire msgs + new factory + payments)
 ./superscalar_lsp --port 9735 --demo --test-rotation
+
+# DW counter advance (broadcast state TXs with decreasing nSequence)
+./superscalar_lsp --port 9735 --demo --test-dw-advance
+
+# DW exhibition (full tree broadcast, all layers visible on-chain)
+./superscalar_lsp --port 9735 --demo --test-dw-exhibition
+
+# Per-leaf advance (individual leaf state update, 3-of-3 signing)
+./superscalar_lsp --port 9735 --demo --test-leaf-advance
+
+# L-stock burn (unilateral exit burns LSP liquidity stock output)
+./superscalar_lsp --port 9735 --demo --test-burn
+
+# Dual factory (two concurrent independent factories)
+./superscalar_lsp --port 9735 --demo --test-dual-factory
+
+# BOLT11 bridge (Lightning ↔ factory bridge via CLN plugin)
+./superscalar_lsp --port 9735 --demo --test-bridge
+
+# HTLC force-close (force-close with HTLC outputs, preimage reveal)
+./superscalar_lsp --port 9735 --demo --test-htlc-force-close
 ```
 
 ### Test Orchestrator
@@ -457,6 +478,13 @@ superscalar_lsp [OPTIONS]
 | `--test-turnover` | — | off | PTLC key turnover, close with extracted keys |
 | `--test-rotation` | — | off | Full factory rotation lifecycle |
 | `--force-close` | — | off | Broadcast factory tree on-chain, wait for confirmations |
+| `--test-dw-advance` | — | off | Broadcast state TXs with decreasing nSequence (DW counter advance) |
+| `--test-dw-exhibition` | — | off | Full DW tree broadcast, all layers visible on-chain |
+| `--test-leaf-advance` | — | off | Per-leaf state advance via 3-of-3 signing |
+| `--test-burn` | — | off | Unilateral exit: burn L-stock output |
+| `--test-dual-factory` | — | off | Run two concurrent independent factories |
+| `--test-bridge` | — | off | BOLT11 Lightning ↔ factory bridge via CLN plugin |
+| `--test-htlc-force-close` | — | off | Force-close with live HTLC outputs, preimage reveal |
 | `--routing-fee-ppm` | N | 0 | Routing fee in parts-per-million (0 = free) |
 | `--lsp-balance-pct` | N | 50 | LSP's share of channel capacity (0-100) |
 | `--placement-mode` | MODE | sequential | Client placement: sequential / inward / outward |
@@ -743,9 +771,11 @@ SuperScalar is pre-1.0 software. Mainnet requires `--i-accept-the-risk`. No exte
 
 SuperScalar needs real-world testing on signet and testnet over weeks and months — multi-party factories, reconnections, breach detection, factory rotation, long-lived daemon sessions.
 
+**Testnet4 on-chain exhibition in progress**: All 13 SuperScalar structures (cooperative close, DW force-close, DW advance, DW exhibition, per-leaf advance, L-stock burn, breach + penalty, CLTV timeout, distribution TX, BOLT11 bridge, HTLC force-close, factory rotation, dual factory) have been validated on regtest and are being broadcast to testnet4 as a public proof-of-concept. Follow [github.com/8144225309/SuperScalar/issues](https://github.com/8144225309/SuperScalar/issues) for TXIDs and results as each structure confirms.
+
 **How to help:**
 
-1. **Run a factory on signet** — Follow the [Running on Signet](#running-on-signet) guide above. Even a 2-client factory running for a few days produces valuable data.
+1. **Run a factory on testnet4 or signet** — Follow the [Running on Signet](#running-on-signet) guide (works for testnet4 too). Even a 2-client factory running for a few days produces valuable data.
 2. **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 30 multi-party scenarios.
 3. **Report bugs** — Open an issue at [github.com/8144225309/SuperScalar/issues](https://github.com/8144225309/SuperScalar/issues). Include logs, network, and steps to reproduce.
 4. **Review the code** — The [internal audit](docs/mainnet-audit.md) is a good starting point. Cryptography lives in `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c`.
