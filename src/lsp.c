@@ -649,7 +649,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
             }
 
             int ready[LSP_MAX_CLIENTS];
-            int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, 30, ready);
+            int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_nonce_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
                     if (close_nonce_cer.clients[i] == CLIENT_WAITING) {
@@ -746,7 +746,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
             }
 
             int ready[LSP_MAX_CLIENTS];
-            int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, 30, ready);
+            int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_psig_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
                     if (close_psig_cer.clients[i] == CLIENT_WAITING) {
