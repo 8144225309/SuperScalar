@@ -1429,7 +1429,7 @@ static void usage(const char *prog) {
         "  --recv PREIMAGE_HEX               Receive payment (can repeat)\n"
         "  --channels                        Expect channel phase (for when LSP uses --payments)\n"
         "  --daemon                          Run as long-lived daemon (auto-fulfill HTLCs)\n"
-        "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
+        "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
         "  --report PATH                     Write diagnostic JSON report to PATH\n"
         "  --db PATH                         SQLite database for persistence (default: none)\n"
         "  --network MODE                    Network: regtest, signet, testnet, testnet4, mainnet (default: regtest)\n"
@@ -1803,6 +1803,12 @@ int main(int argc, char *argv[]) {
                                   datadir, rpcport);
     if (!rt_ok)
         fprintf(stderr, "Client: regtest init failed (watchtower disabled)\n");
+
+    if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
+        fprintf(stderr, "ERROR: --fee-rate %d is below minimum %d sat/kvB (0.1 sat/vB)\n",
+                fee_rate, FEE_FLOOR_SAT_PER_KVB);
+        return 1;
+    }
 
     static watchtower_t client_wt;
     fee_estimator_t client_fee;

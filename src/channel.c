@@ -1,4 +1,5 @@
 #include "superscalar/channel.h"
+#include "superscalar/fee.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -275,7 +276,7 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->local_amount = local_amount;
     ch->remote_amount = remote_amount;
     ch->to_self_delay = to_self_delay;
-    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB */
+    ch->fee_rate_sat_per_kvb = FEE_FLOOR_SAT_PER_KVB;  /* default: 0.1 sat/vB */
     ch->funder_is_local = 0;
     ch->commitment_number = 0;
 

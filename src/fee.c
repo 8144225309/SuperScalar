@@ -37,8 +37,8 @@ int fee_update_from_node(fee_estimator_t *fe, void *rt_ptr, int target_blocks) {
     /* Convert BTC/kvB to sat/kvB: multiply by 100,000,000 */
     uint64_t sat_per_kvb = (uint64_t)(feerate->valuedouble * 100000000.0 + 0.5);
 
-    /* Clamp to minimum 1000 sat/kvB (1 sat/vB) */
-    if (sat_per_kvb < 1000) sat_per_kvb = 1000;
+    /* Clamp to minimum FEE_FLOOR_SAT_PER_KVB (0.1 sat/vB) */
+    if (sat_per_kvb < FEE_FLOOR_SAT_PER_KVB) sat_per_kvb = FEE_FLOOR_SAT_PER_KVB;
 
     fe->fee_rate_sat_per_kvb = sat_per_kvb;
     fe->last_updated = (uint64_t)time(NULL);
@@ -82,4 +82,12 @@ uint64_t fee_for_factory_tx(const fee_estimator_t *fe, size_t n_outputs) {
     /* Factory tree tx: ~50 vB overhead + ~43 vB per P2TR output */
     size_t vsize = 50 + 43 * n_outputs;
     return fee_estimate(fe, vsize);
+}
+
+int fee_should_use_anchor(const fee_estimator_t *fe) {
+    /* At sub-1-sat/vB rates the 240-sat P2A anchor costs more than the
+       entire TX fee, making CPFP uneconomical.  Skip anchors below
+       1000 sat/kvB and rely on the low base rate for relay. */
+    if (!fe) return 1;  /* default: include anchor */
+    return fe->fee_rate_sat_per_kvb >= 1000;
 }

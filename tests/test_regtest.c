@@ -1249,8 +1249,8 @@ int test_regtest_fee_estimation_parsing(void) {
         printf("  estimatesmartfee returned insufficient data (expected on fresh regtest)\n");
     } else {
         /* If we got a rate, verify it's reasonable (clamped >= 1000) */
-        TEST_ASSERT(fe.fee_rate_sat_per_kvb >= 1000,
-                    "rate clamped to minimum 1000");
+        TEST_ASSERT(fe.fee_rate_sat_per_kvb >= FEE_FLOOR_SAT_PER_KVB,
+                    "rate clamped to minimum floor");
         printf("  estimatesmartfee returned rate: %llu sat/kvB\n",
                (unsigned long long)fe.fee_rate_sat_per_kvb);
     }
@@ -1268,8 +1268,8 @@ int test_regtest_fee_estimation_parsing(void) {
     fee_init(&fe2, 9999);
     updated = fee_update_from_node(&fe2, &rt, 6);
     if (updated) {
-        TEST_ASSERT(fe2.fee_rate_sat_per_kvb >= 1000,
-                    "updated rate at least 1000");
+        TEST_ASSERT(fe2.fee_rate_sat_per_kvb >= FEE_FLOOR_SAT_PER_KVB,
+                    "updated rate at least floor");
         printf("  After txs: rate=%llu sat/kvB\n",
                (unsigned long long)fe2.fee_rate_sat_per_kvb);
     } else {

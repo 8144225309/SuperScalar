@@ -423,12 +423,14 @@ int watchtower_check(watchtower_t *wt) {
         tx_buf_t penalty_tx;
         tx_buf_init(&penalty_tx, 512);
 
+        int use_anchor = fee_should_use_anchor(wt->fee);
         if (!channel_build_penalty_tx(ch, &penalty_tx,
                                         e->txid, e->to_local_vout,
                                         e->to_local_amount,
                                         e->to_local_spk, e->to_local_spk_len,
                                         e->commit_num,
-                                        wt->anchor_spk, wt->anchor_spk_len)) {
+                                        use_anchor ? wt->anchor_spk : NULL,
+                                        use_anchor ? wt->anchor_spk_len : 0)) {
             fprintf(stderr, "Watchtower: build penalty tx failed for channel %u\n",
                     e->channel_id);
             tx_buf_free(&penalty_tx);
@@ -461,8 +463,10 @@ int watchtower_check(watchtower_t *wt) {
         tx_buf_free(&penalty_tx);
 
         /* Track in pending for CPFP bump if anchor is active.
-           NOTE: anchor_vout=1 must match channel_build_penalty_tx output order. */
-        if (penalty_sent && wt->anchor_spk_len == P2A_SPK_LEN &&
+           NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
+           Skip CPFP tracking at sub-1-sat/vB — no anchor output was created. */
+        if (penalty_sent && use_anchor &&
+            wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < wt->pending_cap) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             memcpy(p->txid, penalty_txid, 64);
@@ -499,7 +503,8 @@ int watchtower_check(watchtower_t *wt) {
                     e->htlc_outputs[h].htlc_amount,
                     e->htlc_outputs[h].htlc_spk, 34,
                     e->commit_num, 0,
-                    wt->anchor_spk, wt->anchor_spk_len)) {
+                    use_anchor ? wt->anchor_spk : NULL,
+                    use_anchor ? wt->anchor_spk_len : 0)) {
                 char *htlc_hex = (char *)malloc(htlc_penalty.len * 2 + 1);
                 if (htlc_hex) {
                     hex_encode(htlc_penalty.data, htlc_penalty.len, htlc_hex);

@@ -1126,6 +1126,9 @@ static int setup_channel_with_htlc(channel_t *ch, secp256k1_context *ctx,
                         funding_sec, local_fund_pk, remote_fund_pk))
         return 0;
 
+    /* Tests expect 1 sat/vB fee arithmetic */
+    ch->fee_rate_sat_per_kvb = 1000;
+
     /* Set HTLC basepoints */
     channel_set_local_htlc_basepoint(ch, local_htlc_secret);
 

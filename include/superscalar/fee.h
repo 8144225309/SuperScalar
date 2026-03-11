@@ -12,7 +12,7 @@ typedef struct {
     uint64_t last_updated;           /* epoch seconds of last successful update */
 } fee_estimator_t;
 
-/* Initialize with a default fee rate (1000 sat/kvB = 1 sat/vB). */
+/* Initialize with a default fee rate.  Accepts any rate >= FEE_FLOOR_SAT_PER_KVB. */
 void fee_init(fee_estimator_t *fe, uint64_t default_rate_sat_per_kvb);
 
 /* Query bitcoind estimatesmartfee for target_blocks confirmation.
@@ -37,5 +37,14 @@ uint64_t fee_for_commitment_tx(const fee_estimator_t *fe, size_t n_htlcs);
 
 /* Convenience: factory tree tx (variable). */
 uint64_t fee_for_factory_tx(const fee_estimator_t *fe, size_t n_outputs);
+
+/* Returns 1 if anchors should be included at this fee rate, 0 if not.
+   At sub-1-sat/vB rates, CPFP anchors cost more than the TX fee itself,
+   creating perverse incentives.  Skip them below 1000 sat/kvB. */
+int fee_should_use_anchor(const fee_estimator_t *fe);
+
+/* Minimum fee floor: 100 sat/kvB = 0.1 sat/vB.
+   Below this, Bitcoin Core won't relay even with lowered minrelaytxfee. */
+#define FEE_FLOOR_SAT_PER_KVB  100
 
 #endif /* SUPERSCALAR_FEE_H */

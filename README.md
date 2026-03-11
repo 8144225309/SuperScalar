@@ -460,7 +460,7 @@ superscalar_lsp [OPTIONS]
 | `--daemon` | — | off | Long-lived daemon mode |
 | `--demo` | — | off | Run scripted demo sequence |
 | `--db` | PATH | — | SQLite persistence |
-| `--fee-rate` | N | 1000 | Fee rate (sat/kvB) |
+| `--fee-rate` | N | 1000 | Fee rate (sat/kvB, min 100 = 0.1 sat/vB) |
 | `--keyfile` | PATH | — | Encrypted keyfile |
 | `--passphrase` | PASS | — | Keyfile passphrase |
 | `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
@@ -539,7 +539,7 @@ superscalar_client [OPTIONS]
 | `--daemon` | — | off | Daemon mode (auto-fulfill HTLCs, client watchtower) |
 | `--db` | PATH | — | SQLite persistence |
 | `--network` | MODE | regtest | Network mode |
-| `--fee-rate` | N | 1000 | Fee rate (sat/kvB) |
+| `--fee-rate` | N | 1000 | Fee rate (sat/kvB, min 100 = 0.1 sat/vB) |
 | `--keyfile` | PATH | — | Encrypted keyfile |
 | `--passphrase` | PASS | — | Keyfile passphrase |
 | `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
