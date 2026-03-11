@@ -330,7 +330,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect NONCE_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t ceremony;
-        ceremony_init(&ceremony, lsp->n_clients, 30, (int)lsp->n_clients);
+        ceremony_init(&ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
         ceremony.state = CEREMONY_COLLECTING_NONCES;
         size_t nonces_received = 0;
 
@@ -462,7 +462,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect PSIG_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t psig_ceremony;
-        ceremony_init(&psig_ceremony, lsp->n_clients, 30, (int)lsp->n_clients);
+        ceremony_init(&psig_ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
         psig_ceremony.state = CEREMONY_COLLECTING_PSIGS;
         size_t psigs_received = 0;
 
@@ -638,7 +638,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
     {
         ceremony_t close_nonce_cer;
-        ceremony_init(&close_nonce_cer, lsp->n_clients, 30, (int)lsp->n_clients);
+        ceremony_init(&close_nonce_cer, lsp->n_clients, 60, (int)lsp->n_clients);
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
@@ -664,7 +664,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_NONCE) {
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60) || msg.msg_type != MSG_CLOSE_NONCE) {
                     if (msg.json && !check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
@@ -735,7 +735,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     /* Collect CLOSE_PSIG from all clients (parallel select) */
     {
         ceremony_t close_psig_cer;
-        ceremony_init(&close_psig_cer, lsp->n_clients, 30, (int)lsp->n_clients);
+        ceremony_init(&close_psig_cer, lsp->n_clients, 60, (int)lsp->n_clients);
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {
@@ -761,7 +761,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 30) || msg.msg_type != MSG_CLOSE_PSIG) {
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60) || msg.msg_type != MSG_CLOSE_PSIG) {
                     if (msg.json && !check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
