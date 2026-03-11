@@ -4844,13 +4844,23 @@ int main(int argc, char *argv[]) {
 
         /* Fund new factory (same address since same participants) */
         char fund2_txid_hex[65];
+        if (!regtest_fund_address(&rt, fund_addr, funding_btc, fund2_txid_hex)) {
+            fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
         if (is_regtest) {
-            if (!regtest_fund_address(&rt, fund_addr, funding_btc, fund2_txid_hex)) {
-                fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        } else {
+            printf("ROTATION: waiting for Factory 1 funding confirmation on %s...\n", network);
+            fflush(stdout);
+            int conf2 = regtest_wait_for_confirmation(&rt, fund2_txid_hex,
+                                                      confirm_timeout_secs);
+            if (conf2 < 1) {
+                fprintf(stderr, "ROTATION: Factory 1 funding not confirmed within timeout\n");
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
-            regtest_mine_blocks(&rt, 1, mine_addr);
         }
 
         unsigned char fund2_txid[32];
