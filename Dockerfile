@@ -34,6 +34,8 @@ COPY . .
 RUN find . -name '*.sh' -o -name '*.py' | xargs sed -i 's/\r$//'
 RUN mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
+EXPOSE 8080
+
 # Entrypoint: start bitcoind regtest, fund wallet, run demo
 COPY tools/docker-entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
