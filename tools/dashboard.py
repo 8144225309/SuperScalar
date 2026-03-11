@@ -150,6 +150,33 @@ def collect_databases(cfg):
             "commitment_number, created_at, target_factory_id "
             "FROM jit_channels ORDER BY jit_channel_id")
         data[label]["jit_channels"] = rows if not err else []
+        # Broadcast log — TX broadcast history for operators
+        rows, err = query_db(path,
+            "SELECT id, txid, source, result, broadcast_time "
+            "FROM broadcast_log ORDER BY id DESC LIMIT 50")
+        data[label]["broadcast_log"] = rows if not err else []
+        # Signing progress — per-signer nonce/sig collection status
+        rows, err = query_db(path,
+            "SELECT factory_id, node_index, signer_slot, has_nonce, "
+            "has_partial_sig, updated_at "
+            "FROM signing_progress ORDER BY factory_id, node_index, signer_slot")
+        data[label]["signing_progress"] = rows if not err else []
+        # Watchtower pending — penalty TXs in-flight
+        rows, err = query_db(path,
+            "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
+            "FROM watchtower_pending ORDER BY bump_count DESC")
+        data[label]["watchtower_pending"] = rows if not err else []
+        # Old commitment HTLCs — HTLCs attached to old (revoked) commitments
+        rows, err = query_db(path,
+            "SELECT channel_id, commit_num, htlc_index, direction, amount, "
+            "payment_hash, cltv_expiry "
+            "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
+        data[label]["old_commitment_htlcs"] = rows if not err else []
+        # Factory revocation secrets — per-epoch flat revocation
+        rows, err = query_db(path,
+            "SELECT factory_id, COUNT(*) as cnt "
+            "FROM factory_revocation_secrets GROUP BY factory_id")
+        data[label]["factory_revocations_by_factory"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -296,6 +323,26 @@ def collect_demo():
                     {"name":"next_request_id","value":4},
                     {"name":"next_htlc_id","value":12},
                 ],
+                "broadcast_log":[
+                    {"id":1,"txid":_rh(64),"source":"factory_funding","result":"success","broadcast_time":int(t)-3600},
+                    {"id":2,"txid":_rh(64),"source":"penalty_tx","result":"success","broadcast_time":int(t)-1800},
+                    {"id":3,"txid":_rh(64),"source":"state_update","result":"mempool_conflict","broadcast_time":int(t)-300},
+                ],
+                "signing_progress":[
+                    {"factory_id":0,"node_index":0,"signer_slot":i,"has_nonce":1,"has_partial_sig":1,"updated_at":int(t)-60}
+                    for i in range(5)
+                ]+[
+                    {"factory_id":0,"node_index":1,"signer_slot":i,"has_nonce":1,"has_partial_sig":int(i<3),"updated_at":int(t)-30}
+                    for i in range(5)
+                ],
+                "watchtower_pending":[
+                    {"txid":_rh(64),"anchor_vout":0,"anchor_amount":330,"cycles_in_mempool":2,"bump_count":1},
+                ],
+                "old_commitment_htlcs":[
+                    {"channel_id":1,"commit_num":5,"htlc_index":0,"direction":"offered","amount":1000,"payment_hash":_rh(64),"cltv_expiry":h+40},
+                    {"channel_id":1,"commit_num":5,"htlc_index":1,"direction":"received","amount":2500,"payment_hash":_rh(64),"cltv_expiry":h+35},
+                ],
+                "factory_revocations_by_factory":[{"factory_id":0,"cnt":6}],
             },
             "client": {
                 "factories":[{"id":0,"n_participants":5,"funding_txid":ft,"funding_vout":0,"funding_amount":200000,"step_blocks":144,"states_per_layer":spl,"cltv_timeout":ct,"fee_per_tx":354,"state":"active","created_at":int(t)-3600}],
@@ -310,6 +357,8 @@ def collect_demo():
                 "htlc_origins":[],"client_invoices":[
                     {"id":1,"payment_hash":_rh(64),"preimage":_rh(64),"amount_msat":10000,"active":1,"created_at":int(t)-500},
                 ],"id_counters":[],
+                "broadcast_log":[],"signing_progress":[],"watchtower_pending":[],
+                "old_commitment_htlcs":[],"factory_revocations_by_factory":[],
             },
         },
         "cln": {
@@ -622,6 +671,19 @@ function rFactory(D){
   for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
   h+=`</table>`;
   h+=`</div>`;}
+ // Signing Progress (MuSig2 nonce/sig collection)
+ const sp=lsp.signing_progress||[];
+ if(sp.length){h+=`<div class="s"><div class="st"><span>Signing Progress (MuSig2)</span><span class="c">${sp.length} entries</span></div>`;
+  // Group by factory_id + node_index
+  const byNode={};sp.forEach(s=>{const k=s.factory_id+'_'+s.node_index;if(!byNode[k])byNode[k]=[];byNode[k].push(s);});
+  h+=`<table><tr><th>Factory</th><th>Node</th><th>Slot</th><th>Nonce</th><th>Partial Sig</th><th>Updated</th></tr>`;
+  for(const s of sp){
+   h+=`<tr><td>#${s.factory_id}</td><td>${s.node_index}</td><td>${s.signer_slot}</td><td>${s.has_nonce?'<span class="b ok">yes</span>':'<span class="b dn">no</span>'}</td><td>${s.has_partial_sig?'<span class="b ok">yes</span>':'<span class="b dn">no</span>'}</td><td>${ta(s.updated_at)}</td></tr>`;}
+  h+=`</table>`;
+  // Summary per node: X/N nonces, Y/N sigs
+  for(const[k,entries]of Object.entries(byNode)){const nn=entries.filter(e=>e.has_nonce).length,ns=entries.filter(e=>e.has_partial_sig).length,tot=entries.length;
+   h+=`<div class="kv" style="margin-top:4px"><div class="ki"><span class="k">Node ${entries[0].node_index}</span><span class="v">nonces ${nn}/${tot}</span></div><div class="ki"><span class="k">sigs</span><span class="v">${ns}/${tot}</span></div><div style="flex:1">${prog(ns/tot*100,ns===tot?'pg':'po')}</div></div>`;}
+  h+=`</div>`;}
  // Protocol + DW
  const proto=D.factory_protocol,dw=D.dw_state;
  if(proto||dw){h+=`<div class="g2">`;
@@ -781,7 +843,33 @@ function rWatchtower(D){
    h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
   if(oc.length>15)h+=`<tr><td colspan="5" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
   h+=`</table>`;}
+ // Old commitment HTLCs (breach penalty HTLCs)
+ const och=lsp.old_commitment_htlcs||[];
+ if(och.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitment HTLCs (breach penalty)</span><span class="c">${och.length}</span></div>`;
+  h+=`<table><tr><th>CH</th><th>Commit#</th><th>HTLC#</th><th>Dir</th><th class="r">Amount</th><th>Hash</th><th class="r">CLTV</th></tr>`;
+  for(const x of och){const dc=x.direction==='offered'?'color:#f0883e':'color:#3fb950';
+   h+=`<tr><td>${x.channel_id}</td><td>${x.commit_num}</td><td>${x.htlc_index}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td class="h">${th(x.payment_hash)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td></tr>`;}
+  h+=`</table>`;}
+ // Factory revocation secrets count
+ const frs=lsp.factory_revocations_by_factory||[];
+ if(frs.length){h+=`<div class="st" style="margin-top:8px"><span>Factory Revocation Secrets</span></div>`;
+  h+=`<div class="kv">`;
+  for(const r of frs)h+=`<div class="ki"><span class="k">Factory #${r.factory_id}</span><span class="v">${r.cnt} epochs revoked</span></div>`;
+  h+=`</div>`;}
+ // Watchtower pending penalty TXs
+ const wp=lsp.watchtower_pending||[];
+ if(wp.length){h+=`<div class="st" style="margin-top:8px"><span>Watchtower Pending Penalties</span><span class="c">${wp.length}</span></div>`;
+  h+=`<table><tr><th>TXID</th><th class="r">Anchor Vout</th><th class="r">Anchor Amount</th><th class="r">Mempool Cycles</th><th class="r">Fee Bumps</th></tr>`;
+  for(const w of wp)h+=`<tr><td class="h">${th(w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
+  h+=`</table>`;}
  h+=`</div>`;
+ // Broadcast log (separate card)
+ const bl=lsp.broadcast_log||[];
+ if(bl.length){h+=`<div class="s"><div class="st"><span>Broadcast Log</span><span class="c">${bl.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>TXID</th><th>Source</th><th>Result</th><th>Time</th></tr>`;
+  for(const b of bl){const rc=b.result==='success'?'b ok':'b dn';
+   h+=`<tr><td>${b.id}</td><td class="h">${th(b.txid)}</td><td>${b.source||'\u2014'}</td><td><span class="${rc}">${b.result||'?'}</span></td><td>${ta(b.broadcast_time)}</td></tr>`;}
+  h+=`</table></div>`;}
  return h;
 }
 
