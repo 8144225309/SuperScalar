@@ -95,7 +95,7 @@ typedef struct {
 
     /* Config */
     uint32_t to_self_delay;
-    uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 100 = 0.1 sat/vB) */
+    uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000 = 1 sat/vB) */
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
 
