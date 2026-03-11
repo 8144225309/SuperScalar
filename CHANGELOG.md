@@ -2,6 +2,28 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.6 — unreleased
+
+### Added
+
+- **Dashboard: 5 missing DB tables** (`tools/dashboard.py`): queries `broadcast_log`, `signing_progress`, `watchtower_pending`, `old_commitment_htlcs`, and `factory_revocation_secrets` — bringing dashboard coverage to all 26 schema tables.
+- **Dashboard: Signing Progress UI** (Factory tab): per-signer MuSig2 nonce/partial-sig collection status with progress bars per tree node.
+- **Dashboard: Watchtower enhancements** (Watchtower tab): Broadcast Log (TX broadcast history with pass/fail results), Watchtower Pending Penalties (in-flight penalty TXs with mempool cycle and fee bump counts), Old Commitment HTLCs (breach-penalty HTLC details), and Factory Revocation Secrets (per-factory epoch count).
+- **Dashboard: demo data**: synthetic data for all new tables so `--demo` previews every section.
+- **Docker: dashboard integration**: `EXPOSE 8080` in Dockerfile, `8080:8080` port mapping in `docker-compose.yml`, and three new entrypoint modes in `docker-entrypoint.sh`: `dashboard` (demo), `dashboard-live` (connects to regtest bitcoind), `orchestrator`.
+
+### Fixed
+
+- **Ceremony close timeout**: `ceremony_select_all()` used 30-second hardcoded timeout for close nonce/psig collection. Now uses `per_client_timeout_sec` (300s on signet/testnet4) so cooperative close doesn't time out on slow networks.
+- **Ceremony and rotation timeouts**: Increased `wire_recv_timeout` for demo rotation and close ceremonies from 30s to 120s for signet/testnet4 where block confirmation can take minutes.
+- **Demo/rotation message timeouts**: Increased `wire_recv_timeout` for `MSG_FACTORY_PROPOSE`, `MSG_NONCE_BUNDLE`, `MSG_PSIG_BUNDLE`, and other ceremony messages from 30s to 120s on non-regtest networks.
+
+### Removed
+
+- **`bitcoin-cli.sh`**: Vestigial pass-through wrapper that added no value. All scripts call `bitcoin-cli` directly.
+
+---
+
 ## 0.1.5 — 2026-03-10
 
 Test counts hold at 30/30 orchestrator scenarios, 418/418 unit tests, and 42/42 regtest tests. This release fixes three bugs in the exhibition test infrastructure found during the 13-structure regtest rehearsal, removes the deprecated `regtest_full.sh` script, and corrects `version.h` which was not updated in v0.1.4.
