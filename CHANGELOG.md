@@ -15,6 +15,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
+- **`test_regtest_breach_penalty_cpfp` CPFP bump failure**: `regtest_sign_raw_tx_with_wallet` returned NULL when signing CPFP child transactions with a P2A anchor input because (1) the `bitcoin-cli` curl wrapper script treated JSON array arguments as quoted strings, corrupting the `prevtxs` parameter to `signrawtransactionwithwallet`; and (2) the function required `complete: true` even though P2A (anyone-can-spend) inputs are intentionally left unsigned. Fixed by (1) updating the wrapper to pass args starting with `[`/`{` as raw JSON and (2) adding `require_complete` flag (pass `0` for CPFP calls).
 - **`fee_for_factory_tx` vbyte underestimate**: Factory tree transaction overhead was calculated as 50 vB instead of the correct 68 vB (10 vB tx overhead + 58 vB P2TR keypath input). Formula is now `68 + 43 × n_outputs`. Updated `test_fee_factory_tx` assertions (93→111, 179→197, 265→283 at 1 sat/vB).
 - **Docs: testing-guide regtest count corrected**: Was 43, actual count is 42. Total automated corrected to 460, suite total to 515.
 - **Docs: ARM64 CI row** added to testing-guide CI table and README feature table.
