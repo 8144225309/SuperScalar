@@ -741,6 +741,7 @@ extern int test_queue_request_type_name(void);
 extern int test_queue_null_payload(void);
 extern int test_queue_drain_limit(void);
 extern int test_queue_null_safety(void);
+extern int test_queue_get(void);
 
 /* Async Signing: Notification Dispatch */
 extern int test_notify_log_init(void);
@@ -765,6 +766,11 @@ extern int test_readiness_persist_roundtrip(void);
 extern int test_readiness_urgency_levels(void);
 extern int test_readiness_get_missing(void);
 extern int test_readiness_reset(void);
+
+/* Async Signing: Rotation Readiness (lsp_check_rotation_readiness) */
+extern int test_rotation_readiness_null(void);
+extern int test_rotation_readiness_none_connected(void);
+extern int test_rotation_readiness_partial(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -1442,6 +1448,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_queue_null_payload);
     RUN_TEST(test_queue_drain_limit);
     RUN_TEST(test_queue_null_safety);
+    RUN_TEST(test_queue_get);
 
     printf("\n=== Async Signing: Notification Dispatch ===\n");
     RUN_TEST(test_notify_log_init);
@@ -1466,6 +1473,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_readiness_urgency_levels);
     RUN_TEST(test_readiness_get_missing);
     RUN_TEST(test_readiness_reset);
+
+    printf("\n=== Async Signing: Rotation Readiness ===\n");
+    RUN_TEST(test_rotation_readiness_null);
+    RUN_TEST(test_rotation_readiness_none_connected);
+    RUN_TEST(test_rotation_readiness_partial);
 }
 
 extern int regtest_init_faucet(void);

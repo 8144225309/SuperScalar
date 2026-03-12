@@ -314,3 +314,38 @@ int test_queue_null_safety(void) {
 
     return 1;
 }
+
+/* Test 14: queue_get fetches a single entry by id. */
+int test_queue_get(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    TEST_ASSERT(queue_push(&db, 2, 7, QUEUE_REQ_ROTATION,
+                           QUEUE_URGENCY_HIGH, 0, "{\"test\":1}"), "push");
+
+    /* Drain to get the assigned id */
+    queue_entry_t entries[4];
+    size_t n = queue_drain(&db, 2, entries, 4);
+    TEST_ASSERT_EQ(n, 1, "one entry");
+    uint64_t entry_id = entries[0].id;
+
+    /* Fetch by id and verify all fields */
+    queue_entry_t got;
+    TEST_ASSERT(queue_get(&db, entry_id, &got), "get found");
+    TEST_ASSERT_EQ(got.id, entry_id, "id matches");
+    TEST_ASSERT_EQ(got.client_idx, 2, "client_idx");
+    TEST_ASSERT_EQ(got.factory_id, 7, "factory_id");
+    TEST_ASSERT_EQ(got.request_type, QUEUE_REQ_ROTATION, "request_type");
+    TEST_ASSERT_EQ(got.urgency, QUEUE_URGENCY_HIGH, "urgency");
+    TEST_ASSERT(strcmp(got.payload, "{\"test\":1}") == 0, "payload");
+
+    /* Not-found returns 0 */
+    TEST_ASSERT_EQ(queue_get(&db, 99999, &got), 0, "not found");
+
+    /* NULL safety */
+    TEST_ASSERT_EQ(queue_get(NULL, entry_id, &got), 0, "null persist");
+    TEST_ASSERT_EQ(queue_get(&db, entry_id, NULL), 0, "null out");
+
+    persist_close(&db);
+    return 1;
+}

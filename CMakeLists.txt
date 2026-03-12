@@ -175,6 +175,7 @@ add_executable(test_superscalar
     tests/test_queue.c
     tests/test_notify.c
     tests/test_readiness.c
+    tests/test_rotation_readiness.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
