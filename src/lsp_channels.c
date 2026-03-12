@@ -2667,6 +2667,10 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
 
+    if (mgr->readiness)
+        readiness_set_connected((readiness_tracker_t *)mgr->readiness,
+                                (uint32_t)c, 1);
+
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);
     return 1;
@@ -3623,6 +3627,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP daemon: client %zu disconnected\n", c);
                 wire_close(lsp->client_fds[c]);
                 lsp->client_fds[c] = -1;
+                if (mgr->readiness)
+                    readiness_clear((readiness_tracker_t *)mgr->readiness,
+                                    (uint32_t)c);
                 continue;
             }
 
