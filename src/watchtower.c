@@ -777,7 +777,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
         parent_txid, anchor_vout, anchor_spk_hex,
         (double)anchor_amount / 100000000.0);
 
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(wt->rt, unsigned_hex, prevtxs);
+    /* P2A anchor input is anyone-can-spend — wallet won't sign it, so
+       complete will be false. Pass require_complete=0. */
+    char *signed_hex = regtest_sign_raw_tx_with_wallet(wt->rt, unsigned_hex, prevtxs, 0);
     free(unsigned_hex);
     tx_buf_free(&unsigned_tx);
 

@@ -74,9 +74,13 @@ int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
                                 unsigned char *spk_out, size_t *spk_len_out);
 
 /* Sign a raw tx using the wallet's keys. Returns signed hex (caller frees).
-   prevtxs_json: JSON array of prevtx objects for non-wallet inputs, or NULL. */
+   prevtxs_json: JSON array of prevtx objects for non-wallet inputs, or NULL.
+   require_complete: if 1, return NULL when complete==false (wallet couldn't
+   sign all inputs). Pass 0 for CPFP transactions with P2A (anyone-can-spend)
+   anchor inputs, where complete==false is expected and correct. */
 char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
-                                        const char *prevtxs_json);
+                                        const char *prevtxs_json,
+                                        int require_complete);
 
 /* Derive bech32m P2TR address from a tweaked x-only pubkey via bitcoin-cli.
    tweaked_ser32: 32-byte serialized x-only public key (already TapTweaked).

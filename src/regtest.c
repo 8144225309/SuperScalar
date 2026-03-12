@@ -1003,7 +1003,8 @@ int regtest_derive_p2tr_address(const regtest_t *rt,
 }
 
 char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
-                                        const char *prevtxs_json) {
+                                        const char *prevtxs_json,
+                                        int require_complete) {
     if (!rt || !unsigned_hex) return NULL;
 
     char *params;
@@ -1023,24 +1024,29 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
 
     char *result = regtest_exec(rt, "signrawtransactionwithwallet", params);
     free(params);
-    if (!result) return NULL;
 
     cJSON *json = cJSON_Parse(result);
     free(result);
-    if (!json) return NULL;
+    if (!json) { fprintf(stderr, "SIGN DEBUG: JSON parse failed\n"); return NULL; }
 
     cJSON *hex = cJSON_GetObjectItem(json, "hex");
     if (!hex || !cJSON_IsString(hex)) {
+        fprintf(stderr, "SIGN DEBUG: no hex field\n");
         cJSON_Delete(json);
         return NULL;
     }
 
     /* Check that signing actually completed — if the wallet can't sign
-       (wrong wallet, missing key), complete will be false */
-    cJSON *complete = cJSON_GetObjectItem(json, "complete");
-    if (!complete || !cJSON_IsTrue(complete)) {
-        cJSON_Delete(json);
-        return NULL;
+       (wrong wallet, missing key), complete will be false.
+       Skip this check when require_complete==0, e.g. CPFP transactions
+       with a P2A anchor input (anyone-can-spend) that the wallet
+       legitimately does not sign. */
+    if (require_complete) {
+        cJSON *complete = cJSON_GetObjectItem(json, "complete");
+        if (!complete || !cJSON_IsTrue(complete)) {
+            cJSON_Delete(json);
+            return NULL;
+        }
     }
 
     char *signed_hex = strdup(hex->valuestring);
@@ -1260,7 +1266,7 @@ int regtest_create_funded_tx(regtest_t *rt, const tx_output_t *outputs,
     while (e > s && (*e == '"' || *e == ' ' || *e == '\n')) *e-- = '\0';
 
     /* Sign */
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, s, NULL);
+    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, s, NULL, 1);
     free(raw);
     if (!signed_hex) return 0;
 

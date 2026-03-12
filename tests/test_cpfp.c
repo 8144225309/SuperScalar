@@ -391,12 +391,12 @@ int test_cpfp_sign_complete_check(void) {
 
     /* With invalid hex, the function should return NULL (can't sign —
        bitcoin-cli not running in unit tests) */
-    char *result = regtest_sign_raw_tx_with_wallet(&rt, "deadbeef", NULL);
+    char *result = regtest_sign_raw_tx_with_wallet(&rt, "deadbeef", NULL, 1);
     TEST_ASSERT(result == NULL, "invalid hex without bitcoind should return NULL");
     if (result) free(result);
 
     /* Test with NULL input */
-    result = regtest_sign_raw_tx_with_wallet(&rt, NULL, NULL);
+    result = regtest_sign_raw_tx_with_wallet(&rt, NULL, NULL, 1);
     TEST_ASSERT(result == NULL, "NULL unsigned_hex returns NULL");
 
     return 1;
