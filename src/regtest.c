@@ -1348,3 +1348,160 @@ int regtest_wait_confirmed_with_bump(regtest_t *rt, const char *txid_hex,
 
     return -1; /* timeout */
 }
+
+/* -------------------------------------------------------------------------
+ * BIP 157/158 filter helpers
+ * ------------------------------------------------------------------------- */
+
+int regtest_get_block_hash(regtest_t *rt, int height,
+                            char *hash_out, size_t hash_out_len)
+{
+    char params[32];
+    snprintf(params, sizeof(params), "%d", height);
+    char *result = regtest_exec(rt, "getblockhash", params);
+    if (!result) return 0;
+
+    /* Strip surrounding quotes and whitespace */
+    char *start = result;
+    while (*start == '"' || *start == ' ' || *start == '\n') start++;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == '"' || *end == ' ' || *end == '\n'))
+        *end-- = '\0';
+
+    if (strlen(start) < 64) { free(result); return 0; }
+    if (hash_out_len >= 65)
+        strncpy(hash_out, start, 65);
+    free(result);
+    return 1;
+}
+
+int regtest_get_block_filter(regtest_t *rt, const char *block_hash,
+                              unsigned char *filter_bytes_out,
+                              size_t        *filter_len_out,
+                              size_t         filter_max,
+                              unsigned char  key_out[16])
+{
+    /* getblockfilter <hash> "basic" returns:
+       {"filter":"<hex>","header":"<hex>"}  */
+    char params[200];
+    snprintf(params, sizeof(params), "\"%s\" \"basic\"", block_hash);
+    char *result = regtest_exec(rt, "getblockfilter", params);
+    if (!result) return 0;
+
+    /* Parse "filter" field */
+    const char *fp = strstr(result, "\"filter\"");
+    if (!fp) { free(result); return 0; }
+    fp = strchr(fp, ':');
+    if (!fp) { free(result); return 0; }
+    fp++;
+    while (*fp == ' ' || *fp == '"') fp++;
+
+    /* Decode hex into filter_bytes_out */
+    size_t hex_len = 0;
+    const char *p = fp;
+    while (*p && *p != '"') { p++; hex_len++; }
+    if (hex_len % 2 != 0 || hex_len / 2 > filter_max) {
+        free(result);
+        return 0;
+    }
+    for (size_t i = 0; i < hex_len / 2; i++) {
+        unsigned int byte;
+        if (sscanf(fp + i * 2, "%02x", &byte) != 1) {
+            free(result);
+            return 0;
+        }
+        filter_bytes_out[i] = (unsigned char)byte;
+    }
+    *filter_len_out = hex_len / 2;
+    free(result);
+
+    /* Derive the 16-byte SipHash key: first 16 bytes of block hash
+       (in internal byte order = reversed from display order) */
+    if (key_out) {
+        unsigned char block_hash_bytes[32];
+        for (int i = 0; i < 32; i++) {
+            unsigned int byte;
+            sscanf(block_hash + (31 - i) * 2, "%02x", &byte);
+            block_hash_bytes[i] = (unsigned char)byte;
+        }
+        memcpy(key_out, block_hash_bytes, 16);
+    }
+
+    return 1;
+}
+
+int regtest_scan_block_txs(regtest_t *rt, const char *block_hash,
+                            regtest_tx_callback_t callback, void *ctx)
+{
+    /* getblock <hash> 2 returns full verbose JSON with decoded tx data */
+    char params[200];
+    snprintf(params, sizeof(params), "\"%s\" 2", block_hash);
+    char *result = regtest_exec(rt, "getblock", params);
+    if (!result) return -1;
+
+    int tx_count = 0;
+
+    /* Walk through each "txid" field and the following "vout" array.
+       Parsing with cJSON for correctness. */
+    cJSON *block = cJSON_Parse(result);
+    free(result);
+    if (!block) return -1;
+
+    cJSON *txs = cJSON_GetObjectItem(block, "tx");
+    if (!txs || !cJSON_IsArray(txs)) { cJSON_Delete(block); return -1; }
+
+    cJSON *tx = NULL;
+    cJSON_ArrayForEach(tx, txs) {
+        cJSON *txid_json = cJSON_GetObjectItem(tx, "txid");
+        if (!txid_json || !cJSON_IsString(txid_json)) continue;
+        const char *txid_hex = txid_json->valuestring;
+
+        cJSON *vout = cJSON_GetObjectItem(tx, "vout");
+        if (!vout || !cJSON_IsArray(vout)) continue;
+
+        int n_out = cJSON_GetArraySize(vout);
+        if (n_out <= 0) continue;
+
+        /* Collect scriptPubKeys */
+        const unsigned char **spks  = calloc(n_out, sizeof(unsigned char *));
+        size_t              *lens   = calloc(n_out, sizeof(size_t));
+        unsigned char      **bufs   = calloc(n_out, sizeof(unsigned char *));
+        if (!spks || !lens || !bufs) {
+            free(spks); free(lens); free(bufs);
+            continue;
+        }
+
+        int valid = 1;
+        for (int i = 0; i < n_out && valid; i++) {
+            cJSON *out   = cJSON_GetArrayItem(vout, i);
+            cJSON *spk_j = cJSON_GetObjectItem(out, "scriptPubKey");
+            cJSON *hex_j = spk_j ? cJSON_GetObjectItem(spk_j, "hex") : NULL;
+            if (!hex_j || !cJSON_IsString(hex_j)) { valid = 0; break; }
+
+            const char *hex = hex_j->valuestring;
+            size_t hlen = strlen(hex);
+            if (hlen % 2 != 0) { valid = 0; break; }
+
+            bufs[i] = malloc(hlen / 2);
+            if (!bufs[i]) { valid = 0; break; }
+            for (size_t j = 0; j < hlen / 2; j++) {
+                unsigned int byte;
+                sscanf(hex + j * 2, "%02x", &byte);
+                bufs[i][j] = (unsigned char)byte;
+            }
+            spks[i] = bufs[i];
+            lens[i] = hlen / 2;
+        }
+
+        if (valid && callback)
+            callback(txid_hex, (size_t)n_out, spks, lens, ctx);
+
+        for (int i = 0; i < n_out; i++) free(bufs[i]);
+        free(spks); free(lens); free(bufs);
+
+        tx_count++;
+    }
+
+    cJSON_Delete(block);
+    return tx_count;
+}

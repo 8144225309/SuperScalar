@@ -77,12 +77,35 @@ typedef struct {
     /* Network ("mainnet", "signet", "testnet") */
     char             network[16];
 
+    /* RPC context for Phase 3 scan loop (regtest_t *); NULL when using P2P */
+    void            *rpc_ctx;
+
     /* TODO: P2P peer connection state */
 } bip158_backend_t;
 
 /* Initialise backend. Returns 1 on success, 0 on failure. */
 int  bip158_backend_init(bip158_backend_t *backend, const char *network);
 void bip158_backend_free(bip158_backend_t *backend);
+
+/*
+ * Attach a regtest_t RPC handle for the Phase-3 scan loop.
+ * Must be called before bip158_backend_scan() when not using a P2P peer.
+ * rt is typed void* to avoid pulling regtest.h into this header.
+ */
+void bip158_backend_set_rpc(bip158_backend_t *backend, void *rt);
+
+/*
+ * Walk blocks from last synced height + 1 up to the current chain tip.
+ * For each new block:
+ *   1. Fetch its compact filter via regtest RPC (getblockfilter).
+ *   2. Run the GCS filter against all registered scriptPubKeys.
+ *   3. On a match, fetch the full block (getblock verbosity 2) and cache
+ *      every tx whose outputs include a watched script.
+ * Updates backend->tip_height on success.
+ * Returns the number of matched blocks (may include false positives),
+ * or -1 on hard error (RPC unavailable, no rpc_ctx attached).
+ */
+int bip158_backend_scan(bip158_backend_t *backend);
 
 /*
  * Low-level GCS helpers — exposed for unit testing.

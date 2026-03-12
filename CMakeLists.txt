@@ -135,6 +135,7 @@ add_executable(test_superscalar
     tests/test_dw_state.c
     tests/test_musig.c
     tests/test_tx_builder.c
+    tests/test_bip158.c
     tests/test_regtest.c
     tests/test_factory.c
     tests/test_tapscript.c

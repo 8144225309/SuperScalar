@@ -156,6 +156,10 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
                                       to_local_spk, spk_len);
     }
 
+    /* Register script with chain backend (no-op for TXID-polling backend) */
+    if (wt->chain && wt->chain->register_script)
+        wt->chain->register_script(wt->chain, to_local_spk, spk_len);
+
     return 1;
 }
 
@@ -293,6 +297,10 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 memcpy(wh->payment_hash, old_htlcs[i].payment_hash, 32);
                 wh->cltv_expiry = old_htlcs[i].cltv_expiry;
                 entry->n_htlc_outputs++;
+
+                /* Register HTLC script with chain backend */
+                if (wt->chain && wt->chain->register_script)
+                    wt->chain->register_script(wt->chain, wh->htlc_spk, 34);
 
                 out_ofs += 8 + 1 + slen;
                 htlc_active_idx++;
@@ -908,7 +916,24 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     e->htlc_outputs_cap = n_htlcs;
 
     wt->n_entries++;
+
+    /* Register HTLC scripts with chain backend */
+    if (wt->chain && wt->chain->register_script)
+        for (size_t i = 0; i < n_htlcs; i++)
+            wt->chain->register_script(wt->chain, htlcs[i].htlc_spk, 34);
     return 1;
+}
+
+/* Unregister all scripts belonging to an entry from the chain backend. */
+static void entry_unregister_scripts(watchtower_t *wt, watchtower_entry_t *e)
+{
+    if (!wt->chain || !wt->chain->unregister_script) return;
+    if (e->to_local_spk_len > 0)
+        wt->chain->unregister_script(wt->chain, e->to_local_spk,
+                                      e->to_local_spk_len);
+    for (size_t h = 0; h < e->n_htlc_outputs; h++)
+        wt->chain->unregister_script(wt->chain, e->htlc_outputs[h].htlc_spk,
+                                      34);
 }
 
 void watchtower_clear_entries(watchtower_t *wt) {
@@ -916,6 +941,7 @@ void watchtower_clear_entries(watchtower_t *wt) {
     /* Free per-entry heap data (HTLC outputs, response/burn txs) but
        preserve the channels and pending arrays — they outlive entries. */
     for (size_t i = 0; i < wt->n_entries; i++) {
+        entry_unregister_scripts(wt, &wt->entries[i]);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE) {
@@ -933,6 +959,7 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
 
     for (size_t i = 0; i < wt->n_entries; ) {
         if (wt->entries[i].channel_id == channel_id) {
+            entry_unregister_scripts(wt, &wt->entries[i]);
             free(wt->entries[i].htlc_outputs);
             if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);

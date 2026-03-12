@@ -1,7 +1,9 @@
 #include "superscalar/bip158_backend.h"
+#include "superscalar/regtest.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* -------------------------------------------------------------------------
  * SipHash-2-4
@@ -412,4 +414,111 @@ int bip158_scan_filter(bip158_backend_t *backend,
     return bip158_gcs_match_any(filter_bytes + hdr, filter_len - hdr,
                                  n_items, key16,
                                  backend->scripts, backend->n_scripts);
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 3: RPC-backed scan loop
+ * Uses regtest bitcoin-cli calls to fetch filters and full blocks.
+ * ------------------------------------------------------------------------- */
+
+void bip158_backend_set_rpc(bip158_backend_t *backend, void *rt)
+{
+    if (backend) backend->rpc_ctx = rt;
+}
+
+/* Callback context for scan_tx_callback */
+typedef struct {
+    bip158_backend_t *backend;
+    int32_t           height;
+    int               found;   /* set to 1 if at least one script matched */
+} scan_cb_ctx_t;
+
+/* Per-tx callback: if any output script is watched, cache the txid. */
+static void scan_tx_callback(const char *txid_hex,
+                              size_t n_outputs,
+                              const unsigned char **spks,
+                              const size_t *spk_lens,
+                              void *ctx)
+{
+    scan_cb_ctx_t    *sc = (scan_cb_ctx_t *)ctx;
+    bip158_backend_t *b  = sc->backend;
+
+    for (size_t i = 0; i < n_outputs; i++) {
+        for (size_t j = 0; j < b->n_scripts; j++) {
+            if (b->scripts[j].spk_len == spk_lens[i] &&
+                memcmp(b->scripts[j].spk, spks[i], spk_lens[i]) == 0) {
+                /* Convert display-order hex txid to internal byte order */
+                unsigned char txid[32];
+                for (int k = 0; k < 32; k++) {
+                    unsigned int byte;
+                    sscanf(txid_hex + (31 - k) * 2, "%02x", &byte);
+                    txid[k] = (unsigned char)byte;
+                }
+                bip158_cache_tx(b, txid, sc->height);
+                sc->found = 1;
+                return;  /* one cache entry per tx is sufficient */
+            }
+        }
+    }
+}
+
+/*
+ * BIP 158 RPC scan loop.
+ * Walks blocks from tip_height+1 to current chain tip.
+ * Returns matched-block count, or -1 on error.
+ */
+int bip158_backend_scan(bip158_backend_t *backend)
+{
+    if (!backend || !backend->rpc_ctx) return -1;
+    regtest_t *rt = (regtest_t *)backend->rpc_ctx;
+
+    if (!backend->n_scripts) return 0;
+
+    int tip = regtest_get_block_height(rt);
+    if (tip < 0) return -1;
+
+    /* On first call, start from the current tip (don't scan genesis→tip) */
+    int start = (backend->tip_height >= 0) ? backend->tip_height + 1 : tip;
+
+    /* Maximum filter size: BIP 158 filters are bounded by block size.
+       16 KB covers any regtest/signet block; mainnet blocks can be larger.
+       Use a heap allocation proportional to a safe upper bound. */
+#define FILTER_BUF_MAX (4 * 1024 * 1024)  /* 4 MB — handles mainnet worst case */
+    unsigned char *filter_buf = malloc(FILTER_BUF_MAX);
+    if (!filter_buf) return -1;
+
+    int matched = 0;
+
+    for (int h = start; h <= tip; h++) {
+        char hash[65];
+        if (!regtest_get_block_hash(rt, h, hash, sizeof(hash)))
+            continue;
+
+        size_t        filter_len = 0;
+        unsigned char key[16];
+        if (!regtest_get_block_filter(rt, hash,
+                                       filter_buf, &filter_len,
+                                       FILTER_BUF_MAX, key)) {
+            /* Non-fatal: skip block but still advance tip */
+            backend->tip_height = h;
+            continue;
+        }
+
+        if (!bip158_scan_filter(backend, filter_buf, filter_len, key)) {
+            /* Fast skip: no scripts match this filter */
+            backend->tip_height = h;
+            continue;
+        }
+
+        /* Filter hit — fetch the full block and cache relevant txids */
+        scan_cb_ctx_t sc = { backend, (int32_t)h, 0 };
+        regtest_scan_block_txs(rt, hash, scan_tx_callback, &sc);
+
+        backend->tip_height = h;
+        if (sc.found) matched++;
+    }
+
+    free(filter_buf);
+#undef FILTER_BUF_MAX
+    return matched;
 }
