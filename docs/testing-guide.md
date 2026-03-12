@@ -53,10 +53,10 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
 | Unit tests | 418 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
-| Regtest integration | 43 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
+| Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
 | Orchestrator scenarios | 30 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation, DW exhibition, dual factory, BOLT11 bridge |
 | Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
-| **Total** | **516 (461 automated + 25 manual + 30 orchestrator)** | | |
+| **Total** | **515 (460 automated + 25 manual + 30 orchestrator)** | | |
 
 ---
 
@@ -500,6 +500,7 @@ GitHub Actions runs on every push and pull request:
 |--------|---------------------|
 | Linux (Ubuntu) | Full build + unit tests |
 | macOS | Full build + unit tests |
+| Linux ARM64 | Full build + unit tests (Docker, linux/arm64) |
 | Linux + Sanitizers | ASan + UBSan build + unit tests |
 | Static Analysis | cppcheck (zero warnings enforced) |
 | Regtest Integration | Real Bitcoin Core 28.1 + regtest tests |

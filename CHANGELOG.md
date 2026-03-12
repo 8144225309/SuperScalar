@@ -6,6 +6,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Added
 
+- **CI: ARM64 build and unit test job**: GitHub Actions now builds and runs all 418 unit tests on `linux/arm64` via Docker on every push to main. CI job count increases from 7 to 8.
 - **Dashboard: 5 missing DB tables** (`tools/dashboard.py`): queries `broadcast_log`, `signing_progress`, `watchtower_pending`, `old_commitment_htlcs`, and `factory_revocation_secrets` — bringing dashboard coverage to all 26 schema tables.
 - **Dashboard: Signing Progress UI** (Factory tab): per-signer MuSig2 nonce/partial-sig collection status with progress bars per tree node.
 - **Dashboard: Watchtower enhancements** (Watchtower tab): Broadcast Log (TX broadcast history with pass/fail results), Watchtower Pending Penalties (in-flight penalty TXs with mempool cycle and fee bump counts), Old Commitment HTLCs (breach-penalty HTLC details), and Factory Revocation Secrets (per-factory epoch count).
@@ -14,6 +15,10 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
+- **`fee_for_factory_tx` vbyte underestimate**: Factory tree transaction overhead was calculated as 50 vB instead of the correct 68 vB (10 vB tx overhead + 58 vB P2TR keypath input). Formula is now `68 + 43 × n_outputs`. Updated `test_fee_factory_tx` assertions (93→111, 179→197, 265→283 at 1 sat/vB).
+- **Docs: testing-guide regtest count corrected**: Was 43, actual count is 42. Total automated corrected to 460, suite total to 515.
+- **Docs: ARM64 CI row** added to testing-guide CI table and README feature table.
+- **Docs: signet/testnet4 ceremony timeout note** added to lsp-operator-guide Timing section — ceremony message timeouts are 120s on non-regtest networks; cooperative close nonce/psig collection is 300s per client, automatic based on `--network`.
 - **Ceremony close timeout**: `ceremony_select_all()` used 30-second hardcoded timeout for close nonce/psig collection. Now uses `per_client_timeout_sec` (300s on signet/testnet4) so cooperative close doesn't time out on slow networks.
 - **Ceremony and rotation timeouts**: Increased `wire_recv_timeout` for demo rotation and close ceremonies from 30s to 120s for signet/testnet4 where block confirmation can take minutes.
 - **Demo/rotation message timeouts**: Increased `wire_recv_timeout` for `MSG_FACTORY_PROPOSE`, `MSG_NONCE_BUNDLE`, `MSG_PSIG_BUNDLE`, and other ceremony messages from 30s to 120s on non-regtest networks.
