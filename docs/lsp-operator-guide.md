@@ -175,6 +175,8 @@ Press **Ctrl+C**. The LSP will:
 | `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (rotation window) |
 | `--fee-rate` | 1000 | Fee rate in sat/kvB |
 
+**Ceremony timeouts on signet/testnet4**: MuSig2 signing ceremonies (factory creation, cooperative close, rotation) use longer message timeouts on non-regtest networks — 120s per message vs 30s on regtest. The cooperative close nonce/psig collection uses 300s per client on signet/testnet4. These are automatic based on `--network`; no flags needed.
+
 ### Security
 
 | Flag | Default | Description |
