@@ -721,6 +721,45 @@ extern int test_hd_wallet_sign_verify(void);
 extern int test_hd_wallet_utxo_persist(void);
 extern int test_p2p_scan_block_full_output(void);
 
+/* Async Signing: Pending Work Queue */
+extern int test_queue_push_drain(void);
+extern int test_queue_urgency_ordering(void);
+extern int test_queue_dedup_replace(void);
+extern int test_queue_different_types(void);
+extern int test_queue_client_isolation(void);
+extern int test_queue_expire(void);
+extern int test_queue_delete_single(void);
+extern int test_queue_delete_all(void);
+extern int test_queue_has_pending(void);
+extern int test_queue_request_type_name(void);
+extern int test_queue_null_payload(void);
+extern int test_queue_drain_limit(void);
+extern int test_queue_null_safety(void);
+
+/* Async Signing: Notification Dispatch */
+extern int test_notify_log_init(void);
+extern int test_notify_custom_dispatch(void);
+extern int test_notify_multiple_sends(void);
+extern int test_notify_cleanup(void);
+extern int test_notify_null_safety(void);
+extern int test_notify_event_names(void);
+extern int test_notify_null_detail(void);
+extern int test_notify_webhook_init(void);
+extern int test_notify_exec_init(void);
+extern int test_notify_init_null_args(void);
+
+/* Async Signing: Client Readiness Tracker */
+extern int test_readiness_init(void);
+extern int test_readiness_set_connected(void);
+extern int test_readiness_set_ready(void);
+extern int test_readiness_all_ready(void);
+extern int test_readiness_partial(void);
+extern int test_readiness_clear(void);
+extern int test_readiness_persist_roundtrip(void);
+extern int test_readiness_urgency_levels(void);
+extern int test_readiness_get_missing(void);
+extern int test_readiness_reset(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -1376,6 +1415,45 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hd_wallet_sign_verify);
     RUN_TEST(test_hd_wallet_utxo_persist);
     RUN_TEST(test_p2p_scan_block_full_output);
+
+    printf("\n=== Async Signing: Pending Work Queue ===\n");
+    RUN_TEST(test_queue_push_drain);
+    RUN_TEST(test_queue_urgency_ordering);
+    RUN_TEST(test_queue_dedup_replace);
+    RUN_TEST(test_queue_different_types);
+    RUN_TEST(test_queue_client_isolation);
+    RUN_TEST(test_queue_expire);
+    RUN_TEST(test_queue_delete_single);
+    RUN_TEST(test_queue_delete_all);
+    RUN_TEST(test_queue_has_pending);
+    RUN_TEST(test_queue_request_type_name);
+    RUN_TEST(test_queue_null_payload);
+    RUN_TEST(test_queue_drain_limit);
+    RUN_TEST(test_queue_null_safety);
+
+    printf("\n=== Async Signing: Notification Dispatch ===\n");
+    RUN_TEST(test_notify_log_init);
+    RUN_TEST(test_notify_custom_dispatch);
+    RUN_TEST(test_notify_multiple_sends);
+    RUN_TEST(test_notify_cleanup);
+    RUN_TEST(test_notify_null_safety);
+    RUN_TEST(test_notify_event_names);
+    RUN_TEST(test_notify_null_detail);
+    RUN_TEST(test_notify_webhook_init);
+    RUN_TEST(test_notify_exec_init);
+    RUN_TEST(test_notify_init_null_args);
+
+    printf("\n=== Async Signing: Client Readiness Tracker ===\n");
+    RUN_TEST(test_readiness_init);
+    RUN_TEST(test_readiness_set_connected);
+    RUN_TEST(test_readiness_set_ready);
+    RUN_TEST(test_readiness_all_ready);
+    RUN_TEST(test_readiness_partial);
+    RUN_TEST(test_readiness_clear);
+    RUN_TEST(test_readiness_persist_roundtrip);
+    RUN_TEST(test_readiness_urgency_levels);
+    RUN_TEST(test_readiness_get_missing);
+    RUN_TEST(test_readiness_reset);
 }
 
 extern int regtest_init_faucet(void);

@@ -270,6 +270,28 @@ static const char *SCHEMA_SQL =
     "  filter_headers_synced INTEGER NOT NULL DEFAULT -1,"
     "  header_hashes BLOB,"
     "  filter_headers BLOB"
+    ");"
+    /* Async signing: pending work queue for offline clients */
+    "CREATE TABLE IF NOT EXISTS pending_queue ("
+    "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  client_idx  INTEGER NOT NULL,"
+    "  factory_id  INTEGER NOT NULL,"
+    "  request_type INTEGER NOT NULL,"
+    "  urgency     INTEGER NOT NULL DEFAULT 1,"
+    "  created_at  INTEGER NOT NULL,"
+    "  expires_at  INTEGER NOT NULL DEFAULT 0,"
+    "  payload     TEXT,"
+    "  UNIQUE (client_idx, factory_id, request_type) ON CONFLICT REPLACE"
+    ");"
+    /* Async signing: per-client readiness state across LSP restarts */
+    "CREATE TABLE IF NOT EXISTS client_readiness ("
+    "  client_idx   INTEGER NOT NULL,"
+    "  factory_id   INTEGER NOT NULL,"
+    "  is_connected INTEGER NOT NULL DEFAULT 0,"
+    "  is_ready     INTEGER NOT NULL DEFAULT 0,"
+    "  last_seen    INTEGER NOT NULL DEFAULT 0,"
+    "  ready_for    INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (client_idx, factory_id)"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
