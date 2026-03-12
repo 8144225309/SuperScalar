@@ -2143,7 +2143,9 @@ int main(int argc, char *argv[]) {
 
             /* Populate keypairs — factory_init_from_pubkeys() leaves them
                zeroed, but factory_sign_all() needs them to generate nonces.
-               In demo mode the LSP has all keys (same pattern as distrib/turnover tests). */
+               In demo mode the LSP has all keys (same pattern as distrib/turnover tests).
+               Reorder to match lsp.factory.pubkeys connection order —
+               MuSig2 key aggregation is order-dependent (BIP-327). */
             {
                 secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
                 all_kps[0] = lsp_kp;
@@ -2154,6 +2156,27 @@ int main(int argc, char *argv[]) {
                     if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
                         fprintf(stderr, "DW ADVANCE TEST: keypair create failed\n");
                         return 1;
+                    }
+                }
+                secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                for (size_t slot = 0; slot < n_total; slot++) {
+                    unsigned char target[33];
+                    size_t tlen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                                                  &lsp.factory.pubkeys[slot],
+                                                  SECP256K1_EC_COMPRESSED);
+                    for (size_t k = 0; k < n_total; k++) {
+                        secp256k1_pubkey kpub;
+                        secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                        unsigned char kser[33];
+                        size_t klen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                      &kpub, SECP256K1_EC_COMPRESSED);
+                        if (memcmp(target, kser, 33) == 0) {
+                            all_kps[slot] = ordered[k];
+                            break;
+                        }
                     }
                 }
                 memcpy(lsp.factory.keypairs, all_kps,
