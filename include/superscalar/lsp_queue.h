@@ -46,6 +46,9 @@ int queue_push(persist_t *p, uint32_t client_idx, uint32_t factory_id,
 size_t queue_drain(persist_t *p, uint32_t client_idx,
                    queue_entry_t *entries_out, size_t max_entries);
 
+/* Fetch a single entry by id. Returns 1 on success, 0 if not found. */
+int queue_get(persist_t *p, uint64_t entry_id, queue_entry_t *out);
+
 /* Delete a single entry by id (after client processes it). Returns 1 on success. */
 int queue_delete(persist_t *p, uint64_t entry_id);
 

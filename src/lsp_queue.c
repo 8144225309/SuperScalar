@@ -74,6 +74,37 @@ size_t queue_drain(persist_t *p, uint32_t client_idx,
     return count;
 }
 
+int queue_get(persist_t *p, uint64_t entry_id, queue_entry_t *out) {
+    if (!p || !p->db || !out) return 0;
+
+    const char *sql =
+        "SELECT id, client_idx, factory_id, request_type, urgency, "
+        "       created_at, expires_at, payload "
+        "FROM pending_queue WHERE id = ?";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return 0;
+
+    sqlite3_bind_int64(stmt, 1, (int64_t)entry_id);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) { sqlite3_finalize(stmt); return 0; }
+
+    memset(out, 0, sizeof(*out));
+    out->id           = (uint64_t)sqlite3_column_int64(stmt, 0);
+    out->client_idx   = (uint32_t)sqlite3_column_int(stmt, 1);
+    out->factory_id   = (uint32_t)sqlite3_column_int(stmt, 2);
+    out->request_type = sqlite3_column_int(stmt, 3);
+    out->urgency      = sqlite3_column_int(stmt, 4);
+    out->created_at   = (time_t)sqlite3_column_int64(stmt, 5);
+    out->expires_at   = (time_t)sqlite3_column_int64(stmt, 6);
+    const char *payload = (const char *)sqlite3_column_text(stmt, 7);
+    if (payload)
+        snprintf(out->payload, sizeof(out->payload), "%s", payload);
+
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
 int queue_delete(persist_t *p, uint64_t entry_id) {
     if (!p || !p->db) return 0;
 

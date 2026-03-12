@@ -8,6 +8,8 @@
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
+#include "superscalar/lsp_queue.h"
+#include "superscalar/readiness.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2195,6 +2197,53 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 client_idx,
                 (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
         return 0;  /* close the connection */
+    }
+
+    case MSG_QUEUE_POLL: {
+        /* Client is polling for pending work items. Drain the queue and reply. */
+        persist_t *db = (persist_t *)mgr->persist;
+        queue_entry_t entries[16];
+        size_t n = 0;
+        if (db)
+            n = queue_drain(db, (uint32_t)client_idx, entries, 16);
+        cJSON *items_json = wire_build_queue_items(entries, n);
+        if (!wire_send(lsp->client_fds[client_idx], MSG_QUEUE_ITEMS, items_json)) {
+            cJSON_Delete(items_json);
+            return 0;
+        }
+        cJSON_Delete(items_json);
+        return 1;
+    }
+
+    case MSG_QUEUE_DONE: {
+        /* Client has processed a set of queue items; delete them from the queue
+           and, if any were QUEUE_REQ_ROTATION, mark this client as ready. */
+        uint64_t ids[64];
+        size_t count = 0;
+        if (!wire_parse_queue_done(msg->json, ids, 64, &count))
+            return 0;
+
+        persist_t *db = (persist_t *)mgr->persist;
+        int has_rotation_ack = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (db) {
+                queue_entry_t entry;
+                if (queue_get(db, ids[i], &entry) &&
+                    entry.request_type == QUEUE_REQ_ROTATION)
+                    has_rotation_ack = 1;
+                queue_delete(db, ids[i]);
+            }
+        }
+
+        if (has_rotation_ack && mgr->readiness) {
+            readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
+            readiness_set_ready(rt, (uint32_t)client_idx, QUEUE_REQ_ROTATION);
+            printf("LSP: client %zu acknowledged rotation — %zu/%zu ready\n",
+                   client_idx,
+                   (size_t)readiness_count_ready(rt),
+                   rt->n_clients);
+        }
+        return 1;
     }
 
     default:
