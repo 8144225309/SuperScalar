@@ -14,6 +14,7 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
+- **`fee_for_factory_tx` vbyte underestimate**: Factory tree transaction overhead was calculated as 50 vB instead of the correct 68 vB (10 vB tx overhead + 58 vB P2TR keypath input). The formula is now `68 + 43 × n_outputs`. Updated `test_fee_factory_tx` assertions accordingly (93→111, 179→197, 265→283 at 1 sat/vB).
 - **Ceremony close timeout**: `ceremony_select_all()` used 30-second hardcoded timeout for close nonce/psig collection. Now uses `per_client_timeout_sec` (300s on signet/testnet4) so cooperative close doesn't time out on slow networks.
 - **Ceremony and rotation timeouts**: Increased `wire_recv_timeout` for demo rotation and close ceremonies from 30s to 120s for signet/testnet4 where block confirmation can take minutes.
 - **Demo/rotation message timeouts**: Increased `wire_recv_timeout` for `MSG_FACTORY_PROPOSE`, `MSG_NONCE_BUNDLE`, `MSG_PSIG_BUNDLE`, and other ceremony messages from 30s to 120s on non-regtest networks.
