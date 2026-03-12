@@ -88,14 +88,20 @@ static uint64_t bip158_hash(const unsigned char *key16,
 #ifdef __SIZEOF_INT128__
     return (uint64_t)((__uint128_t)h * F >> 64);
 #else
-    /* Portable 64x64→128 multiply using 32-bit halves */
-    uint64_t lo_h = h  & 0xffffffff;
-    uint64_t hi_h = h  >> 32;
-    uint64_t lo_F = F  & 0xffffffff;
-    uint64_t hi_F = F  >> 32;
-    uint64_t mid  = (lo_h * hi_F) + (hi_h * lo_F);
-    uint64_t hi   = hi_h * hi_F + (mid >> 32);
-    return hi + ((lo_h * lo_F) >> 64);  /* approximation on 32-bit hosts */
+    /* Portable 64x64→high-64 multiply using 32-bit halves.
+     * Split: h = hi_h*2^32 + lo_h, F = hi_F*2^32 + lo_F
+     * (h*F) >> 64 = hh + (lh>>32) + (hl>>32) + (mid>>32)
+     * where mid = (ll>>32) + (lh & mask32) + (hl & mask32) */
+    uint64_t lo_h  = h & 0xffffffffULL;
+    uint64_t hi_h  = h >> 32;
+    uint64_t lo_F  = F & 0xffffffffULL;
+    uint64_t hi_F  = F >> 32;
+    uint64_t ll    = lo_h * lo_F;
+    uint64_t lh    = lo_h * hi_F;
+    uint64_t hl    = hi_h * lo_F;
+    uint64_t hh    = hi_h * hi_F;
+    uint64_t mid   = (ll >> 32) + (lh & 0xffffffffULL) + (hl & 0xffffffffULL);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
 #endif
 }
 
