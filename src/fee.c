@@ -79,7 +79,7 @@ uint64_t fee_for_commitment_tx(const fee_estimator_t *fe, size_t n_htlcs) {
 }
 
 uint64_t fee_for_factory_tx(const fee_estimator_t *fe, size_t n_outputs) {
-    /* Factory tree tx: ~50 vB overhead + ~43 vB per P2TR output */
-    size_t vsize = 50 + 43 * n_outputs;
+    /* Factory tree tx: 68 vB overhead (10 vB tx + 58 vB P2TR keypath input) + 43 vB per P2TR output */
+    size_t vsize = 68 + 43 * n_outputs;
     return fee_estimate(fe, vsize);
 }
