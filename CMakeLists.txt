@@ -86,6 +86,8 @@ add_library(superscalar
     src/tx_builder.c
     src/musig.c
     src/regtest.c
+    src/chain_backend_regtest.c
+    src/bip158_backend.c
     src/util.c
     src/factory.c
     src/tapscript.c

@@ -1,7 +1,10 @@
 #include "superscalar/watchtower.h"
 #include "superscalar/types.h"
 #include "superscalar/persist.h"
+#include "superscalar/chain_backend.h"
 #include "cJSON.h"
+
+extern void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt);
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -32,6 +35,12 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     wt->rt = rt;
     wt->fee = fee;
     wt->db = db;
+
+    /* Wrap regtest_t as the default chain backend when provided. */
+    if (rt) {
+        chain_backend_regtest_init(&wt->_chain_regtest_wrapper, rt);
+        wt->chain = &wt->_chain_regtest_wrapper;
+    }
 
     /* P2A anchor: static anyone-can-spend SPK — no keys needed */
     memcpy(wt->anchor_spk, P2A_SPK, P2A_SPK_LEN);
@@ -315,8 +324,14 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     free(saved_htlcs);
 }
 
+void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)
+{
+    if (wt)
+        wt->chain = backend;
+}
+
 int watchtower_check(watchtower_t *wt) {
-    if (!wt || !wt->rt) return 0;
+    if (!wt || !wt->chain) return 0;
 
     int penalties_broadcast = 0;
 
@@ -331,8 +346,8 @@ int watchtower_check(watchtower_t *wt) {
         hex_encode(display_txid, 32, txid_hex);
 
         /* Check if old commitment is on chain or in mempool */
-        int conf = regtest_get_confirmations(wt->rt, txid_hex);
-        int in_mempool = regtest_is_in_mempool(wt->rt, txid_hex);
+        int conf = wt->chain->get_confirmations(wt->chain, txid_hex);
+        int in_mempool = wt->chain->is_in_mempool(wt->chain, txid_hex);
 
         if (conf < 0 && !in_mempool) {
             i++;  /* not found, keep watching */
@@ -350,7 +365,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (resp_hex) {
                     hex_encode(e->response_tx, e->response_tx_len, resp_hex);
                     char resp_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, resp_hex, resp_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
                         penalties_broadcast++;
                         if (wt->db && wt->db->db)
@@ -372,7 +387,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (burn_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, burn_hex);
                     char burn_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, burn_hex, burn_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, burn_hex, burn_txid)) {
                         printf("  L-stock burn tx broadcast: %s\n", burn_txid);
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, burn_txid,
@@ -403,7 +418,8 @@ int watchtower_check(watchtower_t *wt) {
         fflush(stdout);
 
         /* If in mempool but not confirmed, mine a block (regtest only) */
-        if (in_mempool && conf < 0 && strcmp(wt->rt->network, "regtest") == 0) {
+        if (in_mempool && conf < 0 &&
+            wt->rt && strcmp(wt->rt->network, "regtest") == 0) {
             char mine_addr[128];
             if (regtest_get_new_address(wt->rt, mine_addr, sizeof(mine_addr)))
                 regtest_mine_blocks(wt->rt, 1, mine_addr);
@@ -442,7 +458,7 @@ int watchtower_check(watchtower_t *wt) {
         int penalty_sent = 0;
         if (penalty_hex) {
             hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
-            if (regtest_send_raw_tx(wt->rt, penalty_hex, penalty_txid)) {
+            if (wt->chain->send_raw_tx(wt->chain, penalty_hex, penalty_txid)) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
                 fflush(stdout);
                 penalties_broadcast++;
@@ -504,7 +520,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (htlc_hex) {
                     hex_encode(htlc_penalty.data, htlc_penalty.len, htlc_hex);
                     char htlc_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, htlc_hex, htlc_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, htlc_hex, htlc_txid)) {
                         printf("  HTLC penalty tx (vout %u) broadcast: %s\n",
                                e->htlc_outputs[h].htlc_vout, htlc_txid);
                         penalties_broadcast++;
@@ -535,7 +551,7 @@ int watchtower_check(watchtower_t *wt) {
     }
 
     /* Force-close HTLC timeout sweep: check if any expired HTLCs can be swept */
-    int current_height = regtest_get_block_height(wt->rt);
+    int current_height = wt->chain->get_block_height(wt->chain);
     if (current_height > 0) {
         for (size_t i = 0; i < wt->n_entries; i++) {
             watchtower_entry_t *e = &wt->entries[i];
@@ -575,7 +591,7 @@ int watchtower_check(watchtower_t *wt) {
                     if (tx_hex) {
                         hex_encode(timeout_tx.data, timeout_tx.len, tx_hex);
                         char txid[65];
-                        if (regtest_send_raw_tx(wt->rt, tx_hex, txid)) {
+                        if (wt->chain->send_raw_tx(wt->chain, tx_hex, txid)) {
                             printf("  HTLC timeout sweep (vout %u, cltv %u): %s\n",
                                    htlc->htlc_vout, htlc->cltv_expiry, txid);
                             penalties_broadcast++;
@@ -610,7 +626,7 @@ int watchtower_check(watchtower_t *wt) {
     /* CPFP bump loop: check pending penalty txs and bump if stuck */
     for (size_t i = 0; i < wt->n_pending; ) {
         watchtower_pending_t *p = &wt->pending[i];
-        int conf = regtest_get_confirmations(wt->rt, p->txid);
+        int conf = wt->chain->get_confirmations(wt->chain, p->txid);
         if (conf > 0) {
             /* Confirmed — remove from pending (swap with last) */
             if (wt->db && wt->db->db)
@@ -634,7 +650,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (cpfp_hex) {
                     hex_encode(cpfp.data, cpfp.len, cpfp_hex);
                     char cpfp_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, cpfp_hex, cpfp_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, cpfp_hex, cpfp_txid)) {
                         printf("  CPFP child broadcast (attempt %d): %s\n",
                                p->bump_count + 1, cpfp_txid);
                         p->bump_count++;
