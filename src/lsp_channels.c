@@ -3273,6 +3273,29 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     }
                                 }
 
+                                /* Async rotation: handle EXPIRED with partial ready set.
+                                   DYING → EXPIRED means the window closed; rotate
+                                   with whoever showed up (n_ready >= 2). */
+                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                    old_states[fi] == FACTORY_DYING &&
+                                    mgr->readiness) {
+                                    readiness_tracker_t *rt =
+                                        (readiness_tracker_t *)mgr->readiness;
+                                    size_t n_ready = (size_t)readiness_count_ready(rt);
+                                    if (n_ready >= 2 && n_ready < rt->n_clients) {
+                                        printf("LSP: factory %u EXPIRED — partial rotation "
+                                               "with %zu/%zu ready clients\n",
+                                               lf->factory_id, n_ready, rt->n_clients);
+                                        fflush(stdout);
+                                        lsp_channels_rotate_factory(mgr, lsp);
+                                    } else if (n_ready < 2) {
+                                        printf("LSP: factory %u EXPIRED — only %zu client(s) ready,"
+                                               " cannot partial-rotate (need >= 2)\n",
+                                               lf->factory_id, n_ready);
+                                    }
+                                    readiness_reset(rt);
+                                }
+
                                 /* Auto-rotate when factory enters DYING
                                    (or jumps directly to EXPIRED, skipping DYING
                                     — can happen if blocks mine faster than poll) */
