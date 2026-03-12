@@ -659,6 +659,12 @@ extern int test_tlv_encode_decode(void);
 extern int test_tlv_decode_truncated(void);
 extern int test_wire_hello_tlv_negotiation(void);
 
+/* Async Signing: Queue Wire Messages */
+extern int test_wire_queue_items_empty(void);
+extern int test_wire_queue_items_roundtrip(void);
+extern int test_wire_queue_done_parse(void);
+extern int test_wire_queue_done_empty(void);
+
 /* Mainnet Codepath Tests */
 extern int test_mainnet_cli_prefix_no_flag(void);
 extern int test_mainnet_scan_depth(void);
@@ -1353,6 +1359,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tlv_encode_decode);
     RUN_TEST(test_tlv_decode_truncated);
     RUN_TEST(test_wire_hello_tlv_negotiation);
+
+    printf("\n=== Async Signing: Queue Wire Messages ===\n");
+    RUN_TEST(test_wire_queue_items_empty);
+    RUN_TEST(test_wire_queue_items_roundtrip);
+    RUN_TEST(test_wire_queue_done_parse);
+    RUN_TEST(test_wire_queue_done_empty);
 
     printf("\n=== Mainnet Codepath Tests ===\n");
     RUN_TEST(test_mainnet_cli_prefix_no_flag);

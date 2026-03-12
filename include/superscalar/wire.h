@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "factory.h"
+#include "lsp_queue.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <cJSON.h>
@@ -92,6 +93,11 @@
 #define MSG_PATH_ALL_NONCES     0x61  /* LSP -> Clients: aggregated path nonces */
 #define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
 #define MSG_PATH_SIGN_DONE      0x63  /* LSP -> Clients: path signing complete */
+
+/* Async signing: pending work queue */
+#define MSG_QUEUE_POLL          0x65  /* Client → LSP: poll for pending work items */
+#define MSG_QUEUE_ITEMS         0x66  /* LSP → Client: pending work items response */
+#define MSG_QUEUE_DONE          0x67  /* Client → LSP: acknowledge processed item IDs */
 
 #define MSG_ERROR              0xFF
 
@@ -643,5 +649,17 @@ const char *wire_msg_type_name(uint8_t type);
 
 /* Associate a peer label (e.g. "client_0", "bridge") with a file descriptor */
 void wire_set_peer_label(int fd, const char *label);
+
+/* --- Async signing: queue messages --- */
+
+/* LSP → Client: QUEUE_ITEMS {items:[{id,request_type,urgency,factory_id,payload},...]}
+   entries: array of queue_entry_t; count: number of entries (0 = empty list) */
+cJSON *wire_build_queue_items(const queue_entry_t *entries, size_t count);
+
+/* Client → LSP: QUEUE_DONE {ids:[N,...]}
+   Parses acknowledged item IDs. Returns 1 on success. */
+int wire_parse_queue_done(const cJSON *json,
+                           uint64_t *ids_out, size_t max_ids,
+                           size_t *count_out);
 
 #endif /* SUPERSCALAR_WIRE_H */

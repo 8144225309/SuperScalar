@@ -1443,3 +1443,78 @@ int test_wire_hello_tlv_negotiation(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* --- Async signing: queue wire message tests --- */
+
+int test_wire_queue_items_empty(void) {
+    cJSON *j = wire_build_queue_items(NULL, 0);
+    TEST_ASSERT(j != NULL, "build with 0 entries");
+    cJSON *items = cJSON_GetObjectItem(j, "items");
+    TEST_ASSERT(items != NULL, "items array present");
+    TEST_ASSERT(cJSON_IsArray(items), "items is array");
+    TEST_ASSERT(cJSON_GetArraySize(items) == 0, "zero items");
+    cJSON_Delete(j);
+    return 1;
+}
+
+int test_wire_queue_items_roundtrip(void) {
+    queue_entry_t entries[2];
+    memset(entries, 0, sizeof(entries));
+
+    entries[0].id = 42;
+    entries[0].request_type = QUEUE_REQ_ROTATION;
+    entries[0].urgency = QUEUE_URGENCY_HIGH;
+    entries[0].factory_id = 7;
+    snprintf(entries[0].payload, sizeof(entries[0].payload), "{\"reason\":\"dying\"}");
+
+    entries[1].id = 99;
+    entries[1].request_type = QUEUE_REQ_CLOSE;
+    entries[1].urgency = QUEUE_URGENCY_NORMAL;
+    entries[1].factory_id = 7;
+    /* no payload */
+
+    cJSON *j = wire_build_queue_items(entries, 2);
+    TEST_ASSERT(j != NULL, "build ok");
+    cJSON *items = cJSON_GetObjectItem(j, "items");
+    TEST_ASSERT(cJSON_GetArraySize(items) == 2, "2 items");
+
+    cJSON *first = cJSON_GetArrayItem(items, 0);
+    TEST_ASSERT(cJSON_GetObjectItem(first, "id")->valuedouble == 42, "id[0]");
+    TEST_ASSERT(cJSON_GetObjectItem(first, "request_type")->valueint == QUEUE_REQ_ROTATION, "type[0]");
+    TEST_ASSERT(cJSON_GetObjectItem(first, "urgency")->valueint == QUEUE_URGENCY_HIGH, "urgency[0]");
+    TEST_ASSERT(cJSON_GetObjectItem(first, "factory_id")->valueint == 7, "factory_id[0]");
+    TEST_ASSERT(cJSON_GetObjectItem(first, "payload") != NULL, "payload present");
+
+    cJSON *second = cJSON_GetArrayItem(items, 1);
+    TEST_ASSERT(cJSON_GetObjectItem(second, "payload") == NULL, "no payload for empty");
+
+    cJSON_Delete(j);
+    return 1;
+}
+
+int test_wire_queue_done_parse(void) {
+    cJSON *j = cJSON_Parse("{\"ids\":[1,2,99]}");
+    TEST_ASSERT(j != NULL, "parse ok");
+
+    uint64_t ids[8]; size_t count = 0;
+    int ok = wire_parse_queue_done(j, ids, 8, &count);
+    TEST_ASSERT(ok == 1, "parse success");
+    TEST_ASSERT(count == 3, "count 3");
+    TEST_ASSERT(ids[0] == 1, "id[0]");
+    TEST_ASSERT(ids[1] == 2, "id[1]");
+    TEST_ASSERT(ids[2] == 99, "id[2]");
+
+    cJSON_Delete(j);
+    return 1;
+}
+
+int test_wire_queue_done_empty(void) {
+    cJSON *j = cJSON_Parse("{\"ids\":[]}");
+    TEST_ASSERT(j != NULL, "parse ok");
+    uint64_t ids[8]; size_t count = 99;
+    int ok = wire_parse_queue_done(j, ids, 8, &count);
+    TEST_ASSERT(ok == 1, "empty ok");
+    TEST_ASSERT(count == 0, "count 0");
+    cJSON_Delete(j);
+    return 1;
+}
