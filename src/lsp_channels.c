@@ -10,6 +10,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/lsp_queue.h"
 #include "superscalar/readiness.h"
+#include "superscalar/notify.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -3289,26 +3290,57 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         uint32_t ridx = lf->factory_id % 8;
                                         mgr->rot_retry_count[ridx] = 0;
                                         mgr->rot_last_attempt_block[ridx] = 0;
-                                        int ok = lsp_channels_rotate_factory(mgr, lsp);
-                                        /* Reset offline timers — rotation involves client
-                                           communication that doesn't go through the
-                                           daemon loop's message handler */
-                                        {
-                                            time_t tnow = time(NULL);
-                                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
-                                                mgr->entries[rc].last_message_time = tnow;
-                                                mgr->entries[rc].offline_detected = 0;
+
+                                        if (mgr->readiness) {
+                                            /* Async path: queue rotation request for all clients,
+                                               mark already-connected ones, fire fast-path if all
+                                               are already present. */
+                                            readiness_tracker_t *rt =
+                                                (readiness_tracker_t *)mgr->readiness;
+                                            readiness_init(rt, lf->factory_id,
+                                                           lsp->n_clients,
+                                                           (persist_t *)mgr->persist);
+                                            persist_t *db = (persist_t *)mgr->persist;
+                                            notify_t *nfy = (notify_t *)mgr->notify;
+                                            for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+                                                if (lsp->client_fds[ci] >= 0)
+                                                    readiness_set_connected(rt, (uint32_t)ci, 1);
+                                                if (db)
+                                                    queue_push(db, (uint32_t)ci,
+                                                               lf->factory_id,
+                                                               QUEUE_REQ_ROTATION,
+                                                               QUEUE_URGENCY_NORMAL,
+                                                               0,
+                                                               "{\"reason\":\"factory_dying\"}");
+                                                notify_send(nfy, (uint32_t)ci,
+                                                            NOTIFY_ROTATION_NEEDED,
+                                                            QUEUE_URGENCY_NORMAL, NULL);
                                             }
-                                        }
-                                        if (ok) {
-                                            printf("LSP: auto-rotation complete — new factory active\n");
-                                            fflush(stdout);
-                                            lsp_rotation_record_success(mgr, lf->factory_id);
+                                            /* Fast path: fire immediately if all already here */
+                                            lsp_check_rotation_readiness(mgr, lsp);
                                         } else {
-                                            fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
-                                                    lf->factory_id);
-                                            lsp_rotation_record_failure(mgr, lf->factory_id,
-                                                                        (uint32_t)height);
+                                            /* Legacy synchronous path */
+                                            int ok = lsp_channels_rotate_factory(mgr, lsp);
+                                            /* Reset offline timers — rotation involves client
+                                               communication that doesn't go through the
+                                               daemon loop's message handler */
+                                            {
+                                                time_t tnow = time(NULL);
+                                                for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                                    mgr->entries[rc].last_message_time = tnow;
+                                                    mgr->entries[rc].offline_detected = 0;
+                                                }
+                                            }
+                                            if (ok) {
+                                                printf("LSP: auto-rotation complete — new factory active\n");
+                                                fflush(stdout);
+                                                lsp_rotation_record_success(mgr, lf->factory_id);
+                                            } else {
+                                                fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
+                                                        lf->factory_id);
+                                                lsp_rotation_record_failure(mgr, lf->factory_id,
+                                                                            (uint32_t)height);
+                                            }
                                         }
                                     }
 
