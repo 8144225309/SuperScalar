@@ -2,6 +2,7 @@
 #define SUPERSCALAR_BIP158_BACKEND_H
 
 #include "chain_backend.h"
+#include "p2p_bitcoin.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -80,7 +81,9 @@ typedef struct {
     /* RPC context for Phase 3 scan loop (regtest_t *); NULL when using P2P */
     void            *rpc_ctx;
 
-    /* TODO: P2P peer connection state */
+    /* Phase 4: P2P peer connection.  p2p.fd == -1 when not connected.
+       Set by bip158_backend_connect_p2p(); closed by bip158_backend_free(). */
+    p2p_conn_t       p2p;
 } bip158_backend_t;
 
 /* Initialise backend. Returns 1 on success, 0 on failure. */
@@ -93,6 +96,16 @@ void bip158_backend_free(bip158_backend_t *backend);
  * rt is typed void* to avoid pulling regtest.h into this header.
  */
 void bip158_backend_set_rpc(bip158_backend_t *backend, void *rt);
+
+/*
+ * Open a Bitcoin P2P connection to host:port and perform the version/verack
+ * handshake.  On success, bip158_backend_scan() will use this connection for
+ * filter fetching instead of the regtest RPC.  cb_send_raw_tx() will also
+ * broadcast via P2P once connected.
+ * Returns 1 on success, 0 on failure (backend continues using rpc_ctx).
+ */
+int bip158_backend_connect_p2p(bip158_backend_t *backend,
+                                const char *host, int port);
 
 /*
  * Walk blocks from last synced height + 1 up to the current chain tip.

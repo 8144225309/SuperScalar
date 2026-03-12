@@ -1,4 +1,5 @@
 #include "superscalar/bip158_backend.h"
+#include "superscalar/p2p_bitcoin.h"
 #include "superscalar/regtest.h"
 #include <string.h>
 #include <stdlib.h>
@@ -319,12 +320,51 @@ static bool cb_is_in_mempool(chain_backend_t *self, const char *txid_hex)
     return false;
 }
 
+/* hex_decode: convert an even-length hex string to bytes.
+   Returns number of bytes written, or -1 on invalid input. */
+static int hex_decode(const char *hex, unsigned char *out, size_t max_out)
+{
+    size_t hlen = strlen(hex);
+    if (hlen % 2 != 0 || hlen / 2 > max_out) return -1;
+    for (size_t i = 0; i < hlen / 2; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%02x", &byte) != 1) return -1;
+        out[i] = (unsigned char)byte;
+    }
+    return (int)(hlen / 2);
+}
+
 static int cb_send_raw_tx(chain_backend_t *self, const char *tx_hex,
                            char *txid_out)
 {
-    /* TODO: broadcast via P2P peer connection */
-    (void)self; (void)tx_hex; (void)txid_out;
-    return 0;
+    bip158_backend_t *b = (bip158_backend_t *)self;
+
+    if (b->p2p.fd < 0) return 0;   /* no P2P connection */
+
+    /* Decode hex to raw bytes */
+    size_t        hlen     = strlen(tx_hex);
+    unsigned char *tx_bytes = malloc(hlen / 2 + 1);
+    if (!tx_bytes) return 0;
+    int tx_len = hex_decode(tx_hex, tx_bytes, hlen / 2 + 1);
+    if (tx_len < 0) { free(tx_bytes); return 0; }
+
+    uint8_t txid32[32];
+    int ok = p2p_broadcast_tx(&b->p2p,
+                               tx_bytes, (size_t)tx_len,
+                               txid32);
+    free(tx_bytes);
+    if (!ok) return 0;
+
+    if (txid_out) {
+        /* Write txid as display-order hex (reversed internal bytes) */
+        static const char hx[] = "0123456789abcdef";
+        for (int i = 0; i < 32; i++) {
+            txid_out[(31 - i) * 2]     = hx[(txid32[i] >> 4) & 0xf];
+            txid_out[(31 - i) * 2 + 1] = hx[txid32[i] & 0xf];
+        }
+        txid_out[64] = '\0';
+    }
+    return 1;
 }
 
 static int cb_register_script(chain_backend_t *self,
@@ -379,12 +419,11 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
     backend->base.unregister_script = cb_unregister_script;
     backend->base.ctx               = backend;
 
-    backend->tip_height = -1;  /* unknown until first sync */
+    backend->tip_height = -1;   /* unknown until first sync */
+    backend->p2p.fd     = -1;   /* no P2P connection yet     */
 
     if (network)
         strncpy(backend->network, network, sizeof(backend->network) - 1);
-
-    /* TODO: open P2P peer connection */
 
     return 1;
 }
@@ -399,7 +438,7 @@ void bip158_backend_free(bip158_backend_t *backend)
         backend->filters[i].data = NULL;
     }
 
-    /* TODO: close P2P peer connection */
+    p2p_close(&backend->p2p);
 }
 
 /*
@@ -468,63 +507,135 @@ static void scan_tx_callback(const char *txid_hex,
     }
 }
 
+/* Convert a 64-char display-order hex block hash to 32 internal bytes. */
+static int hash_hex_to_bytes(const char *hex64, uint8_t out32[32])
+{
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        if (sscanf(hex64 + (31 - i) * 2, "%02x", &byte) != 1) return 0;
+        out32[i] = (uint8_t)byte;
+    }
+    return 1;
+}
+
 /*
- * BIP 158 RPC scan loop.
- * Walks blocks from tip_height+1 to current chain tip.
- * Returns matched-block count, or -1 on error.
+ * BIP 158 scan loop — Phase 3 (RPC) + Phase 4 (P2P filter fetch).
+ *
+ * Priority:
+ *   - If backend->p2p.fd >= 0: fetch compact filters via P2P getcfilters/cfilter
+ *   - Else if backend->rpc_ctx: fetch compact filters via getblockfilter RPC
+ *   - Else: return -1
+ *
+ * Full-block scan on filter hit still uses RPC (regtest_scan_block_txs) when
+ * rpc_ctx is available.  P2P block parsing is Phase 5.
+ *
+ * Returns number of matched blocks, or -1 on hard error.
  */
 int bip158_backend_scan(bip158_backend_t *backend)
 {
-    if (!backend || !backend->rpc_ctx) return -1;
+    if (!backend) return -1;
+
     regtest_t *rt = (regtest_t *)backend->rpc_ctx;
+
+    /* Need at least one fetch path */
+    if (backend->p2p.fd < 0 && !rt) return -1;
+    /* Need RPC for block height + hash lookup (both paths use this for now) */
+    if (!rt) return -1;
 
     if (!backend->n_scripts) return 0;
 
     int tip = regtest_get_block_height(rt);
     if (tip < 0) return -1;
 
-    /* On first call, start from the current tip (don't scan genesis→tip) */
     int start = (backend->tip_height >= 0) ? backend->tip_height + 1 : tip;
 
-    /* Maximum filter size: BIP 158 filters are bounded by block size.
-       16 KB covers any regtest/signet block; mainnet blocks can be larger.
-       Use a heap allocation proportional to a safe upper bound. */
-#define FILTER_BUF_MAX (4 * 1024 * 1024)  /* 4 MB — handles mainnet worst case */
+#define FILTER_BUF_MAX (4 * 1024 * 1024)
     unsigned char *filter_buf = malloc(FILTER_BUF_MAX);
     if (!filter_buf) return -1;
 
     int matched = 0;
 
     for (int h = start; h <= tip; h++) {
-        char hash[65];
-        if (!regtest_get_block_hash(rt, h, hash, sizeof(hash)))
+        char    hash_hex[65];
+        uint8_t hash_bytes[32];
+
+        if (!regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex)))
             continue;
 
         size_t        filter_len = 0;
         unsigned char key[16];
-        if (!regtest_get_block_filter(rt, hash,
-                                       filter_buf, &filter_len,
-                                       FILTER_BUF_MAX, key)) {
-            /* Non-fatal: skip block but still advance tip */
-            backend->tip_height = h;
-            continue;
+
+        if (backend->p2p.fd >= 0) {
+            /* Phase 4: fetch filter via P2P */
+            if (!hash_hex_to_bytes(hash_hex, hash_bytes)) {
+                backend->tip_height = h;
+                continue;
+            }
+            if (!p2p_send_getcfilters(&backend->p2p, (uint32_t)h, hash_bytes)) {
+                /* P2P send failed — connection likely dead */
+                p2p_close(&backend->p2p);
+                /* Fall through to RPC below on next iteration */
+                backend->tip_height = h;
+                continue;
+            }
+            uint8_t *p2p_filter = NULL;
+            uint8_t  p2p_hash[32], p2p_key[16];
+            int r = p2p_recv_cfilter(&backend->p2p, p2p_hash,
+                                      &p2p_filter, &filter_len, p2p_key);
+            if (r != 1) {
+                free(p2p_filter);
+                if (r == -1) p2p_close(&backend->p2p);
+                backend->tip_height = h;
+                continue;
+            }
+            if (filter_len <= FILTER_BUF_MAX) {
+                memcpy(filter_buf, p2p_filter, filter_len);
+                memcpy(key, p2p_key, 16);
+            } else {
+                filter_len = 0;  /* oversized — treat as no match */
+            }
+            free(p2p_filter);
+        } else {
+            /* Phase 3: fetch filter via RPC */
+            if (!regtest_get_block_filter(rt, hash_hex,
+                                           filter_buf, &filter_len,
+                                           FILTER_BUF_MAX, key)) {
+                backend->tip_height = h;
+                continue;
+            }
         }
 
         if (!bip158_scan_filter(backend, filter_buf, filter_len, key)) {
-            /* Fast skip: no scripts match this filter */
             backend->tip_height = h;
             continue;
         }
 
-        /* Filter hit — fetch the full block and cache relevant txids */
-        scan_cb_ctx_t sc = { backend, (int32_t)h, 0 };
-        regtest_scan_block_txs(rt, hash, scan_tx_callback, &sc);
-
+        /* Filter hit — fetch full block via RPC and cache matching txids.
+           Phase 5 will replace this with P2P getdata/block parsing. */
+        if (rt) {
+            scan_cb_ctx_t sc = { backend, (int32_t)h, 0 };
+            regtest_scan_block_txs(rt, hash_hex, scan_tx_callback, &sc);
+            if (sc.found) matched++;
+        } else {
+            matched++;  /* filter hit but can't confirm; count tentatively */
+        }
         backend->tip_height = h;
-        if (sc.found) matched++;
     }
 
     free(filter_buf);
 #undef FILTER_BUF_MAX
     return matched;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 4: P2P connection management
+ * ------------------------------------------------------------------------- */
+
+int bip158_backend_connect_p2p(bip158_backend_t *backend,
+                                const char *host, int port)
+{
+    if (!backend) return 0;
+    /* Close any existing connection first */
+    p2p_close(&backend->p2p);
+    return p2p_connect(&backend->p2p, host, port, backend->network);
 }

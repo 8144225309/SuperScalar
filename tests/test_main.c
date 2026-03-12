@@ -95,6 +95,13 @@ extern int test_bip158_gcs_empty_filter(void);
 extern int test_bip158_scan_filter_zero_items(void);
 extern int test_bip158_gcs_round_trip(void);
 
+extern int test_p2p_getcfilters_payload(void);
+extern int test_p2p_cfilter_parse(void);
+extern int test_p2p_cfilter_skips_ping(void);
+extern int test_p2p_send_recv_roundtrip(void);
+extern int test_p2p_recv_magic_mismatch(void);
+extern int test_p2p_broadcast_tx_flow(void);
+
 extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
 extern int test_tapscript_control_block(void);
@@ -713,13 +720,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_split_round_with_pool);
     RUN_TEST(test_factory_advance_split_round);
 
-    printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
+    printf("\n=== BIP 158 Compact Block Filters ===\n");
     RUN_TEST(test_bip158_backend_init);
     RUN_TEST(test_bip158_script_registry);
     RUN_TEST(test_bip158_tx_cache);
     RUN_TEST(test_bip158_gcs_empty_filter);
     RUN_TEST(test_bip158_scan_filter_zero_items);
     RUN_TEST(test_bip158_gcs_round_trip);
+
+    printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
+    RUN_TEST(test_p2p_getcfilters_payload);
+    RUN_TEST(test_p2p_cfilter_parse);
+    RUN_TEST(test_p2p_cfilter_skips_ping);
+    RUN_TEST(test_p2p_send_recv_roundtrip);
+    RUN_TEST(test_p2p_recv_magic_mismatch);
+    RUN_TEST(test_p2p_broadcast_tx_flow);
+
+    printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
 
     RUN_TEST(test_tapscript_leaf_hash);
     RUN_TEST(test_tapscript_tweak_with_tree);

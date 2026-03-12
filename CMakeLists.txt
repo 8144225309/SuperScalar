@@ -88,6 +88,7 @@ add_library(superscalar
     src/regtest.c
     src/chain_backend_regtest.c
     src/bip158_backend.c
+    src/p2p_bitcoin.c
     src/util.c
     src/factory.c
     src/tapscript.c
@@ -136,6 +137,7 @@ add_executable(test_superscalar
     tests/test_musig.c
     tests/test_tx_builder.c
     tests/test_bip158.c
+    tests/test_p2p.c
     tests/test_regtest.c
     tests/test_factory.c
     tests/test_tapscript.c
