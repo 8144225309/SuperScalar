@@ -3514,6 +3514,41 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
             }
 
+            /* Async rotation: fire ceremony if all clients ready;
+               escalate urgency for missing clients when factory is DYING. */
+            if (mgr->readiness && mgr->ladder && mgr->watchtower && mgr->watchtower->rt) {
+                readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
+                ladder_t *lad = (ladder_t *)mgr->ladder;
+                ladder_factory_t *lf = ladder_get_by_id(lad, rt->factory_id);
+                if (lf && lf->cached_state == FACTORY_DYING) {
+                    /* Try to fire ceremony */
+                    if (lsp_check_rotation_readiness(mgr, lsp)) {
+                        /* Ceremony fired — skip escalation */
+                    } else {
+                        /* Escalate urgency for missing clients */
+                        int bh = regtest_get_block_height(mgr->watchtower->rt);
+                        if (bh > 0) {
+                            uint32_t blocks_left = factory_blocks_until_expired(
+                                &lf->factory, (uint32_t)bh);
+                            int urgency = readiness_compute_urgency(
+                                blocks_left, lf->factory.dying_blocks);
+                            uint32_t missing[FACTORY_MAX_SIGNERS];
+                            size_t n_missing = readiness_get_missing(
+                                rt, missing, FACTORY_MAX_SIGNERS);
+                            persist_t *db = (persist_t *)mgr->persist;
+                            notify_t *nfy = (notify_t *)mgr->notify;
+                            for (size_t mi = 0; mi < n_missing; mi++) {
+                                if (db)
+                                    queue_push(db, missing[mi], rt->factory_id,
+                                               QUEUE_REQ_ROTATION, urgency, 0, NULL);
+                                notify_send(nfy, missing[mi],
+                                            NOTIFY_ROTATION_NEEDED, urgency, NULL);
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Heartbeat: periodic daemon status line */
             if (mgr->heartbeat_interval > 0) {
                 time_t now = time(NULL);
