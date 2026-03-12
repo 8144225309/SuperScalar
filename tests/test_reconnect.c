@@ -615,10 +615,10 @@ int test_fee_factory_tx(void) {
     uint64_t fee3 = fee_for_factory_tx(&fe, 3);
     uint64_t fee5 = fee_for_factory_tx(&fe, 5);
 
-    /* fee = (50 + 43*n) at 1 sat/vB */
-    TEST_ASSERT_EQ(fee1, 93, "1 output: 50+43=93");
-    TEST_ASSERT_EQ(fee3, 179, "3 outputs: 50+129=179");
-    TEST_ASSERT_EQ(fee5, 265, "5 outputs: 50+215=265");
+    /* fee = (68 + 43*n) at 1 sat/vB: 68 = 10 tx overhead + 58 P2TR keypath input */
+    TEST_ASSERT_EQ(fee1, 111, "1 output: 68+43=111");
+    TEST_ASSERT_EQ(fee3, 197, "3 outputs: 68+129=197");
+    TEST_ASSERT_EQ(fee5, 283, "5 outputs: 68+215=283");
 
     /* Must scale: more outputs = higher fee */
     TEST_ASSERT(fee3 > fee1, "fee scales up with outputs");
