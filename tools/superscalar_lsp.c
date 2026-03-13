@@ -17,6 +17,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
+#include "superscalar/bip158_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +128,11 @@ static void usage(const char *prog) {
         "  --backup PATH       Create encrypted backup of --db and --keyfile to PATH, then exit\n"
         "  --restore PATH      Restore encrypted backup from PATH to --db and --keyfile, then exit\n"
         "  --backup-verify PATH  Verify encrypted backup integrity, then exit\n"
+        "  --light-client HOST:PORT  Use BIP 157/158 P2P light client instead of bitcoin-cli for\n"
+        "                            chain scanning (requires a BIP 157 full node peer).\n"
+        "                            bitcoin-cli is still used for wallet funding and fee estimation.\n"
+        "  --light-client-fallback HOST:PORT  Add a fallback peer for automatic rotation on\n"
+        "                            disconnect. May be specified multiple times (up to 7 total).\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -469,6 +475,97 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
     return 1;
 }
 
+/* -------------------------------------------------------------------------
+ * BIP 158 light client — production wiring
+ * ------------------------------------------------------------------------- */
+
+/* Static backend — bip158_backend_t contains two 64 KB ring buffers;
+ * too large for the stack of main(). */
+static bip158_backend_t g_bip158;
+
+/*
+ * Parse a "host:port" string into separate host / port components.
+ * Modifies a temporary buffer; writes to host_out (up to host_cap bytes)
+ * and *port_out.  Returns 1 on success, 0 on parse error.
+ */
+static int parse_host_port(const char *arg,
+                            char *host_out, size_t host_cap,
+                            int *port_out)
+{
+    const char *colon = strrchr(arg, ':');
+    if (!colon || colon == arg) return 0;
+    size_t hlen = (size_t)(colon - arg);
+    if (hlen >= host_cap) return 0;
+    memcpy(host_out, arg, hlen);
+    host_out[hlen] = '\0';
+    *port_out = atoi(colon + 1);
+    return (*port_out > 0 && *port_out <= 65535);
+}
+
+/*
+ * Initialise the BIP 158 backend, connect to the peer, restore checkpoint,
+ * then plug the backend into the watchtower as its chain backend.
+ * Returns 1 on success, 0 on failure (caller may fall back to regtest).
+ */
+static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
+                                const char *host_port, const char *network,
+                                const char **fallbacks, int n_fallbacks)
+{
+    char host[256];
+    int  port = 0;
+    if (!parse_host_port(host_port, host, sizeof(host), &port)) {
+        fprintf(stderr, "LSP: --light-client: bad HOST:PORT '%s'\n", host_port);
+        return 0;
+    }
+
+    if (!bip158_backend_init(&g_bip158, network)) {
+        fprintf(stderr, "LSP: bip158_backend_init failed\n");
+        return 0;
+    }
+
+    if (db_ptr) {
+        bip158_backend_set_db(&g_bip158, db_ptr);
+        int restored = bip158_backend_restore_checkpoint(&g_bip158);
+        if (restored)
+            printf("LSP: BIP 158 checkpoint restored (tip_height=%d)\n",
+                   g_bip158.tip_height);
+    }
+
+    /* Register fallback peers before connecting so they're available on retry */
+    for (int i = 0; i < n_fallbacks; i++) {
+        char fb_host[256];
+        int  fb_port = 0;
+        if (parse_host_port(fallbacks[i], fb_host, sizeof(fb_host), &fb_port))
+            bip158_backend_add_peer(&g_bip158, fb_host, fb_port);
+        else
+            fprintf(stderr, "LSP: --light-client-fallback: bad HOST:PORT '%s' (ignored)\n",
+                    fallbacks[i]);
+    }
+
+    printf("LSP: connecting BIP 157/158 peer %s:%d ...\n", host, port);
+    if (!bip158_backend_connect_p2p(&g_bip158, host, port)) {
+        fprintf(stderr, "LSP: primary peer %s:%d failed; trying fallbacks...\n",
+                host, port);
+        /* Stash primary in slot 0 so rotation has a full list */
+        if (g_bip158.n_peers == 0) {
+            snprintf(g_bip158.peer_hosts[0], sizeof(g_bip158.peer_hosts[0]),
+                     "%s", host);
+            g_bip158.peer_ports[0] = port;
+            g_bip158.n_peers = 1;
+        }
+        if (!bip158_backend_reconnect(&g_bip158)) {
+            fprintf(stderr, "LSP: --light-client: all peers failed\n");
+            bip158_backend_free(&g_bip158);
+            return 0;
+        }
+    }
+    printf("LSP: BIP 158 P2P peer connected (version %u, height %d)\n",
+           g_bip158.p2p.peer_version, g_bip158.p2p.peer_start_height);
+
+    watchtower_set_chain_backend(wt, &g_bip158.base);
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     /* Line-buffered stdout/stderr so logs are visible in real time */
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -560,6 +657,11 @@ int main(int argc, char *argv[]) {
     int fee_bump_max = 3;         /* max bump attempts */
     double fee_bump_multiplier = 1.5;
     (void)fee_bump_after; (void)fee_bump_max; (void)fee_bump_multiplier;
+    const char *light_client_arg = NULL;  /* HOST:PORT for BIP 157 P2P peer */
+    /* Fallback peers for rotation: up to BIP158_MAX_PEERS-1 additional entries */
+    const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
+    memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
+    int n_lc_fallbacks = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -779,6 +881,14 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--backup-verify") == 0 && i + 1 < argc) {
             restore_path_arg = argv[++i];
             backup_verify_arg = 1;
+        }
+        else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
+            light_client_arg = argv[++i];
+        else if (strcmp(argv[i], "--light-client-fallback") == 0 && i + 1 < argc) {
+            if (n_lc_fallbacks < (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0])))
+                lc_fallbacks[n_lc_fallbacks++] = argv[++i];
+            else { fprintf(stderr, "Warning: too many --light-client-fallback peers (max %d)\n",
+                           (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0]))); i++; }
         }
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
@@ -1250,6 +1360,10 @@ int main(int argc, char *argv[]) {
             for (size_t c = 0; c < mgr->n_channels; c++)
                 watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
             mgr->watchtower = &rec_wt;
+            if (light_client_arg)
+                attach_light_client(&rec_wt, use_db ? &db : NULL,
+                                    light_client_arg, network,
+                                    lc_fallbacks, n_lc_fallbacks);
 
             /* Initialize ladder */
             ladder_t rec_lad;
@@ -2007,6 +2121,10 @@ int main(int argc, char *argv[]) {
         for (size_t c = 0; c < mgr->n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
         mgr->watchtower = &wt;
+        if (light_client_arg)
+            attach_light_client(&wt, use_db ? &db : NULL,
+                                 light_client_arg, network,
+                                 lc_fallbacks, n_lc_fallbacks);
 
         /* Wire ladder into channel manager (Tier 2) */
         mgr->ladder = lad;

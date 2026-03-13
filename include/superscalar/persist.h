@@ -371,6 +371,38 @@ int persist_update_jit_balance(persist_t *p, uint32_t jit_id,
 /* Delete a JIT channel by ID. */
 int persist_delete_jit_channel(persist_t *p, uint32_t jit_id);
 
+/* --- BIP 158 scan checkpoint --- */
+
+/*
+ * Save (upsert) a singleton checkpoint row that records where the BIP 158
+ * light client scan left off.  header_hashes / filter_headers are flat
+ * arrays of BIP158_HEADER_WINDOW × 32 bytes; pass NULL / 0 to omit blobs.
+ * Returns 1 on success.
+ */
+int persist_save_bip158_checkpoint(persist_t *p,
+                                    int32_t tip_height,
+                                    int32_t headers_synced,
+                                    int32_t filter_headers_synced,
+                                    const uint8_t *header_hashes,
+                                    size_t header_hashes_len,
+                                    const uint8_t *filter_headers,
+                                    size_t filter_headers_len);
+
+/*
+ * Load the checkpoint saved by persist_save_bip158_checkpoint().
+ * Out-parameters are filled only when non-NULL.  Ring buffer blobs are
+ * copied into caller-supplied buffers up to _cap bytes.
+ * Returns 1 if a checkpoint row was found, 0 if none exists yet.
+ */
+int persist_load_bip158_checkpoint(persist_t *p,
+                                    int32_t *tip_height_out,
+                                    int32_t *headers_synced_out,
+                                    int32_t *filter_headers_synced_out,
+                                    uint8_t *header_hashes_out,
+                                    size_t header_hashes_cap,
+                                    uint8_t *filter_headers_out,
+                                    size_t filter_headers_cap);
+
 /* --- Flat revocation secrets (Phase 2: item 2.8) --- */
 
 /* Save flat revocation secrets for a factory. */

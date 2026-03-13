@@ -36,7 +36,10 @@
 /* Capacity limits */
 #define BIP158_MAX_SCRIPTS     512   /* watched scriptPubKeys             */
 #define BIP158_TX_CACHE_SIZE   256   /* confirmed tx entries              */
-#define BIP158_FILTER_CACHE    16    /* cached filters (ring buffer)      */
+
+/* Header ring buffer: one difficulty-adjustment window of block hashes.
+   Indexed by (height % BIP158_HEADER_WINDOW) — wraps safely for long chains. */
+#define BIP158_HEADER_WINDOW  2016   /* ~63 KB inline in the struct       */
 
 typedef struct {
     unsigned char spk[34];
@@ -49,14 +52,6 @@ typedef struct {
 } bip158_tx_entry_t;
 
 typedef struct {
-    uint32_t      height;
-    unsigned char key[16];   /* SipHash key = first 16 bytes of block hash */
-    unsigned char *data;     /* raw GCS bytes (heap-allocated)              */
-    size_t         data_len;
-    uint64_t       n_items;  /* number of elements in this filter           */
-} bip158_filter_t;
-
-typedef struct {
     chain_backend_t  base;   /* Must be first — cast-compatible              */
 
     /* Script registry */
@@ -67,13 +62,25 @@ typedef struct {
        download and the committing tx is found inside */
     bip158_tx_entry_t tx_cache[BIP158_TX_CACHE_SIZE];
     size_t            n_tx_cache;
-
-    /* Filter ring buffer (most-recently-seen blocks) */
-    bip158_filter_t  filters[BIP158_FILTER_CACHE];
-    size_t           filter_head;  /* next write slot */
+    size_t            tx_cache_cursor;  /* next eviction slot (wraps at BIP158_TX_CACHE_SIZE) */
 
     /* Chain tip (updated on each successful filter download) */
     int32_t          tip_height;
+
+    /* Block header ring buffer — populated by bip158_sync_headers() via P2P.
+       Stores SHA256d(80-byte header) for the most recent BIP158_HEADER_WINDOW
+       heights.  Indexed by height % BIP158_HEADER_WINDOW.
+       headers_synced == -1 until the first header sync completes. */
+    uint8_t          header_hashes[BIP158_HEADER_WINDOW][32];
+    int32_t          headers_synced;
+
+    /* Filter header ring buffer — populated by bip158_sync_filter_headers().
+       BIP 157 filter header chain: filter_header[N] =
+         SHA256d(SHA256d(filter_bytes[N]) || filter_header[N-1])
+       prev at height -1 is all zeros.  Indexed by height % BIP158_HEADER_WINDOW.
+       filter_headers_synced == -1 until the first cfheaders sync completes. */
+    uint8_t          filter_headers[BIP158_HEADER_WINDOW][32];
+    int32_t          filter_headers_synced;
 
     /* Network ("mainnet", "signet", "testnet") */
     char             network[16];
@@ -81,9 +88,29 @@ typedef struct {
     /* RPC context for Phase 3 scan loop (regtest_t *); NULL when using P2P */
     void            *rpc_ctx;
 
-    /* Phase 4: P2P peer connection.  p2p.fd == -1 when not connected.
+    /* SQLite persistence handle (persist_t *); NULL = no checkpointing.
+       Set by bip158_backend_set_db(); not owned — caller manages lifetime. */
+    void            *db;
+
+    /* P2P peer connection.  p2p.fd == -1 when not connected.
        Set by bip158_backend_connect_p2p(); closed by bip158_backend_free(). */
     p2p_conn_t       p2p;
+
+    /* Peer rotation (Phase 6): up to BIP158_MAX_PEERS peers tried in round-robin
+       order when a connection drops.  Populated by bip158_backend_connect_p2p()
+       (sets slot 0) and bip158_backend_add_peer() (appends further slots). */
+#define BIP158_MAX_PEERS 8
+    char             peer_hosts[BIP158_MAX_PEERS][256];
+    int              peer_ports[BIP158_MAX_PEERS];
+    int              n_peers;        /* number of configured peers (>= 1 when connected) */
+    int              current_peer;   /* index of the last successfully connected peer */
+
+    /* Mempool awareness (Phase 7, BIP 35).
+       Set by bip158_backend_set_mempool_cb(); fired for each unconfirmed
+       MSG_TX seen via P2P inv subscription. */
+    void           (*mempool_cb)(const char *txid_hex, void *ctx);
+    void            *mempool_ctx;
+    int              mempool_subscribed; /* 1 after mempool message sent */
 } bip158_backend_t;
 
 /* Initialise backend. Returns 1 on success, 0 on failure. */
@@ -98,6 +125,61 @@ void bip158_backend_free(bip158_backend_t *backend);
 void bip158_backend_set_rpc(bip158_backend_t *backend, void *rt);
 
 /*
+ * Attach a persist_t database handle for scan checkpointing (Phase 4).
+ * When set, bip158_backend_scan() saves tip_height + ring buffers after each
+ * successful filter pass, and bip158_backend_restore_checkpoint() loads them
+ * on startup so scanning resumes from the last committed block.
+ * db is typed void* to avoid pulling persist.h into this header.
+ * The caller retains ownership; the backend does not close the handle.
+ */
+void bip158_backend_set_db(bip158_backend_t *backend, void *db);
+
+/*
+ * Register a callback to be invoked for each unconfirmed transaction seen via
+ * P2P mempool inv subscription (Phase 7).  txid_hex is a 64-char display-order
+ * (reversed) hex string.  Pass NULL to disable.
+ */
+void bip158_backend_set_mempool_cb(bip158_backend_t *backend,
+                                    void (*cb)(const char *txid_hex, void *ctx),
+                                    void *ctx);
+
+/*
+ * Poll for pending mempool inv announcements from the connected peer.
+ * Subscribes via BIP 35 `mempool` message on first call.  Reads pending
+ * inv(MSG_TX) messages (up to 100 ms wait) and fires the registered
+ * mempool_cb for each new txid seen.
+ * Returns the number of txids dispatched, or 0 if none / no connection.
+ * Safe to call frequently (e.g., every scan cycle).
+ */
+int bip158_backend_poll_mempool(bip158_backend_t *backend);
+
+/*
+ * Add a fallback peer for automatic rotation on disconnect (Phase 6).
+ * Up to BIP158_MAX_PEERS peers total (including the primary set by
+ * bip158_backend_connect_p2p()).  Silently ignored when the list is full.
+ */
+void bip158_backend_add_peer(bip158_backend_t *backend,
+                              const char *host, int port);
+
+/*
+ * Attempt to reconnect to the next available peer in the rotation list.
+ * Tries each peer once, starting from the one after current_peer.
+ * Returns 1 if a connection was established, 0 if all peers failed.
+ * Called automatically by bip158_backend_scan() on mid-scan disconnect;
+ * also available for manual use by callers.
+ */
+int bip158_backend_reconnect(bip158_backend_t *backend);
+
+/*
+ * Restore tip_height, headers_synced, filter_headers_synced, and both ring
+ * buffers from the checkpoint saved in the attached persist_t database.
+ * No-op if no database is attached or no checkpoint row exists.
+ * Call once after bip158_backend_set_db() and before the first scan().
+ * Returns 1 if a checkpoint was loaded, 0 otherwise.
+ */
+int bip158_backend_restore_checkpoint(bip158_backend_t *backend);
+
+/*
  * Open a Bitcoin P2P connection to host:port and perform the version/verack
  * handshake.  On success, bip158_backend_scan() will use this connection for
  * filter fetching instead of the regtest RPC.  cb_send_raw_tx() will also
@@ -110,13 +192,15 @@ int bip158_backend_connect_p2p(bip158_backend_t *backend,
 /*
  * Walk blocks from last synced height + 1 up to the current chain tip.
  * For each new block:
- *   1. Fetch its compact filter via regtest RPC (getblockfilter).
+ *   1. Fetch compact filter — via P2P getcfilters/cfilter if connected,
+ *      otherwise via regtest RPC getblockfilter.
  *   2. Run the GCS filter against all registered scriptPubKeys.
- *   3. On a match, fetch the full block (getblock verbosity 2) and cache
+ *   3. On a match, fetch the full block via RPC (Phase 3/4) and cache
  *      every tx whose outputs include a watched script.
  * Updates backend->tip_height on success.
  * Returns the number of matched blocks (may include false positives),
- * or -1 on hard error (RPC unavailable, no rpc_ctx attached).
+ * or -1 on hard error (no rpc_ctx attached; rpc_ctx required even when P2P
+ * is active for block-height and block-hash lookup until Phase 5).
  */
 int bip158_backend_scan(bip158_backend_t *backend);
 

@@ -94,6 +94,11 @@ extern int test_bip158_tx_cache(void);
 extern int test_bip158_gcs_empty_filter(void);
 extern int test_bip158_scan_filter_zero_items(void);
 extern int test_bip158_gcs_round_trip(void);
+extern int test_bip158_checkpoint_round_trip(void);
+extern int test_bip158_backend_restore_checkpoint(void);
+extern int test_bip158_add_peer(void);
+extern int test_bip158_reconnect_no_peers(void);
+extern int test_bip158_mempool_cb_wiring(void);
 
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
@@ -101,6 +106,18 @@ extern int test_p2p_cfilter_skips_ping(void);
 extern int test_p2p_send_recv_roundtrip(void);
 extern int test_p2p_recv_magic_mismatch(void);
 extern int test_p2p_broadcast_tx_flow(void);
+extern int test_p2p_getheaders_payload(void);
+extern int test_p2p_recv_headers_parse(void);
+extern int test_p2p_recv_headers_skips_ping(void);
+extern int test_p2p_getcfheaders_payload(void);
+extern int test_p2p_recv_cfheaders_parse(void);
+extern int test_bip157_filter_header_chain(void);
+extern int test_p2p_scan_block_txs_legacy(void);
+extern int test_p2p_scan_block_txs_empty(void);
+extern int test_p2p_recv_block(void);
+extern int test_p2p_send_mempool(void);
+extern int test_p2p_poll_inv_parse(void);
+extern int test_p2p_poll_inv_ignores_block(void);
 
 extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
@@ -727,6 +744,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip158_gcs_empty_filter);
     RUN_TEST(test_bip158_scan_filter_zero_items);
     RUN_TEST(test_bip158_gcs_round_trip);
+    RUN_TEST(test_bip158_checkpoint_round_trip);
+    RUN_TEST(test_bip158_backend_restore_checkpoint);
+    RUN_TEST(test_bip158_add_peer);
+    RUN_TEST(test_bip158_reconnect_no_peers);
+    RUN_TEST(test_bip158_mempool_cb_wiring);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
@@ -735,6 +757,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_p2p_send_recv_roundtrip);
     RUN_TEST(test_p2p_recv_magic_mismatch);
     RUN_TEST(test_p2p_broadcast_tx_flow);
+    RUN_TEST(test_p2p_getheaders_payload);
+    RUN_TEST(test_p2p_recv_headers_parse);
+    RUN_TEST(test_p2p_recv_headers_skips_ping);
+    RUN_TEST(test_p2p_getcfheaders_payload);
+    RUN_TEST(test_p2p_recv_cfheaders_parse);
+    RUN_TEST(test_bip157_filter_header_chain);
+    RUN_TEST(test_p2p_scan_block_txs_legacy);
+    RUN_TEST(test_p2p_scan_block_txs_empty);
+    RUN_TEST(test_p2p_recv_block);
+    RUN_TEST(test_p2p_send_mempool);
+    RUN_TEST(test_p2p_poll_inv_parse);
+    RUN_TEST(test_p2p_poll_inv_ignores_block);
 
     printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
 

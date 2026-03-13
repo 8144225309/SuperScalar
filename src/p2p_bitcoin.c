@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 /* -------------------------------------------------------------------------
  * Network magic bytes (4-byte little-endian prefix on every message)
@@ -30,10 +32,11 @@ static void set_magic(uint8_t magic[4], const char *network)
  * Wire helpers
  * ------------------------------------------------------------------------- */
 
-static void write_le16(uint8_t *p, uint16_t v)
+/* Ports in Bitcoin P2P addr structures are big-endian (network byte order) */
+static void write_be16(uint8_t *p, uint16_t v)
 {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
 }
 
 static void write_le32(uint8_t *p, uint32_t v)
@@ -99,7 +102,7 @@ int p2p_send_msg(p2p_conn_t *conn, const char *command,
 
     memcpy(header, conn->magic, 4);
     memset(header + 4, 0, 12);
-    strncpy((char *)(header + 4), command, 12);
+    memcpy(header + 4, command, strnlen(command, 12));
     write_le32(header + 16, payload_len);
 
     if (payload_len == 0) {
@@ -172,15 +175,15 @@ static int send_version(p2p_conn_t *conn)
     write_le64(buf + n, 0);                 n += 8;  /* services: none */
     write_le64(buf + n, (uint64_t)time(NULL)); n += 8; /* timestamp   */
 
-    /* addr_recv (26 bytes): services + 16-byte IPv6 addr + port */
+    /* addr_recv (26 bytes): services + 16-byte IPv6 addr + port (BE per spec) */
     write_le64(buf + n, 0);  n += 8;
     memset(buf + n, 0, 16);  n += 16;       /* addr */
-    write_le16(buf + n, 8333); n += 2;      /* port (ignored for recv) */
+    write_be16(buf + n, 8333); n += 2;      /* port big-endian (ignored for recv) */
 
     /* addr_from (26 bytes): same structure, all zeros */
     write_le64(buf + n, 0);  n += 8;
     memset(buf + n, 0, 16);  n += 16;
-    write_le16(buf + n, 0);  n += 2;
+    write_be16(buf + n, 0);  n += 2;
 
     write_le64(buf + n, 0);  n += 8;        /* nonce             */
     buf[n++] = 0;                            /* user_agent: ""    */
@@ -200,6 +203,10 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
     conn->fd = wire_connect_direct_internal(host, port);
     if (conn->fd < 0) return 0;
 
+    /* 30-second receive timeout — prevents blocking forever on a stalled peer */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     if (!send_version(conn)) { p2p_close(conn); return 0; }
 
     /* Read messages until we have seen both version and verack from peer.
@@ -214,6 +221,18 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
 
         if (strcmp(cmd, "version") == 0) {
             if (plen >= 4) conn->peer_version = read_le32(payload);
+            /* Parse start_height: version(4)+services(8)+time(8)+addr_recv(26)+
+               addr_from(26)+nonce(8) = 80 bytes, then user_agent varint+string,
+               then start_height(4 LE). */
+            if (plen > 80) {
+                const uint8_t *p   = payload + 80;
+                size_t         rem = (size_t)(plen - 80);
+                size_t ua_skip = 1;
+                if (p[0] == 0xfd && rem >= 3) ua_skip = 3 + ((size_t)p[1] | ((size_t)p[2] << 8));
+                else                           ua_skip = 1 + p[0];
+                if (ua_skip < rem && rem - ua_skip >= 4)
+                    conn->peer_start_height = (int32_t)read_le32(p + ua_skip);
+            }
             got_version = 1;
             /* Reply immediately with our verack */
             p2p_send_msg(conn, "verack", NULL, 0);
@@ -225,6 +244,8 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
     }
 
     if (!got_version || !got_verack) { p2p_close(conn); return 0; }
+    /* Require BIP 157 support (protocol version 70016+) */
+    if (conn->peer_version < 70016) { p2p_close(conn); return 0; }
     return 1;
 }
 
@@ -234,6 +255,104 @@ void p2p_close(p2p_conn_t *conn)
         close(conn->fd);
         conn->fd = -1;
     }
+}
+
+/* -------------------------------------------------------------------------
+ * Block header download (getheaders / headers)
+ * ------------------------------------------------------------------------- */
+
+int p2p_send_getheaders(p2p_conn_t *conn,
+                        const uint8_t (*locator_hashes)[32], size_t n_locator,
+                        const uint8_t *stop_hash32)
+{
+    /* version(4) + varint(1-3) + n_locator*32 + stop_hash(32) */
+    size_t   buf_size = 4 + 9 + n_locator * 32 + 32;
+    uint8_t *buf      = malloc(buf_size);
+    if (!buf) return 0;
+
+    size_t n = 0;
+    write_le32(buf + n, 70016); n += 4;
+
+    /* CompactSize varint for locator hash count */
+    if (n_locator < 0xfd) {
+        buf[n++] = (uint8_t)n_locator;
+    } else {
+        buf[n++] = 0xfd;
+        buf[n++] = (uint8_t)(n_locator & 0xff);
+        buf[n++] = (uint8_t)((n_locator >> 8) & 0xff);
+    }
+
+    for (size_t i = 0; i < n_locator; i++) {
+        memcpy(buf + n, locator_hashes[i], 32);
+        n += 32;
+    }
+
+    /* stop_hash: all zeros = "as many as possible" */
+    if (stop_hash32) memcpy(buf + n, stop_hash32, 32);
+    else             memset(buf + n, 0, 32);
+    n += 32;
+
+    int ok = p2p_send_msg(conn, "getheaders", buf, (uint32_t)n);
+    free(buf);
+    return ok;
+}
+
+int p2p_recv_headers(p2p_conn_t *conn,
+                     uint8_t (*hashes_out)[32], size_t max_headers)
+{
+    for (int attempt = 0; attempt < 64; attempt++) {
+        char     cmd[13];
+        uint8_t *payload;
+        int      plen = p2p_recv_msg(conn, cmd, &payload);
+        if (plen < 0) return -1;
+
+        if (strcmp(cmd, "ping") == 0) {
+            p2p_send_msg(conn, "pong", payload, (uint32_t)plen);
+            free(payload);
+            continue;
+        }
+
+        if (strcmp(cmd, "headers") == 0) {
+            if (plen < 1) { free(payload); return 0; }
+
+            const uint8_t *p   = payload;
+            size_t         rem = (size_t)plen;
+
+            /* Parse CompactSize count */
+            uint64_t count;
+            size_t   varint_len;
+            if (p[0] < 0xfd) {
+                count      = p[0];
+                varint_len = 1;
+            } else if (p[0] == 0xfd && rem >= 3) {
+                count      = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+                varint_len = 3;
+            } else {
+                free(payload);
+                return 0;
+            }
+            p   += varint_len;
+            rem -= varint_len;
+
+            /* Each entry: 80-byte header + 1-byte tx_count varint (always 0x00) */
+            size_t n_stored = 0;
+            for (uint64_t i = 0; i < count; i++) {
+                if (rem < 81) break;
+                if (n_stored < max_headers && hashes_out)
+                    sha256_double(p, 80, hashes_out[n_stored++]);
+                p   += 81;
+                rem -= 81;
+            }
+
+            free(payload);
+            return (int)n_stored;
+        }
+
+        /* Ignore other message types */
+        free(payload);
+    }
+
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -271,17 +390,39 @@ int p2p_recv_cfilter(p2p_conn_t *conn,
         }
 
         if (strcmp(cmd, "cfilter") == 0) {
-            /* Payload: filter_type(1) + block_hash(32) + filter_bytes */
-            if (plen < 33) { free(payload); return 0; }
+            /* Payload: filter_type(1) + block_hash(32) +
+             *          num_filter_bytes(CompactSize) + filter_bytes */
+            if (plen < 34) { free(payload); return 0; }
 
             memcpy(block_hash32_out, payload + 1, 32);
-            /* SipHash key for this filter = first 16 bytes of block hash */
+            /* SipHash key for this filter = first 16 bytes of block hash
+             * (already in internal byte order in the P2P message) */
             memcpy(key_out, payload + 1, 16);
 
-            size_t   flen  = (size_t)(plen - 33);
+            /* Skip the CompactSize length prefix */
+            const uint8_t *p   = payload + 33;
+            size_t         rem = (size_t)(plen - 33);
+            uint64_t       filter_byte_count = 0;
+            size_t         varint_len;
+            if (p[0] < 0xfd) {
+                filter_byte_count = p[0];
+                varint_len = 1;
+            } else if (p[0] == 0xfd && rem >= 3) {
+                filter_byte_count = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+                varint_len = 3;
+            } else if (p[0] == 0xfe && rem >= 5) {
+                filter_byte_count = (uint64_t)p[1] | ((uint64_t)p[2] << 8) |
+                                    ((uint64_t)p[3] << 16) | ((uint64_t)p[4] << 24);
+                varint_len = 5;
+            } else {
+                free(payload); return 0;
+            }
+            if (rem < varint_len + filter_byte_count) { free(payload); return 0; }
+
+            size_t   flen  = (size_t)filter_byte_count;
             uint8_t *fdata = malloc(flen > 0 ? flen : 1);
             if (!fdata) { free(payload); return 0; }
-            if (flen > 0) memcpy(fdata, payload + 33, flen);
+            if (flen > 0) memcpy(fdata, p + varint_len, flen);
             *filter_out     = fdata;
             *filter_len_out = flen;
             free(payload);
@@ -293,6 +434,291 @@ int p2p_recv_cfilter(p2p_conn_t *conn,
     }
 
     return 0;  /* timed out waiting for cfilter */
+}
+
+/* -------------------------------------------------------------------------
+ * BIP 157 filter header chain download
+ * ------------------------------------------------------------------------- */
+
+int p2p_send_getcfheaders(p2p_conn_t *conn, uint32_t start_height,
+                          const uint8_t *stop_hash32)
+{
+    uint8_t buf[37];
+    buf[0] = P2P_FILTER_BASIC;
+    write_le32(buf + 1, start_height);
+    memcpy(buf + 5, stop_hash32, 32);
+    return p2p_send_msg(conn, "getcfheaders", buf, 37);
+}
+
+int p2p_recv_cfheaders(p2p_conn_t *conn,
+                       uint8_t  stop_hash_out[32],
+                       uint8_t  prev_filter_hdr_out[32],
+                       uint8_t **headers_out,
+                       size_t  *count_out)
+{
+    *headers_out = NULL;
+    *count_out   = 0;
+
+    for (int attempt = 0; attempt < 64; attempt++) {
+        char     cmd[13];
+        uint8_t *payload;
+        int      plen = p2p_recv_msg(conn, cmd, &payload);
+        if (plen < 0) return -1;
+
+        if (strcmp(cmd, "ping") == 0) {
+            p2p_send_msg(conn, "pong", payload, (uint32_t)plen);
+            free(payload);
+            continue;
+        }
+
+        if (strcmp(cmd, "cfheaders") == 0) {
+            /* Payload layout:
+             *   filter_type      (1 byte)
+             *   stop_hash        (32 bytes)
+             *   prev_filter_hdr  (32 bytes)
+             *   header_count     (CompactSize varint)
+             *   filter_headers[] (count × 32 bytes) */
+            if (plen < 66) { free(payload); return 0; }
+
+            memcpy(stop_hash_out,       payload + 1,  32);
+            memcpy(prev_filter_hdr_out, payload + 33, 32);
+
+            const uint8_t *p   = payload + 65;
+            size_t         rem = (size_t)(plen - 65);
+
+            uint64_t count;
+            size_t   varint_len;
+            if (p[0] < 0xfd) {
+                count      = p[0];
+                varint_len = 1;
+            } else if (p[0] == 0xfd && rem >= 3) {
+                count      = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+                varint_len = 3;
+            } else if (p[0] == 0xfe && rem >= 5) {
+                count      = (uint64_t)p[1] | ((uint64_t)p[2] <<  8) |
+                             ((uint64_t)p[3] << 16) | ((uint64_t)p[4] << 24);
+                varint_len = 5;
+            } else {
+                free(payload); return 0;
+            }
+
+            if (rem < varint_len + count * 32) { free(payload); return 0; }
+
+            size_t   hlen = (size_t)count * 32;
+            uint8_t *hdrs = malloc(hlen > 0 ? hlen : 1);
+            if (!hdrs) { free(payload); return 0; }
+            if (hlen > 0) memcpy(hdrs, p + varint_len, hlen);
+
+            *headers_out = hdrs;
+            *count_out   = (size_t)count;
+            free(payload);
+            return 1;
+        }
+
+        free(payload);
+    }
+
+    return 0;  /* timed out waiting for cfheaders */
+}
+
+/* -------------------------------------------------------------------------
+ * Block download and transaction scanning
+ * ------------------------------------------------------------------------- */
+
+/* Decode one CompactSize varint.  Returns 1 on success, 0 on insufficient
+   data.  Sets *val and *consumed on success. */
+static int parse_varint_block(const uint8_t *p, size_t rem,
+                               uint64_t *val, size_t *consumed)
+{
+    if (rem < 1) return 0;
+    if (p[0] < 0xfd) {
+        *val = p[0]; *consumed = 1; return 1;
+    } else if (p[0] == 0xfd && rem >= 3) {
+        *val = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+        *consumed = 3; return 1;
+    } else if (p[0] == 0xfe && rem >= 5) {
+        *val = (uint64_t)p[1] | ((uint64_t)p[2] <<  8) |
+               ((uint64_t)p[3] << 16) | ((uint64_t)p[4] << 24);
+        *consumed = 5; return 1;
+    } else if (p[0] == 0xff && rem >= 9) {
+        *val = (uint64_t)p[1]       | ((uint64_t)p[2] <<  8) |
+               ((uint64_t)p[3] << 16) | ((uint64_t)p[4] << 24) |
+               ((uint64_t)p[5] << 32) | ((uint64_t)p[6] << 40) |
+               ((uint64_t)p[7] << 48) | ((uint64_t)p[8] << 56);
+        *consumed = 9; return 1;
+    }
+    return 0;
+}
+
+int p2p_send_getdata_block(p2p_conn_t *conn, const uint8_t *block_hash32)
+{
+    /* inv: count=1 (varint) + type(4 LE MSG_BLOCK=2) + hash(32) */
+    uint8_t buf[37];
+    buf[0] = 0x01;
+    write_le32(buf + 1, 2);  /* MSG_BLOCK */
+    memcpy(buf + 5, block_hash32, 32);
+    return p2p_send_msg(conn, "getdata", buf, 37);
+}
+
+int p2p_recv_block(p2p_conn_t *conn,
+                   uint8_t **block_out, size_t *block_len_out)
+{
+    *block_out     = NULL;
+    *block_len_out = 0;
+
+    for (int attempt = 0; attempt < 64; attempt++) {
+        char     cmd[13];
+        uint8_t *payload;
+        int      plen = p2p_recv_msg(conn, cmd, &payload);
+        if (plen < 0) return -1;
+
+        if (strcmp(cmd, "ping") == 0) {
+            p2p_send_msg(conn, "pong", payload, (uint32_t)plen);
+            free(payload);
+            continue;
+        }
+
+        if (strcmp(cmd, "block") == 0) {
+            *block_out     = payload;
+            *block_len_out = (size_t)plen;
+            return 1;
+        }
+
+        free(payload);
+    }
+
+    return 0;  /* timed out waiting for block */
+}
+
+int p2p_scan_block_txs(const uint8_t *block, size_t block_len,
+                       p2p_block_scan_cb_t callback, void *ctx)
+{
+    if (!block || block_len < 81) return -1;  /* header(80) + tx_count(1) */
+
+    const uint8_t *p   = block + 80;
+    size_t         rem = block_len - 80;
+
+    uint64_t tx_count; size_t vl;
+    if (!parse_varint_block(p, rem, &tx_count, &vl)) return -1;
+    p += vl; rem -= vl;
+
+    static const char hx[] = "0123456789abcdef";
+    int processed = 0;
+
+    for (uint64_t tx_i = 0; tx_i < tx_count; tx_i++) {
+        if (rem < 4) return -1;
+        const uint8_t *tx_start = p;
+
+        p += 4; rem -= 4;  /* version */
+
+        /* Detect segwit marker (0x00) + flag (0x01) */
+        int segwit = (rem >= 2 && p[0] == 0x00 && p[1] == 0x01);
+        if (segwit) { p += 2; rem -= 2; }
+
+        const uint8_t *inputs_start = p;  /* for segwit txid */
+
+        /* Skip inputs */
+        uint64_t vin_count;
+        if (!parse_varint_block(p, rem, &vin_count, &vl)) return -1;
+        p += vl; rem -= vl;
+
+        for (uint64_t i = 0; i < vin_count; i++) {
+            if (rem < 36) return -1;  /* txid(32) + vout(4) */
+            p += 36; rem -= 36;
+            uint64_t ss_len;
+            if (!parse_varint_block(p, rem, &ss_len, &vl)) return -1;
+            if (rem < vl + ss_len) return -1;
+            p += vl + ss_len; rem -= vl + ss_len;
+            if (rem < 4) return -1;  /* sequence */
+            p += 4; rem -= 4;
+        }
+        const uint8_t *inputs_end = p;
+
+        /* Parse outputs — collect scriptPubKey pointers into the block buffer */
+        uint64_t vout_count;
+        if (!parse_varint_block(p, rem, &vout_count, &vl)) return -1;
+        p += vl; rem -= vl;
+
+        if (vout_count > 4096) return -1;  /* sanity cap */
+
+        const unsigned char **spks    = malloc(vout_count * sizeof(*spks));
+        size_t              *spk_lens = malloc(vout_count * sizeof(*spk_lens));
+        if (!spks || !spk_lens) { free(spks); free(spk_lens); return -1; }
+
+        for (uint64_t i = 0; i < vout_count; i++) {
+            if (rem < 8) { free(spks); free(spk_lens); return -1; }
+            p += 8; rem -= 8;  /* value */
+            uint64_t spk_len;
+            if (!parse_varint_block(p, rem, &spk_len, &vl)) {
+                free(spks); free(spk_lens); return -1;
+            }
+            if (rem < vl + spk_len || spk_len > 10000) {
+                free(spks); free(spk_lens); return -1;
+            }
+            p += vl; rem -= vl;
+            spks[i]    = p;
+            spk_lens[i] = (size_t)spk_len;
+            p += spk_len; rem -= spk_len;
+        }
+        const uint8_t *outputs_end = p;
+
+        /* Skip witness data */
+        if (segwit) {
+            for (uint64_t i = 0; i < vin_count; i++) {
+                uint64_t n_items;
+                if (!parse_varint_block(p, rem, &n_items, &vl)) {
+                    free(spks); free(spk_lens); return -1;
+                }
+                p += vl; rem -= vl;
+                for (uint64_t j = 0; j < n_items; j++) {
+                    uint64_t item_len;
+                    if (!parse_varint_block(p, rem, &item_len, &vl)) {
+                        free(spks); free(spk_lens); return -1;
+                    }
+                    if (rem < vl + item_len) { free(spks); free(spk_lens); return -1; }
+                    p += vl + item_len; rem -= vl + item_len;
+                }
+            }
+        }
+
+        if (rem < 4) { free(spks); free(spk_lens); return -1; }  /* locktime */
+        p += 4; rem -= 4;
+
+        /* Compute txid */
+        uint8_t txid[32];
+        if (!segwit) {
+            sha256_double(tx_start, (size_t)(p - tx_start), txid);
+        } else {
+            /* Segwit legacy txid = SHA256d(version || inputs+outputs || locktime)
+               Excludes marker/flag/witness; inputs_start is after marker/flag. */
+            size_t   io_len     = (size_t)(outputs_end - inputs_start);
+            size_t   legacy_len = 4 + io_len + 4;
+            uint8_t *legacy     = malloc(legacy_len);
+            if (!legacy) { free(spks); free(spk_lens); return -1; }
+            memcpy(legacy,             tx_start,    4);       /* version */
+            memcpy(legacy + 4,         inputs_start, io_len); /* inputs+outputs */
+            memcpy(legacy + 4 + io_len, p - 4,       4);      /* locktime */
+            sha256_double(legacy, legacy_len, txid);
+            free(legacy);
+        }
+
+        /* Display-order hex txid (reversed bytes) */
+        char txid_hex[65];
+        for (int k = 0; k < 32; k++) {
+            txid_hex[(31 - k) * 2]     = hx[(txid[k] >> 4) & 0xf];
+            txid_hex[(31 - k) * 2 + 1] = hx[txid[k] & 0xf];
+        }
+        txid_hex[64] = '\0';
+
+        callback(txid_hex, (size_t)vout_count, spks, spk_lens, ctx);
+        free(spks);
+        free(spk_lens);
+        processed++;
+
+        (void)inputs_end;  /* only used for segwit path; suppress warning */
+    }
+
+    return processed;
 }
 
 /* -------------------------------------------------------------------------
@@ -339,4 +765,90 @@ int p2p_broadcast_tx(p2p_conn_t *conn,
     }
 
     return 0;  /* peer never requested the tx */
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 7: Mempool awareness (BIP 35)
+ * ------------------------------------------------------------------------- */
+
+int p2p_send_mempool(p2p_conn_t *conn)
+{
+    /* The `mempool` message has an empty payload (BIP 35) */
+    return p2p_send_msg(conn, "mempool", NULL, 0);
+}
+
+int p2p_poll_inv(p2p_conn_t *conn,
+                 uint8_t txids_out[][32], int max_txids,
+                 int timeout_ms)
+{
+    if (!conn || conn->fd < 0 || !txids_out || max_txids <= 0) return 0;
+
+    /* Temporarily shorten the receive timeout to avoid blocking */
+    struct timeval short_tv;
+    short_tv.tv_sec  = timeout_ms / 1000;
+    short_tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO,
+               &short_tv, sizeof(short_tv));
+
+    int n_txids = 0;
+
+    /* Read up to a small number of messages; stop on timeout or error */
+    for (int iter = 0; iter < 32 && n_txids < max_txids; iter++) {
+        char     cmd[13];
+        uint8_t *payload = NULL;
+        int      plen    = p2p_recv_msg(conn, cmd, &payload);
+
+        if (plen < 0) {
+            /* EAGAIN / EWOULDBLOCK from short timeout = no more data */
+            free(payload);
+            break;
+        }
+
+        if (strcmp(cmd, "ping") == 0) {
+            p2p_send_msg(conn, "pong", payload, (uint32_t)plen);
+            free(payload);
+            continue;
+        }
+
+        if (strcmp(cmd, "inv") == 0 && plen > 0) {
+            /* inv payload: varint(count) + [type(4 LE) + hash(32)] * count */
+            const uint8_t *p   = payload;
+            size_t         rem = (size_t)plen;
+
+            /* Decode varint count */
+            if (rem < 1) { free(payload); continue; }
+            uint64_t count;
+            size_t   vi_len;
+            if (p[0] < 0xfd) {
+                count  = p[0];
+                vi_len = 1;
+            } else if (p[0] == 0xfd && rem >= 3) {
+                count  = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+                vi_len = 3;
+            } else {
+                free(payload); continue;
+            }
+            p   += vi_len;
+            rem -= vi_len;
+
+            for (uint64_t i = 0; i < count && rem >= 36 && n_txids < max_txids; i++) {
+                uint32_t type;
+                memcpy(&type, p, 4);
+                type = (uint32_t)(p[0] | ((uint32_t)p[1] << 8) |
+                                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+                if (type == 1 /* MSG_TX */)
+                    memcpy(txids_out[n_txids++], p + 4, 32);
+                p   += 36;
+                rem -= 36;
+            }
+        }
+
+        free(payload);
+    }
+
+    /* Restore normal 30-second receive timeout */
+    struct timeval norm_tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &norm_tv, sizeof(norm_tv));
+
+    return n_txids;
 }

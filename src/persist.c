@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <limits.h>
 
 #ifndef BASEPOINT_DIAG
 #define BASEPOINT_DIAG 0
@@ -260,6 +261,15 @@ static const char *SCHEMA_SQL =
     "  epoch INTEGER NOT NULL,"
     "  secret TEXT NOT NULL,"
     "  PRIMARY KEY (factory_id, epoch)"
+    ");"
+    /* BIP 158 light client scan checkpoint (singleton row, id=1) */
+    "CREATE TABLE IF NOT EXISTS bip158_checkpoints ("
+    "  id INTEGER PRIMARY KEY DEFAULT 1,"
+    "  tip_height INTEGER NOT NULL DEFAULT -1,"
+    "  headers_synced INTEGER NOT NULL DEFAULT -1,"
+    "  filter_headers_synced INTEGER NOT NULL DEFAULT -1,"
+    "  header_hashes BLOB,"
+    "  filter_headers BLOB"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -2598,4 +2608,93 @@ size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- BIP 158 scan checkpoint (singleton) --- */
+
+int persist_save_bip158_checkpoint(persist_t *p,
+                                    int32_t tip_height,
+                                    int32_t headers_synced,
+                                    int32_t filter_headers_synced,
+                                    const uint8_t *header_hashes,
+                                    size_t header_hashes_len,
+                                    const uint8_t *filter_headers,
+                                    size_t filter_headers_len) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO bip158_checkpoints "
+        "(id, tip_height, headers_synced, filter_headers_synced, "
+        " header_hashes, filter_headers) "
+        "VALUES (1, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)tip_height);
+    sqlite3_bind_int(stmt, 2, (int)headers_synced);
+    sqlite3_bind_int(stmt, 3, (int)filter_headers_synced);
+    if (header_hashes && header_hashes_len > 0 &&
+        header_hashes_len <= (size_t)INT_MAX)
+        sqlite3_bind_blob(stmt, 4, header_hashes, (int)header_hashes_len,
+                          SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 4);
+    if (filter_headers && filter_headers_len > 0 &&
+        filter_headers_len <= (size_t)INT_MAX)
+        sqlite3_bind_blob(stmt, 5, filter_headers, (int)filter_headers_len,
+                          SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 5);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_bip158_checkpoint(persist_t *p,
+                                    int32_t *tip_height_out,
+                                    int32_t *headers_synced_out,
+                                    int32_t *filter_headers_synced_out,
+                                    uint8_t *header_hashes_out,
+                                    size_t header_hashes_cap,
+                                    uint8_t *filter_headers_out,
+                                    size_t filter_headers_cap) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT tip_height, headers_synced, filter_headers_synced, "
+        "       header_hashes, filter_headers "
+        "FROM bip158_checkpoints WHERE id = 1;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        if (tip_height_out)
+            *tip_height_out = (int32_t)sqlite3_column_int(stmt, 0);
+        if (headers_synced_out)
+            *headers_synced_out = (int32_t)sqlite3_column_int(stmt, 1);
+        if (filter_headers_synced_out)
+            *filter_headers_synced_out = (int32_t)sqlite3_column_int(stmt, 2);
+
+        if (header_hashes_out && header_hashes_cap > 0) {
+            const void *blob = sqlite3_column_blob(stmt, 3);
+            int blen = sqlite3_column_bytes(stmt, 3);
+            if (blob && blen > 0 && (size_t)blen <= header_hashes_cap)
+                memcpy(header_hashes_out, blob, (size_t)blen);
+        }
+        if (filter_headers_out && filter_headers_cap > 0) {
+            const void *blob = sqlite3_column_blob(stmt, 4);
+            int blen = sqlite3_column_bytes(stmt, 4);
+            if (blob && blen > 0 && (size_t)blen <= filter_headers_cap)
+                memcpy(filter_headers_out, blob, (size_t)blen);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }

@@ -72,6 +72,13 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
                 e->to_local_spk_len = spk_lens[i];
+
+                /* Re-register the watched script with the chain backend so
+                   BIP 158 scanning resumes correctly after a process restart. */
+                if (wt->chain && wt->chain->register_script && spk_lens[i] > 0)
+                    wt->chain->register_script(wt->chain,
+                                               e->to_local_spk, e->to_local_spk_len);
+
                 e->n_htlc_outputs = 0;
                 e->response_tx = NULL;
                 e->response_tx_len = 0;
