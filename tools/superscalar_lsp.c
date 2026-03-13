@@ -3724,9 +3724,11 @@ int main(int argc, char *argv[]) {
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            /* Build the LSP's OWN old commitment (not the client's).
-               Client watchtowers watch for the LSP's commitment txid. */
-            int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
+            /* Build the CLIENT's old commitment (not the LSP's).
+               The LSP's embedded watchtower watches for the CLIENT's commitment txid,
+               registered via watchtower_watch_revoked_commitment() using
+               channel_build_commitment_tx_for_remote(). */
+            int built = channel_build_commitment_tx_for_remote(chX, &old_commit_tx, old_txid);
 
             /* Restore current state */
             chX->commitment_number = saved_num;
