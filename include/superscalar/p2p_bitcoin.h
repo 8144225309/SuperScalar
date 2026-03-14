@@ -319,4 +319,39 @@ int p2p_scan_block_full(const uint8_t *block, size_t block_len,
                          p2p_input_cb_t input_cb,
                          void *ctx);
 
+/* -----------------------------------------------------------------------
+ * Phase B: PoW / nBits header chain validation
+ * --------------------------------------------------------------------- */
+
+/*
+ * Returns 1 if SHA256d(header80) < target(nBits), 0 if invalid.
+ * Rejects negative/overflow nBits per Bitcoin Core rules.
+ */
+int p2p_validate_header_pow(const uint8_t header80[80]);
+
+/*
+ * Check actual retarget: new_bits should follow from actual_timespan_secs.
+ * Allows ±4x factor as per protocol. Returns 1 if plausible, 0 if not.
+ */
+int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
+                                        uint32_t actual_timespan_secs);
+
+/*
+ * Like p2p_recv_headers but validates PoW for each header inline.
+ * If nbits_out is non-NULL, fills nbits_out[i] with nBits of hashes_out[i].
+ * On PoW failure: closes conn, returns -1.
+ * On success: returns number of headers (0 if peer at tip).
+ */
+int p2p_recv_headers_pow(p2p_conn_t *conn,
+                          uint8_t (*hashes_out)[32], size_t max_headers,
+                          uint32_t *nbits_out);
+
+/*
+ * Like p2p_connect() but uses a non-blocking connect() with timeout_ms
+ * milliseconds wait. Returns 1 on success, 0 on failure.
+ * Used by bip158_backend_connect_all() for concurrent connection setup.
+ */
+int p2p_connect_nonblocking(p2p_conn_t *conn, const char *host, int port,
+                              const char *network, int timeout_ms);
+
 #endif /* SUPERSCALAR_P2P_BITCOIN_H */
