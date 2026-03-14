@@ -1,5 +1,6 @@
 #include "superscalar/lsps.h"
 #include "superscalar/wire.h"
+#include "superscalar/jit_channel.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,10 +51,8 @@ cJSON *lsps_build_error(int id, int code, const char *message)
     return resp;
 }
 
-int lsps_handle_request(void *lsp_ctx, int fd, const cJSON *json)
+int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
 {
-    (void)lsp_ctx;
-
     int req_id = 0;
     const char *method = lsps_parse_request(json, &req_id);
     if (!method) return 0;
@@ -76,9 +75,13 @@ int lsps_handle_request(void *lsp_ctx, int fd, const cJSON *json)
             response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "invalid params");
         } else {
             cJSON *result = cJSON_CreateObject();
-            cJSON_AddStringToObject(result, "order_state", "CREATED");
-            cJSON_AddNumberToObject(result, "amount_msat", (double)amount_msat);
-            response = lsps_build_response(req_id, result);
+            if (!result) {
+                response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "oom");
+            } else {
+                cJSON_AddStringToObject(result, "order_state", "CREATED");
+                cJSON_AddNumberToObject(result, "amount_msat", (double)amount_msat);
+                response = lsps_build_response(req_id, result);
+            }
         }
     } else if (strcmp(method, "lsps2.get_info") == 0) {
         lsps2_fee_params_t params = {
@@ -95,9 +98,27 @@ int lsps_handle_request(void *lsp_ctx, int fd, const cJSON *json)
             response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "invalid params");
         } else {
             cJSON *result = cJSON_CreateObject();
-            /* Return a fake SCID for the JIT channel */
-            cJSON_AddStringToObject(result, "jit_channel_scid", "800000x1x0");
-            response = lsps_build_response(req_id, result);
+            if (!result) {
+                response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "oom");
+            } else if (!ctx || !ctx->mgr || !ctx->lsp) {
+                cJSON_Delete(result);
+                response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "no channel context");
+            } else {
+                uint64_t funding_sats = (amount_msat + fee_msat + 999) / 1000;
+                if (funding_sats < 20000) funding_sats = 20000; /* minimum channel */
+                if (jit_channel_create(ctx->mgr, ctx->lsp, ctx->client_idx,
+                                        funding_sats, "lsps2.buy")) {
+                    char scid_buf[32];
+                    snprintf(scid_buf, sizeof(scid_buf), "800000x%zux0",
+                             ctx->client_idx + 1);
+                    cJSON_AddStringToObject(result, "jit_channel_scid", scid_buf);
+                    response = lsps_build_response(req_id, result);
+                } else {
+                    cJSON_Delete(result);
+                    response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR,
+                                                 "jit_channel_create failed");
+                }
+            }
         }
     } else {
         response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
