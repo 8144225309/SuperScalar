@@ -94,10 +94,12 @@
 #define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
 #define MSG_PATH_SIGN_DONE      0x63  /* LSP -> Clients: path signing complete */
 
-/* Async signing: pending work queue */
-#define MSG_QUEUE_POLL          0x65  /* Client → LSP: poll for pending work items */
-#define MSG_QUEUE_ITEMS         0x66  /* LSP → Client: pending work items response */
-#define MSG_QUEUE_DONE          0x67  /* Client → LSP: acknowledge processed item IDs */
+/* Async signing: pending work queue
+ * NOTE: 0x65–0x6C are reserved for LSPS/splice (PR #14).
+ *       Queue messages start at 0x6D to avoid collision. */
+#define MSG_QUEUE_POLL          0x6D  /* Client → LSP: poll for pending work items */
+#define MSG_QUEUE_ITEMS         0x6E  /* LSP → Client: pending work items response */
+#define MSG_QUEUE_DONE          0x6F  /* Client → LSP: acknowledge processed item IDs */
 
 #define MSG_ERROR              0xFF
 

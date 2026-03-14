@@ -120,9 +120,9 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x5E: return "LEAF_REALLOC_ALL_NONCES";
     case 0x5F: return "LEAF_REALLOC_PSIG";
     case 0x64: return "LEAF_REALLOC_DONE";
-    case 0x65: return "QUEUE_POLL";
-    case 0x66: return "QUEUE_ITEMS";
-    case 0x67: return "QUEUE_DONE";
+    case 0x6D: return "QUEUE_POLL";
+    case 0x6E: return "QUEUE_ITEMS";
+    case 0x6F: return "QUEUE_DONE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
