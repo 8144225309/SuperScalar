@@ -104,12 +104,12 @@ int main(int argc, char *argv[]) {
     }
 
     /* Initialize fee estimator */
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
 
     /* Initialize watchtower */
     watchtower_t wt;
-    if (!watchtower_init(&wt, 0, &rt, &fee, &db)) {
+    if (!watchtower_init(&wt, 0, &rt, (fee_estimator_t *)&fee, &db)) {
         fprintf(stderr, "Error: watchtower_init failed\n");
         persist_close(&db);
         return 1;

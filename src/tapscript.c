@@ -576,3 +576,102 @@ int finalize_script_path_tx_preimage(
     tx_buf_write_bytes(out, unsigned_tx + unsigned_tx_len - 4, 4);
     return 1;
 }
+
+int compute_keypath_sighash_anyonecanpay(
+    unsigned char *sighash_out32,
+    const unsigned char *unsigned_tx, size_t tx_len,
+    uint32_t input_index,
+    const unsigned char *prev_spk, size_t prev_spk_len,
+    uint64_t prev_amount,
+    uint32_t nsequence
+) {
+    if (!sighash_out32 || !unsigned_tx || tx_len < 8) return 0;
+    if (!prev_spk || prev_spk_len == 0 || prev_spk_len > 10000) return 0;
+
+    /* nVersion (first 4 bytes), nLocktime (last 4 bytes) */
+    unsigned char nversion_le[4], nlocktime_le[4];
+    memcpy(nversion_le, unsigned_tx, 4);
+    memcpy(nlocktime_le, unsigned_tx + tx_len - 4, 4);
+
+    /* --- Parse tx to find: outpoint of input_index, sha_outputs --- */
+
+    /* Inline varint parser */
+#define RD_VARINT(p, rem, out, vl) do { \
+    if ((rem) < 1) return 0; \
+    if ((p)[0] < 0xfd) { (out) = (p)[0]; (vl) = 1; } \
+    else if ((p)[0] == 0xfd && (rem) >= 3) { \
+        (out) = (uint64_t)(p)[1] | ((uint64_t)(p)[2] << 8); (vl) = 3; \
+    } else return 0; \
+} while(0)
+
+    const unsigned char *p = unsigned_tx + 4;  /* skip nVersion */
+    size_t rem = tx_len - 4;
+
+    uint64_t vin_count; size_t vl;
+    RD_VARINT(p, rem, vin_count, vl);
+    p += vl; rem -= vl;
+
+    unsigned char outpoint[36];  /* txid32 + vout4 for input_index */
+    int found_input = 0;
+
+    for (uint64_t i = 0; i < vin_count; i++) {
+        if (rem < 36) return 0;
+        if (i == input_index) {
+            memcpy(outpoint, p, 36);
+            found_input = 1;
+        }
+        p += 36; rem -= 36;
+        uint64_t ss_len;
+        RD_VARINT(p, rem, ss_len, vl);
+        p += vl + ss_len; rem -= vl + ss_len;
+        if (rem < 4) return 0;
+        p += 4; rem -= 4;  /* nSequence */
+    }
+    if (!found_input) return 0;
+
+    /* sha_outputs: SHA256 of all serialized outputs */
+    uint64_t vout_count;
+    RD_VARINT(p, rem, vout_count, vl);
+    p += vl; rem -= vl;
+    const unsigned char *outputs_start = p;
+    for (uint64_t i = 0; i < vout_count; i++) {
+        if (rem < 8) return 0;
+        p += 8; rem -= 8;  /* amount */
+        uint64_t spk_len;
+        RD_VARINT(p, rem, spk_len, vl);
+        if (rem < vl + spk_len) return 0;
+        p += vl + spk_len; rem -= vl + spk_len;
+    }
+    unsigned char sha_outputs[32];
+    sha256(outputs_start, (size_t)(p - outputs_start), sha_outputs);
+
+#undef RD_VARINT
+
+    /* BIP 341 sighash message for key-path ANYONECANPAY|ALL (hash_type=0x81):
+         epoch(1) hash_type(1) nVersion(4) nLocktime(4)
+         sha_outputs(32)
+         spend_type(1) = 0x00 (key-path, no annex)
+         outpoint(36) amount(8) compact_spk(1+spk_len) nSequence(4)
+    */
+    size_t msg_len = 1 + 1 + 4 + 4 + 32 + 1 + 36 + 8 + 1 + prev_spk_len + 4;
+    unsigned char *msg = (unsigned char *)malloc(msg_len);
+    if (!msg) return 0;
+
+    size_t pos = 0;
+    msg[pos++] = 0x00;  /* epoch */
+    msg[pos++] = 0x81;  /* SIGHASH_ALL | ANYONECANPAY */
+    memcpy(msg + pos, nversion_le, 4);  pos += 4;
+    memcpy(msg + pos, nlocktime_le, 4); pos += 4;
+    memcpy(msg + pos, sha_outputs, 32); pos += 32;
+    msg[pos++] = 0x00;  /* spend_type: key-path, no annex */
+    /* ANYONECANPAY: outpoint, amount, compact_spk, nSequence */
+    memcpy(msg + pos, outpoint, 36);    pos += 36;
+    for (int i = 0; i < 8; i++) msg[pos++] = (unsigned char)(prev_amount >> (i * 8));
+    msg[pos++] = (unsigned char)prev_spk_len;  /* compact_size (< 0xfd for scripts) */
+    memcpy(msg + pos, prev_spk, prev_spk_len); pos += prev_spk_len;
+    write_u32_le(msg + pos, nsequence);  pos += 4;
+
+    sha256_tagged("TapSighash", msg, pos, sighash_out32);
+    free(msg);
+    return 1;
+}

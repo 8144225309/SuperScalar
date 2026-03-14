@@ -894,8 +894,8 @@ int test_regtest_channel_unilateral(void) {
     /* Channel funding keys must match factory leaf output order:
        setup_leaf_outputs uses [client_a, LSP] for channel A */
     channel_t ch;
-    fee_estimator_t _fe; fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
     uint64_t usable = chan_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -1932,8 +1932,8 @@ int test_regtest_htlc_success(void) {
     /* Set up channel with HTLC */
     channel_t ch;
     uint32_t csv_delay = 6;
-    fee_estimator_t _fe; fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -2162,8 +2162,8 @@ int test_regtest_htlc_timeout(void) {
     /* Set up channel */
     channel_t ch;
     uint32_t csv_delay = 6;
-    fee_estimator_t _fe; fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -3089,8 +3089,8 @@ int test_regtest_channel_penalty(void) {
 
     /* CHEATER channel (Client A perspective) */
     channel_t cheater_ch;
-    fee_estimator_t _fe; fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
     uint64_t usable = chan_amount > commit_fee ? chan_amount - commit_fee : chan_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -3427,8 +3427,8 @@ int test_regtest_multi_htlc_unilateral(void) {
     /* Set up channel with 2 HTLCs */
     channel_t ch;
     uint32_t csv_delay = 6;
-    fee_estimator_t fe; fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe; fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -3716,8 +3716,8 @@ int test_regtest_penalty_with_htlcs(void) {
     if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
 
     uint32_t csv_delay = 6;
-    fee_estimator_t fe; fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe; fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = chan_amount > commit_fee ? chan_amount - commit_fee : chan_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -4039,8 +4039,8 @@ int test_regtest_htlc_timeout_race(void) {
     /* Channel setup: we have a received HTLC (we know the preimage) */
     channel_t ch;
     uint32_t csv_delay = 6;
-    fee_estimator_t fe; fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe; fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : 0;
     /* Give remote enough to satisfy CHANNEL_RESERVE_SATS after HTLC deduction.
        HTLC is RECEIVED (remote offers), so remote_amt >= htlc + reserve. */
@@ -4401,8 +4401,8 @@ int test_regtest_htlc_wrong_preimage_rejected(void) {
     /* Set up channel with HTLC */
     channel_t ch;
     uint32_t csv_delay = 6;
-    fee_estimator_t _fe; fee_init(&_fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+    fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;

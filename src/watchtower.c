@@ -1,7 +1,11 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/wallet_source.h"
 #include "superscalar/types.h"
 #include "superscalar/persist.h"
+#include "superscalar/chain_backend.h"
 #include "cJSON.h"
+
+extern void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt);
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -33,6 +37,14 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     wt->fee = fee;
     wt->db = db;
 
+    /* Wrap regtest_t as the default chain backend when provided. */
+    if (rt) {
+        chain_backend_regtest_init(&wt->_chain_regtest_wrapper, rt);
+        wt->chain = &wt->_chain_regtest_wrapper;
+        wallet_source_rpc_init(&wt->_wallet_rpc_default, rt);
+        wt->wallet = &wt->_wallet_rpc_default.base;
+    }
+
     /* P2A anchor: static anyone-can-spend SPK — no keys needed */
     memcpy(wt->anchor_spk, P2A_SPK, P2A_SPK_LEN);
     wt->anchor_spk_len = P2A_SPK_LEN;
@@ -63,6 +75,13 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
                 e->to_local_spk_len = spk_lens[i];
+
+                /* Re-register the watched script with the chain backend so
+                   BIP 158 scanning resumes correctly after a process restart. */
+                if (wt->chain && wt->chain->register_script && spk_lens[i] > 0)
+                    wt->chain->register_script(wt->chain,
+                                               e->to_local_spk, e->to_local_spk_len);
+
                 e->n_htlc_outputs = 0;
                 e->response_tx = NULL;
                 e->response_tx_len = 0;
@@ -146,6 +165,10 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
                                       txid32, to_local_vout, to_local_amount,
                                       to_local_spk, spk_len);
     }
+
+    /* Register script with chain backend (no-op for TXID-polling backend) */
+    if (wt->chain && wt->chain->register_script)
+        wt->chain->register_script(wt->chain, to_local_spk, spk_len);
 
     return 1;
 }
@@ -285,6 +308,10 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 wh->cltv_expiry = old_htlcs[i].cltv_expiry;
                 entry->n_htlc_outputs++;
 
+                /* Register HTLC script with chain backend */
+                if (wt->chain && wt->chain->register_script)
+                    wt->chain->register_script(wt->chain, wh->htlc_spk, 34);
+
                 out_ofs += 8 + 1 + slen;
                 htlc_active_idx++;
             }
@@ -315,8 +342,20 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     free(saved_htlcs);
 }
 
+void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)
+{
+    if (wt)
+        wt->chain = backend;
+}
+
+void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet)
+{
+    if (wt)
+        wt->wallet = wallet;
+}
+
 int watchtower_check(watchtower_t *wt) {
-    if (!wt || !wt->rt) return 0;
+    if (!wt || !wt->chain) return 0;
 
     int penalties_broadcast = 0;
 
@@ -331,8 +370,8 @@ int watchtower_check(watchtower_t *wt) {
         hex_encode(display_txid, 32, txid_hex);
 
         /* Check if old commitment is on chain or in mempool */
-        int conf = regtest_get_confirmations(wt->rt, txid_hex);
-        int in_mempool = regtest_is_in_mempool(wt->rt, txid_hex);
+        int conf = wt->chain->get_confirmations(wt->chain, txid_hex);
+        int in_mempool = wt->chain->is_in_mempool(wt->chain, txid_hex);
 
         if (conf < 0 && !in_mempool) {
             i++;  /* not found, keep watching */
@@ -350,7 +389,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (resp_hex) {
                     hex_encode(e->response_tx, e->response_tx_len, resp_hex);
                     char resp_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, resp_hex, resp_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
                         penalties_broadcast++;
                         if (wt->db && wt->db->db)
@@ -372,7 +411,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (burn_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, burn_hex);
                     char burn_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, burn_hex, burn_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, burn_hex, burn_txid)) {
                         printf("  L-stock burn tx broadcast: %s\n", burn_txid);
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, burn_txid,
@@ -403,7 +442,8 @@ int watchtower_check(watchtower_t *wt) {
         fflush(stdout);
 
         /* If in mempool but not confirmed, mine a block (regtest only) */
-        if (in_mempool && conf < 0 && strcmp(wt->rt->network, "regtest") == 0) {
+        if (in_mempool && conf < 0 &&
+            wt->rt && strcmp(wt->rt->network, "regtest") == 0) {
             char mine_addr[128];
             if (regtest_get_new_address(wt->rt, mine_addr, sizeof(mine_addr)))
                 regtest_mine_blocks(wt->rt, 1, mine_addr);
@@ -442,7 +482,7 @@ int watchtower_check(watchtower_t *wt) {
         int penalty_sent = 0;
         if (penalty_hex) {
             hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
-            if (regtest_send_raw_tx(wt->rt, penalty_hex, penalty_txid)) {
+            if (wt->chain->send_raw_tx(wt->chain, penalty_hex, penalty_txid)) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
                 fflush(stdout);
                 penalties_broadcast++;
@@ -504,7 +544,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (htlc_hex) {
                     hex_encode(htlc_penalty.data, htlc_penalty.len, htlc_hex);
                     char htlc_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, htlc_hex, htlc_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, htlc_hex, htlc_txid)) {
                         printf("  HTLC penalty tx (vout %u) broadcast: %s\n",
                                e->htlc_outputs[h].htlc_vout, htlc_txid);
                         penalties_broadcast++;
@@ -535,7 +575,7 @@ int watchtower_check(watchtower_t *wt) {
     }
 
     /* Force-close HTLC timeout sweep: check if any expired HTLCs can be swept */
-    int current_height = regtest_get_block_height(wt->rt);
+    int current_height = wt->chain->get_block_height(wt->chain);
     if (current_height > 0) {
         for (size_t i = 0; i < wt->n_entries; i++) {
             watchtower_entry_t *e = &wt->entries[i];
@@ -575,7 +615,7 @@ int watchtower_check(watchtower_t *wt) {
                     if (tx_hex) {
                         hex_encode(timeout_tx.data, timeout_tx.len, tx_hex);
                         char txid[65];
-                        if (regtest_send_raw_tx(wt->rt, tx_hex, txid)) {
+                        if (wt->chain->send_raw_tx(wt->chain, tx_hex, txid)) {
                             printf("  HTLC timeout sweep (vout %u, cltv %u): %s\n",
                                    htlc->htlc_vout, htlc->cltv_expiry, txid);
                             penalties_broadcast++;
@@ -610,7 +650,7 @@ int watchtower_check(watchtower_t *wt) {
     /* CPFP bump loop: check pending penalty txs and bump if stuck */
     for (size_t i = 0; i < wt->n_pending; ) {
         watchtower_pending_t *p = &wt->pending[i];
-        int conf = regtest_get_confirmations(wt->rt, p->txid);
+        int conf = wt->chain->get_confirmations(wt->chain, p->txid);
         if (conf > 0) {
             /* Confirmed — remove from pending (swap with last) */
             if (wt->db && wt->db->db)
@@ -634,7 +674,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (cpfp_hex) {
                     hex_encode(cpfp.data, cpfp.len, cpfp_hex);
                     char cpfp_txid[65];
-                    if (regtest_send_raw_tx(wt->rt, cpfp_hex, cpfp_txid)) {
+                    if (wt->chain->send_raw_tx(wt->chain, cpfp_hex, cpfp_txid)) {
                         printf("  CPFP child broadcast (attempt %d): %s\n",
                                p->bump_count + 1, cpfp_txid);
                         p->bump_count++;
@@ -671,8 +711,12 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                const char *parent_txid,
                                uint32_t anchor_vout,
                                uint64_t anchor_amount) {
-    if (!wt || !wt->rt || !cpfp_tx_out || !parent_txid) return 0;
+    if (!wt || !cpfp_tx_out || !parent_txid) return 0;
     if (wt->anchor_spk_len != P2A_SPK_LEN) return 0;
+    if (!wt->wallet) {
+        fprintf(stderr, "CPFP: disabled (no wallet source attached)\n");
+        return 0;
+    }
 
     /* Get a wallet UTXO to fund the CPFP child */
     char wallet_txid_hex[65];
@@ -684,10 +728,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 200;
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
 
-    if (!regtest_get_utxo_for_bump(wt->rt, min_amount,
-                                     wallet_txid_hex, &wallet_vout,
-                                     &wallet_amount,
-                                     wallet_spk, &wallet_spk_len)) {
+    if (!wt->wallet->get_utxo(wt->wallet, min_amount,
+                               wallet_txid_hex, &wallet_vout,
+                               &wallet_amount, wallet_spk, &wallet_spk_len)) {
         fprintf(stderr, "CPFP: no suitable wallet UTXO for bump\n");
         return 0;
     }
@@ -706,32 +749,11 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     uint64_t change_amount = total_in > cpfp_fee ? total_in - cpfp_fee : 0;
     if (change_amount == 0) return 0;
 
-    /* Get change address SPK from wallet */
-    char change_addr[128];
-    if (!regtest_get_new_address(wt->rt, change_addr, sizeof(change_addr)))
-        return 0;
-
-    /* Use getaddressinfo to get the scriptPubKey */
-    char addr_params[256];
-    snprintf(addr_params, sizeof(addr_params), "\"%s\"", change_addr);
-    char *addr_info = regtest_exec(wt->rt, "getaddressinfo", addr_params);
-    if (!addr_info) return 0;
-
+    /* Get change scriptPubKey from wallet */
     unsigned char change_spk[64];
     size_t change_spk_len = 0;
-    {
-        cJSON *json = cJSON_Parse(addr_info);
-        free(addr_info);
-        if (!json) return 0;
-        cJSON *spk_hex = cJSON_GetObjectItem(json, "scriptPubKey");
-        if (!spk_hex || !cJSON_IsString(spk_hex)) {
-            cJSON_Delete(json);
-            return 0;
-        }
-        int decoded = hex_decode(spk_hex->valuestring, change_spk, sizeof(change_spk));
-        if (decoded > 0) change_spk_len = (size_t)decoded;
-        cJSON_Delete(json);
-    }
+    if (!wt->wallet->get_change_spk(wt->wallet, change_spk, &change_spk_len))
+        return 0;
     if (change_spk_len == 0) return 0;
 
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
@@ -757,50 +779,29 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* nLockTime */
     tx_buf_write_u32_le(&unsigned_tx, 0);
 
-    /* Hex-encode the unsigned tx for signrawtransactionwithwallet.
-       Input 0 (P2A anchor) is anyone-can-spend — empty witness is valid.
-       The wallet only needs to sign input 1. */
-    char *unsigned_hex = (char *)malloc(unsigned_tx.len * 2 + 1);
-    if (!unsigned_hex) {
+    /* Sign input 1 (wallet UTXO) via the wallet_source vtable.
+       Input 0 (P2A anchor) is anyone-can-spend — no signature needed. */
+    size_t signed_len = unsigned_tx.len + 512; /* room for witness data */
+    unsigned char *signed_buf = (unsigned char *)malloc(signed_len);
+    if (!signed_buf) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
-    hex_encode(unsigned_tx.data, unsigned_tx.len, unsigned_hex);
-
-    /* Build prevtxs JSON for the P2A anchor input so the wallet knows
-       to leave it unsigned (it only signs its own input 1). */
-    char anchor_spk_hex[16];
-    hex_encode(wt->anchor_spk, wt->anchor_spk_len, anchor_spk_hex);
-    char prevtxs[512];
-    snprintf(prevtxs, sizeof(prevtxs),
-        "[{\"txid\":\"%s\",\"vout\":%u,\"scriptPubKey\":\"%s\",\"amount\":%.8f}]",
-        parent_txid, anchor_vout, anchor_spk_hex,
-        (double)anchor_amount / 100000000.0);
-
-    /* P2A anchor input is anyone-can-spend — wallet won't sign it, so
-       complete will be false. Pass require_complete=0. */
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(wt->rt, unsigned_hex, prevtxs, 0);
-    free(unsigned_hex);
+    memcpy(signed_buf, unsigned_tx.data, unsigned_tx.len);
+    signed_len = unsigned_tx.len;
     tx_buf_free(&unsigned_tx);
 
-    if (!signed_hex) return 0;
-
-    /* Decode the signed tx binary. The wallet signed input 1 and left
-       input 0 (P2A) with empty witness (0x00), which is valid for
-       anyone-can-spend. No witness splicing needed. */
-    size_t signed_hex_len = strlen(signed_hex);
-    size_t signed_bin_len = signed_hex_len / 2;
-    unsigned char *signed_bin = (unsigned char *)malloc(signed_bin_len);
-    if (!signed_bin) {
-        free(signed_hex);
+    if (!wt->wallet->sign_input(wt->wallet, signed_buf, &signed_len,
+                                 1 /* input_idx */,
+                                 wallet_spk, wallet_spk_len,
+                                 wallet_amount)) {
+        free(signed_buf);
         return 0;
     }
-    hex_decode(signed_hex, signed_bin, signed_bin_len);
-    free(signed_hex);
 
     tx_buf_reset(cpfp_tx_out);
-    tx_buf_write_bytes(cpfp_tx_out, signed_bin, signed_bin_len);
-    free(signed_bin);
+    tx_buf_write_bytes(cpfp_tx_out, signed_buf, signed_len);
+    free(signed_buf);
 
     return 1;
 }
@@ -892,7 +893,24 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     e->htlc_outputs_cap = n_htlcs;
 
     wt->n_entries++;
+
+    /* Register HTLC scripts with chain backend */
+    if (wt->chain && wt->chain->register_script)
+        for (size_t i = 0; i < n_htlcs; i++)
+            wt->chain->register_script(wt->chain, htlcs[i].htlc_spk, 34);
     return 1;
+}
+
+/* Unregister all scripts belonging to an entry from the chain backend. */
+static void entry_unregister_scripts(watchtower_t *wt, watchtower_entry_t *e)
+{
+    if (!wt->chain || !wt->chain->unregister_script) return;
+    if (e->to_local_spk_len > 0)
+        wt->chain->unregister_script(wt->chain, e->to_local_spk,
+                                      e->to_local_spk_len);
+    for (size_t h = 0; h < e->n_htlc_outputs; h++)
+        wt->chain->unregister_script(wt->chain, e->htlc_outputs[h].htlc_spk,
+                                      34);
 }
 
 void watchtower_clear_entries(watchtower_t *wt) {
@@ -900,6 +918,7 @@ void watchtower_clear_entries(watchtower_t *wt) {
     /* Free per-entry heap data (HTLC outputs, response/burn txs) but
        preserve the channels and pending arrays — they outlive entries. */
     for (size_t i = 0; i < wt->n_entries; i++) {
+        entry_unregister_scripts(wt, &wt->entries[i]);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE) {
@@ -917,6 +936,7 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
 
     for (size_t i = 0; i < wt->n_entries; ) {
         if (wt->entries[i].channel_id == channel_id) {
+            entry_unregister_scripts(wt, &wt->entries[i]);
             free(wt->entries[i].htlc_outputs);
             if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);

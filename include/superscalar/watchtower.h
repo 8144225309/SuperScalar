@@ -5,6 +5,8 @@
 #include "persist.h"
 #include "regtest.h"
 #include "fee.h"
+#include "chain_backend.h"
+#include "wallet_source.h"
 #include <secp256k1.h>
 
 #define WATCHTOWER_MAX_WATCH 128
@@ -69,8 +71,12 @@ typedef struct {
     channel_t **channels;  /* pointers to channels by index */
     size_t n_channels;
     size_t channels_cap;
-    regtest_t *rt;                 /* for chain queries + broadcasting */
+    chain_backend_t *chain;        /* chain queries + tx broadcast (abstract) */
+    chain_backend_t _chain_regtest_wrapper; /* embedded storage when backed by regtest_t */
+    regtest_t *rt;                 /* regtest handle for mining / compat (may be NULL) */
     fee_estimator_t *fee;
+    wallet_source_t *wallet;       /* UTXO selection + signing for CPFP (may be NULL) */
+    wallet_source_rpc_t _wallet_rpc_default; /* auto-init'd when rt != NULL */
     persist_t *db;
 
     /* P2A anchor SPK for CPFP fee bumping (anyone-can-spend, no keys needed) */
@@ -83,9 +89,19 @@ typedef struct {
     size_t pending_cap;
 } watchtower_t;
 
-/* Initialize watchtower. Load old commitments from DB if available. */
+/* Initialize watchtower. Load old commitments from DB if available.
+   If rt is non-NULL, automatically wraps it as the chain backend. */
 int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db);
+
+/* Override the chain backend (e.g. plug in a BIP 158 light client).
+   Must be called after watchtower_init. The caller owns the backend lifetime. */
+void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend);
+
+/* Override the wallet source (e.g. plug in a hardware wallet or mobile wallet).
+   Must be called after watchtower_init. The caller owns the wallet lifetime.
+   Pass NULL to disable CPFP (watchtower_build_cpfp_tx will return 0). */
+void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet);
 
 /* Set channel pointer for a given index. */
 void watchtower_set_channel(watchtower_t *wt, size_t idx, channel_t *ch);

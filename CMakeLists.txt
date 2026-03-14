@@ -86,6 +86,9 @@ add_library(superscalar
     src/tx_builder.c
     src/musig.c
     src/regtest.c
+    src/chain_backend_regtest.c
+    src/bip158_backend.c
+    src/p2p_bitcoin.c
     src/util.c
     src/factory.c
     src/tapscript.c
@@ -104,6 +107,13 @@ add_library(superscalar
     src/persist.c
     src/bridge.c
     src/fee.c
+    src/fee_estimator_static.c
+    src/fee_estimator_rpc.c
+    src/fee_estimator_blocks.c
+    src/fee_estimator_api.c
+    src/wallet_source_rpc.c
+    src/wallet_source_hd.c
+    src/superscalar_sdk.c
     src/watchtower.c
     src/crypto_aead.c
     src/noise.c
@@ -121,7 +131,7 @@ target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar PRIVATE ${cjson_SOURCE_DIR})
 target_include_directories(superscalar PUBLIC ${SQLite3_INCLUDE_DIRS})
-target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto)
+target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto OpenSSL::SSL)
 target_link_libraries(superscalar PRIVATE project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar PRIVATE project_sanitizers)
@@ -133,6 +143,8 @@ add_executable(test_superscalar
     tests/test_dw_state.c
     tests/test_musig.c
     tests/test_tx_builder.c
+    tests/test_bip158.c
+    tests/test_p2p.c
     tests/test_regtest.c
     tests/test_factory.c
     tests/test_tapscript.c
@@ -155,6 +167,8 @@ add_executable(test_superscalar
     tests/test_keyfile.c
     tests/test_bip39.c
     tests/test_rate_limit.c
+    tests/test_fee_estimator.c
+    tests/test_wallet_hd.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
@@ -186,6 +200,14 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_client_bin PRIVATE project_sanitizers)
 endif()
 set_target_properties(superscalar_client_bin PROPERTIES OUTPUT_NAME superscalar_client)
+
+add_executable(bip158_integration_test tools/bip158_integration_test.c)
+target_include_directories(bip158_integration_test PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(bip158_integration_test PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(bip158_integration_test PRIVATE superscalar project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(bip158_integration_test PRIVATE project_sanitizers)
+endif()
 
 add_executable(superscalar_bridge tools/superscalar_bridge.c)
 target_include_directories(superscalar_bridge PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)

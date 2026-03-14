@@ -63,7 +63,7 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const unsigned char *local_delay_sec32,
                                  const unsigned char *local_revoc_sec32,
                                  const unsigned char *local_htlc_sec32,
-                                 const fee_estimator_t *fee_est) {
+                                 fee_estimator_t *fee_est) {
     /* Map client index to leaf output (arity-aware) */
     size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
     size_t node_idx;
@@ -98,9 +98,9 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
 
     /* Commitment tx fee: must match lsp_channels_init so both sides agree. */
-    fee_estimator_t _fe_default;
-    const fee_estimator_t *_fe = fee_est;
-    if (!_fe) { fee_init(&_fe_default, 1000); _fe = &_fe_default; }
+    fee_estimator_static_t _fe_default;
+    fee_estimator_t *_fe = fee_est;
+    if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
     uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;

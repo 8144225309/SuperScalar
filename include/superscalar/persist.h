@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 1
+#define PERSIST_SCHEMA_VERSION 2
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -371,6 +371,38 @@ int persist_update_jit_balance(persist_t *p, uint32_t jit_id,
 /* Delete a JIT channel by ID. */
 int persist_delete_jit_channel(persist_t *p, uint32_t jit_id);
 
+/* --- BIP 158 scan checkpoint --- */
+
+/*
+ * Save (upsert) a singleton checkpoint row that records where the BIP 158
+ * light client scan left off.  header_hashes / filter_headers are flat
+ * arrays of BIP158_HEADER_WINDOW × 32 bytes; pass NULL / 0 to omit blobs.
+ * Returns 1 on success.
+ */
+int persist_save_bip158_checkpoint(persist_t *p,
+                                    int32_t tip_height,
+                                    int32_t headers_synced,
+                                    int32_t filter_headers_synced,
+                                    const uint8_t *header_hashes,
+                                    size_t header_hashes_len,
+                                    const uint8_t *filter_headers,
+                                    size_t filter_headers_len);
+
+/*
+ * Load the checkpoint saved by persist_save_bip158_checkpoint().
+ * Out-parameters are filled only when non-NULL.  Ring buffer blobs are
+ * copied into caller-supplied buffers up to _cap bytes.
+ * Returns 1 if a checkpoint row was found, 0 if none exists yet.
+ */
+int persist_load_bip158_checkpoint(persist_t *p,
+                                    int32_t *tip_height_out,
+                                    int32_t *headers_synced_out,
+                                    int32_t *filter_headers_synced_out,
+                                    uint8_t *header_hashes_out,
+                                    size_t header_hashes_cap,
+                                    uint8_t *filter_headers_out,
+                                    size_t filter_headers_cap);
+
 /* --- Flat revocation secrets (Phase 2: item 2.8) --- */
 
 /* Save flat revocation secrets for a factory. */
@@ -382,5 +414,44 @@ int persist_save_flat_secrets(persist_t *p, uint32_t factory_id,
 size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
                                   unsigned char secrets_out[][32],
                                   size_t max_secrets);
+
+/* --- HD wallet UTXO tracking (schema v2) --- */
+
+/* Save (insert) a new unspent UTXO discovered by the HD wallet scanner. */
+int persist_save_hd_utxo(persist_t *p,
+                           const char *txid,   /* 64-char display-order hex */
+                           uint32_t vout,
+                           uint64_t amount_sats,
+                           uint32_t key_index);
+
+/* Mark a UTXO as spent (called when input scanner detects the spend). */
+int persist_mark_hd_utxo_spent(persist_t *p, const char *txid, uint32_t vout);
+
+/*
+ * Find the best unspent UTXO with amount >= min_sats.
+ * Returns 1 if found, 0 otherwise.
+ */
+int persist_get_hd_utxo(persist_t *p,
+                          uint64_t min_sats,
+                          char txid_out[65],
+                          uint32_t *vout_out,
+                          uint64_t *amount_out,
+                          uint32_t *key_index_out);
+
+/* Save / load the HD wallet's next unused address index. */
+int persist_save_hd_next_index(persist_t *p, uint32_t next_index);
+uint32_t persist_load_hd_next_index(persist_t *p);
+
+/*
+ * Save / load the HD wallet's BIP 32 seed (up to 64 bytes).
+ * The seed is stored as hex in the hd_wallet_state row (schema v2).
+ * If no seed row exists, persist_load_hd_seed returns 0; the caller
+ * should generate a fresh seed and save it.
+ */
+int persist_save_hd_seed(persist_t *p,
+                           const unsigned char *seed, size_t seed_len);
+int persist_load_hd_seed(persist_t *p,
+                           unsigned char *seed_out, size_t *seed_len_out,
+                           size_t seed_cap);
 
 #endif /* SUPERSCALAR_PERSIST_H */

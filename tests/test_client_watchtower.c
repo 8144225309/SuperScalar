@@ -82,10 +82,10 @@ static int setup_channel_pair(secp256k1_context *ctx,
 /* Test 1: watchtower init with NULL regtest doesn't crash */
 int test_client_watchtower_init(void) {
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
 
-    int ok = watchtower_init(&wt, 1, NULL, &fee, NULL);
+    int ok = watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
     TEST_ASSERT(ok == 1, "watchtower_init with NULL regtest should succeed");
     TEST_ASSERT(wt.n_channels == 1, "n_channels should be 1");
     TEST_ASSERT(wt.rt == NULL, "rt should be NULL");
@@ -160,9 +160,9 @@ int test_client_watch_revoked_commitment(void) {
 
     /* Set up watchtower for client side */
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
     watchtower_set_channel(&wt, 0, &client_ch);
 
     /* Advance commitment and do revocation */
@@ -255,9 +255,9 @@ int test_lsp_revoke_and_ack_wire(void) {
 /* Test 5: watchtower_watch_factory_node creates entry with response tx */
 int test_factory_node_watch(void) {
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
 
     unsigned char old_txid[32];
     memset(old_txid, 0xCC, 32);
@@ -287,9 +287,9 @@ int test_factory_node_watch(void) {
 /* Test 6: factory node entry coexists with commitment entries */
 int test_factory_and_commitment_entries(void) {
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 2, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 2, NULL, (fee_estimator_t *)&fee, NULL);
 
     /* Add a commitment entry */
     unsigned char commit_txid[32];
@@ -339,9 +339,9 @@ int test_htlc_penalty_watch(void) {
 
     /* Set up watchtower for client side */
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
     watchtower_set_channel(&wt, 0, &client_ch);
 
     /* Add 1 HTLC (5000 sats, offered from LSP to client) */
