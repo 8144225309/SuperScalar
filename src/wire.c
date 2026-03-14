@@ -120,6 +120,14 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x5E: return "LEAF_REALLOC_ALL_NONCES";
     case 0x5F: return "LEAF_REALLOC_PSIG";
     case 0x64: return "LEAF_REALLOC_DONE";
+    case 0x65: return "LSPS_REQUEST";
+    case 0x66: return "LSPS_RESPONSE";
+    case 0x67: return "LSPS_NOTIFY";
+    case 0x68: return "STFU";
+    case 0x69: return "STFU_ACK";
+    case 0x6A: return "SPLICE_INIT";
+    case 0x6B: return "SPLICE_ACK";
+    case 0x6C: return "SPLICE_LOCKED";
     case 0x6D: return "QUEUE_POLL";
     case 0x6E: return "QUEUE_ITEMS";
     case 0x6F: return "QUEUE_DONE";
