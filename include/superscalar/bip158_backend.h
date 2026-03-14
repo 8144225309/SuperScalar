@@ -88,6 +88,10 @@ typedef struct {
        Used for difficulty-transition validation at 2016-block retarget boundaries. */
     uint32_t         nBits_ring[BIP158_HEADER_WINDOW];
 
+    /* Timestamp ring buffer — populated alongside nBits_ring.
+       Stores nTime (Unix epoch, LE uint32) from bytes 68-71 of each header. */
+    uint32_t         timestamp_ring[BIP158_HEADER_WINDOW];
+
     /* Network ("mainnet", "signet", "testnet") */
     char             network[16];
 

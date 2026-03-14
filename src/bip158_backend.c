@@ -978,7 +978,8 @@ static int bip158_sync_headers(bip158_backend_t *b)
         }
 
         uint32_t nbits_batch[2000];
-        int n = p2p_recv_headers_pow(&b->peers[b->current_peer], new_hashes, 2000, nbits_batch);
+        uint32_t ts_batch[2000];
+        int n = p2p_recv_headers_pow(&b->peers[b->current_peer], new_hashes, 2000, nbits_batch, ts_batch);
         if (n < 0) { result = -1; break; }
         if (n == 0) break;  /* peer has nothing more to send */
 
@@ -987,11 +988,16 @@ static int bip158_sync_headers(bip158_backend_t *b)
             memcpy(b->header_hashes[height % BIP158_HEADER_WINDOW],
                    new_hashes[i], 32);
             b->nBits_ring[height % BIP158_HEADER_WINDOW] = nbits_batch[i];
+            b->timestamp_ring[height % BIP158_HEADER_WINDOW] = ts_batch[i];
             /* Difficulty transition check at every 2016-block boundary */
             if (height > 0 && (height % 2016) == 0) {
                 uint32_t old_bits = b->nBits_ring[(height - 1) % BIP158_HEADER_WINDOW];
                 uint32_t new_bits = nbits_batch[i];
-                if (!p2p_validate_difficulty_transition(old_bits, new_bits, 1209600)) {
+                /* Compute real timespan: time of last block in window minus first block */
+                uint32_t t_first = b->timestamp_ring[(height - 2016) % BIP158_HEADER_WINDOW];
+                uint32_t t_last  = b->timestamp_ring[(height - 1) % BIP158_HEADER_WINDOW];
+                uint32_t actual_timespan = (t_last > t_first) ? (t_last - t_first) : 1209600;
+                if (!p2p_validate_difficulty_transition(old_bits, new_bits, actual_timespan)) {
                     fprintf(stderr, "BIP158: difficulty transition violation at height %d\n",
                             height);
                     p2p_close(&b->peers[b->current_peer]);

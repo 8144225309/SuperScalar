@@ -1155,32 +1155,74 @@ static void shr256(const uint8_t in[32], int n, uint8_t out[32]) {
 int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
                                         uint32_t actual_timespan_secs)
 {
-    (void)actual_timespan_secs;  /* timespan clamping not needed for range check */
-
     /* Decode both targets — invalid nBits → reject */
     uint8_t old_target[32], new_target[32];
     if (!decode_target(old_bits, old_target)) return 0;
     if (!decode_target(new_bits, new_target)) return 0;
     if ((new_bits & 0x00800000)) return 0;  /* negative target */
 
-    /* new_target must be in [old/4, old*4] */
-    uint8_t max_target[32];
-    if (!shl256(old_target, 2, max_target)) {
-        /* old_target * 4 overflows → anything is valid on the upper end */
-        memset(max_target, 0xff, 32);
-    }
-    if (cmp256(new_target, max_target) > 0) return 0;  /* too easy: >4x */
+    /* Clamp timespan per Bitcoin Core: min 1/4 of target, max 4x target */
+    uint32_t clamped = actual_timespan_secs;
+    if (clamped < 302400)  clamped = 302400;   /* 1209600 / 4 */
+    if (clamped > 4838400) clamped = 4838400;  /* 1209600 * 4 */
 
-    uint8_t min_target[32];
-    shr256(old_target, 2, min_target);
-    if (cmp256(new_target, min_target) < 0) return 0;  /* too hard: <1/4x */
+    /* Compute expected_target = old_target * clamped / 1209600
+       Using 256-bit arithmetic: multiply by clamped (up to ~5e6 < 2^23),
+       then divide by 1209600. We do this byte by byte to avoid overflow. */
+
+    /* Step 1: multiply old_target (256-bit big-endian) by clamped */
+    uint8_t scaled[36];  /* 32 + 4 bytes to hold overflow */
+    memset(scaled, 0, sizeof(scaled));
+    uint64_t carry = 0;
+    for (int i = 31; i >= 0; i--) {
+        uint64_t v = (uint64_t)old_target[i] * clamped + carry;
+        scaled[i + 4] = (uint8_t)(v & 0xff);
+        carry = v >> 8;
+    }
+    /* carry holds the top 4 bytes of overflow */
+    scaled[3] = (uint8_t)(carry & 0xff); carry >>= 8;
+    scaled[2] = (uint8_t)(carry & 0xff); carry >>= 8;
+    scaled[1] = (uint8_t)(carry & 0xff); carry >>= 8;
+    scaled[0] = (uint8_t)(carry & 0xff);
+
+    /* Step 2: divide by 1209600 */
+    uint8_t expected[36];
+    memset(expected, 0, sizeof(expected));
+    uint64_t rem = 0;
+    for (int i = 0; i < 36; i++) {
+        uint64_t v = (rem << 8) | scaled[i];
+        expected[i] = (uint8_t)(v / 1209600);
+        rem = v % 1209600;
+    }
+
+    /* expected[0..3] should be 0 (result fits in 32 bytes); take expected[4..35] */
+    uint8_t *exp_target = &expected[4];
+
+    /* Allow ±1 nBits rounding tolerance: new_target must be in
+       [exp_target/2, exp_target*2] (generous since nBits has only 3-byte mantissa) */
+    uint8_t max_exp[32];
+    if (!shl256(exp_target, 1, max_exp)) memset(max_exp, 0xff, 32);
+    if (cmp256(new_target, max_exp) > 0) return 0;
+
+    uint8_t min_exp[32];
+    shr256(exp_target, 1, min_exp);
+    if (cmp256(new_target, min_exp) < 0) return 0;
+
+    /* Also enforce the 4x global cap regardless of expected */
+    uint8_t global_max[32];
+    if (!shl256(old_target, 2, global_max)) memset(global_max, 0xff, 32);
+    if (cmp256(new_target, global_max) > 0) return 0;
+
+    uint8_t global_min[32];
+    shr256(old_target, 2, global_min);
+    if (cmp256(new_target, global_min) < 0) return 0;
 
     return 1;
 }
 
 int p2p_recv_headers_pow(p2p_conn_t *conn,
                           uint8_t (*hashes_out)[32], size_t max_headers,
-                          uint32_t *nbits_out)
+                          uint32_t *nbits_out, uint32_t *timestamps_out)
 {
     for (int attempt = 0; attempt < 64; attempt++) {
         char     cmd[13];
@@ -1233,6 +1275,12 @@ int p2p_recv_headers_pow(p2p_conn_t *conn,
                                               ((uint32_t)p[73] <<  8) |
                                               ((uint32_t)p[74] << 16) |
                                               ((uint32_t)p[75] << 24);
+                    }
+                    if (timestamps_out) {
+                        timestamps_out[n_stored] = (uint32_t)p[68]        |
+                                                   ((uint32_t)p[69] <<  8) |
+                                                   ((uint32_t)p[70] << 16) |
+                                                   ((uint32_t)p[71] << 24);
                     }
                     n_stored++;
                 }

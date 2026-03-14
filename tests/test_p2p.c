@@ -1122,3 +1122,40 @@ int test_pow_difficulty_transition_too_easy(void)
            "16x relaxation should fail transition check (exceeds 4x cap)");
     return 1;
 }
+
+/* Phase 1 fix: real timespan difficulty tests */
+
+/* Test B5: nominal 2-week timespan with same nBits → should pass */
+int test_pow_difficulty_nominal_timespan(void)
+{
+    /* nominal: timespan = 1209600 (exactly 2 weeks), same bits → expected = old,
+       new = old → pass */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 1209600) == 1,
+           "nominal timespan same bits should pass");
+    return 1;
+}
+
+/* Test B6: blocks found 4x too fast → same nBits rejected (needs harder target) */
+int test_pow_difficulty_too_fast_rejected(void)
+{
+    /* timespan = 302400 (exactly 1/4 of nominal → clamped to 302400).
+       expected_target = old * 302400/1209600 = old/4 (4x harder).
+       new_target = old (same bits) → old > old/4 * 2 = old/2 → too easy → fail. */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 302400) == 0,
+           "too fast same bits should fail (needs harder target)");
+    return 1;
+}
+
+/* Test B7: blocks found 4x too slow → same nBits rejected (needs easier target) */
+int test_pow_difficulty_too_slow_rejected(void)
+{
+    /* timespan = 4838400 (exactly 4x nominal → clamped to 4838400).
+       expected_target = old * 4838400/1209600 = old*4 (4x easier).
+       new_target = old (same bits) → old < old*4/2 = old*2 → too hard → fail. */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 4838400) == 0,
+           "too slow same bits should fail (needs easier target)");
+    return 1;
+}
