@@ -2,6 +2,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/hd_key.h"
 #include "superscalar/sha256.h"
+#include "superscalar/bip39.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <string.h>
@@ -32,7 +33,7 @@ int test_hd_wallet_derives_p2tr(void)
     ASSERT(ctx != NULL, "secp256k1_context_create failed");
 
     wallet_source_hd_t ws;
-    int ok = wallet_source_hd_init(&ws, TEST_SEED, 32, ctx, NULL, NULL, "regtest");
+    int ok = wallet_source_hd_init(&ws, TEST_SEED, 32, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD);
     ASSERT(ok == 1, "wallet_source_hd_init failed");
     ASSERT(ws.n_spks == HD_WALLET_LOOKAHEAD, "should have derived lookahead addresses");
     ASSERT(ws.coin_type == 1, "coin_type=1 for regtest");
@@ -56,7 +57,7 @@ int test_hd_wallet_sign_verify(void)
     ASSERT(ctx != NULL, "ctx");
 
     wallet_source_hd_t ws;
-    ASSERT(wallet_source_hd_init(&ws, TEST_SEED, 32, ctx, NULL, NULL, "regtest"), "init");
+    ASSERT(wallet_source_hd_init(&ws, TEST_SEED, 32, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD), "init");
 
     /* Get tweaked seckey for index 0 */
     unsigned char spk[34], seckey[32];
@@ -178,5 +179,88 @@ int test_p2p_scan_block_full_output(void)
     ASSERT(sc.last_spk_len == 22, "output spk_len correct");
     ASSERT(memcmp(sc.last_spk, p2wpkh_spk, 22) == 0, "output spk correct");
 
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 5: BIP 39 round-trip — generate mnemonic, derive seed, same address
+ *         as direct seed
+ * --------------------------------------------------------------------- */
+int test_hd_wallet_bip39_roundtrip(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    ASSERT(ctx != NULL, "ctx");
+
+    /* Generate a 24-word mnemonic */
+    char mnemonic[300];
+    ASSERT(bip39_generate(24, mnemonic, sizeof(mnemonic)), "bip39_generate");
+
+    /* Derive seed from mnemonic (no passphrase) */
+    unsigned char seed_from_mnemonic[64];
+    ASSERT(bip39_mnemonic_to_seed(mnemonic, "", seed_from_mnemonic), "mnemonic_to_seed");
+
+    /* Initialize HD wallet with the derived seed */
+    wallet_source_hd_t ws1, ws2;
+    ASSERT(wallet_source_hd_init(&ws1, seed_from_mnemonic, 64, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD), "init ws1");
+
+    /* Do it again with same seed — should produce identical address */
+    ASSERT(wallet_source_hd_init(&ws2, seed_from_mnemonic, 64, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD), "init ws2");
+    ASSERT(memcmp(ws1.spks[0], ws2.spks[0], 34) == 0, "same seed → same address[0]");
+    ASSERT(memcmp(ws1.spks[0], ws2.spks[1], 34) != 0, "address[0] != address[1]");
+
+    if (ws1.base.free) ws1.base.free(&ws1.base);
+    if (ws2.base.free) ws2.base.free(&ws2.base);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 6: same mnemonic + different passphrase → different addresses
+ * --------------------------------------------------------------------- */
+int test_hd_wallet_passphrase_isolation(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    ASSERT(ctx != NULL, "ctx");
+
+    char mnemonic[300];
+    ASSERT(bip39_generate(24, mnemonic, sizeof(mnemonic)), "bip39_generate");
+
+    unsigned char seed_no_pass[64], seed_with_pass[64];
+    ASSERT(bip39_mnemonic_to_seed(mnemonic, "", seed_no_pass), "seed no pass");
+    ASSERT(bip39_mnemonic_to_seed(mnemonic, "mypassphrase", seed_with_pass), "seed with pass");
+
+    wallet_source_hd_t ws_no, ws_pass;
+    ASSERT(wallet_source_hd_init(&ws_no, seed_no_pass, 64, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD), "init no pass");
+    ASSERT(wallet_source_hd_init(&ws_pass, seed_with_pass, 64, ctx, NULL, NULL, "regtest", HD_WALLET_LOOKAHEAD), "init with pass");
+
+    /* Different passphrase must produce different addresses */
+    ASSERT(memcmp(ws_no.spks[0], ws_pass.spks[0], 34) != 0, "different passphrase → different address");
+
+    if (ws_no.base.free) ws_no.base.free(&ws_no.base);
+    if (ws_pass.base.free) ws_pass.base.free(&ws_pass.base);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 7: dynamic lookahead — init with lookahead=5, verify n_spks == 5
+ * --------------------------------------------------------------------- */
+int test_hd_wallet_dynamic_lookahead(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    ASSERT(ctx != NULL, "ctx");
+
+    wallet_source_hd_t ws;
+    ASSERT(wallet_source_hd_init(&ws, TEST_SEED, 32, ctx, NULL, NULL, "regtest", 5), "init lookahead=5");
+    ASSERT(ws.n_spks == 5, "n_spks should be 5");
+    ASSERT(ws.lookahead == 5, "lookahead field should be 5");
+    /* All 5 SPKs should be valid P2TR */
+    for (uint32_t i = 0; i < 5; i++) {
+        ASSERT(ws.spks[i][0] == 0x51, "SPK[i] starts with OP_1");
+        ASSERT(ws.spks[i][1] == 0x20, "SPK[i] has OP_PUSHBYTES_32");
+    }
+
+    if (ws.base.free) ws.base.free(&ws.base);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

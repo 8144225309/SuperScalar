@@ -168,7 +168,7 @@ static int hd_sign_input(wallet_source_t *self,
     if (key_index == 0xFFFFFFFFu) {
         /* Cache miss — try deriving up to next_index */
         unsigned char tmp_spk[34];
-        for (uint32_t i = ws->n_spks; i < ws->next_index + HD_WALLET_LOOKAHEAD; i++) {
+        for (uint32_t i = ws->n_spks; i < ws->next_index + ws->lookahead; i++) {
             if (!wallet_source_hd_derive(ws, i, tmp_spk, NULL)) break;
             if (memcmp(tmp_spk, spk, 34) == 0) { key_index = i; break; }
         }
@@ -349,12 +349,20 @@ static void hd_utxo_spent(const char *txid_hex,
  * Public init
  * --------------------------------------------------------------------- */
 
+static void hd_free(wallet_source_t *self)
+{
+    wallet_source_hd_t *ws = (wallet_source_hd_t *)self;
+    free(ws->spks);
+    ws->spks = NULL;
+}
+
 int wallet_source_hd_init(wallet_source_hd_t *ws,
                            const unsigned char *seed, size_t seed_len,
                            secp256k1_context *ctx,
                            persist_t *db,
                            bip158_backend_t *bip158,
-                           const char *network)
+                           const char *network,
+                           uint32_t lookahead)
 {
     if (!ws || !seed || seed_len == 0 || !ctx) return 0;
 
@@ -362,7 +370,7 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     ws->base.get_utxo      = hd_get_utxo;
     ws->base.get_change_spk = hd_get_change_spk;
     ws->base.sign_input    = hd_sign_input;
-    ws->base.free          = NULL;
+    ws->base.free          = hd_free;
     ws->ctx      = ctx;
     ws->db       = db;
     ws->bip158   = bip158;
@@ -383,9 +391,16 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     if (db)
         ws->next_index = persist_load_hd_next_index(db);
 
-    /* Pre-derive first HD_WALLET_LOOKAHEAD addresses */
+    /* Set lookahead window size */
+    ws->lookahead = (lookahead == 0) ? HD_WALLET_LOOKAHEAD : lookahead;
+
+    /* Heap-allocate the SPK cache */
+    ws->spks = malloc(ws->lookahead * sizeof(*ws->spks));
+    if (!ws->spks) return 0;
+
+    /* Pre-derive first ws->lookahead addresses */
     uint32_t n = 0;
-    for (uint32_t i = 0; i < HD_WALLET_LOOKAHEAD; i++) {
+    for (uint32_t i = 0; i < ws->lookahead; i++) {
         if (!wallet_source_hd_derive(ws, i, ws->spks[i], NULL))
             break;
         n++;
