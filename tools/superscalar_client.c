@@ -17,6 +17,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
+#include "superscalar/splice.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1542,6 +1543,78 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        /* -------------------------------------------------------------------
+         * Splice protocol — LSP-initiated quiescence and funding replacement
+         * ----------------------------------------------------------------- */
+
+        case MSG_STFU: {
+            /* LSP is requesting quiescence prior to splice.
+               Mark channel quiescent and echo STFU_ACK (reusing splice_ack
+               JSON with acceptor_contribution=0 — same format as lsp_channels.c). */
+            const cJSON *cid_f = cJSON_GetObjectItemCaseSensitive(msg.json, "channel_id");
+            uint32_t stfu_ch_id = (cid_f && cJSON_IsNumber(cid_f))
+                                      ? (uint32_t)cid_f->valuedouble : 0;
+            ch->channel_quiescent = 1;
+            cJSON *ack = wire_build_splice_ack(stfu_ch_id, 0);
+            if (ack) { wire_send(fd, MSG_STFU_ACK, ack); cJSON_Delete(ack); }
+            printf("Client %u: STFU from LSP (ch %u), sent STFU_ACK\n",
+                   my_index, stfu_ch_id);
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_SPLICE_INIT: {
+            /* LSP is proposing a splice (amount + new funding SPK).
+               Respond with SPLICE_ACK, no extra contribution from client. */
+            uint32_t sp_ch_id = 0;
+            uint64_t sp_new_amount = 0;
+            unsigned char sp_new_spk[34];
+            size_t sp_spk_len = 0;
+            if (wire_parse_splice_init(msg.json, &sp_ch_id, &sp_new_amount,
+                                        sp_new_spk, &sp_spk_len, sizeof(sp_new_spk))) {
+                ch->channel_quiescent = 1;
+                cJSON *ack = wire_build_splice_ack(sp_ch_id, 0);
+                if (ack) { wire_send(fd, MSG_SPLICE_ACK, ack); cJSON_Delete(ack); }
+                printf("Client %u: SPLICE_INIT from LSP: new_funding=%llu sats, sent SPLICE_ACK\n",
+                       my_index, (unsigned long long)sp_new_amount);
+            } else {
+                fprintf(stderr, "Client %u: invalid SPLICE_INIT\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_SPLICE_LOCKED: {
+            /* LSP confirms splice tx confirmed on-chain.
+               Apply channel update and echo SPLICE_LOCKED. */
+            uint32_t sl_ch_id = 0;
+            unsigned char sl_new_txid[32];
+            uint32_t sl_new_vout = 0;
+            if (wire_parse_splice_locked(msg.json, &sl_ch_id,
+                                          sl_new_txid, &sl_new_vout)) {
+                channel_apply_splice_update(ch, sl_new_txid, sl_new_vout,
+                                             ch->funding_amount);
+                cJSON *locked = wire_build_splice_locked(sl_ch_id, sl_new_txid, sl_new_vout);
+                if (locked) { wire_send(fd, MSG_SPLICE_LOCKED, locked); cJSON_Delete(locked); }
+
+                unsigned char disp_txid[32];
+                memcpy(disp_txid, sl_new_txid, 32);
+                /* txid display: reverse to RPC byte order */
+                for (int _i = 0; _i < 16; _i++) {
+                    unsigned char _t = disp_txid[_i];
+                    disp_txid[_i] = disp_txid[31 - _i];
+                    disp_txid[31 - _i] = _t;
+                }
+                char disp_hex[65]; hex_encode(disp_txid, 32, disp_hex);
+                printf("Client %u: splice complete! new txid=%s vout=%u\n",
+                       my_index, disp_hex, sl_new_vout);
+            } else {
+                fprintf(stderr, "Client %u: invalid SPLICE_LOCKED\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
