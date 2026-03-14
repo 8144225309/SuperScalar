@@ -44,7 +44,7 @@ static uint64_t query_estimatesmartfee(regtest_t *rt, int target_blocks)
     uint64_t sat_per_kvb = 0;
     if (feerate && cJSON_IsNumber(feerate) && feerate->valuedouble > 0) {
         sat_per_kvb = (uint64_t)(feerate->valuedouble * 100000000.0 + 0.5);
-        if (sat_per_kvb < 1000) sat_per_kvb = 1000;
+        if (sat_per_kvb < FEE_FLOOR_SAT_PER_KVB) sat_per_kvb = FEE_FLOOR_SAT_PER_KVB;
     }
     cJSON_Delete(json);
     return sat_per_kvb;

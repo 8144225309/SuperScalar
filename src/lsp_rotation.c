@@ -306,9 +306,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         size_t close_vsize = 68 + 43 * n_total;
         uint64_t close_fee = fee_estimate(fe, close_vsize);
         if (close_fee == 0) {
-            close_fee = close_vsize;
+            close_fee = (close_vsize * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
+            if (close_fee == 0) close_fee = 1;
             fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
-                    "using 1 sat/vB floor (%llu sats)\n",
+                    "using %.1f sat/vB floor (%llu sats)\n",
+                    (double)FEE_FLOOR_SAT_PER_KVB / 1000.0,
                     (unsigned long long)close_fee);
         }
         size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,

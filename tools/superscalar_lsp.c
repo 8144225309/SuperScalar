@@ -72,7 +72,7 @@ static void usage(const char *prog) {
         "  --daemon            Run as long-lived daemon (Ctrl+C for graceful close)\n"
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
-        "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
+        "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
@@ -978,6 +978,21 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* --- Validate fee rate floor --- */
+    if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
+        fprintf(stderr, "ERROR: --fee-rate %llu is below minimum %d sat/kvB (0.1 sat/vB)\n",
+                (unsigned long long)fee_rate, FEE_FLOOR_SAT_PER_KVB);
+        return 1;
+    }
+    if (fee_rate < 1000) {
+        fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
+                "default minrelaytxfee (1 sat/vB).\n"
+                "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or rely on "
+                "package relay (Bitcoin Core v28+).\n"
+                "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
+                (unsigned long long)fee_rate, (double)fee_rate / 1000.0);
+    }
 
     /* --- Backup / Restore / Verify (early exit) --- */
     if (backup_path_arg || restore_path_arg || backup_verify_arg) {

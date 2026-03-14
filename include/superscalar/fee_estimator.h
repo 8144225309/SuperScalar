@@ -22,6 +22,10 @@ typedef enum {
     FEE_TARGET_MINIMUM = 1008, /* mempool floor: informational                */
 } fee_target_t;
 
+/* Minimum relayable fee: 100 sat/kvB = 0.1 sat/vB.
+   Bitcoin Core won't relay below this with lowered -minrelaytxfee. */
+#define FEE_FLOOR_SAT_PER_KVB  100
+
 typedef struct fee_estimator fee_estimator_t;
 struct fee_estimator {
     /* Required.  Returns sat/kvB; 0 = unavailable / estimator not ready. */
@@ -32,6 +36,11 @@ struct fee_estimator {
     /* Optional.  Free heap allocations owned by the impl. */
     void     (*free)(fee_estimator_t *self);
 };
+
+/* Returns 1 if P2A anchors should be included at this estimator's URGENT
+   rate.  At sub-1-sat/vB the 240-sat anchor costs more than the TX fee
+   itself, making CPFP uneconomical.  Pass NULL to default to 1 (use anchor). */
+int fee_should_use_anchor(fee_estimator_t *fe);
 
 /* -----------------------------------------------------------------------
  * Static (constant-rate) implementation

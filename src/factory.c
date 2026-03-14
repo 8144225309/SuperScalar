@@ -1874,8 +1874,11 @@ int factory_build_distribution_tx(
     for (size_t i = 0; i < n_outputs; i++)
         aug_outputs[i] = outputs[i];
 
-    /* Add P2A anchor output for CPFP fee bumping */
-    if (aug_outputs[0].amount_sats > ANCHOR_OUTPUT_AMOUNT) {
+    /* Add P2A anchor output for CPFP fee bumping.
+       Skip at sub-1-sat/vB rates where the 240-sat anchor would cost more
+       than the entire TX fee, making CPFP uneconomical. */
+    if (fee_should_use_anchor(f->fee) &&
+        aug_outputs[0].amount_sats > ANCHOR_OUTPUT_AMOUNT) {
         aug_outputs[0].amount_sats -= ANCHOR_OUTPUT_AMOUNT;
         memcpy(aug_outputs[aug_n].script_pubkey, P2A_SPK, P2A_SPK_LEN);
         aug_outputs[aug_n].script_pubkey_len = P2A_SPK_LEN;
