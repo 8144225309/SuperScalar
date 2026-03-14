@@ -1923,3 +1923,87 @@ int wire_parse_queue_done(const cJSON *json,
     }
     return 1;
 }
+
+/* --- Splice message builders/parsers (Phase G) --- */
+
+cJSON *wire_build_splice_init(uint32_t channel_id,
+                               uint64_t new_funding_amount,
+                               const unsigned char *new_funding_spk,
+                               size_t new_funding_spk_len) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "channel_id", (double)channel_id);
+    cJSON_AddNumberToObject(j, "new_funding_amount", (double)new_funding_amount);
+    wire_json_add_hex(j, "new_funding_spk", new_funding_spk, new_funding_spk_len);
+    return j;
+}
+
+int wire_parse_splice_init(const cJSON *json,
+                            uint32_t *channel_id_out,
+                            uint64_t *new_funding_amount_out,
+                            unsigned char *new_funding_spk_out,
+                            size_t *new_funding_spk_len_out,
+                            size_t max_spk_len) {
+    if (!json || !channel_id_out || !new_funding_amount_out) return 0;
+    const cJSON *cid = cJSON_GetObjectItemCaseSensitive(json, "channel_id");
+    if (!cid || !cJSON_IsNumber(cid)) return 0;
+    *channel_id_out = (uint32_t)cid->valuedouble;
+    const cJSON *amt = cJSON_GetObjectItemCaseSensitive(json, "new_funding_amount");
+    if (!amt || !cJSON_IsNumber(amt)) return 0;
+    *new_funding_amount_out = (uint64_t)amt->valuedouble;
+    int spk_len = wire_json_get_hex(json, "new_funding_spk",
+                                     new_funding_spk_out, max_spk_len);
+    if (spk_len <= 0) return 0;
+    if (new_funding_spk_len_out) *new_funding_spk_len_out = (size_t)spk_len;
+    return 1;
+}
+
+cJSON *wire_build_splice_ack(uint32_t channel_id, uint64_t acceptor_contribution) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "channel_id", (double)channel_id);
+    cJSON_AddNumberToObject(j, "acceptor_contribution", (double)acceptor_contribution);
+    return j;
+}
+
+int wire_parse_splice_ack(const cJSON *json,
+                           uint32_t *channel_id_out,
+                           uint64_t *acceptor_contribution_out) {
+    if (!json || !channel_id_out || !acceptor_contribution_out) return 0;
+    const cJSON *cid = cJSON_GetObjectItemCaseSensitive(json, "channel_id");
+    if (!cid || !cJSON_IsNumber(cid)) return 0;
+    *channel_id_out = (uint32_t)cid->valuedouble;
+    const cJSON *contrib = cJSON_GetObjectItemCaseSensitive(json, "acceptor_contribution");
+    *acceptor_contribution_out = (contrib && cJSON_IsNumber(contrib))
+                                  ? (uint64_t)contrib->valuedouble : 0;
+    return 1;
+}
+
+cJSON *wire_build_splice_locked(uint32_t channel_id,
+                                  const unsigned char *new_funding_txid32,
+                                  uint32_t new_funding_vout) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "channel_id", (double)channel_id);
+    wire_json_add_hex(j, "new_funding_txid", new_funding_txid32, 32);
+    cJSON_AddNumberToObject(j, "new_funding_vout", (double)new_funding_vout);
+    return j;
+}
+
+int wire_parse_splice_locked(const cJSON *json,
+                               uint32_t *channel_id_out,
+                               unsigned char *new_funding_txid32_out,
+                               uint32_t *new_funding_vout_out) {
+    if (!json || !channel_id_out || !new_funding_txid32_out || !new_funding_vout_out)
+        return 0;
+    const cJSON *cid = cJSON_GetObjectItemCaseSensitive(json, "channel_id");
+    if (!cid || !cJSON_IsNumber(cid)) return 0;
+    *channel_id_out = (uint32_t)cid->valuedouble;
+    int txid_len = wire_json_get_hex(json, "new_funding_txid",
+                                      new_funding_txid32_out, 32);
+    if (txid_len != 32) return 0;
+    const cJSON *vout = cJSON_GetObjectItemCaseSensitive(json, "new_funding_vout");
+    if (!vout || !cJSON_IsNumber(vout)) return 0;
+    *new_funding_vout_out = (uint32_t)vout->valuedouble;
+    return 1;
+}

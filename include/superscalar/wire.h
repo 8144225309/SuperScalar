@@ -629,6 +629,38 @@ int wire_parse_scid_assign(const cJSON *json, uint32_t *channel_id,
 size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
                          size_t max_entries, size_t expected_data_len);
 
+/* --- Splice message builders/parsers (Phase G) --- */
+
+/* Initiator → Acceptor: SPLICE_INIT {channel_id, new_funding_amount, new_funding_spk_hex} */
+cJSON *wire_build_splice_init(uint32_t channel_id,
+                               uint64_t new_funding_amount,
+                               const unsigned char *new_funding_spk,
+                               size_t new_funding_spk_len);
+
+int wire_parse_splice_init(const cJSON *json,
+                            uint32_t *channel_id_out,
+                            uint64_t *new_funding_amount_out,
+                            unsigned char *new_funding_spk_out,
+                            size_t *new_funding_spk_len_out,
+                            size_t max_spk_len);
+
+/* Acceptor → Initiator: SPLICE_ACK {channel_id, acceptor_contribution} */
+cJSON *wire_build_splice_ack(uint32_t channel_id, uint64_t acceptor_contribution);
+
+int wire_parse_splice_ack(const cJSON *json,
+                           uint32_t *channel_id_out,
+                           uint64_t *acceptor_contribution_out);
+
+/* Both: SPLICE_LOCKED {channel_id, new_funding_txid_hex, new_funding_vout} */
+cJSON *wire_build_splice_locked(uint32_t channel_id,
+                                  const unsigned char *new_funding_txid32,
+                                  uint32_t new_funding_vout);
+
+int wire_parse_splice_locked(const cJSON *json,
+                               uint32_t *channel_id_out,
+                               unsigned char *new_funding_txid32_out,
+                               uint32_t *new_funding_vout_out);
+
 /* --- Encrypted transport (Phase 19) --- */
 
 /* Perform noise handshake as initiator and register encryption for fd.
