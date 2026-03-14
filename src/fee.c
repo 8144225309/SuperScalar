@@ -86,3 +86,12 @@ uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_outputs)
     size_t vsize = 68 + 43 * n_outputs;
     return compute_fee(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
 }
+
+int fee_should_use_anchor(fee_estimator_t *fe)
+{
+    /* At sub-1-sat/vB rates the 240-sat P2A anchor costs more than the
+       entire TX fee, making CPFP uneconomical.  Skip anchors below
+       1000 sat/kvB and rely on the low base rate for relay. */
+    if (!fe || !fe->get_rate) return 1;  /* default: include anchor */
+    return fe->get_rate(fe, FEE_TARGET_URGENT) >= 1000;
+}
