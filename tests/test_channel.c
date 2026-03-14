@@ -1322,6 +1322,7 @@ int test_htlc_add_fulfill(void) {
                                           local_funding_secret,
                                           &local_fund_pk, &remote_fund_pk),
                 "setup channel with htlc");
+    ch.fee_rate_sat_per_kvb = 1000;  /* pin to 1 sat/vB: assertions are at this rate */
 
     /* Create payment preimage and hash */
     unsigned char preimage[32] = { [0 ... 31] = 0x42 };
@@ -1390,6 +1391,7 @@ int test_htlc_add_fail(void) {
                                           local_funding_secret,
                                           &local_fund_pk, &remote_fund_pk),
                 "setup channel with htlc");
+    ch.fee_rate_sat_per_kvb = 1000;  /* pin to 1 sat/vB: assertions are at this rate */
 
     unsigned char payment_hash[32] = { [0 ... 31] = 0x55 };
 
