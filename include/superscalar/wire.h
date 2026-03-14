@@ -94,9 +94,20 @@
 #define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
 #define MSG_PATH_SIGN_DONE      0x63  /* LSP -> Clients: path signing complete */
 
+/* LSPS0/1/2 standard protocol (Phase E) */
+#define MSG_LSPS_REQUEST   0x65  /* client → LSP: JSON-RPC request  */
+#define MSG_LSPS_RESPONSE  0x66  /* LSP → client: JSON-RPC response */
+#define MSG_LSPS_NOTIFY    0x67  /* LSP → client: async notification */
+
+/* Splicing (Phase G — BOLT 2 draft) */
+#define MSG_STFU           0x68  /* quiescence request */
+#define MSG_STFU_ACK       0x69  /* quiescence acknowledge */
+#define MSG_SPLICE_INIT    0x6A  /* initiator: new funding amount + spk */
+#define MSG_SPLICE_ACK     0x6B  /* acceptor: agrees + optional contribution */
+#define MSG_SPLICE_LOCKED  0x6C  /* both: new funding tx confirmed */
+
 /* Async signing: pending work queue
- * NOTE: 0x65–0x6C are reserved for LSPS/splice (PR #14).
- *       Queue messages start at 0x6D to avoid collision. */
+ * NOTE: 0x65–0x6C are reserved for LSPS/splice above. */
 #define MSG_QUEUE_POLL          0x6D  /* Client → LSP: poll for pending work items */
 #define MSG_QUEUE_ITEMS         0x6E  /* LSP → Client: pending work items response */
 #define MSG_QUEUE_DONE          0x6F  /* Client → LSP: acknowledge processed item IDs */

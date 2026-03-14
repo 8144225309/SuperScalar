@@ -99,6 +99,10 @@ typedef struct {
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
 
+    /* Splicing state (Phase G) */
+    int           channel_quiescent;       /* 1 if in quiescence for splice */
+    unsigned char splice_pending_txid[32]; /* txid of pending splice tx (if any) */
+
     /* MuSig2 signer index: 0 or 1 in the canonical 2-of-2 keyagg order.
        Needed for distributed signing (Phase 12). */
     int local_funding_signer_idx;
