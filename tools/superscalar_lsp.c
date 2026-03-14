@@ -19,6 +19,8 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
+#include "superscalar/readiness.h"
+#include "superscalar/notify.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +143,9 @@ static void usage(const char *prog) {
         "                          api         mempool.space /api/v1/fees/recommended\n"
         "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
         "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
+        "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
+        "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
+        "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -712,6 +717,9 @@ int main(int argc, char *argv[]) {
     const char *bind_addr = NULL;
     int auto_rebalance = 0;
     int rebalance_threshold = 80;  /* default 80% imbalance threshold */
+    int async_rotation = 0;
+    const char *notify_webhook = NULL;  /* --notify-webhook URL */
+    const char *notify_exec = NULL;     /* --notify-exec SCRIPT */
     int test_rebalance = 0;
     int test_batch_rebalance = 0;
     int test_realloc = 0;
@@ -807,6 +815,12 @@ int main(int argc, char *argv[]) {
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--no-jit") == 0)
             no_jit = 1;
+        else if (strcmp(argv[i], "--async-rotation") == 0)
+            async_rotation = 1;
+        else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
+            notify_webhook = argv[++i];
+        else if (strcmp(argv[i], "--notify-exec") == 0 && i + 1 < argc)
+            notify_exec = argv[++i];
         else if (strcmp(argv[i], "--states-per-layer") == 0 && i + 1 < argc) {
             states_per_layer = atoi(argv[++i]);
             if (states_per_layer < 2 || states_per_layer > 256) {
@@ -1581,6 +1595,23 @@ int main(int argc, char *argv[]) {
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
 
+            /* Async rotation coordination */
+            if (async_rotation) {
+                readiness_tracker_t *rt = calloc(1, sizeof(readiness_tracker_t));
+                if (rt) mgr->readiness = rt;
+                notify_t *nfy = calloc(1, sizeof(notify_t));
+                if (nfy) {
+                    if (notify_webhook)
+                        notify_init_webhook(nfy, notify_webhook);
+                    else if (notify_exec)
+                        notify_init_exec(nfy, notify_exec);
+                    else
+                        notify_init_log(nfy);
+                    mgr->notify = nfy;
+                }
+                printf("LSP: async rotation enabled\n");
+            }
+
             /* Load JIT channels from DB */
             {
                 jit_channel_t *jits = (jit_channel_t *)mgr->jit_channels;
@@ -2276,6 +2307,23 @@ int main(int argc, char *argv[]) {
         if (no_jit) mgr->jit_enabled = 0;
         mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
+
+        /* Async rotation coordination */
+        if (async_rotation) {
+            readiness_tracker_t *rt = calloc(1, sizeof(readiness_tracker_t));
+            if (rt) mgr->readiness = rt;
+            notify_t *nfy = calloc(1, sizeof(notify_t));
+            if (nfy) {
+                if (notify_webhook)
+                    notify_init_webhook(nfy, notify_webhook);
+                else if (notify_exec)
+                    notify_init_exec(nfy, notify_exec);
+                else
+                    notify_init_log(nfy);
+                mgr->notify = nfy;
+            }
+            printf("LSP: async rotation enabled\n");
+        }
 
         /* Load persisted JIT channels from DB */
         if (use_db) {

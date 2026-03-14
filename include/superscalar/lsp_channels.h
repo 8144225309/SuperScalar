@@ -152,6 +152,10 @@ typedef struct {
     uint64_t accumulated_fees_sats;       /* total routing fees since last settlement */
     uint32_t last_settlement_block;       /* block height of last settlement */
     uint32_t settlement_interval_blocks;  /* blocks between settlements (default: 144) */
+
+    /* Async rotation coordination (--async-rotation flag) */
+    void *readiness;  /* readiness_tracker_t* or NULL */
+    void *notify;     /* notify_t* or NULL */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -261,6 +265,11 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    All parameters come from mgr->rot_* fields.
    Returns 1 on success, 0 on failure. */
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Fire ceremony if all clients are ready (async-rotation mode).
+   Resets the readiness tracker regardless of outcome.
+   Returns 1 if ceremony was fired, 0 if not all clients ready yet. */
+int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* --- Reconnection (Phase 16) --- */
 

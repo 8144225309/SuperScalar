@@ -1,4 +1,5 @@
 #include "superscalar/wire.h"
+#include "superscalar/lsp_queue.h"
 #include "superscalar/factory.h"
 #include "superscalar/noise.h"
 #include "superscalar/crypto_aead.h"
@@ -119,6 +120,9 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x5E: return "LEAF_REALLOC_ALL_NONCES";
     case 0x5F: return "LEAF_REALLOC_PSIG";
     case 0x64: return "LEAF_REALLOC_DONE";
+    case 0x6D: return "QUEUE_POLL";
+    case 0x6E: return "QUEUE_ITEMS";
+    case 0x6F: return "QUEUE_DONE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1873,5 +1877,41 @@ int wire_noise_handshake_nk_responder(int fd, secp256k1_context *ctx,
         return 0;
     }
     secure_zero(&ns, sizeof(ns));
+    return 1;
+}
+
+/* --- Async signing: queue wire builders/parsers --- */
+
+cJSON *wire_build_queue_items(const queue_entry_t *entries, size_t count) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr  = cJSON_CreateArray();
+    for (size_t i = 0; i < count; i++) {
+        const queue_entry_t *e = &entries[i];
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "id",           (double)e->id);
+        cJSON_AddNumberToObject(item, "request_type", e->request_type);
+        cJSON_AddNumberToObject(item, "urgency",      e->urgency);
+        cJSON_AddNumberToObject(item, "factory_id",   (double)e->factory_id);
+        if (e->payload[0])
+            cJSON_AddStringToObject(item, "payload", e->payload);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddItemToObject(root, "items", arr);
+    return root;
+}
+
+int wire_parse_queue_done(const cJSON *json,
+                           uint64_t *ids_out, size_t max_ids,
+                           size_t *count_out) {
+    if (!json || !ids_out || !count_out) return 0;
+    *count_out = 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "ids");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n && (size_t)i < max_ids; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsNumber(item)) return 0;
+        ids_out[(*count_out)++] = (uint64_t)item->valuedouble;
+    }
     return 1;
 }

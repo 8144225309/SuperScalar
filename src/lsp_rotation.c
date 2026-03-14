@@ -10,6 +10,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
+#include "superscalar/readiness.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -804,4 +805,20 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: rotation complete — new factory active with %zu channels\n",
            mgr->n_channels);
     return 1;
+}
+
+int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr->readiness)
+        return 0;
+
+    readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
+    if (!readiness_all_ready(rt))
+        return 0;
+
+    printf("LSP rotate: all %zu clients ready — firing async rotation ceremony\n",
+           rt->n_clients);
+
+    int result = lsp_channels_rotate_factory(mgr, lsp);
+    readiness_reset(rt);
+    return result ? 1 : 0;
 }
