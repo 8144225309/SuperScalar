@@ -126,6 +126,8 @@ extern int test_lsps2_buy_creates_jit(void);
 /* Phase 2 fix: LSPS context / NULL-safety */
 extern int test_lsps_null_ctx_returns_error(void);
 extern int test_lsps_malformed_json_returns_zero(void);
+/* Gap fix: lsps1.get_order */
+extern int test_lsps1_get_order(void);
 
 /* Phase F: BOLT 12 / Offers */
 extern int test_offer_encode_decode(void);
@@ -150,6 +152,8 @@ extern int test_wire_splice_init_roundtrip(void);
 extern int test_wire_splice_ack_roundtrip(void);
 extern int test_wire_splice_locked_roundtrip(void);
 extern int test_splice_state_machine(void);
+/* Gap fix: MuSig2 aggregate key for splice funding output */
+extern int test_splice_musig_funding_spk(void);
 
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
@@ -909,6 +913,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsps2_buy_creates_jit);
     RUN_TEST(test_lsps_null_ctx_returns_error);
     RUN_TEST(test_lsps_malformed_json_returns_zero);
+    RUN_TEST(test_lsps1_get_order);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -931,6 +936,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_splice_ack_roundtrip);
     RUN_TEST(test_wire_splice_locked_roundtrip);
     RUN_TEST(test_splice_state_machine);
+    RUN_TEST(test_splice_musig_funding_spk);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);

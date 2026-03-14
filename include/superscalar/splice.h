@@ -3,8 +3,10 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <secp256k1.h>
 #include "channel.h"
 #include "tx_builder.h"
+#include "musig.h"
 
 /*
  * Channel splicing implementation (BOLT 2 draft).
@@ -67,6 +69,28 @@ int splice_build_funding_tx(tx_buf_t *out,
                               uint32_t old_funding_vout,
                               uint64_t new_funding_amount,
                               const unsigned char *new_funding_spk34);
+
+/*
+ * Compute the 2-of-2 MuSig2 P2TR scriptPubKey for a splice funding output.
+ *
+ * Aggregates local_pubkey and remote_pubkey using MuSig key aggregation,
+ * applies a BIP 341 key-path taptweak (no script tree), and serialises the
+ * result as a 34-byte OP_1 <x-only-key> scriptPubKey into spk34_out.
+ *
+ * secp:         secp256k1 context (SECP256K1_CONTEXT_SIGN | VERIFY).
+ * spk34_out:    output buffer, exactly 34 bytes.
+ * local_pubkey: initiating side's compressed 33-byte pubkey.
+ * remote_pubkey: accepting side's compressed 33-byte pubkey.
+ *
+ * Returns 1 on success, 0 on failure (invalid keys, OOM).
+ *
+ * The caller should pass this SPK directly to splice_build_funding_tx()
+ * as new_funding_spk34 to produce a correctly-keyed splice transaction.
+ */
+int splice_compute_funding_spk(const secp256k1_context *secp,
+                                unsigned char spk34_out[34],
+                                const secp256k1_pubkey *local_pubkey,
+                                const secp256k1_pubkey *remote_pubkey);
 
 /*
  * Update a channel_t after the splice funding tx is confirmed.

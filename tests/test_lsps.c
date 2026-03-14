@@ -175,3 +175,64 @@ int test_lsps_malformed_json_returns_zero(void)
     cJSON_Delete(arr);
     return 1;
 }
+
+/* Test E9: lsps1.get_order round-trip — create then retrieve */
+int test_lsps1_get_order(void)
+{
+    /* Step 1: create_order via handle_request (fd=-1 swallows wire send) */
+    cJSON *create_req = cJSON_CreateObject();
+    ASSERT(create_req != NULL, "create request");
+    cJSON_AddStringToObject(create_req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(create_req, "method", "lsps1.create_order");
+    cJSON_AddNumberToObject(create_req, "id", 10);
+    cJSON *cparams = cJSON_CreateObject();
+    cJSON_AddNumberToObject(cparams, "channel_balance_msat", 5000000);
+    cJSON_AddNumberToObject(cparams, "confirms_within_blocks", 3);
+    cJSON_AddItemToObject(create_req, "params", cparams);
+    ASSERT(lsps_handle_request(NULL, -1, create_req) == 1, "create_order handled");
+    cJSON_Delete(create_req);
+
+    /* Step 2: lsps1_parse_get_order with string id */
+    cJSON *gparams = cJSON_CreateObject();
+    ASSERT(gparams != NULL, "create get_order params");
+    cJSON_AddStringToObject(gparams, "order_id", "1");
+    int oid = 0;
+    ASSERT(lsps1_parse_get_order(gparams, &oid) == 1, "parse get_order string id ok");
+    ASSERT(oid == 1, "order_id parsed as 1");
+    cJSON_Delete(gparams);
+
+    /* Step 3: lsps1_parse_get_order with numeric id */
+    cJSON *gparams2 = cJSON_CreateObject();
+    cJSON_AddNumberToObject(gparams2, "order_id", 1);
+    int oid2 = 0;
+    ASSERT(lsps1_parse_get_order(gparams2, &oid2) == 1, "parse numeric order_id ok");
+    ASSERT(oid2 == 1, "numeric order_id correct");
+    cJSON_Delete(gparams2);
+
+    /* Step 4: get_order via handle_request — order just created; should be handled */
+    cJSON *get_req = cJSON_CreateObject();
+    ASSERT(get_req != NULL, "create get_order request");
+    cJSON_AddStringToObject(get_req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(get_req, "method", "lsps1.get_order");
+    cJSON_AddNumberToObject(get_req, "id", 11);
+    cJSON *gp = cJSON_CreateObject();
+    cJSON_AddStringToObject(gp, "order_id", "1");
+    cJSON_AddItemToObject(get_req, "params", gp);
+    ASSERT(lsps_handle_request(NULL, -1, get_req) == 1, "get_order handled");
+    cJSON_Delete(get_req);
+
+    /* Step 5: get_order for unknown id → error response (still returns 1 = handled) */
+    cJSON *bad_req = cJSON_CreateObject();
+    ASSERT(bad_req != NULL, "create bad get_order request");
+    cJSON_AddStringToObject(bad_req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(bad_req, "method", "lsps1.get_order");
+    cJSON_AddNumberToObject(bad_req, "id", 12);
+    cJSON *bp = cJSON_CreateObject();
+    cJSON_AddStringToObject(bp, "order_id", "9999");
+    cJSON_AddItemToObject(bad_req, "params", bp);
+    ASSERT(lsps_handle_request(NULL, -1, bad_req) == 1,
+           "get_order unknown id returns error response (handled)");
+    cJSON_Delete(bad_req);
+
+    return 1;
+}

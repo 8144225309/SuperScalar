@@ -1,6 +1,8 @@
 #include "superscalar/splice.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/musig.h"
 #include "superscalar/sha256.h"
+#include <secp256k1_extrakeys.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -56,6 +58,38 @@ int splice_build_funding_tx(tx_buf_t *out,
     tx_buf_write_u32_le(out, 0);
 
     return !out->oom;
+}
+
+int splice_compute_funding_spk(const secp256k1_context *secp,
+                                unsigned char spk34_out[34],
+                                const secp256k1_pubkey *local_pubkey,
+                                const secp256k1_pubkey *remote_pubkey)
+{
+    if (!secp || !spk34_out || !local_pubkey || !remote_pubkey) return 0;
+
+    /* Aggregate local + remote keys into a single MuSig2 internal key */
+    secp256k1_pubkey pks[2] = { *local_pubkey, *remote_pubkey };
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(secp, &ka, pks, 2)) return 0;
+
+    /* BIP 341 key-path tweak: tag_hash("TapTweak", internal_key_bytes) */
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(secp, internal_ser, &ka.agg_pubkey)) return 0;
+
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    secp256k1_pubkey tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(secp, &tweaked_full, &ka.agg_pubkey, tweak))
+        return 0;
+
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(secp, &tweaked_xonly, NULL, &tweaked_full))
+        return 0;
+
+    /* OP_1 <32-byte-x-only-key> */
+    build_p2tr_script_pubkey(spk34_out, &tweaked_xonly);
+    return 1;
 }
 
 int channel_apply_splice_update(channel_t *ch,
