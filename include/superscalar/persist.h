@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 2
+#define PERSIST_SCHEMA_VERSION 3
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -457,5 +457,28 @@ int persist_load_hd_seed(persist_t *p,
 /* Save / load the HD wallet's lookahead window size. */
 int persist_save_hd_lookahead(persist_t *p, uint32_t lookahead);
 uint32_t persist_load_hd_lookahead(persist_t *p);
+
+/* --- BOLT 12 Offers (schema v3) --- */
+
+/* Save an offer (bech32m-encoded string).
+ * offer_id: caller-assigned 32-byte identifier (e.g. SHA256 of offer bytes).
+ * encoded: null-terminated bech32m offer string.
+ * Returns 1 on success. */
+int persist_save_offer(persist_t *p,
+                        const unsigned char *offer_id32,
+                        const char *encoded);
+
+/* List all stored offers.
+ * ids_out: array of 32-byte offer IDs (caller-allocated, max_offers entries)
+ * encoded_out: array of char buffers, each BOLT12_OFFER_ENC_MAX bytes (caller-allocated)
+ * Returns number of offers loaded. */
+#define PERSIST_OFFER_ENC_MAX 512
+size_t persist_list_offers(persist_t *p,
+                            unsigned char (*ids_out)[32],
+                            char (*encoded_out)[PERSIST_OFFER_ENC_MAX],
+                            size_t max_offers);
+
+/* Delete an offer by ID. Returns 1 if deleted, 0 if not found or error. */
+int persist_delete_offer(persist_t *p, const unsigned char *offer_id32);
 
 #endif /* SUPERSCALAR_PERSIST_H */

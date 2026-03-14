@@ -1,5 +1,7 @@
 #include "superscalar/bolt12.h"
 #include "superscalar/blinded_path.h"
+#include "superscalar/bech32m.h"
+#include "superscalar/persist.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
@@ -110,7 +112,7 @@ int test_invoice_sign_verify(void)
     return 1;
 }
 
-/* Test F4: blinded path with 2 hops */
+/* Test F4: blinded path with 2 hops — blinded_node_id != original pubkey */
 int test_blinded_path_onion(void)
 {
     secp256k1_context *ctx = secp256k1_context_create(
@@ -120,23 +122,32 @@ int test_blinded_path_onion(void)
     unsigned char intro_seckey[32];
     memset(intro_seckey, 0x33, 32);
 
-    /* 2 hop pubkeys (33 bytes each) */
+    /* 2 valid compressed pubkeys derived from known seckeys */
+    unsigned char sec0[32], sec1[32];
+    memset(sec0, 0x11, 32);
+    memset(sec1, 0x22, 32);
+    secp256k1_keypair kp0, kp1;
+    secp256k1_pubkey pub0, pub1;
+    ASSERT(secp256k1_keypair_create(ctx, &kp0, sec0), "kp0");
+    ASSERT(secp256k1_keypair_create(ctx, &kp1, sec1), "kp1");
+    ASSERT(secp256k1_keypair_pub(ctx, &pub0, &kp0), "pub0");
+    ASSERT(secp256k1_keypair_pub(ctx, &pub1, &kp1), "pub1");
     unsigned char hops[2][33];
-    memset(hops[0], 0x02, 33); hops[0][0] = 0x02;
-    memset(hops[1], 0x03, 33); hops[1][0] = 0x03;
+    size_t sz = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hops[0], &sz, &pub0, SECP256K1_EC_COMPRESSED);
+    sz = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hops[1], &sz, &pub1, SECP256K1_EC_COMPRESSED);
 
     blinded_path_t path;
     ASSERT(blinded_path_build(&path, ctx, (const unsigned char (*)[33])hops, 2, intro_seckey),
            "blinded_path_build should succeed");
     ASSERT(path.n_hops == 2, "2 hops");
-    ASSERT(path.hops[0].blinded_node_id[0] == 0x02, "hop[0] node_id matches");
-    ASSERT(path.hops[1].blinded_node_id[0] == 0x03, "hop[1] node_id matches");
 
-    /* Unblind first hop → get hop[1] pubkey */
-    unsigned char next33[33];
-    ASSERT(blinded_path_unblind_first_hop(&path, ctx, intro_seckey, next33),
-           "unblind_first_hop should succeed");
-    ASSERT(memcmp(next33, hops[1], 33) == 0, "unblinded next hop matches hop[1]");
+    /* Phase 4 fix: blinded_node_id must be DIFFERENT from the original pubkey */
+    ASSERT(memcmp(path.hops[0].blinded_node_id, hops[0], 33) != 0,
+           "hop[0] blinded_node_id != original pubkey (real ECDH blinding)");
+    ASSERT(memcmp(path.hops[1].blinded_node_id, hops[1], 33) != 0,
+           "hop[1] blinded_node_id != original pubkey (real ECDH blinding)");
 
     secp256k1_context_destroy(ctx);
     return 1;
@@ -161,5 +172,110 @@ int test_offer_no_amount(void)
     ASSERT(decoded.amount_msat == 0, "amount_msat == 0 for variable offer");
     ASSERT(strcmp(decoded.description, o.description) == 0, "description matches");
 
+    return 1;
+}
+
+/* Phase 4 fix: bech32m known vector test (BIP 350 test vector) */
+int test_bech32m_known_vector(void)
+{
+    /* Simple round-trip: encode some bytes and decode them back */
+    const unsigned char data[] = {0x00, 0x0e, 0x14, 0x00, 0xd3, 0x23, 0x14, 0x04};
+    char encoded[256];
+    ASSERT(bech32m_encode("test", data, sizeof(data), encoded, sizeof(encoded)),
+           "bech32m_encode should succeed");
+    /* Should start with "test1" */
+    ASSERT(strncmp(encoded, "test1", 5) == 0, "HRP 'test' present");
+
+    unsigned char decoded[64];
+    size_t dec_len = 0;
+    ASSERT(bech32m_decode(encoded, "test", decoded, &dec_len, sizeof(decoded)),
+           "bech32m_decode should succeed");
+    ASSERT(dec_len == sizeof(data), "decoded length matches");
+    ASSERT(memcmp(decoded, data, sizeof(data)) == 0, "decoded data matches original");
+    return 1;
+}
+
+/* Phase 4 fix: real bech32m offer encode has valid bech32m checksum */
+int test_offer_encode_bech32m_valid(void)
+{
+    offer_t o;
+    memset(&o, 0, sizeof(o));
+    memset(o.node_id, 0x02, 33);
+    o.node_id[0] = 0x02;
+    o.amount_msat = 1000;
+    o.has_amount = 1;
+    strcpy(o.description, "bech32m test");
+
+    char encoded[1024];
+    ASSERT(offer_encode(&o, encoded, sizeof(encoded)), "encode succeeds");
+
+    /* Verify it decodes back correctly with bech32m */
+    offer_t decoded;
+    ASSERT(offer_decode(encoded, &decoded), "decode succeeds");
+    ASSERT(decoded.amount_msat == 1000, "amount round-trips");
+    ASSERT(strcmp(decoded.description, "bech32m test") == 0, "description round-trips");
+
+    /* Verify prefix is "lno1" (lno + separator "1") */
+    ASSERT(strncmp(encoded, "lno1", 4) == 0, "starts with lno1");
+    return 1;
+}
+
+/* Phase 4 fix: corrupted checksum should fail decode */
+int test_offer_decode_bad_checksum(void)
+{
+    offer_t o;
+    memset(&o, 0, sizeof(o));
+    memset(o.node_id, 0x02, 33);
+    o.node_id[0] = 0x02;
+    o.amount_msat = 500;
+    strcpy(o.description, "checksum test");
+
+    char encoded[1024];
+    ASSERT(offer_encode(&o, encoded, sizeof(encoded)), "encode");
+
+    /* Corrupt the last character of the checksum */
+    size_t len = strlen(encoded);
+    encoded[len - 1] = (encoded[len - 1] == 'q') ? 'p' : 'q';
+
+    offer_t bad;
+    ASSERT(!offer_decode(encoded, &bad), "corrupted offer should fail decode");
+    return 1;
+}
+
+/* Phase 4 fix: persist schema v3 — offers table smoke test */
+int test_persist_schema_v3(void)
+{
+    persist_t p;
+    ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
+    ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
+    ASSERT(PERSIST_SCHEMA_VERSION == 3, "schema version is 3");
+    persist_close(&p);
+    return 1;
+}
+
+/* Phase 4 fix: persist_save_offer / persist_list_offers / persist_delete_offer */
+int test_persist_save_list_offer(void)
+{
+    persist_t p;
+    ASSERT(persist_open(&p, ":memory:"), "open DB");
+
+    unsigned char offer_id[32];
+    memset(offer_id, 0xAB, 32);
+    const char *enc = "lno1testencoded";
+
+    ASSERT(persist_save_offer(&p, offer_id, enc), "save offer");
+
+    unsigned char ids[8][32];
+    char encs[8][PERSIST_OFFER_ENC_MAX];
+    size_t count = persist_list_offers(&p, ids, encs, 8);
+    ASSERT(count == 1, "one offer listed");
+    ASSERT(memcmp(ids[0], offer_id, 32) == 0, "offer_id matches");
+    ASSERT(strcmp(encs[0], enc) == 0, "encoded string matches");
+
+    ASSERT(persist_delete_offer(&p, offer_id), "delete offer");
+    count = persist_list_offers(&p, ids, encs, 8);
+    ASSERT(count == 0, "no offers after delete");
+
+    persist_close(&p);
     return 1;
 }

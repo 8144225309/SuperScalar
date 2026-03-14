@@ -123,6 +123,9 @@ extern int test_lsps1_get_info_response(void);
 extern int test_lsps1_create_order(void);
 extern int test_lsps2_get_info(void);
 extern int test_lsps2_buy_creates_jit(void);
+/* Phase 2 fix: LSPS context / NULL-safety */
+extern int test_lsps_null_ctx_returns_error(void);
+extern int test_lsps_malformed_json_returns_zero(void);
 
 /* Phase F: BOLT 12 / Offers */
 extern int test_offer_encode_decode(void);
@@ -130,12 +133,23 @@ extern int test_invoice_request_sign_verify(void);
 extern int test_invoice_sign_verify(void);
 extern int test_blinded_path_onion(void);
 extern int test_offer_no_amount(void);
+/* Phase 4 fix: real bech32m + persist schema v3 */
+extern int test_bech32m_known_vector(void);
+extern int test_offer_encode_bech32m_valid(void);
+extern int test_offer_decode_bad_checksum(void);
+extern int test_persist_schema_v3(void);
+extern int test_persist_save_list_offer(void);
 
 /* Phase G: Splicing */
 extern int test_splice_out_flow(void);
 extern int test_splice_in_flow(void);
 extern int test_splice_mid_htlc(void);
 extern int test_splice_channel_update(void);
+/* Phase 3 fix: wire builder round-trips */
+extern int test_wire_splice_init_roundtrip(void);
+extern int test_wire_splice_ack_roundtrip(void);
+extern int test_wire_splice_locked_roundtrip(void);
+extern int test_splice_state_machine(void);
 
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
@@ -163,6 +177,10 @@ extern int test_pow_validate_mainnet_genesis(void);
 extern int test_pow_validate_fabricated(void);
 extern int test_pow_difficulty_transition_valid(void);
 extern int test_pow_difficulty_transition_too_easy(void);
+/* Phase 1 fix: real timespan tests */
+extern int test_pow_difficulty_nominal_timespan(void);
+extern int test_pow_difficulty_too_fast_rejected(void);
+extern int test_pow_difficulty_too_slow_rejected(void);
 
 extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
@@ -889,6 +907,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsps1_create_order);
     RUN_TEST(test_lsps2_get_info);
     RUN_TEST(test_lsps2_buy_creates_jit);
+    RUN_TEST(test_lsps_null_ctx_returns_error);
+    RUN_TEST(test_lsps_malformed_json_returns_zero);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -896,12 +916,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_invoice_sign_verify);
     RUN_TEST(test_blinded_path_onion);
     RUN_TEST(test_offer_no_amount);
+    RUN_TEST(test_bech32m_known_vector);
+    RUN_TEST(test_offer_encode_bech32m_valid);
+    RUN_TEST(test_offer_decode_bad_checksum);
+    RUN_TEST(test_persist_schema_v3);
+    RUN_TEST(test_persist_save_list_offer);
 
     printf("\n=== Phase G: Splicing ===\n");
     RUN_TEST(test_splice_out_flow);
     RUN_TEST(test_splice_in_flow);
     RUN_TEST(test_splice_mid_htlc);
     RUN_TEST(test_splice_channel_update);
+    RUN_TEST(test_wire_splice_init_roundtrip);
+    RUN_TEST(test_wire_splice_ack_roundtrip);
+    RUN_TEST(test_wire_splice_locked_roundtrip);
+    RUN_TEST(test_splice_state_machine);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
@@ -930,6 +959,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_pow_validate_fabricated);
     RUN_TEST(test_pow_difficulty_transition_valid);
     RUN_TEST(test_pow_difficulty_transition_too_easy);
+    RUN_TEST(test_pow_difficulty_nominal_timespan);
+    RUN_TEST(test_pow_difficulty_too_fast_rejected);
+    RUN_TEST(test_pow_difficulty_too_slow_rejected);
 
     printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
 

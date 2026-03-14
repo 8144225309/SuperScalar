@@ -1,54 +1,26 @@
 #include "superscalar/bolt12.h"
+#include "superscalar/bech32m.h"
 #include "superscalar/sha256.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 /* -----------------------------------------------------------------------
- * Simple bech32m codec for offers (lno1...)
- *
- * We use a simplified encoding: prefix "lno1" + hex encoding of
- * the offer fields. This is not full BOLT 12 spec but passes tests.
+ * Real bech32m codec for offers (lno1...)
+ * Uses BIP 350 bech32m (HRP = "lno") via src/bech32m.c
  * --------------------------------------------------------------------- */
+
+#define BOLT12_OFFER_HRP "lno"
 
 static int b32encode(const unsigned char *data, size_t data_len,
                       char *out, size_t out_cap)
 {
-    /* Simplified: encode as hex with lno1 prefix */
-    if (out_cap < data_len * 2 + 5) return 0;
-    const char hx[] = "0123456789abcdef";
-    strcpy(out, "lno1");
-    size_t pos = 4;
-    for (size_t i = 0; i < data_len; i++) {
-        out[pos++] = hx[(data[i] >> 4) & 0xf];
-        out[pos++] = hx[ data[i]       & 0xf];
-    }
-    out[pos] = '\0';
-    return 1;
+    return bech32m_encode(BOLT12_OFFER_HRP, data, data_len, out, out_cap);
 }
 
 static int b32decode(const char *str, unsigned char *out, size_t *len_out, size_t cap)
 {
-    if (strncmp(str, "lno1", 4) != 0) return 0;
-    str += 4;
-    size_t hex_len = strlen(str);
-    if (hex_len % 2 != 0) return 0;
-    size_t byte_len = hex_len / 2;
-    if (byte_len > cap) return 0;
-    for (size_t i = 0; i < byte_len; i++) {
-        unsigned char hi, lo;
-        char c = str[i*2];
-        if (c >= '0' && c <= '9') hi = (unsigned char)(c - '0');
-        else if (c >= 'a' && c <= 'f') hi = (unsigned char)(c - 'a' + 10);
-        else return 0;
-        c = str[i*2+1];
-        if (c >= '0' && c <= '9') lo = (unsigned char)(c - '0');
-        else if (c >= 'a' && c <= 'f') lo = (unsigned char)(c - 'a' + 10);
-        else return 0;
-        out[i] = (unsigned char)((hi << 4) | lo);
-    }
-    *len_out = byte_len;
-    return 1;
+    return bech32m_decode(str, BOLT12_OFFER_HRP, out, len_out, cap);
 }
 
 /* Serialise offer to bytes for encoding */

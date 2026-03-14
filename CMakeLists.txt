@@ -133,6 +133,7 @@ add_library(superscalar
     src/bolt12.c
     src/blinded_path.c
     src/splice.c
+    src/bech32m.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)

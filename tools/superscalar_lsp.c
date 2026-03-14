@@ -37,6 +37,8 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
+#include "superscalar/bolt12.h"
+#include "superscalar/bech32m.h"
 
 static volatile sig_atomic_t g_shutdown = 0;
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
@@ -772,6 +774,8 @@ int main(int argc, char *argv[]) {
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
+    const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
+    uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -1014,6 +1018,10 @@ int main(int argc, char *argv[]) {
             hd_passphrase = argv[++i];
         else if (strcmp(argv[i], "--hd-lookahead") == 0 && i + 1 < argc)
             hd_lookahead = (uint32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--create-offer") == 0 && i + 1 < argc)
+            create_offer_desc = argv[++i];
+        else if (strcmp(argv[i], "--offer-amount") == 0 && i + 1 < argc)
+            create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1080,6 +1088,61 @@ int main(int argc, char *argv[]) {
             printf("Backup restore: %s\n", ok ? "OK" : "FAILED");
             return ok ? 0 : 1;
         }
+    }
+
+    /* --- BOLT 12 Offer creation (early exit) --- */
+    if (create_offer_desc) {
+        if (!seckey_hex && !keyfile_path) {
+            fprintf(stderr, "Error: --create-offer requires --seckey or --keyfile\n");
+            return 1;
+        }
+        /* Build a simple LSP offer with the node key and description */
+        secp256k1_context *ctx2 = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+        unsigned char seckey[32] = {0};
+        if (seckey_hex) {
+            extern int hex_decode(const char *, unsigned char *, size_t);
+            hex_decode(seckey_hex, seckey, 32);
+        }
+        secp256k1_keypair kp2;
+        secp256k1_pubkey pub2;
+        unsigned char node_id[33];
+        if (secp256k1_keypair_create(ctx2, &kp2, seckey) &&
+            secp256k1_keypair_pub(ctx2, &pub2, &kp2)) {
+            size_t sz = 33;
+            secp256k1_ec_pubkey_serialize(ctx2, node_id, &sz,
+                                           &pub2, SECP256K1_EC_COMPRESSED);
+        } else {
+            memset(node_id, 0, 33);
+        }
+        secp256k1_context_destroy(ctx2);
+
+        offer_t offer;
+        memset(&offer, 0, sizeof(offer));
+        memcpy(offer.node_id, node_id, 33);
+        offer.amount_msat = create_offer_amount;
+        offer.has_amount = (create_offer_amount > 0);
+        strncpy(offer.description, create_offer_desc,
+                sizeof(offer.description) - 1);
+
+        char enc[1024];
+        if (!offer_encode(&offer, enc, sizeof(enc))) {
+            fprintf(stderr, "Error: offer_encode failed\n");
+            return 1;
+        }
+        printf("%s\n", enc);
+
+        /* Optionally persist to DB */
+        if (db_path) {
+            persist_t pdb;
+            if (persist_open(&pdb, db_path)) {
+                unsigned char offer_id[32];
+                sha256((const unsigned char *)enc, strlen(enc), offer_id);
+                persist_save_offer(&pdb, offer_id, enc);
+                persist_close(&pdb);
+                fprintf(stderr, "Offer saved to %s\n", db_path);
+            }
+        }
+        return 0;
     }
 
     /* --- BIP39 Mnemonic (early exit) --- */
