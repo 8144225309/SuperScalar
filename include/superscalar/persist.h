@@ -454,4 +454,8 @@ int persist_load_hd_seed(persist_t *p,
                            unsigned char *seed_out, size_t *seed_len_out,
                            size_t seed_cap);
 
+/* Save / load the HD wallet's lookahead window size. */
+int persist_save_hd_lookahead(persist_t *p, uint32_t lookahead);
+uint32_t persist_load_hd_lookahead(persist_t *p);
+
 #endif /* SUPERSCALAR_PERSIST_H */

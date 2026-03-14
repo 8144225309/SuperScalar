@@ -608,7 +608,7 @@ static int cb_send_raw_tx(chain_backend_t *self, const char *tx_hex,
 {
     bip158_backend_t *b = (bip158_backend_t *)self;
 
-    if (b->p2p.fd < 0) return 0;   /* no P2P connection */
+    if (b->peers[b->current_peer].fd < 0) return 0;   /* no P2P connection */
 
     /* Decode hex to raw bytes */
     size_t        hlen     = strlen(tx_hex);
@@ -618,7 +618,7 @@ static int cb_send_raw_tx(chain_backend_t *self, const char *tx_hex,
     if (tx_len < 0) { free(tx_bytes); return 0; }
 
     uint8_t txid32[32];
-    int ok = p2p_broadcast_tx(&b->p2p,
+    int ok = p2p_broadcast_tx(&b->peers[b->current_peer],
                                tx_bytes, (size_t)tx_len,
                                txid32);
     free(tx_bytes);
@@ -760,7 +760,7 @@ int bip158_verify_filter_checkpoints(bip158_backend_t *b,
             fprintf(stderr,
                     "BIP158: checkpoint mismatch at height %d — "
                     "disconnecting peer\n", (int)ch);
-            p2p_close(&b->p2p);
+            p2p_close(&b->peers[b->current_peer]);
             return 0;
         }
     }
@@ -794,7 +794,11 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
     backend->tip_height             = -1;  /* unknown until first sync */
     backend->headers_synced         = -1;  /* no block headers yet     */
     backend->filter_headers_synced  = -1;  /* no filter headers yet    */
-    backend->p2p.fd                 = -1;  /* no P2P connection yet    */
+    for (int i = 0; i < BIP158_MAX_PEERS; i++) {
+        backend->peers[i].fd = -1;         /* no P2P connection yet    */
+    }
+    backend->n_connected = 0;
+    memset(backend->peer_connected, 0, sizeof(backend->peer_connected));
 
     if (network)
         snprintf(backend->network, sizeof(backend->network), "%s", network);
@@ -805,7 +809,9 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
 void bip158_backend_free(bip158_backend_t *backend)
 {
     if (!backend) return;
-    p2p_close(&backend->p2p);
+    for (int i = 0; i < BIP158_MAX_PEERS; i++) {
+        p2p_close(&backend->peers[i]);
+    }
 }
 
 /*
@@ -854,17 +860,17 @@ void bip158_backend_set_mempool_cb(bip158_backend_t *backend,
 
 int bip158_backend_poll_mempool(bip158_backend_t *backend)
 {
-    if (!backend || backend->p2p.fd < 0 || !backend->mempool_cb) return 0;
+    if (!backend || backend->peers[backend->current_peer].fd < 0 || !backend->mempool_cb) return 0;
 
     /* Subscribe to mempool (BIP 35) on first call */
     if (!backend->mempool_subscribed) {
-        if (p2p_send_mempool(&backend->p2p))
+        if (p2p_send_mempool(&backend->peers[backend->current_peer]))
             backend->mempool_subscribed = 1;
     }
 
     /* Collect pending MSG_TX inv announcements (100 ms poll window) */
     uint8_t txids[256][32];
-    int n = p2p_poll_inv(&backend->p2p, txids, 256, 100);
+    int n = p2p_poll_inv(&backend->peers[backend->current_peer], txids, 256, 100);
 
     /* Convert each txid to display-order hex and fire the callback */
     static const char hx[] = "0123456789abcdef";
@@ -966,12 +972,13 @@ static int bip158_sync_headers(bip158_backend_t *b)
             n_locator = 1;
         }
 
-        if (!p2p_send_getheaders(&b->p2p, locator, n_locator, NULL)) {
+        if (!p2p_send_getheaders(&b->peers[b->current_peer], locator, n_locator, NULL)) {
             result = -1;
             break;
         }
 
-        int n = p2p_recv_headers(&b->p2p, new_hashes, 2000);
+        uint32_t nbits_batch[2000];
+        int n = p2p_recv_headers_pow(&b->peers[b->current_peer], new_hashes, 2000, nbits_batch);
         if (n < 0) { result = -1; break; }
         if (n == 0) break;  /* peer has nothing more to send */
 
@@ -979,6 +986,19 @@ static int bip158_sync_headers(bip158_backend_t *b)
             int height = start_height + i;
             memcpy(b->header_hashes[height % BIP158_HEADER_WINDOW],
                    new_hashes[i], 32);
+            b->nBits_ring[height % BIP158_HEADER_WINDOW] = nbits_batch[i];
+            /* Difficulty transition check at every 2016-block boundary */
+            if (height > 0 && (height % 2016) == 0) {
+                uint32_t old_bits = b->nBits_ring[(height - 1) % BIP158_HEADER_WINDOW];
+                uint32_t new_bits = nbits_batch[i];
+                if (!p2p_validate_difficulty_transition(old_bits, new_bits, 1209600)) {
+                    fprintf(stderr, "BIP158: difficulty transition violation at height %d\n",
+                            height);
+                    p2p_close(&b->peers[b->current_peer]);
+                    result = -1;
+                    goto headers_done;
+                }
+            }
             b->headers_synced = height;
         }
         result = b->headers_synced;
@@ -986,6 +1006,7 @@ static int bip158_sync_headers(bip158_backend_t *b)
         if (n < 2000) break;  /* fewer than max → reached peer's tip */
     }
 
+headers_done:
     free(new_hashes);
     return result;
 }
@@ -1039,11 +1060,11 @@ static int bip158_resolve_conflict(bip158_backend_t *b, int height,
     const uint8_t *block_hash = b->header_hashes[height % BIP158_HEADER_WINDOW];
 
     /* Download the block from the current peer */
-    if (!p2p_send_getdata_block(&b->p2p, block_hash)) goto disconnect;
+    if (!p2p_send_getdata_block(&b->peers[b->current_peer], block_hash)) goto disconnect;
 
     uint8_t *block_data = NULL;
     size_t   block_len  = 0;
-    if (p2p_recv_block(&b->p2p, &block_data, &block_len) != 1) goto disconnect;
+    if (p2p_recv_block(&b->peers[b->current_peer], &block_data, &block_len) != 1) goto disconnect;
 
     /* Collect output scripts (OP_RETURN excluded) */
     collect_scripts_ctx_t cctx;
@@ -1079,7 +1100,7 @@ static int bip158_resolve_conflict(bip158_backend_t *b, int height,
     if (memcmp(local_hdr, stored, 32) == 0) {
         fprintf(stderr, "BIP158: conflict at height %d — peer header wrong, "
                 "disconnecting\n", height);
-        p2p_close(&b->p2p);
+        p2p_close(&b->peers[b->current_peer]);
         return 0;
     }
 
@@ -1097,7 +1118,7 @@ static int bip158_resolve_conflict(bip158_backend_t *b, int height,
             "(no prevouts available), disconnecting\n", height);
 
 disconnect:
-    p2p_close(&b->p2p);
+    p2p_close(&b->peers[b->current_peer]);
     return 0;
 }
 
@@ -1129,7 +1150,7 @@ static int bip158_sync_filter_headers(bip158_backend_t *b, int tip_height)
         const uint8_t *stop_hash =
             b->header_hashes[end % BIP158_HEADER_WINDOW];
 
-        if (!p2p_send_getcfheaders(&b->p2p, (uint32_t)start, stop_hash)) {
+        if (!p2p_send_getcfheaders(&b->peers[b->current_peer], (uint32_t)start, stop_hash)) {
             result = -1;
             break;
         }
@@ -1137,7 +1158,7 @@ static int bip158_sync_filter_headers(bip158_backend_t *b, int tip_height)
         uint8_t  stop_out[32], prev_fh[32];
         uint8_t *hdrs   = NULL;
         size_t   count  = 0;
-        int r = p2p_recv_cfheaders(&b->p2p, stop_out, prev_fh, &hdrs, &count);
+        int r = p2p_recv_cfheaders(&b->peers[b->current_peer], stop_out, prev_fh, &hdrs, &count);
         if (r != 1) {
             free(hdrs);
             if (r == -1) result = -1;
@@ -1231,10 +1252,46 @@ void bip158_compute_filter_header(const unsigned char *filter_bytes,
     compute_filter_header(filter_bytes, filter_len, prev_filter_hdr, out);
 }
 
+int bip158_backend_connect_all(bip158_backend_t *backend)
+{
+    if (!backend || backend->n_peers == 0) return 0;
+
+    int limit = backend->n_peers < 3 ? backend->n_peers : 3;
+    int connected = 0;
+
+    for (int i = 0; i < limit; i++) {
+        if (backend->peer_connected[i]) {
+            connected++;
+            continue;
+        }
+        if (p2p_connect(&backend->peers[i],
+                         backend->peer_hosts[i],
+                         backend->peer_ports[i],
+                         backend->network)) {
+            backend->peer_connected[i] = 1;
+            connected++;
+            fprintf(stderr, "BIP158: connected to peer %d (%s:%d)\n",
+                    i, backend->peer_hosts[i], backend->peer_ports[i]);
+        }
+    }
+
+    backend->n_connected = connected;
+    /* If no current peer is connected, pick first connected */
+    if (backend->peers[backend->current_peer].fd < 0) {
+        for (int i = 0; i < limit; i++) {
+            if (backend->peer_connected[i]) {
+                backend->current_peer = i;
+                break;
+            }
+        }
+    }
+    return connected;
+}
+
 /*
  * BIP 158 scan loop — Phase 3 (RPC) + Phase 4/5 (P2P filter + header sync).
  *
- * P2P path (preferred when backend->p2p.fd >= 0):
+ * P2P path (preferred when backend->peers[backend->current_peer].fd >= 0):
  *   1. bip158_sync_headers() fetches block hashes into the ring buffer and
  *      provides the chain tip height — no RPC needed for header data.
  *   2. getcfilters requests are batched in chunks of 1000 blocks.
@@ -1253,18 +1310,18 @@ int bip158_backend_scan(bip158_backend_t *backend)
 
     regtest_t *rt = (regtest_t *)backend->rpc_ctx;
 
-    if (backend->p2p.fd < 0 && !rt && backend->n_peers == 0) return -1;
+    if (backend->peers[backend->current_peer].fd < 0 && !rt && backend->n_peers == 0) return -1;
     if (!backend->n_scripts) return 0;
 
     /* Determine chain tip — P2P path syncs headers + filter headers.
        Phase 6: attempt peer rotation on disconnect before falling back. */
     int tip = -1;
-    if (backend->p2p.fd >= 0) {
+    if (backend->peers[backend->current_peer].fd >= 0) {
         tip = bip158_sync_headers(backend);
         if (tip >= 0) {
             bip158_sync_filter_headers(backend, tip);
         } else {
-            p2p_close(&backend->p2p);
+            p2p_close(&backend->peers[backend->current_peer]);
             if (backend->n_peers > 1)
                 bip158_backend_reconnect(backend);
         }
@@ -1273,12 +1330,12 @@ int bip158_backend_scan(bip158_backend_t *backend)
         bip158_backend_reconnect(backend);
     }
     /* Re-check after possible reconnect */
-    if (tip < 0 && backend->p2p.fd >= 0) {
+    if (tip < 0 && backend->peers[backend->current_peer].fd >= 0) {
         tip = bip158_sync_headers(backend);
         if (tip >= 0)
             bip158_sync_filter_headers(backend, tip);
         else
-            p2p_close(&backend->p2p);
+            p2p_close(&backend->peers[backend->current_peer]);
     }
     if (tip < 0) {
         if (!rt) return 0;  /* P2P tip not yet available; caller retries on next poll */
@@ -1295,14 +1352,14 @@ int bip158_backend_scan(bip158_backend_t *backend)
 
     int matched = 0;
 
-    if (backend->p2p.fd >= 0) {
+    if (backend->peers[backend->current_peer].fd >= 0) {
         /* === P2P path: batched getcfilters, ring-buffer block hashes === */
-        for (int h = start; h <= tip && backend->p2p.fd >= 0; ) {
+        for (int h = start; h <= tip && backend->peers[backend->current_peer].fd >= 0; ) {
             int batch_end = (h + 999 < tip) ? h + 999 : tip;
             const uint8_t *stop = backend->header_hashes[batch_end % BIP158_HEADER_WINDOW];
 
-            if (!p2p_send_getcfilters(&backend->p2p, (uint32_t)h, stop)) {
-                p2p_close(&backend->p2p);
+            if (!p2p_send_getcfilters(&backend->peers[backend->current_peer], (uint32_t)h, stop)) {
+                p2p_close(&backend->peers[backend->current_peer]);
                 break;
             }
 
@@ -1312,11 +1369,11 @@ int bip158_backend_scan(bip158_backend_t *backend)
                 size_t   pf_len;
                 uint8_t  recv_hash[32], recv_key[16];
 
-                int r = p2p_recv_cfilter(&backend->p2p, recv_hash,
+                int r = p2p_recv_cfilter(&backend->peers[backend->current_peer], recv_hash,
                                           &pf, &pf_len, recv_key);
                 if (r != 1) {
                     free(pf);
-                    if (r == -1) p2p_close(&backend->p2p);
+                    if (r == -1) p2p_close(&backend->peers[backend->current_peer]);
                     batch_ok = 0;
                     break;
                 }
@@ -1341,7 +1398,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                32) != 0) {
                         /* Peer sent a filter that doesn't match the committed
                            header — likely a misbehaving or stale peer. */
-                        p2p_close(&backend->p2p);
+                        p2p_close(&backend->peers[backend->current_peer]);
                         batch_ok = 0;
                         break;
                     }
@@ -1356,10 +1413,10 @@ int bip158_backend_scan(bip158_backend_t *backend)
                    Falls back to RPC if P2P block download fails. */
                 scan_cb_ctx_t sc = { backend, (int32_t)bh, 0 };
                 int block_scanned = 0;
-                if (p2p_send_getdata_block(&backend->p2p, recv_hash)) {
+                if (p2p_send_getdata_block(&backend->peers[backend->current_peer], recv_hash)) {
                     uint8_t *blk  = NULL;
                     size_t   blen = 0;
-                    int br = p2p_recv_block(&backend->p2p, &blk, &blen);
+                    int br = p2p_recv_block(&backend->peers[backend->current_peer], &blk, &blen);
                     if (br == 1) {
                         p2p_scan_block_txs(blk, blen,
                                            (p2p_block_scan_cb_t)scan_tx_callback,
@@ -1384,11 +1441,11 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                     sample);
                         }
                     } else if (br < 0) {
-                        p2p_close(&backend->p2p);
+                        p2p_close(&backend->peers[backend->current_peer]);
                     }
                     free(blk);
                 } else {
-                    p2p_close(&backend->p2p);
+                    p2p_close(&backend->peers[backend->current_peer]);
                 }
                 if (!block_scanned)
                     fprintf(stderr, "BIP158: block %d P2P download failed, skipping\n", bh);
@@ -1400,7 +1457,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
             if (!batch_ok) break;
             h = batch_end + 1;
         }
-    } else if (backend->p2p.fd < 0 && rt) {
+    } else if (backend->peers[backend->current_peer].fd < 0 && rt) {
         /* === RPC path (no P2P connection) === */
         for (int h = start; h <= tip; h++) {
             char          hash_hex[65];
@@ -1457,8 +1514,8 @@ int bip158_backend_connect_p2p(bip158_backend_t *backend,
 {
     if (!backend) return 0;
     /* Close any existing connection first */
-    p2p_close(&backend->p2p);
-    int ok = p2p_connect(&backend->p2p, host, port, backend->network);
+    p2p_close(&backend->peers[backend->current_peer]);
+    int ok = p2p_connect(&backend->peers[backend->current_peer], host, port, backend->network);
     if (ok) {
         /* Record as primary peer (slot 0) if not already present */
         if (backend->n_peers == 0) {
@@ -1506,7 +1563,7 @@ int bip158_backend_reconnect(bip158_backend_t *backend)
 {
     if (!backend || backend->n_peers == 0) return 0;
 
-    p2p_close(&backend->p2p);
+    p2p_close(&backend->peers[backend->current_peer]);
 
     /* Try each peer once, starting after the last successful one */
     for (int i = 1; i <= backend->n_peers; i++) {
@@ -1517,17 +1574,17 @@ int bip158_backend_reconnect(bip158_backend_t *backend)
 
         fprintf(stderr, "BIP158: reconnecting to %s:%d (peer %d/%d)...\n",
                 h, p, idx + 1, backend->n_peers);
-        if (p2p_connect(&backend->p2p, h, p, backend->network)) {
+        if (p2p_connect(&backend->peers[idx], h, p, backend->network)) {
             backend->current_peer = idx;
             fprintf(stderr, "BIP158: reconnected to %s:%d (services=0x%llx, feefilter=%llu sat/kvB)\n",
-                    h, p, (unsigned long long)backend->p2p.peer_services,
-                    (unsigned long long)backend->p2p.peer_feefilter_sat_per_kvb);
+                    h, p, (unsigned long long)backend->peers[backend->current_peer].peer_services,
+                    (unsigned long long)backend->peers[backend->current_peer].peer_feefilter_sat_per_kvb);
             /* Update fee estimator floor with peer's feefilter */
             if (backend->fee_estimator &&
-                backend->p2p.peer_feefilter_sat_per_kvb > 0) {
+                backend->peers[backend->current_peer].peer_feefilter_sat_per_kvb > 0) {
                 fee_estimator_blocks_set_floor(
                     (fee_estimator_blocks_t *)backend->fee_estimator,
-                    backend->p2p.peer_feefilter_sat_per_kvb);
+                    backend->peers[backend->current_peer].peer_feefilter_sat_per_kvb);
             }
             return 1;
         }
