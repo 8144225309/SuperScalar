@@ -220,3 +220,58 @@ int test_finalize_signed_tx(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Phase C: V3/TRUC CPFP — build_unsigned_tx_v with nVersion=3 */
+int test_v3_cpfp_tx_version(void)
+{
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xcc, 32);
+
+    tx_output_t output;
+    output.amount_sats = 10000;
+    memset(output.script_pubkey, 0x51, 34);
+    output.script_pubkey[0] = 0x51;
+    output.script_pubkey[1] = 0x20;
+    output.script_pubkey_len = 34;
+
+    tx_buf_t buf;
+    tx_buf_init(&buf, 256);
+
+    TEST_ASSERT(build_unsigned_tx_v(&buf, NULL, funding_txid, 0, 0xFFFFFFFE,
+                                     &output, 1, 3),
+                "build_unsigned_tx_v nVersion=3 should succeed");
+    TEST_ASSERT(buf.len >= 4, "tx has data");
+    /* nVersion = 3 (LE) at offset 0 */
+    TEST_ASSERT_EQ(buf.data[0], 0x03, "nVersion byte 0 == 3 (TRUC)");
+    TEST_ASSERT_EQ(buf.data[1], 0x00, "nVersion byte 1 == 0");
+    TEST_ASSERT_EQ(buf.data[2], 0x00, "nVersion byte 2 == 0");
+    TEST_ASSERT_EQ(buf.data[3], 0x00, "nVersion byte 3 == 0");
+
+    tx_buf_free(&buf);
+    return 1;
+}
+
+/* Phase C: standard channel tx must still use nVersion=2 */
+int test_v2_channel_tx_version(void)
+{
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xdd, 32);
+
+    tx_output_t output;
+    output.amount_sats = 50000;
+    memset(output.script_pubkey, 0, 34);
+    output.script_pubkey[0] = 0x51;
+    output.script_pubkey[1] = 0x20;
+    output.script_pubkey_len = 34;
+
+    tx_buf_t buf;
+    tx_buf_init(&buf, 256);
+
+    TEST_ASSERT(build_unsigned_tx(&buf, NULL, funding_txid, 0, 144, &output, 1),
+                "build_unsigned_tx (V2) should succeed");
+    TEST_ASSERT_EQ(buf.data[0], 0x02, "standard tx nVersion=2 byte 0");
+    TEST_ASSERT_EQ(buf.data[1], 0x00, "standard tx nVersion byte 1");
+
+    tx_buf_free(&buf);
+    return 1;
+}

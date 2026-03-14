@@ -764,7 +764,7 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    tx_buf_write_u32_le(&unsigned_tx, 2);           /* nVersion */
+    tx_buf_write_u32_le(&unsigned_tx, 3);           /* nVersion=3 (V3/TRUC for CPFP) */
     tx_buf_write_varint(&unsigned_tx, 2);            /* 2 inputs */
     /* Input 0: P2A anchor output from penalty tx (anyone-can-spend) */
     tx_buf_write_bytes(&unsigned_tx, anchor_txid, 32);
