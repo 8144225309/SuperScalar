@@ -1366,6 +1366,14 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                            &sc);
                         block_scanned = 1;
 
+                        /* Fire UTXO tracking callbacks if registered */
+                        if (backend->utxo_found_cb || backend->utxo_spent_cb) {
+                            p2p_scan_block_full(blk, blen,
+                                                backend->utxo_found_cb,
+                                                backend->utxo_spent_cb,
+                                                backend->utxo_cb_ctx);
+                        }
+
                         /* Extract fee sample from coinbase for fee estimator */
                         if (backend->fee_estimator && blen > 80 + 4 + 1) {
                             uint64_t sample = bip158_extract_block_fee_sample(
@@ -1532,4 +1540,15 @@ void bip158_backend_set_fee_estimator(bip158_backend_t *backend,
 {
     if (!backend) return;
     backend->fee_estimator = fe;
+}
+
+void bip158_backend_set_utxo_cb(bip158_backend_t *backend,
+                                  p2p_output_cb_t found_cb,
+                                  p2p_input_cb_t  spent_cb,
+                                  void *ctx)
+{
+    if (!backend) return;
+    backend->utxo_found_cb = found_cb;
+    backend->utxo_spent_cb = spent_cb;
+    backend->utxo_cb_ctx   = ctx;
 }

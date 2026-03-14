@@ -117,6 +117,14 @@ typedef struct {
        full-block download.  Set by bip158_backend_set_fee_estimator().
        Not owned; caller manages lifetime. */
     fee_estimator_t *fee_estimator;
+
+    /* Optional UTXO tracking callbacks — fired for every output and input
+     * in each full-block P2P download.  Set via bip158_backend_set_utxo_cb().
+     * Allows wallet_source_hd_t to detect incoming UTXOs and spends.
+     * NULL = disabled. */
+    p2p_output_cb_t utxo_found_cb;
+    p2p_input_cb_t  utxo_spent_cb;
+    void           *utxo_cb_ctx;
 } bip158_backend_t;
 
 /* Parse a "HOST:PORT" string.  host_out receives the NUL-terminated hostname,
@@ -311,5 +319,17 @@ void bip158_cache_tx(bip158_backend_t *backend,
 int bip158_scan_filter(bip158_backend_t *backend,
                         const unsigned char *filter_bytes, size_t filter_len,
                         const unsigned char *key16);
+
+/*
+ * Register callbacks fired for every tx output and input in each downloaded
+ * full block.  Enables in-process wallet UTXO tracking without RPC.
+ * found_cb: fired for each output (txid, vout_idx, amount, spk, spk_len)
+ * spent_cb: fired for each input  (spending_txid, prev_txid32, prev_vout)
+ * Pass NULL to disable.  Caller retains ownership.
+ */
+void bip158_backend_set_utxo_cb(bip158_backend_t *backend,
+                                  p2p_output_cb_t found_cb,
+                                  p2p_input_cb_t spent_cb,
+                                  void *ctx);
 
 #endif /* SUPERSCALAR_BIP158_BACKEND_H */

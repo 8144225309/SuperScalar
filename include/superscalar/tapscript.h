@@ -147,4 +147,28 @@ int finalize_script_path_tx_preimage(
     const unsigned char *script, size_t script_len,
     const unsigned char *control_block, size_t control_block_len);
 
+/*
+ * Compute the BIP 341 key-path sighash for SIGHASH_ALL|ANYONECANPAY (0x81).
+ *
+ * This variant only requires the CURRENT input's amount and scriptPubKey,
+ * making it suitable for in-process signing without access to all UTXOs.
+ *
+ * unsigned_tx: legacy (non-segwit) serialization of the unsigned transaction
+ * tx_len:      byte length
+ * input_index: which input is being signed (0-based)
+ * prev_spk/prev_spk_len: scriptPubKey of the UTXO being spent
+ * prev_amount: satoshi value of the UTXO being spent
+ * nsequence:   nSequence of the input being signed
+ *
+ * Returns 1 on success, 0 on error.
+ */
+int compute_keypath_sighash_anyonecanpay(
+    unsigned char *sighash_out32,
+    const unsigned char *unsigned_tx, size_t tx_len,
+    uint32_t input_index,
+    const unsigned char *prev_spk, size_t prev_spk_len,
+    uint64_t prev_amount,
+    uint32_t nsequence
+);
+
 #endif /* SUPERSCALAR_TAPSCRIPT_H */

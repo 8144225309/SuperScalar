@@ -282,4 +282,41 @@ int p2p_send_msg(p2p_conn_t *conn, const char *command,
 int p2p_recv_msg(p2p_conn_t *conn, char command_out[13],
                  uint8_t **payload_out);
 
+/*
+ * Extended per-output callback: fires for every output in every tx in a block.
+ * txid_hex: 64-char display-order hex string
+ * vout_idx: output index (0-based)
+ * amount_sats: output value
+ * spk/spk_len: scriptPubKey bytes
+ * ctx: caller context
+ */
+typedef void (*p2p_output_cb_t)(const char *txid_hex,
+                                 uint32_t vout_idx,
+                                 uint64_t amount_sats,
+                                 const unsigned char *spk,
+                                 size_t spk_len,
+                                 void *ctx);
+
+/*
+ * Per-input callback: fires for every input in every tx in a block.
+ * txid_hex: spending tx's txid (display order)
+ * prev_txid32: 32-byte internal-order txid of the UTXO being spent
+ * prev_vout: output index being spent
+ * ctx: caller context
+ */
+typedef void (*p2p_input_cb_t)(const char *txid_hex,
+                                const uint8_t prev_txid32[32],
+                                uint32_t prev_vout,
+                                void *ctx);
+
+/*
+ * Extended block scanner that fires per-output and per-input callbacks with
+ * full amount and prevout information.  Either callback may be NULL.
+ * Returns the number of transactions processed, or -1 on parse error.
+ */
+int p2p_scan_block_full(const uint8_t *block, size_t block_len,
+                         p2p_output_cb_t output_cb,
+                         p2p_input_cb_t input_cb,
+                         void *ctx);
+
 #endif /* SUPERSCALAR_P2P_BITCOIN_H */

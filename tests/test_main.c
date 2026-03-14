@@ -715,6 +715,12 @@ extern int test_fee_estimator_api_ttl(void);
 extern int test_wallet_source_stub(void);
 extern int test_ss_config_default(void);
 
+/* HD Wallet (wallet_source_hd_t) */
+extern int test_hd_wallet_derives_p2tr(void);
+extern int test_hd_wallet_sign_verify(void);
+extern int test_hd_wallet_utxo_persist(void);
+extern int test_p2p_scan_block_full_output(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -1364,6 +1370,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_fee_estimator_api_ttl);
     RUN_TEST(test_wallet_source_stub);
     RUN_TEST(test_ss_config_default);
+
+    printf("\n=== HD Wallet (wallet_source_hd_t) ===\n");
+    RUN_TEST(test_hd_wallet_derives_p2tr);
+    RUN_TEST(test_hd_wallet_sign_verify);
+    RUN_TEST(test_hd_wallet_utxo_persist);
+    RUN_TEST(test_p2p_scan_block_full_output);
 }
 
 extern int regtest_init_faucet(void);

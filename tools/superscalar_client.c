@@ -16,6 +16,7 @@
 #include "superscalar/bip39.h"
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
+#include "superscalar/wallet_source_hd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,54 @@ static void sigint_handler(int sig) {
 
 /* BIP 158 light client backend (global so it outlives main's stack frame) */
 static bip158_backend_t g_bip158_client;
+
+/* HD wallet — used when --light-client is active without a bitcoind wallet */
+static wallet_source_hd_t *g_hd_wallet_client = NULL;
+
+static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
+                                     secp256k1_context *ctx, const char *network)
+{
+    if (!wt || !ctx) return 0;
+
+    unsigned char seed[64];
+    size_t seed_len = 0;
+
+    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+        printf("Client: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
+    } else {
+        seed_len = 32;
+        FILE *rf = fopen("/dev/urandom", "rb");
+        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
+            if (rf) fclose(rf);
+            fprintf(stderr, "Client: HD wallet: /dev/urandom unavailable\n");
+            return 0;
+        }
+        fclose(rf);
+        if (db_ptr)
+            persist_save_hd_seed(db_ptr, seed, seed_len);
+        printf("Client: HD wallet: generated fresh seed (32 bytes)\n");
+    }
+
+    g_hd_wallet_client = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
+    if (!g_hd_wallet_client) return 0;
+
+    if (!wallet_source_hd_init(g_hd_wallet_client, seed, seed_len,
+                                ctx, db_ptr, &g_bip158_client, network)) {
+        fprintf(stderr, "Client: HD wallet: init failed\n");
+        free(g_hd_wallet_client);
+        g_hd_wallet_client = NULL;
+        return 0;
+    }
+
+    char spk_hex[69];
+    if (wallet_source_hd_get_address(g_hd_wallet_client, 0, spk_hex, sizeof(spk_hex)))
+        printf("Client: HD wallet address[0] SPK: %s\n"
+               "Client: HD wallet ready (%u addresses pre-derived)\n",
+               spk_hex, g_hd_wallet_client->n_spks);
+
+    watchtower_set_wallet(wt, &g_hd_wallet_client->base);
+    return 1;
+}
 
 /*
  * Initialise the BIP 158 backend, connect to the peer, restore checkpoint,
@@ -1928,6 +1977,9 @@ int main(int argc, char *argv[]) {
         /* Wire blocks estimator into backend for per-block samples */
         if (strcmp(fe_mode, "blocks") == 0)
             bip158_backend_set_fee_estimator(&g_bip158_client, client_fee_ptr);
+        /* Auto-attach HD wallet when running without bitcoind */
+        if (!rt_ok)
+            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network);
     }
 
     int ok;

@@ -112,6 +112,7 @@ add_library(superscalar
     src/fee_estimator_blocks.c
     src/fee_estimator_api.c
     src/wallet_source_rpc.c
+    src/wallet_source_hd.c
     src/superscalar_sdk.c
     src/watchtower.c
     src/crypto_aead.c
@@ -167,6 +168,7 @@ add_executable(test_superscalar
     tests/test_bip39.c
     tests/test_rate_limit.c
     tests/test_fee_estimator.c
+    tests/test_wallet_hd.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

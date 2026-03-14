@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 1
+#define PERSIST_SCHEMA_VERSION 2
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -414,5 +414,44 @@ int persist_save_flat_secrets(persist_t *p, uint32_t factory_id,
 size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
                                   unsigned char secrets_out[][32],
                                   size_t max_secrets);
+
+/* --- HD wallet UTXO tracking (schema v2) --- */
+
+/* Save (insert) a new unspent UTXO discovered by the HD wallet scanner. */
+int persist_save_hd_utxo(persist_t *p,
+                           const char *txid,   /* 64-char display-order hex */
+                           uint32_t vout,
+                           uint64_t amount_sats,
+                           uint32_t key_index);
+
+/* Mark a UTXO as spent (called when input scanner detects the spend). */
+int persist_mark_hd_utxo_spent(persist_t *p, const char *txid, uint32_t vout);
+
+/*
+ * Find the best unspent UTXO with amount >= min_sats.
+ * Returns 1 if found, 0 otherwise.
+ */
+int persist_get_hd_utxo(persist_t *p,
+                          uint64_t min_sats,
+                          char txid_out[65],
+                          uint32_t *vout_out,
+                          uint64_t *amount_out,
+                          uint32_t *key_index_out);
+
+/* Save / load the HD wallet's next unused address index. */
+int persist_save_hd_next_index(persist_t *p, uint32_t next_index);
+uint32_t persist_load_hd_next_index(persist_t *p);
+
+/*
+ * Save / load the HD wallet's BIP 32 seed (up to 64 bytes).
+ * The seed is stored as hex in the hd_wallet_state row (schema v2).
+ * If no seed row exists, persist_load_hd_seed returns 0; the caller
+ * should generate a fresh seed and save it.
+ */
+int persist_save_hd_seed(persist_t *p,
+                           const unsigned char *seed, size_t seed_len);
+int persist_load_hd_seed(persist_t *p,
+                           unsigned char *seed_out, size_t *seed_len_out,
+                           size_t seed_cap);
 
 #endif /* SUPERSCALAR_PERSIST_H */

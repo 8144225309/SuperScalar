@@ -741,6 +741,191 @@ int p2p_scan_block_txs(const uint8_t *block, size_t block_len,
     return processed;
 }
 
+int p2p_scan_block_full(const uint8_t *block, size_t block_len,
+                         p2p_output_cb_t output_cb,
+                         p2p_input_cb_t input_cb,
+                         void *ctx)
+{
+    if (!block || block_len < 81) return -1;
+    if (!output_cb && !input_cb) return 0;
+
+    const uint8_t *p   = block + 80;
+    size_t         rem = block_len - 80;
+
+    uint64_t tx_count; size_t vl;
+    if (!parse_varint_block(p, rem, &tx_count, &vl)) return -1;
+    p += vl; rem -= vl;
+
+    static const char hx[] = "0123456789abcdef";
+    int processed = 0;
+
+    for (uint64_t tx_i = 0; tx_i < tx_count; tx_i++) {
+        if (rem < 4) return -1;
+        const uint8_t *tx_start = p;
+        p += 4; rem -= 4;  /* version */
+
+        int segwit = (rem >= 2 && p[0] == 0x00 && p[1] == 0x01);
+        if (segwit) { p += 2; rem -= 2; }
+
+        const uint8_t *inputs_start = p;
+
+        /* --- Inputs --- */
+        uint64_t vin_count;
+        if (!parse_varint_block(p, rem, &vin_count, &vl)) return -1;
+        p += vl; rem -= vl;
+
+        /* Collect input prevouts for spending detection */
+        uint8_t  (*inp_txids)[32] = NULL;
+        uint32_t  *inp_vouts      = NULL;
+        if (input_cb && vin_count > 0 && vin_count <= 4096) {
+            inp_txids = (uint8_t (*)[32])malloc(vin_count * 32);
+            inp_vouts = (uint32_t *)malloc(vin_count * sizeof(uint32_t));
+        }
+
+        for (uint64_t i = 0; i < vin_count; i++) {
+            if (rem < 36) { free(inp_txids); free(inp_vouts); return -1; }
+            if (inp_txids) {
+                memcpy(inp_txids[i], p, 32);
+                inp_vouts[i] = (uint32_t)p[32] | ((uint32_t)p[33] << 8) |
+                               ((uint32_t)p[34] << 16) | ((uint32_t)p[35] << 24);
+            }
+            p += 36; rem -= 36;
+            uint64_t ss_len;
+            if (!parse_varint_block(p, rem, &ss_len, &vl)) {
+                free(inp_txids); free(inp_vouts); return -1;
+            }
+            if (rem < vl + ss_len) { free(inp_txids); free(inp_vouts); return -1; }
+            p += vl + ss_len; rem -= vl + ss_len;
+            if (rem < 4) { free(inp_txids); free(inp_vouts); return -1; }
+            p += 4; rem -= 4;
+        }
+        const uint8_t *inputs_end = p;
+
+        /* --- Outputs --- */
+        uint64_t vout_count;
+        if (!parse_varint_block(p, rem, &vout_count, &vl)) {
+            free(inp_txids); free(inp_vouts); return -1;
+        }
+        p += vl; rem -= vl;
+        if (vout_count > 4096) { free(inp_txids); free(inp_vouts); return -1; }
+
+        /* Collect output info for amount callback */
+        uint64_t  *out_amounts = NULL;
+        uint8_t  **out_spks    = NULL;
+        size_t    *out_spklens = NULL;
+        if (output_cb && vout_count > 0) {
+            out_amounts = (uint64_t *)malloc(vout_count * sizeof(uint64_t));
+            out_spks    = (uint8_t **)malloc(vout_count * sizeof(uint8_t *));
+            out_spklens = (size_t *)  malloc(vout_count * sizeof(size_t));
+            if (!out_amounts || !out_spks || !out_spklens) {
+                free(out_amounts); free(out_spks); free(out_spklens);
+                free(inp_txids);   free(inp_vouts);
+                return -1;
+            }
+        }
+
+        for (uint64_t i = 0; i < vout_count; i++) {
+            if (rem < 8) { free(out_amounts); free(out_spks); free(out_spklens);
+                           free(inp_txids); free(inp_vouts); return -1; }
+            uint64_t amt = (uint64_t)p[0] | ((uint64_t)p[1]<<8) | ((uint64_t)p[2]<<16) |
+                           ((uint64_t)p[3]<<24) | ((uint64_t)p[4]<<32) | ((uint64_t)p[5]<<40) |
+                           ((uint64_t)p[6]<<48) | ((uint64_t)p[7]<<56);
+            p += 8; rem -= 8;
+            uint64_t spk_len;
+            if (!parse_varint_block(p, rem, &spk_len, &vl)) {
+                free(out_amounts); free(out_spks); free(out_spklens);
+                free(inp_txids);   free(inp_vouts); return -1;
+            }
+            if (rem < vl + spk_len || spk_len > 10000) {
+                free(out_amounts); free(out_spks); free(out_spklens);
+                free(inp_txids);   free(inp_vouts); return -1;
+            }
+            p += vl; rem -= vl;
+            if (out_amounts) {
+                out_amounts[i] = amt;
+                out_spks[i]    = (uint8_t *)p;
+                out_spklens[i] = (size_t)spk_len;
+            }
+            p += spk_len; rem -= spk_len;
+        }
+        const uint8_t *outputs_end = p;
+
+        /* Skip witness */
+        if (segwit) {
+            for (uint64_t i = 0; i < vin_count; i++) {
+                uint64_t n_items;
+                if (!parse_varint_block(p, rem, &n_items, &vl)) {
+                    free(out_amounts); free(out_spks); free(out_spklens);
+                    free(inp_txids);   free(inp_vouts); return -1;
+                }
+                p += vl; rem -= vl;
+                for (uint64_t j = 0; j < n_items; j++) {
+                    uint64_t item_len;
+                    if (!parse_varint_block(p, rem, &item_len, &vl)) {
+                        free(out_amounts); free(out_spks); free(out_spklens);
+                        free(inp_txids);   free(inp_vouts); return -1;
+                    }
+                    if (rem < vl + item_len) {
+                        free(out_amounts); free(out_spks); free(out_spklens);
+                        free(inp_txids);   free(inp_vouts); return -1;
+                    }
+                    p += vl + item_len; rem -= vl + item_len;
+                }
+            }
+        }
+        if (rem < 4) { free(out_amounts); free(out_spks); free(out_spklens);
+                       free(inp_txids);   free(inp_vouts); return -1; }
+        p += 4; rem -= 4;  /* locktime */
+
+        /* Compute txid */
+        uint8_t txid[32];
+        if (!segwit) {
+            sha256_double(tx_start, (size_t)(p - tx_start), txid);
+        } else {
+            size_t io_len     = (size_t)(outputs_end - inputs_start);
+            size_t legacy_len = 4 + io_len + 4;
+            uint8_t *legacy   = (uint8_t *)malloc(legacy_len);
+            if (!legacy) {
+                free(out_amounts); free(out_spks); free(out_spklens);
+                free(inp_txids);   free(inp_vouts); return -1;
+            }
+            memcpy(legacy,              tx_start,     4);
+            memcpy(legacy + 4,          inputs_start, io_len);
+            memcpy(legacy + 4 + io_len, p - 4,        4);
+            sha256_double(legacy, legacy_len, txid);
+            free(legacy);
+        }
+
+        /* Display-order txid hex */
+        char txid_hex[65];
+        for (int k = 0; k < 32; k++) {
+            txid_hex[(31 - k) * 2]     = hx[(txid[k] >> 4) & 0xf];
+            txid_hex[(31 - k) * 2 + 1] = hx[ txid[k]       & 0xf];
+        }
+        txid_hex[64] = '\0';
+
+        /* Fire output callbacks */
+        if (output_cb && out_amounts) {
+            for (uint64_t i = 0; i < vout_count; i++)
+                output_cb(txid_hex, (uint32_t)i, out_amounts[i],
+                          out_spks[i], out_spklens[i], ctx);
+        }
+
+        /* Fire input callbacks */
+        if (input_cb && inp_txids) {
+            for (uint64_t i = 0; i < vin_count; i++)
+                input_cb(txid_hex, inp_txids[i], inp_vouts[i], ctx);
+        }
+
+        free(out_amounts); free(out_spks); free(out_spklens);
+        free(inp_txids);   free(inp_vouts);
+
+        (void)inputs_end;
+        processed++;
+    }
+    return processed;
+}
+
 /* -------------------------------------------------------------------------
  * Transaction broadcast
  * ------------------------------------------------------------------------- */

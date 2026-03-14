@@ -365,9 +365,32 @@ int persist_open(persist_t *p, const char *path) {
         return 0;
     }
 
-    /* Run migrations from db_version+1 to PERSIST_SCHEMA_VERSION.
-       Currently version 1 is the baseline — no migrations yet.
-       Future migrations go here as: if (db_version < 2) { ... } */
+    /* Run migrations from db_version+1 to PERSIST_SCHEMA_VERSION. */
+    if (db_version < 2) {
+        const char *sql_v2 =
+            "CREATE TABLE IF NOT EXISTS hd_utxos ("
+            "  txid TEXT NOT NULL,"
+            "  vout INTEGER NOT NULL,"
+            "  amount_sats INTEGER NOT NULL,"
+            "  key_index INTEGER NOT NULL,"
+            "  spent INTEGER NOT NULL DEFAULT 0,"
+            "  PRIMARY KEY (txid, vout)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS hd_wallet_state ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  next_index INTEGER NOT NULL DEFAULT 0,"
+            "  seed_hex TEXT"          /* 64–128 hex chars; NULL until first use */
+            ");";
+        char *merr = NULL;
+        if (sqlite3_exec(p->db, sql_v2, NULL, NULL, &merr) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v2 failed: %s\n",
+                    merr ? merr : "unknown");
+            sqlite3_free(merr);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
 
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
@@ -2693,6 +2716,162 @@ int persist_load_bip158_checkpoint(persist_t *p,
             int blen = sqlite3_column_bytes(stmt, 4);
             if (blob && blen > 0 && (size_t)blen <= filter_headers_cap)
                 memcpy(filter_headers_out, blob, (size_t)blen);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- HD wallet UTXO persistence --- */
+
+int persist_save_hd_utxo(persist_t *p,
+                           const char *txid,
+                           uint32_t vout,
+                           uint64_t amount_sats,
+                           uint32_t key_index)
+{
+    if (!p || !p->db || !txid) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR IGNORE INTO hd_utxos "
+            "(txid, vout, amount_sats, key_index, spent) VALUES (?,?,?,?,0);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text (stmt, 1, txid, -1, SQLITE_STATIC);
+    sqlite3_bind_int  (stmt, 2, (int)vout);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)amount_sats);
+    sqlite3_bind_int  (stmt, 4, (int)key_index);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_mark_hd_utxo_spent(persist_t *p, const char *txid, uint32_t vout)
+{
+    if (!p || !p->db || !txid) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE hd_utxos SET spent=1 WHERE txid=? AND vout=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, txid, -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 2, (int)vout);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_get_hd_utxo(persist_t *p,
+                          uint64_t min_sats,
+                          char txid_out[65],
+                          uint32_t *vout_out,
+                          uint64_t *amount_out,
+                          uint32_t *key_index_out)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid, vout, amount_sats, key_index FROM hd_utxos "
+            "WHERE spent=0 AND amount_sats>=? ORDER BY amount_sats ASC LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)min_sats);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *txid = (const char *)sqlite3_column_text(stmt, 0);
+        if (txid && txid_out) {
+            strncpy(txid_out, txid, 64);
+            txid_out[64] = '\0';
+        }
+        if (vout_out)      *vout_out      = (uint32_t)sqlite3_column_int(stmt, 1);
+        if (amount_out)    *amount_out    = (uint64_t)sqlite3_column_int64(stmt, 2);
+        if (key_index_out) *key_index_out = (uint32_t)sqlite3_column_int(stmt, 3);
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+int persist_save_hd_next_index(persist_t *p, uint32_t next_index)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO hd_wallet_state (id, next_index) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET next_index=excluded.next_index;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)next_index);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+uint32_t persist_load_hd_next_index(persist_t *p)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT next_index FROM hd_wallet_state WHERE id=1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    uint32_t val = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        val = (uint32_t)sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return val;
+}
+
+int persist_save_hd_seed(persist_t *p,
+                           const unsigned char *seed, size_t seed_len)
+{
+    if (!p || !p->db || !seed || seed_len == 0 || seed_len > 64) return 0;
+    /* Hex-encode the seed */
+    char hex[129];
+    static const char hx[] = "0123456789abcdef";
+    for (size_t i = 0; i < seed_len; i++) {
+        hex[i * 2]     = hx[(seed[i] >> 4) & 0xf];
+        hex[i * 2 + 1] = hx[ seed[i]       & 0xf];
+    }
+    hex[seed_len * 2] = '\0';
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO hd_wallet_state (id, next_index, seed_hex) VALUES (1, 0, ?) "
+            "ON CONFLICT(id) DO UPDATE SET seed_hex=excluded.seed_hex;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_STATIC);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_hd_seed(persist_t *p,
+                           unsigned char *seed_out, size_t *seed_len_out,
+                           size_t seed_cap)
+{
+    if (!p || !p->db || !seed_out || !seed_len_out) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT seed_hex FROM hd_wallet_state WHERE id=1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (hex) {
+            size_t hex_len = strlen(hex);
+            size_t byte_len = hex_len / 2;
+            if (byte_len > 0 && byte_len <= seed_cap) {
+                /* Inline hex decode */
+                for (size_t i = 0; i < byte_len; i++) {
+                    unsigned char hi = hex[i*2];
+                    unsigned char lo = hex[i*2+1];
+                    hi = (hi >= '0' && hi <= '9') ? hi - '0' :
+                         (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
+                         (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : 0;
+                    lo = (lo >= '0' && lo <= '9') ? lo - '0' :
+                         (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
+                         (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : 0;
+                    seed_out[i] = (hi << 4) | lo;
+                }
+                *seed_len_out = byte_len;
+                found = 1;
+            }
         }
     }
     sqlite3_finalize(stmt);

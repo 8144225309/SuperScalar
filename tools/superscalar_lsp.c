@@ -18,6 +18,7 @@
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/bip158_backend.h"
+#include "superscalar/wallet_source_hd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -489,6 +490,63 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
 /* Static backend — bip158_backend_t contains two 64 KB ring buffers;
  * too large for the stack of main(). */
 static bip158_backend_t g_bip158;
+
+/* HD wallet — used when --light-client is active without a bitcoind wallet.
+ * Heap-allocated so the 100 × 34-byte SPK cache doesn't bloat the stack. */
+static wallet_source_hd_t *g_hd_wallet = NULL;
+
+/*
+ * Initialise an in-process HD wallet and attach it to the watchtower.
+ * Loads an existing seed from the DB, or generates and persists a fresh one.
+ * Called after attach_light_client() when no bitcoind RPC is available.
+ */
+static int attach_hd_wallet(watchtower_t *wt, persist_t *db_ptr,
+                              secp256k1_context *ctx, const char *network)
+{
+    if (!wt || !ctx) return 0;
+
+    unsigned char seed[64];
+    size_t seed_len = 0;
+
+    /* Try to load existing seed from DB */
+    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+        printf("LSP: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
+    } else {
+        /* Generate a fresh 32-byte seed */
+        seed_len = 32;
+        FILE *rf = fopen("/dev/urandom", "rb");
+        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
+            if (rf) fclose(rf);
+            fprintf(stderr, "LSP: HD wallet: /dev/urandom unavailable\n");
+            return 0;
+        }
+        fclose(rf);
+        if (db_ptr)
+            persist_save_hd_seed(db_ptr, seed, seed_len);
+        printf("LSP: HD wallet: generated fresh seed (32 bytes)\n");
+    }
+
+    g_hd_wallet = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
+    if (!g_hd_wallet) return 0;
+
+    if (!wallet_source_hd_init(g_hd_wallet, seed, seed_len,
+                                ctx, db_ptr, &g_bip158, network)) {
+        fprintf(stderr, "LSP: HD wallet: init failed\n");
+        free(g_hd_wallet);
+        g_hd_wallet = NULL;
+        return 0;
+    }
+
+    /* Print the first address for funding */
+    char spk_hex[69];
+    if (wallet_source_hd_get_address(g_hd_wallet, 0, spk_hex, sizeof(spk_hex)))
+        printf("LSP: HD wallet address[0] SPK: %s\n"
+               "LSP: HD wallet ready (%u addresses pre-derived)\n",
+               spk_hex, g_hd_wallet->n_spks);
+
+    watchtower_set_wallet(wt, &g_hd_wallet->base);
+    return 1;
+}
 
 /*
  * Parse a "host:port" string into separate host / port components.
@@ -1420,10 +1478,13 @@ int main(int argc, char *argv[]) {
             for (size_t c = 0; c < mgr->n_channels; c++)
                 watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
             mgr->watchtower = &rec_wt;
-            if (light_client_arg)
+            if (light_client_arg) {
                 attach_light_client(&rec_wt, use_db ? &db : NULL,
                                     light_client_arg, network,
                                     lc_fallbacks, n_lc_fallbacks, fee_est);
+                if (!rt_ok)
+                    attach_hd_wallet(&rec_wt, use_db ? &db : NULL, ctx, network);
+            }
 
             /* Initialize ladder */
             ladder_t rec_lad;
@@ -2181,10 +2242,13 @@ int main(int argc, char *argv[]) {
         for (size_t c = 0; c < mgr->n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
         mgr->watchtower = &wt;
-        if (light_client_arg)
+        if (light_client_arg) {
             attach_light_client(&wt, use_db ? &db : NULL,
                                  light_client_arg, network,
                                  lc_fallbacks, n_lc_fallbacks, fee_est);
+            if (!rt_ok)
+                attach_hd_wallet(&wt, use_db ? &db : NULL, ctx, network);
+        }
 
         /* Wire ladder into channel manager (Tier 2) */
         mgr->ladder = lad;
