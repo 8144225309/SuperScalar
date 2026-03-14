@@ -75,9 +75,28 @@ typedef struct {
     uint32_t fee_ppm;
 } lsps1_info_t;
 
+/*
+ * In-memory order record stored by lsps1.create_order and retrieved by
+ * lsps1.get_order.  The order registry is module-internal; these fields
+ * mirror what the wire responses expose.
+ */
+typedef struct {
+    int      order_id;
+    uint64_t amount_msat;
+    uint32_t confs;
+    char     state[16];   /* "CREATED", "COMPLETED", … */
+} lsps1_order_t;
+
 cJSON *lsps1_build_get_info_response(const lsps1_info_t *info);
 int    lsps1_parse_create_order(const cJSON *params,
                                   uint64_t *amount_msat, uint32_t *confs);
+
+/*
+ * Parse a lsps1.get_order params object.
+ * Accepts "order_id" as either a JSON number or a decimal string.
+ * Returns 1 on success, 0 on failure.
+ */
+int    lsps1_parse_get_order(const cJSON *params, int *order_id_out);
 
 /* -----------------------------------------------------------------------
  * LSPS2 — JIT channel API

@@ -2,6 +2,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wire.h"
+#include <secp256k1.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,5 +209,50 @@ int test_splice_state_machine(void)
     ASSERT(ch.channel_quiescent == 0, "quiescence cleared after splice complete");
     ASSERT(ch.funding_amount == 750000, "funding_amount updated to new value");
 
+    return 1;
+}
+
+/* Test G9: splice_compute_funding_spk — MuSig2 aggregate key produces valid P2TR SPK */
+int test_splice_musig_funding_spk(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx != NULL, "secp256k1 context created");
+
+    /* Derive two deterministic keypairs from fixed seeds */
+    unsigned char seckey_a[32], seckey_b[32];
+    memset(seckey_a, 0x11, 32);
+    memset(seckey_b, 0x22, 32);
+
+    secp256k1_pubkey pubkey_a, pubkey_b;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pubkey_a, seckey_a), "pubkey_a created");
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pubkey_b, seckey_b), "pubkey_b created");
+
+    /* Compute the 2-of-2 P2TR funding SPK */
+    unsigned char spk[34];
+    ASSERT(splice_compute_funding_spk(ctx, spk, &pubkey_a, &pubkey_b),
+           "splice_compute_funding_spk succeeds");
+
+    /* OP_1 (0x51) followed by 32 bytes (0x20 push) */
+    ASSERT(spk[0] == 0x51, "SPK starts with OP_1");
+    ASSERT(spk[1] == 0x20, "SPK has 32-byte push");
+
+    /* Key-path SPK must differ from either individual key's P2TR */
+    unsigned char spk_a_only[34], spk_b_only[34];
+    secp256k1_xonly_pubkey xonly_a, xonly_b;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly_a, NULL, &pubkey_a);
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly_b, NULL, &pubkey_b);
+    build_p2tr_script_pubkey(spk_a_only, &xonly_a);
+    build_p2tr_script_pubkey(spk_b_only, &xonly_b);
+    ASSERT(memcmp(spk, spk_a_only, 34) != 0, "aggregate SPK != single-key-a SPK");
+    ASSERT(memcmp(spk, spk_b_only, 34) != 0, "aggregate SPK != single-key-b SPK");
+
+    /* Deterministic: same inputs → same SPK */
+    unsigned char spk2[34];
+    ASSERT(splice_compute_funding_spk(ctx, spk2, &pubkey_a, &pubkey_b),
+           "second compute succeeds");
+    ASSERT(memcmp(spk, spk2, 34) == 0, "splice_compute_funding_spk is deterministic");
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }

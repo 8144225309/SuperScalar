@@ -6,6 +6,25 @@
 #include <stdlib.h>
 
 /* -----------------------------------------------------------------------
+ * LSPS1 in-memory order registry
+ * Supports up to 64 concurrent orders.  IDs are monotonically increasing
+ * integers starting at 1.  Represented as decimal strings on the wire per
+ * the LSPS1 spec.
+ * --------------------------------------------------------------------- */
+#define LSPS1_MAX_ORDERS 64
+
+typedef struct {
+    int      order_id;
+    uint64_t amount_msat;
+    uint32_t confs;
+    char     state[16];
+    int      active;
+} lsps1_order_entry_t;
+
+static lsps1_order_entry_t s_orders[LSPS1_MAX_ORDERS];
+static int s_order_next_id = 1;
+
+/* -----------------------------------------------------------------------
  * LSPS0 — JSON-RPC 2.0 dispatch
  * --------------------------------------------------------------------- */
 
@@ -74,13 +93,63 @@ int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
         if (!params || !lsps1_parse_create_order(params, &amount_msat, &confs)) {
             response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "invalid params");
         } else {
-            cJSON *result = cJSON_CreateObject();
-            if (!result) {
-                response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "oom");
+            /* Find a free slot in the registry */
+            int slot = -1;
+            for (int i = 0; i < LSPS1_MAX_ORDERS; i++) {
+                if (!s_orders[i].active) { slot = i; break; }
+            }
+            if (slot < 0) {
+                response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "order table full");
             } else {
-                cJSON_AddStringToObject(result, "order_state", "CREATED");
-                cJSON_AddNumberToObject(result, "amount_msat", (double)amount_msat);
-                response = lsps_build_response(req_id, result);
+                int oid = s_order_next_id++;
+                s_orders[slot].order_id   = oid;
+                s_orders[slot].amount_msat = amount_msat;
+                s_orders[slot].confs       = confs;
+                strncpy(s_orders[slot].state, "CREATED", sizeof(s_orders[slot].state) - 1);
+                s_orders[slot].active      = 1;
+
+                cJSON *result = cJSON_CreateObject();
+                if (!result) {
+                    response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "oom");
+                } else {
+                    char id_buf[16];
+                    snprintf(id_buf, sizeof(id_buf), "%d", oid);
+                    cJSON_AddStringToObject(result, "order_id", id_buf);
+                    cJSON_AddStringToObject(result, "order_state", "CREATED");
+                    cJSON_AddNumberToObject(result, "amount_msat", (double)amount_msat);
+                    cJSON_AddNumberToObject(result, "confirms_within_blocks", (double)confs);
+                    response = lsps_build_response(req_id, result);
+                }
+            }
+        }
+    } else if (strcmp(method, "lsps1.get_order") == 0) {
+        const cJSON *params = cJSON_GetObjectItemCaseSensitive(json, "params");
+        int order_id = 0;
+        if (!params || !lsps1_parse_get_order(params, &order_id)) {
+            response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "invalid params");
+        } else {
+            lsps1_order_entry_t *entry = NULL;
+            for (int i = 0; i < LSPS1_MAX_ORDERS; i++) {
+                if (s_orders[i].active && s_orders[i].order_id == order_id) {
+                    entry = &s_orders[i];
+                    break;
+                }
+            }
+            if (!entry) {
+                response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "order not found");
+            } else {
+                cJSON *result = cJSON_CreateObject();
+                if (!result) {
+                    response = lsps_build_error(req_id, LSPS_ERR_INTERNAL_ERROR, "oom");
+                } else {
+                    char id_buf[16];
+                    snprintf(id_buf, sizeof(id_buf), "%d", entry->order_id);
+                    cJSON_AddStringToObject(result, "order_id", id_buf);
+                    cJSON_AddStringToObject(result, "order_state", entry->state);
+                    cJSON_AddNumberToObject(result, "amount_msat", (double)entry->amount_msat);
+                    cJSON_AddNumberToObject(result, "confirms_within_blocks", (double)entry->confs);
+                    response = lsps_build_response(req_id, result);
+                }
             }
         }
     } else if (strcmp(method, "lsps2.get_info") == 0) {
@@ -160,6 +229,24 @@ int lsps1_parse_create_order(const cJSON *params,
     const cJSON *c = cJSON_GetObjectItemCaseSensitive(params, "confirms_within_blocks");
     *confs = (c && cJSON_IsNumber(c)) ? (uint32_t)c->valuedouble : 1;
     return 1;
+}
+
+int lsps1_parse_get_order(const cJSON *params, int *order_id_out)
+{
+    if (!params || !cJSON_IsObject(params) || !order_id_out) return 0;
+    const cJSON *oid = cJSON_GetObjectItemCaseSensitive(params, "order_id");
+    if (!oid) return 0;
+    if (cJSON_IsNumber(oid)) {
+        *order_id_out = (int)oid->valuedouble;
+        return 1;
+    }
+    if (cJSON_IsString(oid) && oid->valuestring) {
+        int parsed = atoi(oid->valuestring);
+        if (parsed <= 0) return 0;
+        *order_id_out = parsed;
+        return 1;
+    }
+    return 0;
 }
 
 /* -----------------------------------------------------------------------
