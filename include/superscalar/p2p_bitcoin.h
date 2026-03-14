@@ -339,12 +339,14 @@ int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
 /*
  * Like p2p_recv_headers but validates PoW for each header inline.
  * If nbits_out is non-NULL, fills nbits_out[i] with nBits of hashes_out[i].
+ * If timestamps_out is non-NULL, fills timestamps_out[i] with nTime (bytes 68-71 LE)
+ * of hashes_out[i].
  * On PoW failure: closes conn, returns -1.
  * On success: returns number of headers (0 if peer at tip).
  */
 int p2p_recv_headers_pow(p2p_conn_t *conn,
                           uint8_t (*hashes_out)[32], size_t max_headers,
-                          uint32_t *nbits_out);
+                          uint32_t *nbits_out, uint32_t *timestamps_out);
 
 /*
  * Like p2p_connect() but uses a non-blocking connect() with timeout_ms
