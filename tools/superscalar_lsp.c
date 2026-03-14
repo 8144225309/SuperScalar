@@ -1687,8 +1687,8 @@ int main(int argc, char *argv[]) {
         if (cltv_timeout_arg > 0) {
             cltv_timeout = (uint32_t)cltv_timeout_arg;
         } else if (cur_height > 0) {
-            /* Auto: regtest +35 blocks, non-regtest +1008 (~1 week) */
-            int offset = is_regtest ? 35 : 1008;
+            /* Auto: regtest +35 blocks, non-regtest = factory lifetime + 10 block buffer */
+            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
             cltv_timeout = (uint32_t)cur_height + offset;
         }
     }
@@ -2550,7 +2550,7 @@ int main(int argc, char *argv[]) {
                         if (cltv_timeout_arg > 0) {
                             exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
                         } else if (cur_h > 0) {
-                            int offset = is_regtest ? 35 : 1008;
+                            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
                             exh_f1->cltv_timeout = (uint32_t)cur_h + offset;
                         }
 
@@ -2584,7 +2584,7 @@ int main(int argc, char *argv[]) {
                                     {
                                         int cur_h2 = regtest_get_block_height(&rt);
                                         if (cltv_timeout_arg > 0) exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
-                                        else if (cur_h2 > 0) exh_f1->cltv_timeout = (uint32_t)cur_h2 + (is_regtest ? 35 : 1008);
+                                        else if (cur_h2 > 0) exh_f1->cltv_timeout = (uint32_t)cur_h2 + (uint32_t)(is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10));
                                     }
                                     factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34);
                                     factory_build_tree(exh_f1);
@@ -2951,7 +2951,7 @@ int main(int argc, char *argv[]) {
                 if (cltv_timeout_arg > 0) {
                     f1.cltv_timeout = (uint32_t)cltv_timeout_arg;
                 } else if (cur_h > 0) {
-                    int offset = is_regtest ? 35 : 1008;
+                    int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
                     f1.cltv_timeout = (uint32_t)cur_h + offset;
                 }
             }
@@ -4921,7 +4921,7 @@ int main(int argc, char *argv[]) {
             if (cltv_timeout_arg > 0) {
                 cltv2 = (uint32_t)cltv_timeout_arg;
             } else if (cur_h > 0) {
-                int offset = is_regtest ? 35 : 1008;
+                int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
                 cltv2 = (uint32_t)cur_h + offset;
             }
         }
