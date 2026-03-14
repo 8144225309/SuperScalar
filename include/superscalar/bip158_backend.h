@@ -37,6 +37,7 @@
 /* Capacity limits */
 #define BIP158_MAX_SCRIPTS     512   /* watched scriptPubKeys             */
 #define BIP158_TX_CACHE_SIZE   256   /* confirmed tx entries              */
+#define BIP158_MAX_PEERS         8   /* maximum P2P peer connections      */
 
 /* Header ring buffer: one difficulty-adjustment window of block hashes.
    Indexed by (height % BIP158_HEADER_WINDOW) — wraps safely for long chains. */
@@ -83,6 +84,10 @@ typedef struct {
     uint8_t          filter_headers[BIP158_HEADER_WINDOW][32];
     int32_t          filter_headers_synced;
 
+    /* nBits ring buffer — populated by bip158_sync_headers() alongside header_hashes.
+       Used for difficulty-transition validation at 2016-block retarget boundaries. */
+    uint32_t         nBits_ring[BIP158_HEADER_WINDOW];
+
     /* Network ("mainnet", "signet", "testnet") */
     char             network[16];
 
@@ -93,14 +98,15 @@ typedef struct {
        Set by bip158_backend_set_db(); not owned — caller manages lifetime. */
     void            *db;
 
-    /* P2P peer connection.  p2p.fd == -1 when not connected.
+    /* P2P peer connections.  peers[i].fd == -1 when not connected.
        Set by bip158_backend_connect_p2p(); closed by bip158_backend_free(). */
-    p2p_conn_t       p2p;
+    p2p_conn_t       peers[BIP158_MAX_PEERS]; /* All configured peer connections */
+    int              peer_connected[BIP158_MAX_PEERS]; /* 1 if connected */
+    int              n_connected;            /* number currently connected */
 
     /* Peer rotation (Phase 6): up to BIP158_MAX_PEERS peers tried in round-robin
        order when a connection drops.  Populated by bip158_backend_connect_p2p()
        (sets slot 0) and bip158_backend_add_peer() (appends further slots). */
-#define BIP158_MAX_PEERS 8
     char             peer_hosts[BIP158_MAX_PEERS][256];
     int              peer_ports[BIP158_MAX_PEERS];
     int              n_peers;        /* number of configured peers (>= 1 when connected) */
@@ -253,6 +259,13 @@ void bip158_backend_add_peer(bip158_backend_t *backend,
  * also available for manual use by callers.
  */
 int bip158_backend_reconnect(bip158_backend_t *backend);
+
+/*
+ * Attempt to connect to up to min(n_peers, 3) configured peers concurrently.
+ * Updates peer_connected[] and n_connected.
+ * Returns the number of peers successfully connected (>= 1 means usable).
+ */
+int bip158_backend_connect_all(bip158_backend_t *backend);
 
 /*
  * Restore tip_height, headers_synced, filter_headers_synced, and both ring

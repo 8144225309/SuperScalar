@@ -506,41 +506,68 @@ static wallet_source_hd_t *g_hd_wallet = NULL;
  * Called after attach_light_client() when no bitcoind RPC is available.
  */
 static int attach_hd_wallet(watchtower_t *wt, persist_t *db_ptr,
-                              secp256k1_context *ctx, const char *network)
+                              secp256k1_context *ctx, const char *network,
+                              const char *hd_mnemonic,
+                              const char *hd_passphrase,
+                              uint32_t lookahead)
 {
     if (!wt || !ctx) return 0;
 
     unsigned char seed[64];
-    size_t seed_len = 0;
+    size_t seed_len = 64;
 
-    /* Try to load existing seed from DB */
-    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+    /* 1. If seed exists in DB AND no hd_mnemonic override: load and use */
+    if (!hd_mnemonic && db_ptr &&
+        persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
         printf("LSP: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
-    } else {
-        /* Generate a fresh 32-byte seed */
-        seed_len = 32;
-        FILE *rf = fopen("/dev/urandom", "rb");
-        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
-            if (rf) fclose(rf);
-            fprintf(stderr, "LSP: HD wallet: /dev/urandom unavailable\n");
+    } else if (hd_mnemonic) {
+        /* 2. Derive seed from provided mnemonic */
+        if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "LSP: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
             return 0;
         }
-        fclose(rf);
-        if (db_ptr)
-            persist_save_hd_seed(db_ptr, seed, seed_len);
-        printf("LSP: HD wallet: generated fresh seed (32 bytes)\n");
+        seed_len = 64;
+        printf("LSP: HD wallet: derived seed from provided mnemonic\n");
+    } else {
+        /* 3. First run: generate a BIP 39 24-word phrase */
+        char mnemonic_buf[300];
+        if (!bip39_generate(24, mnemonic_buf, sizeof(mnemonic_buf))) {
+            fprintf(stderr, "LSP: HD wallet: bip39_generate failed\n");
+            return 0;
+        }
+        printf("=== WRITE THIS DOWN: YOUR 24-WORD RECOVERY PHRASE ===\n%s\n"
+               "=== KEEP THIS SAFE — LOSING IT MEANS LOSING FUNDS ===\n",
+               mnemonic_buf);
+        if (!bip39_mnemonic_to_seed(mnemonic_buf, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "LSP: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
+            return 0;
+        }
+        seed_len = 64;
+    }
+
+    /* Save seed and lookahead to DB */
+    if (db_ptr) {
+        persist_save_hd_seed(db_ptr, seed, seed_len);
+        persist_save_hd_lookahead(db_ptr, lookahead);
     }
 
     g_hd_wallet = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
-    if (!g_hd_wallet) return 0;
+    if (!g_hd_wallet) {
+        memset(seed, 0, sizeof(seed));
+        return 0;
+    }
 
-    if (!wallet_source_hd_init(g_hd_wallet, seed, seed_len,
-                                ctx, db_ptr, &g_bip158, network)) {
+    if (!wallet_source_hd_init(g_hd_wallet, seed, 64,
+                                ctx, db_ptr, &g_bip158, network, lookahead)) {
         fprintf(stderr, "LSP: HD wallet: init failed\n");
         free(g_hd_wallet);
         g_hd_wallet = NULL;
+        memset(seed, 0, sizeof(seed));
         return 0;
     }
+    memset(seed, 0, sizeof(seed));
 
     /* Print the first address for funding */
     char spk_hex[69];
@@ -631,7 +658,8 @@ static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
         }
     }
     printf("LSP: BIP 158 P2P peer connected (version %u, height %d)\n",
-           g_bip158.p2p.peer_version, g_bip158.p2p.peer_start_height);
+           g_bip158.peers[g_bip158.current_peer].peer_version,
+           g_bip158.peers[g_bip158.current_peer].peer_start_height);
 
     /* Wire fee estimator if provided (enables per-block fee samples) */
     if (fee_est)
@@ -732,6 +760,9 @@ int main(int argc, char *argv[]) {
     int generate_mnemonic = 0;
     const char *from_mnemonic = NULL;
     const char *mnemonic_passphrase = "";
+    const char *hd_mnemonic = NULL;
+    const char *hd_passphrase = "";
+    uint32_t hd_lookahead = HD_WALLET_LOOKAHEAD;
     int fee_bump_after = 6;       /* blocks before first bump */
     int fee_bump_max = 3;         /* max bump attempts */
     double fee_bump_multiplier = 1.5;
@@ -977,6 +1008,12 @@ int main(int argc, char *argv[]) {
             else { fprintf(stderr, "Warning: too many --light-client-fallback peers (max %d)\n",
                            (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0]))); i++; }
         }
+        else if (strcmp(argv[i], "--hd-mnemonic") == 0 && i + 1 < argc)
+            hd_mnemonic = argv[++i];
+        else if (strcmp(argv[i], "--hd-passphrase") == 0 && i + 1 < argc)
+            hd_passphrase = argv[++i];
+        else if (strcmp(argv[i], "--hd-lookahead") == 0 && i + 1 < argc)
+            hd_lookahead = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1512,7 +1549,8 @@ int main(int argc, char *argv[]) {
                                     light_client_arg, network,
                                     lc_fallbacks, n_lc_fallbacks, fee_est);
                 if (!rt_ok)
-                    attach_hd_wallet(&rec_wt, use_db ? &db : NULL, ctx, network);
+                    attach_hd_wallet(&rec_wt, use_db ? &db : NULL, ctx, network,
+                                     hd_mnemonic, hd_passphrase, hd_lookahead);
             }
 
             /* Initialize ladder */
@@ -2293,7 +2331,8 @@ int main(int argc, char *argv[]) {
                                  light_client_arg, network,
                                  lc_fallbacks, n_lc_fallbacks, fee_est);
             if (!rt_ok)
-                attach_hd_wallet(&wt, use_db ? &db : NULL, ctx, network);
+                attach_hd_wallet(&wt, use_db ? &db : NULL, ctx, network,
+                                 hd_mnemonic, hd_passphrase, hd_lookahead);
         }
 
         /* Wire ladder into channel manager (Tier 2) */

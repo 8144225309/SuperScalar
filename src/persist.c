@@ -414,6 +414,11 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* Migrate: add lookahead column if missing (silently ignore error) */
+    sqlite3_exec(p->db,
+        "ALTER TABLE hd_wallet_state ADD COLUMN lookahead INTEGER DEFAULT 100;",
+        NULL, NULL, NULL);
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -2898,4 +2903,34 @@ int persist_load_hd_seed(persist_t *p,
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+int persist_save_hd_lookahead(persist_t *p, uint32_t lookahead)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO hd_wallet_state (id, next_index, lookahead) VALUES (1, 0, ?) "
+            "ON CONFLICT(id) DO UPDATE SET lookahead=excluded.lookahead;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)lookahead);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+uint32_t persist_load_hd_lookahead(persist_t *p)
+{
+    if (!p || !p->db) return 100; /* default: HD_WALLET_LOOKAHEAD */
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT lookahead FROM hd_wallet_state WHERE id=1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 100;
+    uint32_t val = 100; /* default: HD_WALLET_LOOKAHEAD */
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int col = sqlite3_column_int(stmt, 0);
+        if (col > 0) val = (uint32_t)col;
+    }
+    sqlite3_finalize(stmt);
+    return val;
 }

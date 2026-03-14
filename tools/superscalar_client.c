@@ -42,39 +42,68 @@ static bip158_backend_t g_bip158_client;
 static wallet_source_hd_t *g_hd_wallet_client = NULL;
 
 static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
-                                     secp256k1_context *ctx, const char *network)
+                                     secp256k1_context *ctx, const char *network,
+                                     const char *hd_mnemonic,
+                                     const char *hd_passphrase,
+                                     uint32_t lookahead)
 {
     if (!wt || !ctx) return 0;
 
     unsigned char seed[64];
-    size_t seed_len = 0;
+    size_t seed_len = 64;
 
-    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+    /* 1. If seed exists in DB AND no hd_mnemonic override: load and use */
+    if (!hd_mnemonic && db_ptr &&
+        persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
         printf("Client: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
-    } else {
-        seed_len = 32;
-        FILE *rf = fopen("/dev/urandom", "rb");
-        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
-            if (rf) fclose(rf);
-            fprintf(stderr, "Client: HD wallet: /dev/urandom unavailable\n");
+    } else if (hd_mnemonic) {
+        /* 2. Derive seed from provided mnemonic */
+        if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
             return 0;
         }
-        fclose(rf);
-        if (db_ptr)
-            persist_save_hd_seed(db_ptr, seed, seed_len);
-        printf("Client: HD wallet: generated fresh seed (32 bytes)\n");
+        seed_len = 64;
+        printf("Client: HD wallet: derived seed from provided mnemonic\n");
+    } else {
+        /* 3. First run: generate a BIP 39 24-word phrase */
+        char mnemonic_buf[300];
+        if (!bip39_generate(24, mnemonic_buf, sizeof(mnemonic_buf))) {
+            fprintf(stderr, "Client: HD wallet: bip39_generate failed\n");
+            return 0;
+        }
+        printf("=== WRITE THIS DOWN: YOUR 24-WORD RECOVERY PHRASE ===\n%s\n"
+               "=== KEEP THIS SAFE — LOSING IT MEANS LOSING FUNDS ===\n",
+               mnemonic_buf);
+        if (!bip39_mnemonic_to_seed(mnemonic_buf, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
+            return 0;
+        }
+        seed_len = 64;
+    }
+
+    /* Save seed and lookahead to DB */
+    if (db_ptr) {
+        persist_save_hd_seed(db_ptr, seed, seed_len);
+        persist_save_hd_lookahead(db_ptr, lookahead);
     }
 
     g_hd_wallet_client = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
-    if (!g_hd_wallet_client) return 0;
+    if (!g_hd_wallet_client) {
+        memset(seed, 0, sizeof(seed));
+        return 0;
+    }
 
-    if (!wallet_source_hd_init(g_hd_wallet_client, seed, seed_len,
-                                ctx, db_ptr, &g_bip158_client, network)) {
+    if (!wallet_source_hd_init(g_hd_wallet_client, seed, 64,
+                                ctx, db_ptr, &g_bip158_client, network, lookahead)) {
         fprintf(stderr, "Client: HD wallet: init failed\n");
         free(g_hd_wallet_client);
         g_hd_wallet_client = NULL;
+        memset(seed, 0, sizeof(seed));
         return 0;
     }
+    memset(seed, 0, sizeof(seed));
 
     char spk_hex[69];
     if (wallet_source_hd_get_address(g_hd_wallet_client, 0, spk_hex, sizeof(spk_hex)))
@@ -142,8 +171,8 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
         }
     }
     printf("Client: BIP 158 P2P peer connected (version %u, height %d)\n",
-           g_bip158_client.p2p.peer_version,
-           g_bip158_client.p2p.peer_start_height);
+           g_bip158_client.peers[g_bip158_client.current_peer].peer_version,
+           g_bip158_client.peers[g_bip158_client.current_peer].peer_start_height);
 
     watchtower_set_chain_backend(wt, &g_bip158_client.base);
     return 1;
@@ -1604,6 +1633,9 @@ int main(int argc, char *argv[]) {
     int generate_mnemonic = 0;
     const char *from_mnemonic = NULL;
     const char *mnemonic_passphrase = "";
+    const char *hd_mnemonic = NULL;
+    const char *hd_passphrase = "";
+    uint32_t hd_lookahead = HD_WALLET_LOOKAHEAD;
     const char *light_client_arg = NULL;
     const char *fee_estimator_arg = NULL;
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
@@ -1654,6 +1686,12 @@ int main(int argc, char *argv[]) {
             else { fprintf(stderr, "Warning: too many --light-client-fallback peers (max %d)\n",
                            (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0]))); i++; }
         }
+        else if (strcmp(argv[i], "--hd-mnemonic") == 0 && i + 1 < argc)
+            hd_mnemonic = argv[++i];
+        else if (strcmp(argv[i], "--hd-passphrase") == 0 && i + 1 < argc)
+            hd_passphrase = argv[++i];
+        else if (strcmp(argv[i], "--hd-lookahead") == 0 && i + 1 < argc)
+            hd_lookahead = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
@@ -1992,7 +2030,8 @@ int main(int argc, char *argv[]) {
             bip158_backend_set_fee_estimator(&g_bip158_client, client_fee_ptr);
         /* Auto-attach HD wallet when running without bitcoind */
         if (!rt_ok)
-            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network);
+            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network,
+                                    hd_mnemonic, hd_passphrase, hd_lookahead);
     }
 
     int ok;
