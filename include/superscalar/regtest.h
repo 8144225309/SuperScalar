@@ -27,6 +27,35 @@ int   regtest_init_full(regtest_t *rt, const char *network,
                         int rpcport);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
 int   regtest_get_block_height(regtest_t *rt);
+
+/* Get the block hash at a given height. Writes 64 hex chars + NUL to hash_out.
+   Returns 1 on success, 0 on error. */
+int   regtest_get_block_hash(regtest_t *rt, int height,
+                              char *hash_out, size_t hash_out_len);
+
+/* Get the BIP 158 basic compact block filter for a block.
+   Requires bitcoind to be running with -blockfilterindex=1.
+   filter_hex_out: caller-allocated buffer of at least filter_hex_max bytes.
+   key_out: 16-byte buffer; receives the SipHash key (first 16 bytes of the
+            block hash in internal byte order).
+   Returns 1 on success, 0 on error. */
+int   regtest_get_block_filter(regtest_t *rt, const char *block_hash,
+                                unsigned char *filter_bytes_out,
+                                size_t        *filter_len_out,
+                                size_t         filter_max,
+                                unsigned char  key_out[16]);
+
+/* Fetch all txids in a block and for each transaction call:
+   callback(txid_hex, n_outputs, spks, spk_lens, ctx)
+   where spks[i] / spk_lens[i] are the scriptPubKeys of each output.
+   Returns the number of transactions processed, -1 on error. */
+typedef void (*regtest_tx_callback_t)(const char *txid_hex,
+                                       size_t n_outputs,
+                                       const unsigned char **spks,
+                                       const size_t *spk_lens,
+                                       void *ctx);
+int   regtest_scan_block_txs(regtest_t *rt, const char *block_hash,
+                              regtest_tx_callback_t callback, void *ctx);
 int   regtest_create_wallet(regtest_t *rt, const char *name);
 int   regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len);
 int   regtest_get_address_scriptpubkey(regtest_t *rt, const char *address,

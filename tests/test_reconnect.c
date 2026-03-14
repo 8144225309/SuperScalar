@@ -554,28 +554,27 @@ int test_balance_reporting(void) {
 
 /* Test 8: fee_init and fee_estimate basics */
 int test_fee_init_default(void) {
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);  /* 1 sat/vB */
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
 
-    TEST_ASSERT_EQ(fe.fee_rate_sat_per_kvb, 1000, "default rate");
-    TEST_ASSERT_EQ(fe.use_estimatesmartfee, 0, "no RPC by default");
+    TEST_ASSERT_EQ(fe.sat_per_kvb, 1000, "default rate");
 
     /* 200 vB tx at 1 sat/vB = 200 sats */
-    uint64_t fee = fee_estimate(&fe, 200);
+    uint64_t fee = fee_estimate((fee_estimator_t *)&fe, 200);
     TEST_ASSERT_EQ(fee, 200, "200 vB at 1 sat/vB");
 
     /* 100 vB tx at 2 sat/vB (2000 sat/kvB) */
-    fee_estimator_t fe2;
-    fee_init(&fe2, 2000);
-    fee = fee_estimate(&fe2, 100);
+    fee_estimator_static_t fe2;
+    fee_estimator_static_init(&fe2, 2000);
+    fee = fee_estimate((fee_estimator_t *)&fe2, 100);
     TEST_ASSERT_EQ(fee, 200, "100 vB at 2 sat/vB");
 
     /* Rounding: 150 vB at 1 sat/vB = ceil(150000/1000) = 150 */
-    fee = fee_estimate(&fe, 150);
+    fee = fee_estimate((fee_estimator_t *)&fe, 150);
     TEST_ASSERT_EQ(fee, 150, "150 vB at 1 sat/vB");
 
     /* Edge: 1 vB at 1 sat/vB = ceil(1999/1000) = 1 */
-    fee = fee_estimate(&fe, 1);
+    fee = fee_estimate((fee_estimator_t *)&fe, 1);
     /* (1000*1 + 999) / 1000 = 1999/1000 = 1 */
     TEST_ASSERT_EQ(fee, 1, "1 vB minimum");
 
@@ -584,36 +583,36 @@ int test_fee_init_default(void) {
 
 /* Test 9: penalty and HTLC tx fee conveniences */
 int test_fee_penalty_tx(void) {
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);  /* 1 sat/vB */
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
 
-    uint64_t penalty = fee_for_penalty_tx(&fe);
+    uint64_t penalty = fee_for_penalty_tx((fee_estimator_t *)&fe);
     TEST_ASSERT(penalty >= 100, "penalty fee >= 100");
     TEST_ASSERT(penalty <= 10000, "penalty fee <= 10000");
     TEST_ASSERT_EQ(penalty, 165, "penalty fee = 165 sats at 1 sat/vB (P2A anchor)");
 
-    uint64_t htlc = fee_for_htlc_tx(&fe);
+    uint64_t htlc = fee_for_htlc_tx((fee_estimator_t *)&fe);
     TEST_ASSERT(htlc >= 100, "htlc fee >= 100");
     TEST_ASSERT(htlc <= 10000, "htlc fee <= 10000");
     TEST_ASSERT_EQ(htlc, 180, "htlc fee = 180 sats at 1 sat/vB");
 
     /* At higher fee rate */
-    fee_estimator_t fe5;
-    fee_init(&fe5, 5000);  /* 5 sat/vB */
-    TEST_ASSERT_EQ(fee_for_penalty_tx(&fe5), 825, "penalty at 5 sat/vB (P2A anchor)");
-    TEST_ASSERT_EQ(fee_for_htlc_tx(&fe5), 900, "htlc at 5 sat/vB");
+    fee_estimator_static_t fe5;
+    fee_estimator_static_init(&fe5, 5000);  /* 5 sat/vB */
+    TEST_ASSERT_EQ(fee_for_penalty_tx((fee_estimator_t *)&fe5), 825, "penalty at 5 sat/vB (P2A anchor)");
+    TEST_ASSERT_EQ(fee_for_htlc_tx((fee_estimator_t *)&fe5), 900, "htlc at 5 sat/vB");
 
     return 1;
 }
 
 /* Test 10: factory tx fee scales with n_outputs */
 int test_fee_factory_tx(void) {
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);  /* 1 sat/vB */
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
 
-    uint64_t fee1 = fee_for_factory_tx(&fe, 1);
-    uint64_t fee3 = fee_for_factory_tx(&fe, 3);
-    uint64_t fee5 = fee_for_factory_tx(&fe, 5);
+    uint64_t fee1 = fee_for_factory_tx((fee_estimator_t *)&fe, 1);
+    uint64_t fee3 = fee_for_factory_tx((fee_estimator_t *)&fe, 3);
+    uint64_t fee5 = fee_for_factory_tx((fee_estimator_t *)&fe, 5);
 
     /* fee = (68 + 43*n) at 1 sat/vB: 68 = 10 tx overhead + 58 P2TR keypath input */
     TEST_ASSERT_EQ(fee1, 111, "1 output: 68+43=111");
@@ -629,16 +628,12 @@ int test_fee_factory_tx(void) {
 
 /* Test: fee_update_from_node with NULL/invalid args */
 int test_fee_update_from_node_null(void) {
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
 
-    /* NULL rt should fail gracefully, rate unchanged */
-    TEST_ASSERT(!fee_update_from_node(&fe, NULL, 6), "NULL rt returns 0");
-    TEST_ASSERT_EQ(fe.fee_rate_sat_per_kvb, 1000, "rate unchanged after NULL");
-
-    /* Invalid target should fail */
-    TEST_ASSERT(!fee_update_from_node(&fe, NULL, 0), "target=0 returns 0");
-    TEST_ASSERT(!fee_update_from_node(&fe, NULL, -1), "target=-1 returns 0");
+    /* Static impl has no update() — fee_update_from_node returns 0 */
+    TEST_ASSERT(!fee_update_from_node((fee_estimator_t *)&fe, NULL, 6), "static: no update");
+    TEST_ASSERT_EQ(fe.sat_per_kvb, 1000, "rate unchanged for static impl");
 
     /* NULL fe should not crash */
     TEST_ASSERT(!fee_update_from_node(NULL, NULL, 6), "NULL fe returns 0");

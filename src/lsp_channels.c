@@ -184,9 +184,9 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         }
 
         /* Commitment tx fee: use manager's fee estimator if available */
-        fee_estimator_t _fe_default;
-        const fee_estimator_t *_fe = (const fee_estimator_t *)mgr->fee;
-        if (!_fe) { fee_init(&_fe_default, 1000); _fe = &_fe_default; }
+        fee_estimator_static_t _fe_default;
+        fee_estimator_t *_fe = (fee_estimator_t *)mgr->fee;
+        if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
         uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
@@ -208,7 +208,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;  /* LSP is funder and local */
-        if (_fe) channel_set_fee_rate(&entry->channel, _fe->fee_rate_sat_per_kvb);
+        if (_fe) channel_set_fee_rate(&entry->channel, _fe->get_rate(_fe, FEE_TARGET_NORMAL));
 
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {
@@ -304,9 +304,9 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         }
 
         /* Commitment tx fee: use manager's fee estimator if available */
-        fee_estimator_t _fe_default2;
-        const fee_estimator_t *_fe2 = (const fee_estimator_t *)mgr->fee;
-        if (!_fe2) { fee_init(&_fe_default2, 1000); _fe2 = &_fe_default2; }
+        fee_estimator_static_t _fe_default2;
+        fee_estimator_t *_fe2 = (fee_estimator_t *)mgr->fee;
+        if (!_fe2) { fee_estimator_static_init(&_fe_default2, 1000); _fe2 = &_fe_default2.base; }
         uint64_t commit_fee = fee_for_commitment_tx(_fe2, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         uint16_t pct2 = mgr->lsp_balance_pct;
@@ -327,7 +327,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;
-        if (_fe2) channel_set_fee_rate(&entry->channel, _fe2->fee_rate_sat_per_kvb);
+        if (_fe2) channel_set_fee_rate(&entry->channel, _fe2->get_rate(_fe2, FEE_TARGET_NORMAL));
 
         /* Load basepoints from DB instead of generating random ones */
         unsigned char local_secrets[4][32];
@@ -1751,9 +1751,9 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint16_t pct = mgr->lsp_balance_pct;
             if (pct == 0) pct = 50;
             if (pct > 100) pct = 100;
-            fee_estimator_t _fe_realloc;
-            const fee_estimator_t *_fe_ra = mgr->fee ? (const fee_estimator_t *)mgr->fee : NULL;
-            if (!_fe_ra) { fee_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc; }
+            fee_estimator_static_t _fe_realloc;
+            fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
+            if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
             uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
             uint64_t usable_ra = amounts[ci] * 1000 > commit_fee_ra ? amounts[ci] * 1000 - commit_fee_ra : 0;
             entry->channel.local_amount = (usable_ra * pct) / 100;
@@ -3103,14 +3103,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         if (ret == 0) {
             /* Periodic fee refresh (every 60s) */
-            if (mgr->fee && mgr->watchtower && mgr->watchtower->rt) {
+            if (mgr->fee) {
                 fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
-                if (fe->use_estimatesmartfee) {
-                    uint64_t now = (uint64_t)time(NULL);
-                    if (now - fe->last_updated >= 60) {
-                        fee_update_from_node(fe, mgr->watchtower->rt, 6);
-                    }
-                }
+                if (fe->update)
+                    fe->update(fe);
             }
 
             /* Timeout — run watchtower check if available */

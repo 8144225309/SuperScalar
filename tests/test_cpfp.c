@@ -294,9 +294,9 @@ int test_htlc_penalty_tx_has_anchor(void) {
 /* Test 3: watchtower pending tracking */
 int test_watchtower_pending_tracking(void) {
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
 
     /* Initially no pending */
     TEST_ASSERT_EQ(wt.n_pending, 0, "no pending initially");
@@ -330,22 +330,22 @@ int test_watchtower_pending_tracking(void) {
 
 /* Test 4: fee_for_penalty_tx returns 165 vB-based fee (P2A) */
 int test_penalty_fee_updated(void) {
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);  /* 1000 sat/kvB = 1 sat/vB */
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);  /* 1000 sat/kvB = 1 sat/vB */
 
-    uint64_t penalty_fee = fee_for_penalty_tx(&fe);
+    uint64_t penalty_fee = fee_for_penalty_tx((fee_estimator_t *)&fe);
     /* 1000 * 165 + 999 / 1000 = 165 (rounded) */
     uint64_t expected = (1000 * 165 + 999) / 1000;
     TEST_ASSERT_EQ(penalty_fee, expected, "penalty fee at 165 vB");
 
-    /* Also check CPFP child fee */
-    uint64_t cpfp_fee = fee_for_cpfp_child(&fe);
-    uint64_t expected_cpfp = (1000 * 200 + 999) / 1000;
-    TEST_ASSERT_EQ(cpfp_fee, expected_cpfp, "cpfp child fee at 200 vB");
+    /* Also check CPFP child fee (264 vB: P2A anchor + wallet input + 1 P2TR output) */
+    uint64_t cpfp_fee = fee_for_cpfp_child((fee_estimator_t *)&fe);
+    uint64_t expected_cpfp = (1000 * 264 + 999) / 1000;
+    TEST_ASSERT_EQ(cpfp_fee, expected_cpfp, "cpfp child fee at 264 vB");
 
     /* Check with higher fee rate */
-    fee_init(&fe, 5000);  /* 5 sat/vB */
-    penalty_fee = fee_for_penalty_tx(&fe);
+    fee_estimator_static_init(&fe, 5000);  /* 5 sat/vB */
+    penalty_fee = fee_for_penalty_tx((fee_estimator_t *)&fe);
     expected = (5000 * 165 + 999) / 1000;
     TEST_ASSERT_EQ(penalty_fee, expected, "penalty fee at 5 sat/vB");
 
@@ -355,9 +355,9 @@ int test_penalty_fee_updated(void) {
 /* Test 5: watchtower init sets static P2A SPK (no keypair needed) */
 int test_watchtower_anchor_init(void) {
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
 
     /* Anchor SPK should be P2A (4 bytes: 0x51 0x02 0x4e 0x73) */
     TEST_ASSERT_EQ(wt.anchor_spk_len, P2A_SPK_LEN, "anchor SPK len = 4");

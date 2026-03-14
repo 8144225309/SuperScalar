@@ -15,6 +15,8 @@
 #include "superscalar/tor.h"
 #include "superscalar/bip39.h"
 #include "superscalar/hd_key.h"
+#include "superscalar/bip158_backend.h"
+#include "superscalar/wallet_source_hd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,120 @@ static volatile sig_atomic_t g_shutdown = 0;
 static void sigint_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
+}
+
+/* BIP 158 light client backend (global so it outlives main's stack frame) */
+static bip158_backend_t g_bip158_client;
+
+/* HD wallet — used when --light-client is active without a bitcoind wallet */
+static wallet_source_hd_t *g_hd_wallet_client = NULL;
+
+static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
+                                     secp256k1_context *ctx, const char *network)
+{
+    if (!wt || !ctx) return 0;
+
+    unsigned char seed[64];
+    size_t seed_len = 0;
+
+    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+        printf("Client: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
+    } else {
+        seed_len = 32;
+        FILE *rf = fopen("/dev/urandom", "rb");
+        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
+            if (rf) fclose(rf);
+            fprintf(stderr, "Client: HD wallet: /dev/urandom unavailable\n");
+            return 0;
+        }
+        fclose(rf);
+        if (db_ptr)
+            persist_save_hd_seed(db_ptr, seed, seed_len);
+        printf("Client: HD wallet: generated fresh seed (32 bytes)\n");
+    }
+
+    g_hd_wallet_client = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
+    if (!g_hd_wallet_client) return 0;
+
+    if (!wallet_source_hd_init(g_hd_wallet_client, seed, seed_len,
+                                ctx, db_ptr, &g_bip158_client, network)) {
+        fprintf(stderr, "Client: HD wallet: init failed\n");
+        free(g_hd_wallet_client);
+        g_hd_wallet_client = NULL;
+        return 0;
+    }
+
+    char spk_hex[69];
+    if (wallet_source_hd_get_address(g_hd_wallet_client, 0, spk_hex, sizeof(spk_hex)))
+        printf("Client: HD wallet address[0] SPK: %s\n"
+               "Client: HD wallet ready (%u addresses pre-derived)\n",
+               spk_hex, g_hd_wallet_client->n_spks);
+
+    watchtower_set_wallet(wt, &g_hd_wallet_client->base);
+    return 1;
+}
+
+/*
+ * Initialise the BIP 158 backend, connect to the peer, restore checkpoint,
+ * then plug the backend into the watchtower as its chain backend.
+ * Returns 1 on success, 0 on failure.
+ */
+static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
+                                       const char *host_port,
+                                       const char *network,
+                                       const char **fallbacks, int n_fallbacks)
+{
+    char host[256];
+    int  port = 0;
+    if (!bip158_parse_host_port(host_port, host, sizeof(host), &port)) {
+        fprintf(stderr, "Client: --light-client: bad HOST:PORT '%s'\n", host_port);
+        return 0;
+    }
+
+    if (!bip158_backend_init(&g_bip158_client, network)) {
+        fprintf(stderr, "Client: bip158_backend_init failed\n");
+        return 0;
+    }
+
+    if (db_ptr) {
+        bip158_backend_set_db(&g_bip158_client, db_ptr);
+        int restored = bip158_backend_restore_checkpoint(&g_bip158_client);
+        if (restored)
+            printf("Client: BIP 158 checkpoint restored (tip_height=%d)\n",
+                   g_bip158_client.tip_height);
+    }
+
+    for (int i = 0; i < n_fallbacks; i++) {
+        char fb_host[256];
+        int  fb_port = 0;
+        if (bip158_parse_host_port(fallbacks[i], fb_host, sizeof(fb_host), &fb_port))
+            bip158_backend_add_peer(&g_bip158_client, fb_host, fb_port);
+        else
+            fprintf(stderr, "Client: --light-client-fallback: bad HOST:PORT '%s' (ignored)\n",
+                    fallbacks[i]);
+    }
+
+    printf("Client: connecting BIP 157/158 peer %s:%d ...\n", host, port);
+    if (!bip158_backend_connect_p2p(&g_bip158_client, host, port)) {
+        fprintf(stderr, "Client: primary peer %s:%d failed; trying fallbacks...\n", host, port);
+        if (g_bip158_client.n_peers == 0) {
+            snprintf(g_bip158_client.peer_hosts[0],
+                     sizeof(g_bip158_client.peer_hosts[0]), "%s", host);
+            g_bip158_client.peer_ports[0] = port;
+            g_bip158_client.n_peers = 1;
+        }
+        if (!bip158_backend_reconnect(&g_bip158_client)) {
+            fprintf(stderr, "Client: --light-client: all peers failed\n");
+            bip158_backend_free(&g_bip158_client);
+            return 0;
+        }
+    }
+    printf("Client: BIP 158 P2P peer connected (version %u, height %d)\n",
+           g_bip158_client.p2p.peer_version,
+           g_bip158_client.p2p.peer_start_height);
+
+    watchtower_set_chain_backend(wt, &g_bip158_client.base);
+    return 1;
 }
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -1441,6 +1557,9 @@ static void usage(const char *prog) {
         "  --rpcpassword PASS                Bitcoin RPC password (default: rpcpass)\n"
         "  --datadir PATH                    Bitcoin datadir (default: bitcoind default)\n"
         "  --rpcport PORT                    Bitcoin RPC port (default: network default)\n"
+        "  --light-client HOST:PORT          Use BIP 157/158 P2P compact block filters for chain\n"
+        "                                    scanning. bitcoind not required when set.\n"
+        "  --light-client-fallback HOST:PORT Add a fallback peer (up to 7 total).\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
@@ -1485,6 +1604,11 @@ int main(int argc, char *argv[]) {
     int generate_mnemonic = 0;
     const char *from_mnemonic = NULL;
     const char *mnemonic_passphrase = "";
+    const char *light_client_arg = NULL;
+    const char *fee_estimator_arg = NULL;
+    const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
+    memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
+    int n_lc_fallbacks = 0;
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1520,6 +1644,16 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fee-estimator") == 0 && i + 1 < argc)
+            fee_estimator_arg = argv[++i];
+        else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
+            light_client_arg = argv[++i];
+        else if (strcmp(argv[i], "--light-client-fallback") == 0 && i + 1 < argc) {
+            if (n_lc_fallbacks < (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0])))
+                lc_fallbacks[n_lc_fallbacks++] = argv[++i];
+            else { fprintf(stderr, "Warning: too many --light-client-fallback peers (max %d)\n",
+                           (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0]))); i++; }
+        }
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
@@ -1802,13 +1936,51 @@ int main(int argc, char *argv[]) {
     int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
                                   datadir, rpcport);
     if (!rt_ok)
-        fprintf(stderr, "Client: regtest init failed (watchtower disabled)\n");
+        fprintf(stderr, "Client: regtest init failed (watchtower/RPC disabled)\n");
 
+    /* Fee estimator — honour --fee-estimator if provided */
     static watchtower_t client_wt;
-    fee_estimator_t client_fee;
-    fee_init(&client_fee, fee_rate);
-    watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, &client_fee,
+    static fee_estimator_static_t  client_fee_static;
+    static fee_estimator_blocks_t  client_fee_blocks;
+    static fee_estimator_api_t     client_fee_api;
+    fee_estimator_t *client_fee_ptr;
+
+    const char *fe_mode = fee_estimator_arg;
+    if (!fe_mode) fe_mode = light_client_arg ? "blocks" : "static";
+
+    if (strcmp(fe_mode, "blocks") == 0) {
+        fee_estimator_blocks_init(&client_fee_blocks);
+        client_fee_ptr = &client_fee_blocks.base;
+    } else if (strcmp(fe_mode, "api") == 0) {
+        fee_estimator_api_init(&client_fee_api, NULL, NULL, NULL);
+        client_fee_ptr = &client_fee_api.base;
+    } else if (strncmp(fe_mode, "api:", 4) == 0) {
+        fee_estimator_api_init(&client_fee_api, fe_mode + 4, NULL, NULL);
+        client_fee_ptr = &client_fee_api.base;
+    } else {
+        /* static or static:N */
+        uint64_t r = (uint64_t)fee_rate;
+        if (strncmp(fe_mode, "static:", 7) == 0)
+            r = (uint64_t)strtoull(fe_mode + 7, NULL, 10) * 1000;
+        fee_estimator_static_init(&client_fee_static, r);
+        client_fee_ptr = &client_fee_static.base;
+    }
+
+    watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, client_fee_ptr,
                       use_db ? &db : NULL);
+
+    /* Attach BIP 158 light client as chain backend (overrides regtest backend) */
+    if (light_client_arg) {
+        attach_light_client_client(&client_wt, use_db ? &db : NULL,
+                                   light_client_arg, network,
+                                   lc_fallbacks, n_lc_fallbacks);
+        /* Wire blocks estimator into backend for per-block samples */
+        if (strcmp(fe_mode, "blocks") == 0)
+            bip158_backend_set_fee_estimator(&g_bip158_client, client_fee_ptr);
+        /* Auto-attach HD wallet when running without bitcoind */
+        if (!rt_ok)
+            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network);
+    }
 
     int ok;
     if (daemon_mode) {
@@ -1816,7 +1988,7 @@ int main(int argc, char *argv[]) {
         memset(&cbd, 0, sizeof(cbd));
         cbd.db = use_db ? &db : NULL;
         cbd.wt = &client_wt;
-        cbd.fee = &client_fee;
+        cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.auto_accept_jit = auto_accept_jit;
 

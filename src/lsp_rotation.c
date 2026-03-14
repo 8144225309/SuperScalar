@@ -738,7 +738,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
 
     /* Set fee rate on all new channels */
-    uint64_t fee_rate = fe->fee_rate_sat_per_kvb;
+    uint64_t fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
     for (size_t c = 0; c < mgr->n_channels; c++)
         mgr->entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
 
