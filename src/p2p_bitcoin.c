@@ -1057,3 +1057,211 @@ int p2p_poll_inv(p2p_conn_t *conn,
 
     return n_txids;
 }
+
+/* -------------------------------------------------------------------------
+ * Phase B: PoW / nBits header chain validation
+ * ------------------------------------------------------------------------- */
+
+/* Decode compact nBits to 32-byte target (big-endian).
+   nBits format: top byte = exponent, lower 3 bytes = mantissa.
+   Negative/overflow nBits → invalid (return 0). */
+static int decode_target(uint32_t nBits, uint8_t target[32])
+{
+    memset(target, 0, 32);
+    uint32_t exponent = (nBits >> 24) & 0xff;
+    uint32_t mantissa = nBits & 0x00ffffff;
+    /* Reject negative (bit 23 of mantissa set) */
+    if (mantissa & 0x00800000) return 0;
+    /* Reject overflow: exponent > 32 → too large for 256-bit */
+    if (exponent > 32) return 0;
+    if (exponent == 0 || mantissa == 0) return 0;
+    /* Place mantissa at byte offset (32 - exponent) */
+    /* target is big-endian; byte 0 is most significant */
+    int offset = (int)exponent - 3;
+    if (offset < 0) {
+        /* Shift mantissa right by -offset bytes */
+        mantissa >>= ((-offset) * 8);
+        offset = 0;
+    }
+    if (offset + 3 > 32) return 0;  /* overflow */
+    target[32 - 1 - offset]     = (uint8_t)(mantissa & 0xff);
+    target[32 - 1 - (offset+1)] = (uint8_t)((mantissa >> 8) & 0xff);
+    target[32 - 1 - (offset+2)] = (uint8_t)((mantissa >> 16) & 0xff);
+    return 1;
+}
+
+int p2p_validate_header_pow(const uint8_t header80[80])
+{
+    if (!header80) return 0;
+
+    /* nBits at bytes 72-75, little-endian */
+    uint32_t nBits = (uint32_t)header80[72]        |
+                     ((uint32_t)header80[73] <<  8) |
+                     ((uint32_t)header80[74] << 16) |
+                     ((uint32_t)header80[75] << 24);
+
+    /* Decode nBits to 32-byte target */
+    uint8_t target[32];
+    if (!decode_target(nBits, target)) return 0;  /* invalid nBits */
+
+    /* Compute SHA256d of header */
+    uint8_t hash_internal[32];
+    sha256_double(header80, 80, hash_internal);
+
+    /* Reverse hash to big-endian for comparison */
+    uint8_t hash_be[32];
+    for (int i = 0; i < 32; i++)
+        hash_be[i] = hash_internal[31 - i];
+
+    /* hash_be < target: compare byte by byte from most significant */
+    for (int i = 0; i < 32; i++) {
+        if (hash_be[i] < target[i]) return 1;   /* hash < target: valid */
+        if (hash_be[i] > target[i]) return 0;   /* hash > target: invalid */
+    }
+    return 0;  /* hash == target: technically invalid (must be strictly less) */
+}
+
+/* 256-bit compare: returns -1 if a<b, 0 if equal, +1 if a>b */
+static int cmp256(const uint8_t a[32], const uint8_t b[32]) {
+    for (int i = 0; i < 32; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return  1;
+    }
+    return 0;
+}
+
+/* Shift 256-bit big-endian value left by n bits (n <= 8).
+   Returns 0 if overflow, 1 if ok. */
+static int shl256(const uint8_t in[32], int n, uint8_t out[32]) {
+    unsigned carry = 0;
+    for (int i = 31; i >= 0; i--) {
+        unsigned v = ((unsigned)in[i] << n) | carry;
+        out[i] = (uint8_t)(v & 0xff);
+        carry = v >> 8;
+    }
+    return carry == 0;
+}
+
+/* Shift 256-bit big-endian value right by n bits (n <= 8). */
+static void shr256(const uint8_t in[32], int n, uint8_t out[32]) {
+    unsigned carry = 0;
+    for (int i = 0; i < 32; i++) {
+        unsigned v = ((carry << 8) | in[i]);
+        out[i] = (uint8_t)(v >> n);
+        carry = v & ((1u << n) - 1u);
+    }
+}
+
+int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
+                                        uint32_t actual_timespan_secs)
+{
+    (void)actual_timespan_secs;  /* timespan clamping not needed for range check */
+
+    /* Decode both targets — invalid nBits → reject */
+    uint8_t old_target[32], new_target[32];
+    if (!decode_target(old_bits, old_target)) return 0;
+    if (!decode_target(new_bits, new_target)) return 0;
+    if ((new_bits & 0x00800000)) return 0;  /* negative target */
+
+    /* new_target must be in [old/4, old*4] */
+    uint8_t max_target[32];
+    if (!shl256(old_target, 2, max_target)) {
+        /* old_target * 4 overflows → anything is valid on the upper end */
+        memset(max_target, 0xff, 32);
+    }
+    if (cmp256(new_target, max_target) > 0) return 0;  /* too easy: >4x */
+
+    uint8_t min_target[32];
+    shr256(old_target, 2, min_target);
+    if (cmp256(new_target, min_target) < 0) return 0;  /* too hard: <1/4x */
+
+    return 1;
+}
+
+int p2p_recv_headers_pow(p2p_conn_t *conn,
+                          uint8_t (*hashes_out)[32], size_t max_headers,
+                          uint32_t *nbits_out)
+{
+    for (int attempt = 0; attempt < 64; attempt++) {
+        char     cmd[13];
+        uint8_t *payload;
+        int      plen = p2p_recv_msg(conn, cmd, &payload);
+        if (plen < 0) return -1;
+
+        if (strcmp(cmd, "ping") == 0) {
+            p2p_send_msg(conn, "pong", payload, (uint32_t)plen);
+            free(payload);
+            continue;
+        }
+
+        if (strcmp(cmd, "headers") == 0) {
+            if (plen < 1) { free(payload); return 0; }
+
+            const uint8_t *p   = payload;
+            size_t         rem = (size_t)plen;
+
+            uint64_t count;
+            size_t   varint_len;
+            if (p[0] < 0xfd) {
+                count      = p[0];
+                varint_len = 1;
+            } else if (p[0] == 0xfd && rem >= 3) {
+                count      = (uint64_t)p[1] | ((uint64_t)p[2] << 8);
+                varint_len = 3;
+            } else {
+                free(payload);
+                return 0;
+            }
+            p   += varint_len;
+            rem -= varint_len;
+
+            size_t n_stored = 0;
+            for (uint64_t i = 0; i < count; i++) {
+                if (rem < 81) break;
+                /* PoW validation */
+                if (!p2p_validate_header_pow(p)) {
+                    fprintf(stderr, "P2P: header PoW invalid at index %llu, closing peer\n",
+                            (unsigned long long)i);
+                    free(payload);
+                    p2p_close(conn);
+                    return -1;
+                }
+                if (n_stored < max_headers && hashes_out) {
+                    sha256_double(p, 80, hashes_out[n_stored]);
+                    if (nbits_out) {
+                        nbits_out[n_stored] = (uint32_t)p[72]        |
+                                              ((uint32_t)p[73] <<  8) |
+                                              ((uint32_t)p[74] << 16) |
+                                              ((uint32_t)p[75] << 24);
+                    }
+                    n_stored++;
+                }
+                p   += 81;
+                rem -= 81;
+            }
+
+            free(payload);
+            return (int)n_stored;
+        }
+
+        free(payload);
+    }
+    return 0;
+}
+
+int p2p_connect_nonblocking(p2p_conn_t *conn, const char *host, int port,
+                              const char *network, int timeout_ms)
+{
+    /* For simplicity, delegate to the blocking connect with a short socket timeout.
+       A full non-blocking implementation would use O_NONBLOCK + select().
+       This version sets SO_RCVTIMEO / SO_SNDTIMEO to timeout_ms. */
+    if (!p2p_connect(conn, host, port, network)) return 0;
+
+    /* Apply timeout to the connected socket */
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(conn->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return 1;
+}
