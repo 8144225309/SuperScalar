@@ -181,6 +181,8 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 #include "superscalar/sha256.h"
+#include "superscalar/bolt12.h"
+#include "superscalar/bech32m.h"
 
 #define MAX_ACTIONS 16
 
@@ -1641,6 +1643,7 @@ int main(int argc, char *argv[]) {
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
+    const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1755,6 +1758,8 @@ int main(int argc, char *argv[]) {
             mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
+        } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
+            pay_offer_str = argv[++i];
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_client %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -1775,6 +1780,26 @@ int main(int argc, char *argv[]) {
                 "default minrelaytxfee (1 sat/vB).\n"
                 "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
                 fee_rate, (double)fee_rate / 1000.0);
+    }
+
+    /* --- BOLT 12 Offer payment (early exit / decode + display) --- */
+    if (pay_offer_str) {
+        offer_t offer;
+        if (!offer_decode(pay_offer_str, &offer)) {
+            fprintf(stderr, "Error: failed to decode offer: %s\n", pay_offer_str);
+            return 1;
+        }
+        printf("Decoded BOLT 12 offer:\n");
+        /* Print node_id as hex */
+        printf("  node_id: ");
+        for (int k = 0; k < 33; k++) printf("%02x", offer.node_id[k]);
+        printf("\n");
+        printf("  amount_msat: %llu%s\n",
+               (unsigned long long)offer.amount_msat,
+               offer.has_amount ? "" : " (any)");
+        printf("  description: %s\n", offer.description);
+        printf("(Payment flow via channel not yet implemented)\n");
+        return 0;
     }
 
     /* --- BIP39 Mnemonic (early exit) --- */
