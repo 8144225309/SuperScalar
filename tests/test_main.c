@@ -99,6 +99,13 @@ extern int test_bip158_backend_restore_checkpoint(void);
 extern int test_bip158_add_peer(void);
 extern int test_bip158_reconnect_no_peers(void);
 extern int test_bip158_mempool_cb_wiring(void);
+extern int test_bip158_scan_p2p_no_rpc(void);
+extern int test_bip158_checkpoint_count(void);
+extern int test_bip158_checkpoint_mismatch_disconnects(void);
+extern int test_bip158_checkpoint_passthrough(void);
+extern int test_bip158_gcs_build_empty(void);
+extern int test_bip158_gcs_build_round_trip(void);
+extern int test_bip158_compute_filter_header(void);
 
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
@@ -118,6 +125,8 @@ extern int test_p2p_recv_block(void);
 extern int test_p2p_send_mempool(void);
 extern int test_p2p_poll_inv_parse(void);
 extern int test_p2p_poll_inv_ignores_block(void);
+extern int test_p2p_connect_rejects_non_cf(void);
+extern int test_p2p_connect_accepts_cf(void);
 
 extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
@@ -695,6 +704,17 @@ extern int test_hd_derive_child(void);
 extern int test_hd_derive_path(void);
 extern int test_keyfile_from_seed(void);
 
+/* Modular Fee Estimation & SDK Surface */
+extern int test_fee_estimator_static_all_targets(void);
+extern int test_fee_estimator_target_ordering(void);
+extern int test_fee_estimator_blocks_floor_only(void);
+extern int test_fee_estimator_blocks_target_ordering(void);
+extern int test_feefilter_p2p_parse(void);
+extern int test_fee_estimator_api_parse(void);
+extern int test_fee_estimator_api_ttl(void);
+extern int test_wallet_source_stub(void);
+extern int test_ss_config_default(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -749,6 +769,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip158_add_peer);
     RUN_TEST(test_bip158_reconnect_no_peers);
     RUN_TEST(test_bip158_mempool_cb_wiring);
+    RUN_TEST(test_bip158_scan_p2p_no_rpc);
+    RUN_TEST(test_bip158_checkpoint_count);
+    RUN_TEST(test_bip158_checkpoint_mismatch_disconnects);
+    RUN_TEST(test_bip158_checkpoint_passthrough);
+    RUN_TEST(test_bip158_gcs_build_empty);
+    RUN_TEST(test_bip158_gcs_build_round_trip);
+    RUN_TEST(test_bip158_compute_filter_header);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
@@ -769,6 +796,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_p2p_send_mempool);
     RUN_TEST(test_p2p_poll_inv_parse);
     RUN_TEST(test_p2p_poll_inv_ignores_block);
+    RUN_TEST(test_p2p_connect_rejects_non_cf);
+    RUN_TEST(test_p2p_connect_accepts_cf);
 
     printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
 
@@ -1324,6 +1353,17 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hd_derive_child);
     RUN_TEST(test_hd_derive_path);
     RUN_TEST(test_keyfile_from_seed);
+
+    printf("\n=== Modular Fee Estimation & SDK Surface ===\n");
+    RUN_TEST(test_fee_estimator_static_all_targets);
+    RUN_TEST(test_fee_estimator_target_ordering);
+    RUN_TEST(test_fee_estimator_blocks_floor_only);
+    RUN_TEST(test_fee_estimator_blocks_target_ordering);
+    RUN_TEST(test_feefilter_p2p_parse);
+    RUN_TEST(test_fee_estimator_api_parse);
+    RUN_TEST(test_fee_estimator_api_ttl);
+    RUN_TEST(test_wallet_source_stub);
+    RUN_TEST(test_ss_config_default);
 }
 
 extern int regtest_init_faucet(void);

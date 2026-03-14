@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 /*
  * Unit tests for BIP 158 GCS filter decoder, SipHash-2-4, and script registry.
@@ -453,5 +456,239 @@ int test_bip158_mempool_cb_wiring(void)
     ASSERT(b.mempool_cb == NULL, "clearing callback failed");
 
     bip158_backend_free(&b);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 1: P2P-only scan path (no RPC fallback)
+ * ------------------------------------------------------------------------- */
+
+/* Test 12: bip158_backend_scan() with rpc_ctx=NULL and no active P2P
+ * connection (but peers configured) should return 0 — "nothing to scan yet,
+ * caller retries" — rather than -1 (hard error).
+ *
+ * This verifies that when P2P is the sole chain source and the connection
+ * is not yet up, the scan loop degrades gracefully instead of aborting.
+ */
+int test_bip158_scan_p2p_no_rpc(void)
+{
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "regtest"), "init failed");
+
+    /* Register one script so the n_scripts > 0 check passes */
+    unsigned char spk[22] = {0x00, 0x14};  /* P2WPKH prefix */
+    ASSERT(b.base.register_script(&b.base, spk, 22), "register_script failed");
+
+    /* Configure an unreachable peer — connect() should refuse immediately */
+    bip158_backend_add_peer(&b, "127.0.0.1", 1);
+
+    /* rpc_ctx is NULL — no RPC fallback available */
+    ASSERT(b.rpc_ctx == NULL, "rpc_ctx should start NULL");
+
+    int rc = bip158_backend_scan(&b);
+    /* Reconnect attempt fails → tip = -1 → !rt → return 0 (not -1) */
+    ASSERT(rc == 0, "scan with peers-but-no-connection and no RPC should return 0");
+
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 3: Filter header checkpoints
+ * ------------------------------------------------------------------------- */
+
+/* Test 13: checkpoint count is non-zero for known networks, zero for unknown */
+int test_bip158_checkpoint_count(void)
+{
+    ASSERT(bip158_backend_checkpoint_count("mainnet")  > 0, "mainnet should have checkpoints");
+    ASSERT(bip158_backend_checkpoint_count("testnet3") > 0, "testnet3 should have checkpoints");
+    ASSERT(bip158_backend_checkpoint_count("testnet")  > 0, "testnet alias should have checkpoints");
+    ASSERT(bip158_backend_checkpoint_count("regtest")  == 0, "regtest should have no checkpoints");
+    ASSERT(bip158_backend_checkpoint_count("signet")   == 0, "signet should have no checkpoints");
+    return 1;
+}
+
+/* Test 14: injecting a WRONG filter header at a checkpoint height causes
+ * bip158_verify_filter_checkpoints() to return 0 and close the peer fd. */
+int test_bip158_checkpoint_mismatch_disconnects(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 2; /* SKIP */
+
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "mainnet"), "init failed");
+
+    /* Attach a real (loopback) fd so p2p_close() has something to close */
+    b.p2p.fd = sv[0];
+
+    /* Store a WRONG filter header at mainnet checkpoint height 100000 */
+    uint8_t wrong[32];
+    memset(wrong, 0xDE, sizeof(wrong));
+    memcpy(b.filter_headers[100000 % BIP158_HEADER_WINDOW], wrong, 32);
+
+    /* Batch covers heights 99999–100001; checkpoint at 100000 falls inside */
+    int rc = bip158_verify_filter_checkpoints(&b, 99999, 3);
+
+    ASSERT(rc == 0, "mismatch should return 0");
+    ASSERT(b.p2p.fd < 0, "peer fd should be closed after mismatch");
+
+    close(sv[1]);  /* sv[0] was closed by p2p_close */
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* Test 15: injecting the CORRECT filter header at a checkpoint height leaves
+ * the peer connected and bip158_verify_filter_checkpoints() returns 1. */
+int test_bip158_checkpoint_passthrough(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 2; /* SKIP */
+
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "mainnet"), "init failed");
+
+    b.p2p.fd = sv[0];
+
+    /* Correct mainnet filter header at height 100000 (little-endian wire bytes)
+     * Source: lightninglabs/neutrino chainsync/filtercontrol.go */
+    static const uint8_t correct[32] = {
+        0xa5,0x7f,0xaa,0x53,0x41,0xbe,0x06,0x6a,0xa2,0x04,0xe4,0x1f,0x47,0x31,0x3a,0xb7,
+        0xab,0x63,0x97,0xf5,0x8b,0xfe,0xb5,0xb7,0x01,0xeb,0x69,0xb3,0x1a,0xbc,0x8c,0xf2
+    };
+    memcpy(b.filter_headers[100000 % BIP158_HEADER_WINDOW], correct, 32);
+
+    int rc = bip158_verify_filter_checkpoints(&b, 99999, 3);
+
+    ASSERT(rc == 1, "correct checkpoint should pass");
+    ASSERT(b.p2p.fd == sv[0], "peer should still be connected after passthrough");
+
+    close(sv[0]);
+    close(sv[1]);
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 6: GCS encoder (bip158_gcs_build) round-trip tests
+ * ------------------------------------------------------------------------- */
+
+/* Test 16: empty filter encodes N=0 as a single varint byte, no GCS bits.
+ * bip158_gcs_match_any on an empty filter should return 0 for any query. */
+int test_bip158_gcs_build_empty(void)
+{
+    unsigned char key[16] = {0};
+    unsigned char buf[16];
+    size_t n = bip158_gcs_build(NULL, 0, key, buf, sizeof(buf));
+    ASSERT(n == 1, "empty filter should be 1 byte (varint 0)");
+    ASSERT(buf[0] == 0x00, "varint(0) should be 0x00");
+
+    /* gcs_match_any on an empty filter returns 0 */
+    bip158_script_t dummy;
+    memset(dummy.spk, 0x01, 22);
+    dummy.spk_len = 22;
+    ASSERT(bip158_gcs_match_any(buf + 1, 0, 0, key, &dummy, 1) == 0,
+           "match on empty filter should return 0");
+    return 1;
+}
+
+/* Test 17: build a filter from a small set of known scripts, then verify that
+ * bip158_gcs_match_any finds each of the included scripts and does NOT find
+ * a script that was not included.
+ *
+ * This is the GCS round-trip: encode → decode-and-match. */
+int test_bip158_gcs_build_round_trip(void)
+{
+    /* Use a deterministic key (all zeros is valid for testing) */
+    static const unsigned char key[16] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+        0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+    };
+
+    /* Three scripts to include in the filter */
+    bip158_script_t scripts[3];
+    memset(scripts, 0, sizeof(scripts));
+    /* P2WPKH: OP_0 <20-byte hash> */
+    scripts[0].spk[0] = 0x00; scripts[0].spk[1] = 0x14;
+    memset(scripts[0].spk + 2, 0xaa, 20); scripts[0].spk_len = 22;
+    /* P2WSH: OP_0 <32-byte hash> */
+    scripts[1].spk[0] = 0x00; scripts[1].spk[1] = 0x20;
+    memset(scripts[1].spk + 2, 0xbb, 32); scripts[1].spk_len = 34;
+    /* P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG */
+    scripts[2].spk[0] = 0x76; scripts[2].spk[1] = 0xa9; scripts[2].spk[2] = 0x14;
+    memset(scripts[2].spk + 3, 0xcc, 20);
+    scripts[2].spk[23] = 0x88; scripts[2].spk[24] = 0xac;
+    scripts[2].spk_len = 25;
+
+    size_t n = 3;
+    size_t buf_cap = bip158_gcs_build_size(n);
+    unsigned char *buf = malloc(buf_cap);
+    ASSERT(buf != NULL, "malloc for filter buffer failed");
+
+    size_t filter_len = bip158_gcs_build(scripts, n, key, buf, buf_cap);
+    ASSERT(filter_len > 1, "filter should have more than 1 byte");
+
+    /* Parse varint(N) from the output */
+    uint64_t n_items = 0;
+    uint8_t vi_first = buf[0];
+    size_t vi_len = (vi_first < 0xfd) ? 1 : (vi_first == 0xfd) ? 3 : 5;
+    if (vi_first < 0xfd) n_items = vi_first;
+    ASSERT(n_items == 3, "encoded N should be 3");
+    ASSERT(vi_len == 1, "varint for 3 should be 1 byte");
+
+    const unsigned char *gcs_data = buf + vi_len;
+    size_t gcs_len = filter_len - vi_len;
+
+    /* Each included script must match */
+    for (int i = 0; i < 3; i++) {
+        ASSERT(bip158_gcs_match_any(gcs_data, gcs_len, n_items,
+                                     key, &scripts[i], 1) == 1,
+               "included script should match");
+    }
+
+    /* A script NOT in the filter should not match (with overwhelming probability) */
+    bip158_script_t absent;
+    memset(absent.spk, 0xff, 22); absent.spk_len = 22;
+    /* A false positive is possible in theory (1/M ≈ 1/784931) but negligible */
+    ASSERT(bip158_gcs_match_any(gcs_data, gcs_len, n_items,
+                                 key, &absent, 1) == 0,
+           "absent script should not match");
+
+    free(buf);
+    return 1;
+}
+
+/* Test 18: bip158_compute_filter_header produces the correct chain commitment.
+ * filter_header[0] = SHA256d(SHA256d(filter) || zeros[32]) */
+int test_bip158_compute_filter_header(void)
+{
+    /* Build a trivial 1-script filter */
+    static const unsigned char key[16] = {0};
+    bip158_script_t s;
+    memset(s.spk, 0x42, 22); s.spk_len = 22;
+
+    size_t cap = bip158_gcs_build_size(1);
+    unsigned char *filter = malloc(cap);
+    ASSERT(filter != NULL, "malloc failed");
+    size_t filter_len = bip158_gcs_build(&s, 1, key, filter, cap);
+    ASSERT(filter_len > 0, "build failed");
+
+    unsigned char prev_fh[32] = {0};
+    unsigned char hdr1[32], hdr2[32];
+
+    bip158_compute_filter_header(filter, filter_len, prev_fh, hdr1);
+
+    /* Call again — deterministic output */
+    bip158_compute_filter_header(filter, filter_len, prev_fh, hdr2);
+
+    ASSERT(memcmp(hdr1, hdr2, 32) == 0, "filter header must be deterministic");
+
+    /* Changing prev_fh must change the header */
+    prev_fh[0] = 0x01;
+    unsigned char hdr3[32];
+    bip158_compute_filter_header(filter, filter_len, prev_fh, hdr3);
+    ASSERT(memcmp(hdr1, hdr3, 32) != 0,
+           "different prev_fh must produce different header");
+
+    free(filter);
     return 1;
 }

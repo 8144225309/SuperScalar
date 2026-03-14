@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 /*
  * Unit tests for p2p_bitcoin message framing.
@@ -951,5 +952,96 @@ int test_p2p_poll_inv_ignores_block(void)
     memset(expected, 0xCC, 32);
     ASSERT(memcmp(txids_out[0], expected, 32) == 0, "txid should be 0xCC*32");
 
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Phase 2 — NODE_COMPACT_FILTERS (SFNodeCF) enforcement
+ *
+ * Tests 19 and 20 verify that p2p_do_version_handshake() rejects peers
+ * that do not advertise the NODE_COMPACT_FILTERS (bit 6) service flag,
+ * and accepts those that do.  A socketpair provides a bidirectional
+ * channel so the handshake can exchange version/verack without a real
+ * TCP connection.
+ * --------------------------------------------------------------------- */
+
+/* Build a framed version message with the given services bitmap into sv[1]. */
+static void write_mock_version(int fd, uint64_t services)
+{
+    /* Minimal version payload: version(4) + services(8) + timestamp(8) +
+       addr_recv(26) + addr_from(26) + nonce(8) + ua_len(1=0) + start_height(4) */
+    uint8_t payload[86];
+    memset(payload, 0, sizeof(payload));
+    /* version = 70016 LE */
+    payload[0] = 0x80; payload[1] = 0x11; payload[2] = 0x01; payload[3] = 0x00;
+    /* services (8 bytes LE) */
+    for (int i = 0; i < 8; i++)
+        payload[4 + i] = (uint8_t)(services >> (i * 8));
+    /* byte 80: user_agent varint length = 0 (empty string) */
+    payload[80] = 0x00;
+    /* bytes 81-84: start_height = 0 */
+
+    uint8_t msg[256];
+    size_t n = build_msg(REGTEST_MAGIC, "version",
+                         payload, (uint32_t)sizeof(payload),
+                         msg, sizeof(msg));
+    (void)write(fd, msg, n);
+}
+
+static void write_mock_verack(int fd)
+{
+    uint8_t msg[256];
+    size_t n = build_msg(REGTEST_MAGIC, "verack", NULL, 0, msg, sizeof(msg));
+    (void)write(fd, msg, n);
+}
+
+/* Test 19: peer with services=0 (no NODE_COMPACT_FILTERS) must be rejected */
+int test_p2p_connect_rejects_non_cf(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 2; /* SKIP */
+
+    /* Pre-load peer side with version(services=0) then verack */
+    write_mock_version(sv[1], 0);
+    write_mock_verack(sv[1]);
+
+    p2p_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = sv[0];
+    memcpy(conn.magic, REGTEST_MAGIC, 4);
+
+    int ok = p2p_do_version_handshake(&conn);
+
+    /* p2p_close() was called internally — fd is -1; don't double-close sv[0] */
+    if (conn.fd >= 0) close(conn.fd);
+    close(sv[1]);
+
+    ASSERT(ok == 0, "non-CF peer (services=0) should be rejected");
+    ASSERT(conn.peer_services == 0, "peer_services should reflect the received value");
+    return 1;
+}
+
+/* Test 20: peer with services=NODE_COMPACT_FILTERS (0x40) must be accepted */
+int test_p2p_connect_accepts_cf(void)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 2; /* SKIP */
+
+    /* Pre-load peer side with version(services=0x40) then verack */
+    write_mock_version(sv[1], NODE_COMPACT_FILTERS);
+    write_mock_verack(sv[1]);
+
+    p2p_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = sv[0];
+    memcpy(conn.magic, REGTEST_MAGIC, 4);
+
+    int ok = p2p_do_version_handshake(&conn);
+
+    if (conn.fd >= 0) close(conn.fd);
+    close(sv[1]);
+
+    ASSERT(ok == 1, "CF peer (services=0x40) should be accepted");
+    ASSERT(conn.peer_services & NODE_COMPACT_FILTERS, "peer_services should have CF bit set");
     return 1;
 }

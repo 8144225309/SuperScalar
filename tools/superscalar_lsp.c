@@ -128,11 +128,18 @@ static void usage(const char *prog) {
         "  --backup PATH       Create encrypted backup of --db and --keyfile to PATH, then exit\n"
         "  --restore PATH      Restore encrypted backup from PATH to --db and --keyfile, then exit\n"
         "  --backup-verify PATH  Verify encrypted backup integrity, then exit\n"
-        "  --light-client HOST:PORT  Use BIP 157/158 P2P light client instead of bitcoin-cli for\n"
-        "                            chain scanning (requires a BIP 157 full node peer).\n"
-        "                            bitcoin-cli is still used for wallet funding and fee estimation.\n"
+        "  --light-client HOST:PORT  Use BIP 157/158 P2P compact block filters for chain scanning.\n"
+        "                            When set, bitcoind is NOT required at startup (no --cli-path\n"
+        "                            needed for chain data). Fee estimation and wallet funding still\n"
+        "                            use --cli-path if provided. Requires a BIP 157 full-node peer.\n"
         "  --light-client-fallback HOST:PORT  Add a fallback peer for automatic rotation on\n"
         "                            disconnect. May be specified multiple times (up to 7 total).\n"
+        "  --fee-estimator MODE  Select fee estimation backend:\n"
+        "                          rpc         estimatesmartfee via bitcoin-cli (default when --cli-path set)\n"
+        "                          blocks      block-derived + BIP 133 feefilter (default when --light-client set)\n"
+        "                          api         mempool.space /api/v1/fees/recommended\n"
+        "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
+        "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -509,7 +516,8 @@ static int parse_host_port(const char *arg,
  */
 static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
                                 const char *host_port, const char *network,
-                                const char **fallbacks, int n_fallbacks)
+                                const char **fallbacks, int n_fallbacks,
+                                fee_estimator_t *fee_est)
 {
     char host[256];
     int  port = 0;
@@ -561,6 +569,10 @@ static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
     }
     printf("LSP: BIP 158 P2P peer connected (version %u, height %d)\n",
            g_bip158.p2p.peer_version, g_bip158.p2p.peer_start_height);
+
+    /* Wire fee estimator if provided (enables per-block fee samples) */
+    if (fee_est)
+        bip158_backend_set_fee_estimator(&g_bip158, fee_est);
 
     watchtower_set_chain_backend(wt, &g_bip158.base);
     return 1;
@@ -646,6 +658,7 @@ int main(int argc, char *argv[]) {
     int test_batch_rebalance = 0;
     int test_realloc = 0;
     int dynamic_fees = 0;
+    const char *fee_estimator_arg = NULL; /* --fee-estimator MODE */
     int heartbeat_interval = 0;  /* 0 = disabled; seconds between daemon status lines */
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
@@ -860,6 +873,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--dynamic-fees") == 0)
             dynamic_fees = 1;
+        else if (strcmp(argv[i], "--fee-estimator") == 0 && i + 1 < argc)
+            fee_estimator_arg = argv[++i];
         else if (strcmp(argv[i], "--heartbeat-interval") == 0 && i + 1 < argc)
             heartbeat_interval = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-after") == 0 && i + 1 < argc)
@@ -1189,28 +1204,73 @@ int main(int argc, char *argv[]) {
     } else {
         rt_ok = regtest_init_network(&rt, network);
     }
-    if (!rt_ok) {
-        fprintf(stderr, "Error: cannot connect to bitcoind (is it running with -%s?)\n", network);
+    if (!rt_ok && !light_client_arg) {
+        fprintf(stderr, "Error: cannot connect to bitcoind (is it running with -%s?)\n"
+                        "       Pass --light-client HOST:PORT to use P2P without bitcoind.\n",
+                network);
         secp256k1_context_destroy(ctx);
         return 1;
     }
     /* Auto-create/load wallet (handles "already exists" gracefully) */
-    regtest_create_wallet(&rt, wallet_name ? wallet_name : "superscalar_lsp");
+    if (rt_ok)
+        regtest_create_wallet(&rt, wallet_name ? wallet_name : "superscalar_lsp");
 
-    /* Initialize fee estimator (dynamic fees always enabled; --dynamic-fees kept for compat) */
+    /* Initialize fee estimator.
+       Priority: --fee-estimator arg > auto-select (rpc when bitcoind up,
+       blocks when --light-client, static otherwise).
+       --dynamic-fees kept for CLI compat (treated as --fee-estimator rpc). */
     (void)dynamic_fees;
-    fee_estimator_t fee_est;
-    fee_init(&fee_est, fee_rate);
-    fee_est.use_estimatesmartfee = 1;
-    if (fee_est.use_estimatesmartfee && fee_update_from_node(&fee_est, &rt, 6)) {
-        printf("LSP: fee rate from estimatesmartfee(6): %llu sat/kvB\n",
-               (unsigned long long)fee_est.fee_rate_sat_per_kvb);
-    } else {
-        printf("LSP: fee rate (static): %llu sat/kvB\n", (unsigned long long)fee_rate);
-        if (!is_regtest)
-            fprintf(stderr, "WARNING: estimatesmartfee failed on %s; using static --fee-rate %llu sat/kvB\n",
-                    network, (unsigned long long)fee_rate);
+    fee_estimator_rpc_t    fee_est_rpc;
+    fee_estimator_static_t fee_est_static;
+    fee_estimator_blocks_t fee_est_blocks;
+    fee_estimator_api_t    fee_est_api;
+    fee_estimator_t *fee_est_ptr = NULL;
+
+    /* Determine mode from --fee-estimator arg */
+    const char *fe_mode = fee_estimator_arg;
+    if (!fe_mode) {
+        /* Auto-select: prefer rpc when bitcoind is up */
+        if (rt_ok)       fe_mode = "rpc";
+        else if (light_client_arg) fe_mode = "blocks";
+        else             fe_mode = "static";
     }
+
+    if (strcmp(fe_mode, "rpc") == 0) {
+        if (!rt_ok) {
+            fprintf(stderr, "LSP: --fee-estimator rpc requires bitcoind (use --cli-path)\n");
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        fee_estimator_rpc_init(&fee_est_rpc, &rt);
+        fee_est_ptr = &fee_est_rpc.base;
+        uint64_t initial = fee_est_ptr->get_rate(fee_est_ptr, FEE_TARGET_NORMAL);
+        printf("LSP: fee estimator: rpc (estimatesmartfee), current=%llu sat/kvB\n",
+               (unsigned long long)(initial ? initial : fee_rate));
+    } else if (strcmp(fe_mode, "blocks") == 0) {
+        fee_estimator_blocks_init(&fee_est_blocks);
+        fee_est_ptr = &fee_est_blocks.base;
+        printf("LSP: fee estimator: blocks (BIP 133 feefilter + block-derived)\n");
+    } else if (strncmp(fe_mode, "api:", 4) == 0) {
+        fee_estimator_api_init(&fee_est_api, fe_mode + 4, NULL, NULL);
+        fee_est_ptr = &fee_est_api.base;
+        printf("LSP: fee estimator: api (%s)\n", fe_mode + 4);
+    } else if (strcmp(fe_mode, "api") == 0) {
+        fee_estimator_api_init(&fee_est_api, NULL, NULL, NULL);
+        fee_est_ptr = &fee_est_api.base;
+        printf("LSP: fee estimator: api (mempool.space)\n");
+    } else if (strncmp(fe_mode, "static:", 7) == 0) {
+        uint64_t r = (uint64_t)strtoull(fe_mode + 7, NULL, 10) * 1000;
+        if (r == 0) r = fee_rate;
+        fee_estimator_static_init(&fee_est_static, r);
+        fee_est_ptr = &fee_est_static.base;
+        printf("LSP: fee estimator: static (%llu sat/kvB)\n", (unsigned long long)r);
+    } else {
+        /* Unknown / "static" without value */
+        fee_estimator_static_init(&fee_est_static, fee_rate);
+        fee_est_ptr = &fee_est_static.base;
+        printf("LSP: fee estimator: static (%llu sat/kvB)\n", (unsigned long long)fee_rate);
+    }
+    /* Alias fee_est for existing code below that references fee_est */
+    fee_estimator_t *fee_est = fee_est_ptr;
 
     /* === Recovery probe: skip ceremony if factory exists in DB === */
     if (use_db && daemon_mode) {
@@ -1266,7 +1326,7 @@ int main(int argc, char *argv[]) {
             lsp.factory = *rec_f;
             free(rec_f);
             rec_f = NULL;
-            lsp.factory.fee = &fee_est;
+            lsp.factory.fee = fee_est;
 
             /* Load DW counter state from DB */
             {
@@ -1294,7 +1354,7 @@ int main(int argc, char *argv[]) {
             /* Initialize channels from DB */
             lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
             if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
-            mgr->fee = &fee_est;
+            mgr->fee = fee_est;
             if (!lsp_channels_init_from_db(mgr, ctx, &lsp.factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
@@ -1356,14 +1416,14 @@ int main(int argc, char *argv[]) {
             /* Initialize watchtower */
             static watchtower_t rec_wt;
             memset(&rec_wt, 0, sizeof(rec_wt));
-            watchtower_init(&rec_wt, mgr->n_channels, &rt, &fee_est, &db);
+            watchtower_init(&rec_wt, mgr->n_channels, &rt, fee_est, &db);
             for (size_t c = 0; c < mgr->n_channels; c++)
                 watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
             mgr->watchtower = &rec_wt;
             if (light_client_arg)
                 attach_light_client(&rec_wt, use_db ? &db : NULL,
                                     light_client_arg, network,
-                                    lc_fallbacks, n_lc_fallbacks);
+                                    lc_fallbacks, n_lc_fallbacks, fee_est);
 
             /* Initialize ladder */
             ladder_t rec_lad;
@@ -1394,7 +1454,7 @@ int main(int argc, char *argv[]) {
 
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
-            mgr->rot_fee_est = &fee_est;
+            mgr->rot_fee_est = fee_est;
             memcpy(mgr->rot_fund_spk, lsp.factory.funding_spk,
                    lsp.factory.funding_spk_len);
             mgr->rot_fund_spk_len = lsp.factory.funding_spk_len;
@@ -1886,7 +1946,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Set fee estimator on factory (for computed fees) */
-    lsp.factory.fee = &fee_est;
+    lsp.factory.fee = fee_est;
 
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t *lad = calloc(1, sizeof(ladder_t));
@@ -1974,7 +2034,7 @@ int main(int argc, char *argv[]) {
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
         test_dual_factory || test_dw_exhibition) {
         /* Set fee policy before init (init preserves these across memset) */
-        mgr->fee = &fee_est;
+        mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
         mgr->lsp_balance_pct = lsp_balance_pct;
         mgr->placement_mode = (placement_mode_t)placement_mode_arg;
@@ -2116,7 +2176,7 @@ int main(int argc, char *argv[]) {
          * Use static to avoid stack corruption (watchtower_t is ~6.5KB). */
         static watchtower_t wt;
         memset(&wt, 0, sizeof(wt));
-        watchtower_init(&wt, mgr->n_channels, &rt, &fee_est,
+        watchtower_init(&wt, mgr->n_channels, &rt, fee_est,
                           use_db ? &db : NULL);
         for (size_t c = 0; c < mgr->n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
@@ -2124,14 +2184,14 @@ int main(int argc, char *argv[]) {
         if (light_client_arg)
             attach_light_client(&wt, use_db ? &db : NULL,
                                  light_client_arg, network,
-                                 lc_fallbacks, n_lc_fallbacks);
+                                 lc_fallbacks, n_lc_fallbacks, fee_est);
 
         /* Wire ladder into channel manager (Tier 2) */
         mgr->ladder = lad;
 
         /* Wire rotation parameters for continuous ladder (Gap #3) */
         memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
-        mgr->rot_fee_est = &fee_est;
+        mgr->rot_fee_est = fee_est;
         memcpy(mgr->rot_fund_spk, fund_spk, 34);
         mgr->rot_fund_spk_len = 34;
         snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr), "%s", fund_addr);
@@ -2718,7 +2778,7 @@ int main(int argc, char *argv[]) {
                             if (cur_h > 0)
                                 factory_set_lifecycle(exh_f1, (uint32_t)cur_h,
                                                       active_blocks, dying_blocks);
-                            exh_f1->fee = &fee_est;
+                            exh_f1->fee = fee_est;
 
                             /* Record Factory 1 initial (max) nSequence */
                             for (size_t ni = 0; ni < exh_f1->n_nodes; ni++) {
@@ -3105,7 +3165,7 @@ int main(int argc, char *argv[]) {
                     factory_set_lifecycle(&f1, (uint32_t)cur_h,
                                           active_blocks, dying_blocks);
             }
-            f1.fee = &fee_est;
+            f1.fee = fee_est;
 
             printf("Factory 1 created: %zu nodes signed\n", f1.n_nodes);
 
@@ -4130,7 +4190,7 @@ int main(int argc, char *argv[]) {
         unsigned char dest_spk[34];
         build_p2tr_script_pubkey(dest_spk, &lsp_xonly);
 
-        uint64_t fee_sats = fee_estimate(&fee_est, 150);
+        uint64_t fee_sats = fee_estimate(fee_est, 150);
         if (fee_sats == 0) fee_sats = 500;
         uint64_t leaf_recovered = 0, mid_recovered = 0;
 
@@ -5077,7 +5137,7 @@ int main(int argc, char *argv[]) {
         /* Initialize new channel manager + send CHANNEL_READY */
         lsp_channel_mgr_t *mgr2 = calloc(1, sizeof(lsp_channel_mgr_t));
         if (!mgr2) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
-        mgr2->fee = &fee_est;
+        mgr2->fee = fee_est;
         mgr2->routing_fee_ppm = routing_fee_ppm;
         mgr2->lsp_balance_pct = lsp_balance_pct;
         mgr2->settlement_interval_blocks = settlement_interval;

@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/wallet_source.h"
 #include "superscalar/types.h"
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
@@ -40,6 +41,8 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     if (rt) {
         chain_backend_regtest_init(&wt->_chain_regtest_wrapper, rt);
         wt->chain = &wt->_chain_regtest_wrapper;
+        wallet_source_rpc_init(&wt->_wallet_rpc_default, rt);
+        wt->wallet = &wt->_wallet_rpc_default.base;
     }
 
     /* P2A anchor: static anyone-can-spend SPK — no keys needed */
@@ -343,6 +346,12 @@ void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)
 {
     if (wt)
         wt->chain = backend;
+}
+
+void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet)
+{
+    if (wt)
+        wt->wallet = wallet;
 }
 
 int watchtower_check(watchtower_t *wt) {
@@ -702,8 +711,12 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                const char *parent_txid,
                                uint32_t anchor_vout,
                                uint64_t anchor_amount) {
-    if (!wt || !wt->rt || !cpfp_tx_out || !parent_txid) return 0;
+    if (!wt || !cpfp_tx_out || !parent_txid) return 0;
     if (wt->anchor_spk_len != P2A_SPK_LEN) return 0;
+    if (!wt->wallet) {
+        fprintf(stderr, "CPFP: disabled (no wallet source attached)\n");
+        return 0;
+    }
 
     /* Get a wallet UTXO to fund the CPFP child */
     char wallet_txid_hex[65];
@@ -715,10 +728,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 200;
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
 
-    if (!regtest_get_utxo_for_bump(wt->rt, min_amount,
-                                     wallet_txid_hex, &wallet_vout,
-                                     &wallet_amount,
-                                     wallet_spk, &wallet_spk_len)) {
+    if (!wt->wallet->get_utxo(wt->wallet, min_amount,
+                               wallet_txid_hex, &wallet_vout,
+                               &wallet_amount, wallet_spk, &wallet_spk_len)) {
         fprintf(stderr, "CPFP: no suitable wallet UTXO for bump\n");
         return 0;
     }
@@ -737,32 +749,11 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     uint64_t change_amount = total_in > cpfp_fee ? total_in - cpfp_fee : 0;
     if (change_amount == 0) return 0;
 
-    /* Get change address SPK from wallet */
-    char change_addr[128];
-    if (!regtest_get_new_address(wt->rt, change_addr, sizeof(change_addr)))
-        return 0;
-
-    /* Use getaddressinfo to get the scriptPubKey */
-    char addr_params[256];
-    snprintf(addr_params, sizeof(addr_params), "\"%s\"", change_addr);
-    char *addr_info = regtest_exec(wt->rt, "getaddressinfo", addr_params);
-    if (!addr_info) return 0;
-
+    /* Get change scriptPubKey from wallet */
     unsigned char change_spk[64];
     size_t change_spk_len = 0;
-    {
-        cJSON *json = cJSON_Parse(addr_info);
-        free(addr_info);
-        if (!json) return 0;
-        cJSON *spk_hex = cJSON_GetObjectItem(json, "scriptPubKey");
-        if (!spk_hex || !cJSON_IsString(spk_hex)) {
-            cJSON_Delete(json);
-            return 0;
-        }
-        int decoded = hex_decode(spk_hex->valuestring, change_spk, sizeof(change_spk));
-        if (decoded > 0) change_spk_len = (size_t)decoded;
-        cJSON_Delete(json);
-    }
+    if (!wt->wallet->get_change_spk(wt->wallet, change_spk, &change_spk_len))
+        return 0;
     if (change_spk_len == 0) return 0;
 
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
@@ -788,50 +779,29 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* nLockTime */
     tx_buf_write_u32_le(&unsigned_tx, 0);
 
-    /* Hex-encode the unsigned tx for signrawtransactionwithwallet.
-       Input 0 (P2A anchor) is anyone-can-spend — empty witness is valid.
-       The wallet only needs to sign input 1. */
-    char *unsigned_hex = (char *)malloc(unsigned_tx.len * 2 + 1);
-    if (!unsigned_hex) {
+    /* Sign input 1 (wallet UTXO) via the wallet_source vtable.
+       Input 0 (P2A anchor) is anyone-can-spend — no signature needed. */
+    size_t signed_len = unsigned_tx.len + 512; /* room for witness data */
+    unsigned char *signed_buf = (unsigned char *)malloc(signed_len);
+    if (!signed_buf) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
-    hex_encode(unsigned_tx.data, unsigned_tx.len, unsigned_hex);
-
-    /* Build prevtxs JSON for the P2A anchor input so the wallet knows
-       to leave it unsigned (it only signs its own input 1). */
-    char anchor_spk_hex[16];
-    hex_encode(wt->anchor_spk, wt->anchor_spk_len, anchor_spk_hex);
-    char prevtxs[512];
-    snprintf(prevtxs, sizeof(prevtxs),
-        "[{\"txid\":\"%s\",\"vout\":%u,\"scriptPubKey\":\"%s\",\"amount\":%.8f}]",
-        parent_txid, anchor_vout, anchor_spk_hex,
-        (double)anchor_amount / 100000000.0);
-
-    /* P2A anchor input is anyone-can-spend — wallet won't sign it, so
-       complete will be false. Pass require_complete=0. */
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(wt->rt, unsigned_hex, prevtxs, 0);
-    free(unsigned_hex);
+    memcpy(signed_buf, unsigned_tx.data, unsigned_tx.len);
+    signed_len = unsigned_tx.len;
     tx_buf_free(&unsigned_tx);
 
-    if (!signed_hex) return 0;
-
-    /* Decode the signed tx binary. The wallet signed input 1 and left
-       input 0 (P2A) with empty witness (0x00), which is valid for
-       anyone-can-spend. No witness splicing needed. */
-    size_t signed_hex_len = strlen(signed_hex);
-    size_t signed_bin_len = signed_hex_len / 2;
-    unsigned char *signed_bin = (unsigned char *)malloc(signed_bin_len);
-    if (!signed_bin) {
-        free(signed_hex);
+    if (!wt->wallet->sign_input(wt->wallet, signed_buf, &signed_len,
+                                 1 /* input_idx */,
+                                 wallet_spk, wallet_spk_len,
+                                 wallet_amount)) {
+        free(signed_buf);
         return 0;
     }
-    hex_decode(signed_hex, signed_bin, signed_bin_len);
-    free(signed_hex);
 
     tx_buf_reset(cpfp_tx_out);
-    tx_buf_write_bytes(cpfp_tx_out, signed_bin, signed_bin_len);
-    free(signed_bin);
+    tx_buf_write_bytes(cpfp_tx_out, signed_buf, signed_len);
+    free(signed_buf);
 
     return 1;
 }

@@ -317,9 +317,9 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     jit->created_block = (cur_h > 0) ? (uint32_t)cur_h : 0;
 
     /* Initialize channel_t for the JIT channel */
-    fee_estimator_t jit_fe_default;
-    const fee_estimator_t *jit_fe = (const fee_estimator_t *)mgr->fee;
-    if (!jit_fe) { fee_init(&jit_fe_default, 1000); jit_fe = &jit_fe_default; }
+    fee_estimator_static_t jit_fe_default;
+    fee_estimator_t *jit_fe = (fee_estimator_t *)mgr->fee;
+    if (!jit_fe) { fee_estimator_static_init(&jit_fe_default, 1000); jit_fe = &jit_fe_default.base; }
     uint64_t commit_fee = fee_for_commitment_tx(jit_fe, 0);
     uint64_t usable = actual_amount > commit_fee ? actual_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
@@ -335,7 +335,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         return 0;
     }
     jit->channel.funder_is_local = 1;
-    if (jit_fe) channel_set_fee_rate(&jit->channel, jit_fe->fee_rate_sat_per_kvb);
+    if (jit_fe) channel_set_fee_rate(&jit->channel, jit_fe->get_rate(jit_fe, FEE_TARGET_NORMAL));
 
     /* Generate random basepoints */
     if (!channel_generate_random_basepoints(&jit->channel)) {
@@ -531,7 +531,7 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
 
     /* Calculate fee: 1-in-1-out P2TR close ~111 vbytes */
     uint64_t total = jit->funding_amount;
-    const fee_estimator_t *fe = (const fee_estimator_t *)mgr->fee;
+    fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
     uint64_t close_fee = fe ? fee_estimate(fe, 111) : 200;
     if (close_fee == 0) close_fee = 200;
     if (close_fee > total / 2) close_fee = total / 2;

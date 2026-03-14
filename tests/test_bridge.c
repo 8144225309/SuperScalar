@@ -1324,9 +1324,9 @@ int test_regtest_bridge_payment(void) {
 
                     /* Verify channel balance: client 0's remote increased */
                     channel_t *ch0 = &ch_mgr.entries[0].channel;
-                    fee_estimator_t fe;
-                    fee_init(&fe, 1000);
-                    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+                    fee_estimator_static_init(&fe, 1000);
+                    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
                     uint64_t orig_remote = usable / 2;
@@ -1800,9 +1800,9 @@ int test_regtest_bridge_invoice_flow(void) {
 
                     /* Verify channel balance: client 0's remote increased */
                     channel_t *ch0 = &ch_mgr.entries[0].channel;
-                    fee_estimator_t fe;
-                    fee_init(&fe, 1000);
-                    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+                    fee_estimator_static_init(&fe, 1000);
+                    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
                     uint64_t orig_remote = usable / 2;

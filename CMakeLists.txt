@@ -107,6 +107,12 @@ add_library(superscalar
     src/persist.c
     src/bridge.c
     src/fee.c
+    src/fee_estimator_static.c
+    src/fee_estimator_rpc.c
+    src/fee_estimator_blocks.c
+    src/fee_estimator_api.c
+    src/wallet_source_rpc.c
+    src/superscalar_sdk.c
     src/watchtower.c
     src/crypto_aead.c
     src/noise.c
@@ -124,7 +130,7 @@ target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar PRIVATE ${cjson_SOURCE_DIR})
 target_include_directories(superscalar PUBLIC ${SQLite3_INCLUDE_DIRS})
-target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto)
+target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto OpenSSL::SSL)
 target_link_libraries(superscalar PRIVATE project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar PRIVATE project_sanitizers)
@@ -160,6 +166,7 @@ add_executable(test_superscalar
     tests/test_keyfile.c
     tests/test_bip39.c
     tests/test_rate_limit.c
+    tests/test_fee_estimator.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

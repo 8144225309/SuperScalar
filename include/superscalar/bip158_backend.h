@@ -3,6 +3,7 @@
 
 #include "chain_backend.h"
 #include "p2p_bitcoin.h"
+#include "fee_estimator.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -111,11 +112,86 @@ typedef struct {
     void           (*mempool_cb)(const char *txid_hex, void *ctx);
     void            *mempool_ctx;
     int              mempool_subscribed; /* 1 after mempool message sent */
+
+    /* Optional fee estimator — receives per-block fee samples after each
+       full-block download.  Set by bip158_backend_set_fee_estimator().
+       Not owned; caller manages lifetime. */
+    fee_estimator_t *fee_estimator;
 } bip158_backend_t;
+
+/* Parse a "HOST:PORT" string.  host_out receives the NUL-terminated hostname,
+ * *port_out the port number.  Returns 1 on success, 0 on error.
+ * Shared utility used by superscalar_lsp and superscalar_client. */
+int bip158_parse_host_port(const char *arg,
+                            char *host_out, size_t host_cap,
+                            int *port_out);
+
+/*
+ * Verify hard-coded BIP 158 filter header checkpoints for a received batch.
+ * Called automatically by bip158_sync_filter_headers() after each cfheaders
+ * batch.  Also exposed for unit testing.
+ *
+ * start_height: block height of hdrs[0]
+ * n:            number of headers in the batch (already stored in ring buffer)
+ *
+ * Returns 1 if all in-range checkpoints match, 0 on mismatch.
+ * On mismatch, closes the peer connection so the caller can reconnect.
+ */
+int bip158_verify_filter_checkpoints(bip158_backend_t *b,
+                                      int start_height, int n);
+
+/*
+ * Return the number of hard-coded filter header checkpoints for the given
+ * network name ("mainnet", "testnet3" / "testnet").  Returns 0 for unknown
+ * networks (e.g. "regtest", "signet").  Useful for diagnostics.
+ */
+int bip158_backend_checkpoint_count(const char *network);
+
+/* -------------------------------------------------------------------------
+ * Phase 6 — GCS encoder and filter header construction
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Build a BIP 158 compact filter (type 0) from an array of scripts.
+ * Output format: varint(N) || Golomb-Rice encoded sorted deltas.
+ * This is exactly the payload consumed by bip158_gcs_match_any /
+ * bip158_scan_filter after stripping the leading varint.
+ *
+ * key16:    first 16 bytes of the block hash (SipHash key)
+ * out_buf:  output buffer; must be at least bip158_gcs_build_size(n) bytes
+ * Returns bytes written, or 0 on error.
+ */
+size_t bip158_gcs_build_size(size_t n);
+size_t bip158_gcs_build(const bip158_script_t *scripts, size_t n,
+                         const unsigned char *key16,
+                         unsigned char *out_buf, size_t out_cap);
+
+/*
+ * Compute a BIP 157 filter header:
+ *   filter_header[N] = SHA256d( SHA256d(filter_bytes) || prev_filter_header[N-1] )
+ *
+ * filter_bytes / filter_len : complete serialised filter (varint(N) + GCS bits)
+ * prev_filter_hdr           : filter header at height N-1; all-zeros at height 0
+ * out                       : 32-byte output
+ */
+void bip158_compute_filter_header(const unsigned char *filter_bytes,
+                                   size_t filter_len,
+                                   const unsigned char prev_filter_hdr[32],
+                                   unsigned char out[32]);
 
 /* Initialise backend. Returns 1 on success, 0 on failure. */
 int  bip158_backend_init(bip158_backend_t *backend, const char *network);
 void bip158_backend_free(bip158_backend_t *backend);
+
+/*
+ * Attach a fee estimator to receive per-block fee samples.
+ * After each full-block P2P download, bip158_backend_scan() calls
+ * fee_estimator_blocks_add_sample() if fe is a fee_estimator_blocks_t,
+ * and fee_estimator_blocks_set_floor() after connect/reconnect.
+ * Pass NULL to detach.  The caller retains ownership.
+ */
+void bip158_backend_set_fee_estimator(bip158_backend_t *backend,
+                                       fee_estimator_t *fe);
 
 /*
  * Attach a regtest_t RPC handle for the Phase-3 scan loop.

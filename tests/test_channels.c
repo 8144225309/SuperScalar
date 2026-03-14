@@ -227,8 +227,8 @@ int test_lsp_channel_init(void) {
         TEST_ASSERT(entry->channel.local_amount > 0, "local_amount > 0");
         TEST_ASSERT(entry->channel.remote_amount > 0, "remote_amount > 0");
         /* local + remote = funding_amount - commit_fee */
-        fee_estimator_t _fe; fee_init(&_fe, 1000);
-        uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
+        fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
+        uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
         TEST_ASSERT_EQ(entry->channel.local_amount + entry->channel.remote_amount,
                         entry->channel.funding_amount - commit_fee, "balance sum");
     }
@@ -842,8 +842,8 @@ int test_regtest_intra_factory_payment(void) {
                Channel B (LSP view): LSP sent 5000 to B
                  -> local decreased by 5000, remote increased by 5000 */
             /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-            fee_estimator_t _fe2; fee_init(&_fe2, 1000);
-            uint64_t commit_fee_ab = fee_for_commitment_tx(&_fe2, 0);
+            fee_estimator_static_t _fe2; fee_estimator_static_init(&_fe2, 1000);
+            uint64_t commit_fee_ab = fee_for_commitment_tx((fee_estimator_t *)&_fe2, 0);
             uint64_t usable_a = ch_a->funding_amount > commit_fee_ab ?
                                 ch_a->funding_amount - commit_fee_ab : 0;
             uint64_t a_orig = usable_a / 2;
@@ -1179,8 +1179,8 @@ int test_regtest_multi_payment(void) {
         channel_t *ch_d = &ch_mgr.entries[3].channel;
 
         /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-        fee_estimator_t _fe3; fee_init(&_fe3, 1000);
-        uint64_t cfe = fee_for_commitment_tx(&_fe3, 0);
+        fee_estimator_static_t _fe3; fee_estimator_static_init(&_fe3, 1000);
+        uint64_t cfe = fee_for_commitment_tx((fee_estimator_t *)&_fe3, 0);
         uint64_t a_orig = (ch_a->funding_amount > cfe ?
                            ch_a->funding_amount - cfe : 0) / 2;
         uint64_t b_orig = (ch_b->funding_amount > cfe ?
@@ -1352,9 +1352,9 @@ int test_fee_policy_balance_split(void) {
     factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f), "build tree");
 
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
 
     /* Test 1: Default 50-50 split (pct=0 means default 50) */
     {
@@ -1486,14 +1486,14 @@ int test_fee_estimator_wiring(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     /* Create a fee estimator with 2000 sat/kvB (2x default) */
-    fee_estimator_t fe;
-    fee_init(&fe, 2000);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 2000);
 
     /* Compute commitment fee at default (1000) and at 2000 */
-    fee_estimator_t fe_default;
-    fee_init(&fe_default, 1000);
-    uint64_t fee_at_1000 = fee_for_commitment_tx(&fe_default, 0);
-    uint64_t fee_at_2000 = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe_default;
+    fee_estimator_static_init(&fe_default, 1000);
+    uint64_t fee_at_1000 = fee_for_commitment_tx((fee_estimator_t *)&fe_default, 0);
+    uint64_t fee_at_2000 = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
 
     /* 2x rate should produce 2x fee */
     TEST_ASSERT_EQ(fee_at_2000, fee_at_1000 * 2, "2x rate = 2x fee");

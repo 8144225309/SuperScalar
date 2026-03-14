@@ -27,11 +27,16 @@
 /* BIP 157 basic filter type */
 #define P2P_FILTER_BASIC 0x00
 
+/* Services flags (version message, 8-byte LE bitmap) */
+#define NODE_COMPACT_FILTERS (1ULL << 6)  /* BIP 157: peer serves compact filters */
+
 typedef struct {
     int      fd;                 /* TCP socket (-1 = not connected)      */
     uint8_t  magic[4];           /* network-specific magic bytes         */
     uint32_t peer_version;       /* protocol version negotiated          */
     int32_t  peer_start_height;  /* chain tip reported in version msg    */
+    uint64_t peer_services;      /* services bitmap from version message */
+    uint64_t peer_feefilter_sat_per_kvb; /* BIP 133: peer's mempool minimum (0 = unknown) */
 } p2p_conn_t;
 
 /* -----------------------------------------------------------------------
@@ -44,9 +49,18 @@ typedef struct {
  * "regtest" (or NULL which defaults to "mainnet").
  * Returns 1 on success, 0 on any failure.  conn->fd is set to -1 on
  * failure so p2p_close() is always safe to call.
+ * Rejects peers that do not advertise NODE_COMPACT_FILTERS (BIP 157).
  */
 int p2p_connect(p2p_conn_t *conn, const char *host, int port,
                 const char *network);
+
+/*
+ * Complete the version/verack handshake on conn->fd (already open).
+ * conn->magic must be set before calling.  Used internally by p2p_connect
+ * and exposed for unit testing with pre-connected socket pairs.
+ * Returns 1 on success (peer supports BIP 157), 0 on failure.
+ */
+int p2p_do_version_handshake(p2p_conn_t *conn);
 
 /* Close the socket and reset conn->fd to -1. Safe to call on an already
    closed connection. */

@@ -67,6 +67,14 @@ static uint32_t read_le32(const uint8_t *p)
            ((uint32_t)p[3] << 24);
 }
 
+static uint64_t read_le64(const uint8_t *p)
+{
+    return (uint64_t)p[0]          | ((uint64_t)p[1] <<  8) |
+           ((uint64_t)p[2] << 16)  | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32)  | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48)  | ((uint64_t)p[7] << 56);
+}
+
 /* First 4 bytes of SHA256d(payload) — used as the P2P message checksum */
 static void p2p_checksum(const uint8_t *data, size_t len, uint8_t out[4])
 {
@@ -193,20 +201,8 @@ static int send_version(p2p_conn_t *conn)
     return p2p_send_msg(conn, "version", buf, (uint32_t)n);
 }
 
-int p2p_connect(p2p_conn_t *conn, const char *host, int port,
-                const char *network)
+int p2p_do_version_handshake(p2p_conn_t *conn)
 {
-    memset(conn, 0, sizeof(*conn));
-    conn->fd = -1;
-    set_magic(conn->magic, network);
-
-    conn->fd = wire_connect_direct_internal(host, port);
-    if (conn->fd < 0) return 0;
-
-    /* 30-second receive timeout — prevents blocking forever on a stalled peer */
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     if (!send_version(conn)) { p2p_close(conn); return 0; }
 
     /* Read messages until we have seen both version and verack from peer.
@@ -220,7 +216,8 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
         if (plen < 0) { p2p_close(conn); return 0; }
 
         if (strcmp(cmd, "version") == 0) {
-            if (plen >= 4) conn->peer_version = read_le32(payload);
+            if (plen >= 4)  conn->peer_version  = read_le32(payload);
+            if (plen >= 12) conn->peer_services = read_le64(payload + 4);
             /* Parse start_height: version(4)+services(8)+time(8)+addr_recv(26)+
                addr_from(26)+nonce(8) = 80 bytes, then user_agent varint+string,
                then start_height(4 LE). */
@@ -238,6 +235,9 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
             p2p_send_msg(conn, "verack", NULL, 0);
         } else if (strncmp(cmd, "verack", 6) == 0) {
             got_verack = 1;
+        } else if (strncmp(cmd, "feefilter", 9) == 0 && plen >= 8) {
+            /* BIP 133: peer's mempool minimum fee rate (sat/kvB as 8-byte LE) */
+            conn->peer_feefilter_sat_per_kvb = read_le64(payload);
         }
         /* Ignore other messages (e.g. sendheaders, sendcmpct) during handshake */
         free(payload);
@@ -246,7 +246,27 @@ int p2p_connect(p2p_conn_t *conn, const char *host, int port,
     if (!got_version || !got_verack) { p2p_close(conn); return 0; }
     /* Require BIP 157 support (protocol version 70016+) */
     if (conn->peer_version < 70016) { p2p_close(conn); return 0; }
+    /* Require NODE_COMPACT_FILTERS service bit — don't connect to nodes that
+       can't serve BIP 157 compact filters (would fail at getcfilters anyway). */
+    if (!(conn->peer_services & NODE_COMPACT_FILTERS)) { p2p_close(conn); return 0; }
     return 1;
+}
+
+int p2p_connect(p2p_conn_t *conn, const char *host, int port,
+                const char *network)
+{
+    memset(conn, 0, sizeof(*conn));
+    conn->fd = -1;
+    set_magic(conn->magic, network);
+
+    conn->fd = wire_connect_direct_internal(host, port);
+    if (conn->fd < 0) return 0;
+
+    /* 30-second receive timeout — prevents blocking forever on a stalled peer */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    return p2p_do_version_handshake(conn);
 }
 
 void p2p_close(p2p_conn_t *conn)

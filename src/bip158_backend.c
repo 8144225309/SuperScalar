@@ -8,6 +8,110 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Forward declaration — defined later in the SipHash section */
+static uint64_t load_le64(const unsigned char *p);
+
+/* -------------------------------------------------------------------------
+ * Block fee sample extraction
+ * Parse the coinbase transaction to estimate average block fee rate.
+ * Returns sat/kvB, or 0 if parsing fails.
+ * ------------------------------------------------------------------------- */
+static uint64_t bip158_extract_block_fee_sample(const uint8_t *block,
+                                                  size_t block_len,
+                                                  uint32_t height)
+{
+    if (!block || block_len < 90) return 0;
+
+    /* Skip 80-byte block header */
+    const uint8_t *p = block + 80;
+    size_t rem = block_len - 80;
+
+    /* tx_count varint */
+    if (rem < 1) return 0;
+    uint64_t tx_count = 0;
+    size_t vi = 1;
+    if (p[0] < 0xfd)      { tx_count = p[0]; vi = 1; }
+    else if (p[0] == 0xfd && rem >= 3) { tx_count = (uint64_t)p[1] | ((uint64_t)p[2] << 8); vi = 3; }
+    else return 0;
+    (void)tx_count;
+    p += vi; rem -= vi;
+
+    /* Coinbase tx starts here (segwit or legacy).
+       nVersion(4) + optional segwit marker(2) + vin_count(varint) */
+    if (rem < 5) return 0;
+    p += 4; rem -= 4;  /* skip nVersion */
+
+    /* Segwit marker + flag */
+    int is_segwit = 0;
+    if (rem >= 2 && p[0] == 0x00 && p[1] != 0x00) {
+        is_segwit = 1;
+        p += 2; rem -= 2;
+    }
+
+    /* vin_count varint — should be 1 for coinbase */
+    if (rem < 1) return 0;
+    /* Skip varint (assume 1 input for coinbase) */
+    size_t vin_vi = (p[0] < 0xfd) ? 1 : (p[0] == 0xfd ? 3 : 9);
+    if (rem < vin_vi) return 0;
+    p += vin_vi; rem -= vin_vi;
+
+    /* Skip coinbase input: prevhash(32) + vout(4) + script_len varint + script + sequence(4) */
+    if (rem < 37) return 0;
+    p += 36; rem -= 36;  /* prevhash + vout */
+    uint64_t script_len = 0;
+    size_t sl_vi = 1;
+    if (p[0] < 0xfd)      { script_len = p[0]; sl_vi = 1; }
+    else if (p[0] == 0xfd && rem >= 3) { script_len = (uint64_t)p[1] | ((uint64_t)p[2] << 8); sl_vi = 3; }
+    else return 0;
+    if (rem < sl_vi + script_len + 4) return 0;
+    p += sl_vi + script_len + 4; rem -= sl_vi + script_len + 4;
+
+    /* vout_count varint */
+    if (rem < 1) return 0;
+    uint64_t vout_count = 0;
+    size_t vc_vi = 1;
+    if (p[0] < 0xfd)      { vout_count = p[0]; vc_vi = 1; }
+    else if (p[0] == 0xfd && rem >= 3) { vout_count = (uint64_t)p[1] | ((uint64_t)p[2] << 8); vc_vi = 3; }
+    else return 0;
+    p += vc_vi; rem -= vc_vi;
+
+    /* Sum all coinbase output amounts */
+    uint64_t total_out = 0;
+    for (uint64_t v = 0; v < vout_count; v++) {
+        if (rem < 9) return 0;
+        uint64_t amt = load_le64(p);
+        total_out += amt;
+        p += 8; rem -= 8;
+        uint64_t spk_len = 0;
+        size_t spk_vi = 1;
+        if (p[0] < 0xfd)      { spk_len = p[0]; spk_vi = 1; }
+        else if (p[0] == 0xfd && rem >= 3) { spk_len = (uint64_t)p[1] | ((uint64_t)p[2] << 8); spk_vi = 3; }
+        else return 0;
+        if (rem < spk_vi + spk_len) return 0;
+        p += spk_vi + spk_len; rem -= spk_vi + spk_len;
+    }
+
+    /* Segwit witness for coinbase — skip it */
+    (void)is_segwit;
+
+    /* Block subsidy = 50 BTC >> (height / 210000) */
+    uint64_t subsidy = 5000000000ULL >> (height / 210000);
+
+    /* Fees = coinbase output - subsidy.  If output <= subsidy, skip (likely no fee txs). */
+    if (total_out <= subsidy) return 0;
+    uint64_t total_fees = total_out - subsidy;
+
+    /* Conservative weight = block_len * 4 (no witness data distinction) */
+    uint64_t block_weight = (uint64_t)block_len * 4;
+    if (block_weight == 0) return 0;
+
+    /* avg_sat_per_kvb = total_fees * 4000 / block_weight */
+    if (total_fees > UINT64_MAX / 4000) return 0;  /* overflow guard */
+    uint64_t avg = total_fees * 4000 / block_weight;
+    if (avg < 1000) avg = 1000;  /* floor at 1 sat/vB */
+    return avg;
+}
+
 /* -------------------------------------------------------------------------
  * SipHash-2-4
  * Used by BIP 158 to hash filter elements into [0, N*M).
@@ -198,6 +302,81 @@ static size_t read_varint(const unsigned char *data, size_t len, uint64_t *out)
 }
 
 /* -------------------------------------------------------------------------
+ * Bit writer (MSB-first) for Golomb-Rice encoding
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    unsigned char *data;
+    size_t         cap;   /* capacity in bytes */
+    size_t         pos;   /* current bit position */
+} bit_writer_t;
+
+static void bit_writer_init(bit_writer_t *w, unsigned char *data, size_t cap)
+{
+    w->data = data;
+    w->cap  = cap;
+    w->pos  = 0;
+    memset(data, 0, cap);
+}
+
+/* Write one bit (MSB-first). Returns 0 on success, -1 on overflow. */
+static int write_bit(bit_writer_t *w, int bit)
+{
+    size_t byte_pos = w->pos / 8;
+    if (byte_pos >= w->cap) return -1;
+    if (bit) w->data[byte_pos] |= (uint8_t)(1 << (7 - (w->pos % 8)));
+    w->pos++;
+    return 0;
+}
+
+/* Write p bits of val (MSB-first). Returns 0 on success, -1 on overflow. */
+static int write_bits(bit_writer_t *w, uint64_t val, int p)
+{
+    for (int i = p - 1; i >= 0; i--) {
+        if (write_bit(w, (int)((val >> i) & 1)) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Golomb-Rice encode one delta value. Returns 0 on success, -1 on overflow. */
+static int golomb_rice_encode(bit_writer_t *w, uint64_t delta)
+{
+    uint64_t q = delta >> BIP158_P;
+    uint64_t r = delta & ((1ULL << BIP158_P) - 1);
+    /* Unary quotient: q one-bits followed by a zero-bit */
+    for (uint64_t i = 0; i < q; i++) {
+        if (write_bit(w, 1) < 0) return -1;
+    }
+    if (write_bit(w, 0) < 0) return -1;
+    /* P-bit remainder */
+    return write_bits(w, r, BIP158_P);
+}
+
+/* Write a Bitcoin varint into buf (capacity cap). Returns bytes written or 0. */
+static size_t write_varint(unsigned char *buf, size_t cap, uint64_t val)
+{
+    if (val < 0xfd) {
+        if (cap < 1) return 0;
+        buf[0] = (uint8_t)val;
+        return 1;
+    } else if (val <= 0xffff) {
+        if (cap < 3) return 0;
+        buf[0] = 0xfd; buf[1] = (uint8_t)val; buf[2] = (uint8_t)(val >> 8);
+        return 3;
+    } else if (val <= 0xffffffff) {
+        if (cap < 5) return 0;
+        buf[0] = 0xfe;
+        for (int i = 0; i < 4; i++) buf[1+i] = (uint8_t)(val >> (i*8));
+        return 5;
+    } else {
+        if (cap < 9) return 0;
+        buf[0] = 0xff;
+        for (int i = 0; i < 8; i++) buf[1+i] = (uint8_t)(val >> (i*8));
+        return 9;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Test-only export: wraps the static bip158_hash so unit tests can compute
  * expected hash values without duplicating the SipHash implementation.
  * ------------------------------------------------------------------------- */
@@ -274,6 +453,75 @@ int bip158_gcs_match_any(const unsigned char *filter_data, size_t filter_len,
 
     free(qhash);
     return found;
+}
+
+/* -------------------------------------------------------------------------
+ * GCS encoder (Phase 6) — builds a BIP 158 compact filter from scripts.
+ *
+ * Takes an array of bip158_script_t elements, sorts and Golomb-Rice encodes
+ * the SipHash values into out_buf.  Output format:
+ *   varint(N) || packed Golomb-Rice bitstream
+ * which is exactly the payload expected by bip158_gcs_match_any after the
+ * leading varint(N) has been stripped.
+ *
+ * key16:    first 16 bytes of the block hash (SipHash key, internal byte order)
+ * out_cap:  must be at least bip158_gcs_build_size(n) bytes
+ *
+ * Returns bytes written, or 0 on error (buffer too small, allocation failure).
+ * ------------------------------------------------------------------------- */
+
+size_t bip158_gcs_build_size(size_t n)
+{
+    /* Conservative upper bound: varint(N) + n * (max_quotient_bits + P + 1).
+     * For N < 0xfd the varint is 1 byte.  Each element's GCS word is at most
+     * (F/n) >> P ≈ M bits of unary quotient plus P+1 bits, where M=784931≈20
+     * bits.  Round up generously: varint(N) + n*(P+22) bits → bytes. */
+    size_t vi  = (n < 0xfd) ? 1 : (n <= 0xffff) ? 3 : 5;
+    size_t bits = (n == 0) ? 0 : n * (size_t)(BIP158_P + 22);
+    return vi + (bits + 7) / 8 + 8;  /* +8 for alignment slack */
+}
+
+size_t bip158_gcs_build(const bip158_script_t *scripts, size_t n,
+                         const unsigned char *key16,
+                         unsigned char *out_buf, size_t out_cap)
+{
+    if (!out_buf || out_cap == 0) return 0;
+
+    /* Guard against overflow: F = n * M */
+    if (n > UINT64_MAX / BIP158_M) return 0;
+    uint64_t F = (n > 0) ? (uint64_t)n * BIP158_M : 0;
+
+    /* Hash all scripts into [0, F) */
+    uint64_t *vals = NULL;
+    if (n > 0) {
+        vals = malloc(n * sizeof(uint64_t));
+        if (!vals) return 0;
+        for (size_t i = 0; i < n; i++)
+            vals[i] = bip158_hash(key16, scripts[i].spk, scripts[i].spk_len, F);
+        qsort(vals, n, sizeof(uint64_t), cmp_uint64);
+    }
+
+    /* Write varint(N) */
+    size_t vi_len = write_varint(out_buf, out_cap, (uint64_t)n);
+    if (vi_len == 0) { free(vals); return 0; }
+
+    /* Golomb-Rice encode sorted deltas */
+    bit_writer_t w;
+    bit_writer_init(&w, out_buf + vi_len, out_cap - vi_len);
+
+    uint64_t prev = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (golomb_rice_encode(&w, vals[i] - prev) < 0) {
+            free(vals);
+            return 0;
+        }
+        prev = vals[i];
+    }
+
+    free(vals);
+
+    size_t bytes_written = (w.pos + 7) / 8;
+    return vi_len + bytes_written;
 }
 
 /* -------------------------------------------------------------------------
@@ -421,6 +669,109 @@ static int cb_unregister_script(chain_backend_t *self,
         }
     }
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * BIP 158 filter header checkpoints
+ *
+ * Hard-coded known-good filter header values at fixed block heights.
+ * Source: lightninglabs/neutrino chainsync/filtercontrol.go
+ * Byte order: little-endian (wire / internal Bitcoin hash order).
+ *
+ * These let us detect a malicious peer that tries to serve a fabricated
+ * filter header chain from genesis.  Any mismatch causes peer disconnect.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    int32_t height;
+    uint8_t filter_header[32];
+} bip158_cp_t;
+
+static const bip158_cp_t mainnet_checkpoints[] = {
+    { 100000, {0xa5,0x7f,0xaa,0x53,0x41,0xbe,0x06,0x6a,0xa2,0x04,0xe4,0x1f,0x47,0x31,0x3a,0xb7,
+               0xab,0x63,0x97,0xf5,0x8b,0xfe,0xb5,0xb7,0x01,0xeb,0x69,0xb3,0x1a,0xbc,0x8c,0xf2} },
+    { 200000, {0xb3,0x32,0x0f,0x4c,0x8e,0x6b,0x04,0x95,0x6b,0xe0,0xe8,0x6a,0xc5,0xd5,0x00,0x33,
+               0x41,0xc1,0xac,0x03,0x6a,0x5f,0xa2,0xe7,0xbf,0x4f,0x2f,0x73,0x71,0x14,0x03,0xe5} },
+    { 300000, {0x5b,0xaa,0xf8,0xbf,0x19,0xe7,0x51,0xbb,0x8d,0xa9,0x2b,0x45,0x8c,0xb3,0xed,0xbf,
+               0xa9,0xd9,0x2d,0x1d,0xc9,0x43,0x31,0xca,0x29,0xe9,0xdd,0xfc,0x20,0x02,0xd5,0x1b} },
+    { 400000, {0x3a,0x2e,0x19,0xef,0x78,0x5f,0xc6,0x62,0xb2,0xb3,0xed,0x56,0x16,0x0f,0x26,0x7a,
+               0x31,0x2e,0xfb,0xa8,0xc1,0xc1,0xee,0x0d,0xc7,0x69,0xc5,0xf1,0xb1,0x3a,0x97,0x5d} },
+    { 500000, {0x3c,0x1a,0x63,0xaa,0xca,0x07,0xa8,0x00,0x42,0xa4,0x59,0x5a,0x09,0x8b,0xe3,0x1b,
+               0x66,0xfb,0x99,0x3f,0xb6,0x79,0xc2,0x9b,0x0a,0xdc,0x9b,0x3c,0x29,0xca,0x16,0x5d} },
+    { 600000, {0xf8,0x98,0x75,0x37,0x4e,0x20,0x0e,0xf7,0x5e,0x51,0xab,0xb2,0xb4,0xf5,0x17,0x68,
+               0x0c,0x0e,0x14,0x47,0x25,0x46,0x60,0xa8,0x86,0x43,0x2f,0x0b,0x4d,0x85,0xe0,0xbd} },
+    { 660000, {0x32,0x30,0xd3,0x4a,0xfa,0x78,0x74,0x4f,0xf9,0x83,0x74,0xbb,0x34,0x9a,0xc1,0x50,
+               0xb3,0xfe,0x43,0x84,0xe8,0x8e,0xfa,0x17,0x2b,0x08,0xbc,0xfa,0x75,0x23,0x31,0x08} },
+};
+
+static const bip158_cp_t testnet3_checkpoints[] = {
+    { 100000,  {0x1c,0x5a,0xb6,0x58,0x2c,0xd0,0x06,0x2b,0x27,0xfd,0xf3,0xb5,0x76,0xe7,0x37,0x59,
+                0x52,0xcc,0xd8,0x0a,0x25,0x33,0xd1,0xfc,0x27,0x56,0x62,0x14,0x3f,0x63,0xc0,0x97} },
+    { 200000,  {0x87,0xcc,0x38,0xcc,0x8e,0x10,0x81,0x90,0x6e,0x28,0xa7,0x73,0x37,0xbc,0x84,0xaf,
+                0x6c,0x73,0xa5,0xb1,0x16,0x36,0x10,0xcf,0xcd,0x3a,0xbe,0x5a,0x7e,0x81,0xaa,0x51} },
+    { 400000,  {0x48,0x7c,0x83,0xfa,0x9d,0x02,0xc3,0x36,0x42,0xcf,0x5d,0x39,0xe8,0xc1,0xfd,0x2b,
+                0x40,0xc4,0x36,0x8b,0xa0,0x48,0xcd,0xcf,0x85,0xcd,0x12,0x43,0x3d,0x9b,0xab,0x4a} },
+    { 600000,  {0x5d,0xb5,0x53,0x97,0x91,0xa6,0x1a,0x13,0x51,0x2d,0x5a,0xb9,0x97,0x62,0xc3,0x51,
+                0xb9,0x5c,0x87,0xb6,0xaa,0x85,0x9e,0x73,0xa0,0xdb,0xe2,0x98,0x91,0x9c,0x3d,0x71} },
+    { 800000,  {0x99,0x5b,0x32,0xf8,0x64,0x9d,0x0b,0x14,0xc6,0xcf,0x98,0x80,0x68,0xe8,0xa5,0x72,
+                0x9a,0x5e,0x1f,0x4b,0xb1,0x20,0xc1,0x93,0x02,0xa7,0x69,0x72,0xf2,0xdf,0xaf,0x0d} },
+    { 1000000, {0x5f,0x9c,0xda,0x78,0xf3,0x55,0x11,0xe3,0x02,0xc3,0x62,0x6b,0xd8,0x2e,0x30,0x36,
+                0x7f,0x18,0x43,0xf7,0x84,0x55,0x2c,0x8d,0x8f,0x5f,0xeb,0xf6,0xa2,0x3f,0x04,0xc2} },
+    { 1400000, {0xb3,0xd9,0x42,0x05,0x93,0x07,0x59,0x57,0x3e,0x8d,0xcb,0xde,0x46,0xaf,0x86,0x28,
+                0x93,0xed,0x1d,0x6b,0x61,0x12,0x25,0xe8,0x8c,0x4c,0x3d,0x48,0x50,0x17,0xae,0xf9} },
+    { 1500000, {0x90,0x50,0xbc,0x94,0x93,0x78,0x4b,0xca,0xb2,0x16,0x50,0x29,0x0b,0x86,0x55,0x42,
+                0xdb,0xeb,0x75,0x2f,0x53,0xe7,0xdb,0xb8,0xf9,0x9d,0xf0,0xda,0x13,0xfa,0x0c,0xdc} },
+};
+
+static const bip158_cp_t *get_checkpoints(const char *network, size_t *count)
+{
+    if (strcmp(network, "mainnet") == 0) {
+        *count = sizeof(mainnet_checkpoints) / sizeof(mainnet_checkpoints[0]);
+        return mainnet_checkpoints;
+    }
+    if (strcmp(network, "testnet3") == 0 || strcmp(network, "testnet") == 0) {
+        *count = sizeof(testnet3_checkpoints) / sizeof(testnet3_checkpoints[0]);
+        return testnet3_checkpoints;
+    }
+    *count = 0;
+    return NULL;
+}
+
+/*
+ * After a batch of filter headers has been stored into the ring buffer,
+ * verify any hard-coded checkpoints whose heights fall within
+ * [start_height, start_height + n).
+ *
+ * Returns 1 if all in-range checkpoints match, 0 on mismatch.
+ * On mismatch, the peer connection is closed so the caller can reconnect.
+ */
+int bip158_verify_filter_checkpoints(bip158_backend_t *b,
+                                      int start_height, int n)
+{
+    size_t cp_count;
+    const bip158_cp_t *cps = get_checkpoints(b->network, &cp_count);
+    if (!cps) return 1;  /* no checkpoints for this network */
+
+    for (size_t i = 0; i < cp_count; i++) {
+        int32_t ch = cps[i].height;
+        if (ch < start_height || ch >= start_height + n) continue;
+        const uint8_t *stored = b->filter_headers[ch % BIP158_HEADER_WINDOW];
+        if (memcmp(stored, cps[i].filter_header, 32) != 0) {
+            fprintf(stderr,
+                    "BIP158: checkpoint mismatch at height %d — "
+                    "disconnecting peer\n", (int)ch);
+            p2p_close(&b->p2p);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int bip158_backend_checkpoint_count(const char *network)
+{
+    size_t count = 0;
+    get_checkpoints(network ? network : "", &count);
+    return (int)count;
 }
 
 /* -------------------------------------------------------------------------
@@ -589,17 +940,6 @@ static void scan_tx_callback(const char *txid_hex,
     }
 }
 
-/* Convert 32 internal-byte-order bytes to a 64-char display-order hex string. */
-static void bytes_to_hash_hex(const uint8_t in32[32], char out65[65])
-{
-    static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < 32; i++) {
-        out65[(31 - i) * 2]     = hx[(in32[i] >> 4) & 0xf];
-        out65[(31 - i) * 2 + 1] = hx[in32[i] & 0xf];
-    }
-    out65[64] = '\0';
-}
-
 /*
  * Sync block header hashes into the ring buffer via P2P getheaders/headers.
  * Issues up to-2000-header round trips until the peer stops sending more.
@@ -648,6 +988,117 @@ static int bip158_sync_headers(bip158_backend_t *b)
 
     free(new_hashes);
     return result;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 6: conflict resolution — verify a peer's filter header by downloading
+ * the block, collecting output scripts, and recomputing the filter locally.
+ *
+ * Called when a peer returns a filter header that differs from the value
+ * already stored in the ring buffer (i.e., from a previous peer connection).
+ *
+ * Returns 1 if the current peer's header is correct (stored value updated).
+ * Returns 0 if the current peer's header is wrong or cannot be verified
+ *           (peer is disconnected so the caller can rotate to the next one).
+ *
+ * Limitation: only output scripts are available here; input prevout scripts
+ * require a UTXO set which a light client does not have.  A mismatch of even
+ * the outputs is conclusive evidence of a bad peer; when the computed header
+ * matches neither stored nor peer, we disconnect conservatively.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    bip158_script_t *scripts;
+    size_t           n;
+    size_t           cap;
+} collect_scripts_ctx_t;
+
+static void collect_scripts_cb(const char *txid_hex,
+                                size_t n_outputs,
+                                const unsigned char **spks,
+                                const size_t *spk_lens,
+                                void *ctx)
+{
+    collect_scripts_ctx_t *c = ctx;
+    (void)txid_hex;
+    for (size_t i = 0; i < n_outputs; i++) {
+        /* BIP 158: skip OP_RETURN outputs (0x6a prefix) */
+        if (spk_lens[i] > 0 && spks[i][0] == 0x6a) continue;
+        if (spk_lens[i] > sizeof(c->scripts[0].spk)) continue;
+        if (c->n >= c->cap) continue;
+        memcpy(c->scripts[c->n].spk, spks[i], spk_lens[i]);
+        c->scripts[c->n].spk_len = spk_lens[i];
+        c->n++;
+    }
+}
+
+static int bip158_resolve_conflict(bip158_backend_t *b, int height,
+                                    const uint8_t peer_hdr[32])
+{
+    const uint8_t *stored     = b->filter_headers[height % BIP158_HEADER_WINDOW];
+    const uint8_t *block_hash = b->header_hashes[height % BIP158_HEADER_WINDOW];
+
+    /* Download the block from the current peer */
+    if (!p2p_send_getdata_block(&b->p2p, block_hash)) goto disconnect;
+
+    uint8_t *block_data = NULL;
+    size_t   block_len  = 0;
+    if (p2p_recv_block(&b->p2p, &block_data, &block_len) != 1) goto disconnect;
+
+    /* Collect output scripts (OP_RETURN excluded) */
+    collect_scripts_ctx_t cctx;
+    cctx.cap     = 4096;
+    cctx.scripts = malloc(cctx.cap * sizeof(bip158_script_t));
+    cctx.n       = 0;
+    if (!cctx.scripts) { free(block_data); goto disconnect; }
+
+    p2p_scan_block_txs(block_data, block_len, collect_scripts_cb, &cctx);
+    free(block_data);
+
+    /* Build the compact filter from collected scripts */
+    size_t filter_cap = bip158_gcs_build_size(cctx.n);
+    uint8_t *filter = malloc(filter_cap);
+    if (!filter) { free(cctx.scripts); goto disconnect; }
+
+    size_t filter_len = bip158_gcs_build(cctx.scripts, cctx.n,
+                                          block_hash, filter, filter_cap);
+    free(cctx.scripts);
+
+    if (filter_len == 0) { free(filter); goto disconnect; }
+
+    /* Compute the filter header locally */
+    uint8_t prev_fh[32] = {0};
+    if (height > 0)
+        memcpy(prev_fh, b->filter_headers[(height - 1) % BIP158_HEADER_WINDOW], 32);
+
+    uint8_t local_hdr[32];
+    bip158_compute_filter_header(filter, filter_len, prev_fh, local_hdr);
+    free(filter);
+
+    /* local == stored → peer's header is wrong; disconnect peer */
+    if (memcmp(local_hdr, stored, 32) == 0) {
+        fprintf(stderr, "BIP158: conflict at height %d — peer header wrong, "
+                "disconnecting\n", height);
+        p2p_close(&b->p2p);
+        return 0;
+    }
+
+    /* local == peer → stored value was wrong; update and trust peer */
+    if (memcmp(local_hdr, peer_hdr, 32) == 0) {
+        fprintf(stderr, "BIP158: conflict at height %d — updating stored "
+                "header from peer\n", height);
+        memcpy(b->filter_headers[height % BIP158_HEADER_WINDOW], peer_hdr, 32);
+        return 1;
+    }
+
+    /* Neither matches — likely because we lack prevout scripts; disconnect
+     * the current peer conservatively */
+    fprintf(stderr, "BIP158: conflict at height %d — cannot verify "
+            "(no prevouts available), disconnecting\n", height);
+
+disconnect:
+    p2p_close(&b->p2p);
+    return 0;
 }
 
 /*
@@ -709,6 +1160,26 @@ static int bip158_sync_filter_headers(bip158_backend_t *b, int tip_height)
             }
         }
 
+        /* Detect conflicts: compare new headers against previously-stored
+         * values at heights we have already processed from an earlier peer.
+         * On mismatch, download the block to arbitrate (Phase 6). */
+        for (size_t i = 0; i < count; i++) {
+            int height = start + (int)i;
+            if (height <= b->filter_headers_synced) {
+                /* We already have this height from a previous peer connection */
+                const uint8_t *new_hdr = hdrs + i * 32;
+                if (memcmp(b->filter_headers[height % BIP158_HEADER_WINDOW],
+                           new_hdr, 32) != 0) {
+                    int ok = bip158_resolve_conflict(b, height, new_hdr);
+                    if (!ok) {
+                        free(hdrs);
+                        result = -1;
+                        goto done;
+                    }
+                }
+            }
+        }
+
         for (size_t i = 0; i < count; i++) {
             int height = start + (int)i;
             memcpy(b->filter_headers[height % BIP158_HEADER_WINDOW],
@@ -717,9 +1188,17 @@ static int bip158_sync_filter_headers(bip158_backend_t *b, int tip_height)
         }
         free(hdrs);
         result = b->filter_headers_synced;
+
+        /* Verify hard-coded checkpoints for this batch */
+        if (!bip158_verify_filter_checkpoints(b, start, (int)count)) {
+            result = -1;
+            break;
+        }
+
         if ((int)count < 2000) break;
     }
 
+done:
     return result;
 }
 
@@ -741,6 +1220,15 @@ static void compute_filter_header(const uint8_t *filter_bytes, size_t filter_len
     memcpy(combined,      filter_hash,      32);
     memcpy(combined + 32, prev_filter_hdr,  32);
     sha256_double(combined, 64, out);
+}
+
+/* Public wrapper — exposed for unit testing and bip158_resolve_conflict(). */
+void bip158_compute_filter_header(const unsigned char *filter_bytes,
+                                   size_t filter_len,
+                                   const unsigned char prev_filter_hdr[32],
+                                   unsigned char out[32])
+{
+    compute_filter_header(filter_bytes, filter_len, prev_filter_hdr, out);
 }
 
 /*
@@ -765,7 +1253,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
 
     regtest_t *rt = (regtest_t *)backend->rpc_ctx;
 
-    if (backend->p2p.fd < 0 && !rt) return -1;
+    if (backend->p2p.fd < 0 && !rt && backend->n_peers == 0) return -1;
     if (!backend->n_scripts) return 0;
 
     /* Determine chain tip — P2P path syncs headers + filter headers.
@@ -793,7 +1281,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
             p2p_close(&backend->p2p);
     }
     if (tip < 0) {
-        if (!rt) return -1;
+        if (!rt) return 0;  /* P2P tip not yet available; caller retries on next poll */
         tip = regtest_get_block_height(rt);
         if (tip < 0) return -1;
     }
@@ -877,6 +1365,16 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                            (p2p_block_scan_cb_t)scan_tx_callback,
                                            &sc);
                         block_scanned = 1;
+
+                        /* Extract fee sample from coinbase for fee estimator */
+                        if (backend->fee_estimator && blen > 80 + 4 + 1) {
+                            uint64_t sample = bip158_extract_block_fee_sample(
+                                blk, blen, (uint32_t)bh);
+                            if (sample > 0)
+                                fee_estimator_blocks_add_sample(
+                                    (fee_estimator_blocks_t *)backend->fee_estimator,
+                                    sample);
+                        }
                     } else if (br < 0) {
                         p2p_close(&backend->p2p);
                     }
@@ -884,13 +1382,8 @@ int bip158_backend_scan(bip158_backend_t *backend)
                 } else {
                     p2p_close(&backend->p2p);
                 }
-                /* RPC fallback if P2P block download didn't complete */
-                if (!block_scanned && rt) {
-                    char hash_hex[65];
-                    bytes_to_hash_hex(recv_hash, hash_hex);
-                    regtest_scan_block_txs(rt, hash_hex, scan_tx_callback, &sc);
-                    block_scanned = 1;
-                }
+                if (!block_scanned)
+                    fprintf(stderr, "BIP158: block %d P2P download failed, skipping\n", bh);
                 if (sc.found) matched++;
                 else if (!block_scanned) matched++;  /* false positive — tentative */
                 backend->tip_height = bh;
@@ -899,8 +1392,8 @@ int bip158_backend_scan(bip158_backend_t *backend)
             if (!batch_ok) break;
             h = batch_end + 1;
         }
-    } else {
-        /* === RPC path === */
+    } else if (backend->p2p.fd < 0 && rt) {
+        /* === RPC path (no P2P connection) === */
         for (int h = start; h <= tip; h++) {
             char          hash_hex[65];
             size_t        filter_len = 0;
@@ -982,6 +1475,25 @@ void bip158_backend_add_peer(bip158_backend_t *backend,
     backend->n_peers++;
 }
 
+/* -------------------------------------------------------------------------
+ * Host:port string parser (shared utility for LSP and client binaries)
+ * ------------------------------------------------------------------------- */
+
+int bip158_parse_host_port(const char *arg,
+                            char *host_out, size_t host_cap,
+                            int *port_out)
+{
+    if (!arg || !host_out || !port_out) return 0;
+    const char *colon = strrchr(arg, ':');
+    if (!colon || colon == arg) return 0;
+    size_t hlen = (size_t)(colon - arg);
+    if (hlen >= host_cap) return 0;
+    memcpy(host_out, arg, hlen);
+    host_out[hlen] = '\0';
+    *port_out = atoi(colon + 1);
+    return (*port_out > 0 && *port_out <= 65535);
+}
+
 int bip158_backend_reconnect(bip158_backend_t *backend)
 {
     if (!backend || backend->n_peers == 0) return 0;
@@ -999,9 +1511,25 @@ int bip158_backend_reconnect(bip158_backend_t *backend)
                 h, p, idx + 1, backend->n_peers);
         if (p2p_connect(&backend->p2p, h, p, backend->network)) {
             backend->current_peer = idx;
-            fprintf(stderr, "BIP158: reconnected to %s:%d\n", h, p);
+            fprintf(stderr, "BIP158: reconnected to %s:%d (services=0x%llx, feefilter=%llu sat/kvB)\n",
+                    h, p, (unsigned long long)backend->p2p.peer_services,
+                    (unsigned long long)backend->p2p.peer_feefilter_sat_per_kvb);
+            /* Update fee estimator floor with peer's feefilter */
+            if (backend->fee_estimator &&
+                backend->p2p.peer_feefilter_sat_per_kvb > 0) {
+                fee_estimator_blocks_set_floor(
+                    (fee_estimator_blocks_t *)backend->fee_estimator,
+                    backend->p2p.peer_feefilter_sat_per_kvb);
+            }
             return 1;
         }
     }
     return 0;
+}
+
+void bip158_backend_set_fee_estimator(bip158_backend_t *backend,
+                                       fee_estimator_t *fe)
+{
+    if (!backend) return;
+    backend->fee_estimator = fe;
 }

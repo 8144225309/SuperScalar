@@ -625,9 +625,9 @@ int test_regtest_cpfp_penalty_bump(void) {
 
     /* Test watchtower anchor init on regtest */
     watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, &rt, &fee, NULL);
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fee, NULL);
     TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor SPK initialized");
     printf("  Watchtower P2A anchor SPK set successfully\n");
 
@@ -686,9 +686,9 @@ int test_regtest_breach_penalty_cpfp(void) {
     if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
     if (!secp256k1_keypair_pub(ctx, &client_pk, &kps[1])) return 0;
 
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : fund_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -776,7 +776,7 @@ int test_regtest_breach_penalty_cpfp(void) {
 
     /* --- Client watchtower: register old commitment #0 for monitoring --- */
     watchtower_t wt;
-    watchtower_init(&wt, 1, &rt, &fe, NULL);
+    watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
     watchtower_set_channel(&wt, 0, &client_ch);
     TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor initialized");
 
@@ -905,9 +905,9 @@ int test_regtest_watchtower_mempool_detection(void) {
     if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
     if (!secp256k1_keypair_pub(ctx, &client_pk, &kps[1])) return 0;
 
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : fund_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -984,7 +984,7 @@ int test_regtest_watchtower_mempool_detection(void) {
 
     /* Register commitment #0 with watchtower */
     watchtower_t wt;
-    watchtower_init(&wt, 1, &rt, &fe, NULL);
+    watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
     watchtower_set_channel(&wt, 0, &client_ch);
 
     tx_buf_t remote_commit0;
@@ -1082,9 +1082,9 @@ int test_regtest_watchtower_late_detection(void) {
     if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
     if (!secp256k1_keypair_pub(ctx, &client_pk, &kps[1])) return 0;
 
-    fee_estimator_t fe;
-    fee_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
     uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : fund_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -1163,7 +1163,7 @@ int test_regtest_watchtower_late_detection(void) {
 
     /* Register commitment #0 with watchtower */
     watchtower_t wt;
-    watchtower_init(&wt, 1, &rt, &fe, NULL);
+    watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
     watchtower_set_channel(&wt, 0, &client_ch);
 
     tx_buf_t remote_commit0;
@@ -1216,7 +1216,7 @@ int test_regtest_watchtower_late_detection(void) {
     return 1;
 }
 
-/* Test fee_update_from_node against real bitcoind.
+/* Test fee_estimator_rpc_t against real bitcoind.
    On fresh regtest, estimatesmartfee returns errors (insufficient data).
    After generating some transactions, it may return a valid feerate.
    Either way, this exercises the real JSON parsing path. */
@@ -1234,25 +1234,18 @@ int test_regtest_fee_estimation_parsing(void) {
     if (!regtest_fund_from_faucet(&rt, 0.1))
         regtest_mine_blocks(&rt, 101, mine_addr);
 
-    fee_estimator_t fe;
-    fee_init(&fe, 5000);  /* 5 sat/vB default */
-    TEST_ASSERT(fe.fee_rate_sat_per_kvb == 5000, "initial rate");
+    fee_estimator_rpc_t fe;
+    fee_estimator_rpc_init(&fe, &rt);
 
     /* estimatesmartfee on fresh regtest typically returns errors (insufficient
-       data) — verify the function handles this gracefully (returns 0, rate
-       unchanged). */
-    int updated = fee_update_from_node(&fe, &rt, 6);
-    if (!updated) {
-        /* Expected: insufficient data, rate unchanged */
-        TEST_ASSERT(fe.fee_rate_sat_per_kvb == 5000,
-                    "rate unchanged on insufficient data");
+       data) — verify get_rate handles this gracefully (returns 0). */
+    uint64_t rate = fe.base.get_rate(&fe.base, FEE_TARGET_NORMAL);
+    if (rate == 0) {
         printf("  estimatesmartfee returned insufficient data (expected on fresh regtest)\n");
     } else {
-        /* If we got a rate, verify it's reasonable (clamped >= 1000) */
-        TEST_ASSERT(fe.fee_rate_sat_per_kvb >= 1000,
-                    "rate clamped to minimum 1000");
+        TEST_ASSERT(rate >= 1000, "rate clamped to minimum 1000");
         printf("  estimatesmartfee returned rate: %llu sat/kvB\n",
-               (unsigned long long)fe.fee_rate_sat_per_kvb);
+               (unsigned long long)rate);
     }
 
     /* Generate some transactions to give estimatesmartfee data */
@@ -1263,23 +1256,24 @@ int test_regtest_fee_estimation_parsing(void) {
     }
     regtest_mine_blocks(&rt, 6, mine_addr);
 
-    /* Try again — may or may not have enough data depending on bitcoind version */
-    fee_estimator_t fe2;
-    fee_init(&fe2, 9999);
-    updated = fee_update_from_node(&fe2, &rt, 6);
-    if (updated) {
-        TEST_ASSERT(fe2.fee_rate_sat_per_kvb >= 1000,
-                    "updated rate at least 1000");
-        printf("  After txs: rate=%llu sat/kvB\n",
-               (unsigned long long)fe2.fee_rate_sat_per_kvb);
+    /* Try again — may or may not have enough data depending on bitcoind version.
+       Force refresh by resetting the last_updated timestamp. */
+    fee_estimator_rpc_t fe2;
+    fee_estimator_rpc_init(&fe2, &rt);
+    uint64_t rate2 = fe2.base.get_rate(&fe2.base, FEE_TARGET_NORMAL);
+    if (rate2 > 0) {
+        TEST_ASSERT(rate2 >= 1000, "updated rate at least 1000");
+        printf("  After txs: rate=%llu sat/kvB\n", (unsigned long long)rate2);
     } else {
         printf("  Still insufficient data (normal on regtest)\n");
     }
 
-    /* Verify fee calculation helpers work with either rate */
-    uint64_t penalty_fee = fee_for_penalty_tx(&fe);
+    /* Verify fee calculation helpers work with either estimator */
+    fee_estimator_static_t sfe;
+    fee_estimator_static_init(&sfe, 5000);
+    uint64_t penalty_fee = fee_for_penalty_tx(&sfe.base);
     TEST_ASSERT(penalty_fee > 0, "penalty fee > 0");
-    uint64_t commit_fee = fee_for_commitment_tx(&fe, 2);
+    uint64_t commit_fee = fee_for_commitment_tx(&sfe.base, 2);
     TEST_ASSERT(commit_fee > penalty_fee, "commitment with HTLCs > penalty");
     printf("  Fee calcs: penalty=%llu, commitment(2htlc)=%llu\n",
            (unsigned long long)penalty_fee, (unsigned long long)commit_fee);
