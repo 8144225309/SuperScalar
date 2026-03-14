@@ -25,6 +25,14 @@
 #define LSPS_ERR_INVALID_PARAMS   (-32602)
 #define LSPS_ERR_INTERNAL_ERROR   (-32603)
 
+/* Context passed from the server message loop into the LSPS handler.
+   Required so lsps2.buy can call jit_channel_create(). */
+typedef struct {
+    void  *mgr;          /* lsp_channel_mgr_t * */
+    void  *lsp;          /* lsp_t * */
+    size_t client_idx;   /* index of requesting client in lsp->client_fds */
+} lsps_ctx_t;
+
 /*
  * Parse an incoming LSPS JSON-RPC request.
  * Returns the method name string (points into json, do not free separately).
@@ -48,12 +56,12 @@ cJSON *lsps_build_error(int id, int code, const char *message);
 
 /*
  * Dispatch an LSPS request to the appropriate handler.
- * lsp_ctx: opaque LSP manager context (lsp_t * or similar).
+ * ctx: LSPS context with mgr, lsp, and client_idx (may be NULL for testing).
  * fd: client connection file descriptor for sending responses.
  * json: the parsed JSON-RPC request object.
  * Returns 1 if handled, 0 if unknown method.
  */
-int lsps_handle_request(void *lsp_ctx, int fd, const cJSON *json);
+int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json);
 
 /* -----------------------------------------------------------------------
  * LSPS1 — Channel purchase API

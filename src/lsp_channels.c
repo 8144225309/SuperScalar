@@ -1,6 +1,8 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/jit_channel.h"
+#include "superscalar/lsps.h"
+#include "superscalar/splice.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
@@ -2191,6 +2193,76 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("LSP: discarding stale PTLC_ADAPTED_SIG from client %zu\n",
                client_idx);
         return 1;
+
+    case MSG_STFU: {
+        /* Quiescence request from client: acknowledge with STFU_ACK */
+        lsp_channel_entry_t *entry = &mgr->entries[client_idx];
+        entry->channel.channel_quiescent = 1;
+        cJSON *ack = wire_build_splice_ack(entry->channel_id, 0);
+        int fd = (lsp && client_idx < lsp->n_clients)
+                     ? lsp->client_fds[client_idx] : -1;
+        if (ack && fd >= 0)
+            wire_send(fd, MSG_STFU_ACK, ack);
+        cJSON_Delete(ack);
+        printf("LSP: client %zu sent STFU, channel %u quiescent\n",
+               client_idx, entry->channel_id);
+        return 1;
+    }
+
+    case MSG_SPLICE_INIT: {
+        /* Initiator sent splice proposal: parse and send SPLICE_ACK */
+        uint32_t channel_id = 0;
+        uint64_t new_funding_amount = 0;
+        unsigned char new_spk[34];
+        size_t new_spk_len = 0;
+        if (!wire_parse_splice_init(msg->json, &channel_id,
+                                      &new_funding_amount,
+                                      new_spk, &new_spk_len, sizeof(new_spk))) {
+            fprintf(stderr, "LSP: invalid SPLICE_INIT from client %zu\n", client_idx);
+            return 0;
+        }
+        /* Mark channel quiescent for splice */
+        mgr->entries[client_idx].channel.channel_quiescent = 1;
+        /* Send SPLICE_ACK with no additional contribution */
+        cJSON *ack = wire_build_splice_ack(channel_id, 0);
+        int fd = (lsp && client_idx < lsp->n_clients)
+                     ? lsp->client_fds[client_idx] : -1;
+        if (ack && fd >= 0)
+            wire_send(fd, MSG_SPLICE_ACK, ack);
+        cJSON_Delete(ack);
+        printf("LSP: SPLICE_INIT from client %zu: new_funding=%llu\n",
+               client_idx, (unsigned long long)new_funding_amount);
+        return 1;
+    }
+
+    case MSG_SPLICE_LOCKED: {
+        /* Both sides confirmed: apply splice update */
+        uint32_t channel_id = 0;
+        unsigned char new_txid[32];
+        uint32_t new_vout = 0;
+        if (!wire_parse_splice_locked(msg->json, &channel_id,
+                                        new_txid, &new_vout)) {
+            fprintf(stderr, "LSP: invalid SPLICE_LOCKED from client %zu\n", client_idx);
+            return 0;
+        }
+        channel_t *ch = &mgr->entries[client_idx].channel;
+        /* amount stays the same unless we tracked it — use existing funding amount */
+        channel_apply_splice_update(ch, new_txid, new_vout, ch->funding_amount);
+        printf("LSP: SPLICE_LOCKED applied for client %zu, channel %u\n",
+               client_idx, channel_id);
+        return 1;
+    }
+
+    case MSG_LSPS_REQUEST: {
+        lsps_ctx_t lsps_ctx = {
+            .mgr        = mgr,
+            .lsp        = lsp,
+            .client_idx = client_idx,
+        };
+        int fd = (lsp && client_idx < lsp->n_clients)
+                     ? lsp->client_fds[client_idx] : -1;
+        return lsps_handle_request(&lsps_ctx, fd, msg->json);
+    }
 
     case MSG_ERROR: {
         cJSON *m = msg->json ? cJSON_GetObjectItem(msg->json, "message") : NULL;

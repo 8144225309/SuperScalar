@@ -116,7 +116,7 @@ int test_lsps2_get_info(void)
     return 1;
 }
 
-/* Test E6: lsps2.buy with valid opening_fee_params succeeds */
+/* Test E6: lsps2.buy with valid opening_fee_params succeeds (parse only) */
 int test_lsps2_buy_creates_jit(void)
 {
     cJSON *params = cJSON_CreateObject();
@@ -134,5 +134,44 @@ int test_lsps2_buy_creates_jit(void)
     ASSERT(fee == 1000, "fee from opening_fee_params.min_fee_msat");
 
     cJSON_Delete(params);
+    return 1;
+}
+
+/* Phase 2 fix: new LSPS context / NULL-safety tests */
+
+/* Test E7: NULL ctx on lsps2.buy returns error response (not segfault) */
+int test_lsps_null_ctx_returns_error(void)
+{
+    /* Build a well-formed lsps2.buy request */
+    cJSON *req = cJSON_CreateObject();
+    ASSERT(req != NULL, "create request");
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps2.buy");
+    cJSON_AddNumberToObject(req, "id", 7);
+    cJSON *params = cJSON_CreateObject();
+    cJSON *ofp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ofp, "min_fee_msat", 1000);
+    cJSON_AddItemToObject(params, "opening_fee_params", ofp);
+    cJSON_AddNumberToObject(params, "payment_size_msat", 5000000);
+    cJSON_AddItemToObject(req, "params", params);
+
+    /* Call with NULL ctx and fd=-1: should return 1 (handled), not segfault */
+    int ret = lsps_handle_request(NULL, -1, req);
+    ASSERT(ret == 1, "lsps2.buy with NULL ctx should return 1 (handled with error response)");
+
+    cJSON_Delete(req);
+    return 1;
+}
+
+/* Test E8: malformed JSON (not an object) returns 0 */
+int test_lsps_malformed_json_returns_zero(void)
+{
+    cJSON *arr = cJSON_CreateArray();
+    ASSERT(arr != NULL, "create array");
+
+    int ret = lsps_handle_request(NULL, -1, arr);
+    ASSERT(ret == 0, "malformed JSON (array) should return 0");
+
+    cJSON_Delete(arr);
     return 1;
 }
