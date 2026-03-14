@@ -24,7 +24,7 @@ static uint64_t blocks_get_rate(fee_estimator_t *self, fee_target_t target)
 
     /* Copy samples into a sorted temporary array */
     int n = fe->n_samples < FEE_BLOCKS_SAMPLES ? fe->n_samples : FEE_BLOCKS_SAMPLES;
-    uint64_t sorted[FEE_BLOCKS_SAMPLES];
+    uint64_t sorted[FEE_BLOCKS_SAMPLES] = {0};
     for (int i = 0; i < n; i++) {
         /* Read from ring buffer: most recent = cursor-1, oldest = cursor-n (mod) */
         int idx = ((fe->cursor - n + i) + FEE_BLOCKS_SAMPLES) % FEE_BLOCKS_SAMPLES;
