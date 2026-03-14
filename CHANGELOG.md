@@ -6,6 +6,14 @@ All notable changes to SuperScalar are documented here.
 
 ### Added
 
+- **Async factory rotation** (`--async-rotation`): The LSP can now coordinate factory rotation without requiring all N clients to be online simultaneously. When the factory enters the DYING state, the LSP pushes a `QUEUE_REQ_ROTATION` work item into each client's pending queue and sends a push notification. As clients reconnect and poll their queue (via `MSG_QUEUE_POLL` / `MSG_QUEUE_ITEMS` / `MSG_QUEUE_DONE`), they acknowledge the rotation request and the LSP marks them ready. The MuSig2 ceremony fires automatically once all N clients are ready. If the factory expires before all clients reconnect, partial rotation is attempted with the ready subset (≥ 2 signers). Urgency escalates from `LOW → NORMAL → HIGH → CRITICAL` as the deadline approaches. Companion flags: `--notify-webhook URL` (HTTP POST notifications) and `--notify-exec SCRIPT` (external script). Without `--async-rotation`, the existing synchronous blocking rotation path is unchanged.
+- **Wire protocol: queue coordination messages** (`MSG_QUEUE_POLL` 0x65, `MSG_QUEUE_ITEMS` 0x66, `MSG_QUEUE_DONE` 0x67): Three new message types for client/LSP pending-work coordination. `wire_build_queue_items()` serializes `queue_entry_t[]` to JSON; `wire_parse_queue_done()` parses client acknowledgement IDs.
+- **`lsp_queue` module** (`src/lsp_queue.c`): SQLite-backed pending work queue with per-client, per-factory, per-request-type deduplication (UNIQUE constraint with `ON CONFLICT REPLACE` for urgency escalation). Supports push, drain, get, delete, expire, and count operations.
+- **`notify` module** (`src/notify.c`): Pluggable push notification backend. Three backends: `notify_init_log` (stdout, default), `notify_init_webhook` (HTTP POST), `notify_init_exec` (external script). Safe to call with `NULL` (no-op).
+- **`readiness` module** (`src/readiness.c`): Bitmap-based per-client readiness tracker. Tracks connected/ready state independently; `readiness_all_ready()` fires when every client has both connected and acknowledged their rotation queue item. `readiness_compute_urgency()` maps blocks-remaining to `QUEUE_URGENCY_*` levels. Supports SQLite persistence via `readiness_save()`/`readiness_load()`.
+
+
+
 - **CI: ARM64 build and unit test job**: GitHub Actions now builds and runs all 418 unit tests on `linux/arm64` via Docker on every push to main. CI job count increases from 7 to 8.
 - **Dashboard: 5 missing DB tables** (`tools/dashboard.py`): queries `broadcast_log`, `signing_progress`, `watchtower_pending`, `old_commitment_htlcs`, and `factory_revocation_secrets` — bringing dashboard coverage to all 26 schema tables.
 - **Dashboard: Signing Progress UI** (Factory tab): per-signer MuSig2 nonce/partial-sig collection status with progress bars per tree node.

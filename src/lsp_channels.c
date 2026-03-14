@@ -8,6 +8,9 @@
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
+#include "superscalar/lsp_queue.h"
+#include "superscalar/readiness.h"
+#include "superscalar/notify.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2197,6 +2200,53 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;  /* close the connection */
     }
 
+    case MSG_QUEUE_POLL: {
+        /* Client is polling for pending work items. Drain the queue and reply. */
+        persist_t *db = (persist_t *)mgr->persist;
+        queue_entry_t entries[16];
+        size_t n = 0;
+        if (db)
+            n = queue_drain(db, (uint32_t)client_idx, entries, 16);
+        cJSON *items_json = wire_build_queue_items(entries, n);
+        if (!wire_send(lsp->client_fds[client_idx], MSG_QUEUE_ITEMS, items_json)) {
+            cJSON_Delete(items_json);
+            return 0;
+        }
+        cJSON_Delete(items_json);
+        return 1;
+    }
+
+    case MSG_QUEUE_DONE: {
+        /* Client has processed a set of queue items; delete them from the queue
+           and, if any were QUEUE_REQ_ROTATION, mark this client as ready. */
+        uint64_t ids[64];
+        size_t count = 0;
+        if (!wire_parse_queue_done(msg->json, ids, 64, &count))
+            return 0;
+
+        persist_t *db = (persist_t *)mgr->persist;
+        int has_rotation_ack = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (db) {
+                queue_entry_t entry;
+                if (queue_get(db, ids[i], &entry) &&
+                    entry.request_type == QUEUE_REQ_ROTATION)
+                    has_rotation_ack = 1;
+                queue_delete(db, ids[i]);
+            }
+        }
+
+        if (has_rotation_ack && mgr->readiness) {
+            readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
+            readiness_set_ready(rt, (uint32_t)client_idx, QUEUE_REQ_ROTATION);
+            printf("LSP: client %zu acknowledged rotation — %zu/%zu ready\n",
+                   client_idx,
+                   (size_t)readiness_count_ready(rt),
+                   rt->n_clients);
+        }
+        return 1;
+    }
+
     default:
         fprintf(stderr, "LSP: unexpected msg 0x%02x from client %zu\n",
                 msg->msg_type, client_idx);
@@ -2617,6 +2667,10 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
+
+    if (mgr->readiness)
+        readiness_set_connected((readiness_tracker_t *)mgr->readiness,
+                                (uint32_t)c, 1);
 
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);
@@ -3219,6 +3273,29 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     }
                                 }
 
+                                /* Async rotation: handle EXPIRED with partial ready set.
+                                   DYING → EXPIRED means the window closed; rotate
+                                   with whoever showed up (n_ready >= 2). */
+                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                    old_states[fi] == FACTORY_DYING &&
+                                    mgr->readiness) {
+                                    readiness_tracker_t *rt =
+                                        (readiness_tracker_t *)mgr->readiness;
+                                    size_t n_ready = (size_t)readiness_count_ready(rt);
+                                    if (n_ready >= 2 && n_ready < rt->n_clients) {
+                                        printf("LSP: factory %u EXPIRED — partial rotation "
+                                               "with %zu/%zu ready clients\n",
+                                               lf->factory_id, n_ready, rt->n_clients);
+                                        fflush(stdout);
+                                        lsp_channels_rotate_factory(mgr, lsp);
+                                    } else if (n_ready < 2) {
+                                        printf("LSP: factory %u EXPIRED — only %zu client(s) ready,"
+                                               " cannot partial-rotate (need >= 2)\n",
+                                               lf->factory_id, n_ready);
+                                    }
+                                    readiness_reset(rt);
+                                }
+
                                 /* Auto-rotate when factory enters DYING
                                    (or jumps directly to EXPIRED, skipping DYING
                                     — can happen if blocks mine faster than poll) */
@@ -3236,26 +3313,57 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         uint32_t ridx = lf->factory_id % 8;
                                         mgr->rot_retry_count[ridx] = 0;
                                         mgr->rot_last_attempt_block[ridx] = 0;
-                                        int ok = lsp_channels_rotate_factory(mgr, lsp);
-                                        /* Reset offline timers — rotation involves client
-                                           communication that doesn't go through the
-                                           daemon loop's message handler */
-                                        {
-                                            time_t tnow = time(NULL);
-                                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
-                                                mgr->entries[rc].last_message_time = tnow;
-                                                mgr->entries[rc].offline_detected = 0;
+
+                                        if (mgr->readiness) {
+                                            /* Async path: queue rotation request for all clients,
+                                               mark already-connected ones, fire fast-path if all
+                                               are already present. */
+                                            readiness_tracker_t *rt =
+                                                (readiness_tracker_t *)mgr->readiness;
+                                            readiness_init(rt, lf->factory_id,
+                                                           lsp->n_clients,
+                                                           (persist_t *)mgr->persist);
+                                            persist_t *db = (persist_t *)mgr->persist;
+                                            notify_t *nfy = (notify_t *)mgr->notify;
+                                            for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+                                                if (lsp->client_fds[ci] >= 0)
+                                                    readiness_set_connected(rt, (uint32_t)ci, 1);
+                                                if (db)
+                                                    queue_push(db, (uint32_t)ci,
+                                                               lf->factory_id,
+                                                               QUEUE_REQ_ROTATION,
+                                                               QUEUE_URGENCY_NORMAL,
+                                                               0,
+                                                               "{\"reason\":\"factory_dying\"}");
+                                                notify_send(nfy, (uint32_t)ci,
+                                                            NOTIFY_ROTATION_NEEDED,
+                                                            QUEUE_URGENCY_NORMAL, NULL);
                                             }
-                                        }
-                                        if (ok) {
-                                            printf("LSP: auto-rotation complete — new factory active\n");
-                                            fflush(stdout);
-                                            lsp_rotation_record_success(mgr, lf->factory_id);
+                                            /* Fast path: fire immediately if all already here */
+                                            lsp_check_rotation_readiness(mgr, lsp);
                                         } else {
-                                            fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
-                                                    lf->factory_id);
-                                            lsp_rotation_record_failure(mgr, lf->factory_id,
-                                                                        (uint32_t)height);
+                                            /* Legacy synchronous path */
+                                            int ok = lsp_channels_rotate_factory(mgr, lsp);
+                                            /* Reset offline timers — rotation involves client
+                                               communication that doesn't go through the
+                                               daemon loop's message handler */
+                                            {
+                                                time_t tnow = time(NULL);
+                                                for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                                    mgr->entries[rc].last_message_time = tnow;
+                                                    mgr->entries[rc].offline_detected = 0;
+                                                }
+                                            }
+                                            if (ok) {
+                                                printf("LSP: auto-rotation complete — new factory active\n");
+                                                fflush(stdout);
+                                                lsp_rotation_record_success(mgr, lf->factory_id);
+                                            } else {
+                                                fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
+                                                        lf->factory_id);
+                                                lsp_rotation_record_failure(mgr, lf->factory_id,
+                                                                            (uint32_t)height);
+                                            }
                                         }
                                     }
 
@@ -3429,6 +3537,41 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
             }
 
+            /* Async rotation: fire ceremony if all clients ready;
+               escalate urgency for missing clients when factory is DYING. */
+            if (mgr->readiness && mgr->ladder && mgr->watchtower && mgr->watchtower->rt) {
+                readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
+                ladder_t *lad = (ladder_t *)mgr->ladder;
+                ladder_factory_t *lf = ladder_get_by_id(lad, rt->factory_id);
+                if (lf && lf->cached_state == FACTORY_DYING) {
+                    /* Try to fire ceremony */
+                    if (lsp_check_rotation_readiness(mgr, lsp)) {
+                        /* Ceremony fired — skip escalation */
+                    } else {
+                        /* Escalate urgency for missing clients */
+                        int bh = regtest_get_block_height(mgr->watchtower->rt);
+                        if (bh > 0) {
+                            uint32_t blocks_left = factory_blocks_until_expired(
+                                &lf->factory, (uint32_t)bh);
+                            int urgency = readiness_compute_urgency(
+                                blocks_left, lf->factory.dying_blocks);
+                            uint32_t missing[FACTORY_MAX_SIGNERS];
+                            size_t n_missing = readiness_get_missing(
+                                rt, missing, FACTORY_MAX_SIGNERS);
+                            persist_t *db = (persist_t *)mgr->persist;
+                            notify_t *nfy = (notify_t *)mgr->notify;
+                            for (size_t mi = 0; mi < n_missing; mi++) {
+                                if (db)
+                                    queue_push(db, missing[mi], rt->factory_id,
+                                               QUEUE_REQ_ROTATION, urgency, 0, NULL);
+                                notify_send(nfy, missing[mi],
+                                            NOTIFY_ROTATION_NEEDED, urgency, NULL);
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Heartbeat: periodic daemon status line */
             if (mgr->heartbeat_interval > 0) {
                 time_t now = time(NULL);
@@ -3574,6 +3717,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP daemon: client %zu disconnected\n", c);
                 wire_close(lsp->client_fds[c]);
                 lsp->client_fds[c] = -1;
+                if (mgr->readiness)
+                    readiness_clear((readiness_tracker_t *)mgr->readiness,
+                                    (uint32_t)c);
                 continue;
             }
 
