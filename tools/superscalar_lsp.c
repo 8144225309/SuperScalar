@@ -21,6 +21,8 @@
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/readiness.h"
 #include "superscalar/notify.h"
+#include "superscalar/splice.h"
+#include "superscalar/musig.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,6 +113,9 @@ static void usage(const char *prog) {
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
+        "  --test-splice       After demo: splice-out channel[0] by 10k sats, broadcast, confirm\n"
+        "  --test-splice-client-seckey HEX  Client[0] secret key for test-only MuSig2 signing\n"
+        "  --test-lightclient  Run in BIP 157/158 light-client mode and verify filter sync\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
@@ -710,6 +715,8 @@ int main(int argc, char *argv[]) {
     int test_distrib = 0;
     int test_turnover = 0;
     int test_rotation = 0;
+    int test_splice = 0;
+    const char *test_splice_client_seckey = NULL;  /* hex seckey for test signing */
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
@@ -898,6 +905,10 @@ int main(int argc, char *argv[]) {
             test_dw_exhibition = 1;
         else if (strcmp(argv[i], "--test-bridge") == 0)
             test_bridge = 1;
+        else if (strcmp(argv[i], "--test-splice") == 0)
+            test_splice = 1;
+        else if (strcmp(argv[i], "--test-splice-client-seckey") == 0 && i + 1 < argc)
+            test_splice_client_seckey = argv[++i];
         else if (strcmp(argv[i], "--confirm-timeout") == 0 && i + 1 < argc) {
             confirm_timeout_arg = atoi(argv[++i]);
             if (confirm_timeout_arg <= 0) {
@@ -2240,7 +2251,7 @@ int main(int argc, char *argv[]) {
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
-        test_dual_factory || test_dw_exhibition) {
+        test_dual_factory || test_dw_exhibition || test_splice) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -5476,6 +5487,276 @@ int main(int argc, char *argv[]) {
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
+    }
+
+    /* === Phase E-splice: LSP-initiated splice-out test === */
+    if (test_splice && channels_active) {
+        printf("\n=== SPLICE TEST ===\n");
+
+        if (n_clients < 1) {
+            fprintf(stderr, "SPLICE TEST: requires at least 1 client\n");
+            goto splice_done;
+        }
+
+        int sp_fd = lsp.client_fds[0];
+
+        /* ---- Step 1: Quiescence ---- */
+        printf("Step 1: sending STFU to client[0]\n");
+        {
+            cJSON *stfu = cJSON_CreateObject();
+            if (!stfu) { fprintf(stderr, "SPLICE TEST: OOM\n"); goto splice_done; }
+            cJSON_AddNumberToObject(stfu, "channel_id", 0);
+            wire_send(sp_fd, MSG_STFU, stfu);
+            cJSON_Delete(stfu);
+        }
+
+        wire_msg_t sp_msg;
+        if (!wire_recv(sp_fd, &sp_msg) || sp_msg.msg_type != MSG_STFU_ACK) {
+            fprintf(stderr, "SPLICE TEST: expected STFU_ACK, got 0x%02x\n", sp_msg.msg_type);
+            if (sp_msg.json) cJSON_Delete(sp_msg.json);
+            goto splice_done;
+        }
+        cJSON_Delete(sp_msg.json);
+        printf("  STFU_ACK received, channel quiescent\n");
+
+        /* ---- Step 2: Compute 2-of-2 P2TR SPKs ----
+         * Current SPK (pre-splice UTXO) and new SPK (post-splice output).
+         * For this test both use the same key-path aggregate; the splice-out
+         * just reduces the amount by 10 000 sats. */
+        secp256k1_pubkey sp_lsp_pubkey;
+        secp256k1_keypair_pub(ctx, &sp_lsp_pubkey, &lsp_kp);
+
+        unsigned char sp_current_spk[34];  /* P2TR SPK of the UTXO being spliced */
+        unsigned char sp_new_spk[34];      /* P2TR SPK of the new channel output  */
+        if (!splice_compute_funding_spk(ctx, sp_current_spk,
+                                          &sp_lsp_pubkey, &lsp.client_pubkeys[0]) ||
+            !splice_compute_funding_spk(ctx, sp_new_spk,
+                                          &sp_lsp_pubkey, &lsp.client_pubkeys[0])) {
+            fprintf(stderr, "SPLICE TEST: splice_compute_funding_spk failed\n");
+            goto splice_done;
+        }
+
+        /* Splice-out: 50 000 sats in → 40 000 sats out (10 000 removed) */
+        uint64_t sp_current_amount = 50000;
+        uint64_t sp_new_amount     = 40000;
+
+        /* ---- Step 2a: Fund a standalone on-chain 2-of-2 UTXO ----
+         * SuperScalar factory channels are off-chain tree nodes; they have no
+         * independent on-chain UTXO until force-closed.  For the splice test we
+         * create a dedicated UTXO on regtest so the splice tx has a real input. */
+        char sp_fund_addr[128] = {0};
+        /* Bytes [2..33] of a P2TR SPK are the 32-byte tweaked x-only pubkey */
+        if (!regtest_derive_p2tr_address(&rt, sp_current_spk + 2,
+                                           sp_fund_addr, sizeof(sp_fund_addr))) {
+            fprintf(stderr, "SPLICE TEST: derive_p2tr_address failed\n");
+            goto splice_done;
+        }
+        char sp_fund_txid_hex[65] = {0};
+        printf("Step 2a: funding splice UTXO: %s\n", sp_fund_addr);
+        if (!regtest_fund_address(&rt, sp_fund_addr,
+                                    (double)sp_current_amount / 1e8,
+                                    sp_fund_txid_hex)) {
+            fprintf(stderr, "SPLICE TEST: fund_address failed\n");
+            goto splice_done;
+        }
+        /* Confirm with 1 block */
+        char sp_pre_mine_addr[128] = {0};
+        regtest_get_new_address(&rt, sp_pre_mine_addr, sizeof(sp_pre_mine_addr));
+        regtest_mine_blocks(&rt, 1, sp_pre_mine_addr);
+
+        /* Locate the correct vout by matching the SPK */
+        uint32_t sp_fund_vout = 0;
+        uint64_t sp_funded_sats = 0;
+        {
+            unsigned char got_spk[64]; size_t got_len = 0;
+            int found = 0;
+            for (uint32_t v = 0; v < 4 && !found; v++) {
+                if (regtest_get_tx_output(&rt, sp_fund_txid_hex, v,
+                                           &sp_funded_sats, got_spk, &got_len)) {
+                    if (got_len == 34 &&
+                        memcmp(got_spk, sp_current_spk, 34) == 0) {
+                        sp_fund_vout = v;
+                        found = 1;
+                    }
+                }
+            }
+            if (!found) {
+                fprintf(stderr, "SPLICE TEST: funded vout not found\n");
+                goto splice_done;
+            }
+        }
+        printf("  funded UTXO: %s:%u (%llu sats)\n",
+               sp_fund_txid_hex, sp_fund_vout,
+               (unsigned long long)sp_funded_sats);
+
+        /* Convert display txid → internal byte order */
+        unsigned char sp_fund_txid[32];
+        for (int i = 0; i < 32; i++) {
+            unsigned int b;
+            sscanf(sp_fund_txid_hex + 2*(31-i), "%02x", &b);
+            sp_fund_txid[i] = (unsigned char)b;
+        }
+
+        /* Build keyagg for the 2-of-2 channel (matches splice_compute_funding_spk) */
+        secp256k1_pubkey sp_agg_pks[2];
+        sp_agg_pks[0] = sp_lsp_pubkey;
+        sp_agg_pks[1] = lsp.client_pubkeys[0];
+        musig_keyagg_t sp_keyagg;
+        if (!musig_aggregate_keys(ctx, &sp_keyagg, sp_agg_pks, 2)) {
+            fprintf(stderr, "SPLICE TEST: musig_aggregate_keys failed\n");
+            goto splice_done;
+        }
+
+        /* ---- Step 3: SPLICE_INIT ---- */
+        printf("Step 3: sending SPLICE_INIT: new_funding=%llu sats\n",
+               (unsigned long long)sp_new_amount);
+        {
+            cJSON *sinit = wire_build_splice_init(0, sp_new_amount, sp_new_spk, 34);
+            if (!sinit) { fprintf(stderr, "SPLICE TEST: OOM\n"); goto splice_done; }
+            wire_send(sp_fd, MSG_SPLICE_INIT, sinit);
+            cJSON_Delete(sinit);
+        }
+
+        if (!wire_recv(sp_fd, &sp_msg) || sp_msg.msg_type != MSG_SPLICE_ACK) {
+            fprintf(stderr, "SPLICE TEST: expected SPLICE_ACK, got 0x%02x\n", sp_msg.msg_type);
+            if (sp_msg.json) cJSON_Delete(sp_msg.json);
+            goto splice_done;
+        }
+        cJSON_Delete(sp_msg.json);
+        printf("  SPLICE_ACK received\n");
+
+        /* ---- Step 4: Build unsigned splice tx ---- */
+        tx_buf_t sp_unsigned;
+        tx_buf_init(&sp_unsigned, 256);
+        if (!splice_build_funding_tx(&sp_unsigned, sp_fund_txid,
+                                       sp_fund_vout, sp_new_amount,
+                                       sp_new_spk)) {
+            fprintf(stderr, "SPLICE TEST: splice_build_funding_tx failed\n");
+            tx_buf_free(&sp_unsigned);
+            goto splice_done;
+        }
+
+        /* ---- Step 5: Sign the splice tx (all-local 2-of-2 MuSig2) ----
+         * In production each party exchanges a partial signature over the wire.
+         * In this test we perform all-local signing using both keypairs together.
+         * The client seckey defaults to 0x22*32 (the deterministic test key used
+         * by manual_tests.py start_clients).  Pass --test-splice-client-seckey
+         * to override if a different seckey was used. */
+        unsigned char sp_client_seckey[32];
+        if (test_splice_client_seckey) {
+            for (int i = 0; i < 32; i++) {
+                unsigned int byte;
+                sscanf(test_splice_client_seckey + 2*i, "%02x", &byte);
+                sp_client_seckey[i] = (unsigned char)byte;
+            }
+        } else {
+            memset(sp_client_seckey, 0x22, 32);
+        }
+        secp256k1_keypair sp_client_kp;
+        if (!secp256k1_keypair_create(ctx, &sp_client_kp, sp_client_seckey)) {
+            fprintf(stderr, "SPLICE TEST: invalid client seckey\n");
+            tx_buf_free(&sp_unsigned);
+            goto splice_done;
+        }
+
+        unsigned char sp_sighash[32];
+        if (!compute_taproot_sighash(sp_sighash,
+                                       sp_unsigned.data, sp_unsigned.len,
+                                       0,                     /* input index */
+                                       sp_current_spk, 34,    /* prevout SPK */
+                                       sp_funded_sats,        /* prevout amount */
+                                       0xFFFFFFFD)) {          /* RBF nsequence */
+            fprintf(stderr, "SPLICE TEST: sighash failed\n");
+            tx_buf_free(&sp_unsigned);
+            goto splice_done;
+        }
+
+        secp256k1_keypair sp_kps[2] = { lsp_kp, sp_client_kp };
+        unsigned char sp_sig64[64];
+        if (!musig_sign_taproot(ctx, sp_sig64, sp_sighash,
+                                  sp_kps, 2, &sp_keyagg, NULL)) {
+            fprintf(stderr, "SPLICE TEST: musig_sign_taproot failed\n");
+            tx_buf_free(&sp_unsigned);
+            goto splice_done;
+        }
+
+        tx_buf_t sp_signed;
+        tx_buf_init(&sp_signed, sp_unsigned.len + 80);
+        if (!finalize_signed_tx(&sp_signed, sp_unsigned.data, sp_unsigned.len, sp_sig64)) {
+            fprintf(stderr, "SPLICE TEST: finalize_signed_tx failed\n");
+            tx_buf_free(&sp_unsigned); tx_buf_free(&sp_signed);
+            goto splice_done;
+        }
+        tx_buf_free(&sp_unsigned);
+
+        /* ---- Step 6: Broadcast and confirm ---- */
+        char *sp_tx_hex = malloc(sp_signed.len * 2 + 1);
+        if (!sp_tx_hex) { tx_buf_free(&sp_signed); goto splice_done; }
+        hex_encode(sp_signed.data, sp_signed.len, sp_tx_hex);
+        tx_buf_free(&sp_signed);
+
+        char sp_splice_txid[65] = {0};
+        printf("Step 6: broadcasting splice tx\n");
+        if (!regtest_send_raw_tx(&rt, sp_tx_hex, sp_splice_txid)) {
+            fprintf(stderr, "SPLICE TEST: broadcast failed\n");
+            free(sp_tx_hex);
+            goto splice_done;
+        }
+        free(sp_tx_hex);
+
+        char sp_mine_addr[128] = {0};
+        regtest_get_new_address(&rt, sp_mine_addr, sizeof(sp_mine_addr));
+        regtest_mine_blocks(&rt, 3, sp_mine_addr);
+        printf("  splice tx confirmed: %s\n", sp_splice_txid);
+
+        /* ---- Step 7: Decode display txid → internal byte order ---- */
+        unsigned char sp_txid_internal[32];
+        for (int i = 0; i < 32; i++) {
+            unsigned int byte;
+            sscanf(sp_splice_txid + 2*(31 - i), "%02x", &byte);
+            sp_txid_internal[i] = (unsigned char)byte;
+        }
+
+        /* ---- Step 8: SPLICE_LOCKED exchange ---- */
+        printf("Step 8: sending SPLICE_LOCKED\n");
+        {
+            cJSON *slocked = wire_build_splice_locked(0, sp_txid_internal, 0);
+            if (!slocked) { fprintf(stderr, "SPLICE TEST: OOM\n"); goto splice_done; }
+            wire_send(sp_fd, MSG_SPLICE_LOCKED, slocked);
+            cJSON_Delete(slocked);
+        }
+
+        if (!wire_recv(sp_fd, &sp_msg) || sp_msg.msg_type != MSG_SPLICE_LOCKED) {
+            fprintf(stderr, "SPLICE TEST: expected SPLICE_LOCKED echo, got 0x%02x\n",
+                    sp_msg.msg_type);
+            if (sp_msg.json) cJSON_Delete(sp_msg.json);
+            goto splice_done;
+        }
+        cJSON_Delete(sp_msg.json);
+
+        /* ---- Step 9: Apply channel update on LSP side ---- */
+        channel_t *sp_ch = &mgr->entries[0].channel;
+        channel_apply_splice_update(sp_ch, sp_txid_internal, 0, sp_new_amount);
+        printf("  LSP channel updated: funding_amount=%llu sats\n",
+               (unsigned long long)sp_ch->funding_amount);
+
+        printf("\n=== SPLICE TEST PASSED ===\n");
+        report_add_string(&rpt, "result", "splice_test_complete");
+        report_add_string(&rpt, "splice_txid", sp_splice_txid);
+        report_close(&rpt);
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 0;
+
+    splice_done:
+        fprintf(stderr, "SPLICE TEST FAILED\n");
+        report_add_string(&rpt, "result", "splice_test_failed");
+        report_close(&rpt);
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
     }
 
     /* === Phase 5: Cooperative close === */
