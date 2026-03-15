@@ -166,8 +166,11 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
 
     if (!wire_parse_commitment_signed(msg->json, &channel_id,
                                         &commitment_number, partial_sig32,
-                                        &nonce_index))
+                                        &nonce_index)) {
+        fprintf(stderr, "Client: wire_parse_commitment_signed failed (cn=%llu)\n",
+                (unsigned long long)ch->commitment_number);
         return 0;
+    }
 
     /* Phase 12: Verify LSP's partial sig and aggregate into full sig.
        The client now holds a valid, broadcastable commitment tx. */
@@ -194,6 +197,9 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     int ok = wire_send(fd, MSG_REVOKE_AND_ACK, ack);
     cJSON_Delete(ack);
     memset(rev_secret, 0, 32);
+    if (!ok)
+        fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
+                (unsigned long long)ch->commitment_number);
     return ok;
 }
 

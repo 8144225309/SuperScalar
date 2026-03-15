@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #ifdef __linux__
 #include <execinfo.h>
 #endif
@@ -3536,35 +3537,46 @@ int main(int argc, char *argv[]) {
                 wire_send(lsp.client_fds[dest_client], MSG_CREATE_INVOICE, inv_req);
                 cJSON_Delete(inv_req);
 
-                wire_msg_t inv_resp;
-                if (!wire_recv_timeout(lsp.client_fds[dest_client], &inv_resp, 10) ||
-                    inv_resp.msg_type != MSG_INVOICE_CREATED) {
-                    fprintf(stderr, "BRIDGE TEST: no INVOICE_CREATED from client\n");
-                    close(bridge_test_fd); close(lsp_bridge_fd);
-                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
-                    secp256k1_context_destroy(ctx); return 1;
-                }
-                cJSON *hash_j = cJSON_GetObjectItem(inv_resp.json, "payment_hash");
-                if (hash_j && hash_j->valuestring)
-                    hex_decode(hash_j->valuestring, test_hash, 32);
-                cJSON_Delete(inv_resp.json);
-            }
-
-            /* Drain MSG_REGISTER_INVOICE from client */
-            {
-                wire_msg_t drain;
-                while (wire_recv_timeout(lsp.client_fds[dest_client], &drain, 1)) {
-                    if (drain.msg_type == MSG_REGISTER_INVOICE) {
+                /* Wait for INVOICE_CREATED, handling REGISTER_INVOICE that
+                   may arrive in any order.  Stale REGISTER_INVOICE messages
+                   from prior payment rounds can arrive before the fresh
+                   INVOICE_CREATED, so loop until both are received or the
+                   10-second window expires. */
+                int got_invoice_created = 0, got_register_invoice = 0;
+                struct timeval _t0, _tnow;
+                gettimeofday(&_t0, NULL);
+                while (1) {
+                    gettimeofday(&_tnow, NULL);
+                    int _elapsed = (int)(_tnow.tv_sec - _t0.tv_sec);
+                    int _remaining = 10 - _elapsed;
+                    if (_remaining <= 0) break;
+                    wire_msg_t m;
+                    if (!wire_recv_timeout(lsp.client_fds[dest_client], &m, _remaining))
+                        break;
+                    if (m.msg_type == MSG_INVOICE_CREATED && !got_invoice_created) {
+                        cJSON *hash_j = cJSON_GetObjectItem(m.json, "payment_hash");
+                        if (hash_j && hash_j->valuestring)
+                            hex_decode(hash_j->valuestring, test_hash, 32);
+                        got_invoice_created = 1;
+                    } else if (m.msg_type == MSG_REGISTER_INVOICE && !got_register_invoice) {
                         unsigned char rh[32] = {0}, rp[32] = {0};
-                        cJSON *rhj = cJSON_GetObjectItem(drain.json, "payment_hash");
-                        cJSON *rpj = cJSON_GetObjectItem(drain.json, "preimage");
+                        cJSON *rhj = cJSON_GetObjectItem(m.json, "payment_hash");
+                        cJSON *rpj = cJSON_GetObjectItem(m.json, "preimage");
                         if (rhj && rhj->valuestring) hex_decode(rhj->valuestring, rh, 32);
                         if (rpj && rpj->valuestring) hex_decode(rpj->valuestring, rp, 32);
                         lsp_channels_register_invoice(mgr, rh, rp, dest_client, amount_msat);
                         memcpy(test_preimage, rp, 32);
+                        got_register_invoice = 1;
                     }
-                    cJSON_Delete(drain.json);
-                    break;
+                    cJSON_Delete(m.json);
+                    if (got_invoice_created && got_register_invoice)
+                        break;
+                }
+                if (!got_invoice_created) {
+                    fprintf(stderr, "BRIDGE TEST: no INVOICE_CREATED from client\n");
+                    close(bridge_test_fd); close(lsp_bridge_fd);
+                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
                 }
             }
             printf("Bridge: invoice registered for client %zu (amount=%llu msat)\n",
