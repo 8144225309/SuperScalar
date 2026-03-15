@@ -16,7 +16,7 @@
  * UTXO tracking: SQLite hd_utxos table updated by block scanning callbacks.
  *
  * Usage:
- *   1. wallet_source_hd_init(&ws, seed, seed_len, ctx, db, bip158, "mainnet")
+ *   1. wallet_source_hd_init(&ws, seed, seed_len, ctx, db, bip158, "mainnet", HD_WALLET_LOOKAHEAD)
  *   2. watchtower_set_wallet(&wt, &ws.base)
  *   3. bip158_backend_set_utxo_cb(&backend, ws.utxo_found_cb, ws.utxo_spent_cb, &ws)
  *   4. Fund at least one address from ws.spks[0..lookahead-1]
@@ -36,8 +36,9 @@ typedef struct {
 
     /* Pre-derived scriptPubKeys for UTXO scan registration.
      * spks[i] = P2TR SPK for path m/86'/coin_type'/0'/i' */
-    unsigned char      spks[HD_WALLET_LOOKAHEAD][34];
-    uint32_t           n_spks;  /* <= HD_WALLET_LOOKAHEAD */
+    unsigned char    (*spks)[34];   /* heap-allocated, size = lookahead */
+    uint32_t           n_spks;
+    uint32_t           lookahead;   /* number of pre-derived addresses */
 } wallet_source_hd_t;
 
 /*
@@ -57,7 +58,8 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
                            secp256k1_context *ctx,
                            persist_t *db,
                            bip158_backend_t *bip158,
-                           const char *network);
+                           const char *network,
+                           uint32_t lookahead);
 
 /*
  * Derive the P2TR scriptPubKey and tweaked secret key for address index i.

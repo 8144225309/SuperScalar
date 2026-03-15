@@ -1045,3 +1045,117 @@ int test_p2p_connect_accepts_cf(void)
     ASSERT(conn.peer_services & NODE_COMPACT_FILTERS, "peer_services should have CF bit set");
     return 1;
 }
+
+/* -----------------------------------------------------------------------
+ * Phase B: PoW / nBits header chain validation tests
+ * --------------------------------------------------------------------- */
+
+/* Test B1: mainnet genesis header — SHA256d < target → valid */
+int test_pow_validate_mainnet_genesis(void)
+{
+    /* Mainnet genesis block header (80 bytes, little-endian fields) */
+    static const uint8_t genesis[80] = {
+        /* nVersion = 1 */
+        0x01, 0x00, 0x00, 0x00,
+        /* hashPrevBlock = 32 zeros */
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        /* hashMerkleRoot */
+        0x3b,0xa3,0xed,0xfd,0x7a,0x7b,0x12,0xb2,
+        0x7a,0xc7,0x2c,0x3e,0x67,0x76,0x8f,0x61,
+        0x7f,0xc8,0x1b,0xc3,0x88,0x8a,0x51,0x32,
+        0x3a,0x9f,0xb8,0xaa,0x4b,0x1e,0x5e,0x4a,
+        /* nTime = 1231006505 = 0x495FAB29 LE */
+        0x29,0xab,0x5f,0x49,
+        /* nBits = 0x1d00ffff LE */
+        0xff,0xff,0x00,0x1d,
+        /* nNonce = 2083236893 = 0x7C2BAC1D LE */
+        0x1d,0xac,0x2b,0x7c,
+    };
+
+    ASSERT(p2p_validate_header_pow(genesis) == 1,
+           "genesis header should pass PoW check");
+    return 1;
+}
+
+/* Test B2: fabricated header with nNonce=0 — hash >> target → invalid */
+int test_pow_validate_fabricated(void)
+{
+    uint8_t fake[80];
+    memset(fake, 0, 80);
+    /* nVersion = 1 */
+    fake[0] = 0x01;
+    /* nBits = 0x1d00ffff (same as genesis but nonce=0 → bad hash) */
+    fake[72] = 0xff; fake[73] = 0xff; fake[74] = 0x00; fake[75] = 0x1d;
+    /* nNonce = 0 (no valid nonce, hash will not meet target) */
+
+    ASSERT(p2p_validate_header_pow(fake) == 0,
+           "fabricated header (nonce=0) should fail PoW check");
+    return 1;
+}
+
+/* Test B3: valid difficulty transition — same nBits (1x) → accepted */
+int test_pow_difficulty_transition_valid(void)
+{
+    /* Both periods use 0x1d00ffff (genesis difficulty, 1x factor) */
+    uint32_t old_bits = 0x1d00ffff;
+    uint32_t new_bits = 0x1d00ffff;
+    ASSERT(p2p_validate_difficulty_transition(old_bits, new_bits, 1209600) == 1,
+           "same nBits (1x) should pass transition check");
+
+    /* 2x relaxation: exponent+0, mantissa doubled — should also pass */
+    uint32_t new_bits_2x = 0x1d01fffe; /* roughly 2x easier */
+    ASSERT(p2p_validate_difficulty_transition(old_bits, new_bits_2x, 1209600) == 1,
+           "2x relaxation should pass transition check");
+    return 1;
+}
+
+/* Test B4: 16x relaxation → rejected (exceeds 4x cap) */
+int test_pow_difficulty_transition_too_easy(void)
+{
+    /* old: 0x1d00ffff, new: 16x easier → exponent 2 higher → rejected */
+    uint32_t old_bits = 0x1c00ffff;   /* exponent 28 */
+    uint32_t new_bits = 0x20000100;   /* exponent 32: massively easier (>>4x) */
+    ASSERT(p2p_validate_difficulty_transition(old_bits, new_bits, 1209600) == 0,
+           "16x relaxation should fail transition check (exceeds 4x cap)");
+    return 1;
+}
+
+/* Phase 1 fix: real timespan difficulty tests */
+
+/* Test B5: nominal 2-week timespan with same nBits → should pass */
+int test_pow_difficulty_nominal_timespan(void)
+{
+    /* nominal: timespan = 1209600 (exactly 2 weeks), same bits → expected = old,
+       new = old → pass */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 1209600) == 1,
+           "nominal timespan same bits should pass");
+    return 1;
+}
+
+/* Test B6: blocks found 4x too fast → same nBits rejected (needs harder target) */
+int test_pow_difficulty_too_fast_rejected(void)
+{
+    /* timespan = 302400 (exactly 1/4 of nominal → clamped to 302400).
+       expected_target = old * 302400/1209600 = old/4 (4x harder).
+       new_target = old (same bits) → old > old/4 * 2 = old/2 → too easy → fail. */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 302400) == 0,
+           "too fast same bits should fail (needs harder target)");
+    return 1;
+}
+
+/* Test B7: blocks found 4x too slow → same nBits rejected (needs easier target) */
+int test_pow_difficulty_too_slow_rejected(void)
+{
+    /* timespan = 4838400 (exactly 4x nominal → clamped to 4838400).
+       expected_target = old * 4838400/1209600 = old*4 (4x easier).
+       new_target = old (same bits) → old < old*4/2 = old*2 → too hard → fail. */
+    uint32_t bits = 0x1703a30c;
+    ASSERT(p2p_validate_difficulty_transition(bits, bits, 4838400) == 0,
+           "too slow same bits should fail (needs easier target)");
+    return 1;
+}

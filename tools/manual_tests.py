@@ -685,6 +685,53 @@ def test_report_json():
     return ok
 
 
+def test_splice():
+    """--demo --test-splice: LSP-initiated splice-out; factory → splice → confirm."""
+    print(f"\n{ts()} === TEST: --demo --test-splice ===")
+    addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
+    # 1 client: client[0] uses seckey 0x22*32, which matches the LSP's default
+    # test_splice_client_seckey — ensuring MuSig2 aggregate key is consistent.
+    rc, log = run_lsp(
+        ['--demo', '--arity', '1', '--test-splice'],
+        n_clients=1,
+        mine_addr=addr,
+        timeout=240,
+    )
+    has_stfu    = 'STFU_ACK received' in log
+    has_init    = 'SPLICE_ACK received' in log
+    has_confirm = 'splice tx confirmed' in log
+    has_pass    = 'SPLICE TEST PASSED' in log
+    ok = rc == 0 and has_pass
+    print(f"  Exit: {rc}, STFU: {has_stfu}, SpliceACK: {has_init}, "
+          f"Confirmed: {has_confirm}, Passed: {has_pass}")
+    for line in log.split('\n'):
+        if any(kw in line.lower() for kw in ['splice', 'stfu', 'quiesc', 'broadcast']):
+            print(f"    {line.strip()}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def test_lightclient():
+    """BIP 157/158 compact filter P2P sync: connect regtest node, scan for funded script."""
+    print(f"\n{ts()} === TEST: BIP 157/158 light-client (compact filters) ===")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    runner = os.path.join(script_dir, '..', 'tests', 'run_bip158_integration.sh')
+    build_dir = build  # reuse SUPERSCALAR_BUILD path
+    env = dict(os.environ)
+    env['PATH'] = os.path.dirname(btc) + ':' + env.get('PATH', '')
+    r = subprocess.run(
+        ['bash', runner],
+        capture_output=False,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    ok = r.returncode == 0
+    print(f"  Exit: {r.returncode}")
+    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -722,6 +769,8 @@ if __name__ == '__main__':
         'burn': test_demo_burn,
         'htlc_force_close': test_htlc_force_close,
         'report': test_report_json,
+        'splice': test_splice,
+        'lightclient': test_lightclient,
     }
 
     if test_name == '--list':

@@ -113,6 +113,44 @@ int build_unsigned_tx(
                                             nsequence, 0, outputs, n_outputs);
 }
 
+int build_unsigned_tx_v(
+    tx_buf_t *out,
+    unsigned char *txid_out32,
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion
+) {
+    tx_buf_reset(out);
+
+    tx_buf_write_u32_le(out, nVersion);    /* nVersion (explicit) */
+    tx_buf_write_varint(out, 1);           /* 1 input */
+    tx_buf_write_bytes(out, funding_txid, 32);
+    tx_buf_write_u32_le(out, funding_vout);
+    tx_buf_write_varint(out, 0);           /* empty scriptSig */
+    tx_buf_write_u32_le(out, nsequence);
+
+    tx_buf_write_varint(out, n_outputs);
+    for (size_t i = 0; i < n_outputs; i++) {
+        tx_buf_write_u64_le(out, outputs[i].amount_sats);
+        tx_buf_write_varint(out, outputs[i].script_pubkey_len);
+        tx_buf_write_bytes(out, outputs[i].script_pubkey, outputs[i].script_pubkey_len);
+    }
+
+    tx_buf_write_u32_le(out, 0);           /* nLockTime = 0 */
+
+    if (out->oom) return 0;
+
+    if (txid_out32) {
+        sha256_double(out->data, out->len, txid_out32);
+        reverse_bytes(txid_out32, 32);
+    }
+
+    return 1;
+}
+
 static void write_u32_le(unsigned char *buf, uint32_t val) {
     buf[0] = (unsigned char)(val & 0xff);
     buf[1] = (unsigned char)((val >> 8) & 0xff);

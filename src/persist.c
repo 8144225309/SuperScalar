@@ -414,6 +414,30 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* Migrate: add lookahead column if missing (silently ignore error) */
+    sqlite3_exec(p->db,
+        "ALTER TABLE hd_wallet_state ADD COLUMN lookahead INTEGER DEFAULT 100;",
+        NULL, NULL, NULL);
+
+    /* v3 migration: offers table for BOLT 12 */
+    if (db_version < 3) {
+        const char *sql_v3 =
+            "CREATE TABLE IF NOT EXISTS offers ("
+            "  offer_id BLOB NOT NULL PRIMARY KEY,"  /* 32 bytes */
+            "  encoded  TEXT NOT NULL,"              /* bech32m string */
+            "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr3 = NULL;
+        if (sqlite3_exec(p->db, sql_v3, NULL, NULL, &merr3) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v3 failed: %s\n",
+                    merr3 ? merr3 : "unknown");
+            sqlite3_free(merr3);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -2898,4 +2922,89 @@ int persist_load_hd_seed(persist_t *p,
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+int persist_save_hd_lookahead(persist_t *p, uint32_t lookahead)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO hd_wallet_state (id, next_index, lookahead) VALUES (1, 0, ?) "
+            "ON CONFLICT(id) DO UPDATE SET lookahead=excluded.lookahead;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)lookahead);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+uint32_t persist_load_hd_lookahead(persist_t *p)
+{
+    if (!p || !p->db) return 100; /* default: HD_WALLET_LOOKAHEAD */
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT lookahead FROM hd_wallet_state WHERE id=1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 100;
+    uint32_t val = 100; /* default: HD_WALLET_LOOKAHEAD */
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int col = sqlite3_column_int(stmt, 0);
+        if (col > 0) val = (uint32_t)col;
+    }
+    sqlite3_finalize(stmt);
+    return val;
+}
+
+/* --- BOLT 12 Offers (schema v3) --- */
+
+int persist_save_offer(persist_t *p,
+                        const unsigned char *offer_id32,
+                        const char *encoded) {
+    if (!p || !p->db || !offer_id32 || !encoded) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO offers (offer_id, encoded) VALUES (?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(stmt, 1, offer_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, encoded, -1, SQLITE_STATIC);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_list_offers(persist_t *p,
+                            unsigned char (*ids_out)[32],
+                            char (*encoded_out)[PERSIST_OFFER_ENC_MAX],
+                            size_t max_offers) {
+    if (!p || !p->db || !ids_out || !encoded_out || max_offers == 0) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT offer_id, encoded FROM offers ORDER BY created_at;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    size_t count = 0;
+    while (count < max_offers && sqlite3_step(stmt) == SQLITE_ROW) {
+        const void *blob = sqlite3_column_blob(stmt, 0);
+        int blen = sqlite3_column_bytes(stmt, 0);
+        if (blob && blen == 32) memcpy(ids_out[count], blob, 32);
+        const char *enc = (const char *)sqlite3_column_text(stmt, 1);
+        if (enc) {
+            strncpy(encoded_out[count], enc, PERSIST_OFFER_ENC_MAX - 1);
+            encoded_out[count][PERSIST_OFFER_ENC_MAX - 1] = '\0';
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int persist_delete_offer(persist_t *p, const unsigned char *offer_id32) {
+    if (!p || !p->db || !offer_id32) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM offers WHERE offer_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(stmt, 1, offer_id32, 32, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    int changes = sqlite3_changes(p->db);
+    sqlite3_finalize(stmt);
+    return changes > 0;
 }
