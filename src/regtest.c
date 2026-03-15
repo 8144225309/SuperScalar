@@ -595,7 +595,10 @@ bool regtest_is_in_mempool(regtest_t *rt, const char *txid) {
     char params[256];
     snprintf(params, sizeof(params), "\"%s\"", txid);
     char *result = regtest_exec(rt, "getmempoolentry", params);
-    if (!result) return false;
+    if (!result || result[0] == '\0') {
+        free(result);
+        return false;
+    }
 
     bool in_mempool = (strstr(result, "error") == NULL);
     free(result);

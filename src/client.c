@@ -725,13 +725,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (msg.json) cJSON_Delete(msg.json);
         free(secnonces); free(nonce_entries); return 0;
     }
+    uint64_t rot_bal_local = 0, rot_bal_remote = 0;
     {
         uint32_t channel_id;
-        uint64_t bl, br;
-        wire_parse_channel_ready(msg.json, &channel_id, &bl, &br);
+        wire_parse_channel_ready(msg.json, &channel_id, &rot_bal_local, &rot_bal_remote);
         cJSON_Delete(msg.json);
         printf("Client %u: rotation channel %u ready (local=%llu, remote=%llu)\n",
-               my_index, channel_id, (unsigned long long)bl, (unsigned long long)br);
+               my_index, channel_id, (unsigned long long)rot_bal_local, (unsigned long long)rot_bal_remote);
     }
 
     /* Receive SCID_ASSIGN for route hints */
@@ -757,6 +757,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     memset(rot_bp_ps, 0, 32); memset(rot_bp_ds, 0, 32);
     memset(rot_bp_rs, 0, 32); memset(rot_bp_hs, 0, 32);
+
+    /* Use LSP-provided initial amounts from CHANNEL_READY. */
+    if (rot_bal_local > 0 || rot_bal_remote > 0) {
+        channel_out->local_amount  = rot_bal_remote / 1000;
+        channel_out->remote_amount = rot_bal_local  / 1000;
+    }
 
     /* Override local_pcs[0,1] with pre-generated secrets + store LSP PCPs */
     channel_set_local_pcs(channel_out, 0, rot_pcs0);
@@ -1328,6 +1334,15 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
+
+        /* Use LSP-provided initial amounts from CHANNEL_READY.
+           The LSP computes these with its own fee estimator (which may differ
+           from the client's static default).  Trusting the LSP's split ensures
+           both sides build identical commitment transactions. */
+        if (bal_local > 0 || bal_remote > 0) {
+            channel.local_amount  = bal_remote / 1000;  /* client balance = LSP remote */
+            channel.remote_amount = bal_local  / 1000;  /* LSP balance   = LSP local  */
+        }
 
         /* Override local_pcs[0,1] with the pre-generated secrets we already sent */
         channel_set_local_pcs(&channel, 0, pcs_secret0);
