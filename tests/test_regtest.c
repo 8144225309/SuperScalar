@@ -1243,7 +1243,7 @@ int test_regtest_fee_estimation_parsing(void) {
     if (rate == 0) {
         printf("  estimatesmartfee returned insufficient data (expected on fresh regtest)\n");
     } else {
-        TEST_ASSERT(rate >= 1000, "rate clamped to minimum 1000");
+        TEST_ASSERT(rate >= FEE_FLOOR_SAT_PER_KVB, "rate at or above floor");
         printf("  estimatesmartfee returned rate: %llu sat/kvB\n",
                (unsigned long long)rate);
     }
@@ -1262,7 +1262,7 @@ int test_regtest_fee_estimation_parsing(void) {
     fee_estimator_rpc_init(&fe2, &rt);
     uint64_t rate2 = fe2.base.get_rate(&fe2.base, FEE_TARGET_NORMAL);
     if (rate2 > 0) {
-        TEST_ASSERT(rate2 >= 1000, "updated rate at least 1000");
+        TEST_ASSERT(rate2 >= FEE_FLOOR_SAT_PER_KVB, "updated rate at floor or above");
         printf("  After txs: rate=%llu sat/kvB\n", (unsigned long long)rate2);
     } else {
         printf("  Still insufficient data (normal on regtest)\n");
