@@ -184,7 +184,7 @@ int regtest_init_network(regtest_t *rt, const char *network) {
     strncpy(rt->rpcuser, "rpcuser", sizeof(rt->rpcuser) - 1);
     strncpy(rt->rpcpassword, "rpcpass", sizeof(rt->rpcpassword) - 1);
     strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
-    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 1000;
+    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 10 : 1000;
 
     /* Verify connection via regtest_exec (uses fork/execvp on POSIX) */
     char *result = regtest_exec(rt, "getblockchaininfo", "");
@@ -215,7 +215,7 @@ int regtest_init_full(regtest_t *rt, const char *network,
     if (datadir)
         strncpy(rt->datadir, datadir, sizeof(rt->datadir) - 1);
     rt->rpcport = rpcport;
-    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 1000;
+    rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 10 : 1000;
 
     /* Verify connection using build_cli_prefix for consistency */
     char prefix[512];
