@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
+/* write() return value is intentionally ignored in pipe-based tests */
+#pragma GCC diagnostic ignored "-Wunused-result"
+
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
         printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, (msg)); \
