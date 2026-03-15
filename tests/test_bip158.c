@@ -763,11 +763,11 @@ int test_multi_peer_round_robin(void)
     bip158_backend_t b;
     ASSERT(bip158_backend_init(&b, "regtest"), "init");
 
-    /* Add 5 peers, connect_all should only try the first 3 */
+    /* Add 5 peers, connect_all should only try the first 3.
+     * Use 127.0.0.1 for all — on macOS only 127.0.0.1 is loopback,
+     * so 127.0.0.2+ would attempt a real network connection and stall. */
     for (int i = 0; i < 5; i++) {
-        char host[32];
-        snprintf(host, sizeof(host), "127.0.0.%d", i+1);
-        bip158_backend_add_peer(&b, host, 8333);
+        bip158_backend_add_peer(&b, "127.0.0.1", 19334 + i);
     }
     ASSERT(b.n_peers <= BIP158_MAX_PEERS, "n_peers within max");
     /* connect_all will fail (no real peers) but should return 0, not crash */
