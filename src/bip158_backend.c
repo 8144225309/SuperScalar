@@ -993,7 +993,10 @@ static int bip158_sync_headers(bip158_backend_t *b)
             if (height > 0 && (height % 2016) == 0) {
                 uint32_t old_bits = b->nBits_ring[(height - 1) % BIP158_HEADER_WINDOW];
                 uint32_t new_bits = nbits_batch[i];
-                /* Compute real timespan: time of last block in window minus first block */
+                /* Compute real timespan: time of last block in window minus first block.
+                 * height >= 2016 here (height > 0 and height % 2016 == 0), so
+                 * height - 2016 >= 0 is guaranteed. */
+                // cppcheck-suppress negativeIndex
                 uint32_t t_first = b->timestamp_ring[(height - 2016) % BIP158_HEADER_WINDOW];
                 uint32_t t_last  = b->timestamp_ring[(height - 1) % BIP158_HEADER_WINDOW];
                 uint32_t actual_timespan = (t_last > t_first) ? (t_last - t_first) : 1209600;

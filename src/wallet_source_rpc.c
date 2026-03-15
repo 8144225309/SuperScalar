@@ -61,14 +61,116 @@ static int rpc_get_change_spk(wallet_source_t *self,
 }
 
 /* -----------------------------------------------------------------------
+ * build_prevtxs_json: build a JSON prevtxs array for signrawtransactionwithwallet.
+ *
+ * Parses the non-segwit serialised tx to extract each input's txid/vout, then
+ * calls gettxout (which includes mempool UTXOs) to retrieve the scriptPubKey
+ * and amount.  This is needed so that Taproot signing (BIP 341 sha_amounts)
+ * covers ALL input amounts — not just the wallet's own UTXOs.
+ *
+ * Returns a malloc'd JSON string like:
+ *   [{"txid":"...","vout":N,"scriptPubKey":"...","amount":X.XXXXXXXX}, ...]
+ * or NULL if nothing useful was found.
+ * --------------------------------------------------------------------- */
+static char *build_prevtxs_json(regtest_t *rt,
+                                 const unsigned char *tx, size_t tx_len)
+{
+    if (!rt || !tx || tx_len < 6) return NULL;
+
+    static const char hexchars[] = "0123456789abcdef";
+
+    /* Skip nVersion (4 bytes) */
+    const unsigned char *p = tx + 4;
+
+    /* vin count — single-byte varint only (≤ 252 inputs) */
+    uint8_t n_in = *p++;
+    if (n_in == 0 || n_in > 252) return NULL;
+
+    /* Allocate generous JSON buffer */
+    size_t json_cap = (size_t)n_in * 256 + 8;
+    char *json = (char *)malloc(json_cap);
+    if (!json) return NULL;
+
+    size_t jlen = 0;
+    json[jlen++] = '[';
+    int added = 0;
+
+    for (uint8_t i = 0; i < n_in; i++) {
+        if ((size_t)(p - tx) + 41 > tx_len) break;
+
+        /* txid: 32 bytes internal order → reverse to display order */
+        char txid_disp[65];
+        for (int j = 31; j >= 0; j--) {
+            txid_disp[(31 - j) * 2]     = hexchars[(p[j] >> 4) & 0xF];
+            txid_disp[(31 - j) * 2 + 1] = hexchars[ p[j]       & 0xF];
+        }
+        txid_disp[64] = '\0';
+        p += 32;
+
+        /* vout: 4 bytes LE */
+        uint32_t vout = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p += 4;
+
+        /* scriptSig length (varint) — skip it */
+        if ((size_t)(p - tx) >= tx_len) break;
+        size_t ss_len = (uint8_t)*p++;
+        if (ss_len == 0xfd) {
+            if ((size_t)(p - tx) + 2 > tx_len) break;
+            ss_len = (size_t)p[0] | ((size_t)p[1] << 8);
+            p += 2;
+        }
+        if ((size_t)(p - tx) + ss_len + 4 > tx_len) break;
+        p += ss_len + 4;  /* skip scriptSig + nSequence */
+
+        /* Look up this prevout — gettxout includes mempool UTXOs by default */
+        char params[140];
+        snprintf(params, sizeof(params), "\"%s\" %u true", txid_disp, vout);
+        char *result = regtest_exec(rt, "gettxout", params);
+        if (!result) continue;
+
+        cJSON *gto = cJSON_Parse(result);
+        free(result);
+        if (!gto) continue;
+
+        cJSON *val  = cJSON_GetObjectItem(gto, "value");
+        cJSON *spko = cJSON_GetObjectItem(gto, "scriptPubKey");
+        cJSON *hex  = spko ? cJSON_GetObjectItem(spko, "hex") : NULL;
+
+        if (val && cJSON_IsNumber(val) && hex && cJSON_IsString(hex)) {
+            if (added) {
+                if (jlen + 1 < json_cap) json[jlen++] = ',';
+            }
+            int n = snprintf(json + jlen, json_cap - jlen,
+                "{\"txid\":\"%s\",\"vout\":%u,"
+                "\"scriptPubKey\":\"%s\",\"amount\":%.8f}",
+                txid_disp, vout, hex->valuestring, val->valuedouble);
+            if (n > 0 && (size_t)n < json_cap - jlen) {
+                jlen += (size_t)n;
+                added++;
+            }
+        }
+        cJSON_Delete(gto);
+    }
+
+    if (jlen + 1 < json_cap) json[jlen++] = ']';
+    json[jlen] = '\0';
+
+    if (!added) { free(json); return NULL; }
+    return json;
+}
+
+/* -----------------------------------------------------------------------
  * sign_input: wraps regtest_sign_raw_tx_with_wallet.
  *
  * The watchtower CPFP tx has two inputs:
  *   input 0 — P2A anchor (anyone-can-spend, no signing needed)
  *   input 1 — wallet UTXO (this is what we sign)
  *
- * We hex-encode the unsigned tx, call signrawtransactionwithwallet,
- * then decode the result back into the caller's buffer.
+ * We hex-encode the unsigned tx, call signrawtransactionwithwallet with
+ * prevtxs built from gettxout for each input (so that Taproot sighash
+ * sha_amounts covers all input amounts, including the unconfirmed P2A
+ * anchor from the penalty tx that is in the mempool).
  * require_complete=0 because the P2A input will never have a signature.
  * --------------------------------------------------------------------- */
 static int rpc_sign_input(wallet_source_t *self,
@@ -94,8 +196,15 @@ static int rpc_sign_input(wallet_source_t *self,
     }
     unsigned_hex[*tx_len * 2] = '\0';
 
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, unsigned_hex, NULL, 0);
+    /* Build prevtxs so signrawtransactionwithwallet has all input amounts.
+     * This is critical for Taproot signing (BIP 341 sha_amounts covers ALL
+     * inputs).  The P2A anchor (input 0) is from the unconfirmed penalty tx
+     * in the mempool; gettxout with include_mempool=true finds it. */
+    char *prevtxs = build_prevtxs_json(rt, tx, *tx_len);
+
+    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, unsigned_hex, prevtxs, 0);
     free(unsigned_hex);
+    free(prevtxs);
     if (!signed_hex) return 0;
 
     size_t signed_len = strlen(signed_hex) / 2;
