@@ -44,6 +44,19 @@ int build_unsigned_tx(
     size_t n_outputs
 );
 
+/* Build unsigned single-input tx with explicit nVersion (use 2 for standard, 3 for CPFP/TRUC).
+   All other fields identical to build_unsigned_tx. */
+int build_unsigned_tx_v(
+    tx_buf_t *out,
+    unsigned char *txid_out32,     /* can be NULL */
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion
+);
+
 /* BIP-341 sighash (key-path, SIGHASH_DEFAULT). */
 int compute_taproot_sighash(
     unsigned char *sighash_out32,

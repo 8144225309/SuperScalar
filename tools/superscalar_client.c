@@ -17,6 +17,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
+#include "superscalar/splice.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,39 +43,68 @@ static bip158_backend_t g_bip158_client;
 static wallet_source_hd_t *g_hd_wallet_client = NULL;
 
 static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
-                                     secp256k1_context *ctx, const char *network)
+                                     secp256k1_context *ctx, const char *network,
+                                     const char *hd_mnemonic,
+                                     const char *hd_passphrase,
+                                     uint32_t lookahead)
 {
     if (!wt || !ctx) return 0;
 
     unsigned char seed[64];
-    size_t seed_len = 0;
+    size_t seed_len = 64;
 
-    if (db_ptr && persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
+    /* 1. If seed exists in DB AND no hd_mnemonic override: load and use */
+    if (!hd_mnemonic && db_ptr &&
+        persist_load_hd_seed(db_ptr, seed, &seed_len, sizeof(seed)) && seed_len >= 16) {
         printf("Client: HD wallet: loaded existing seed (%zu bytes)\n", seed_len);
-    } else {
-        seed_len = 32;
-        FILE *rf = fopen("/dev/urandom", "rb");
-        if (!rf || fread(seed, 1, seed_len, rf) != seed_len) {
-            if (rf) fclose(rf);
-            fprintf(stderr, "Client: HD wallet: /dev/urandom unavailable\n");
+    } else if (hd_mnemonic) {
+        /* 2. Derive seed from provided mnemonic */
+        if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
             return 0;
         }
-        fclose(rf);
-        if (db_ptr)
-            persist_save_hd_seed(db_ptr, seed, seed_len);
-        printf("Client: HD wallet: generated fresh seed (32 bytes)\n");
+        seed_len = 64;
+        printf("Client: HD wallet: derived seed from provided mnemonic\n");
+    } else {
+        /* 3. First run: generate a BIP 39 24-word phrase */
+        char mnemonic_buf[300];
+        if (!bip39_generate(24, mnemonic_buf, sizeof(mnemonic_buf))) {
+            fprintf(stderr, "Client: HD wallet: bip39_generate failed\n");
+            return 0;
+        }
+        printf("=== WRITE THIS DOWN: YOUR 24-WORD RECOVERY PHRASE ===\n%s\n"
+               "=== KEEP THIS SAFE — LOSING IT MEANS LOSING FUNDS ===\n",
+               mnemonic_buf);
+        if (!bip39_mnemonic_to_seed(mnemonic_buf, hd_passphrase ? hd_passphrase : "", seed)) {
+            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            memset(seed, 0, sizeof(seed));
+            return 0;
+        }
+        seed_len = 64;
+    }
+
+    /* Save seed and lookahead to DB */
+    if (db_ptr) {
+        persist_save_hd_seed(db_ptr, seed, seed_len);
+        persist_save_hd_lookahead(db_ptr, lookahead);
     }
 
     g_hd_wallet_client = (wallet_source_hd_t *)calloc(1, sizeof(wallet_source_hd_t));
-    if (!g_hd_wallet_client) return 0;
+    if (!g_hd_wallet_client) {
+        memset(seed, 0, sizeof(seed));
+        return 0;
+    }
 
-    if (!wallet_source_hd_init(g_hd_wallet_client, seed, seed_len,
-                                ctx, db_ptr, &g_bip158_client, network)) {
+    if (!wallet_source_hd_init(g_hd_wallet_client, seed, 64,
+                                ctx, db_ptr, &g_bip158_client, network, lookahead)) {
         fprintf(stderr, "Client: HD wallet: init failed\n");
         free(g_hd_wallet_client);
         g_hd_wallet_client = NULL;
+        memset(seed, 0, sizeof(seed));
         return 0;
     }
+    memset(seed, 0, sizeof(seed));
 
     char spk_hex[69];
     if (wallet_source_hd_get_address(g_hd_wallet_client, 0, spk_hex, sizeof(spk_hex)))
@@ -142,8 +172,8 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
         }
     }
     printf("Client: BIP 158 P2P peer connected (version %u, height %d)\n",
-           g_bip158_client.p2p.peer_version,
-           g_bip158_client.p2p.peer_start_height);
+           g_bip158_client.peers[g_bip158_client.current_peer].peer_version,
+           g_bip158_client.peers[g_bip158_client.current_peer].peer_start_height);
 
     watchtower_set_chain_backend(wt, &g_bip158_client.base);
     return 1;
@@ -152,6 +182,8 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 #include "superscalar/sha256.h"
+#include "superscalar/bolt12.h"
+#include "superscalar/bech32m.h"
 
 #define MAX_ACTIONS 16
 
@@ -1516,6 +1548,78 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             break;
         }
 
+        /* -------------------------------------------------------------------
+         * Splice protocol — LSP-initiated quiescence and funding replacement
+         * ----------------------------------------------------------------- */
+
+        case MSG_STFU: {
+            /* LSP is requesting quiescence prior to splice.
+               Mark channel quiescent and echo STFU_ACK (reusing splice_ack
+               JSON with acceptor_contribution=0 — same format as lsp_channels.c). */
+            const cJSON *cid_f = cJSON_GetObjectItemCaseSensitive(msg.json, "channel_id");
+            uint32_t stfu_ch_id = (cid_f && cJSON_IsNumber(cid_f))
+                                      ? (uint32_t)cid_f->valuedouble : 0;
+            ch->channel_quiescent = 1;
+            cJSON *ack = wire_build_splice_ack(stfu_ch_id, 0);
+            if (ack) { wire_send(fd, MSG_STFU_ACK, ack); cJSON_Delete(ack); }
+            printf("Client %u: STFU from LSP (ch %u), sent STFU_ACK\n",
+                   my_index, stfu_ch_id);
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_SPLICE_INIT: {
+            /* LSP is proposing a splice (amount + new funding SPK).
+               Respond with SPLICE_ACK, no extra contribution from client. */
+            uint32_t sp_ch_id = 0;
+            uint64_t sp_new_amount = 0;
+            unsigned char sp_new_spk[34];
+            size_t sp_spk_len = 0;
+            if (wire_parse_splice_init(msg.json, &sp_ch_id, &sp_new_amount,
+                                        sp_new_spk, &sp_spk_len, sizeof(sp_new_spk))) {
+                ch->channel_quiescent = 1;
+                cJSON *ack = wire_build_splice_ack(sp_ch_id, 0);
+                if (ack) { wire_send(fd, MSG_SPLICE_ACK, ack); cJSON_Delete(ack); }
+                printf("Client %u: SPLICE_INIT from LSP: new_funding=%llu sats, sent SPLICE_ACK\n",
+                       my_index, (unsigned long long)sp_new_amount);
+            } else {
+                fprintf(stderr, "Client %u: invalid SPLICE_INIT\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_SPLICE_LOCKED: {
+            /* LSP confirms splice tx confirmed on-chain.
+               Apply channel update and echo SPLICE_LOCKED. */
+            uint32_t sl_ch_id = 0;
+            unsigned char sl_new_txid[32];
+            uint32_t sl_new_vout = 0;
+            if (wire_parse_splice_locked(msg.json, &sl_ch_id,
+                                          sl_new_txid, &sl_new_vout)) {
+                channel_apply_splice_update(ch, sl_new_txid, sl_new_vout,
+                                             ch->funding_amount);
+                cJSON *locked = wire_build_splice_locked(sl_ch_id, sl_new_txid, sl_new_vout);
+                if (locked) { wire_send(fd, MSG_SPLICE_LOCKED, locked); cJSON_Delete(locked); }
+
+                unsigned char disp_txid[32];
+                memcpy(disp_txid, sl_new_txid, 32);
+                /* txid display: reverse to RPC byte order */
+                for (int _i = 0; _i < 16; _i++) {
+                    unsigned char _t = disp_txid[_i];
+                    disp_txid[_i] = disp_txid[31 - _i];
+                    disp_txid[31 - _i] = _t;
+                }
+                char disp_hex[65]; hex_encode(disp_txid, 32, disp_hex);
+                printf("Client %u: splice complete! new txid=%s vout=%u\n",
+                       my_index, disp_hex, sl_new_vout);
+            } else {
+                fprintf(stderr, "Client %u: invalid SPLICE_LOCKED\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         default:
             fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
                     my_index, msg.msg_type);
@@ -1604,11 +1708,15 @@ int main(int argc, char *argv[]) {
     int generate_mnemonic = 0;
     const char *from_mnemonic = NULL;
     const char *mnemonic_passphrase = "";
+    const char *hd_mnemonic = NULL;
+    const char *hd_passphrase = "";
+    uint32_t hd_lookahead = HD_WALLET_LOOKAHEAD;
     const char *light_client_arg = NULL;
     const char *fee_estimator_arg = NULL;
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
+    const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1654,6 +1762,12 @@ int main(int argc, char *argv[]) {
             else { fprintf(stderr, "Warning: too many --light-client-fallback peers (max %d)\n",
                            (int)(sizeof(lc_fallbacks)/sizeof(lc_fallbacks[0]))); i++; }
         }
+        else if (strcmp(argv[i], "--hd-mnemonic") == 0 && i + 1 < argc)
+            hd_mnemonic = argv[++i];
+        else if (strcmp(argv[i], "--hd-passphrase") == 0 && i + 1 < argc)
+            hd_passphrase = argv[++i];
+        else if (strcmp(argv[i], "--hd-lookahead") == 0 && i + 1 < argc)
+            hd_lookahead = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
@@ -1717,6 +1831,8 @@ int main(int argc, char *argv[]) {
             mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
+        } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
+            pay_offer_str = argv[++i];
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_client %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -1737,6 +1853,26 @@ int main(int argc, char *argv[]) {
                 "default minrelaytxfee (1 sat/vB).\n"
                 "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
                 fee_rate, (double)fee_rate / 1000.0);
+    }
+
+    /* --- BOLT 12 Offer payment (early exit / decode + display) --- */
+    if (pay_offer_str) {
+        offer_t offer;
+        if (!offer_decode(pay_offer_str, &offer)) {
+            fprintf(stderr, "Error: failed to decode offer: %s\n", pay_offer_str);
+            return 1;
+        }
+        printf("Decoded BOLT 12 offer:\n");
+        /* Print node_id as hex */
+        printf("  node_id: ");
+        for (int k = 0; k < 33; k++) printf("%02x", offer.node_id[k]);
+        printf("\n");
+        printf("  amount_msat: %llu%s\n",
+               (unsigned long long)offer.amount_msat,
+               offer.has_amount ? "" : " (any)");
+        printf("  description: %s\n", offer.description);
+        printf("(Payment flow via channel not yet implemented)\n");
+        return 0;
     }
 
     /* --- BIP39 Mnemonic (early exit) --- */
@@ -1992,7 +2128,8 @@ int main(int argc, char *argv[]) {
             bip158_backend_set_fee_estimator(&g_bip158_client, client_fee_ptr);
         /* Auto-attach HD wallet when running without bitcoind */
         if (!rt_ok)
-            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network);
+            attach_hd_wallet_client(&client_wt, use_db ? &db : NULL, ctx, network,
+                                    hd_mnemonic, hd_passphrase, hd_lookahead);
     }
 
     int ok;

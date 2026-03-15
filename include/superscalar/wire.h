@@ -94,9 +94,20 @@
 #define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
 #define MSG_PATH_SIGN_DONE      0x63  /* LSP -> Clients: path signing complete */
 
+/* LSPS0/1/2 standard protocol (Phase E) */
+#define MSG_LSPS_REQUEST   0x65  /* client → LSP: JSON-RPC request  */
+#define MSG_LSPS_RESPONSE  0x66  /* LSP → client: JSON-RPC response */
+#define MSG_LSPS_NOTIFY    0x67  /* LSP → client: async notification */
+
+/* Splicing (Phase G — BOLT 2 draft) */
+#define MSG_STFU           0x68  /* quiescence request */
+#define MSG_STFU_ACK       0x69  /* quiescence acknowledge */
+#define MSG_SPLICE_INIT    0x6A  /* initiator: new funding amount + spk */
+#define MSG_SPLICE_ACK     0x6B  /* acceptor: agrees + optional contribution */
+#define MSG_SPLICE_LOCKED  0x6C  /* both: new funding tx confirmed */
+
 /* Async signing: pending work queue
- * NOTE: 0x65–0x6C are reserved for LSPS/splice (PR #14).
- *       Queue messages start at 0x6D to avoid collision. */
+ * NOTE: 0x65–0x6C are reserved for LSPS/splice above. */
 #define MSG_QUEUE_POLL          0x6D  /* Client → LSP: poll for pending work items */
 #define MSG_QUEUE_ITEMS         0x6E  /* LSP → Client: pending work items response */
 #define MSG_QUEUE_DONE          0x6F  /* Client → LSP: acknowledge processed item IDs */
@@ -617,6 +628,38 @@ int wire_parse_scid_assign(const cJSON *json, uint32_t *channel_id,
 /* Parse a nonce or psig bundle array from JSON. Returns count, fills entries[]. */
 size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
                          size_t max_entries, size_t expected_data_len);
+
+/* --- Splice message builders/parsers (Phase G) --- */
+
+/* Initiator → Acceptor: SPLICE_INIT {channel_id, new_funding_amount, new_funding_spk_hex} */
+cJSON *wire_build_splice_init(uint32_t channel_id,
+                               uint64_t new_funding_amount,
+                               const unsigned char *new_funding_spk,
+                               size_t new_funding_spk_len);
+
+int wire_parse_splice_init(const cJSON *json,
+                            uint32_t *channel_id_out,
+                            uint64_t *new_funding_amount_out,
+                            unsigned char *new_funding_spk_out,
+                            size_t *new_funding_spk_len_out,
+                            size_t max_spk_len);
+
+/* Acceptor → Initiator: SPLICE_ACK {channel_id, acceptor_contribution} */
+cJSON *wire_build_splice_ack(uint32_t channel_id, uint64_t acceptor_contribution);
+
+int wire_parse_splice_ack(const cJSON *json,
+                           uint32_t *channel_id_out,
+                           uint64_t *acceptor_contribution_out);
+
+/* Both: SPLICE_LOCKED {channel_id, new_funding_txid_hex, new_funding_vout} */
+cJSON *wire_build_splice_locked(uint32_t channel_id,
+                                  const unsigned char *new_funding_txid32,
+                                  uint32_t new_funding_vout);
+
+int wire_parse_splice_locked(const cJSON *json,
+                               uint32_t *channel_id_out,
+                               unsigned char *new_funding_txid32_out,
+                               uint32_t *new_funding_vout_out);
 
 /* --- Encrypted transport (Phase 19) --- */
 

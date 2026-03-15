@@ -75,6 +75,10 @@ extern int test_build_unsigned_tx(void);
 extern int test_finalize_signed_tx(void);
 extern int test_varint_encoding(void);
 
+/* Phase C: V3/TRUC CPFP */
+extern int test_v3_cpfp_tx_version(void);
+extern int test_v2_channel_tx_version(void);
+
 extern int test_regtest_basic_dw(void);
 extern int test_regtest_old_first_attack(void);
 extern int test_regtest_musig_onchain(void);
@@ -107,6 +111,50 @@ extern int test_bip158_gcs_build_empty(void);
 extern int test_bip158_gcs_build_round_trip(void);
 extern int test_bip158_compute_filter_header(void);
 
+/* Phase D: multi-peer */
+extern int test_multi_peer_filter_header_crosscheck(void);
+extern int test_multi_peer_sybil_detection(void);
+extern int test_multi_peer_round_robin(void);
+
+/* Phase E: LSPS0/1/2 */
+extern int test_lsps0_request_roundtrip(void);
+extern int test_lsps0_error_response(void);
+extern int test_lsps1_get_info_response(void);
+extern int test_lsps1_create_order(void);
+extern int test_lsps2_get_info(void);
+extern int test_lsps2_buy_creates_jit(void);
+/* Phase 2 fix: LSPS context / NULL-safety */
+extern int test_lsps_null_ctx_returns_error(void);
+extern int test_lsps_malformed_json_returns_zero(void);
+/* Gap fix: lsps1.get_order */
+extern int test_lsps1_get_order(void);
+
+/* Phase F: BOLT 12 / Offers */
+extern int test_offer_encode_decode(void);
+extern int test_invoice_request_sign_verify(void);
+extern int test_invoice_sign_verify(void);
+extern int test_blinded_path_onion(void);
+extern int test_offer_no_amount(void);
+/* Phase 4 fix: real bech32m + persist schema v3 */
+extern int test_bech32m_known_vector(void);
+extern int test_offer_encode_bech32m_valid(void);
+extern int test_offer_decode_bad_checksum(void);
+extern int test_persist_schema_v3(void);
+extern int test_persist_save_list_offer(void);
+
+/* Phase G: Splicing */
+extern int test_splice_out_flow(void);
+extern int test_splice_in_flow(void);
+extern int test_splice_mid_htlc(void);
+extern int test_splice_channel_update(void);
+/* Phase 3 fix: wire builder round-trips */
+extern int test_wire_splice_init_roundtrip(void);
+extern int test_wire_splice_ack_roundtrip(void);
+extern int test_wire_splice_locked_roundtrip(void);
+extern int test_splice_state_machine(void);
+/* Gap fix: MuSig2 aggregate key for splice funding output */
+extern int test_splice_musig_funding_spk(void);
+
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
 extern int test_p2p_cfilter_skips_ping(void);
@@ -127,6 +175,16 @@ extern int test_p2p_poll_inv_parse(void);
 extern int test_p2p_poll_inv_ignores_block(void);
 extern int test_p2p_connect_rejects_non_cf(void);
 extern int test_p2p_connect_accepts_cf(void);
+
+/* Phase B: PoW validation */
+extern int test_pow_validate_mainnet_genesis(void);
+extern int test_pow_validate_fabricated(void);
+extern int test_pow_difficulty_transition_valid(void);
+extern int test_pow_difficulty_transition_too_easy(void);
+/* Phase 1 fix: real timespan tests */
+extern int test_pow_difficulty_nominal_timespan(void);
+extern int test_pow_difficulty_too_fast_rejected(void);
+extern int test_pow_difficulty_too_slow_rejected(void);
 
 extern int test_tapscript_leaf_hash(void);
 extern int test_tapscript_tweak_with_tree(void);
@@ -726,6 +784,9 @@ extern int test_hd_wallet_derives_p2tr(void);
 extern int test_hd_wallet_sign_verify(void);
 extern int test_hd_wallet_utxo_persist(void);
 extern int test_p2p_scan_block_full_output(void);
+extern int test_hd_wallet_bip39_roundtrip(void);
+extern int test_hd_wallet_passphrase_isolation(void);
+extern int test_hd_wallet_dynamic_lookahead(void);
 
 /* Async Signing: Pending Work Queue */
 extern int test_queue_push_drain(void);
@@ -804,6 +865,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_finalize_signed_tx);
     RUN_TEST(test_varint_encoding);
 
+    printf("\n=== Phase C: V3/TRUC CPFP ===\n");
+    RUN_TEST(test_v3_cpfp_tx_version);
+    RUN_TEST(test_v2_channel_tx_version);
+
     printf("\n=== Factory Tree ===\n");
     RUN_TEST(test_factory_build_tree);
     RUN_TEST(test_factory_sign_all);
@@ -834,6 +899,45 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip158_gcs_build_round_trip);
     RUN_TEST(test_bip158_compute_filter_header);
 
+    printf("\n=== Phase D: Multi-Peer Filter Queries ===\n");
+    RUN_TEST(test_multi_peer_filter_header_crosscheck);
+    RUN_TEST(test_multi_peer_sybil_detection);
+    RUN_TEST(test_multi_peer_round_robin);
+
+    printf("\n=== Phase E: LSPS0/1/2 Protocol ===\n");
+    RUN_TEST(test_lsps0_request_roundtrip);
+    RUN_TEST(test_lsps0_error_response);
+    RUN_TEST(test_lsps1_get_info_response);
+    RUN_TEST(test_lsps1_create_order);
+    RUN_TEST(test_lsps2_get_info);
+    RUN_TEST(test_lsps2_buy_creates_jit);
+    RUN_TEST(test_lsps_null_ctx_returns_error);
+    RUN_TEST(test_lsps_malformed_json_returns_zero);
+    RUN_TEST(test_lsps1_get_order);
+
+    printf("\n=== Phase F: BOLT 12 / Offers ===\n");
+    RUN_TEST(test_offer_encode_decode);
+    RUN_TEST(test_invoice_request_sign_verify);
+    RUN_TEST(test_invoice_sign_verify);
+    RUN_TEST(test_blinded_path_onion);
+    RUN_TEST(test_offer_no_amount);
+    RUN_TEST(test_bech32m_known_vector);
+    RUN_TEST(test_offer_encode_bech32m_valid);
+    RUN_TEST(test_offer_decode_bad_checksum);
+    RUN_TEST(test_persist_schema_v3);
+    RUN_TEST(test_persist_save_list_offer);
+
+    printf("\n=== Phase G: Splicing ===\n");
+    RUN_TEST(test_splice_out_flow);
+    RUN_TEST(test_splice_in_flow);
+    RUN_TEST(test_splice_mid_htlc);
+    RUN_TEST(test_splice_channel_update);
+    RUN_TEST(test_wire_splice_init_roundtrip);
+    RUN_TEST(test_wire_splice_ack_roundtrip);
+    RUN_TEST(test_wire_splice_locked_roundtrip);
+    RUN_TEST(test_splice_state_machine);
+    RUN_TEST(test_splice_musig_funding_spk);
+
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
     RUN_TEST(test_p2p_cfilter_parse);
@@ -855,6 +959,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_p2p_poll_inv_ignores_block);
     RUN_TEST(test_p2p_connect_rejects_non_cf);
     RUN_TEST(test_p2p_connect_accepts_cf);
+
+    printf("\n=== Phase B: PoW Header Validation ===\n");
+    RUN_TEST(test_pow_validate_mainnet_genesis);
+    RUN_TEST(test_pow_validate_fabricated);
+    RUN_TEST(test_pow_difficulty_transition_valid);
+    RUN_TEST(test_pow_difficulty_transition_too_easy);
+    RUN_TEST(test_pow_difficulty_nominal_timespan);
+    RUN_TEST(test_pow_difficulty_too_fast_rejected);
+    RUN_TEST(test_pow_difficulty_too_slow_rejected);
 
     printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
 
@@ -1433,6 +1546,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hd_wallet_sign_verify);
     RUN_TEST(test_hd_wallet_utxo_persist);
     RUN_TEST(test_p2p_scan_block_full_output);
+    RUN_TEST(test_hd_wallet_bip39_roundtrip);
+    RUN_TEST(test_hd_wallet_passphrase_isolation);
+    RUN_TEST(test_hd_wallet_dynamic_lookahead);
 
     printf("\n=== Async Signing: Pending Work Queue ===\n");
     RUN_TEST(test_queue_push_drain);
