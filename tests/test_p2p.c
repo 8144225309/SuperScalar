@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
+/* write() return value is intentionally ignored in pipe-based tests */
+#pragma GCC diagnostic ignored "-Wunused-result"
+
 /*
  * Unit tests for p2p_bitcoin message framing.
  * All tests use pipe(2) so no real network connection is needed.
