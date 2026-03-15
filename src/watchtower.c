@@ -71,6 +71,10 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->channel_id = (uint32_t)c;
                 e->commit_num = commit_nums[i];
                 memcpy(e->txid, txids[i], 32);
+                /* DB-loaded entries: registered_height = 0 so that late-arrival
+                   breach detection works (breach confirmed during downtime).
+                   Fresh entries set registered_height in watchtower_watch(). */
+                e->registered_height = 0;
                 e->to_local_vout = vouts[i];
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
@@ -151,6 +155,9 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->channel_id = channel_id;
     e->commit_num = commit_num;
     memcpy(e->txid, txid32, 32);
+    /* Record current height so watchtower_check can reject pre-existing on-chain txids */
+    e->registered_height = (wt->chain && wt->chain->get_block_height)
+                           ? wt->chain->get_block_height(wt->chain) : 0;
     e->to_local_vout = to_local_vout;
     e->to_local_amount = to_local_amount;
     memcpy(e->to_local_spk, to_local_spk, spk_len);
@@ -376,6 +383,20 @@ int watchtower_check(watchtower_t *wt) {
         if (conf < 0 && !in_mempool) {
             i++;  /* not found, keep watching */
             continue;
+        }
+
+        /* Reject false positives: if the tx was confirmed BEFORE we registered
+           this entry, it predates the current factory and is not a breach of
+           our channel.  This prevents deterministic-key regtest runs from
+           triggering on old commitments left on-chain by previous scenarios. */
+        if (conf >= 0 && e->registered_height > 0) {
+            int cur_height = (wt->chain->get_block_height)
+                             ? wt->chain->get_block_height(wt->chain) : 0;
+            int tx_height = cur_height - conf + 1;  /* block the tx was mined in */
+            if (tx_height < e->registered_height) {
+                i++;  /* predates our factory -- skip */
+                continue;
+            }
         }
 
         if (e->type == WATCH_FACTORY_NODE) {

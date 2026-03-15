@@ -86,12 +86,26 @@ def client_seckey(index):
 # ChainControl — wraps bitcoin-cli -regtest
 # ---------------------------------------------------------------------------
 
+def _find_bitcoin_cli():
+    """Find bitcoin-cli in PATH or known install locations."""
+    import shutil
+    found = shutil.which("bitcoin-cli")
+    if found:
+        return found
+    # Common WSL / Linux install paths
+    for p in ["/home/pirq/bin/bitcoin-cli", "/usr/local/bin/bitcoin-cli",
+               "/usr/bin/bitcoin-cli", os.path.expanduser("~/bin/bitcoin-cli")]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return "bitcoin-cli"  # fallback; will error at runtime if missing
+
+
 class ChainControl:
     """Bitcoin Core chain operations (regtest, signet, etc.)."""
 
-    def __init__(self, cli_path="bitcoin-cli", network=None,
+    def __init__(self, cli_path=None, network=None,
                  rpcuser=None, rpcpassword=None):
-        self.cli_path = cli_path
+        self.cli_path = cli_path or _find_bitcoin_cli()
         self.network = network or os.environ.get("SUPERSCALAR_NETWORK", "regtest")
         self.rpcuser = rpcuser or os.environ.get("RPCUSER", "rpcuser")
         self.rpcpassword = rpcpassword or os.environ.get("RPCPASS", "rpcpass")
@@ -304,7 +318,7 @@ class Orchestrator:
 
     def __init__(self, n_clients=DEFAULT_N_CLIENTS, port=DEFAULT_PORT,
                  amount=DEFAULT_AMOUNT, verbose=False, network=DEFAULT_NETWORK,
-                 rpcuser=None, rpcpassword=None):
+                 rpcuser=None, rpcpassword=None, cli_path=None):
         self.n_clients = n_clients
         self.port = port
         self.amount = amount
@@ -312,13 +326,18 @@ class Orchestrator:
         self.network = network
         self.is_regtest = (network == "regtest")
         self.timing = TIMING.get(network, TIMING["signet"])
-        self.chain = ChainControl(network=network, rpcuser=rpcuser,
-                                   rpcpassword=rpcpassword)
+        self.chain = ChainControl(cli_path=cli_path, network=network,
+                                   rpcuser=rpcuser, rpcpassword=rpcpassword)
         self.rpcuser = self.chain.rpcuser
         self.rpcpassword = self.chain.rpcpassword
         self.lsp = None
         self.clients = [None] * n_clients
         self.test_dir = TEST_DIR
+
+        # Kill any stale superscalar processes that might be reconnecting to
+        # the port (e.g. daemon clients left over from a previous failed run).
+        safe_pkill("superscalar_lsp", "-9")
+        safe_pkill("superscalar_client", "-9")
 
         # Clean and recreate test directory
         if os.path.exists(self.test_dir):
@@ -1960,6 +1979,173 @@ def scenario_buy_liquidity(orch):
     return success
 
 
+def scenario_splice_channel(orch):
+    """Splice out channel[0] by 10k sats after demo: STFU → SPLICE_INIT → broadcast → confirm."""
+    orch._log("=== SCENARIO: splice_channel ===")
+    orch._log("LSP runs demo then splice test (requires client 0 seckey for MuSig2).")
+
+    orch.start_lsp(["--demo", "--test-splice",
+                    "--test-splice-client-seckey", client_seckey(0)])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 3)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_pass = "SPLICE TEST PASSED" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"splice {'passed' if has_pass else 'failed'}")
+    return success
+
+
+def scenario_async_rotation(orch):
+    """Factory rotation with --async-rotation: clients reconnect, rotation completes."""
+    orch._log("=== SCENARIO: async_rotation ===")
+    orch._log("LSP runs demo then async factory rotation test.")
+
+    orch.start_lsp(["--demo", "--test-rotation", "--async-rotation"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 3)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_pass = "FACTORY ROTATION TEST PASSED" in lsp_log
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"async rotation {'passed' if has_pass else 'failed'}")
+    return success
+
+
+def scenario_bolt12_offer(orch):
+    """Create a BOLT 12 offer via LSP CLI and decode it via client CLI."""
+    orch._log("=== SCENARIO: bolt12_offer ===")
+
+    # Step 1: create offer (early-exit LSP command, no daemon needed)
+    lsp_create = subprocess.run(
+        [LSP_BIN,
+         "--create-offer", "Test Offer",
+         "--seckey", LSP_SECKEY,
+         "--network", orch.network],
+        capture_output=True, text=True, timeout=15,
+    )
+    orch._log(f"create-offer exit={lsp_create.returncode}")
+
+    offer_str = ""
+    for line in lsp_create.stdout.splitlines():
+        if line.startswith("lno1"):
+            offer_str = line.strip()
+            break
+
+    if not offer_str or lsp_create.returncode != 0:
+        orch._log(f"FAIL: no lno1... offer in LSP output: {lsp_create.stdout!r}")
+        return False
+
+    orch._log(f"Offer: {offer_str[:40]}...")
+
+    # Step 2: decode offer (early-exit client command, no daemon needed)
+    client_decode = subprocess.run(
+        [CLIENT_BIN,
+         "--pay-offer", offer_str,
+         "--network", orch.network],
+        capture_output=True, text=True, timeout=15,
+    )
+    orch._log(f"pay-offer exit={client_decode.returncode}")
+    has_decoded = "Decoded BOLT 12 offer:" in client_decode.stdout
+
+    success = client_decode.returncode == 0 and has_decoded
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"offer={'created' if offer_str else 'missing'}, "
+              f"decoded={'yes' if has_decoded else 'no'}")
+    return success
+
+
+def scenario_bip39_restore(orch):
+    """Generate BIP 39 mnemonic, restore from it, verify both keyfile operations succeed."""
+    orch._log("=== SCENARIO: bip39_restore ===")
+
+    keyfile1 = os.path.join(orch.test_dir, "bip39_k1.key")
+    keyfile2 = os.path.join(orch.test_dir, "bip39_k2.key")
+
+    # Step 1: generate mnemonic (early-exit LSP command)
+    gen = subprocess.run(
+        [LSP_BIN,
+         "--generate-mnemonic",
+         "--keyfile", keyfile1,
+         "--network", orch.network],
+        capture_output=True, text=True, timeout=15,
+    )
+    orch._log(f"generate-mnemonic exit={gen.returncode}")
+
+    # Extract 24-word mnemonic: the line of 24 space-separated words
+    mnemonic = ""
+    for line in gen.stdout.splitlines():
+        stripped = line.strip()
+        words = stripped.split()
+        if len(words) >= 12 and not stripped.startswith("BIP39") and not stripped.startswith("Keyfile"):
+            mnemonic = stripped
+            break
+
+    if not mnemonic or gen.returncode != 0:
+        orch._log(f"FAIL: mnemonic generation failed (rc={gen.returncode}, "
+                  f"stdout={gen.stdout!r})")
+        return False
+
+    orch._log(f"Mnemonic captured ({len(mnemonic.split())} words)")
+
+    # Step 2: restore from mnemonic
+    restore = subprocess.run(
+        [LSP_BIN,
+         "--from-mnemonic", mnemonic,
+         "--keyfile", keyfile2,
+         "--network", orch.network],
+        capture_output=True, text=True, timeout=15,
+    )
+    orch._log(f"from-mnemonic exit={restore.returncode}")
+    has_ok = "OK" in restore.stdout
+
+    success = gen.returncode == 0 and restore.returncode == 0 and has_ok
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"generate={'ok' if gen.returncode == 0 else 'fail'}, "
+              f"restore={'ok' if restore.returncode == 0 and has_ok else 'fail'}")
+    return success
+
+
+def scenario_lsps2_wire(orch):
+    """Client sends lsps2.get_info over live connection; LSP responds with fee params."""
+    orch._log("=== SCENARIO: lsps2_wire ===")
+
+    saved_n = orch.n_clients
+    orch.n_clients = 1
+
+    orch.start_lsp(["--demo", "--arity", "1"])
+    orch.start_client(0, ["--test-lsps2"])
+
+    # Client exits cleanly (rc=0) after LSPS2 response is verified
+    client_rc = "TIMEOUT"
+    if orch.clients[0]:
+        client_rc = orch.clients[0].wait(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"Client 0 exited with code {client_rc}")
+
+    client_log = orch.clients[0].read_log() if orch.clients[0] else ""
+    has_ok = "LSPS2 GET_INFO: OK" in client_log
+
+    orch.stop_all()
+    orch.n_clients = saved_n
+
+    success = (client_rc == 0) and has_ok
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"LSPS2 get_info {'ok' if has_ok else 'missing/failed'}")
+    return success
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -1995,6 +2181,11 @@ SCENARIOS = {
     "dw_exhibition": lambda o, **kw: scenario_dw_exhibition(o),
     "buy_liquidity": lambda o, **kw: scenario_buy_liquidity(o),
     "dual_factory": lambda o, **kw: scenario_dual_factory(o),
+    "splice_channel": lambda o, **kw: scenario_splice_channel(o),
+    "async_rotation": lambda o, **kw: scenario_async_rotation(o),
+    "bolt12_offer": lambda o, **kw: scenario_bolt12_offer(o),
+    "bip39_restore": lambda o, **kw: scenario_bip39_restore(o),
+    "lsps2_wire": lambda o, **kw: scenario_lsps2_wire(o),
 }
 
 
@@ -2032,6 +2223,11 @@ def list_scenarios():
         "buy_liquidity": "Buy inbound liquidity from L-stock via CLI",
         "dual_factory": "Two simultaneously ACTIVE factories in ladder",
         "dw_exhibition": "Full DW lifecycle: multi-advance + PTLC close + cross-factory contrast",
+        "splice_channel": "Splice-out channel[0] by 10k sats: STFU → SPLICE_INIT → confirm",
+        "async_rotation": "Factory rotation with async-rotation flag; clients reconnect",
+        "bolt12_offer": "Create BOLT 12 offer via LSP CLI; decode via client CLI",
+        "bip39_restore": "Generate BIP 39 mnemonic; restore from it; verify keyfile OK",
+        "lsps2_wire": "Client sends lsps2.get_info; LSP responds with opening_fee_params",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
@@ -2062,6 +2258,8 @@ def main():
                         help="Bitcoin RPC username (default from env or 'rpcuser')")
     parser.add_argument("--rpcpassword", type=str, default=None,
                         help="Bitcoin RPC password (default from env or 'rpcpass')")
+    parser.add_argument("--cli-path", type=str, default=None,
+                        help="Path to bitcoin-cli (default: auto-detect)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output (dump logs on failure)")
 
@@ -2127,6 +2325,7 @@ def main():
             network=args.network,
             rpcuser=args.rpcuser,
             rpcpassword=args.rpcpassword,
+            cli_path=args.cli_path,
         )
 
         try:

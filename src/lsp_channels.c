@@ -3235,10 +3235,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     fe->update(fe);
             }
 
-            /* Timeout — run watchtower check if available */
-            if (mgr->watchtower)
-                watchtower_check(mgr->watchtower);
-            /* Check HTLC timeouts if we have a chain connection */
+            /* Check block height / factory lifecycle FIRST (fast: 1 RPC call).
+               watchtower_check is deferred to avoid blocking the daemon loop —
+               it makes O(n_entries * scan_depth) RPC calls and can take minutes. */
             if (mgr->watchtower && mgr->watchtower->rt) {
                 int height = regtest_get_block_height(mgr->watchtower->rt);
                 if (height > 0) {
@@ -3508,6 +3507,22 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             }
                         }
                     }
+                }
+            }
+
+            /* Watchtower breach check — rate-limited to once per 60s because
+               it makes O(n_entries × scan_depth) RPC calls and would otherwise
+               block the daemon loop for tens of seconds every 5-second timeout.
+               Initialize last_wt_check on first entry (0 sentinel) so the first
+               real check is delayed by a full 60-second cycle. */
+            {
+                static time_t last_wt_check = 0;
+                time_t tnow = time(NULL);
+                if (last_wt_check == 0)
+                    last_wt_check = tnow;   /* arm the clock; skip this tick */
+                else if (mgr->watchtower && (tnow - last_wt_check) >= 60) {
+                    last_wt_check = tnow;
+                    watchtower_check(mgr->watchtower);
                 }
             }
 

@@ -31,6 +31,8 @@ typedef struct {
     uint32_t channel_id;          /* channel index (commitment) or node index (factory) */
     uint64_t commit_num;          /* commitment number or DW epoch */
     unsigned char txid[32];       /* txid to watch for (internal byte order) */
+    int32_t registered_height;    /* chain height when this entry was registered;
+                                     skip if confirmed tx predates this height */
 
     /* WATCH_COMMITMENT fields */
     uint32_t to_local_vout;
