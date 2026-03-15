@@ -2,9 +2,20 @@
 
 All notable changes to SuperScalar are documented here.
 
-## 0.1.6 — unreleased
+## 0.1.6 — 2026-03-15
+
+32 of 36 orchestrator scenarios pass (4 pre-existing failures: jit_lifecycle, factory_rotation, ladder_breach, turnover_abort). 553/553 unit tests pass.
 
 ### Added
+
+- **5 new orchestrator scenarios** (`tools/test_orchestrator.py`):
+  - `splice_channel` — splice-out channel[0] by 10k sats: STFU → SPLICE_INIT → broadcast → confirm
+  - `async_rotation` — factory rotation with `--async-rotation`; clients reconnect and rotation completes
+  - `bolt12_offer` — create BOLT 12 offer via LSP CLI (`--create-offer`); decode via client CLI (`--pay-offer`)
+  - `bip39_restore` — generate 24-word BIP 39 mnemonic, restore from it, verify keyfile OK
+  - `lsps2_wire` — client sends `lsps2.get_info` over live factory connection; LSP responds with fee params
+- **LSPS_REQUEST handling during cooperative close** (`src/lsp.c`): `lsp_run_cooperative_close` now drains queued `MSG_LSPS_REQUEST` messages from each client before sending `CLOSE_PROPOSE`, and dispatches them inline during close-nonce collection. Prevents LSPS responses from appearing mid-ceremony and breaking the MuSig2 close sequence when a client sends a protocol query right after factory entry.
+- **LSPS_REQUEST dispatch in demo `wait_for_msg`** (`src/lsp_demo.c`): `wait_for_msg` now routes `MSG_LSPS_REQUEST` to `lsps_handle_request` inline so protocol queries arriving during factory ceremonies (DW advance, rotation nonce exchange) receive a timely response.
 
 - **Async factory rotation** (`--async-rotation`): The LSP can now coordinate factory rotation without requiring all N clients to be online simultaneously. When the factory enters the DYING state, the LSP pushes a `QUEUE_REQ_ROTATION` work item into each client's pending queue and sends a push notification. As clients reconnect and poll their queue (via `MSG_QUEUE_POLL` / `MSG_QUEUE_ITEMS` / `MSG_QUEUE_DONE`), they acknowledge the rotation request and the LSP marks them ready. The MuSig2 ceremony fires automatically once all N clients are ready. If the factory expires before all clients reconnect, partial rotation is attempted with the ready subset (≥ 2 signers). Urgency escalates from `LOW → NORMAL → HIGH → CRITICAL` as the deadline approaches. Companion flags: `--notify-webhook URL` (HTTP POST notifications) and `--notify-exec SCRIPT` (external script). Without `--async-rotation`, the existing synchronous blocking rotation path is unchanged.
 - **Wire protocol: queue coordination messages** (`MSG_QUEUE_POLL` 0x65, `MSG_QUEUE_ITEMS` 0x66, `MSG_QUEUE_DONE` 0x67): Three new message types for client/LSP pending-work coordination. `wire_build_queue_items()` serializes `queue_entry_t[]` to JSON; `wire_parse_queue_done()` parses client acknowledgement IDs.
@@ -23,6 +34,10 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
+- **`watchtower_check` false-positive on cooperative close** (`src/regtest.c`): `regtest_is_in_mempool` returned `true` for any txid when `bitcoin-cli getmempoolentry` produced empty output (stderr redirected to `/dev/null`, stdout was empty string). Added empty-string guard: `result[0] == '\0'` → `false`. Previously `cooperative_close` was incorrectly flagged as a breach.
+- **Watchtower `all_watch` txid mismatch** (`tools/superscalar_lsp.c`): The LSP breach test built a CPFP child from the client's old commitment (`channel_build_commitment_tx_for_remote(lsp_ch)`) which produces the commitment from the LSP's side. But the client's watchtower registered the txid built from `channel_build_commitment_tx_for_remote(client_ch)`, which is the LSP's commitment from the client's perspective — a different transaction. Changed the LSP breach code to use `channel_build_commitment_tx(chX, ...)` (LSP's own commitment), which is the same transaction the client watches for. Fixes 0/4 → 4/4 detected breach.
+- **Watchtower `all_watch` periodic check blocking** (`tools/superscalar_client.c`): Periodic `watchtower_check()` was called every 2-second select timeout, blocking for 150 ms × 4 entries × 41 calls ≈ 24 seconds, starving the payment message loop. Rate-limited to once every 15 timeouts (~30s).
+- **Watchtower `late_arrival` detection** (`src/watchtower.c`): Entries loaded from SQLite had `registered_height` set to the current block height at load time. A breach confirmed during downtime (height < load height) was filtered as "pre-existing" and never detected. Changed to `registered_height = 0` for all DB-loaded entries — height filter only applies to fresh in-session registrations. Fixes 0/4 → 4/4 late-arrival detection.
 - **`test_regtest_breach_penalty_cpfp` CPFP bump failure**: `regtest_sign_raw_tx_with_wallet` required `complete: true` from `signrawtransactionwithwallet`, but CPFP child transactions have a P2A (anyone-can-spend) anchor input that the wallet intentionally leaves unsigned — so `complete` is correctly `false`. Added `require_complete` flag; CPFP callers pass `0`.
 - **`fee_for_factory_tx` vbyte underestimate**: Factory tree transaction overhead was calculated as 50 vB instead of the correct 68 vB (10 vB tx overhead + 58 vB P2TR keypath input). Formula is now `68 + 43 × n_outputs`. Updated `test_fee_factory_tx` assertions (93→111, 179→197, 265→283 at 1 sat/vB).
 - **Docs: testing-guide regtest count corrected**: Was 43, actual count is 42. Total automated corrected to 460, suite total to 515.

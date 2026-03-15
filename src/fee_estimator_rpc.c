@@ -67,7 +67,10 @@ static uint64_t rpc_get_rate(fee_estimator_t *self, fee_target_t target)
             fe->last_updated = now;
         }
     }
-    return fe->cached[idx];
+    /* Fall back to 1 sat/vB when estimatesmartfee is unavailable (e.g. regtest).
+       This matches the client's static default and prevents channel balance
+       mismatches when the two sides compute commit fees independently. */
+    return fe->cached[idx] > 0 ? fe->cached[idx] : 1000;
 }
 
 static void rpc_update(fee_estimator_t *self)

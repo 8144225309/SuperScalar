@@ -52,11 +52,11 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 418 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, property-based tests |
+| Unit tests | 553 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, LSPS0/1/2, BIP 39, PoW validation, splicing, BOLT 12 offers, property-based tests |
 | Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
-| Orchestrator scenarios | 30 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation, DW exhibition, dual factory, BOLT11 bridge |
+| Orchestrator scenarios | 36 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation, DW exhibition, dual factory, BOLT11 bridge, splice, async rotation, BOLT 12 offer, BIP 39 restore, LSPS2 wire |
 | Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
-| **Total** | **515 (460 automated + 25 manual + 30 orchestrator)** | | |
+| **Total** | **656 (631 automated + 25 manual)** | | |
 
 ---
 
@@ -69,7 +69,7 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 418/418 passed`
+Expected output: `Results: 553/553 passed`
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript (including 2-leaf taptree

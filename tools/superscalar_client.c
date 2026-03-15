@@ -374,6 +374,8 @@ typedef struct {
     regtest_t *rt;
     jit_channel_t *jit_ch;  /* JIT channel, or NULL */
     int auto_accept_jit;    /* 1 = auto-accept JIT offers */
+    int test_lsps2;         /* 1 = send lsps2.get_info after factory setup */
+    int test_lsps2_done;    /* 1 = LSPS2 test completed */
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -588,6 +590,25 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                my_index, factory->active_blocks, factory->dying_blocks);
     }
 
+    /* Rate-limit periodic watchtower checks: each select() timeout is 2s;
+       only run check every 15 timeouts (~30s) to avoid blocking message I/O
+       with slow RPC calls. */
+    int wt_check_counter = 0;
+
+    /* --test-lsps2: send lsps2.get_info immediately on factory entry */
+    if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
+        cJSON *req = cJSON_CreateObject();
+        if (req) {
+            cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+            cJSON_AddNumberToObject(req, "id", 1);
+            cJSON_AddStringToObject(req, "method", "lsps2.get_info");
+            cJSON_AddNullToObject(req, "params");
+            wire_send(fd, MSG_LSPS_REQUEST, req);
+            cJSON_Delete(req);
+            printf("Client %u: sent lsps2.get_info request\n", my_index);
+        }
+    }
+
     while (!g_shutdown) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -596,9 +617,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) continue;  /* EINTR */
         if (ret == 0) {
-            /* Periodic watchtower check on timeout */
-            if (cbd && cbd->wt)
+            /* Periodic watchtower check — throttled to once every ~30s */
+            if (cbd && cbd->wt && ++wt_check_counter >= 15) {
+                wt_check_counter = 0;
                 watchtower_check(cbd->wt);
+            }
             continue;
         }
 
@@ -1620,6 +1643,24 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             break;
         }
 
+        case MSG_LSPS_RESPONSE: {
+            /* --test-lsps2: verify lsps2.get_info response has required fields */
+            if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
+                cJSON *result = msg.json
+                    ? cJSON_GetObjectItem(msg.json, "result") : NULL;
+                int ok = (result != NULL &&
+                          cJSON_GetObjectItem(result, "min_fee_msat") != NULL);
+                printf("LSPS2 GET_INFO: %s\n", ok ? "OK" : "FAIL");
+                fflush(stdout);
+                cbd->test_lsps2_done = 1;
+                cJSON_Delete(msg.json);
+                /* Continue in daemon loop to participate in cooperative close */
+                break;
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         default:
             fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
                     my_index, msg.msg_type);
@@ -1717,6 +1758,7 @@ int main(int argc, char *argv[]) {
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
+    int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1817,6 +1859,8 @@ int main(int argc, char *argv[]) {
 
         } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
             auto_accept_jit = 1;
+        } else if (strcmp(argv[i], "--test-lsps2") == 0) {
+            test_lsps2 = 1;
         } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
             lsp_pubkey_hex = argv[++i];
         } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
@@ -2141,6 +2185,7 @@ int main(int argc, char *argv[]) {
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.auto_accept_jit = auto_accept_jit;
+        cbd.test_lsps2 = test_lsps2;
 
         /* Load persisted client invoices (Phase 23) */
         if (use_db) {
