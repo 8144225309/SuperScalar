@@ -229,7 +229,7 @@ static int hd_sign_input(wallet_source_t *self,
 
     unsigned char aux_rand[32];
     FILE *f = fopen("/dev/urandom", "rb");
-    if (f) { fread(aux_rand, 1, 32, f); fclose(f); }
+    if (f) { if (fread(aux_rand, 1, 32, f) != 32) memset(aux_rand, 0, 32); fclose(f); }
     else   memset(aux_rand, 0, 32);
 
     unsigned char sig64[64];

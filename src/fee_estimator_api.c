@@ -51,8 +51,7 @@ static int parse_url(const char *url, char *scheme, char *host, int *port, char 
         host[hlen] = '\0';
         url = slash ? slash : "";
     }
-    strncpy(path, url[0] ? url : "/", 1023);
-    path[1023] = '\0';
+    snprintf(path, 1024, "%s", url[0] ? url : "/");
     return 1;
 }
 
