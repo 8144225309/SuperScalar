@@ -4,7 +4,7 @@ All notable changes to SuperScalar are documented here.
 
 ## 0.1.6 — 2026-03-15
 
-32 of 36 orchestrator scenarios pass (4 pre-existing failures: jit_lifecycle, factory_rotation, ladder_breach, turnover_abort). 553/553 unit tests pass.
+36/36 orchestrator scenarios pass. 553/553 unit tests pass.
 
 ### Added
 
@@ -33,6 +33,8 @@ All notable changes to SuperScalar are documented here.
 - **Docker: dashboard integration**: `EXPOSE 8080` in Dockerfile, `8080:8080` port mapping in `docker-compose.yml`, and three new entrypoint modes in `docker-entrypoint.sh`: `dashboard` (demo), `dashboard-live` (connects to regtest bitcoind), `orchestrator`.
 
 ### Fixed
+
+- **Daemon loop lifecycle detection** (`src/lsp_channels.c`): `watchtower_check` was called synchronously on every 5-second poll timeout, making ~672 `bitcoin-cli` subprocess calls per cycle (16 old commitment entries × 42 RPC calls each — one `gettransaction` attempt plus up to 20-block fallback scan per entry). This blocked the daemon loop for ~65 seconds, preventing factory DYING/EXPIRED state from ever being detected within the orchestrator test window. Fixed by: (1) moving the block-height/factory-lifecycle check before `watchtower_check` so it runs on every 5-second tick with 1 RPC call; (2) rate-limiting `watchtower_check` to once per 60 seconds; (3) initializing the rate-limit clock on the first tick so the initial cycle is not blocked. Fixes four pre-existing orchestrator failures: `factory_rotation`, `jit_lifecycle`, `ladder_breach`, `turnover_abort`.
 
 - **`watchtower_check` false-positive on cooperative close** (`src/regtest.c`): `regtest_is_in_mempool` returned `true` for any txid when `bitcoin-cli getmempoolentry` produced empty output (stderr redirected to `/dev/null`, stdout was empty string). Added empty-string guard: `result[0] == '\0'` → `false`. Previously `cooperative_close` was incorrectly flagged as a breach.
 - **Watchtower `all_watch` txid mismatch** (`tools/superscalar_lsp.c`): The LSP breach test built a CPFP child from the client's old commitment (`channel_build_commitment_tx_for_remote(lsp_ch)`) which produces the commitment from the LSP's side. But the client's watchtower registered the txid built from `channel_build_commitment_tx_for_remote(client_ch)`, which is the LSP's commitment from the client's perspective — a different transaction. Changed the LSP breach code to use `channel_build_commitment_tx(chX, ...)` (LSP's own commitment), which is the same transaction the client watches for. Fixes 0/4 → 4/4 detected breach.
