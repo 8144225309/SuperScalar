@@ -40,14 +40,14 @@ static int parse_url(const char *url, char *scheme, char *host, int *port, char 
     if (colon && (!slash || colon < slash)) {
         size_t hlen = (size_t)(colon - url);
         if (hlen >= 256) return 0;
-        strncpy(host, url, hlen);
+        memcpy(host, url, hlen);
         host[hlen] = '\0';
         *port = atoi(colon + 1);
         url = slash ? slash : "";
     } else {
         size_t hlen = slash ? (size_t)(slash - url) : strlen(url);
         if (hlen >= 256) return 0;
-        strncpy(host, url, hlen);
+        memcpy(host, url, hlen);
         host[hlen] = '\0';
         url = slash ? slash : "";
     }
