@@ -366,18 +366,49 @@ int watchtower_check(watchtower_t *wt) {
 
     int penalties_broadcast = 0;
 
+    /* Pre-compute display-order hex for every entry once */
+    char (*txid_hexes)[65] = calloc(wt->n_entries + 1, 65);
+    int  *batch_confs      = calloc(wt->n_entries + 1, sizeof(int));
+    if (!txid_hexes || !batch_confs) {
+        free(txid_hexes);
+        free(batch_confs);
+        return 0;
+    }
+    for (size_t j = 0; j < wt->n_entries; j++) {
+        unsigned char disp[32];
+        memcpy(disp, wt->entries[j].txid, 32);
+        reverse_bytes(disp, 32);
+        hex_encode(disp, 32, txid_hexes[j]);
+        batch_confs[j] = -1;
+    }
+
+    /* Batch confirmation lookup: O(scan_depth) RPCs regardless of n_entries.
+       Falls back to per-entry calls if the backend doesn't implement the slot
+       (e.g. the BIP 158 backend). */
+    if (wt->chain->get_confirmations_batch) {
+        /* Build a flat pointer array — char (*)[65] cannot be cast to char **
+           because the stride is different (65 bytes vs sizeof(char*) bytes). */
+        const char **ptrs = malloc(wt->n_entries * sizeof(const char *));
+        if (ptrs) {
+            for (size_t j = 0; j < wt->n_entries; j++)
+                ptrs[j] = txid_hexes[j];
+            wt->chain->get_confirmations_batch(wt->chain,
+                ptrs, wt->n_entries, batch_confs);
+            free(ptrs);
+        }
+    } else {
+        for (size_t j = 0; j < wt->n_entries; j++)
+            batch_confs[j] = wt->chain->get_confirmations(wt->chain,
+                                                           txid_hexes[j]);
+    }
+
     for (size_t i = 0; i < wt->n_entries; ) {
         watchtower_entry_t *e = &wt->entries[i];
 
-        /* Convert txid to display-order hex */
-        unsigned char display_txid[32];
-        memcpy(display_txid, e->txid, 32);
-        reverse_bytes(display_txid, 32);
-        char txid_hex[65];
-        hex_encode(display_txid, 32, txid_hex);
+        const char *txid_hex = txid_hexes[i];
 
         /* Check if old commitment is on chain or in mempool */
-        int conf = wt->chain->get_confirmations(wt->chain, txid_hex);
+        int conf = batch_confs[i];
         int in_mempool = wt->chain->is_in_mempool(wt->chain, txid_hex);
 
         if (conf < 0 && !in_mempool) {
@@ -452,7 +483,12 @@ int watchtower_check(watchtower_t *wt) {
             e->response_tx = NULL;
             free(e->burn_tx);
             e->burn_tx = NULL;
-            wt->entries[i] = wt->entries[wt->n_entries - 1];
+            {
+                size_t _last = wt->n_entries - 1;
+                memcpy(txid_hexes[i], txid_hexes[_last], 65);
+                batch_confs[i] = batch_confs[_last];
+                wt->entries[i] = wt->entries[_last];
+            }
             wt->n_entries--;
             continue;
         }
@@ -594,8 +630,13 @@ int watchtower_check(watchtower_t *wt) {
                 ch->htlcs[0] = saved_h0;
         }
 
-        /* Remove this entry (swap with last) */
-        wt->entries[i] = wt->entries[wt->n_entries - 1];
+        /* Remove this entry (swap with last); sync batch arrays for next iter */
+        {
+            size_t _last = wt->n_entries - 1;
+            memcpy(txid_hexes[i], txid_hexes[_last], 65);
+            batch_confs[i] = batch_confs[_last];
+            wt->entries[i] = wt->entries[_last];
+        }
         wt->n_entries--;
         /* Don't increment i — check the swapped entry */
     }
@@ -727,6 +768,8 @@ int watchtower_check(watchtower_t *wt) {
         i++;
     }
 
+    free(txid_hexes);
+    free(batch_confs);
     return penalties_broadcast;
 }
 
