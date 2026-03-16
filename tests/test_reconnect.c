@@ -1582,6 +1582,70 @@ int test_regtest_init_full(void) {
     return 1;
 }
 
+/* Test: regtest_http_rpc path returns same result as fork+exec for getblockcount.
+   Requires bitcoind running on regtest port 18443 — skips if not available. */
+int test_regtest_http_rpc_path(void) {
+    regtest_t rt_fork, rt_http;
+    memset(&rt_fork, 0, sizeof(rt_fork));
+    memset(&rt_http,  0, sizeof(rt_http));
+
+    strncpy(rt_fork.cli_path,    "bitcoin-cli", sizeof(rt_fork.cli_path) - 1);
+    strncpy(rt_fork.rpcuser,     "rpcuser",     sizeof(rt_fork.rpcuser)  - 1);
+    strncpy(rt_fork.rpcpassword, "rpcpass",     sizeof(rt_fork.rpcpassword) - 1);
+    strncpy(rt_fork.network,     "regtest",     sizeof(rt_fork.network)  - 1);
+    /* rpcport = 0 → fork path */
+
+    memcpy(&rt_http, &rt_fork, sizeof(rt_fork));
+    rt_http.rpcport = 18443;  /* HTTP path */
+
+    /* Test the HTTP path directly — skip if bitcoind unavailable */
+    char *result_http = regtest_exec(&rt_http, "getblockcount", "");
+    if (!result_http) {
+        /* bitcoind not running — skip gracefully */
+        return 1;
+    }
+    int height_http = atoi(result_http);
+    free(result_http);
+
+    TEST_ASSERT(height_http >= 0, "HTTP RPC getblockcount returns non-negative height");
+
+    /* Also verify against the fork+exec path if bitcoin-cli is available */
+    char *result_fork = regtest_exec(&rt_fork, "getblockcount", "");
+    if (result_fork) {
+        /* Only compare if fork path returned a plausible integer (not an error string) */
+        int height_fork = atoi(result_fork);
+        int looks_valid = (result_fork[0] >= '0' && result_fork[0] <= '9');
+        free(result_fork);
+        if (looks_valid) {
+            TEST_ASSERT(height_http == height_fork,
+                        "HTTP RPC height matches fork+exec height");
+        }
+        /* If not valid (e.g. bitcoin-cli not in PATH), skip the comparison */
+    }
+
+    /* Verify string result: getblockhash returns a valid 64-char hex hash */
+    if (height_http > 0) {
+        char params[32];
+        snprintf(params, sizeof(params), "%d", height_http);
+        char *hash_http = regtest_exec(&rt_http, "getblockhash", params);
+        TEST_ASSERT(hash_http != NULL, "getblockhash returns result");
+        if (hash_http) {
+            /* HTTP path wraps strings in quotes — strip them */
+            const char *hp = hash_http;
+            while (*hp == '"' || *hp == ' ' || *hp == '\n') hp++;
+            char h[65] = {0};
+            strncpy(h, hp, 64);
+            char *he = h + strlen(h) - 1;
+            while (he > h && (*he == '"' || *he == ' ' || *he == '\n' || *he == '\r'))
+                *he-- = '\0';
+            TEST_ASSERT(strlen(h) == 64, "getblockhash is 64-char hex");
+            free(hash_http);
+        }
+    }
+
+    return 1;
+}
+
 /* Test: regtest_get_balance with fake cli returns valid double */
 int test_regtest_get_balance(void) {
     regtest_t rt;
