@@ -23,6 +23,8 @@ All notable changes to SuperScalar are documented here.
 
 ### Fixed
 
+- **`--test-bridge` race: `INVOICE_CREATED` missed by client**: `CREATE_INVOICE` was sent to the client immediately after demo payments completed, while the client was still inside the `MSG_UPDATE_ADD_HTLC` handler processing nested `recv_or_handle_ptlc` and revocation rounds (up to ~14s of blocking recvs). The client missed the message and the 10-second wait window expired. Added a 15-second sleep before sending `CREATE_INVOICE` — ensuring the client has returned to the daemon loop and is ready to receive — and extended the `INVOICE_CREATED`/`REGISTER_INVOICE` collection window from 10s to 60s.
+
 - **`test_regtest_breach_penalty_cpfp` CPFP bump failure**: `regtest_sign_raw_tx_with_wallet` required `complete: true` from `signrawtransactionwithwallet`, but CPFP child transactions have a P2A (anyone-can-spend) anchor input that the wallet intentionally leaves unsigned — so `complete` is correctly `false`. Added `require_complete` flag; CPFP callers pass `0`.
 - **`fee_for_factory_tx` vbyte underestimate**: Factory tree transaction overhead was calculated as 50 vB instead of the correct 68 vB (10 vB tx overhead + 58 vB P2TR keypath input). Formula is now `68 + 43 × n_outputs`. Updated `test_fee_factory_tx` assertions (93→111, 179→197, 265→283 at 1 sat/vB).
 - **Docs: testing-guide regtest count corrected**: Was 43, actual count is 42. Total automated corrected to 460, suite total to 515.
