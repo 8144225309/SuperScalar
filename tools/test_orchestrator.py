@@ -2146,6 +2146,37 @@ def scenario_lsps2_wire(orch):
     return success
 
 
+def scenario_lsps2_buy(orch):
+    """Client sends lsps2.get_info then lsps2.buy; verifies jit_channel_scid in response."""
+    orch._log("=== SCENARIO: lsps2_buy ===")
+
+    saved_n = orch.n_clients
+    orch.n_clients = 1
+
+    # --daemon keeps the LSP alive after the demo so jit_channel_create has mgr context
+    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_client(0, ["--test-lsps2-buy"])
+
+    client_rc = "TIMEOUT"
+    if orch.clients[0]:
+        client_rc = orch.clients[0].wait(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"Client 0 exited with code {client_rc}")
+
+    client_log = orch.clients[0].read_log() if orch.clients[0] else ""
+    has_get_info_ok = "LSPS2 GET_INFO: OK" in client_log
+    has_buy_ok      = "LSPS2 BUY: OK"      in client_log
+
+    orch.stop_all()
+    orch.n_clients = saved_n
+
+    success = (client_rc == 0) and has_get_info_ok and has_buy_ok
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"get_info={'ok' if has_get_info_ok else 'fail'}, "
+              f"buy={'ok' if has_buy_ok else 'fail'}")
+    return success
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -2186,6 +2217,7 @@ SCENARIOS = {
     "bolt12_offer": lambda o, **kw: scenario_bolt12_offer(o),
     "bip39_restore": lambda o, **kw: scenario_bip39_restore(o),
     "lsps2_wire": lambda o, **kw: scenario_lsps2_wire(o),
+    "lsps2_buy":  lambda o, **kw: scenario_lsps2_buy(o),
 }
 
 
@@ -2228,6 +2260,7 @@ def list_scenarios():
         "bolt12_offer": "Create BOLT 12 offer via LSP CLI; decode via client CLI",
         "bip39_restore": "Generate BIP 39 mnemonic; restore from it; verify keyfile OK",
         "lsps2_wire": "Client sends lsps2.get_info; LSP responds with opening_fee_params",
+        "lsps2_buy":  "Client sends lsps2.get_info then lsps2.buy; verifies jit_channel_scid",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
