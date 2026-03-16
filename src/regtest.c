@@ -591,6 +591,98 @@ int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     return -1;
 }
 
+int regtest_get_confirmations_batch(regtest_t *rt,
+                                    const char **txids_hex, size_t n_txids,
+                                    int *confs_out)
+{
+    if (!rt || !txids_hex || !confs_out || n_txids == 0) return 0;
+
+    for (size_t i = 0; i < n_txids; i++)
+        confs_out[i] = -1;
+
+    size_t n_remaining = n_txids;
+
+    /* Step 1: gettransaction for each txid (cheap for wallet txs) */
+    for (size_t i = 0; i < n_txids; i++) {
+        char params[256];
+        snprintf(params, sizeof(params), "\"%s\" true", txids_hex[i]);
+        char *result = regtest_exec(rt, "gettransaction", params);
+        if (!result) continue;
+        cJSON *json = cJSON_Parse(result);
+        free(result);
+        if (!json) continue;
+        cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
+        if (conf && cJSON_IsNumber(conf)) {
+            confs_out[i] = conf->valueint;
+            n_remaining--;
+        }
+        cJSON_Delete(json);
+    }
+
+    if (n_remaining == 0) return 1;
+
+    /* Step 2: scan recent blocks — one getblockhash + one getblock per block,
+       then check all remaining txids against the block's tx array in memory.
+       O(scan_depth) RPCs regardless of n_txids. */
+    char *hcnt = regtest_exec(rt, "getblockcount", "");
+    if (!hcnt) return 1;
+    int height = atoi(hcnt);
+    free(hcnt);
+
+    int depth = rt->scan_depth > 0 ? rt->scan_depth : 20;
+    for (int blk = 0; blk < depth && blk <= height && n_remaining > 0; blk++) {
+        char params[256];
+        snprintf(params, sizeof(params), "%d", height - blk);
+        char *hash_result = regtest_exec(rt, "getblockhash", params);
+        if (!hash_result) continue;
+
+        char blockhash[65];
+        char *s = hash_result;
+        while (*s == ' ' || *s == '\n' || *s == '"') s++;
+        char *e = s + strlen(s) - 1;
+        while (e > s && (*e == ' ' || *e == '\n' || *e == '"' || *e == '\r'))
+            *e-- = '\0';
+        strncpy(blockhash, s, 64);
+        blockhash[64] = '\0';
+        free(hash_result);
+
+        /* getblock hash 1 — returns tx as array of txid strings, much lighter
+           than verbosity 2 (no decoded script data needed here) */
+        snprintf(params, sizeof(params), "\"%s\" 1", blockhash);
+        char *blk_result = regtest_exec(rt, "getblock", params);
+        if (!blk_result) continue;
+
+        cJSON *block = cJSON_Parse(blk_result);
+        free(blk_result);
+        if (!block) continue;
+
+        /* Use the block's own confirmations field for accuracy */
+        int blk_confs = blk + 1;
+        cJSON *conf_j = cJSON_GetObjectItem(block, "confirmations");
+        if (conf_j && cJSON_IsNumber(conf_j))
+            blk_confs = conf_j->valueint;
+
+        cJSON *txs = cJSON_GetObjectItem(block, "tx");
+        if (txs && cJSON_IsArray(txs)) {
+            cJSON *txid_j = NULL;
+            cJSON_ArrayForEach(txid_j, txs) {
+                if (!cJSON_IsString(txid_j)) continue;
+                const char *block_txid = txid_j->valuestring;
+                for (size_t i = 0; i < n_txids; i++) {
+                    if (confs_out[i] != -1) continue;
+                    if (strcasecmp(block_txid, txids_hex[i]) == 0) {
+                        confs_out[i] = blk_confs;
+                        n_remaining--;
+                    }
+                }
+            }
+        }
+        cJSON_Delete(block);
+    }
+
+    return 1;
+}
+
 bool regtest_is_in_mempool(regtest_t *rt, const char *txid) {
     char params[256];
     snprintf(params, sizeof(params), "\"%s\"", txid);
