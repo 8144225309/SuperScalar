@@ -3537,18 +3537,24 @@ int main(int argc, char *argv[]) {
                 wire_send(lsp.client_fds[dest_client], MSG_CREATE_INVOICE, inv_req);
                 cJSON_Delete(inv_req);
 
+                /* Sleep to let clients finish in-flight commit exchanges before
+                   we send CREATE_INVOICE. MSG_UPDATE_ADD_HTLC handler has
+                   nested recv timeouts up to 5+2+5+2=14s; sleeping ensures
+                   the client is in daemon loop ready to receive. */
+                sleep(15);
+
                 /* Wait for INVOICE_CREATED, handling REGISTER_INVOICE that
                    may arrive in any order.  Stale REGISTER_INVOICE messages
                    from prior payment rounds can arrive before the fresh
                    INVOICE_CREATED, so loop until both are received or the
-                   10-second window expires. */
+                   60-second window expires. */
                 int got_invoice_created = 0, got_register_invoice = 0;
                 struct timeval _t0, _tnow;
                 gettimeofday(&_t0, NULL);
                 while (1) {
                     gettimeofday(&_tnow, NULL);
                     int _elapsed = (int)(_tnow.tv_sec - _t0.tv_sec);
-                    int _remaining = 10 - _elapsed;
+                    int _remaining = 60 - _elapsed;
                     if (_remaining <= 0) break;
                     wire_msg_t m;
                     if (!wire_recv_timeout(lsp.client_fds[dest_client], &m, _remaining))
