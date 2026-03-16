@@ -459,6 +459,26 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v5 migration: scid_registry for factory leaf → fake SCID */
+    if (db_version < 5) {
+        const char *sql_v5 =
+            "CREATE TABLE IF NOT EXISTS scid_registry ("
+            "  scid        INTEGER NOT NULL PRIMARY KEY,"
+            "  factory_id  INTEGER NOT NULL,"
+            "  leaf_idx    INTEGER NOT NULL,"
+            "  created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr5 = NULL;
+        if (sqlite3_exec(p->db, sql_v5, NULL, NULL, &merr5) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v5 failed: %s\n",
+                    merr5 ? merr5 : "unknown");
+            sqlite3_free(merr5);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -3079,6 +3099,48 @@ int persist_load_lsp_endpoint(persist_t *p,
             pubkey_hex_out[pubkey_cap - 1] = '\0';
             found = 1;
         }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Schema v5: SCID registry --- */
+
+int persist_save_scid_entry(persist_t *p,
+                             uint32_t factory_id,
+                             uint32_t leaf_idx,
+                             uint64_t scid) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO scid_registry"
+            "  (scid, factory_id, leaf_idx)"
+            "  VALUES (?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)scid);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)factory_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)leaf_idx);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
+}
+
+int persist_load_scid_entry(persist_t *p,
+                             uint64_t scid,
+                             uint32_t *factory_id_out,
+                             uint32_t *leaf_idx_out) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT factory_id, leaf_idx FROM scid_registry"
+            "  WHERE scid = ? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)scid);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (factory_id_out) *factory_id_out = (uint32_t)sqlite3_column_int64(stmt, 0);
+        if (leaf_idx_out)   *leaf_idx_out   = (uint32_t)sqlite3_column_int64(stmt, 1);
+        found = 1;
     }
     sqlite3_finalize(stmt);
     return found;

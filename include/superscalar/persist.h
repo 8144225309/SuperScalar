@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 4
+#define PERSIST_SCHEMA_VERSION 5
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -498,5 +498,26 @@ int persist_load_lsp_endpoint(persist_t *p,
                                char *host_out,       size_t host_cap,
                                uint16_t   *port_out,
                                char *pubkey_hex_out, size_t pubkey_cap);
+
+/* -----------------------------------------------------------------------
+ * Schema v5: SCID registry + inbound HTLC tracking
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Upsert a factory leaf → fake SCID mapping.
+ * factory_id: 24-bit factory internal ID
+ * leaf_idx:   24-bit leaf index within the factory
+ * scid:       the encoded fake short_channel_id
+ */
+int persist_save_scid_entry(persist_t *p,
+                             uint32_t factory_id,
+                             uint32_t leaf_idx,
+                             uint64_t scid);
+
+/* Returns 1 if found, 0 otherwise. */
+int persist_load_scid_entry(persist_t *p,
+                             uint64_t scid,
+                             uint32_t *factory_id_out,
+                             uint32_t *leaf_idx_out);
 
 #endif /* SUPERSCALAR_PERSIST_H */

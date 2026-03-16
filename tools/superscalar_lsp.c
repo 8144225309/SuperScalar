@@ -785,6 +785,7 @@ int main(int argc, char *argv[]) {
     const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
     uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
     uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
+    int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -1037,6 +1038,8 @@ int main(int argc, char *argv[]) {
             create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
             well_known_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--clnbridge") == 0)
+            use_clnbridge = 1;
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1874,6 +1877,11 @@ int main(int argc, char *argv[]) {
         hex_encode(nk_pub_ser, 33, nk_hex);
         printf("LSP: NK static pubkey: %s\n", nk_hex);
         printf("LSP: clients should use --lsp-pubkey %s\n", nk_hex);
+
+        if (use_clnbridge)
+            printf("LSP: inbound HTLC routing: CLN bridge (--clnbridge)\n");
+        else
+            printf("LSP: inbound HTLC routing: native (fake-SCID / htlc_inbound)\n");
 
         if (well_known_port > 0) {
             char wk_pubkey[67] = {0};
