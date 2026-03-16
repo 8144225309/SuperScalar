@@ -42,10 +42,20 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
+#include "superscalar/bolt8_server.h"
+#include <pthread.h>
 
 static volatile sig_atomic_t g_shutdown = 0;
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
 static persist_t *g_db = NULL;  /* for broadcast audit logging */
+
+/* BOLT #8 server thread — owns g_bolt8_cfg; runs blocking accept loop */
+static bolt8_server_cfg_t g_bolt8_cfg;
+static void *bolt8_server_thread(void *arg) {
+    (void)arg;
+    bolt8_server_run(&g_bolt8_cfg);
+    return NULL;
+}
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -154,6 +164,7 @@ static void usage(const char *prog) {
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
+        "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -787,6 +798,7 @@ int main(int argc, char *argv[]) {
     uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
     int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
     char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
+    uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -1045,6 +1057,8 @@ int main(int argc, char *argv[]) {
             strncpy(gossip_peers, argv[++i], sizeof(gossip_peers) - 1);
             gossip_peers[sizeof(gossip_peers) - 1] = '\0';
         }
+        else if (strcmp(argv[i], "--bolt8-port") == 0 && i + 1 < argc)
+            bolt8_listen_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1892,6 +1906,23 @@ int main(int argc, char *argv[]) {
             printf("LSP: gossip peers configured: %s\n", gossip_peers);
         else
             printf("LSP: gossip peers: none configured (use --gossip-peers HOST:PORT,...)\n");
+
+        if (bolt8_listen_port > 0) {
+            memset(&g_bolt8_cfg, 0, sizeof(g_bolt8_cfg));
+            g_bolt8_cfg.bolt8_port = bolt8_listen_port;
+            memcpy(g_bolt8_cfg.static_priv, lsp.nk_seckey, 32);
+            g_bolt8_cfg.ctx = ctx;
+            pthread_t bolt8_tid;
+            if (pthread_create(&bolt8_tid, NULL, bolt8_server_thread, NULL) == 0) {
+                pthread_detach(bolt8_tid);
+                printf("LSP: BOLT #8 server listening on port %u\n",
+                       (unsigned)bolt8_listen_port);
+            } else {
+                fprintf(stderr,
+                        "LSP: warning: failed to start BOLT #8 server on port %u\n",
+                        (unsigned)bolt8_listen_port);
+            }
+        }
 
         if (well_known_port > 0) {
             char wk_pubkey[67] = {0};

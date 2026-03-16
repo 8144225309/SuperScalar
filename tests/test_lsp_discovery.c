@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -208,6 +209,42 @@ int test_wellknown_http_serve(void) {
     close(sv2[0]);
 
     ASSERT(strncmp(resp2, "HTTP/1.0 404", 12) == 0, "unknown path returns 404");
+
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 4: end-to-end fetch from a local well-known HTTP server
+ *
+ * Forks a background server via lsp_wellknown_serve_fork(), then uses
+ * lsp_wellknown_fetch_http_port() to retrieve and parse the response.
+ * ----------------------------------------------------------------------- */
+int test_client_bootstrap_from_domain(void) {
+    /* Use a high port unlikely to collide with anything */
+    uint16_t test_port = 18765;
+
+    /* Fork a background server serving TEST_CFG */
+    if (!lsp_wellknown_serve_fork(&TEST_CFG, test_port)) {
+        /* If fork is unavailable (e.g. some sandboxes), skip gracefully */
+        printf("  SKIP: lsp_wellknown_serve_fork unavailable\n");
+        return 1;
+    }
+
+    /* Give the child process time to bind and listen */
+    usleep(150000);  /* 150 ms */
+
+    char host[256]   = {0};
+    uint16_t port    = 0;
+    char pubkey[128] = {0};
+
+    ASSERT(lsp_wellknown_fetch_http_port("127.0.0.1", test_port,
+                                         host, sizeof(host),
+                                         &port, pubkey, sizeof(pubkey)),
+           "fetch_http_port from local server succeeds");
+
+    ASSERT(strcmp(host, TEST_CFG.host) == 0, "fetched host matches cfg");
+    ASSERT(port == TEST_CFG.bolt8_port,       "fetched port matches cfg");
+    ASSERT(strcmp(pubkey, TEST_CFG.pubkey_hex) == 0, "fetched pubkey matches cfg");
 
     return 1;
 }

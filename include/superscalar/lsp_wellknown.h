@@ -70,6 +70,15 @@ int lsp_wellknown_fetch_http(const char *domain,
                               char *pubkey_hex_out, size_t pubkey_cap);
 
 /*
+ * Same as lsp_wellknown_fetch_http but connects to an explicit tcp_port
+ * instead of port 80.  Useful for testing with non-privileged ports.
+ */
+int lsp_wellknown_fetch_http_port(const char *domain, uint16_t tcp_port,
+                                   char *host_out,       size_t host_cap,
+                                   uint16_t *port_out,
+                                   char *pubkey_hex_out, size_t pubkey_cap);
+
+/*
  * Fork a background process that accepts HTTP connections on tcp_port and
  * serves the .well-known/lsps.json endpoint.  Returns 1 in the parent on
  * success, 0 on error.  The child runs indefinitely; the parent continues.

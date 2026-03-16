@@ -151,6 +151,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     mgr->htlc_origins_cap = MAX_HTLC_ORIGINS;
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
+    htlc_inbound_init(&mgr->htlc_inbound);
 
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
@@ -271,6 +272,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->htlc_origins_cap = MAX_HTLC_ORIGINS;
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
+    htlc_inbound_init(&mgr->htlc_inbound);
 
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
