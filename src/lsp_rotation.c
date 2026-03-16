@@ -153,15 +153,40 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         cJSON_Delete(pm);
 
-        /* Wait for PTLC_ADAPTED_SIG (15s timeout per client) */
+        /* Wait for PTLC_ADAPTED_SIG (60s wall-clock).
+           Discard stray messages (e.g. MSG_REVOKE_AND_ACK or
+           MSG_COMMITMENT_SIGNED from concurrent flows) rather than
+           failing the whole rotation. */
         wire_msg_t resp;
         memset(&resp, 0, sizeof(resp));
-        if (!wire_recv_timeout(lsp->client_fds[ci], &resp, 60) ||
-            resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
-            if (resp.json) cJSON_Delete(resp.json);
-            fprintf(stderr, "LSP rotate: no adapted_sig from client %zu, skipping\n", ci);
-            turnover_fail++;
-            continue;
+        {
+            struct timeval t_rot_start, t_rot_now;
+            gettimeofday(&t_rot_start, NULL);
+            int got_sig = 0;
+            while (1) {
+                gettimeofday(&t_rot_now, NULL);
+                int elapsed = (int)(t_rot_now.tv_sec - t_rot_start.tv_sec);
+                int remain  = 60 - elapsed;
+                if (remain <= 0) break;
+                if (!wire_recv_timeout(lsp->client_fds[ci], &resp, remain)) break;
+                if (resp.msg_type == MSG_PTLC_ADAPTED_SIG) { got_sig = 1; break; }
+                if (resp.msg_type == MSG_ERROR) {
+                    if (resp.json) cJSON_Delete(resp.json);
+                    memset(&resp, 0, sizeof(resp));
+                    break;
+                }
+                /* Discard stray message and keep waiting */
+                fprintf(stderr, "LSP rotate: discarding stray msg 0x%02x from client %zu\n",
+                        resp.msg_type, ci);
+                if (resp.json) cJSON_Delete(resp.json);
+                memset(&resp, 0, sizeof(resp));
+            }
+            if (!got_sig) {
+                if (resp.json) cJSON_Delete(resp.json);
+                fprintf(stderr, "LSP rotate: no adapted_sig from client %zu, skipping\n", ci);
+                turnover_fail++;
+                continue;
+            }
         }
 
         unsigned char adapted_sig[64];

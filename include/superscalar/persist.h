@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 3
+#define PERSIST_SCHEMA_VERSION 4
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -480,5 +480,18 @@ size_t persist_list_offers(persist_t *p,
 
 /* Delete an offer by ID. Returns 1 if deleted, 0 if not found or error. */
 int persist_delete_offer(persist_t *p, const unsigned char *offer_id32);
+
+/* --- Pending commitment-signed tracking (Fix 5: CS retransmit on reconnect) --- */
+
+/* Save or clear a pending COMMITMENT_SIGNED flag for a channel.
+   commitment_number == 0 clears (deletes) the entry.
+   On reconnect, if this cn matches ch->commitment_number, the LSP
+   retransmits a fresh CS (with new nonces -- NOT a replay). */
+int persist_save_pending_cs(persist_t *p, uint32_t channel_id,
+                             uint64_t commitment_number);
+
+/* Load pending CS for channel_id into *cn_out. Returns 1 if found, 0 if none. */
+int persist_load_pending_cs(persist_t *p, uint32_t channel_id,
+                             uint64_t *cn_out);
 
 #endif /* SUPERSCALAR_PERSIST_H */

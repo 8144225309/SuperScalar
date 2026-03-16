@@ -34,6 +34,13 @@ All notable changes to SuperScalar are documented here.
 - **Ceremony and rotation timeouts**: Increased `wire_recv_timeout` for demo rotation and close ceremonies from 30s to 120s for signet/testnet4 where block confirmation can take minutes.
 - **Demo/rotation message timeouts**: Increased `wire_recv_timeout` for `MSG_FACTORY_PROPOSE`, `MSG_NONCE_BUNDLE`, `MSG_PSIG_BUNDLE`, and other ceremony messages from 30s to 120s on non-regtest networks.
 
+- **Client message inbox (`tools/superscalar_client.c`)**: `recv_or_handle_ptlc` previously returned unexpected messages to its caller, causing `MSG_COMMITMENT_SIGNED` and other protocol messages to be silently dropped when they arrived during a different blocking receive. Added a per-fd `client_inbox_t` ring-buffer (4-slot) to `daemon_cb_data_t`; unexpected messages are now queued rather than discarded, and the daemon loop drains the inbox before each `select()` call. `MSG_LSP_REVOKE_AND_ACK` is handled via a new `case` in the daemon switch so bidirectional revocations are never lost.
+
+- **PTLC rotation race (`src/lsp_rotation.c`, `tools/superscalar_lsp.c`)**: The LSP's wait for `MSG_PTLC_ADAPTED_SIG` during factory rotation used a single `wire_recv_timeout` call that failed immediately if any stray message (e.g. `MSG_REVOKE_AND_ACK` from a concurrent payment flow) arrived first. Replaced with a 60-second wall-clock retry loop in `lsp_rotation.c` (30-second in the `--test-rotation` path in `superscalar_lsp.c`) that discards stray messages, breaks on `MSG_ERROR`, and only exits on success or deadline.
+
+- **Channel reestablish CS retransmit (`src/lsp_channels.c`, `src/client.c`, `src/persist.c`)**: If the LSP crashed between sending `MSG_COMMITMENT_SIGNED` and receiving the client's `MSG_REVOKE_AND_ACK`, the commitment was silently abandoned on reconnect and channel state diverged. Added a `pending_cs` SQLite table (schema v1 → v2) that records the in-flight commitment number after every CS send and is cleared after RAA receipt. On reconnect (`handle_reconnect_with_msg`), if a pending CS is detected, the LSP generates a fresh partial sig using the newly-exchanged nonces (no MuSig2 nonce reuse) and retransmits the commitment before sending `MSG_RECONNECT_ACK`. The client (`client_run_reconnect`) peeks for an optional `MSG_COMMITMENT_SIGNED` before `MSG_RECONNECT_ACK` and handles it inline.
+
+
 ### Removed
 
 - **`bitcoin-cli.sh`**: Vestigial pass-through wrapper that added no value. All scripts call `bitcoin-cli` directly.

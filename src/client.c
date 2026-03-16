@@ -1692,10 +1692,30 @@ int client_run_reconnect(secp256k1_context *ctx,
     printf("Client %u: nonce re-exchange complete (%zu nonces)\n",
            my_index, channel.remote_nonce_count);
 
-    /* 9. Recv MSG_RECONNECT_ACK (sent by LSP after nonce exchange) */
+    /* 9. Recv MSG_RECONNECT_ACK (sent by LSP after nonce exchange).
+       Fix 5: LSP may send a pending COMMITMENT_SIGNED before RECONNECT_ACK
+       if a CS was in-flight when the client disconnected. Handle it inline. */
     {
         wire_msg_t msg;
-        if (!wire_recv(fd, &msg) || msg.msg_type != MSG_RECONNECT_ACK) {
+        if (!wire_recv(fd, &msg)) {
+            fprintf(stderr, "Client reconnect: recv failed expecting RECONNECT_ACK\n");
+            wire_close(fd);
+            factory_free(&factory);
+            return 0;
+        }
+        if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+            /* LSP retransmitting a pending CS -- handle it before RECONNECT_ACK */
+            client_handle_commitment_signed(fd, &channel, ctx, &msg);
+            cJSON_Delete(msg.json);
+            /* Now read the actual RECONNECT_ACK */
+            if (!wire_recv(fd, &msg)) {
+                fprintf(stderr, "Client reconnect: recv failed after CS retransmit\n");
+                wire_close(fd);
+                factory_free(&factory);
+                return 0;
+            }
+        }
+        if (msg.msg_type != MSG_RECONNECT_ACK) {
             fprintf(stderr, "Client reconnect: expected RECONNECT_ACK, got 0x%02x\n",
                     msg.msg_type);
             if (msg.json) cJSON_Delete(msg.json);

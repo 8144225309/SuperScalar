@@ -292,6 +292,11 @@ static const char *SCHEMA_SQL =
     "  last_seen    INTEGER NOT NULL DEFAULT 0,"
     "  ready_for    INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (client_idx, factory_id)"
+    ");"
+    /* Schema v4: pending commitment-signed flag (Fix 5 reconnect retransmit) */
+    "CREATE TABLE IF NOT EXISTS pending_cs ("
+    "  channel_id INTEGER PRIMARY KEY,"
+    "  commitment_number INTEGER NOT NULL"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -432,6 +437,23 @@ int persist_open(persist_t *p, const char *path) {
             fprintf(stderr, "persist_open: migration v3 failed: %s\n",
                     merr3 ? merr3 : "unknown");
             sqlite3_free(merr3);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    if (db_version < 4) {
+        const char *sql_v4 =
+            "CREATE TABLE IF NOT EXISTS pending_cs ("
+            "  channel_id INTEGER PRIMARY KEY,"
+            "  commitment_number INTEGER NOT NULL"
+            ");";
+        char *merr4 = NULL;
+        if (sqlite3_exec(p->db, sql_v4, NULL, NULL, &merr4) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v4 failed: %s\n",
+                    merr4 ? merr4 : "unknown");
+            sqlite3_free(merr4);
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
@@ -3007,4 +3029,53 @@ int persist_delete_offer(persist_t *p, const unsigned char *offer_id32) {
     int changes = sqlite3_changes(p->db);
     sqlite3_finalize(stmt);
     return changes > 0;
+}
+
+/* Fix 5: pending CS tracking for reconnect retransmit. */
+int persist_save_pending_cs(persist_t *p, uint32_t channel_id,
+                             uint64_t commitment_number)
+{
+    if (!p || !p->db) return 0;
+    if (commitment_number == 0) {
+        /* Clear: delete the entry for this channel */
+        const char *sql = "DELETE FROM pending_cs WHERE channel_id = ?;";
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)channel_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    /* Upsert: save or overwrite the pending CS cn for this channel */
+    const char *sql =
+        "INSERT OR REPLACE INTO pending_cs (channel_id, commitment_number)"
+        " VALUES (?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commitment_number);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+int persist_load_pending_cs(persist_t *p, uint32_t channel_id,
+                             uint64_t *cn_out)
+{
+    if (!p || !p->db || !cn_out) return 0;
+    const char *sql =
+        "SELECT commitment_number FROM pending_cs WHERE channel_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)channel_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *cn_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }
