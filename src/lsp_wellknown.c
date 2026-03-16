@@ -216,19 +216,21 @@ void lsp_wellknown_handle_connection(int fd,
 
 /* --- Client: fetch .well-known/lsps.json over plain HTTP --- */
 
-int lsp_wellknown_fetch_http(const char *domain,
-                              char *host_out,       size_t host_cap,
-                              uint16_t *port_out,
-                              char *pubkey_hex_out, size_t pubkey_cap) {
+int lsp_wellknown_fetch_http_port(const char *domain, uint16_t tcp_port,
+                                   char *host_out,       size_t host_cap,
+                                   uint16_t *port_out,
+                                   char *pubkey_hex_out, size_t pubkey_cap) {
     if (!domain || !host_out || !port_out || !pubkey_hex_out) return 0;
 
-    /* Resolve domain:80 */
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)tcp_port);
+
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(domain, "80", &hints, &res) != 0 || !res)
+    if (getaddrinfo(domain, port_str, &hints, &res) != 0 || !res)
         return 0;
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
@@ -274,6 +276,16 @@ int lsp_wellknown_fetch_http(const char *domain,
 
     return lsp_wellknown_parse_json(body, host_out, host_cap,
                                     port_out, pubkey_hex_out, pubkey_cap);
+}
+
+int lsp_wellknown_fetch_http(const char *domain,
+                              char *host_out,       size_t host_cap,
+                              uint16_t *port_out,
+                              char *pubkey_hex_out, size_t pubkey_cap) {
+    return lsp_wellknown_fetch_http_port(domain, 80,
+                                         host_out, host_cap,
+                                         port_out,
+                                         pubkey_hex_out, pubkey_cap);
 }
 
 /* --- Background server (fork-based) --- */
