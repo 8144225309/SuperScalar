@@ -727,10 +727,10 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         }
     }
 
-    /* 8. Build unsigned tx */
-    if (!build_unsigned_tx(unsigned_tx_out, txid_out32,
-                            ch->funding_txid, ch->funding_vout,
-                            0xFFFFFFFE, outputs, out_idx))
+    /* 8. Build unsigned tx (nVersion=3/TRUC: enables V3 penalty + CPFP chain) */
+    if (!build_unsigned_tx_v(unsigned_tx_out, txid_out32,
+                              ch->funding_txid, ch->funding_vout,
+                              0xFFFFFFFE, outputs, out_idx, 3))
         goto commit_tx_done;
 
     /* Convert display-order txid to internal byte order (wire format),
@@ -985,13 +985,15 @@ int channel_build_penalty_tx(const channel_t *ch,
         n_outputs = 2;
     }
 
-    /* 8. Build unsigned penalty tx (RBF-enabled via nSequence 0xFFFFFFFD) */
+    /* 8. Build unsigned penalty tx (V3/TRUC + RBF via nSequence 0xFFFFFFFD).
+          V3 requires the parent commitment tx to also be V3; this is satisfied
+          by channel_build_commitment_tx_impl. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char penalty_txid[32];
-    if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
-                            commitment_txid, to_local_vout,
-                            0xFFFFFFFD, outputs, n_outputs)) {
+    if (!build_unsigned_tx_v(&unsigned_tx, penalty_txid,
+                              commitment_txid, to_local_vout,
+                              0xFFFFFFFD, outputs, n_outputs, 3)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1148,13 +1150,13 @@ int channel_build_penalty_tx_script_path(const channel_t *ch,
         n_outputs = 2;
     }
 
-    /* 9. Build unsigned penalty tx */
+    /* 9. Build unsigned penalty tx (V3/TRUC + RBF via nSequence 0xFFFFFFFD) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char penalty_txid[32];
-    if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
-                            commitment_txid, to_local_vout,
-                            0xFFFFFFFD, outputs, n_outputs)) {
+    if (!build_unsigned_tx_v(&unsigned_tx, penalty_txid,
+                              commitment_txid, to_local_vout,
+                              0xFFFFFFFD, outputs, n_outputs, 3)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -2199,7 +2201,11 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
         n_outputs = 2;
     }
 
-    /* 7. Build unsigned penalty tx (RBF-enabled via nSequence 0xFFFFFFFD) */
+    /* 7. Build unsigned HTLC penalty tx (nVersion=2, RBF via nSequence 0xFFFFFFFD).
+          Stays V2 intentionally: TRUC allows only 1 unconfirmed descendant per V3 tx.
+          The main (to_local) penalty tx is the single V3 child of the V3 commitment tx.
+          HTLC penalty txs are broadcast only after the commitment tx confirms, at which
+          point the TRUC 1-child constraint no longer applies. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     unsigned char penalty_txid[32];

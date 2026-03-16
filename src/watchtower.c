@@ -828,8 +828,8 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    tx_buf_write_u32_le(&unsigned_tx, 2);           /* nVersion=2: TRUC prohibits V3 child of V2 parent;
-                                                       penalty tx is always V2 (channel protocol) */
+    tx_buf_write_u32_le(&unsigned_tx, 3);           /* nVersion=3 (TRUC): penalty tx is V3, so this
+                                                       child can also be V3; enables package relay */
     tx_buf_write_varint(&unsigned_tx, 2);            /* 2 inputs */
     /* Input 0: P2A anchor output from penalty tx (anyone-can-spend) */
     tx_buf_write_bytes(&unsigned_tx, anchor_txid, 32);
