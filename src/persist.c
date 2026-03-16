@@ -479,6 +479,31 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v6 migration: htlc_inbound for durable inbound HTLC state */
+    if (db_version < 6) {
+        const char *sql_v6 =
+            "CREATE TABLE IF NOT EXISTS htlc_inbound ("
+            "  htlc_id        INTEGER NOT NULL PRIMARY KEY,"
+            "  amount_msat    INTEGER NOT NULL,"
+            "  payment_hash   TEXT    NOT NULL,"
+            "  payment_secret TEXT    NOT NULL,"
+            "  cltv_expiry    INTEGER NOT NULL,"
+            "  scid           INTEGER NOT NULL,"
+            "  state          INTEGER NOT NULL DEFAULT 0,"
+            "  preimage       TEXT,"
+            "  created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr6 = NULL;
+        if (sqlite3_exec(p->db, sql_v6, NULL, NULL, &merr6) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v6 failed: %s\n",
+                    merr6 ? merr6 : "unknown");
+            sqlite3_free(merr6);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -3144,4 +3169,101 @@ int persist_load_scid_entry(persist_t *p,
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+/* --- Schema v6: inbound HTLC persistence --- */
+
+int persist_save_htlc_inbound(persist_t *p, const htlc_inbound_t *h) {
+    if (!p || !p->db || !h) return 0;
+
+    char ph_hex[65], ps_hex[65];
+    hex_encode(h->payment_hash,   32, ph_hex);
+    hex_encode(h->payment_secret, 32, ps_hex);
+
+    char pre_hex[65] = "";
+    if (h->state == HTLC_INBOUND_FULFILLED)
+        hex_encode(h->preimage, 32, pre_hex);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO htlc_inbound"
+            "  (htlc_id, amount_msat, payment_hash, payment_secret,"
+            "   cltv_expiry, scid, state, preimage)"
+            "  VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)h->htlc_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)h->amount_msat);
+    sqlite3_bind_text (stmt, 3, ph_hex, -1, SQLITE_STATIC);
+    sqlite3_bind_text (stmt, 4, ps_hex, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)h->cltv_expiry);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)h->scid);
+    sqlite3_bind_int  (stmt, 7, (int)h->state);
+    if (pre_hex[0])
+        sqlite3_bind_text(stmt, 8, pre_hex, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(stmt, 8);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
+}
+
+int persist_load_htlc_inbound_pending(persist_t *p, htlc_inbound_table_t *tbl) {
+    if (!p || !p->db || !tbl) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT htlc_id, amount_msat, payment_hash, payment_secret,"
+            "       cltv_expiry, scid"
+            "  FROM htlc_inbound WHERE state = 0;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+
+    int n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && tbl->count < HTLC_INBOUND_MAX) {
+        htlc_inbound_t *e = &tbl->entries[tbl->count];
+        e->htlc_id    = (uint64_t)sqlite3_column_int64(stmt, 0);
+        e->amount_msat = (uint64_t)sqlite3_column_int64(stmt, 1);
+
+        const char *ph = (const char *)sqlite3_column_text(stmt, 2);
+        const char *ps = (const char *)sqlite3_column_text(stmt, 3);
+        if (ph) hex_decode(ph, e->payment_hash,   32);
+        if (ps) hex_decode(ps, e->payment_secret, 32);
+
+        e->cltv_expiry = (uint32_t)sqlite3_column_int64(stmt, 4);
+        e->scid        = (uint64_t)sqlite3_column_int64(stmt, 5);
+        e->state       = HTLC_INBOUND_PENDING;
+        memset(e->preimage, 0, 32);
+        tbl->count++;
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+int persist_update_htlc_inbound(persist_t *p, uint64_t htlc_id,
+                                 htlc_inbound_state_t state,
+                                 const unsigned char preimage[32]) {
+    if (!p || !p->db) return 0;
+
+    char pre_hex[65] = "";
+    if (state == HTLC_INBOUND_FULFILLED && preimage)
+        hex_encode(preimage, 32, pre_hex);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE htlc_inbound SET state = ?, preimage = ?"
+            "  WHERE htlc_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+
+    sqlite3_bind_int  (stmt, 1, (int)state);
+    if (pre_hex[0])
+        sqlite3_bind_text(stmt, 2, pre_hex, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(stmt, 2);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
 }

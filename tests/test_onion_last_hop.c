@@ -5,6 +5,7 @@
 
 #include "superscalar/onion_last_hop.h"
 #include "superscalar/htlc_inbound.h"
+#include "superscalar/persist.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <string.h>
@@ -273,5 +274,67 @@ int test_htlc_inbound_timeout(void)
     ASSERT(tbl2.entries[0].state == HTLC_INBOUND_FAILED, "state FAILED");
     ASSERT(!htlc_inbound_fail(&tbl2, 10), "re-fail returns 0 (already failed)");
 
+    return 1;
+}
+
+/* Test O5: htlc_inbound persist round-trip (schema v6) */
+int test_htlc_inbound_persist_roundtrip(void)
+{
+    persist_t p;
+    ASSERT(persist_open(&p, ":memory:"), "open DB");
+    ASSERT(PERSIST_SCHEMA_VERSION >= 6, "schema version >= 6");
+
+    /* Build and save a pending HTLC */
+    htlc_inbound_t h;
+    memset(&h, 0, sizeof(h));
+    h.htlc_id    = 42;
+    h.amount_msat = 100000;
+    memset(h.payment_hash,   0xAA, 32);
+    memset(h.payment_secret, 0xBB, 32);
+    h.cltv_expiry = 800000;
+    h.scid        = 0x000001000003000ULL;
+    h.state       = HTLC_INBOUND_PENDING;
+
+    ASSERT(persist_save_htlc_inbound(&p, &h), "save pending HTLC");
+
+    /* Load pending HTLCs back */
+    htlc_inbound_table_t tbl;
+    htlc_inbound_init(&tbl);
+    int n = persist_load_htlc_inbound_pending(&p, &tbl);
+    ASSERT(n == 1, "one pending HTLC loaded");
+    ASSERT(tbl.entries[0].htlc_id == 42, "htlc_id");
+    ASSERT(tbl.entries[0].amount_msat == 100000, "amount_msat");
+    ASSERT(memcmp(tbl.entries[0].payment_hash, h.payment_hash, 32) == 0, "payment_hash");
+    ASSERT(memcmp(tbl.entries[0].payment_secret, h.payment_secret, 32) == 0, "payment_secret");
+    ASSERT(tbl.entries[0].cltv_expiry == 800000, "cltv_expiry");
+    ASSERT(tbl.entries[0].scid == h.scid, "scid");
+
+    /* Fulfill: update state + preimage */
+    unsigned char preimage[32];
+    memset(preimage, 0xCC, 32);
+    ASSERT(persist_update_htlc_inbound(&p, 42, HTLC_INBOUND_FULFILLED, preimage),
+           "update to fulfilled");
+
+    /* Reload: fulfilled HTLC should NOT appear in pending load */
+    htlc_inbound_table_t tbl2;
+    htlc_inbound_init(&tbl2);
+    n = persist_load_htlc_inbound_pending(&p, &tbl2);
+    ASSERT(n == 0, "no pending HTLCs after fulfill");
+
+    /* Failed HTLC also not in pending load */
+    htlc_inbound_t h2;
+    memset(&h2, 0, sizeof(h2));
+    h2.htlc_id = 99;
+    h2.state   = HTLC_INBOUND_PENDING;
+    memset(h2.payment_hash,   0x11, 32);
+    memset(h2.payment_secret, 0x22, 32);
+    ASSERT(persist_save_htlc_inbound(&p, &h2), "save second HTLC");
+    ASSERT(persist_update_htlc_inbound(&p, 99, HTLC_INBOUND_FAILED, NULL), "fail HTLC");
+    htlc_inbound_table_t tbl3;
+    htlc_inbound_init(&tbl3);
+    n = persist_load_htlc_inbound_pending(&p, &tbl3);
+    ASSERT(n == 0, "failed HTLC not in pending");
+
+    persist_close(&p);
     return 1;
 }
