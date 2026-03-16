@@ -4160,10 +4160,13 @@ int main(int argc, char *argv[]) {
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            /* Build the LSP's OWN old commitment at state #0 (from the LSP's
-               perspective).  The client's watchtower watches for this txid via
-               channel_build_commitment_tx_for_remote(client_ch) which produces the
-               same transaction (LSP's commitment) from the remote side. */
+            /* Build the LSP's OWN old commitment (not the client's).
+               In --cheat-daemon mode, the LSP is the cheater broadcasting
+               an old state. The CLIENT's watchtower watches for the LSP's old
+               commitment txid (registered via watchtower_watch_revoked_commitment
+               which calls channel_build_commitment_tx_for_remote from the CLIENT's
+               perspective = LSP's commitment). Broadcast the LSP's own commitment
+               so it matches what clients are watching for. */
             int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
 
             /* Restore current state */
