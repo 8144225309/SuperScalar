@@ -161,6 +161,11 @@ extern int test_bolt8_key_rotation(void);
 extern int test_bolt8_init_features(void);
 extern int test_bolt8_lsps_dispatch(void);
 
+/* PR #17 Phase 2: LSP discovery */
+extern int test_wellknown_json_format(void);
+extern int test_wellknown_json_parse(void);
+extern int test_wellknown_http_serve(void);
+
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
 extern int test_p2p_cfilter_skips_ping(void);
@@ -952,6 +957,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt8_key_rotation);
     RUN_TEST(test_bolt8_init_features);
     RUN_TEST(test_bolt8_lsps_dispatch);
+
+    printf("\n=== PR #17 Phase 2: LSP Discovery ===\n");
+    RUN_TEST(test_wellknown_json_format);
+    RUN_TEST(test_wellknown_json_parse);
+    RUN_TEST(test_wellknown_http_serve);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);

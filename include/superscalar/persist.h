@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 3
+#define PERSIST_SCHEMA_VERSION 4
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -480,5 +480,23 @@ size_t persist_list_offers(persist_t *p,
 
 /* Delete an offer by ID. Returns 1 if deleted, 0 if not found or error. */
 int persist_delete_offer(persist_t *p, const unsigned char *offer_id32);
+
+/* --- LSP endpoint cache (schema v4) ---
+ *
+ * Cache the resolved host/port/pubkey for a domain so clients don't need to
+ * re-fetch /.well-known/lsps.json on every start.
+ */
+int persist_save_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               const char *host,
+                               uint16_t    port,
+                               const char *pubkey_hex);
+
+/* Returns 1 if found, 0 otherwise. host_out/pubkey_out buffers are NUL-terminated. */
+int persist_load_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               char *host_out,       size_t host_cap,
+                               uint16_t   *port_out,
+                               char *pubkey_hex_out, size_t pubkey_cap);
 
 #endif /* SUPERSCALAR_PERSIST_H */
