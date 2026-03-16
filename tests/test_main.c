@@ -155,6 +155,12 @@ extern int test_splice_state_machine(void);
 /* Gap fix: MuSig2 aggregate key for splice funding output */
 extern int test_splice_musig_funding_spk(void);
 
+/* PR #17 Phase 1: BOLT #8 transport */
+extern int test_bolt8_handshake_vectors(void);
+extern int test_bolt8_key_rotation(void);
+extern int test_bolt8_init_features(void);
+extern int test_bolt8_lsps_dispatch(void);
+
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
 extern int test_p2p_cfilter_skips_ping(void);
@@ -940,6 +946,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_splice_locked_roundtrip);
     RUN_TEST(test_splice_state_machine);
     RUN_TEST(test_splice_musig_funding_spk);
+
+    printf("\n=== PR #17 Phase 1: BOLT #8 Transport ===\n");
+    RUN_TEST(test_bolt8_handshake_vectors);
+    RUN_TEST(test_bolt8_key_rotation);
+    RUN_TEST(test_bolt8_init_features);
+    RUN_TEST(test_bolt8_lsps_dispatch);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);

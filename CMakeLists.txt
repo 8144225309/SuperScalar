@@ -134,6 +134,8 @@ add_library(superscalar
     src/blinded_path.c
     src/splice.c
     src/bech32m.c
+    src/bolt8.c
+    src/bolt8_server.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -184,6 +186,7 @@ add_executable(test_superscalar
     tests/test_lsps.c
     tests/test_bolt12.c
     tests/test_splice.c
+    tests/test_bolt8.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
