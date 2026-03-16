@@ -1987,7 +1987,8 @@ def scenario_splice_channel(orch):
     orch.start_lsp(["--demo", "--test-splice",
                     "--test-splice-client-seckey", client_seckey(0)])
     time.sleep(orch.timing["lsp_bind"])
-    orch.start_all_clients()
+    # --test-splice causes clients to exit cleanly (rc=0) after SPLICE_LOCKED
+    orch.start_all_clients(extra_flags=["--test-splice"])
 
     rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 3)
     orch._log(f"LSP exited with code {rc}")
@@ -1995,10 +1996,15 @@ def scenario_splice_channel(orch):
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
     has_pass = "SPLICE TEST PASSED" in lsp_log
 
+    # Verify client 0 also completed the splice (not just killed by stop_all)
+    client_log = orch.clients[0].read_log() if orch.clients[0] else ""
+    has_client_ok = "splice complete!" in client_log
+
     orch.stop_all()
-    success = rc == 0 and has_pass
+    success = rc == 0 and has_pass and has_client_ok
     orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
-              f"splice {'passed' if has_pass else 'failed'}")
+              f"lsp={'passed' if has_pass else 'failed'}, "
+              f"client={'ok' if has_client_ok else 'no splice complete!'}")
     return success
 
 
@@ -2125,7 +2131,9 @@ def scenario_lsps2_wire(orch):
     saved_n = orch.n_clients
     orch.n_clients = 1
 
-    orch.start_lsp(["--demo", "--arity", "1"])
+    # --daemon keeps LSP alive so get_info response arrives before CLOSE_PROPOSE
+    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    time.sleep(orch.timing["lsp_bind"])
     orch.start_client(0, ["--test-lsps2"])
 
     # Client exits cleanly (rc=0) after LSPS2 response is verified
