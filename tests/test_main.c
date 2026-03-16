@@ -163,6 +163,12 @@ extern int test_bolt8_lsps_dispatch(void);
 
 /* PR #17 Phase 2: LSP discovery */
 extern int test_wellknown_json_format(void);
+/* PR #17 Phase 3: BOLT #7 gossip */
+extern int test_gossip_node_announcement_sign_verify(void);
+extern int test_gossip_channel_announcement_fields(void);
+extern int test_gossip_channel_update_construction(void);
+extern int test_gossip_store_roundtrip(void);
+extern int test_gossip_channel_update_store_and_filter(void);
 extern int test_wellknown_json_parse(void);
 extern int test_wellknown_http_serve(void);
 
@@ -962,6 +968,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wellknown_json_format);
     RUN_TEST(test_wellknown_json_parse);
     RUN_TEST(test_wellknown_http_serve);
+
+    printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
+    RUN_TEST(test_gossip_node_announcement_sign_verify);
+    RUN_TEST(test_gossip_channel_announcement_fields);
+    RUN_TEST(test_gossip_channel_update_construction);
+    RUN_TEST(test_gossip_store_roundtrip);
+    RUN_TEST(test_gossip_channel_update_store_and_filter);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);

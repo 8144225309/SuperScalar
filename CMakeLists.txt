@@ -137,6 +137,8 @@ add_library(superscalar
     src/bolt8.c
     src/bolt8_server.c
     src/lsp_wellknown.c
+    src/gossip.c
+    src/gossip_store.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -189,6 +191,7 @@ add_executable(test_superscalar
     tests/test_splice.c
     tests/test_bolt8.c
     tests/test_lsp_discovery.c
+    tests/test_gossip.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
