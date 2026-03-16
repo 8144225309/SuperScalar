@@ -169,6 +169,14 @@ extern int test_gossip_channel_announcement_fields(void);
 extern int test_gossip_channel_update_construction(void);
 extern int test_gossip_store_roundtrip(void);
 extern int test_gossip_channel_update_store_and_filter(void);
+/* PR #17 Phase 4: factory entry/exit */
+extern int test_scid_encode_decode(void);
+extern int test_scid_route_hint_format(void);
+extern int test_scid_persist_roundtrip(void);
+extern int test_onion_last_hop_decrypt(void);
+extern int test_onion_tlv_parse_partial(void);
+extern int test_htlc_inbound_fulfill_path(void);
+extern int test_htlc_inbound_timeout(void);
 extern int test_wellknown_json_parse(void);
 extern int test_wellknown_http_serve(void);
 
@@ -975,6 +983,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_gossip_channel_update_construction);
     RUN_TEST(test_gossip_store_roundtrip);
     RUN_TEST(test_gossip_channel_update_store_and_filter);
+
+    printf("\n=== PR #17 Phase 4: Factory Entry/Exit ===\n");
+    RUN_TEST(test_scid_encode_decode);
+    RUN_TEST(test_scid_route_hint_format);
+    RUN_TEST(test_scid_persist_roundtrip);
+    RUN_TEST(test_onion_last_hop_decrypt);
+    RUN_TEST(test_onion_tlv_parse_partial);
+    RUN_TEST(test_htlc_inbound_fulfill_path);
+    RUN_TEST(test_htlc_inbound_timeout);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
