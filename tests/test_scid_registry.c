@@ -89,7 +89,7 @@ int test_scid_persist_roundtrip(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version current");
-    ASSERT(PERSIST_SCHEMA_VERSION >= 5, "schema version >= 5");
+    ASSERT(PERSIST_SCHEMA_VERSION >= 6, "schema version >= 6");
 
     uint32_t fid = 7, lid = 3;
     uint64_t scid = scid_encode(fid, lid);
