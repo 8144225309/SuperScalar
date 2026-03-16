@@ -378,6 +378,7 @@ typedef struct {
     int test_lsps2_done;    /* 1 = LSPS2 get_info response verified */
     int test_lsps2_buy;     /* 1 = also send lsps2.buy after get_info */
     int test_lsps2_buy_done;/* 1 = LSPS2 buy response verified */
+    int test_splice;        /* 1 = exit cleanly after first SPLICE_LOCKED */
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -1638,6 +1639,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 char disp_hex[65]; hex_encode(disp_txid, 32, disp_hex);
                 printf("Client %u: splice complete! new txid=%s vout=%u\n",
                        my_index, disp_hex, sl_new_vout);
+                if (cbd && cbd->test_splice) {
+                    cJSON_Delete(msg.json);
+                    return 2;  /* splice test done — exit daemon loop cleanly */
+                }
             } else {
                 fprintf(stderr, "Client %u: invalid SPLICE_LOCKED\n", my_index);
             }
@@ -1656,6 +1661,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 printf("LSPS2 GET_INFO: %s\n", ok ? "OK" : "FAIL");
                 fflush(stdout);
                 cbd->test_lsps2_done = 1;
+
+                /* get_info-only test: exit cleanly now — no need for close ceremony */
+                if (!cbd->test_lsps2_buy) {
+                    cJSON_Delete(msg.json);
+                    return 2;
+                }
 
                 /* If buy test requested, send lsps2.buy using returned fee params */
                 if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
@@ -1807,6 +1818,7 @@ int main(int argc, char *argv[]) {
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
+    int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1913,6 +1925,8 @@ int main(int argc, char *argv[]) {
             test_lsps2 = 1;        /* implies get_info first */
             test_lsps2_buy = 1;
             auto_accept_jit = 1;   /* lsps2.buy triggers JIT offer; must accept */
+        } else if (strcmp(argv[i], "--test-splice") == 0) {
+            test_splice = 1;
         } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
             lsp_pubkey_hex = argv[++i];
         } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
@@ -2239,6 +2253,7 @@ int main(int argc, char *argv[]) {
         cbd.auto_accept_jit = auto_accept_jit;
         cbd.test_lsps2     = test_lsps2;
         cbd.test_lsps2_buy = test_lsps2_buy;
+        cbd.test_splice    = test_splice;
 
         /* Load persisted client invoices (Phase 23) */
         if (use_db) {
