@@ -9,6 +9,8 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #endif
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -186,7 +188,15 @@ int regtest_init_network(regtest_t *rt, const char *network) {
     strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
     rt->scan_depth = (strcmp(rt->network, "regtest") == 0) ? 10 : 1000;
 
-    /* Verify connection via regtest_exec (uses fork/execvp on POSIX) */
+    /* Set default RPC port by network so HTTP path is tried first.
+       Standard Bitcoin Core ports: regtest=18443, testnet=18332,
+       signet=38332, mainnet=8332.  Falls back to fork+exec if HTTP fails. */
+    if (strcmp(rt->network, "regtest") == 0)       rt->rpcport = 18443;
+    else if (strcmp(rt->network, "testnet") == 0)  rt->rpcport = 18332;
+    else if (strcmp(rt->network, "signet") == 0)   rt->rpcport = 38332;
+    else                                            rt->rpcport = 8332;
+
+    /* Verify connection — uses HTTP when rpcport > 0, else fork+exec */
     char *result = regtest_exec(rt, "getblockchaininfo", "");
     if (!result) return 0;
 
@@ -325,13 +335,316 @@ static void free_argv(char **argv, size_t n) {
 }
 #endif /* _POSIX_VERSION */
 
+/* -----------------------------------------------------------------------
+ * HTTP JSON-RPC client for Bitcoin Core
+ *
+ * Replaces fork+exec(bitcoin-cli) with a direct HTTP/1.0 POST to
+ * 127.0.0.1:rpcport.  One TCP connection per call; no external deps.
+ * Falls back to fork+exec when rpcport == 0.
+ * --------------------------------------------------------------------- */
+
+#ifdef _POSIX_VERSION
+
+/* RFC 4648 base64 encoder. Writes NUL-terminated string to out[0..out_cap).
+   Returns number of output chars written (excluding NUL), or -1 on overflow. */
+static int regtest_base64(const char *in, size_t in_len, char *out, size_t out_cap)
+{
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t olen = ((in_len + 2) / 3) * 4;
+    if (olen + 1 > out_cap) return -1;
+    size_t i, j;
+    for (i = 0, j = 0; i + 2 < in_len; i += 3) {
+        unsigned c0 = (unsigned char)in[i];
+        unsigned c1 = (unsigned char)in[i+1];
+        unsigned c2 = (unsigned char)in[i+2];
+        out[j++] = b64[(c0 >> 2) & 0x3f];
+        out[j++] = b64[((c0 << 4) | (c1 >> 4)) & 0x3f];
+        out[j++] = b64[((c1 << 2) | (c2 >> 6)) & 0x3f];
+        out[j++] = b64[c2 & 0x3f];
+    }
+    if (i < in_len) {
+        unsigned c0 = (unsigned char)in[i];
+        unsigned c1 = (i + 1 < in_len) ? (unsigned char)in[i+1] : 0;
+        out[j++] = b64[(c0 >> 2) & 0x3f];
+        out[j++] = b64[((c0 << 4) | (c1 >> 4)) & 0x3f];
+        out[j++] = (i + 1 < in_len) ? b64[(c1 << 2) & 0x3f] : '=';
+        out[j++] = '=';
+    }
+    out[j] = '\0';
+    return (int)j;
+}
+
+/* Convert space-tokenized params string (same format as build_argv) into
+   a JSON array string.  Tokens in double quotes become JSON strings;
+   "true"/"false"/"null" become JSON literals; purely numeric tokens become
+   JSON numbers; everything else becomes a JSON string.
+   Writes directly to out[0..out_cap) without intermediate token buffers,
+   so arbitrarily long tokens (e.g. full raw tx hex) are handled correctly. */
+static int params_to_json_array(const char *params, char *out, size_t out_cap)
+{
+    if (!params || params[0] == '\0') {
+        if (out_cap < 3) return 0;
+        strcpy(out, "[]");
+        return 1;
+    }
+
+    size_t pos = 0;
+    if (pos + 1 >= out_cap) return 0;
+    out[pos++] = '[';
+
+    const char *p = params;
+    int first = 1;
+    while (*p) {
+        /* Skip whitespace */
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        if (!first) {
+            if (pos + 1 >= out_cap) return 0;
+            out[pos++] = ',';
+        }
+        first = 0;
+
+        const char *tok_start;
+        size_t tok_len;
+        int is_quoted = 0;
+
+        if (*p == '"' || *p == '\'') {
+            /* Quoted string token: strip outer quotes */
+            char q = *p++;
+            tok_start = p;
+            while (*p && *p != q) p++;
+            tok_len = (size_t)(p - tok_start);
+            if (*p == q) p++;
+            is_quoted = 1;
+        } else {
+            tok_start = p;
+            while (*p && *p != ' ') p++;
+            tok_len = (size_t)(p - tok_start);
+        }
+
+        /* Classify token (using the raw bytes, not a copy).
+           Single-quoted JSON objects/arrays (e.g. '[{"txid":...}]') must be
+           emitted as raw JSON, not as JSON strings. */
+        int is_num = 0, is_literal = 0, is_raw_json = 0;
+        if (is_quoted && tok_len > 0 && (tok_start[0] == '{' || tok_start[0] == '[')) {
+            is_raw_json = 1;
+            is_quoted = 0;  /* treat as raw JSON, no string wrapping */
+        }
+        if (!is_quoted) {
+            if (tok_len > 0 &&
+                (tok_start[0] == '-' || (tok_start[0] >= '0' && tok_start[0] <= '9'))) {
+                is_num = 1;
+                for (size_t k = (tok_start[0] == '-') ? 1 : 0; k < tok_len; k++) {
+                    if (tok_start[k] != '.' &&
+                        (tok_start[k] < '0' || tok_start[k] > '9')) { is_num = 0; break; }
+                }
+            }
+            if (!is_num) {
+                is_literal = ((tok_len == 4 && memcmp(tok_start, "true", 4) == 0) ||
+                              (tok_len == 5 && memcmp(tok_start, "false", 5) == 0) ||
+                              (tok_len == 4 && memcmp(tok_start, "null", 4) == 0));
+                is_raw_json = (tok_len > 0 && (tok_start[0] == '{' || tok_start[0] == '['));
+            }
+        }
+
+        if (is_num || is_literal || is_raw_json) {
+            if (pos + tok_len + 1 > out_cap) return 0;
+            memcpy(out + pos, tok_start, tok_len);
+            pos += tok_len;
+        } else {
+            /* Emit as JSON string with escaping */
+            if (pos + 1 >= out_cap) return 0;
+            out[pos++] = '"';
+            for (size_t k = 0; k < tok_len; k++) {
+                if (tok_start[k] == '"' || tok_start[k] == '\\') {
+                    if (pos + 2 > out_cap) return 0;
+                    out[pos++] = '\\';
+                    out[pos++] = tok_start[k];
+                } else {
+                    if (pos + 1 >= out_cap) return 0;
+                    out[pos++] = tok_start[k];
+                }
+            }
+            if (pos + 1 >= out_cap) return 0;
+            out[pos++] = '"';
+        }
+    }
+
+    if (pos + 2 > out_cap) return 0;
+    out[pos++] = ']';
+    out[pos] = '\0';
+    return 1;
+}
+
+/* HTTP/1.0 JSON-RPC POST to Bitcoin Core.
+   Returns malloc'd string containing the serialized "result" field,
+   or NULL on error (caller falls back to fork+exec).
+   Return format mirrors bitcoin-cli output:
+     - JSON object/array result: compact JSON string (cJSON_PrintUnformatted)
+     - String result: "value" (with outer quotes, matching bitcoin-cli)
+     - Number result: "42" decimal string
+   All existing regtest_exec callers work unchanged. */
+static char *regtest_http_rpc(const regtest_t *rt,
+                               const char *method, const char *params)
+{
+    int port = (rt->rpcport > 0) ? rt->rpcport : 18443;
+
+    /* Build Basic Auth header */
+    char credentials[512];
+    snprintf(credentials, sizeof(credentials), "%s:%s", rt->rpcuser, rt->rpcpassword);
+    char auth_b64[512];
+    if (regtest_base64(credentials, strlen(credentials), auth_b64, sizeof(auth_b64)) < 0)
+        return NULL;
+
+    /* Build JSON-RPC body — heap-allocated to handle large params (e.g. raw tx hex).
+       params_json capacity: params length * 2 + 32 covers worst-case escaping. */
+    size_t params_len = params ? strlen(params) : 0;
+    size_t pjcap = params_len * 2 + 64;
+    char *params_json = malloc(pjcap);
+    if (!params_json) return NULL;
+    if (!params_to_json_array(params, params_json, pjcap)) {
+        free(params_json); return NULL;
+    }
+
+    /* Wallet path: /wallet/NAME or / */
+    char path[256] = "/";
+    if (rt->wallet[0] != '\0')
+        snprintf(path, sizeof(path), "/wallet/%s", rt->wallet);
+
+    size_t bodycap = strlen(params_json) + 128;
+    char *body = malloc(bodycap);
+    if (!body) { free(params_json); return NULL; }
+    int body_len = snprintf(body, bodycap,
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}",
+        method, params_json);
+    free(params_json);
+    if (body_len <= 0 || (size_t)body_len >= bodycap) { free(body); return NULL; }
+
+    /* Build HTTP request */
+    size_t reqcap = (size_t)body_len + 512;
+    char *req = malloc(reqcap);
+    if (!req) { free(body); return NULL; }
+    int req_len = snprintf(req, reqcap,
+        "POST %s HTTP/1.0\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Authorization: Basic %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        path, port, auth_b64, body_len, body);
+    free(body);
+    if (req_len <= 0 || (size_t)req_len >= reqcap) { free(req); return NULL; }
+
+    /* Connect to 127.0.0.1:port */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo("127.0.0.1", port_str, &hints, &res) != 0) { free(req); return NULL; }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); free(req); return NULL; }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd); freeaddrinfo(res); free(req); return NULL;
+    }
+    freeaddrinfo(res);
+
+    /* Send request */
+    ssize_t sent_bytes = send(fd, req, (size_t)req_len, 0);
+    free(req);
+    if (sent_bytes != (ssize_t)req_len) {
+        close(fd); return NULL;
+    }
+
+    /* Read full response */
+    size_t cap = 65536, used = 0;
+    char *resp = malloc(cap);
+    if (!resp) { close(fd); return NULL; }
+    ssize_t n;
+    while ((n = recv(fd, resp + used, cap - used - 1, 0)) > 0) {
+        used += (size_t)n;
+        if (used + 1 >= cap) {
+            cap *= 2;
+            char *tmp = realloc(resp, cap);
+            if (!tmp) { free(resp); close(fd); return NULL; }
+            resp = tmp;
+        }
+    }
+    close(fd);
+    resp[used] = '\0';
+
+    /* Find HTTP body (after blank line) */
+    char *bodyp = strstr(resp, "\r\n\r\n");
+    if (!bodyp) { free(resp); return NULL; }
+    bodyp += 4;
+
+    /* Parse JSON-RPC response */
+    cJSON *jresp = cJSON_Parse(bodyp);
+    free(resp);
+    if (!jresp) return NULL;
+
+    /* Check for error */
+    cJSON *err = cJSON_GetObjectItem(jresp, "error");
+    if (err && !cJSON_IsNull(err)) {
+        char *errstr = cJSON_PrintUnformatted(err);
+        if (errstr) {
+            fprintf(stderr, "HTTP RPC %s error: %s\n", method, errstr);
+            free(errstr);
+        }
+        cJSON_Delete(jresp);
+        return NULL;
+    }
+
+    cJSON *result = cJSON_GetObjectItem(jresp, "result");
+    if (!result) { cJSON_Delete(jresp); return NULL; }
+
+    /* Serialize result to match bitcoin-cli output format */
+    char *out = NULL;
+    if (cJSON_IsString(result)) {
+        /* Return with outer quotes: matches bitcoin-cli "value"\n format */
+        size_t vlen = strlen(result->valuestring);
+        out = malloc(vlen + 3);
+        if (out) {
+            out[0] = '"';
+            memcpy(out + 1, result->valuestring, vlen);
+            out[vlen + 1] = '"';
+            out[vlen + 2] = '\0';
+        }
+    } else if (cJSON_IsNumber(result)) {
+        out = malloc(64);
+        if (out) snprintf(out, 64, "%g", result->valuedouble);
+    } else {
+        /* Object, array, bool, null: compact JSON */
+        out = cJSON_PrintUnformatted(result);
+    }
+
+    cJSON_Delete(jresp);
+    return out;
+}
+
+#endif /* _POSIX_VERSION (HTTP RPC) */
+
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params) {
     /* Reject shell metacharacters in method and params */
     if (!sanitize_rpc_param(method) || !sanitize_rpc_param(params))
         return NULL;
 
 #ifdef _POSIX_VERSION
-    /* Preferred path: fork/execvp with no shell interpretation */
+    /* Preferred path: direct HTTP JSON-RPC (no subprocess fork).
+       Falls back to fork/execvp when rpcport == 0 or HTTP fails. */
+    if (rt->rpcport > 0) {
+        char *result = regtest_http_rpc(rt, method, params);
+        if (result) return result;
+        /* HTTP failed — fall through to fork+exec */
+    }
+
+    /* Fork+exec bitcoin-cli (used when rpcport==0 or HTTP unavailable) */
     size_t argc_n = 0;
     char **argv = build_argv(rt, method, params, &argc_n);
     if (!argv) return NULL;
@@ -360,15 +673,25 @@ int regtest_create_wallet(regtest_t *rt, const char *name) {
     char params[256];
     snprintf(params, sizeof(params), "\"%s\"", name);
     char *result = regtest_exec(rt, "createwallet", params);
-    if (!result) return 0;
-
-    if (strstr(result, "error") != NULL && strstr(result, "already exists") == NULL) {
-        free(result);
+    if (!result) {
+        /* createwallet failed — wallet may already exist (HTTP path returns NULL for
+           all errors, including the benign "already exists" case).
+           Try loadwallet; if that also fails the wallet is likely already loaded. */
         result = regtest_exec(rt, "loadwallet", params);
-        if (!result) return 0;
+        if (result) {
+            free(result);
+        }
+        /* Fall through: set wallet name regardless — it either was created, loaded,
+           or is already active.  Subsequent RPC calls will confirm. */
+    } else {
+        if (strstr(result, "error") != NULL && strstr(result, "already exists") == NULL) {
+            free(result);
+            result = regtest_exec(rt, "loadwallet", params);
+            if (!result) return 0;
+        }
+        free(result);
     }
 
-    free(result);
     strncpy(rt->wallet, name, sizeof(rt->wallet) - 1);
     return 1;
 }

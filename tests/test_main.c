@@ -386,6 +386,7 @@ extern int test_keyfile_generate(void);
 
 /* Phase 20: Signet Interop */
 extern int test_regtest_init_full(void);
+extern int test_regtest_http_rpc_path(void);
 extern int test_regtest_get_balance(void);
 extern int test_mine_blocks_non_regtest(void);
 
@@ -1162,6 +1163,7 @@ static void run_unit_tests(void) {
 
     printf("\n=== Signet Interop (Phase 20) ===\n");
     RUN_TEST(test_regtest_init_full);
+    RUN_TEST(test_regtest_http_rpc_path);
     RUN_TEST(test_regtest_get_balance);
     RUN_TEST(test_mine_blocks_non_regtest);
 
