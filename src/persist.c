@@ -438,6 +438,27 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v4 migration: lsp_endpoints cache for client bootstrap */
+    if (db_version < 4) {
+        const char *sql_v4 =
+            "CREATE TABLE IF NOT EXISTS lsp_endpoints ("
+            "  domain     TEXT NOT NULL PRIMARY KEY,"
+            "  host       TEXT NOT NULL,"
+            "  port       INTEGER NOT NULL,"
+            "  pubkey_hex TEXT NOT NULL,"
+            "  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr4 = NULL;
+        if (sqlite3_exec(p->db, sql_v4, NULL, NULL, &merr4) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v4 failed: %s\n",
+                    merr4 ? merr4 : "unknown");
+            sqlite3_free(merr4);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -3007,4 +3028,58 @@ int persist_delete_offer(persist_t *p, const unsigned char *offer_id32) {
     int changes = sqlite3_changes(p->db);
     sqlite3_finalize(stmt);
     return changes > 0;
+}
+
+/* --- LSP endpoint cache (schema v4) --- */
+
+int persist_save_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               const char *host,
+                               uint16_t    port,
+                               const char *pubkey_hex) {
+    if (!p || !p->db || !domain || !host || !pubkey_hex) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO lsp_endpoints"
+            "  (domain, host, port, pubkey_hex, updated_at)"
+            "  VALUES (?, ?, ?, ?, strftime('%s','now'));",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, domain, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, host,   -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 3, (int)port);
+    sqlite3_bind_text(stmt, 4, pubkey_hex, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE);
+}
+
+int persist_load_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               char *host_out,       size_t host_cap,
+                               uint16_t   *port_out,
+                               char *pubkey_hex_out, size_t pubkey_cap) {
+    if (!p || !p->db || !domain || !host_out || !port_out || !pubkey_hex_out)
+        return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT host, port, pubkey_hex FROM lsp_endpoints"
+            "  WHERE domain = ? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, domain, -1, SQLITE_STATIC);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *h = (const char *)sqlite3_column_text(stmt, 0);
+        int          pt = sqlite3_column_int (stmt, 1);
+        const char *pk = (const char *)sqlite3_column_text(stmt, 2);
+        if (h && pk && pt > 0 && pt <= 65535) {
+            strncpy(host_out, h, host_cap - 1);
+            host_out[host_cap - 1] = '\0';
+            *port_out = (uint16_t)pt;
+            strncpy(pubkey_hex_out, pk, pubkey_cap - 1);
+            pubkey_hex_out[pubkey_cap - 1] = '\0';
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }

@@ -23,6 +23,7 @@
 #include "superscalar/notify.h"
 #include "superscalar/splice.h"
 #include "superscalar/musig.h"
+#include "superscalar/lsp_wellknown.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -783,6 +784,7 @@ int main(int argc, char *argv[]) {
     int n_lc_fallbacks = 0;
     const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
     uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
+    uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -1033,6 +1035,8 @@ int main(int argc, char *argv[]) {
             create_offer_desc = argv[++i];
         else if (strcmp(argv[i], "--offer-amount") == 0 && i + 1 < argc)
             create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
+            well_known_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1870,6 +1874,35 @@ int main(int argc, char *argv[]) {
         hex_encode(nk_pub_ser, 33, nk_hex);
         printf("LSP: NK static pubkey: %s\n", nk_hex);
         printf("LSP: clients should use --lsp-pubkey %s\n", nk_hex);
+
+        if (well_known_port > 0) {
+            char wk_pubkey[67] = {0};
+            secp256k1_pubkey wk_pub;
+            if (secp256k1_ec_pubkey_create(ctx, &wk_pub, lsp_seckey)) {
+                unsigned char wk_ser[33]; size_t wk_len = 33;
+                secp256k1_ec_pubkey_serialize(ctx, wk_ser, &wk_len, &wk_pub,
+                                              SECP256K1_EC_COMPRESSED);
+                hex_encode(wk_ser, 33, wk_pubkey);
+            }
+            lsp_wellknown_cfg_t wk_cfg = {
+                .pubkey_hex       = wk_pubkey,
+                .host             = bind_addr ? bind_addr : "",
+                .bolt8_port       = (uint16_t)port,
+                .native_port      = (uint16_t)port,
+                .network          = network,
+                .fee_ppm          = (uint32_t)routing_fee_ppm,
+                .min_channel_sats = 100000,
+                .max_channel_sats = 10000000,
+                .version          = SUPERSCALAR_VERSION,
+            };
+            if (lsp_wellknown_serve_fork(&wk_cfg, well_known_port))
+                printf("LSP: well-known HTTP server on port %u\n",
+                       (unsigned)well_known_port);
+            else
+                fprintf(stderr,
+                        "LSP: warning: well-known server on port %u failed\n",
+                        (unsigned)well_known_port);
+        }
     }
 
     signal(SIGINT, sigint_handler);
