@@ -45,6 +45,13 @@ typedef struct {
 #define BOLT8_ACT2_SIZE  50
 #define BOLT8_ACT3_SIZE  66
 
+/* Phase-specific timeout constants (milliseconds) */
+#define BOLT8_HANDSHAKE_TIMEOUT_MS   60000   /* CLN: 60s for full 3-act handshake */
+#define BOLT8_INIT_TIMEOUT_MS        30000   /* Eclair: 30s for BOLT #1 init exchange */
+#define BOLT8_PING_INTERVAL_MS       60000   /* LND: ping every 60s */
+#define BOLT8_PING_TIMEOUT_MS        30000   /* LND: expect pong within 30s */
+#define BOLT8_IDLE_TIMEOUT_MS       300000   /* LND: disconnect after 5min silence */
+
 /* --- Handshake functions --- */
 
 /* Initialize handshake state.
@@ -138,5 +145,19 @@ int bolt8_send(bolt8_state_t *state, int fd,
    Returns 1 on success, 0 on I/O error or auth failure. */
 int bolt8_recv(bolt8_state_t *state, int fd,
                unsigned char *out_msg, size_t *out_msg_len, size_t max_len);
+
+/*
+ * bolt8_connect — outbound BOLT #8 initiator.
+ * Performs acts 1/2/3 on an already-connected fd.
+ * timeout_ms: per-phase deadline applied as SO_RCVTIMEO/SO_SNDTIMEO.
+ * their_pub33: remote static pubkey (33 bytes). Must be a valid secp256k1 point.
+ * Returns 1 on success with state_out populated, 0 on failure.
+ */
+int bolt8_connect(int fd,
+                  secp256k1_context *ctx,
+                  const unsigned char our_priv32[32],
+                  const unsigned char their_pub33[33],
+                  int timeout_ms,
+                  bolt8_state_t *state_out);
 
 #endif /* SUPERSCALAR_BOLT8_H */
