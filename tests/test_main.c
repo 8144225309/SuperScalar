@@ -288,6 +288,15 @@ extern int test_chan_close_recv_shutdown_parse(void);
 extern int test_chan_close_recv_closing_signed_parse(void);
 extern int test_chan_close_negotiate_fee_steps(void);
 extern int test_chan_close_negotiate_fee_low_high(void);
+/* PR #21 Phase 6: Peer database */
+extern int test_peer_db_upsert_and_get(void);
+extern int test_peer_db_upsert_update(void);
+extern int test_peer_db_update_score(void);
+extern int test_peer_db_ban_and_is_banned(void);
+extern int test_peer_db_ban_expires(void);
+extern int test_peer_db_count(void);
+extern int test_peer_db_get_not_found(void);
+extern int test_peer_db_unban(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1227,6 +1236,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_chan_close_recv_closing_signed_parse);
     RUN_TEST(test_chan_close_negotiate_fee_steps);
     RUN_TEST(test_chan_close_negotiate_fee_low_high);
+    printf("\n=== PR #21 Phase 6: Peer Database ===\n");
+    RUN_TEST(test_peer_db_upsert_and_get);
+    RUN_TEST(test_peer_db_upsert_update);
+    RUN_TEST(test_peer_db_update_score);
+    RUN_TEST(test_peer_db_ban_and_is_banned);
+    RUN_TEST(test_peer_db_ban_expires);
+    RUN_TEST(test_peer_db_count);
+    RUN_TEST(test_peer_db_get_not_found);
+    RUN_TEST(test_peer_db_unban);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
