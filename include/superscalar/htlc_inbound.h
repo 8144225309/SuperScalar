@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "superscalar/mpp.h"
 
 #define HTLC_INBOUND_MAX 64   /* max concurrent inbound HTLCs */
 
@@ -33,6 +34,7 @@ typedef struct {
 typedef struct {
     htlc_inbound_t entries[HTLC_INBOUND_MAX];
     int count;
+    mpp_table_t mpp;   /* MPP aggregation (PR #19 Commit 5) */
 } htlc_inbound_table_t;
 
 /* Initialise an empty HTLC table. */
