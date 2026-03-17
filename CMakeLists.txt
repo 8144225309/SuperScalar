@@ -46,6 +46,7 @@ include(FetchContent)
 set(SECP256K1_ENABLE_MODULE_MUSIG ON CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_SCHNORRSIG ON CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_EXTRAKEYS ON CACHE BOOL "" FORCE)
+set(SECP256K1_ENABLE_MODULE_RECOVERY ON CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_EXHAUSTIVE_TESTS OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
@@ -144,6 +145,13 @@ add_library(superscalar
     src/onion_last_hop.c
     src/htlc_inbound.c
     src/gossip_peer.c
+    src/bolt11.c
+    src/pathfind.c
+    src/onion.c
+    src/htlc_forward.c
+    src/peer_mgr.c
+    src/chan_open.c
+    src/payment.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -202,6 +210,15 @@ add_executable(test_superscalar
     tests/test_gossip_net.c
     tests/test_mpp.c
     tests/test_lsps2_deferred.c
+    tests/test_bolt11.c
+    tests/test_pathfind.c
+    tests/test_onion.c
+    tests/test_htlc_forward.c
+    tests/test_peer_mgr.c
+    tests/test_chan_open.c
+    tests/test_payment.c
+    tests/test_splice_wire.c
+    tests/test_bolt12_full.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
