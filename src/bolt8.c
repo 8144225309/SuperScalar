@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 /* --- Internal helpers --- */
 
@@ -570,5 +571,75 @@ int bolt8_recv(bolt8_state_t *state, int fd,
     secure_zero(body, body_len);
     free(body);
     *out_msg_len = msg_len;
+    return 1;
+}
+
+/* --- Outbound connection helper --- */
+
+static void set_socket_timeout_ms(int fd, int ms) {
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+int bolt8_connect(int fd,
+                  secp256k1_context *ctx,
+                  const unsigned char our_priv32[32],
+                  const unsigned char their_pub33[33],
+                  int timeout_ms,
+                  bolt8_state_t *state_out) {
+    if (fd < 0 || !ctx || !our_priv32 || !their_pub33 || !state_out) return 0;
+
+    bolt8_hs_t hs;
+    bolt8_hs_init(&hs, their_pub33);
+
+    /* Generate ephemeral key for act1 */
+    unsigned char e_priv[32];
+    FILE *rnd = fopen("/dev/urandom", "rb");
+    if (!rnd || fread(e_priv, 1, 32, rnd) != 32) {
+        if (rnd) fclose(rnd);
+        return 0;
+    }
+    fclose(rnd);
+
+    /* Act 1: build and send */
+    set_socket_timeout_ms(fd, timeout_ms);
+    unsigned char act1[BOLT8_ACT1_SIZE];
+    if (!bolt8_act1_create(&hs, ctx, e_priv, their_pub33, act1)) {
+        secure_zero(e_priv, 32);
+        return 0;
+    }
+    secure_zero(e_priv, 32);
+
+    ssize_t n = write(fd, act1, BOLT8_ACT1_SIZE);
+    if (n != BOLT8_ACT1_SIZE) return 0;
+
+    /* Act 2: read from responder */
+    unsigned char act2[BOLT8_ACT2_SIZE];
+    {
+        size_t got = 0;
+        while (got < BOLT8_ACT2_SIZE) {
+            ssize_t r = read(fd, act2 + got, BOLT8_ACT2_SIZE - got);
+            if (r <= 0) return 0;
+            got += (size_t)r;
+        }
+    }
+    if (!bolt8_act2_process(&hs, ctx, act2)) return 0;
+
+    /* Act 3: build and send */
+    unsigned char act3[BOLT8_ACT3_SIZE];
+    if (!bolt8_act3_create(&hs, ctx, our_priv32, act3, state_out)) return 0;
+
+    n = write(fd, act3, BOLT8_ACT3_SIZE);
+    if (n != BOLT8_ACT3_SIZE) {
+        secure_zero(state_out, sizeof(*state_out));
+        return 0;
+    }
+
+    /* Reset to blocking (no timeout) after successful handshake */
+    set_socket_timeout_ms(fd, 0);
+
     return 1;
 }

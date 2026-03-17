@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <pthread.h>
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -382,5 +383,154 @@ int test_bolt8_lsps_dispatch(void) {
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 5: bolt8_connect outbound initiator via socketpair
+ *
+ * Run a simple responder thread that performs the responder side of
+ * the 3-act handshake; verify the initiator side populates state_out.
+ * ----------------------------------------------------------------------- */
+
+struct outbound_connect_arg {
+    int fd;
+    unsigned char rs_priv[32];
+    unsigned char rs_pub33[33];
+    int result;           /* 1 = success */
+};
+
+static void *responder_thread(void *arg) {
+    struct outbound_connect_arg *a = (struct outbound_connect_arg *)arg;
+
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN
+                                                        | SECP256K1_CONTEXT_VERIFY);
+    if (!ctx) { a->result = 0; return NULL; }
+
+    bolt8_hs_t hs;
+    bolt8_hs_init(&hs, a->rs_pub33);
+
+    /* Act 1 */
+    unsigned char act1[BOLT8_ACT1_SIZE];
+    {
+        size_t got = 0;
+        while (got < BOLT8_ACT1_SIZE) {
+            ssize_t n = read(a->fd, act1 + got, BOLT8_ACT1_SIZE - got);
+            if (n <= 0) { a->result = 0; secp256k1_context_destroy(ctx); return NULL; }
+            got += (size_t)n;
+        }
+    }
+    if (!bolt8_act1_process(&hs, ctx, act1, a->rs_priv)) {
+        a->result = 0; secp256k1_context_destroy(ctx); return NULL;
+    }
+
+    /* Act 2 */
+    unsigned char re_priv[32];
+    FILE *rnd = fopen("/dev/urandom", "rb");
+    if (!rnd || fread(re_priv, 1, 32, rnd) != 32) {
+        if (rnd) fclose(rnd);
+        a->result = 0; secp256k1_context_destroy(ctx); return NULL;
+    }
+    fclose(rnd);
+
+    unsigned char act2[BOLT8_ACT2_SIZE];
+    if (!bolt8_act2_create(&hs, ctx, re_priv, act2)) {
+        a->result = 0; secp256k1_context_destroy(ctx); return NULL;
+    }
+    {
+        ssize_t n = write(a->fd, act2, BOLT8_ACT2_SIZE);
+        if (n != BOLT8_ACT2_SIZE) { a->result = 0; secp256k1_context_destroy(ctx); return NULL; }
+    }
+
+    /* Act 3 */
+    unsigned char act3[BOLT8_ACT3_SIZE];
+    {
+        size_t got = 0;
+        while (got < BOLT8_ACT3_SIZE) {
+            ssize_t n = read(a->fd, act3 + got, BOLT8_ACT3_SIZE - got);
+            if (n <= 0) { a->result = 0; secp256k1_context_destroy(ctx); return NULL; }
+            got += (size_t)n;
+        }
+    }
+    bolt8_state_t r_state;
+    a->result = bolt8_act3_process(&hs, ctx, act3, &r_state) ? 1 : 0;
+
+    secp256k1_context_destroy(ctx);
+    return NULL;
+}
+
+int test_bolt8_outbound_connect(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN
+                                                        | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx != NULL, "create context");
+
+    unsigned char ls_priv[32], rs_priv[32];
+    hex2bin("1111111111111111111111111111111111111111111111111111111111111111", ls_priv, 32);
+    hex2bin("2121212121212121212121212121212121212121212121212121212121212121", rs_priv, 32);
+
+    unsigned char rs_pub33[33];
+    secp256k1_pubkey rs_pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &rs_pub, rs_priv), "derive rs pubkey");
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, rs_pub33, &pub_len, &rs_pub, SECP256K1_EC_COMPRESSED);
+
+    int sv[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    struct outbound_connect_arg arg;
+    arg.fd = sv[1];
+    memcpy(arg.rs_priv, rs_priv, 32);
+    memcpy(arg.rs_pub33, rs_pub33, 33);
+    arg.result = 0;
+
+    pthread_t tid;
+    ASSERT(pthread_create(&tid, NULL, responder_thread, &arg) == 0, "create thread");
+
+    bolt8_state_t i_state;
+    int ok = bolt8_connect(sv[0], ctx, ls_priv, rs_pub33,
+                           BOLT8_HANDSHAKE_TIMEOUT_MS, &i_state);
+
+    pthread_join(tid, NULL);
+
+    ASSERT(ok, "bolt8_connect returned 1");
+    ASSERT(arg.result, "responder completed handshake");
+
+    /* Verify transport keys are non-zero */
+    unsigned char zeros[32] = {0};
+    ASSERT(memcmp(i_state.sk, zeros, 32) != 0, "initiator sk is non-zero");
+    ASSERT(memcmp(i_state.rk, zeros, 32) != 0, "initiator rk is non-zero");
+
+    close(sv[0]);
+    close(sv[1]);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 6: Phase-specific timeout constants have sane values
+ * ----------------------------------------------------------------------- */
+int test_bolt8_phase_timeout_constants(void) {
+    /* Handshake timeout: 60s */
+    ASSERT(BOLT8_HANDSHAKE_TIMEOUT_MS == 60000,
+           "BOLT8_HANDSHAKE_TIMEOUT_MS is 60s");
+    /* Init timeout: 30s */
+    ASSERT(BOLT8_INIT_TIMEOUT_MS == 30000,
+           "BOLT8_INIT_TIMEOUT_MS is 30s");
+    /* Ping interval: 60s */
+    ASSERT(BOLT8_PING_INTERVAL_MS == 60000,
+           "BOLT8_PING_INTERVAL_MS is 60s");
+    /* Ping timeout: 30s */
+    ASSERT(BOLT8_PING_TIMEOUT_MS == 30000,
+           "BOLT8_PING_TIMEOUT_MS is 30s");
+    /* Idle timeout: 300s */
+    ASSERT(BOLT8_IDLE_TIMEOUT_MS == 300000,
+           "BOLT8_IDLE_TIMEOUT_MS is 300s");
+    /* Ordering: handshake >= init, ping_interval > ping_timeout */
+    ASSERT(BOLT8_HANDSHAKE_TIMEOUT_MS >= BOLT8_INIT_TIMEOUT_MS,
+           "handshake timeout >= init timeout");
+    ASSERT(BOLT8_PING_INTERVAL_MS > BOLT8_PING_TIMEOUT_MS,
+           "ping interval > ping timeout");
+    ASSERT(BOLT8_IDLE_TIMEOUT_MS > BOLT8_PING_INTERVAL_MS + BOLT8_PING_TIMEOUT_MS,
+           "idle timeout > ping interval + ping timeout");
     return 1;
 }
