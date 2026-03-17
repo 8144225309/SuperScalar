@@ -155,6 +155,8 @@ add_library(superscalar
     src/cltv_watchdog.c
     src/chan_close.c
     src/peer_db.c
+    src/probe.c
+    src/peer_storage.c
     src/payment.c
 )
 target_include_directories(superscalar PUBLIC include)
@@ -224,6 +226,7 @@ add_executable(test_superscalar
     tests/test_cltv_watchdog.c
     tests/test_chan_close.c
     tests/test_peer_db.c
+    tests/test_probe_storage.c
     tests/test_payment.c
     tests/test_splice_wire.c
     tests/test_bolt12_full.c

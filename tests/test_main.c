@@ -297,6 +297,15 @@ extern int test_peer_db_ban_expires(void);
 extern int test_peer_db_count(void);
 extern int test_peer_db_get_not_found(void);
 extern int test_peer_db_unban(void);
+/* PR #21 Phase 7: Probe + peer storage */
+extern int test_probe_build_hash(void);
+extern int test_probe_success_failure(void);
+extern int test_probe_liquidity_failure(void);
+extern int test_probe_classify_all_codes(void);
+extern int test_peer_storage_build_type7(void);
+extern int test_peer_storage_build_type9(void);
+extern int test_peer_storage_parse_roundtrip(void);
+extern int test_peer_storage_parse_errors(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1245,6 +1254,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_peer_db_count);
     RUN_TEST(test_peer_db_get_not_found);
     RUN_TEST(test_peer_db_unban);
+    printf("\n=== PR #21 Phase 7: Probe + Peer Storage ===\n");
+    RUN_TEST(test_probe_build_hash);
+    RUN_TEST(test_probe_success_failure);
+    RUN_TEST(test_probe_liquidity_failure);
+    RUN_TEST(test_probe_classify_all_codes);
+    RUN_TEST(test_peer_storage_build_type7);
+    RUN_TEST(test_peer_storage_build_type9);
+    RUN_TEST(test_peer_storage_parse_roundtrip);
+    RUN_TEST(test_peer_storage_parse_errors);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
