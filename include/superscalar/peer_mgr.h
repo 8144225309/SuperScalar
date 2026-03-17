@@ -36,6 +36,8 @@ typedef struct {
     unsigned char     our_privkey[32];
     unsigned char     our_pubkey[33];
     volatile int      *shutdown_flag; /* set to non-zero to stop accept loop */
+    char              tor_proxy_host[256];
+    int               tor_proxy_port; /* 0 = no proxy configured */
 } peer_mgr_t;
 
 /*
@@ -85,5 +87,12 @@ void peer_mgr_disconnect(peer_mgr_t *mgr, int peer_idx);
  * Returns peer index, or -1 if not connected.
  */
 int peer_mgr_find(const peer_mgr_t *mgr, const unsigned char pubkey33[33]);
+
+/*
+ * Configure a SOCKS5 proxy for outbound .onion connections.
+ * host: proxy hostname (e.g. "127.0.0.1"), port: proxy port (e.g. 9050).
+ * Set port=0 to disable proxy.
+ */
+void peer_mgr_set_proxy(peer_mgr_t *mgr, const char *host, int port);
 
 #endif /* SUPERSCALAR_PEER_MGR_H */
