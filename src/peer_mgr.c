@@ -9,6 +9,7 @@
 
 #include "superscalar/peer_mgr.h"
 #include "superscalar/bolt8.h"
+#include "superscalar/tor.h"
 #include "superscalar/bolt8_server.h"   /* bolt8_init_exchange */
 #include <secp256k1.h>
 #include <string.h>
@@ -71,7 +72,12 @@ int peer_mgr_connect(peer_mgr_t *mgr, const char *host, uint16_t port,
     int existing = peer_mgr_find(mgr, their_pub33);
     if (existing >= 0) return existing;
 
-    int fd = tcp_connect(host, port);
+    int fd;
+    int is_onion = (strstr(host, ".onion") != NULL);
+    if (is_onion && mgr->tor_proxy_port > 0)
+        fd = tor_connect_socks5(mgr->tor_proxy_host, mgr->tor_proxy_port, host, port);
+    else
+        fd = tcp_connect(host, port);
     if (fd < 0) {
         fprintf(stderr, "peer_mgr: connect to %s:%u failed: %s\n",
                 host, port, strerror(errno));
@@ -229,4 +235,11 @@ int peer_mgr_find(const peer_mgr_t *mgr, const unsigned char pubkey33[33]) {
         if (memcmp(mgr->peers[i].pubkey, pubkey33, 33) == 0) return i;
     }
     return -1;
+}
+
+void peer_mgr_set_proxy(peer_mgr_t *mgr, const char *host, int port) {
+    if (!mgr) return;
+    if (host)
+        strncpy(mgr->tor_proxy_host, host, sizeof(mgr->tor_proxy_host) - 1);
+    mgr->tor_proxy_port = port;
 }

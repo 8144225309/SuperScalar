@@ -38,6 +38,12 @@ typedef struct {
     /* If set, accepted peers are registered in this peer_mgr (not owned) */
     peer_mgr_t *peer_mgr;
 
+    /* If set, BOLT #2 messages (types 128-135) are routed here inline.
+     * bolt8_server exclusively owns inbound fds; routing happens in the
+     * bolt8_dispatch_message loop to avoid a double-read race with ln_dispatch_run.
+     * Stored as void* to avoid circular header dependency; cast to ln_dispatch_t*. */
+    void *ln_dispatch;
+
     /* Callbacks for inbound messages */
     void *cb_userdata;
     /* Called for LSPS0 requests; json_req is null-terminated JSON.

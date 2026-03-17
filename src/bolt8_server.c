@@ -11,6 +11,7 @@
 
 #include "superscalar/bolt8_server.h"
 #include "superscalar/bolt8.h"
+#include "superscalar/ln_dispatch.h"
 #include "superscalar/lsps.h"
 #include "superscalar/types.h"
 
@@ -144,6 +145,13 @@ int bolt8_dispatch_message(const bolt8_server_cfg_t *cfg,
                 free(json);
             }
         }
+    } else if (msg_type >= 128 && msg_type <= 135) {
+        /* BOLT #2 messages (update_add_htlc, update_fulfill_htlc, etc.).
+         * Route inline to ln_dispatch to avoid double-read race: bolt8_server
+         * exclusively owns the inbound fd; ln_dispatch_run never sees it. */
+        if (cfg->ln_dispatch)
+            ln_dispatch_process_msg((ln_dispatch_t *)cfg->ln_dispatch,
+                                     /*peer_idx=*/ -1, msg, msg_len);
     } else if (msg_type >= 0x51 && msg_type <= 0x57) {
         /* SuperScalar native message types */
         if (cfg->native_msg_cb) {
@@ -245,9 +253,11 @@ static void handle_connection(const bolt8_server_cfg_t *cfg, int client_fd) {
         return;
     }
 
-    /* Register accepted peer in peer_mgr if configured */
-    if (cfg->peer_mgr)
-        peer_mgr_accept(cfg->peer_mgr, client_fd);
+    /* NOTE: peer_mgr_accept() is intentionally NOT called here.
+     * bolt8_server exclusively owns inbound fds; registering them in peer_mgr
+     * would cause ln_dispatch_run's select() loop to also read from the same
+     * fd (double-read race).  BOLT #2 messages are routed inline via cfg->ln_dispatch
+     * in bolt8_dispatch_message(). */
 
     /* Message dispatch loop */
     while (bolt8_dispatch_message(cfg, client_fd, &state))
