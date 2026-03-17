@@ -245,6 +245,10 @@ static void handle_connection(const bolt8_server_cfg_t *cfg, int client_fd) {
         return;
     }
 
+    /* Register accepted peer in peer_mgr if configured */
+    if (cfg->peer_mgr)
+        peer_mgr_accept(cfg->peer_mgr, client_fd);
+
     /* Message dispatch loop */
     while (bolt8_dispatch_message(cfg, client_fd, &state))
         ;

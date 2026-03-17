@@ -253,6 +253,31 @@ extern int test_bolt12_invoice_from_request(void);
 extern int test_bolt12_invoice_error(void);
 extern int test_bolt12_full_sign_verify(void);
 extern int test_bolt12_offer_encode_decode(void);
+/* PR #22 Phase 4: Splice wire completion */
+extern int test_splice_wire_parse_ack(void);
+extern int test_splice_wire_splicing_signed(void);
+extern int test_splice_wire_wrong_type(void);
+extern int test_splice_wire_truncated(void);
+/* PR #22 Phase 5: BOLT #12 completion */
+extern int test_bolt12_blinded_path_aead(void);
+extern int test_bolt12_merkle_root_nonempty(void);
+extern int test_bolt12_merkle_root_empty(void);
+extern int test_bolt12_sign_verify_merkle(void);
+extern int test_bolt12_invoice_error_wire(void);
+/* PR #22 Phase 1: LN peer dispatch */
+extern int test_ln_dispatch_add_htlc(void);
+extern int test_ln_dispatch_fulfill(void);
+extern int test_ln_dispatch_unknown_type(void);
+extern int test_ln_dispatch_fail(void);
+extern int test_ln_dispatch_truncated(void);
+/* PR #22 Phase 2: Invoice receivability */
+extern int test_invoice_create_decode(void);
+extern int test_invoice_claim_success(void);
+extern int test_invoice_claim_underpay(void);
+extern int test_invoice_claim_double(void);
+extern int test_invoice_claim_expired(void);
+extern int test_invoice_settle(void);
+extern int test_invoice_any_amount(void);
 /* PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire */
 extern int test_htlc_commit_add_layout(void);
 extern int test_htlc_commit_commitment_signed_layout(void);
@@ -279,6 +304,7 @@ extern int test_cltv_watchdog_offered_ignored(void);
 extern int test_cltv_watchdog_expire(void);
 extern int test_cltv_watchdog_earliest_expiry(void);
 extern int test_cltv_watchdog_multi_htlc(void);
+extern int test_cltv_watchdog_block_cb(void);
 /* PR #21 Phase 4: Cooperative close */
 extern int test_chan_close_shutdown_layout(void);
 extern int test_chan_close_closing_signed_layout(void);
@@ -1212,6 +1238,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_splice_wire_locked);
     RUN_TEST(test_splice_wire_stfu);
     RUN_TEST(test_splice_wire_buffer_small);
+    RUN_TEST(test_splice_wire_parse_ack);
+    RUN_TEST(test_splice_wire_splicing_signed);
+    RUN_TEST(test_splice_wire_wrong_type);
+    RUN_TEST(test_splice_wire_truncated);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
@@ -1219,6 +1249,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt12_invoice_error);
     RUN_TEST(test_bolt12_full_sign_verify);
     RUN_TEST(test_bolt12_offer_encode_decode);
+    RUN_TEST(test_bolt12_blinded_path_aead);
+    RUN_TEST(test_bolt12_merkle_root_nonempty);
+    RUN_TEST(test_bolt12_merkle_root_empty);
+    RUN_TEST(test_bolt12_sign_verify_merkle);
+    RUN_TEST(test_bolt12_invoice_error_wire);
     printf("\n=== PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire ===\n");
     RUN_TEST(test_htlc_commit_add_layout);
     RUN_TEST(test_htlc_commit_commitment_signed_layout);
@@ -1245,6 +1280,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cltv_watchdog_expire);
     RUN_TEST(test_cltv_watchdog_earliest_expiry);
     RUN_TEST(test_cltv_watchdog_multi_htlc);
+    RUN_TEST(test_cltv_watchdog_block_cb);
     printf("\n=== PR #21 Phase 4: Cooperative Close ===\n");
     RUN_TEST(test_chan_close_shutdown_layout);
     RUN_TEST(test_chan_close_closing_signed_layout);
@@ -1281,6 +1317,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_it_closing_signed_roundtrip);
     RUN_TEST(test_it_probe_peer_db_score);
     RUN_TEST(test_it_watchdog_expire_chain);
+
+    printf("\n=== PR #22 Phase 1: LN Peer Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_add_htlc);
+    RUN_TEST(test_ln_dispatch_fulfill);
+    RUN_TEST(test_ln_dispatch_unknown_type);
+    RUN_TEST(test_ln_dispatch_fail);
+    RUN_TEST(test_ln_dispatch_truncated);
+    printf("\n=== PR #22 Phase 2: Invoice Receivability ===\n");
+    RUN_TEST(test_invoice_create_decode);
+    RUN_TEST(test_invoice_claim_success);
+    RUN_TEST(test_invoice_claim_underpay);
+    RUN_TEST(test_invoice_claim_double);
+    RUN_TEST(test_invoice_claim_expired);
+    RUN_TEST(test_invoice_settle);
+    RUN_TEST(test_invoice_any_amount);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
