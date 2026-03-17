@@ -5,6 +5,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     strategy:
@@ -16,11 +20,18 @@ jobs:
           - { os: ubuntu-latest,  name: "Linux (sanitizers)", sanitizers: true  }
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: Cache CMake deps
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: cmake-deps-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-deps-${{ matrix.os }}-
       - name: Configure
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug \
@@ -40,6 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Linux ARM64
     if: github.event_name == 'push'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Set up QEMU
@@ -63,6 +75,7 @@ jobs:
   static-analysis:
     runs-on: ubuntu-latest
     name: Static Analysis
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -91,15 +104,26 @@ jobs:
   regtest-tests:
     runs-on: ubuntu-latest
     name: Regtest Integration
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: Cache Bitcoin Core binary
+        id: btc-cache
+        uses: actions/cache@v4
+        with:
+          path: bitcoin-28.1
+          key: bitcoin-core-28.1-x86_64
       - name: Download Bitcoin Core 28.1
+        if: steps.btc-cache.outputs.cache-hit != 'true'
         run: |
           wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/SHA256SUMS
+          grep "bitcoin-28.1-x86_64-linux-gnu.tar.gz" SHA256SUMS | sha256sum -c -
           tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
-          sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+      - name: Install Bitcoin Core
+        run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
       - name: Configure regtest
         run: |
           mkdir -p ~/.bitcoin
@@ -134,6 +158,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     name: Coverage
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -169,6 +194,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     name: Fuzz Testing
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install deps

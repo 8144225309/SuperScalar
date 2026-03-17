@@ -15,6 +15,7 @@ All notable changes to SuperScalar are documented here.
 
 
 - **CI: ARM64 build and unit test job**: GitHub Actions now builds and runs all 418 unit tests on `linux/arm64` via Docker on every push to main. CI job count increases from 7 to 8.
+- **CI: concurrency cancellation, job timeouts, and caching**: Duplicate CI runs are cancelled when a new push arrives on the same ref. All jobs have explicit `timeout-minutes` (20 for build/test/analysis, 30 for ARM64, 60 for fuzz). CMake `_deps` are cached across runs; Bitcoin Core binary is cached in the regtest job — eliminating redundant downloads on repeat pushes.
 - **Dashboard: 5 missing DB tables** (`tools/dashboard.py`): queries `broadcast_log`, `signing_progress`, `watchtower_pending`, `old_commitment_htlcs`, and `factory_revocation_secrets` — bringing dashboard coverage to all 26 schema tables.
 - **Dashboard: Signing Progress UI** (Factory tab): per-signer MuSig2 nonce/partial-sig collection status with progress bars per tree node.
 - **Dashboard: Watchtower enhancements** (Watchtower tab): Broadcast Log (TX broadcast history with pass/fail results), Watchtower Pending Penalties (in-flight penalty TXs with mempool cycle and fee bump counts), Old Commitment HTLCs (breach-penalty HTLC details), and Factory Revocation Secrets (per-factory epoch count).
