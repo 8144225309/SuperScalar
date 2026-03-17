@@ -1,0 +1,43 @@
+name: CodeQL Security Analysis
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly scan catches issues in upstream deps (secp256k1-zkp, cJSON)
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    name: CodeQL
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+        with:
+          languages: c-cpp
+          # Security-focused queries for a Bitcoin protocol implementation
+          queries: security-extended
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --parallel
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+        with:
+          category: "/language:c-cpp"

@@ -5,29 +5,48 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  name: Linux,                sanitizers: false }
-          - { os: macos-latest,   name: macOS,                sanitizers: false }
-          - { os: ubuntu-latest,  name: "Linux (sanitizers)", sanitizers: true  }
+          - { os: ubuntu-latest,  cc: gcc,   name: "Linux",                  sanitizers: false }
+          - { os: ubuntu-latest,  cc: clang, name: "Linux (Clang)",          sanitizers: false }
+          - { os: macos-latest,   cc: clang, name: "macOS",                  sanitizers: false }
+          - { os: ubuntu-latest,  cc: gcc,   name: "Linux (sanitizers)",     sanitizers: true  }
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+
+      - name: Cache CMake build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            build/_deps
+          key: deps-${{ matrix.os }}-${{ matrix.cc }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-${{ matrix.os }}-${{ matrix.cc }}-
+
       - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug \
-            -DENABLE_SANITIZERS=${{ matrix.sanitizers && 'ON' || 'OFF' }} \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DENABLE_SANITIZERS=${{ matrix.sanitizers && 'ON' || 'OFF' }}
+
       - name: Build
         run: cmake --build build --parallel
+
       - name: Unit tests
         env:
           ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
@@ -41,7 +60,7 @@ jobs:
     name: Linux ARM64
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -63,20 +82,31 @@ jobs:
   static-analysis:
     runs-on: ubuntu-latest
     name: Static Analysis
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev libssl-dev cppcheck
+          sudo apt-get install -y libsqlite3-dev libssl-dev cppcheck clang-tidy
+
+      - name: Cache CMake build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: build/_deps
+          key: deps-analysis-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-analysis-
+
       - name: Configure (generate compile_commands.json)
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
       - name: Build (needed for FetchContent headers)
         run: cmake --build build --parallel
-      - name: Run cppcheck
+
+      - name: cppcheck
         run: |
           cppcheck --enable=warning,performance,portability \
             --suppress=missingInclude \
@@ -88,22 +118,93 @@ jobs:
             -i build/_deps \
             2>&1
 
+      - name: clang-tidy (security + bugprone)
+        continue-on-error: true
+        run: |
+          find src/ -name '*.c' | xargs clang-tidy \
+            -p build \
+            --checks='-*,bugprone-*,cert-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-bugprone-reserved-identifier,-cert-dcl37-c,-cert-dcl51-cpp' \
+            --warnings-as-errors='clang-analyzer-*' \
+            2>&1 || echo "::warning::clang-tidy found issues (see above)"
+
+  coverage:
+    runs-on: ubuntu-latest
+    name: Coverage
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev lcov
+
+      - name: Cache CMake build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: build/_deps
+          key: deps-coverage-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-coverage-
+
+      - name: Configure with coverage
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build -R unit_tests --output-on-failure
+
+      - name: Generate coverage report
+        run: |
+          lcov --capture --directory build --output-file coverage.info \
+            --ignore-errors mismatch
+          lcov --remove coverage.info \
+            '*/build/_deps/*' '*/tests/*' '/usr/*' \
+            --output-file coverage-filtered.info \
+            --ignore-errors unused
+          lcov --list coverage-filtered.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage-filtered.info
+
   regtest-tests:
     runs-on: ubuntu-latest
     name: Regtest Integration
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+
+      - name: Cache Bitcoin Core binary
+        id: btc-cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: bitcoin-28.1
+          key: bitcoin-core-28.1-x86_64
+
       - name: Download Bitcoin Core 28.1
+        if: steps.btc-cache.outputs.cache-hit != 'true'
         run: |
           wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/SHA256SUMS
+          grep "bitcoin-28.1-x86_64-linux-gnu.tar.gz" SHA256SUMS | sha256sum -c -
           tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
-          sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+
+      - name: Install Bitcoin Core
+        run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+
       - name: Configure regtest
         run: |
           mkdir -p ~/.bitcoin
-          cat > ~/.bitcoin/bitcoin.conf <<CONF
+          cat > ~/.bitcoin/bitcoin.conf <<'CONF'
           regtest=1
           server=1
           rpcuser=rpcuser
@@ -112,65 +213,40 @@ jobs:
           [regtest]
           rpcport=18443
           CONF
+
       - name: Start bitcoind
         run: |
           bitcoind -regtest -daemon
           sleep 3
           bitcoin-cli -regtest createwallet "test"
           bitcoin-cli -regtest -generate 101 > /dev/null
+
+      - name: Cache CMake build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: build/_deps
+          key: deps-regtest-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-regtest-
+
       - name: Build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
           cmake --build build --parallel
+
       - name: Regtest tests
         run: |
           ulimit -s unlimited
           cd build && ./test_superscalar --regtest
+
       - name: Stop bitcoind
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
-
-  coverage:
-    runs-on: ubuntu-latest
-    name: Coverage
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev lcov
-      - name: Build with coverage
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build --parallel
-      - name: Run tests
-        run: ulimit -s unlimited && ctest --test-dir build -R unit_tests --output-on-failure --timeout 180
-      - name: Generate coverage report
-        run: |
-          cd build
-          lcov --capture --directory . --output-file coverage.info \
-               --ignore-errors mismatch --ignore-errors unused
-          lcov --remove coverage.info '*/build/_deps/*' '/usr/*' '*/tests/*' \
-               --output-file filtered.info --ignore-errors unused
-          genhtml filtered.info --output-directory coverage_report/ \
-               --ignore-errors unused
-      - name: Coverage summary
-        run: |
-          cd build
-          lcov --summary filtered.info 2>&1 | tee coverage-summary.txt
-          LINES=$(grep 'lines' coverage-summary.txt | grep -oP '[\d.]+%' | head -1)
-          echo "### Coverage: $LINES" >> $GITHUB_STEP_SUMMARY
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: build/coverage_report/
 
   fuzz:
     runs-on: ubuntu-latest
     name: Fuzz Testing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install deps
         run: |
           sudo apt-get update
