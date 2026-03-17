@@ -374,6 +374,11 @@ typedef struct {
     regtest_t *rt;
     jit_channel_t *jit_ch;  /* JIT channel, or NULL */
     int auto_accept_jit;    /* 1 = auto-accept JIT offers */
+    int test_lsps2;         /* 1 = send lsps2.get_info after factory setup */
+    int test_lsps2_done;    /* 1 = LSPS2 get_info response verified */
+    int test_lsps2_buy;     /* 1 = also send lsps2.buy after get_info */
+    int test_lsps2_buy_done;/* 1 = LSPS2 buy response verified */
+    int test_splice;        /* 1 = exit cleanly after first SPLICE_LOCKED */
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -588,6 +593,25 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                my_index, factory->active_blocks, factory->dying_blocks);
     }
 
+    /* Rate-limit periodic watchtower checks: each select() timeout is 2s;
+       only run check every 15 timeouts (~30s) to avoid blocking message I/O
+       with slow RPC calls. */
+    int wt_check_counter = 0;
+
+    /* --test-lsps2: send lsps2.get_info immediately on factory entry */
+    if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
+        cJSON *req = cJSON_CreateObject();
+        if (req) {
+            cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+            cJSON_AddNumberToObject(req, "id", 1);
+            cJSON_AddStringToObject(req, "method", "lsps2.get_info");
+            cJSON_AddNullToObject(req, "params");
+            wire_send(fd, MSG_LSPS_REQUEST, req);
+            cJSON_Delete(req);
+            printf("Client %u: sent lsps2.get_info request\n", my_index);
+        }
+    }
+
     while (!g_shutdown) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -596,9 +620,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) continue;  /* EINTR */
         if (ret == 0) {
-            /* Periodic watchtower check on timeout */
-            if (cbd && cbd->wt)
+            /* Periodic watchtower check — throttled to once every ~30s */
+            if (cbd && cbd->wt && ++wt_check_counter >= 15) {
+                wt_check_counter = 0;
                 watchtower_check(cbd->wt);
+            }
             continue;
         }
 
@@ -1613,9 +1639,82 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 char disp_hex[65]; hex_encode(disp_txid, 32, disp_hex);
                 printf("Client %u: splice complete! new txid=%s vout=%u\n",
                        my_index, disp_hex, sl_new_vout);
+                if (cbd && cbd->test_splice) {
+                    cJSON_Delete(msg.json);
+                    return 2;  /* splice test done — exit daemon loop cleanly */
+                }
             } else {
                 fprintf(stderr, "Client %u: invalid SPLICE_LOCKED\n", my_index);
             }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_LSPS_RESPONSE: {
+            cJSON *result = msg.json
+                ? cJSON_GetObjectItem(msg.json, "result") : NULL;
+
+            /* Phase 1: lsps2.get_info response */
+            if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
+                int ok = (result != NULL &&
+                          cJSON_GetObjectItem(result, "min_fee_msat") != NULL);
+                printf("LSPS2 GET_INFO: %s\n", ok ? "OK" : "FAIL");
+                fflush(stdout);
+                cbd->test_lsps2_done = 1;
+
+                /* get_info-only test: exit cleanly now — no need for close ceremony */
+                if (!cbd->test_lsps2_buy) {
+                    cJSON_Delete(msg.json);
+                    return 2;
+                }
+
+                /* If buy test requested, send lsps2.buy using returned fee params */
+                if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
+                    cJSON *buy_req = cJSON_CreateObject();
+                    if (buy_req) {
+                        cJSON_AddStringToObject(buy_req, "jsonrpc", "2.0");
+                        cJSON_AddNumberToObject(buy_req, "id", 2);
+                        cJSON_AddStringToObject(buy_req, "method", "lsps2.buy");
+                        cJSON *params = cJSON_CreateObject();
+                        if (params) {
+                            /* opening_fee_params: forward the params object from get_info */
+                            cJSON *fee_params = cJSON_CreateObject();
+                            cJSON *min_fee = cJSON_GetObjectItem(result, "min_fee_msat");
+                            if (fee_params && min_fee)
+                                cJSON_AddNumberToObject(fee_params, "min_fee_msat",
+                                                        min_fee->valuedouble);
+                            cJSON_AddItemToObject(params, "opening_fee_params", fee_params);
+                            cJSON_AddNumberToObject(params, "payment_size_msat", 100000.0);
+                            cJSON_AddItemToObject(buy_req, "params", params);
+                        }
+                        wire_send(fd, MSG_LSPS_REQUEST, buy_req);
+                        cJSON_Delete(buy_req);
+                        printf("Client %u: sent lsps2.buy request\n", my_index);
+                        fflush(stdout);
+                    }
+                }
+                cJSON_Delete(msg.json);
+                break;
+            }
+
+            /* Phase 2: lsps2.buy response — verify jit_channel_scid */
+            if (cbd && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
+                int ok = 0;
+                if (result) {
+                    cJSON *scid_j = cJSON_GetObjectItem(result, "jit_channel_scid");
+                    if (scid_j && cJSON_IsString(scid_j) && scid_j->valuestring) {
+                        /* scid format: NxNxN */
+                        unsigned int a, b, c;
+                        ok = (sscanf(scid_j->valuestring, "%ux%ux%u", &a, &b, &c) == 3);
+                    }
+                }
+                printf("LSPS2 BUY: %s\n", ok ? "OK" : "FAIL");
+                fflush(stdout);
+                cbd->test_lsps2_buy_done = 1;
+                cJSON_Delete(msg.json);
+                return 2;  /* all LSPS2 test objectives done; skip close ceremony */
+            }
+
             cJSON_Delete(msg.json);
             break;
         }
@@ -1717,6 +1816,9 @@ int main(int argc, char *argv[]) {
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
+    int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
+    int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
+    int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1817,6 +1919,14 @@ int main(int argc, char *argv[]) {
 
         } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
             auto_accept_jit = 1;
+        } else if (strcmp(argv[i], "--test-lsps2") == 0) {
+            test_lsps2 = 1;
+        } else if (strcmp(argv[i], "--test-lsps2-buy") == 0) {
+            test_lsps2 = 1;        /* implies get_info first */
+            test_lsps2_buy = 1;
+            auto_accept_jit = 1;   /* lsps2.buy triggers JIT offer; must accept */
+        } else if (strcmp(argv[i], "--test-splice") == 0) {
+            test_splice = 1;
         } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
             lsp_pubkey_hex = argv[++i];
         } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
@@ -2141,6 +2251,9 @@ int main(int argc, char *argv[]) {
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.auto_accept_jit = auto_accept_jit;
+        cbd.test_lsps2     = test_lsps2;
+        cbd.test_lsps2_buy = test_lsps2_buy;
+        cbd.test_splice    = test_splice;
 
         /* Load persisted client invoices (Phase 23) */
         if (use_db) {

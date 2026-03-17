@@ -30,6 +30,17 @@ struct chain_backend {
      */
     int  (*get_confirmations)(chain_backend_t *self, const char *txid_hex);
 
+    /*
+     * Batch confirmations for n_txids txids (display-order hex).
+     * confs_out[i] = confirmation count (>= 1) if confirmed, -1 if not found.
+     * Returns 1 on success. Optional — may be NULL; callers must fall back to
+     * repeated get_confirmations if NULL.
+     * Implementations should fetch each block only once (O(scan_depth) RPCs).
+     */
+    int  (*get_confirmations_batch)(chain_backend_t *self,
+                                    const char **txids_hex, size_t n_txids,
+                                    int *confs_out);
+
     /* Returns true if txid is in the mempool. */
     bool (*is_in_mempool)(chain_backend_t *self, const char *txid_hex);
 

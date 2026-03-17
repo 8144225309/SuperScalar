@@ -65,6 +65,15 @@ int   regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *addres
 int   regtest_fund_address(regtest_t *rt, const char *address, double btc_amount, char *txid_out);
 int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
+/*
+ * Batch confirmations for n_txids display-order hex txids.
+ * Fetches each block only once (getblock hash 1), O(scan_depth) RPCs total.
+ * confs_out[i] = confirmation count (>= 1) if confirmed, -1 if not found.
+ * Returns 1 on success.
+ */
+int   regtest_get_confirmations_batch(regtest_t *rt,
+                                      const char **txids_hex, size_t n_txids,
+                                      int *confs_out);
 bool  regtest_is_in_mempool(regtest_t *rt, const char *txid);
 int   regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
                              uint64_t *amount_sats_out,
