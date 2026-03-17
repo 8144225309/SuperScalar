@@ -626,7 +626,8 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
     /* Count active HTLCs */
     size_t n_active_htlcs = 0;
     for (size_t i = 0; i < ch->n_htlcs; i++) {
-        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
             n_active_htlcs++;
     }
 
@@ -686,6 +687,10 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
 
         for (size_t i = 0; i < ch->n_htlcs; i++) {
             if (ch->htlcs[i].state != HTLC_STATE_ACTIVE)
+                continue;
+            /* BOLT #3 §3: trim sub-dust HTLCs from commitment tx outputs.
+               Their value accrues to the commitment fee. */
+            if (ch->htlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS)
                 continue;
 
             tapscript_leaf_t success_leaf, timeout_leaf;
