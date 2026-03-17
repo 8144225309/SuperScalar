@@ -6,6 +6,7 @@
 
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
+#include "superscalar/blinded_path.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
@@ -168,5 +169,147 @@ int test_bolt12_offer_encode_decode(void)
     ASSERT(offer_decode(encoded, &dec), "decode");
     ASSERT(dec.amount_msat == o.amount_msat, "amount");
     ASSERT(strcmp(dec.description, o.description) == 0, "description");
+    return 1;
+}
+
+/* ---- Test BF1: blinded path build → unblind first hop → recovers next_node_id ---- */
+int test_bolt12_blinded_path_aead(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    /* Ephemeral key e (used by sender to build path) */
+    unsigned char e[32];
+    memset(e, 0x42, 32);
+
+    /* Hop 0 private key (introduction node's own key) */
+    unsigned char hop0_priv[32];
+    memset(hop0_priv, 0x11, 32);
+
+    /* Hop 1 private key */
+    unsigned char hop1_priv[32];
+    memset(hop1_priv, 0x22, 32);
+
+    /* Derive public keys */
+    unsigned char hop0_pub[33], hop1_pub[33];
+    secp256k1_pubkey pub0, pub1;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pub0, hop0_priv), "pub0");
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pub1, hop1_priv), "pub1");
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hop0_pub, &l, &pub0, SECP256K1_EC_COMPRESSED);
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hop1_pub, &l, &pub1, SECP256K1_EC_COMPRESSED);
+
+    /* Build blinded path: node_pubkeys = [hop0_pub, hop1_pub], intro_seckey = e */
+    unsigned char node_pubkeys[2][33];
+    memcpy(node_pubkeys[0], hop0_pub, 33);
+    memcpy(node_pubkeys[1], hop1_pub, 33);
+
+    blinded_path_t path;
+    ASSERT(blinded_path_build(&path, ctx, node_pubkeys, 2, e), "build");
+    ASSERT(path.n_hops == 2, "n_hops");
+
+    /* Unblind first hop with hop0's private key → should recover hop1_pub */
+    unsigned char next_node[33];
+    ASSERT(blinded_path_unblind_first_hop(&path, ctx, hop0_priv, next_node),
+           "unblind succeeds");
+    ASSERT(memcmp(next_node, hop1_pub, 33) == 0, "recovered next_node_id == hop1_pub");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test BF2: BOLT #12 merkle root — non-empty stream ---- */
+int test_bolt12_merkle_root_nonempty(void)
+{
+    /* Two known byte streams → different roots */
+    unsigned char stream_a[64];
+    memset(stream_a, 0xAA, 64);
+    unsigned char stream_b[64];
+    memset(stream_b, 0xBB, 64);
+
+    unsigned char root_a[32], root_b[32];
+    bolt12_merkle_root(stream_a, 64, root_a);
+    bolt12_merkle_root(stream_b, 64, root_b);
+
+    ASSERT(memcmp(root_a, root_b, 32) != 0, "different streams → different roots");
+
+    /* Same stream → same root (deterministic) */
+    unsigned char root_a2[32];
+    bolt12_merkle_root(stream_a, 64, root_a2);
+    ASSERT(memcmp(root_a, root_a2, 32) == 0, "same stream → same root");
+
+    return 1;
+}
+
+/* ---- Test BF3: merkle root over empty stream is well-defined ---- */
+int test_bolt12_merkle_root_empty(void)
+{
+    unsigned char root1[32], root2[32];
+    bolt12_merkle_root(NULL, 0, root1);
+    bolt12_merkle_root((const unsigned char *)"", 0, root2);
+    ASSERT(memcmp(root1, root2, 32) == 0, "NULL and zero-len give same root");
+    return 1;
+}
+
+/* ---- Test BF4: invoice_sign → invoice_verify with merkle-based sighash ---- */
+int test_bolt12_sign_verify_merkle(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char seckey[32];
+    memset(seckey, 0x77, 32);
+    secp256k1_pubkey pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pub, seckey), "pub");
+    unsigned char node_id33[33];
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, node_id33, &l, &pub, SECP256K1_EC_COMPRESSED);
+
+    invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    memset(inv.payment_hash, 0x11, 32);
+    memset(inv.offer_id,     0x22, 32);
+    inv.amount_msat = 99000;
+
+    ASSERT(invoice_sign(&inv, ctx, seckey),             "sign");
+    ASSERT(invoice_verify(&inv, ctx, node_id33),        "verify");
+
+    /* Tamper with amount → verify fails */
+    inv.amount_msat = 1;
+    ASSERT(!invoice_verify(&inv, ctx, node_id33),       "tampered verify fails");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test BF5: invoice_error_encode → invoice_error_decode roundtrip ---- */
+int test_bolt12_invoice_error_wire(void)
+{
+    const char *reason = "invalid payment hash";
+    unsigned char req_tlv[32];
+    memset(req_tlv, 0x55, 32);
+
+    invoice_error_t err;
+    ASSERT(invoice_error_build(req_tlv, 32, reason, 7, &err), "build");
+
+    unsigned char buf[512];
+    size_t len = invoice_error_encode(&err, buf, sizeof(buf));
+    ASSERT(len > 4, "encoded to wire");
+    ASSERT(buf[0] == 0x80 && buf[1] == 0x02, "outer type 0x8002");
+
+    invoice_error_t dec;
+    ASSERT(invoice_error_decode(buf, len, &dec), "decode");
+    ASSERT(strcmp(dec.error, reason) == 0,        "error message matches");
+    ASSERT(dec.erroneous_field == 7,               "erroneous_field matches");
+    ASSERT(dec.invoice_request_len == 32,          "request TLV length");
+    ASSERT(memcmp(dec.invoice_request, req_tlv, 32) == 0, "request TLV data");
+
+    /* Wrong outer type → decode fails */
+    buf[1] = 0x01;
+    ASSERT(!invoice_error_decode(buf, len, &dec), "wrong outer type rejected");
+
     return 1;
 }
