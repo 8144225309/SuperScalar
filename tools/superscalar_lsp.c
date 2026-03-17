@@ -4160,10 +4160,13 @@ int main(int argc, char *argv[]) {
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            /* Build the LSP's OWN old commitment at state #0 (from the LSP's
-               perspective).  The client's watchtower watches for this txid via
-               channel_build_commitment_tx_for_remote(client_ch) which produces the
-               same transaction (LSP's commitment) from the remote side. */
+            /* Build the LSP's OWN old commitment (not the client's).
+               In --cheat-daemon mode, the LSP is the cheater broadcasting
+               an old state. The CLIENT's watchtower watches for the LSP's old
+               commitment txid (registered via watchtower_watch_revoked_commitment
+               which calls channel_build_commitment_tx_for_remote from the CLIENT's
+               perspective = LSP's commitment). Broadcast the LSP's own commitment
+               so it matches what clients are watching for. */
             int built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
 
             /* Restore current state */
@@ -5208,14 +5211,37 @@ int main(int argc, char *argv[]) {
             }
             cJSON_Delete(pm);
 
-            /* Recv PTLC_ADAPTED_SIG from client */
+            /* Recv PTLC_ADAPTED_SIG from client (30s wall-clock,
+               discard stray messages from concurrent flows). */
             wire_msg_t resp;
-            if (!wire_recv(lsp.client_fds[ci], &resp) ||
-                resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
-                if (resp.json) cJSON_Delete(resp.json);
-                fprintf(stderr, "ROTATION: no adapted_sig from client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
-                secp256k1_context_destroy(ctx); return 1;
+            memset(&resp, 0, sizeof(resp));
+            {
+                struct timeval t_rs, t_rn;
+                gettimeofday(&t_rs, NULL);
+                int got_sig = 0;
+                while (1) {
+                    gettimeofday(&t_rn, NULL);
+                    int elapsed = (int)(t_rn.tv_sec - t_rs.tv_sec);
+                    int remain  = 30 - elapsed;
+                    if (remain <= 0) break;
+                    if (!wire_recv_timeout(lsp.client_fds[ci], &resp, remain)) break;
+                    if (resp.msg_type == MSG_PTLC_ADAPTED_SIG) { got_sig = 1; break; }
+                    if (resp.msg_type == MSG_ERROR) {
+                        if (resp.json) cJSON_Delete(resp.json);
+                        memset(&resp, 0, sizeof(resp));
+                        break;
+                    }
+                    fprintf(stderr, "ROTATION: discarding stray msg 0x%02x from client %d\n",
+                            resp.msg_type, ci);
+                    if (resp.json) cJSON_Delete(resp.json);
+                    memset(&resp, 0, sizeof(resp));
+                }
+                if (!got_sig) {
+                    if (resp.json) cJSON_Delete(resp.json);
+                    fprintf(stderr, "ROTATION: no adapted_sig from client %d\n", ci);
+                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
             }
 
             unsigned char adapted_sig[64];

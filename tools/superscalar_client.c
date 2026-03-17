@@ -363,6 +363,40 @@ typedef struct {
     int active;
 } client_invoice_t;
 
+/* Per-fd message inbox: queues messages that arrive out-of-order while
+   recv_or_handle_ptlc is blocking for a specific message type.
+   Prevents unexpected messages from being silently lost. */
+#define CLIENT_INBOX_SIZE 4
+
+typedef struct {
+    wire_msg_t msgs[CLIENT_INBOX_SIZE];
+    int head, tail, count;
+} client_inbox_t;
+
+static void client_inbox_push(client_inbox_t *ib, const wire_msg_t *m)
+{
+    if (ib->count >= CLIENT_INBOX_SIZE) {
+        /* Inbox full — drop oldest to make room */
+        if (ib->msgs[ib->head].json)
+            cJSON_Delete(ib->msgs[ib->head].json);
+        ib->head = (ib->head + 1) % CLIENT_INBOX_SIZE;
+        ib->count--;
+    }
+    ib->msgs[ib->tail] = *m;
+    ib->tail = (ib->tail + 1) % CLIENT_INBOX_SIZE;
+    ib->count++;
+}
+
+static int client_inbox_pop(client_inbox_t *ib, wire_msg_t *out)
+{
+    if (ib->count == 0) return 0;
+    *out = ib->msgs[ib->head];
+    ib->head = (ib->head + 1) % CLIENT_INBOX_SIZE;
+    ib->count--;
+    return 1;
+}
+
+
 /* Data passed through daemon callback's user_data */
 typedef struct {
     persist_t *db;
@@ -374,6 +408,7 @@ typedef struct {
     regtest_t *rt;
     jit_channel_t *jit_ch;  /* JIT channel, or NULL */
     int auto_accept_jit;    /* 1 = auto-accept JIT offers */
+    client_inbox_t inbox;   /* out-of-order messages from recv_or_handle_ptlc */
     int test_lsps2;         /* 1 = send lsps2.get_info after factory setup */
     int test_lsps2_done;    /* 1 = LSPS2 get_info response verified */
     int test_lsps2_buy;     /* 1 = also send lsps2.buy after get_info */
@@ -415,7 +450,8 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
                                 uint8_t expected_type,
                                 secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
-                                uint32_t my_index) {
+                                uint32_t my_index,
+                                client_inbox_t *inbox) {
     struct timeval start, now;
     gettimeofday(&start, NULL);
     while (1) {
@@ -434,8 +470,18 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
             msg->json = NULL;
             continue;  /* Retry for the expected message */
         }
-        /* Unexpected non-PTLC message — return it as-is */
-        return 1;
+        /* Unexpected non-PTLC message: queue to inbox so the daemon loop
+           can process it, rather than silently discarding it. */
+        if (msg->msg_type == MSG_ERROR)
+            return 0;  /* propagate abort */
+        if (inbox) {
+            client_inbox_push(inbox, msg);
+            msg->json = NULL;  /* inbox owns the json now */
+        } else {
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+        }
+        continue;  /* keep waiting for expected_type */
     }
 }
 
@@ -451,7 +497,7 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                                          uint32_t my_index) {
     wire_msg_t rev_msg;
     if (!recv_or_handle_ptlc(fd, &rev_msg, 2, MSG_LSP_REVOKE_AND_ACK,
-                              ctx, keypair, my_index))
+                              ctx, keypair, my_index, cbd ? &cbd->inbox : NULL))
         return;
     if (rev_msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
         /* Not a revocation — unexpected msg; silently skip */
@@ -585,6 +631,16 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     int epoch_reset_round1_done = 0;
     memset(epoch_secnonces, 0, sizeof(epoch_secnonces));
 
+    /* Clear any stale inbox messages from a previous connection.
+       The same daemon_cb_data_t is reused across reconnects, so
+       messages queued during the previous session would otherwise
+       be replayed with the new connection's channel state. */
+    {
+        wire_msg_t stale_imsg;
+        while (client_inbox_pop(&cbd->inbox, &stale_imsg))
+            cJSON_Delete(stale_imsg.json);
+    }
+
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
     /* Log factory lifecycle once (Tier 2) */
@@ -613,6 +669,30 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     }
 
     while (!g_shutdown) {
+        /* Fix 3: Drain messages queued by recv_or_handle_ptlc before blocking.
+           MSG_COMMITMENT_SIGNED can arrive while we wait for a different message;
+           the inbox ensures it is processed rather than lost.
+           IMPORTANT: we must NOT call client_recv_lsp_revocation here because
+           it blocks on the socket and would consume the next real message.
+           MSG_LSP_REVOKE_AND_ACK will arrive naturally and be handled by the
+           case MSG_LSP_REVOKE_AND_ACK branch in the daemon switch below. */
+        {
+            wire_msg_t imsg;
+            while (client_inbox_pop(&cbd->inbox, &imsg)) {
+                if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &imsg);
+                    cJSON_Delete(imsg.json);
+                    if (cbd && cbd->db)
+                        persist_update_channel_balance(cbd->db, my_index - 1,
+                            ch->local_amount, ch->remote_amount,
+                            ch->commitment_number);
+                } else {
+                    /* Unknown queued message — discard */
+                    cJSON_Delete(imsg.json);
+                }
+            }
+        }
+
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
@@ -650,7 +730,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Wait for COMMITMENT_SIGNED (5s timeout), handling PTLC_PRESIG
                inline to prevent rotation messages from being discarded */
             if (!recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
-                                      ctx, keypair, my_index)) {
+                                      ctx, keypair, my_index, &cbd->inbox)) {
                 fprintf(stderr, "Client %u: timeout waiting for commit after ADD\n", my_index);
                 break;
             }
@@ -734,7 +814,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     /* Handle COMMITMENT_SIGNED for the fulfill (5s timeout),
                        handling PTLC_PRESIG inline to prevent rotation loss */
                     if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
-                                             ctx, keypair, my_index) &&
+                                             ctx, keypair, my_index, &cbd->inbox) &&
                         msg.msg_type == MSG_COMMITMENT_SIGNED) {
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
                         if (msg.json) cJSON_Delete(msg.json);
@@ -797,7 +877,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Handle follow-up COMMITMENT_SIGNED (5s timeout),
                handling PTLC_PRESIG inline to prevent rotation loss */
             if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
-                                     ctx, keypair, my_index) &&
+                                     ctx, keypair, my_index, &cbd->inbox) &&
                 msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 if (msg.json) cJSON_Delete(msg.json);
@@ -814,6 +894,34 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_update_channel_balance(cbd->db, my_index - 1,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
+            break;
+        }
+
+        case MSG_LSP_REVOKE_AND_ACK: {
+            /* LSP's own revocation, arriving naturally in the daemon loop.
+               This happens when a queued CS was processed from the inbox:
+               client_handle_commitment_signed sent RAA, LSP responded with this. */
+            uint32_t lra_chan_id;
+            unsigned char lra_rev_secret[32], lra_next_point[33];
+            if (wire_parse_revoke_and_ack(msg.json, &lra_chan_id,
+                                            lra_rev_secret, lra_next_point)) {
+                if (ch->commitment_number > 0)
+                    channel_receive_revocation(ch, ch->commitment_number - 1,
+                                               lra_rev_secret);
+                /* Persist new remote PCP */
+                if (cbd && cbd->db) {
+                    secp256k1_pubkey lra_pcp;
+                    if (secp256k1_ec_pubkey_parse(ctx, &lra_pcp, lra_next_point, 33)) {
+                        unsigned char lra_ser[33];
+                        size_t lra_slen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, lra_ser, &lra_slen,
+                                                       &lra_pcp, SECP256K1_EC_COMPRESSED);
+                        persist_save_remote_pcp(cbd->db, 0,
+                            ch->commitment_number, lra_ser);
+                    }
+                }
+            }
+            cJSON_Delete(msg.json);
             break;
         }
 
