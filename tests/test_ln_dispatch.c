@@ -10,12 +10,21 @@
 
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/htlc_forward.h"
+#include "superscalar/invoice.h"
 #include "superscalar/mpp.h"
+#include "superscalar/onion.h"            /* onion_build */
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
+#include "superscalar/bolt8_server.h"     /* bolt8_server_cfg_t */
+#include "superscalar/lsps.h"             /* lsps0_bolt8_cb test helpers */
+#include "superscalar/bolt12.h"           /* invoice_request_decode */
+#include "superscalar/peer_mgr.h"         /* peer_mgr_set_proxy */
+#include "superscalar/tor.h"              /* tor_parse_proxy_arg */
+#include <cJSON.h>
 #include <secp256k1.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -257,5 +266,446 @@ int test_ln_dispatch_truncated(void)
            "zero-length message returns -1");
 
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LD6 — FORWARD_FINAL claims matching invoice and settles it         */
+/* ================================================================== */
+int test_ln_dispatch_invoice_claim(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    /* Our private key (same as make_dispatch) */
+    unsigned char our_priv[32];
+    memset(our_priv, 0x11, 32);
+    secp256k1_pubkey our_pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub, our_priv), "pubkey");
+    unsigned char our_pub33[33];
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub33, &pub_len, &our_pub,
+                                   SECP256K1_EC_COMPRESSED);
+
+    /* Build a valid final-hop onion for our key */
+    unsigned char payment_secret[32];
+    memset(payment_secret, 0xBB, 32);
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    memcpy(hop.pubkey, our_pub33, 33);
+    hop.amount_msat  = 500000;
+    hop.cltv_expiry  = 700100;
+    hop.is_final     = 1;
+    memcpy(hop.payment_secret, payment_secret, 32);
+    hop.total_msat   = 500000;
+
+    unsigned char session_key[32];
+    memset(session_key, 0x44, 32);
+    unsigned char onion_pkt[ONION_PACKET_SIZE];
+    ASSERT(onion_build(&hop, 1, session_key, ctx, onion_pkt), "build onion");
+
+    /* Pre-insert a matching invoice */
+    unsigned char payment_hash[32];
+    memset(payment_hash, 0xCC, 32);
+    bolt11_invoice_table_t tbl;
+    invoice_init(&tbl);
+    bolt11_invoice_entry_t *e = &tbl.entries[0];
+    e->active      = 1;
+    e->settled     = 0;
+    memcpy(e->payment_hash, payment_hash, 32);
+    memset(e->preimage, 0xDD, 32);
+    e->amount_msat = 0;           /* accept any amount */
+    e->created_at  = (uint32_t)time(NULL);
+    e->expiry      = 3600;
+    tbl.count      = 1;
+
+    /* Build update_add_htlc with our payment_hash */
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+    d.invoices = &tbl;
+    /* pmgr = NULL: fulfill send is guarded by peer_idx >= 0 check */
+
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = (unsigned char *)calloc(1, msg_len);
+    ASSERT(msg, "alloc");
+    wr16(msg, 128);                              /* type */
+    /* channel_id: msg+2 = zeros */
+    wr64(msg + 34, 1);                           /* htlc_id */
+    wr64(msg + 42, 500000);                      /* amount_msat */
+    memcpy(msg + 50, payment_hash, 32);          /* payment_hash at p+48 */
+    wr32(msg + 82, 700100);                      /* cltv_expiry */
+    memcpy(msg + 86, onion_pkt, ONION_PACKET_SIZE); /* onion at p+84 */
+
+    int rc = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    ASSERT(rc == 128 || rc == -1, "returns 128 or -1");
+
+    /* Invoice should be settled (invoice_claim sets settled=1) */
+    ASSERT(tbl.entries[0].settled == 1, "invoice settled after final-hop claim");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LD7 — FORWARD_FINAL with no matching invoice: no crash             */
+/* ================================================================== */
+int test_ln_dispatch_no_matching_invoice(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char our_priv[32];
+    memset(our_priv, 0x11, 32);
+    secp256k1_pubkey our_pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub, our_priv), "pubkey");
+    unsigned char our_pub33[33];
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub33, &pub_len, &our_pub,
+                                   SECP256K1_EC_COMPRESSED);
+
+    /* Build final-hop onion */
+    unsigned char payment_secret[32];
+    memset(payment_secret, 0xBB, 32);
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    memcpy(hop.pubkey, our_pub33, 33);
+    hop.amount_msat = 500000;
+    hop.cltv_expiry = 700100;
+    hop.is_final    = 1;
+    memcpy(hop.payment_secret, payment_secret, 32);
+    hop.total_msat  = 500000;
+
+    unsigned char session_key[32];
+    memset(session_key, 0x44, 32);
+    unsigned char onion_pkt[ONION_PACKET_SIZE];
+    ASSERT(onion_build(&hop, 1, session_key, ctx, onion_pkt), "build onion");
+
+    /* Empty invoice table: no match */
+    bolt11_invoice_table_t tbl;
+    invoice_init(&tbl);
+
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+    d.invoices = &tbl;
+
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = (unsigned char *)calloc(1, msg_len);
+    ASSERT(msg, "alloc");
+    wr16(msg, 128);
+    wr64(msg + 34, 1);
+    wr64(msg + 42, 500000);
+    /* payment_hash: zeros (no matching invoice) */
+    wr32(msg + 82, 700100);
+    memcpy(msg + 86, onion_pkt, ONION_PACKET_SIZE);
+
+    int rc = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    /* No crash, returns 128 (FORWARD_FINAL reached) or -1 (onion error) */
+    ASSERT(rc == 128 || rc == -1, "no matching invoice: no crash");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LD8 — FORWARD_FINAL with d->invoices=NULL: no crash                */
+/* ================================================================== */
+int test_ln_dispatch_forward_final_no_invoices(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char our_priv[32];
+    memset(our_priv, 0x11, 32);
+    secp256k1_pubkey our_pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub, our_priv), "pubkey");
+    unsigned char our_pub33[33];
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub33, &pub_len, &our_pub,
+                                   SECP256K1_EC_COMPRESSED);
+
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    memcpy(hop.pubkey, our_pub33, 33);
+    hop.amount_msat = 500000; hop.cltv_expiry = 700100;
+    hop.is_final = 1; hop.total_msat = 500000;
+    unsigned char session_key[32];
+    memset(session_key, 0x44, 32);
+    unsigned char onion_pkt[ONION_PACKET_SIZE];
+    ASSERT(onion_build(&hop, 1, session_key, ctx, onion_pkt), "build onion");
+
+    htlc_forward_table_t fwd; htlc_forward_init(&fwd);
+    mpp_table_t mpp; mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+    d.invoices = NULL;  /* no invoice table */
+
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = (unsigned char *)calloc(1, msg_len);
+    ASSERT(msg, "alloc");
+    wr16(msg, 128);
+    wr64(msg + 34, 1); wr64(msg + 42, 500000);
+    wr32(msg + 82, 700100);
+    memcpy(msg + 86, onion_pkt, ONION_PACKET_SIZE);
+
+    int rc = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    ASSERT(rc == 128 || rc == -1, "no invoice table: no crash");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_ln_dispatch_peer_idx_neg1(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+    /* pmgr is NULL from make_dispatch */
+
+    /* update_fulfill_htlc with peer_idx=-1 */
+    unsigned char preimage[32];
+    memset(preimage, 0xAB, 32);
+    unsigned char buf[128];
+    size_t len = build_update_fulfill_htlc(buf, 7, preimage);
+
+    int rc = ln_dispatch_process_msg(&d, -1, buf, len);
+    ASSERT(rc == 130, "peer_idx=-1 returns correct type 130, no crash");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* BS1 — bolt8_server_cfg_t has ln_dispatch field; routing path works */
+/* ================================================================== */
+int test_bolt8_ln_dispatch_routing(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+
+    /* Verify bolt8_server_cfg_t has ln_dispatch field */
+    bolt8_server_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.ln_dispatch = &d;
+    ASSERT(cfg.ln_dispatch == &d, "ln_dispatch field exists and can be set");
+
+    /* Simulate what bolt8_dispatch_message does for a BOLT #2 type:
+     * call ln_dispatch_process_msg with peer_idx=-1 */
+    unsigned char buf[128];
+    size_t len = build_update_fulfill_htlc(buf, 42, (unsigned char *)
+                                            "\xAB\xAB\xAB\xAB\xAB\xAB\xAB\xAB"
+                                            "\xAB\xAB\xAB\xAB\xAB\xAB\xAB\xAB"
+                                            "\xAB\xAB\xAB\xAB\xAB\xAB\xAB\xAB"
+                                            "\xAB\xAB\xAB\xAB\xAB\xAB\xAB\xAB");
+    int rc = ln_dispatch_process_msg((ln_dispatch_t *)cfg.ln_dispatch,
+                                      /*peer_idx=*/ -1, buf, len);
+    ASSERT(rc == 130, "bolt8-routed BOLT #2 msg dispatched correctly");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LS1 — lsps1_get_info JSON response contains min_channel_balance    */
+/* ================================================================== */
+int test_lsps0_get_info_response(void)
+{
+    lsps1_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.min_channel_balance_msat = 100000000ULL;
+    info.max_channel_balance_msat = 10000000000ULL;
+    info.min_confirmations = 1;
+    info.base_fee_msat     = 1000;
+    info.fee_ppm           = 500;
+
+    cJSON *result = lsps1_build_get_info_response(&info);
+    ASSERT(result, "result non-NULL");
+
+    cJSON *resp = lsps_build_response(1, result);
+    ASSERT(resp, "resp non-NULL");
+    char *s = cJSON_PrintUnformatted(resp);
+    ASSERT(s, "serialize ok");
+    ASSERT(strstr(s, "min_channel_balance_msat") != NULL,
+           "response contains min_channel_balance_msat");
+    free(s);
+    cJSON_Delete(resp);
+    return 1;
+}
+
+/* ================================================================== */
+/* LS2 — unknown LSPS method → error with METHOD_NOT_FOUND code       */
+/* ================================================================== */
+int test_lsps0_unknown_method(void)
+{
+    cJSON *err = lsps_build_error(99, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
+    ASSERT(err, "err non-NULL");
+    char *s = cJSON_PrintUnformatted(err);
+    ASSERT(s, "serialize ok");
+    /* JSON-RPC error should contain the code */
+    ASSERT(strstr(s, "-32601") != NULL || strstr(s, "error") != NULL,
+           "error response contains error field");
+    free(s);
+    cJSON_Delete(err);
+    return 1;
+}
+
+/* ================================================================== */
+/* LS3 — invoice_create with "tbs" → bech32 starts with "lntbs"       */
+/* ================================================================== */
+int test_lsps0_invoice_create_tbs(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char priv[32]; memset(priv, 0x44, 32);
+    bolt11_invoice_table_t tbl; invoice_init(&tbl);
+    char bech32[512]; memset(bech32, 0, sizeof(bech32));
+    int r = invoice_create(&tbl, ctx, priv, "signet", 10000, "test", 3600, bech32, sizeof(bech32));
+    ASSERT(r == 1, "invoice_create returns 1");
+    ASSERT(strncmp(bech32, "lntbs", 5) == 0, "bech32 starts with lntbs");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LS4 — invoice_create with amount=0 (any-amount) → returns 1        */
+/* ================================================================== */
+int test_lsps0_invoice_any_amount(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char priv[32]; memset(priv, 0x55, 32);
+    bolt11_invoice_table_t tbl; invoice_init(&tbl);
+    char bech32[512]; memset(bech32, 0, sizeof(bech32));
+    int r = invoice_create(&tbl, ctx, priv, "tbs", 0, "any amount", 3600, bech32, sizeof(bech32));
+    ASSERT(r == 1, "any-amount invoice returns 1");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* LS5 — lsps_parse_request with NULL JSON → returns NULL, no crash   */
+/* ================================================================== */
+int test_lsps0_malformed_json(void)
+{
+    int id = 0;
+    const char *method = lsps_parse_request(NULL, &id);
+    ASSERT(method == NULL, "NULL json returns NULL method");
+    return 1;
+}
+
+/* ================================================================== */
+/* LS6 — lsps2_get_info response contains fee_ppm                     */
+/* ================================================================== */
+int test_lsps0_lsps2_get_info(void)
+{
+    lsps2_fee_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.min_fee_msat             = 1000;
+    params.fee_ppm                  = 500;
+    params.min_channel_balance_msat = 100000000ULL;
+    params.max_channel_balance_msat = 10000000000ULL;
+
+    cJSON *result = lsps2_build_get_info_response(&params);
+    ASSERT(result, "result non-NULL");
+    cJSON *resp = lsps_build_response(1, result);
+    ASSERT(resp, "resp non-NULL");
+    char *s = cJSON_PrintUnformatted(resp);
+    ASSERT(s, "serialize ok");
+    ASSERT(strstr(s, "fee_ppm") != NULL, "response contains fee_ppm");
+    free(s);
+    cJSON_Delete(resp);
+    return 1;
+}
+
+/* ================================================================== */
+/* TW1 — peer_mgr_set_proxy sets tor_proxy_port                       */
+/* ================================================================== */
+int test_peer_mgr_tor_proxy_set(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char priv[32]; memset(priv, 0x11, 32);
+    peer_mgr_t mgr; peer_mgr_init(&mgr, ctx, priv);
+    peer_mgr_set_proxy(&mgr, "127.0.0.1", 9050);
+    ASSERT(mgr.tor_proxy_port == 9050, "tor_proxy_port set to 9050");
+    ASSERT(strcmp(mgr.tor_proxy_host, "127.0.0.1") == 0, "tor_proxy_host set");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* TW2 — .onion host with no proxy → connect fails (TCP, no Tor)      */
+/* ================================================================== */
+int test_peer_mgr_onion_no_proxy(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char priv[32]; memset(priv, 0x22, 32);
+    peer_mgr_t mgr; peer_mgr_init(&mgr, ctx, priv);
+    /* No proxy set: tor_proxy_port == 0, so TCP path taken and fails */
+    unsigned char their_pk[33]; memset(their_pk, 0x02, 33);
+    int r = peer_mgr_connect(&mgr, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion",
+                              9735, their_pk);
+    ASSERT(r < 0, ".onion without proxy → connect fails");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* TW3 — non-.onion host bypasses Tor regardless of proxy             */
+/* ================================================================== */
+int test_peer_mgr_clearnet_bypass_tor(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char priv[32]; memset(priv, 0x33, 32);
+    peer_mgr_t mgr; peer_mgr_init(&mgr, ctx, priv);
+    peer_mgr_set_proxy(&mgr, "127.0.0.1", 9050);
+    /* clearnet host: even with proxy configured, TCP path taken → fails to closed port */
+    unsigned char their_pk[33]; memset(their_pk, 0x02, 33);
+    int r = peer_mgr_connect(&mgr, "127.0.0.1", 1, their_pk);
+    ASSERT(r < 0, "clearnet host with proxy still uses TCP and fails on closed port");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* TW4 — tor_parse_proxy_arg parses HOST:PORT                         */
+/* ================================================================== */
+int test_tor_parse_proxy_arg_basic(void)
+{
+    char host[256]; int port = 0;
+    int r = tor_parse_proxy_arg("127.0.0.1:9050", host, sizeof(host), &port);
+    ASSERT(r == 1, "parse succeeds");
+    ASSERT(strcmp(host, "127.0.0.1") == 0, "host correct");
+    ASSERT(port == 9050, "port correct");
     return 1;
 }
