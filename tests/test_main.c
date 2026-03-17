@@ -270,6 +270,15 @@ extern int test_htlc_commit_update_fee_layout(void);
 extern int test_htlc_commit_recv_update_fee_accepts(void);
 extern int test_htlc_commit_recv_update_fee_rejects_low(void);
 extern int test_htlc_commit_recv_update_fee_rejects_high(void);
+/* PR #21 Phase 3: CLTV watchdog */
+extern int test_cltv_watchdog_default_delta(void);
+extern int test_cltv_watchdog_no_htlcs(void);
+extern int test_cltv_watchdog_htlc_safe(void);
+extern int test_cltv_watchdog_htlc_at_risk(void);
+extern int test_cltv_watchdog_offered_ignored(void);
+extern int test_cltv_watchdog_expire(void);
+extern int test_cltv_watchdog_earliest_expiry(void);
+extern int test_cltv_watchdog_multi_htlc(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1191,6 +1200,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
     RUN_TEST(test_htlc_commit_recv_update_fee_rejects_low);
     RUN_TEST(test_htlc_commit_recv_update_fee_rejects_high);
+    printf("\n=== PR #21 Phase 3: CLTV Watchdog ===\n");
+    RUN_TEST(test_cltv_watchdog_default_delta);
+    RUN_TEST(test_cltv_watchdog_no_htlcs);
+    RUN_TEST(test_cltv_watchdog_htlc_safe);
+    RUN_TEST(test_cltv_watchdog_htlc_at_risk);
+    RUN_TEST(test_cltv_watchdog_offered_ignored);
+    RUN_TEST(test_cltv_watchdog_expire);
+    RUN_TEST(test_cltv_watchdog_earliest_expiry);
+    RUN_TEST(test_cltv_watchdog_multi_htlc);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
