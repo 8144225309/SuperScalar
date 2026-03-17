@@ -253,6 +253,23 @@ extern int test_bolt12_invoice_from_request(void);
 extern int test_bolt12_invoice_error(void);
 extern int test_bolt12_full_sign_verify(void);
 extern int test_bolt12_offer_encode_decode(void);
+/* PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire */
+extern int test_htlc_commit_add_layout(void);
+extern int test_htlc_commit_commitment_signed_layout(void);
+extern int test_htlc_commit_revoke_and_ack_layout(void);
+extern int test_htlc_commit_fulfill_layout(void);
+extern int test_htlc_commit_fail_layout(void);
+extern int test_htlc_commit_fail_malformed_layout(void);
+extern int test_htlc_commit_dispatch_types(void);
+extern int test_htlc_commit_dust_excluded_from_tx(void);
+extern int test_htlc_commit_dust_tx_output_count(void);
+extern int test_htlc_commit_above_dust_counted(void);
+extern int test_htlc_commit_mixed_dust_counted(void);
+/* PR #21 Phase 5: update_fee */
+extern int test_htlc_commit_update_fee_layout(void);
+extern int test_htlc_commit_recv_update_fee_accepts(void);
+extern int test_htlc_commit_recv_update_fee_rejects_low(void);
+extern int test_htlc_commit_recv_update_fee_rejects_high(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1157,6 +1174,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt12_invoice_error);
     RUN_TEST(test_bolt12_full_sign_verify);
     RUN_TEST(test_bolt12_offer_encode_decode);
+    printf("\n=== PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire ===\n");
+    RUN_TEST(test_htlc_commit_add_layout);
+    RUN_TEST(test_htlc_commit_commitment_signed_layout);
+    RUN_TEST(test_htlc_commit_revoke_and_ack_layout);
+    RUN_TEST(test_htlc_commit_fulfill_layout);
+    RUN_TEST(test_htlc_commit_fail_layout);
+    RUN_TEST(test_htlc_commit_fail_malformed_layout);
+    RUN_TEST(test_htlc_commit_dispatch_types);
+    RUN_TEST(test_htlc_commit_dust_excluded_from_tx);
+    RUN_TEST(test_htlc_commit_dust_tx_output_count);
+    RUN_TEST(test_htlc_commit_above_dust_counted);
+    RUN_TEST(test_htlc_commit_mixed_dust_counted);
+    printf("\n=== PR #21 Phase 5: update_fee ===\n");
+    RUN_TEST(test_htlc_commit_update_fee_layout);
+    RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
+    RUN_TEST(test_htlc_commit_recv_update_fee_rejects_low);
+    RUN_TEST(test_htlc_commit_recv_update_fee_rejects_high);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
