@@ -715,6 +715,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON_Delete(cs);
+        /* Fix 5: flag pending CS so reconnect can retransmit if RAA lost */
+        if (mgr->persist)
+            persist_save_pending_cs((persist_t *)mgr->persist,
+                mgr->entries[sender_idx].channel_id,
+                sender_ch->commitment_number);
     }
 
     int sender_batch = 0;
@@ -977,6 +982,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON_Delete(cs);
+        /* Fix 5: flag pending CS so reconnect can retransmit if RAA lost */
+        if (mgr->persist)
+            persist_save_pending_cs((persist_t *)mgr->persist,
+                dest_chan_id, dest_ch->commitment_number);
     }
 
     int dest_batch = 0;
@@ -1908,6 +1917,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON_Delete(cs);
+        /* Fix 5: flag pending CS so reconnect can retransmit if RAA lost */
+        if (mgr->persist)
+            persist_save_pending_cs((persist_t *)mgr->persist,
+                mgr->entries[client_idx].channel_id,
+                ch->commitment_number);
     }
 
     /* Wait for REVOKE_AND_ACK */
@@ -2720,6 +2734,50 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         channel_set_remote_pubnonces(ch,
             (const unsigned char (*)[66])client_nonces, client_nonce_count);
+    }
+
+    /* Fix 5: CS retransmit — if a COMMITMENT_SIGNED was pending when the client
+       disconnected, retransmit it now using fresh nonces from the exchange above.
+       This is NOT a replay: channel_create_commitment_partial_sig generates a
+       new psig with the new nonces (MuSig2 nonce reuse avoided). */
+    if (mgr->persist) {
+        persist_t *pcs_db = (persist_t *)mgr->persist;
+        uint64_t pending_cn = 0;
+        if (persist_load_pending_cs(pcs_db, mgr->entries[c].channel_id, &pending_cn) &&
+            pending_cn == ch->commitment_number) {
+            unsigned char pcs_psig32[32];
+            uint32_t pcs_nonce_idx;
+            if (channel_create_commitment_partial_sig(ch, pcs_psig32, &pcs_nonce_idx)) {
+                cJSON *pcs_cs = wire_build_commitment_signed(
+                    mgr->entries[c].channel_id,
+                    ch->commitment_number, pcs_psig32, pcs_nonce_idx);
+                if (wire_send(new_fd, MSG_COMMITMENT_SIGNED, pcs_cs)) {
+                    fprintf(stderr, "LSP reconnect: retransmitted pending CS "
+                            "(cn=%llu) to client %zu\n",
+                            (unsigned long long)ch->commitment_number, c);
+                    /* Wait for RAA before RECONNECT_ACK */
+                    wire_msg_t pcs_raa;
+                    if (wire_recv_timeout(new_fd, &pcs_raa, 30) &&
+                        pcs_raa.msg_type == MSG_REVOKE_AND_ACK) {
+                        uint32_t pcs_ack_id;
+                        unsigned char pcs_rev[32], pcs_np[33];
+                        if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
+                                                        pcs_rev, pcs_np)) {
+                            uint64_t old_pcn = ch->commitment_number - 1;
+                            channel_receive_revocation(ch, old_pcn, pcs_rev);
+                        }
+                        cJSON_Delete(pcs_raa.json);
+                        persist_save_pending_cs(pcs_db,
+                            mgr->entries[c].channel_id, 0); /* clear */
+                    } else {
+                        if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
+                        fprintf(stderr, "LSP reconnect: RAA timeout after CS retransmit "
+                                "(client %zu)\n", c);
+                    }
+                }
+                cJSON_Delete(pcs_cs);
+            }
+        }
     }
 
     /* 9. Send MSG_RECONNECT_ACK */

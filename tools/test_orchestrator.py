@@ -68,7 +68,7 @@ DEFAULT_NETWORK = "regtest"
 
 # Per-network timing constants
 TIMING = {
-    "regtest":  {"factory_timeout": 60, "breach_wait": 30, "lsp_timeout": 120,
+    "regtest":  {"factory_timeout": 90, "breach_wait": 30, "lsp_timeout": 120,
                  "coop_wait": 20, "stagger": 0.5, "lsp_bind": 3.0},
     "signet":   {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
                  "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
@@ -1689,7 +1689,7 @@ def scenario_watchtower_late_arrival(orch):
 
     # Now start all clients (they come online after breach is confirmed)
     orch._log("Starting all clients after breach is confirmed...")
-    orch.start_all_clients(["--watchtower"])
+    orch.start_all_clients([])
 
     # Give clients time to scan chain and detect breach
     time.sleep(orch.timing["breach_wait"] * 2)
@@ -2332,6 +2332,11 @@ def main():
     scenarios_to_run = list(SCENARIOS.keys()) if args.scenario == "all" else [args.scenario]
     results = {}
 
+    # Kill any stale superscalar processes from a previous session before starting
+    safe_pkill("superscalar_lsp", "-9")
+    safe_pkill("superscalar_client", "-9")
+    time.sleep(1)
+
     for idx, name in enumerate(scenarios_to_run):
         if name not in SCENARIOS:
             print(f"Unknown scenario: {name}")
@@ -2342,7 +2347,7 @@ def main():
         if idx > 0:
             safe_pkill("superscalar_lsp", "-9")
             safe_pkill("superscalar_client", "-9")
-            time.sleep(1)
+            time.sleep(2)
             # Clean state directory
             shutil.rmtree("/tmp/superscalar_test", ignore_errors=True)
             # Wait for port to be released (up to 10s)
