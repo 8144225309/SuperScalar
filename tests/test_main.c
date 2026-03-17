@@ -279,6 +279,15 @@ extern int test_cltv_watchdog_offered_ignored(void);
 extern int test_cltv_watchdog_expire(void);
 extern int test_cltv_watchdog_earliest_expiry(void);
 extern int test_cltv_watchdog_multi_htlc(void);
+/* PR #21 Phase 4: Cooperative close */
+extern int test_chan_close_shutdown_layout(void);
+extern int test_chan_close_closing_signed_layout(void);
+extern int test_chan_close_negotiate_fee_converge(void);
+extern int test_chan_close_negotiate_fee_equal(void);
+extern int test_chan_close_recv_shutdown_parse(void);
+extern int test_chan_close_recv_closing_signed_parse(void);
+extern int test_chan_close_negotiate_fee_steps(void);
+extern int test_chan_close_negotiate_fee_low_high(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1209,6 +1218,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cltv_watchdog_expire);
     RUN_TEST(test_cltv_watchdog_earliest_expiry);
     RUN_TEST(test_cltv_watchdog_multi_htlc);
+    printf("\n=== PR #21 Phase 4: Cooperative Close ===\n");
+    RUN_TEST(test_chan_close_shutdown_layout);
+    RUN_TEST(test_chan_close_closing_signed_layout);
+    RUN_TEST(test_chan_close_negotiate_fee_converge);
+    RUN_TEST(test_chan_close_negotiate_fee_equal);
+    RUN_TEST(test_chan_close_recv_shutdown_parse);
+    RUN_TEST(test_chan_close_recv_closing_signed_parse);
+    RUN_TEST(test_chan_close_negotiate_fee_steps);
+    RUN_TEST(test_chan_close_negotiate_fee_low_high);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
