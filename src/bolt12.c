@@ -160,3 +160,57 @@ int invoice_verify(const invoice_t *inv, secp256k1_context *ctx,
     if (!secp256k1_xonly_pubkey_parse(ctx, &xpk, node_id33 + 1)) return 0;
     return secp256k1_schnorrsig_verify(ctx, inv->node_sig, sighash, 32, &xpk);
 }
+
+/* -----------------------------------------------------------------------
+ * Phase 5 additions: invoice_from_request, invoice_error, offer_is_expired,
+ * blinded path support, recurrence fields.
+ * --------------------------------------------------------------------- */
+
+int invoice_from_request(const invoice_request_t *req,
+                          secp256k1_context *ctx,
+                          const unsigned char node_seckey32[32],
+                          const unsigned char payment_hash[32],
+                          const unsigned char payment_secret[32],
+                          invoice_t *inv_out)
+{
+    if (!req || !ctx || !node_seckey32 || !payment_hash || !payment_secret || !inv_out)
+        return 0;
+
+    memset(inv_out, 0, sizeof(*inv_out));
+    memcpy(inv_out->payment_hash,   payment_hash,   32);
+    memcpy(inv_out->payment_secret, payment_secret, 32);
+    memcpy(inv_out->offer_id,       req->offer_id,  32);
+    inv_out->amount_msat = req->amount_msat;
+
+    /* Sign the invoice */
+    return invoice_sign(inv_out, ctx, node_seckey32);
+}
+
+int invoice_error_build(const unsigned char *invoice_request_tlv,
+                         size_t inv_req_len,
+                         const char *error_msg,
+                         uint32_t erroneous_field,
+                         invoice_error_t *err_out)
+{
+    if (!err_out) return 0;
+    memset(err_out, 0, sizeof(*err_out));
+
+    if (invoice_request_tlv && inv_req_len > 0) {
+        size_t copy = inv_req_len < sizeof(err_out->invoice_request) ?
+                      inv_req_len : sizeof(err_out->invoice_request);
+        memcpy(err_out->invoice_request, invoice_request_tlv, copy);
+        err_out->invoice_request_len = copy;
+    }
+    if (error_msg) {
+        strncpy(err_out->error, error_msg, sizeof(err_out->error) - 1);
+        err_out->error[sizeof(err_out->error) - 1] = '\0';
+    }
+    err_out->erroneous_field = erroneous_field;
+    return 1;
+}
+
+int offer_is_expired(const offer_t *o, uint64_t now_unix)
+{
+    if (!o || !o->has_expiry) return 0;
+    return (now_unix >= o->absolute_expiry) ? 1 : 0;
+}

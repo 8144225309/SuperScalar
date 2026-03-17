@@ -206,6 +206,54 @@ extern int test_scid_encode_decode(void);
 extern int test_scid_route_hint_format(void);
 extern int test_scid_persist_roundtrip(void);
 extern int test_onion_last_hop_decrypt(void);
+
+/* PR #20 Phase 1: BOLT #11 + Pathfinding */
+extern int test_bolt11_decode_known(void);
+extern int test_bolt11_no_amount(void);
+extern int test_bolt11_route_hints(void);
+extern int test_bolt11_invalid_rejected(void);
+extern int test_pathfind_two_hops(void);
+extern int test_pathfind_one_hop(void);
+extern int test_pathfind_no_route(void);
+extern int test_pathfind_mpp(void);
+
+/* PR #20 Phase 2: Multi-hop Onion + HTLC Forwarding */
+extern int test_onion_single_hop(void);
+extern int test_onion_two_hops(void);
+extern int test_onion_keysend(void);
+extern int test_htlc_forward_final(void);
+extern int test_htlc_forward_settle(void);
+extern int test_htlc_forward_fail(void);
+extern int test_htlc_forward_init(void);
+
+/* PR #20 Phase 3: Peer Manager + BOLT #2 Channel Open */
+extern int test_peer_mgr_init(void);
+extern int test_peer_mgr_find_unknown(void);
+extern int test_peer_mgr_connect_fail(void);
+extern int test_peer_mgr_disconnect(void);
+extern int test_chan_open_build_open_channel(void);
+extern int test_chan_open_build_accept_channel(void);
+extern int test_chan_open_buffer_too_small(void);
+
+/* PR #20 Phase 4: Payment State Machine */
+extern int test_payment_init(void);
+extern int test_payment_send_no_route(void);
+extern int test_payment_on_settle(void);
+extern int test_payment_keysend_no_route(void);
+extern int test_payment_keysend_hash(void);
+
+/* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
+extern int test_splice_wire_init_roundtrip(void);
+extern int test_splice_wire_ack(void);
+extern int test_splice_wire_locked(void);
+extern int test_splice_wire_stfu(void);
+extern int test_splice_wire_buffer_small(void);
+extern int test_bolt12_offer_expiry(void);
+extern int test_bolt12_invoice_from_request(void);
+extern int test_bolt12_invoice_error(void);
+extern int test_bolt12_full_sign_verify(void);
+extern int test_bolt12_offer_encode_decode(void);
+
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
 extern int test_htlc_inbound_timeout(void);
@@ -1054,6 +1102,62 @@ static void run_unit_tests(void) {
     RUN_TEST(test_scid_route_hint_format);
     RUN_TEST(test_scid_persist_roundtrip);
     RUN_TEST(test_onion_last_hop_decrypt);
+
+    printf("\n=== BOLT #11 Invoice ===\n");
+    RUN_TEST(test_bolt11_decode_known);
+    RUN_TEST(test_bolt11_no_amount);
+    RUN_TEST(test_bolt11_route_hints);
+    RUN_TEST(test_bolt11_invalid_rejected);
+
+    printf("\n=== Pathfinding (Dijkstra) ===\n");
+    RUN_TEST(test_pathfind_two_hops);
+    RUN_TEST(test_pathfind_one_hop);
+    RUN_TEST(test_pathfind_no_route);
+    RUN_TEST(test_pathfind_mpp);
+
+    printf("\n=== Multi-Hop Onion (BOLT #4) ===\n");
+    RUN_TEST(test_onion_single_hop);
+    RUN_TEST(test_onion_two_hops);
+    RUN_TEST(test_onion_keysend);
+
+    printf("\n=== HTLC Forwarding ===\n");
+    RUN_TEST(test_htlc_forward_init);
+    RUN_TEST(test_htlc_forward_final);
+    RUN_TEST(test_htlc_forward_settle);
+    RUN_TEST(test_htlc_forward_fail);
+
+    printf("\n=== Peer Manager ===\n");
+    RUN_TEST(test_peer_mgr_init);
+    RUN_TEST(test_peer_mgr_find_unknown);
+    RUN_TEST(test_peer_mgr_connect_fail);
+    RUN_TEST(test_peer_mgr_disconnect);
+
+    printf("\n=== BOLT #2 Channel Open ===\n");
+    RUN_TEST(test_chan_open_build_open_channel);
+    RUN_TEST(test_chan_open_build_accept_channel);
+    RUN_TEST(test_chan_open_buffer_too_small);
+
+    printf("\n=== Payment State Machine ===\n");
+    RUN_TEST(test_payment_init);
+    RUN_TEST(test_payment_send_no_route);
+    RUN_TEST(test_payment_on_settle);
+    RUN_TEST(test_payment_keysend_no_route);
+    RUN_TEST(test_payment_keysend_hash);
+
+    printf("\n=== Splice Wire Protocol ===\n");
+    RUN_TEST(test_splice_wire_init_roundtrip);
+    RUN_TEST(test_splice_wire_ack);
+    RUN_TEST(test_splice_wire_locked);
+    RUN_TEST(test_splice_wire_stfu);
+    RUN_TEST(test_splice_wire_buffer_small);
+
+    printf("\n=== BOLT #12 Offers (Full) ===\n");
+    RUN_TEST(test_bolt12_offer_expiry);
+    RUN_TEST(test_bolt12_invoice_from_request);
+    RUN_TEST(test_bolt12_invoice_error);
+    RUN_TEST(test_bolt12_full_sign_verify);
+    RUN_TEST(test_bolt12_offer_encode_decode);
+
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);
     RUN_TEST(test_htlc_inbound_timeout);
