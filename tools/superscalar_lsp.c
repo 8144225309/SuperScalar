@@ -1,5 +1,6 @@
 #include "superscalar/version.h"
 #include "superscalar/lsp.h"
+#include "superscalar/lsps.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/tx_builder.h"
@@ -74,22 +75,114 @@ static payment_table_t     g_payments;
 static ln_dispatch_t       g_ln_dispatch;
 static bolt11_invoice_table_t g_invoice_tbl;
 
+/* CLTV watchdog: pointer to the active channel manager, set after each alloc */
+static lsp_channel_mgr_t *g_channel_mgr = NULL;
+
+/* LSPS0 context for bolt8_server callback */
+static lsps_ctx_t  g_lsps_ctx;
+
+/* Watchtower: breach detection on every block */
+static watchtower_t g_watchtower;
+static int          g_watchtower_ready = 0;
+
 static void *ln_dispatch_thread(void *arg) {
     (void)arg;
     ln_dispatch_run(&g_ln_dispatch);
     return NULL;
 }
 
+/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
+                           const char *json_req, char *resp_buf, size_t resp_cap)
+{
+    (void)state;
+    if (!json_req || !resp_buf || resp_cap == 0) return 0;
+    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
+
+    cJSON *json = cJSON_Parse(json_req);
+    if (!json) {
+        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
+        if (err) {
+            char *s = cJSON_PrintUnformatted(err);
+            if (s) {
+                size_t n = strlen(s);
+                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
+                free(s);
+            }
+            cJSON_Delete(err);
+        }
+        return 0;
+    }
+
+    int id = 0;
+    const char *method = lsps_parse_request(json, &id);
+    cJSON *resp = NULL;
+
+    if (!method) {
+        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
+    } else if (strcmp(method, "lsps1_get_info") == 0) {
+        lsps1_info_t info;
+        memset(&info, 0, sizeof(info));
+        info.min_channel_balance_msat = 100000000ULL;
+        info.max_channel_balance_msat = 10000000000ULL;
+        info.min_confirmations        = 1;
+        info.base_fee_msat            = 1000;
+        info.fee_ppm                  = 500;
+        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
+    } else if (strcmp(method, "lsps2_get_info") == 0) {
+        lsps2_fee_params_t params;
+        memset(&params, 0, sizeof(params));
+        params.min_fee_msat             = 1000;
+        params.fee_ppm                  = 500;
+        params.min_channel_balance_msat = 100000000ULL;
+        params.max_channel_balance_msat = 10000000000ULL;
+        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
+    } else if (lsps_handle_request(ctx, fd, json)) {
+        cJSON_Delete(json);
+        return 0;
+    } else {
+        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
+    }
+
+    cJSON_Delete(json);
+    int written = 0;
+    if (resp) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) {
+            size_t n = strlen(s);
+            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
+            free(s);
+        }
+        cJSON_Delete(resp);
+    }
+    return written;
+}
+
 /* Chain monitoring: called by bip158_backend after each new block is processed */
 static void on_block_connected(uint32_t height, void *cb_ctx)
 {
-    /* cb_ctx is unused — watchtower is a global in this daemon */
     (void)cb_ctx;
-    /* Log new block; CLTV watchdog per-channel runs via htlc_commit layer */
-    printf("LSP: block %u connected\n", (unsigned)height);
-    /* Watchtower breach detection is wired separately via watchtower_check().
-     * Per-channel HTLC expiry monitoring uses cltv_watchdog_check() called
-     * from the HTLC commitment layer as channels process each new block. */
+    if (!g_channel_mgr) return;
+
+    for (size_t i = 0; i < g_channel_mgr->n_channels; i++) {
+        channel_t *ch = &g_channel_mgr->entries[i].channel;
+        cltv_watchdog_t wd;
+        cltv_watchdog_init(&wd, ch, 0);          /* 0 = CLTV_EXPIRY_DELTA default */
+        int at_risk = cltv_watchdog_check(&wd, height);
+        if (at_risk > 0)
+            fprintf(stderr, "LSP: block %u: channel %zu has %d HTLC(s)"
+                    " within expiry delta — consider force-close\n",
+                    (unsigned)height, i, at_risk);
+        cltv_watchdog_expire(&wd, height);
+    }
+
+    /* Watchtower breach detection */
+    if (g_watchtower_ready) {
+        int penalties = watchtower_check(&g_watchtower);
+        if (penalties > 0)
+            fprintf(stderr, "LSP: block %u: broadcast %d penalty tx(s)\n",
+                    (unsigned)height, penalties);
+    }
 }
 
 static void sigint_handler(int sig) {
@@ -1616,6 +1709,7 @@ int main(int argc, char *argv[]) {
             /* Initialize channels from DB */
             lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
             if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+            g_channel_mgr = mgr;
             mgr->fee = fee_est;
             if (!lsp_channels_init_from_db(mgr, ctx, &lsp.factory, lsp_seckey,
                                              rec_n_clients, &db)) {
@@ -1987,6 +2081,7 @@ int main(int argc, char *argv[]) {
             memcpy(g_bolt8_cfg.static_priv, lsp.nk_seckey, 32);
             g_bolt8_cfg.ctx = ctx;
             g_bolt8_cfg.peer_mgr = &g_peer_mgr;
+            g_bolt8_cfg.ln_dispatch = &g_ln_dispatch;
             pthread_t bolt8_tid;
             if (pthread_create(&bolt8_tid, NULL, bolt8_server_thread, NULL) == 0) {
                 pthread_detach(bolt8_tid);
@@ -2007,6 +2102,32 @@ int main(int argc, char *argv[]) {
             g_ln_dispatch.ctx          = ctx;
             g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
             memcpy(g_ln_dispatch.our_privkey, lsp.nk_seckey, 32);
+            g_ln_dispatch.invoices = &g_invoice_tbl;
+
+            /* Wire LSPS0 callback */
+            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
+            g_lsps_ctx.mgr = g_channel_mgr;
+            g_lsps_ctx.lsp = g_lsp;
+            g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
+            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+
+            /* Wire Tor proxy for .onion outbound peers */
+            if (tor_proxy_arg) {
+                char px_host[256]; int px_port;
+                if (tor_parse_proxy_arg(tor_proxy_arg, px_host, sizeof(px_host), &px_port))
+                    peer_mgr_set_proxy(&g_peer_mgr, px_host, px_port);
+            }
+
+            /* Watchtower: init and wire into dispatch */
+            watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, NULL, g_db);
+            if (g_bip158.base.get_block_height)
+                watchtower_set_chain_backend(&g_watchtower, &g_bip158.base);
+            for (size_t _wi = 0; _wi < g_channel_mgr->n_channels; _wi++)
+                watchtower_set_channel(&g_watchtower, _wi,
+                                       &g_channel_mgr->entries[_wi].channel);
+            g_watchtower_ready = 1;
+            g_ln_dispatch.watchtower = &g_watchtower;
+
             pthread_t dispatch_tid;
             if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
                 pthread_detach(dispatch_tid);
@@ -2420,6 +2541,7 @@ int main(int argc, char *argv[]) {
     /* === Phase 4b: Channel Operations === */
     lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
     if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+    g_channel_mgr = mgr;
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
