@@ -158,6 +158,8 @@ add_library(superscalar
     src/probe.c
     src/peer_storage.c
     src/payment.c
+    src/ln_dispatch.c
+    src/invoice.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -231,6 +233,8 @@ add_executable(test_superscalar
     tests/test_payment.c
     tests/test_splice_wire.c
     tests/test_bolt12_full.c
+    tests/test_invoice.c
+    tests/test_ln_dispatch.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
