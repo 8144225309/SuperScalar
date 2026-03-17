@@ -43,6 +43,8 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
 #include "superscalar/bolt8_server.h"
+#include "superscalar/gossip_peer.h"
+#include "superscalar/gossip_store.h"
 #include <pthread.h>
 
 static volatile sig_atomic_t g_shutdown = 0;
@@ -1902,9 +1904,38 @@ int main(int argc, char *argv[]) {
         else
             printf("LSP: inbound HTLC routing: native (fake-SCID / htlc_inbound)\n");
 
-        if (gossip_peers[0])
+        if (gossip_peers[0]) {
             printf("LSP: gossip peers configured: %s\n", gossip_peers);
-        else
+
+            static gossip_store_t s_gossip_store;
+            static int s_gossip_store_opened = 0;
+            if (!s_gossip_store_opened) {
+                const char *gdb_path = db_path ? db_path : ":memory:";
+                s_gossip_store_opened = gossip_store_open(&s_gossip_store, gdb_path);
+            }
+
+            if (s_gossip_store_opened) {
+                static gossip_peer_mgr_cfg_t s_gp_cfg;
+                memset(&s_gp_cfg, 0, sizeof(s_gp_cfg));
+                s_gp_cfg.n_peers = gossip_peer_parse_list(gossip_peers,
+                    s_gp_cfg.peers, GOSSIP_PEER_MAX);
+                s_gp_cfg.ctx = ctx;
+                s_gp_cfg.store = &s_gossip_store;
+                memcpy(s_gp_cfg.our_priv32, lsp.nk_seckey, 32);
+                s_gp_cfg.network = network;
+                s_gp_cfg.shutdown_flag = (volatile int *)&g_shutdown;
+
+                if (s_gp_cfg.n_peers > 0) {
+                    static pthread_t s_gp_tids[GOSSIP_PEER_MAX];
+                    int started = gossip_peer_mgr_start(&s_gp_cfg, s_gp_tids);
+                    if (started > 0)
+                        printf("LSP: gossip peer manager started (%d peers)\n",
+                               started);
+                    else
+                        fprintf(stderr, "LSP: warning: gossip peer manager failed to start\n");
+                }
+            }
+        } else
             printf("LSP: gossip peers: none configured (use --gossip-peers HOST:PORT,...)\n");
 
         if (bolt8_listen_port > 0) {
