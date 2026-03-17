@@ -153,4 +153,32 @@ int invoice_error_build(const unsigned char *invoice_request_tlv,
  */
 int offer_is_expired(const offer_t *o, uint64_t now_unix);
 
+/*
+ * BOLT #12 §3 merkle root over all non-signature TLV fields.
+ * Leaves: SHA256("LnLeaf" || tlv_field_bytes)
+ * Branches: SHA256("LnBranch" || left[32] || right[32])
+ * Recursively combines until one 32-byte root remains.
+ * tlv_stream: serialized TLV bytes (the entire offer/invoice body)
+ * len: byte count
+ * root_out: 32-byte merkle root
+ */
+void bolt12_merkle_root(const unsigned char *tlv_stream, size_t len,
+                         unsigned char root_out[32]);
+
+/*
+ * Encode an invoice_error_t to the wire TLV format (type 0x8002).
+ * buf: output buffer
+ * buf_cap: buffer capacity
+ * Returns bytes written, or 0 on error.
+ */
+size_t invoice_error_encode(const invoice_error_t *err,
+                              unsigned char *buf, size_t buf_cap);
+
+/*
+ * Parse a wire-encoded invoice_error back to an invoice_error_t.
+ * Returns 1 on success.
+ */
+int invoice_error_decode(const unsigned char *buf, size_t buf_len,
+                          invoice_error_t *err_out);
+
 #endif /* SUPERSCALAR_BOLT12_H */
