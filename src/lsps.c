@@ -280,3 +280,31 @@ int lsps2_parse_buy(const cJSON *params,
     *fee_msat = (fee && cJSON_IsNumber(fee)) ? (uint64_t)fee->valuedouble : 0;
     return 1;
 }
+
+/* -----------------------------------------------------------------------
+ * LSPS2 deferred funding broadcast (PR #19 Commit 5)
+ * --------------------------------------------------------------------- */
+
+int lsps2_handle_intercept_htlc(lsps2_pending_table_t *tbl,
+                                  uint64_t scid, uint64_t amount_msat,
+                                  void *mgr, void *lsp) {
+    (void)mgr; (void)lsp;  /* used when triggering jit_channel_create */
+    if (!tbl) return 0;
+
+    for (int i = 0; i < LSPS2_PENDING_MAX; i++) {
+        lsps2_pending_t *e = &tbl->entries[i];
+        if (!e->active || e->scid != scid) continue;
+
+        e->collected_msat += amount_msat;
+        if (e->collected_msat >= e->cost_msat) {
+            /* Cost covered — channel should be opened.
+             * In production, call jit_channel_create(mgr, lsp, ...) here.
+             * The funding_tx_hex is broadcast by the caller after this returns 1. */
+            e->active = 0;
+            tbl->count--;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;  /* scid not found */
+}

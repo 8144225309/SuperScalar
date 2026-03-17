@@ -3,6 +3,7 @@
  */
 
 #include "superscalar/htlc_inbound.h"
+#include "superscalar/mpp.h"
 #include <string.h>
 
 void htlc_inbound_init(htlc_inbound_table_t *tbl) {
@@ -26,7 +27,7 @@ int htlc_inbound_add(htlc_inbound_table_t *tbl,
     }
 
     htlc_inbound_t *e = &tbl->entries[tbl->count++];
-    e->htlc_id    = htlc_id;
+    e->htlc_id     = htlc_id;
     e->amount_msat = amount_msat;
     memcpy(e->payment_hash,   payment_hash,   32);
     memcpy(e->payment_secret, payment_secret, 32);
@@ -34,6 +35,11 @@ int htlc_inbound_add(htlc_inbound_table_t *tbl,
     e->scid        = scid;
     e->state       = HTLC_INBOUND_PENDING;
     memset(e->preimage, 0, 32);
+
+    /* MPP integration: register this part.
+     * A total_msat of 0 means single-part (amount == total). */
+    mpp_add_part(&tbl->mpp, payment_secret, htlc_id, amount_msat,
+                 amount_msat, cltv_expiry);
     return 1;
 }
 
