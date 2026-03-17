@@ -121,19 +121,72 @@ int invoice_request_verify(const invoice_request_t *req, secp256k1_context *ctx)
     return secp256k1_schnorrsig_verify(ctx, req->sig, sighash, 32, &xpk);
 }
 
+/* -----------------------------------------------------------------------
+ * Phase A/B: invoice_to_tlv_bytes helper — serializes invoice fields to TLV
+ * wire encoding for merkle root computation (BOLT #12 s3).
+ *
+ * Fields (ascending type, big-endian values):
+ *   type 1 (8B BE): amount_msat
+ *   type 2 (32B):   payment_hash
+ *   type 3 (32B):   payment_secret
+ *   type 4 (32B):   offer_id
+ * Caller must free *buf_out.  Returns 1 on success.
+ * --------------------------------------------------------------------- */
+static int invoice_to_tlv_bytes(const invoice_t *inv,
+                                  unsigned char **buf_out, size_t *len_out)
+{
+    if (!inv || !buf_out || !len_out) return 0;
+    /* Each field: [type:2 BE][length:2 BE][value]
+     * type 1: 2+2+8=12, type 2-4: 2+2+32=36 each -> total 120 */
+    size_t sz = 12 + 36 + 36 + 36;
+    unsigned char *buf = (unsigned char *)malloc(sz);
+    if (!buf) return 0;
+    size_t pos = 0;
+
+    /* type 1: amount_msat (8 bytes big-endian) */
+    buf[pos++] = 0x00; buf[pos++] = 0x01;
+    buf[pos++] = 0x00; buf[pos++] = 0x08;
+    uint64_t a = inv->amount_msat;
+    buf[pos++] = (unsigned char)(a >> 56); buf[pos++] = (unsigned char)(a >> 48);
+    buf[pos++] = (unsigned char)(a >> 40); buf[pos++] = (unsigned char)(a >> 32);
+    buf[pos++] = (unsigned char)(a >> 24); buf[pos++] = (unsigned char)(a >> 16);
+    buf[pos++] = (unsigned char)(a >>  8); buf[pos++] = (unsigned char)(a);
+
+    /* type 2: payment_hash (32 bytes) */
+    buf[pos++] = 0x00; buf[pos++] = 0x02;
+    buf[pos++] = 0x00; buf[pos++] = 0x20;
+    memcpy(buf + pos, inv->payment_hash, 32); pos += 32;
+
+    /* type 3: payment_secret (32 bytes) */
+    buf[pos++] = 0x00; buf[pos++] = 0x03;
+    buf[pos++] = 0x00; buf[pos++] = 0x20;
+    memcpy(buf + pos, inv->payment_secret, 32); pos += 32;
+
+    /* type 4: offer_id (32 bytes) */
+    buf[pos++] = 0x00; buf[pos++] = 0x04;
+    buf[pos++] = 0x00; buf[pos++] = 0x20;
+    memcpy(buf + pos, inv->offer_id, 32); pos += 32;
+
+    *buf_out = buf;
+    *len_out = pos;
+    return 1;
+}
+
 int invoice_sign(invoice_t *inv, secp256k1_context *ctx,
                   const unsigned char *node_seckey32)
 {
     if (!inv || !ctx || !node_seckey32) return 0;
 
-    unsigned char msg[72];
-    memcpy(msg, inv->payment_hash, 32);
-    memcpy(msg + 32, inv->offer_id, 32);
-    uint64_t amt = inv->amount_msat;
-    for (int i = 0; i < 8; i++) { msg[64+i] = (unsigned char)(amt & 0xff); amt >>= 8; }
+    unsigned char *tlv;
+    size_t tlv_len;
+    if (!invoice_to_tlv_bytes(inv, &tlv, &tlv_len)) return 0;
+
+    unsigned char merkle_root[32];
+    bolt12_merkle_root(tlv, tlv_len, merkle_root);
+    free(tlv);
 
     unsigned char sighash[32];
-    bolt12_sighash(msg, 72, sighash);
+    bolt12_sighash(merkle_root, 32, sighash);
 
     secp256k1_keypair kp;
     if (!secp256k1_keypair_create(ctx, &kp, node_seckey32)) return 0;
@@ -147,14 +200,16 @@ int invoice_verify(const invoice_t *inv, secp256k1_context *ctx,
 {
     if (!inv || !ctx || !node_id33) return 0;
 
-    unsigned char msg[72];
-    memcpy(msg, inv->payment_hash, 32);
-    memcpy(msg + 32, inv->offer_id, 32);
-    uint64_t amt = inv->amount_msat;
-    for (int i = 0; i < 8; i++) { msg[64+i] = (unsigned char)(amt & 0xff); amt >>= 8; }
+    unsigned char *tlv;
+    size_t tlv_len;
+    if (!invoice_to_tlv_bytes(inv, &tlv, &tlv_len)) return 0;
+
+    unsigned char merkle_root[32];
+    bolt12_merkle_root(tlv, tlv_len, merkle_root);
+    free(tlv);
 
     unsigned char sighash[32];
-    bolt12_sighash(msg, 72, sighash);
+    bolt12_sighash(merkle_root, 32, sighash);
 
     secp256k1_xonly_pubkey xpk;
     if (!secp256k1_xonly_pubkey_parse(ctx, &xpk, node_id33 + 1)) return 0;
@@ -238,38 +293,60 @@ void bolt12_merkle_root(const unsigned char *tlv_stream, size_t len,
 {
     if (!root_out) return;
 
-    /* Split the stream into leaf chunks of at most 64 bytes each.
-     * Empty stream → single leaf hash over empty input. */
-    #define MERKLE_LEAF_SIZE 64
+    /*
+     * BOLT #12 s3 compliant merkle root.
+     *
+     * Parses the TLV stream field-by-field (wire format: [type:2 BE][length:2 BE][value]).
+     * Each complete TLV record becomes one leaf.
+     * Leaf hash:   SHA256("LnLeaf"   || field_bytes)
+     * Branch hash: SHA256("LnBranch" || left32 || right32)
+     * Odd node count: duplicate last node.
+     *
+     * Reference: CLN common/bolt12_merkle.c, LDK lightning/src/offers/merkle.rs
+     */
     #define MERKLE_MAX_LEAVES 256
 
-    /* Tag hashes (pre-compute once) */
+    /* Pre-compute tag hashes */
     unsigned char tag_leaf[32], tag_branch[32];
     sha256((const unsigned char *)"LnLeaf",   6, tag_leaf);
     sha256((const unsigned char *)"LnBranch", 8, tag_branch);
 
-    /* Compute leaf hashes */
+    /* Compute leaf hashes by parsing TLV fields */
     unsigned char leaves[MERKLE_MAX_LEAVES][32];
     int n_leaves = 0;
 
-    if (len == 0) {
-        /* Single leaf over empty data */
-        unsigned char buf[32 + 1];
-        memcpy(buf, tag_leaf, 32);
-        buf[32] = 0;
-        sha256(buf, 32, leaves[0]);
+    if (len == 0 || !tlv_stream) {
+        /* Empty stream -> single leaf: SHA256(tag_leaf) */
+        sha256(tag_leaf, 32, leaves[0]);
         n_leaves = 1;
     } else {
-        size_t off = 0;
-        while (off < len && n_leaves < MERKLE_MAX_LEAVES) {
-            size_t chunk = len - off;
-            if (chunk > MERKLE_LEAF_SIZE) chunk = MERKLE_LEAF_SIZE;
-            unsigned char buf[32 + MERKLE_LEAF_SIZE];
+        size_t pos = 0;
+        while (pos + 4 <= len && n_leaves < MERKLE_MAX_LEAVES) {
+            /* Parse TLV header: [type:2 BE][length:2 BE] */
+            size_t vlen = ((size_t)tlv_stream[pos + 2] << 8) | tlv_stream[pos + 3];
+            size_t field_len = 4 + vlen;
+            if (pos + field_len > len) break;  /* truncated field */
+
+            /* leaf = SHA256(tag_leaf || entire_field_bytes) */
+            unsigned char stack_buf[32 + 512];
+            unsigned char *buf;
+            if (field_len > 512) {
+                buf = (unsigned char *)malloc(32 + field_len);
+                if (!buf) break;
+            } else {
+                buf = stack_buf;
+            }
             memcpy(buf, tag_leaf, 32);
-            memcpy(buf + 32, tlv_stream + off, chunk);
-            sha256(buf, 32 + chunk, leaves[n_leaves]);
+            memcpy(buf + 32, tlv_stream + pos, field_len);
+            sha256(buf, 32 + field_len, leaves[n_leaves]);
+            if (field_len > 512) free(buf);
             n_leaves++;
-            off += chunk;
+            pos += field_len;
+        }
+        if (n_leaves == 0) {
+            /* No valid TLV fields parsed -> treat as empty stream */
+            sha256(tag_leaf, 32, leaves[0]);
+            n_leaves = 1;
         }
     }
 
@@ -290,7 +367,6 @@ void bolt12_merkle_root(const unsigned char *tlv_stream, size_t len,
 
     memcpy(root_out, leaves[0], 32);
 
-    #undef MERKLE_LEAF_SIZE
     #undef MERKLE_MAX_LEAVES
 }
 
@@ -403,4 +479,105 @@ int invoice_error_decode(const unsigned char *buf, size_t buf_len,
         pos += l;
     }
     return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * PR #24 Phase I: invoice_request_decode + invoice_encode
+ * --------------------------------------------------------------------- */
+
+/*
+ * Decode a TLV-encoded invoice_request into req_out.
+ * Wire format: [type:2BE][len:2BE][value...] fields.
+ *   type 82 (0x0052): amount_msat (8B BE)
+ *   type 88 (0x0058): payer_key   (33B)
+ *   type 240 (0x00F0): sig        (64B)
+ * Returns 1 if payer_key and sig are present, 0 otherwise.
+ */
+int invoice_request_decode(const unsigned char *tlv, size_t tlv_len,
+                             invoice_request_t *req_out)
+{
+    if (!tlv || !req_out) return 0;
+    memset(req_out, 0, sizeof(*req_out));
+    if (tlv_len == 0) return 0;
+
+    int has_payer_key = 0, has_sig = 0;
+    size_t pos = 0;
+    while (pos + 4 <= tlv_len) {
+        uint16_t t = ((uint16_t)tlv[pos] << 8) | tlv[pos + 1];
+        uint16_t l = ((uint16_t)tlv[pos + 2] << 8) | tlv[pos + 3];
+        pos += 4;
+        if (pos + l > tlv_len) break;  /* truncated */
+        if (t == 82 && l == 8) {        /* amount_msat */
+            uint64_t v = 0;
+            for (int i = 0; i < 8; i++) v = (v << 8) | tlv[pos + i];
+            req_out->amount_msat = v;
+        } else if (t == 88 && l == 33) { /* payer_key */
+            memcpy(req_out->payer_key, tlv + pos, 33);
+            has_payer_key = 1;
+        } else if (t == 240 && l == 64) { /* sig */
+            memcpy(req_out->sig, tlv + pos, 64);
+            has_sig = 1;
+        }
+        pos += l;
+    }
+    return (has_payer_key && has_sig) ? 1 : 0;
+}
+
+/*
+ * Encode an invoice_t to TLV wire bytes (type 0x8000 outer wrapper).
+ * Inner fields:
+ *   type 1 (8B BE): amount_msat
+ *   type 2 (32B):   payment_hash
+ *   type 3 (32B):   payment_secret
+ *   type 4 (32B):   offer_id
+ *   type 240 (64B): node_sig
+ * Returns bytes written, 0 on error.
+ */
+size_t invoice_encode(const invoice_t *inv, unsigned char *buf, size_t buf_cap)
+{
+    if (!inv || !buf || buf_cap < 8) return 0;
+
+    unsigned char body[512];
+    size_t bpos = 0;
+
+    /* type 1: amount_msat (8B BE) */
+    if (bpos + 4 + 8 > sizeof(body)) return 0;
+    body[bpos++] = 0x00; body[bpos++] = 0x01;
+    body[bpos++] = 0x00; body[bpos++] = 0x08;
+    uint64_t a = inv->amount_msat;
+    body[bpos++] = (unsigned char)(a >> 56); body[bpos++] = (unsigned char)(a >> 48);
+    body[bpos++] = (unsigned char)(a >> 40); body[bpos++] = (unsigned char)(a >> 32);
+    body[bpos++] = (unsigned char)(a >> 24); body[bpos++] = (unsigned char)(a >> 16);
+    body[bpos++] = (unsigned char)(a >>  8); body[bpos++] = (unsigned char)a;
+
+    /* type 2: payment_hash (32B) */
+    if (bpos + 4 + 32 > sizeof(body)) return 0;
+    body[bpos++] = 0x00; body[bpos++] = 0x02;
+    body[bpos++] = 0x00; body[bpos++] = 0x20;
+    memcpy(body + bpos, inv->payment_hash, 32); bpos += 32;
+
+    /* type 3: payment_secret (32B) */
+    if (bpos + 4 + 32 > sizeof(body)) return 0;
+    body[bpos++] = 0x00; body[bpos++] = 0x03;
+    body[bpos++] = 0x00; body[bpos++] = 0x20;
+    memcpy(body + bpos, inv->payment_secret, 32); bpos += 32;
+
+    /* type 4: offer_id (32B) */
+    if (bpos + 4 + 32 > sizeof(body)) return 0;
+    body[bpos++] = 0x00; body[bpos++] = 0x04;
+    body[bpos++] = 0x00; body[bpos++] = 0x20;
+    memcpy(body + bpos, inv->offer_id, 32); bpos += 32;
+
+    /* type 240: node_sig (64B) */
+    if (bpos + 4 + 64 > sizeof(body)) return 0;
+    body[bpos++] = 0x00; body[bpos++] = 0xF0;
+    body[bpos++] = 0x00; body[bpos++] = 0x40;
+    memcpy(body + bpos, inv->node_sig, 64); bpos += 64;
+
+    /* Outer wrapper: type=0x8000, length=bpos */
+    if (buf_cap < 4 + bpos) return 0;
+    buf[0] = 0x80; buf[1] = 0x00;
+    buf[2] = (unsigned char)(bpos >> 8); buf[3] = (unsigned char)bpos;
+    memcpy(buf + 4, body, bpos);
+    return 4 + bpos;
 }
