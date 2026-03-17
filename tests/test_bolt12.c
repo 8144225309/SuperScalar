@@ -242,13 +242,13 @@ int test_offer_decode_bad_checksum(void)
     return 1;
 }
 
-/* Phase 4 fix: persist schema v3 — offers table smoke test */
+/* Schema v4 smoke test (v2=HD wallet, v3=BOLT 12 offers, v4=pending_cs) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 3, "schema version is 3");
+    ASSERT(PERSIST_SCHEMA_VERSION == 4, "schema version is 4");
     persist_close(&p);
     return 1;
 }
