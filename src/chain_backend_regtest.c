@@ -28,6 +28,14 @@ static int cb_send_raw_tx(chain_backend_t *self, const char *tx_hex,
     return regtest_send_raw_tx((regtest_t *)self->ctx, tx_hex, txid_out);
 }
 
+static int cb_get_confirmations_batch(chain_backend_t *self,
+                                      const char **txids_hex, size_t n_txids,
+                                      int *confs_out)
+{
+    return regtest_get_confirmations_batch((regtest_t *)self->ctx,
+                                           txids_hex, n_txids, confs_out);
+}
+
 static int cb_register_script(chain_backend_t *self,
                                const unsigned char *spk, size_t spk_len)
 {
@@ -44,9 +52,10 @@ static int cb_unregister_script(chain_backend_t *self,
 
 void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt)
 {
-    backend->get_block_height  = cb_get_block_height;
-    backend->get_confirmations = cb_get_confirmations;
-    backend->is_in_mempool     = cb_is_in_mempool;
+    backend->get_block_height        = cb_get_block_height;
+    backend->get_confirmations       = cb_get_confirmations;
+    backend->get_confirmations_batch = cb_get_confirmations_batch;
+    backend->is_in_mempool           = cb_is_in_mempool;
     backend->send_raw_tx       = cb_send_raw_tx;
     backend->register_script   = cb_register_script;
     backend->unregister_script = cb_unregister_script;

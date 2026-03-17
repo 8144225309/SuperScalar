@@ -3,6 +3,7 @@
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/wire.h"
 #include "superscalar/persist.h"
+#include "superscalar/lsps.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,21 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             size_t dc;
             if (wire_parse_register_invoice(msg->json, ph, pre, &am, &dc))
                 lsp_channels_register_invoice(mgr, ph, pre, dc, am);
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;
+        }
+
+        /* Handle MSG_LSPS_REQUEST inline — client may send LSPS queries at any time */
+        if (msg->msg_type == MSG_LSPS_REQUEST) {
+            size_t ci = 0;
+            if (lsp) {
+                for (size_t k = 0; k < (size_t)lsp->n_clients; k++) {
+                    if (lsp->client_fds[k] == fd) { ci = k; break; }
+                }
+            }
+            lsps_ctx_t lsps_ctx = { .mgr = mgr, .lsp = lsp, .client_idx = ci };
+            lsps_handle_request(&lsps_ctx, fd, msg->json);
             cJSON_Delete(msg->json);
             msg->json = NULL;
             continue;

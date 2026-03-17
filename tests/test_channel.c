@@ -627,8 +627,8 @@ int test_channel_penalty_tx(void) {
 
     tx_buf_t penalty_unsigned;
     tx_buf_init(&penalty_unsigned, 256);
-    build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 0,
-                       0xFFFFFFFD, &penalty_output, 1);
+    build_unsigned_tx_v(&penalty_unsigned, NULL, local_txid, 0,
+                         0xFFFFFFFD, &penalty_output, 1, 3);  /* V3: matches channel_build_penalty_tx */
 
     unsigned char penalty_sighash[32];
     TEST_ASSERT(compute_taproot_sighash(penalty_sighash,
@@ -4747,8 +4747,8 @@ int test_penalty_tx_key_path_2leaf(void) {
 
     tx_buf_t penalty_unsigned;
     tx_buf_init(&penalty_unsigned, 256);
-    build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 0,
-                       0xFFFFFFFD, &penalty_output, 1);
+    build_unsigned_tx_v(&penalty_unsigned, NULL, local_txid, 0,
+                         0xFFFFFFFD, &penalty_output, 1, 3);  /* V3: matches channel_build_penalty_tx */
 
     unsigned char penalty_sighash[32];
     TEST_ASSERT(compute_taproot_sighash(penalty_sighash,

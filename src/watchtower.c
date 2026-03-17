@@ -71,6 +71,10 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->channel_id = (uint32_t)c;
                 e->commit_num = commit_nums[i];
                 memcpy(e->txid, txids[i], 32);
+                /* DB-loaded entries: registered_height = 0 so that late-arrival
+                   breach detection works (breach confirmed during downtime).
+                   Fresh entries set registered_height in watchtower_watch(). */
+                e->registered_height = 0;
                 e->to_local_vout = vouts[i];
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
@@ -151,6 +155,9 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->channel_id = channel_id;
     e->commit_num = commit_num;
     memcpy(e->txid, txid32, 32);
+    /* Record current height so watchtower_check can reject pre-existing on-chain txids */
+    e->registered_height = (wt->chain && wt->chain->get_block_height)
+                           ? wt->chain->get_block_height(wt->chain) : 0;
     e->to_local_vout = to_local_vout;
     e->to_local_amount = to_local_amount;
     memcpy(e->to_local_spk, to_local_spk, spk_len);
@@ -359,23 +366,68 @@ int watchtower_check(watchtower_t *wt) {
 
     int penalties_broadcast = 0;
 
+    /* Pre-compute display-order hex for every entry once */
+    char (*txid_hexes)[65] = calloc(wt->n_entries + 1, 65);
+    int  *batch_confs      = calloc(wt->n_entries + 1, sizeof(int));
+    if (!txid_hexes || !batch_confs) {
+        free(txid_hexes);
+        free(batch_confs);
+        return 0;
+    }
+    for (size_t j = 0; j < wt->n_entries; j++) {
+        unsigned char disp[32];
+        memcpy(disp, wt->entries[j].txid, 32);
+        reverse_bytes(disp, 32);
+        hex_encode(disp, 32, txid_hexes[j]);
+        batch_confs[j] = -1;
+    }
+
+    /* Batch confirmation lookup: O(scan_depth) RPCs regardless of n_entries.
+       Falls back to per-entry calls if the backend doesn't implement the slot
+       (e.g. the BIP 158 backend). */
+    if (wt->chain->get_confirmations_batch) {
+        /* Build a flat pointer array — char (*)[65] cannot be cast to char **
+           because the stride is different (65 bytes vs sizeof(char*) bytes). */
+        const char **ptrs = malloc(wt->n_entries * sizeof(const char *));
+        if (ptrs) {
+            for (size_t j = 0; j < wt->n_entries; j++)
+                ptrs[j] = txid_hexes[j];
+            wt->chain->get_confirmations_batch(wt->chain,
+                ptrs, wt->n_entries, batch_confs);
+            free(ptrs);
+        }
+    } else {
+        for (size_t j = 0; j < wt->n_entries; j++)
+            batch_confs[j] = wt->chain->get_confirmations(wt->chain,
+                                                           txid_hexes[j]);
+    }
+
     for (size_t i = 0; i < wt->n_entries; ) {
         watchtower_entry_t *e = &wt->entries[i];
 
-        /* Convert txid to display-order hex */
-        unsigned char display_txid[32];
-        memcpy(display_txid, e->txid, 32);
-        reverse_bytes(display_txid, 32);
-        char txid_hex[65];
-        hex_encode(display_txid, 32, txid_hex);
+        const char *txid_hex = txid_hexes[i];
 
         /* Check if old commitment is on chain or in mempool */
-        int conf = wt->chain->get_confirmations(wt->chain, txid_hex);
+        int conf = batch_confs[i];
         int in_mempool = wt->chain->is_in_mempool(wt->chain, txid_hex);
 
         if (conf < 0 && !in_mempool) {
             i++;  /* not found, keep watching */
             continue;
+        }
+
+        /* Reject false positives: if the tx was confirmed BEFORE we registered
+           this entry, it predates the current factory and is not a breach of
+           our channel.  This prevents deterministic-key regtest runs from
+           triggering on old commitments left on-chain by previous scenarios. */
+        if (conf >= 0 && e->registered_height > 0) {
+            int cur_height = (wt->chain->get_block_height)
+                             ? wt->chain->get_block_height(wt->chain) : 0;
+            int tx_height = cur_height - conf + 1;  /* block the tx was mined in */
+            if (tx_height < e->registered_height) {
+                i++;  /* predates our factory -- skip */
+                continue;
+            }
         }
 
         if (e->type == WATCH_FACTORY_NODE) {
@@ -431,7 +483,12 @@ int watchtower_check(watchtower_t *wt) {
             e->response_tx = NULL;
             free(e->burn_tx);
             e->burn_tx = NULL;
-            wt->entries[i] = wt->entries[wt->n_entries - 1];
+            {
+                size_t _last = wt->n_entries - 1;
+                memcpy(txid_hexes[i], txid_hexes[_last], 65);
+                batch_confs[i] = batch_confs[_last];
+                wt->entries[i] = wt->entries[_last];
+            }
             wt->n_entries--;
             continue;
         }
@@ -573,8 +630,13 @@ int watchtower_check(watchtower_t *wt) {
                 ch->htlcs[0] = saved_h0;
         }
 
-        /* Remove this entry (swap with last) */
-        wt->entries[i] = wt->entries[wt->n_entries - 1];
+        /* Remove this entry (swap with last); sync batch arrays for next iter */
+        {
+            size_t _last = wt->n_entries - 1;
+            memcpy(txid_hexes[i], txid_hexes[_last], 65);
+            batch_confs[i] = batch_confs[_last];
+            wt->entries[i] = wt->entries[_last];
+        }
         wt->n_entries--;
         /* Don't increment i — check the swapped entry */
     }
@@ -706,6 +768,8 @@ int watchtower_check(watchtower_t *wt) {
         i++;
     }
 
+    free(txid_hexes);
+    free(batch_confs);
     return penalties_broadcast;
 }
 
@@ -764,7 +828,8 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    tx_buf_write_u32_le(&unsigned_tx, 2);           /* nVersion=2; V3/TRUC requires V3 parent */
+    tx_buf_write_u32_le(&unsigned_tx, 3);           /* nVersion=3 (TRUC): penalty tx is V3, so this
+                                                       child can also be V3; enables package relay */
     tx_buf_write_varint(&unsigned_tx, 2);            /* 2 inputs */
     /* Input 0: P2A anchor output from penalty tx (anyone-can-spend) */
     tx_buf_write_bytes(&unsigned_tx, anchor_txid, 32);

@@ -1,5 +1,6 @@
 #include "superscalar/lsp.h"
 #include "superscalar/ceremony.h"
+#include "superscalar/lsps.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -620,6 +621,26 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
     musig_session_set_pubnonce(&session, 0, &lsp_pubnonce);
 
+    /* Drain any LSPS_REQUEST messages queued before close started.
+       A client may send lsps2.get_info immediately on factory entry; if we
+       don't respond before CLOSE_PROPOSE the client will receive LSPS_RESPONSE
+       mid-ceremony and mistake it for CLOSE_ALL_NONCES. */
+    for (size_t di = 0; di < lsp->n_clients; di++) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[di], &rfds);
+        struct timeval dtv = { .tv_sec = 0, .tv_usec = 100000 }; /* 100 ms */
+        if (select(lsp->client_fds[di] + 1, &rfds, NULL, NULL, &dtv) > 0) {
+            wire_msg_t drain_msg;
+            if (wire_recv_timeout(lsp->client_fds[di], &drain_msg, 1) &&
+                drain_msg.msg_type == MSG_LSPS_REQUEST) {
+                lsps_ctx_t lsps_ctx = { .mgr = NULL, .lsp = lsp, .client_idx = di };
+                lsps_handle_request(&lsps_ctx, lsp->client_fds[di], drain_msg.json);
+            }
+            if (drain_msg.json) cJSON_Delete(drain_msg.json);
+        }
+    }
+
     /* Send CLOSE_PROPOSE */
     cJSON *propose = wire_build_close_propose(outputs, n_outputs, current_height);
     for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -664,8 +685,23 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60) || msg.msg_type != MSG_CLOSE_NONCE) {
-                    if (msg.json && !check_client_error(&msg, c))
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60)) {
+                    fprintf(stderr, "LSP: timeout/disconnect waiting for CLOSE_NONCE from client %zu\n", c);
+                    close_nonce_cer.clients[c] = CLIENT_ERROR;
+                    continue;
+                }
+                /* Dispatch LSPS_REQUEST that arrives before close started.
+                   Client may send lsps2.get_info right after factory entry,
+                   and the request sits in the kernel buffer until we read it. */
+                if (msg.msg_type == MSG_LSPS_REQUEST) {
+                    lsps_ctx_t lsps_ctx = { .mgr = NULL, .lsp = lsp, .client_idx = c };
+                    lsps_handle_request(&lsps_ctx, lsp->client_fds[c], msg.json);
+                    cJSON_Delete(msg.json);
+                    /* Re-mark client as waiting so we read CLOSE_NONCE next */
+                    continue;
+                }
+                if (msg.msg_type != MSG_CLOSE_NONCE) {
+                    if (!check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected CLOSE_NONCE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
                     close_nonce_cer.clients[c] = CLIENT_ERROR;
