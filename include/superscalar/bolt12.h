@@ -181,4 +181,17 @@ size_t invoice_error_encode(const invoice_error_t *err,
 int invoice_error_decode(const unsigned char *buf, size_t buf_len,
                           invoice_error_t *err_out);
 
+/*
+ * Decode a TLV-encoded invoice_request wire message into req_out.
+ * Returns 1 if payer_key and sig are present, 0 otherwise.
+ */
+int invoice_request_decode(const unsigned char *tlv, size_t tlv_len,
+                             invoice_request_t *req_out);
+
+/*
+ * Encode an invoice_t to wire TLV bytes (type 0x8000 outer wrapper).
+ * Returns bytes written, 0 on error.
+ */
+size_t invoice_encode(const invoice_t *inv, unsigned char *buf, size_t buf_cap);
+
 #endif /* SUPERSCALAR_BOLT12_H */
