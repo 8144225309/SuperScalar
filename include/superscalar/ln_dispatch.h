@@ -19,6 +19,8 @@
 #include "htlc_forward.h"
 #include "mpp.h"
 #include "payment.h"
+#include "invoice.h"
+#include "watchtower.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -32,6 +34,8 @@ typedef struct {
     secp256k1_context     *ctx;           /* secp256k1 context */
     unsigned char          our_privkey[32]; /* node private key */
     volatile int          *shutdown_flag; /* set non-zero to stop loop */
+    bolt11_invoice_table_t *invoices;      /* inbound invoice registry; NULL = no lookup */
+    watchtower_t           *watchtower;    /* breach watcher; NULL = disabled */
 } ln_dispatch_t;
 
 /*
