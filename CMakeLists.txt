@@ -139,9 +139,11 @@ add_library(superscalar
     src/lsp_wellknown.c
     src/gossip.c
     src/gossip_store.c
+    src/mpp.c
     src/scid_registry.c
     src/onion_last_hop.c
     src/htlc_inbound.c
+    src/gossip_peer.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -197,6 +199,9 @@ add_executable(test_superscalar
     tests/test_gossip.c
     tests/test_scid_registry.c
     tests/test_onion_last_hop.c
+    tests/test_gossip_net.c
+    tests/test_mpp.c
+    tests/test_lsps2_deferred.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

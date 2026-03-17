@@ -161,6 +161,37 @@ extern int test_bolt8_key_rotation(void);
 extern int test_bolt8_init_features(void);
 extern int test_bolt8_lsps_dispatch(void);
 
+/* PR #19: BOLT #8 outbound + timeouts */
+extern int test_bolt8_outbound_connect(void);
+extern int test_bolt8_phase_timeout_constants(void);
+
+/* PR #19: Gossip peer networking (commits 2-4) */
+extern int test_gossip_peer_timestamp_strategy(void);
+extern int test_gossip_reconnect_backoff(void);
+extern int test_gossip_reconnect_jitter(void);
+extern int test_gossip_peer_parse_list(void);
+/* Commit 3: stale pruning, rejection cache, 4-sig, waiting proof */
+extern int test_gossip_prune_stale_channel(void);
+extern int test_gossip_rejection_cache(void);
+extern int test_gossip_4sig_validation(void);
+extern int test_gossip_waiting_proof_buffer(void);
+/* Commit 4: rate limiting, refill, embargo */
+extern int test_gossip_rate_limit_token_bucket(void);
+extern int test_gossip_rate_refill(void);
+extern int test_gossip_peer_embargo(void);
+
+/* PR #19 Commit 5: MPP aggregation */
+extern int test_mpp_single_part(void);
+extern int test_mpp_three_parts(void);
+extern int test_mpp_timeout(void);
+extern int test_mpp_overpayment_guard(void);
+extern int test_mpp_table_full(void);
+
+/* PR #19 Commit 5: LSPS2 deferred broadcast */
+extern int test_lsps2_deferred_no_immediate_channel(void);
+extern int test_lsps2_deferred_coverage_triggers_channel(void);
+extern int test_lsps2_unknown_scid(void);
+
 /* PR #17 Phase 2: LSP discovery */
 extern int test_wellknown_json_format(void);
 extern int test_client_bootstrap_from_domain(void);
@@ -973,6 +1004,37 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt8_key_rotation);
     RUN_TEST(test_bolt8_init_features);
     RUN_TEST(test_bolt8_lsps_dispatch);
+
+    printf("\n=== PR #19: BOLT #8 Outbound + Timeouts ===\n");
+    RUN_TEST(test_bolt8_outbound_connect);
+    RUN_TEST(test_bolt8_phase_timeout_constants);
+
+    printf("\n=== PR #19: Gossip Peer Networking ===\n");
+    RUN_TEST(test_gossip_peer_timestamp_strategy);
+    RUN_TEST(test_gossip_reconnect_backoff);
+    RUN_TEST(test_gossip_reconnect_jitter);
+    RUN_TEST(test_gossip_peer_parse_list);
+    /* Commit 3 */
+    RUN_TEST(test_gossip_prune_stale_channel);
+    RUN_TEST(test_gossip_rejection_cache);
+    RUN_TEST(test_gossip_4sig_validation);
+    RUN_TEST(test_gossip_waiting_proof_buffer);
+    /* Commit 4 */
+    RUN_TEST(test_gossip_rate_limit_token_bucket);
+    RUN_TEST(test_gossip_rate_refill);
+    RUN_TEST(test_gossip_peer_embargo);
+
+    printf("\n=== PR #19: MPP Aggregation ===\n");
+    RUN_TEST(test_mpp_single_part);
+    RUN_TEST(test_mpp_three_parts);
+    RUN_TEST(test_mpp_timeout);
+    RUN_TEST(test_mpp_overpayment_guard);
+    RUN_TEST(test_mpp_table_full);
+
+    printf("\n=== PR #19: LSPS2 Deferred Broadcast ===\n");
+    RUN_TEST(test_lsps2_deferred_no_immediate_channel);
+    RUN_TEST(test_lsps2_deferred_coverage_triggers_channel);
+    RUN_TEST(test_lsps2_unknown_scid);
 
     printf("\n=== PR #17 Phase 2: LSP Discovery ===\n");
     RUN_TEST(test_wellknown_json_format);
