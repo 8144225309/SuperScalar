@@ -1415,6 +1415,9 @@ int bip158_backend_scan(bip158_backend_t *backend)
 
                 if (!bip158_scan_filter(backend, filter_buf, use_len, recv_key)) {
                     backend->tip_height = bh;
+                    if (backend->block_connected_cb)
+                        backend->block_connected_cb((uint32_t)bh,
+                                                     backend->block_connected_ctx);
                     continue;
                 }
 
@@ -1461,6 +1464,9 @@ int bip158_backend_scan(bip158_backend_t *backend)
                 if (sc.found) matched++;
                 else if (!block_scanned) matched++;  /* false positive — tentative */
                 backend->tip_height = bh;
+                if (backend->block_connected_cb)
+                    backend->block_connected_cb((uint32_t)bh,
+                                                 backend->block_connected_ctx);
             }
 
             if (!batch_ok) break;
@@ -1475,16 +1481,25 @@ int bip158_backend_scan(bip158_backend_t *backend)
 
             if (!regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex))) {
                 backend->tip_height = h;
+                if (backend->block_connected_cb)
+                    backend->block_connected_cb((uint32_t)h,
+                                                 backend->block_connected_ctx);
                 continue;
             }
             if (!regtest_get_block_filter(rt, hash_hex,
                                            filter_buf, &filter_len,
                                            FILTER_BUF_MAX, key)) {
                 backend->tip_height = h;
+                if (backend->block_connected_cb)
+                    backend->block_connected_cb((uint32_t)h,
+                                                 backend->block_connected_ctx);
                 continue;
             }
             if (!bip158_scan_filter(backend, filter_buf, filter_len, key)) {
                 backend->tip_height = h;
+                if (backend->block_connected_cb)
+                    backend->block_connected_cb((uint32_t)h,
+                                                 backend->block_connected_ctx);
                 continue;
             }
 
@@ -1492,6 +1507,9 @@ int bip158_backend_scan(bip158_backend_t *backend)
             regtest_scan_block_txs(rt, hash_hex, scan_tx_callback, &sc);
             if (sc.found) matched++;
             backend->tip_height = h;
+            if (backend->block_connected_cb)
+                backend->block_connected_cb((uint32_t)h,
+                                             backend->block_connected_ctx);
         }
     }
 
@@ -1617,4 +1635,14 @@ void bip158_backend_set_utxo_cb(bip158_backend_t *backend,
     backend->utxo_found_cb = found_cb;
     backend->utxo_spent_cb = spent_cb;
     backend->utxo_cb_ctx   = ctx;
+}
+
+void bip158_backend_set_block_connected_cb(bip158_backend_t *backend,
+                                            void (*cb)(uint32_t height,
+                                                       void *cb_ctx),
+                                            void *cb_ctx)
+{
+    if (!backend) return;
+    backend->block_connected_cb  = cb;
+    backend->block_connected_ctx = cb_ctx;
 }

@@ -15,6 +15,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/sha256.h"
+#include "superscalar/bip158_backend.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <string.h>
@@ -318,6 +319,61 @@ int test_cltv_watchdog_multi_htlc(void)
     int count = cltv_watchdog_check(&wd, 800000);
     ASSERT(count == 2, "exactly 2 inbound HTLCs should be at risk");
     ASSERT(wd.triggered == 1, "triggered should be set");
+
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* CW9 — block_connected_cb fires watchdog on bip158_backend advance  */
+/* ================================================================== */
+
+/* Test state for block callback */
+typedef struct {
+    cltv_watchdog_t *wd;
+    uint32_t         last_height;
+    int              check_called;
+} cw9_ctx_t;
+
+static void cw9_block_cb(uint32_t height, void *ctx)
+{
+    cw9_ctx_t *c = (cw9_ctx_t *)ctx;
+    c->last_height = height;
+    c->check_called += cltv_watchdog_check(c->wd, height);
+}
+
+int test_cltv_watchdog_block_cb(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    ASSERT(cw_setup_channel(&ch, ctx, 5000000, 5000000), "channel init");
+
+    /* Inject an inbound HTLC expiring at block 800010 */
+    cw_inject_htlc(&ch, HTLC_RECEIVED, 100000, 800010, 1);
+
+    cltv_watchdog_t wd;
+    cltv_watchdog_init(&wd, &ch, 0);  /* delta = 18 */
+
+    /* Set up a minimal bip158_backend_t with just the callback fields */
+    bip158_backend_t backend;
+    memset(&backend, 0, sizeof(backend));
+    backend.tip_height = -1;
+
+    cw9_ctx_t cw9 = { &wd, 0, 0 };
+    bip158_backend_set_block_connected_cb(&backend, cw9_block_cb, &cw9);
+
+    /* Manually advance tip_height and fire callback at a height that triggers watchdog */
+    backend.tip_height = 800000;
+    if (backend.block_connected_cb)
+        backend.block_connected_cb((uint32_t)backend.tip_height,
+                                    backend.block_connected_ctx);
+
+    ASSERT(cw9.last_height == 800000, "callback received correct height");
+    /* At height 800000, threshold = 800018 >= 800010 → 1 at-risk HTLC */
+    ASSERT(cw9.check_called > 0, "watchdog check fired via callback");
+    ASSERT(wd.triggered == 1, "watchdog marked triggered");
 
     channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
