@@ -364,3 +364,78 @@ size_t gossip_build_timestamp_filter(
 
     return off;
 }
+
+/* --- gossip_validate_channel_announcement --- */
+
+/*
+ * BOLT #7 channel_announcement wire layout after type(2):
+ *   node_sig_1(64)   @ offset 2
+ *   node_sig_2(64)   @ offset 66
+ *   bitcoin_sig_1(64)@ offset 130
+ *   bitcoin_sig_2(64)@ offset 194
+ *   features_len(2)  @ offset 258
+ *   features(flen)   @ offset 260
+ *   chain_hash(32)   @ offset 260+flen
+ *   short_channel_id(8)
+ *   node_id_1(33)    <- signer for node_sig_1
+ *   node_id_2(33)    <- signer for node_sig_2
+ *   bitcoin_key_1(33)<- signer for bitcoin_sig_1
+ *   bitcoin_key_2(33)<- signer for bitcoin_sig_2
+ *
+ * Signed data: SHA256(SHA256( msg[0..1] || msg[258..end] ))
+ *   (type bytes || everything after the 4 sigs)
+ */
+int gossip_validate_channel_announcement(secp256k1_context *ctx,
+                                          const unsigned char *msg, size_t msg_len) {
+    /* Minimum: type(2) + 4*64sigs(256) + features_len(2) + chain_hash(32)
+     *          + scid(8) + node_id_1(33) + node_id_2(33) + btc_key_1(33) + btc_key_2(33)
+     *          = 2 + 256 + 2 + 32 + 8 + 33*4 = 432 bytes with flen=0 */
+    if (!ctx || !msg || msg_len < 432) return 0;
+
+    /* features_len at offset 258 */
+    uint16_t flen = ((uint16_t)msg[258] << 8) | (uint16_t)msg[259];
+
+    /* Minimum length with features */
+    size_t min_len = (size_t)(2 + 256 + 2 + flen + 32 + 8 + 33 + 33 + 33 + 33);
+    if (msg_len < min_len) return 0;
+
+    /* Public keys start after: type(2)+sigs(256)+features_len(2)+features(flen)+chain_hash(32)+scid(8) */
+    size_t keys_off = (size_t)(2 + 256 + 2 + flen + 32 + 8);
+    const unsigned char *node_id_1     = msg + keys_off;
+    const unsigned char *node_id_2     = msg + keys_off + 33;
+    const unsigned char *bitcoin_key_1 = msg + keys_off + 66;
+    const unsigned char *bitcoin_key_2 = msg + keys_off + 99;
+
+    /* Signed content = msg[0..1] || msg[258..end] */
+    size_t content_tail_len = msg_len - 258;
+    size_t content_len = 2 + content_tail_len;
+
+    /* SHA256(SHA256(type(2) || data_after_sigs)) using contiguous temp buffer */
+    unsigned char *content = (unsigned char *)malloc(content_len);
+    if (!content) return 0;
+    memcpy(content, msg, 2);
+    memcpy(content + 2, msg + 258, content_tail_len);
+
+    unsigned char digest[32];
+    sha256_double(content, content_len, digest);
+    free(content);
+
+    /* Verify one Schnorr sig against a 33-byte compressed public key */
+#define VERIFY_SIG(sig_off, key33) do {                                      \
+    secp256k1_xonly_pubkey xpk;                                               \
+    secp256k1_pubkey pk;                                                      \
+    if (!secp256k1_ec_pubkey_parse(ctx, &pk, (key33), 33)) return 0;         \
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, &pk)) return 0; \
+    if (!secp256k1_schnorrsig_verify(ctx, msg + (sig_off), digest, 32, &xpk)) \
+        return 0;                                                             \
+} while (0)
+
+    VERIFY_SIG(2,   node_id_1);
+    VERIFY_SIG(66,  node_id_2);
+    VERIFY_SIG(130, bitcoin_key_1);
+    VERIFY_SIG(194, bitcoin_key_2);
+
+#undef VERIFY_SIG
+
+    return 1;
+}

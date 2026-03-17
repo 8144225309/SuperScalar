@@ -130,4 +130,22 @@ size_t gossip_build_timestamp_filter(
     uint32_t         timestamp_range
 );
 
+/*
+ * Validate a received channel_announcement (type 256).
+ * Checks all 4 Schnorr signatures:
+ *   node_sig_1  (offset 2)  signed by node_id_1
+ *   node_sig_2  (offset 66) signed by node_id_2
+ *   bitcoin_sig_1 (offset 130) signed by bitcoin_key_1
+ *   bitcoin_sig_2 (offset 194) signed by bitcoin_key_2
+ *
+ * Signed data: SHA256(SHA256(type(2) || data_after_all_sigs))
+ *   = SHA256(SHA256(msg[0..1] || msg[258..end]))
+ *   (assuming features_len is at msg[258..259])
+ *
+ * msg: raw wire bytes including the 2-byte type prefix.
+ * Returns 1 if all 4 sigs valid, 0 otherwise.
+ */
+int gossip_validate_channel_announcement(secp256k1_context *ctx,
+                                          const unsigned char *msg, size_t msg_len);
+
 #endif /* SUPERSCALAR_GOSSIP_H */

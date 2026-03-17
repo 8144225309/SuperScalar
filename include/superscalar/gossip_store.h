@@ -90,4 +90,25 @@ int gossip_store_get_channel_update(gossip_store_t *gs,
                                      uint16_t *cltv_delta_out,
                                      uint32_t *timestamp_out);
 
+/* --- Stale channel pruning --- */
+
+#define GOSSIP_PRUNE_SECS   1209600u   /* 14 days — standard across CLN/LND/Eclair */
+#define GOSSIP_GRACE_SECS    604800u   /* 7 days tracking after removal (LDK) */
+
+/*
+ * Remove channel_updates older than GOSSIP_PRUNE_SECS, then remove
+ * gossip_channels where both directions are stale (or never updated).
+ * Returns count of channels removed, or -1 on error.
+ */
+int gossip_store_prune_stale(gossip_store_t *gs, uint32_t now_unix);
+
+/*
+ * Mark a channel as spent (funding output confirmed spent on-chain).
+ * Sets pruned_at = now_unix; rows with pruned_at + GOSSIP_GRACE_SECS <= now
+ * are hard-deleted on the next call to gossip_store_prune_stale.
+ * Returns 1 on success, 0 on error.
+ */
+int gossip_store_mark_channel_spent(gossip_store_t *gs,
+                                     uint64_t scid, uint32_t now_unix);
+
 #endif /* SUPERSCALAR_GOSSIP_STORE_H */
