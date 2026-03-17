@@ -306,6 +306,15 @@ extern int test_peer_storage_build_type7(void);
 extern int test_peer_storage_build_type9(void);
 extern int test_peer_storage_parse_roundtrip(void);
 extern int test_peer_storage_parse_errors(void);
+/* PR #21 Phase 8: BOLT spec vectors + integration */
+extern int test_bolt3_shachain_vector_zero_seed(void);
+extern int test_bolt3_shachain_vector_ff_seed(void);
+extern int test_bolt3_shachain_vector_ff_aaa(void);
+extern int test_bolt3_shachain_vector_01_seed(void);
+extern int test_it_shutdown_roundtrip(void);
+extern int test_it_closing_signed_roundtrip(void);
+extern int test_it_probe_peer_db_score(void);
+extern int test_it_watchdog_expire_chain(void);
 
 extern int test_onion_tlv_parse_partial(void);
 extern int test_htlc_inbound_fulfill_path(void);
@@ -1263,6 +1272,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_peer_storage_build_type9);
     RUN_TEST(test_peer_storage_parse_roundtrip);
     RUN_TEST(test_peer_storage_parse_errors);
+    printf("\n=== PR #21 Phase 8: BOLT Spec Vectors + Integration ===\n");
+    RUN_TEST(test_bolt3_shachain_vector_zero_seed);
+    RUN_TEST(test_bolt3_shachain_vector_ff_seed);
+    RUN_TEST(test_bolt3_shachain_vector_ff_aaa);
+    RUN_TEST(test_bolt3_shachain_vector_01_seed);
+    RUN_TEST(test_it_shutdown_roundtrip);
+    RUN_TEST(test_it_closing_signed_roundtrip);
+    RUN_TEST(test_it_probe_peer_db_score);
+    RUN_TEST(test_it_watchdog_expire_chain);
 
     RUN_TEST(test_onion_tlv_parse_partial);
     RUN_TEST(test_htlc_inbound_fulfill_path);

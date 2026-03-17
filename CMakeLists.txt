@@ -227,6 +227,7 @@ add_executable(test_superscalar
     tests/test_chan_close.c
     tests/test_peer_db.c
     tests/test_probe_storage.c
+    tests/test_spec_vectors.c
     tests/test_payment.c
     tests/test_splice_wire.c
     tests/test_bolt12_full.c
