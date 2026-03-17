@@ -51,7 +51,8 @@ static const char *GOSSIP_SCHEMA_SQL =
     "  node1_hex    TEXT NOT NULL,"
     "  node2_hex    TEXT NOT NULL,"
     "  capacity_sat INTEGER NOT NULL DEFAULT 0,"
-    "  last_update  INTEGER NOT NULL DEFAULT 0"
+    "  last_update  INTEGER NOT NULL DEFAULT 0,"
+    "  pruned_at    INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS gossip_channel_updates ("
     "  scid          INTEGER NOT NULL,"
@@ -75,7 +76,12 @@ static int run_sql(sqlite3 *db, const char *sql) {
 }
 
 static int gossip_store_init(gossip_store_t *gs) {
-    return run_sql(gs->db, GOSSIP_SCHEMA_SQL);
+    if (!run_sql(gs->db, GOSSIP_SCHEMA_SQL)) return 0;
+    /* Add pruned_at column to existing databases (idempotent — ignore error if exists). */
+    sqlite3_exec(gs->db,
+        "ALTER TABLE gossip_channels ADD COLUMN pruned_at INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+    return 1;
 }
 
 int gossip_store_open(gossip_store_t *gs, const char *db_path) {
@@ -310,4 +316,72 @@ int gossip_store_get_channel_update(gossip_store_t *gs,
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+/* --- Stale channel pruning --- */
+
+int gossip_store_prune_stale(gossip_store_t *gs, uint32_t now_unix) {
+    if (!gs || !gs->db) return -1;
+
+    /* 1. Hard-delete channels that have been marked spent and grace period has elapsed */
+    {
+        sqlite3_stmt *stmt;
+        int rc = sqlite3_prepare_v2(gs->db,
+            "DELETE FROM gossip_channels"
+            "  WHERE pruned_at > 0 AND pruned_at + ? <= ?;",
+            -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64)GOSSIP_GRACE_SECS);
+            sqlite3_bind_int64(stmt, 2, (sqlite3_int64)now_unix);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* 2. Delete channel_updates older than GOSSIP_PRUNE_SECS */
+    {
+        sqlite3_stmt *stmt;
+        int rc = sqlite3_prepare_v2(gs->db,
+            "DELETE FROM gossip_channel_updates"
+            "  WHERE timestamp + ? <= ?;",
+            -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64)GOSSIP_PRUNE_SECS);
+            sqlite3_bind_int64(stmt, 2, (sqlite3_int64)now_unix);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* 3. Delete channels where neither direction has a recent update and not spent-marked */
+    {
+        sqlite3_stmt *stmt;
+        int rc = sqlite3_prepare_v2(gs->db,
+            "DELETE FROM gossip_channels"
+            "  WHERE pruned_at = 0"
+            "    AND scid NOT IN (SELECT DISTINCT scid FROM gossip_channel_updates);",
+            -1, &stmt, NULL);
+        if (rc != SQLITE_OK) return -1;
+        sqlite3_step(stmt);
+        int removed = sqlite3_changes(gs->db);
+        sqlite3_finalize(stmt);
+        return removed;
+    }
+}
+
+int gossip_store_mark_channel_spent(gossip_store_t *gs,
+                                     uint64_t scid, uint32_t now_unix) {
+    if (!gs || !gs->db) return 0;
+
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(gs->db,
+        "UPDATE gossip_channels SET pruned_at = ? WHERE scid = ?;",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return 0;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)now_unix);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)scid);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
 }
