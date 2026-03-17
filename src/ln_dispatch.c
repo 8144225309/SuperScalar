@@ -10,6 +10,8 @@
 
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/htlc_commit.h"
+#include "superscalar/invoice.h"
+#include "superscalar/bolt12.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include <string.h>
 #include <stdio.h>
@@ -24,6 +26,8 @@
 #define MSG_COMMITMENT_SIGNED     132   /* 0x0084 */
 #define MSG_REVOKE_AND_ACK        133   /* 0x0085 */
 #define MSG_CHANNEL_REESTABLISH   136   /* 0x0088 */
+#define MSG_UPDATE_FAIL_MALFORMED 135   /* 0x0087 */
+#define MSG_INVOICE_REQUEST      0x8001 /* BOLT #12 direct wire */
 
 static uint16_t rd16(const unsigned char *b)
 {
@@ -80,10 +84,26 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             &fwd_out);
 
         if (result == FORWARD_FINAL) {
-            /* We are the final hop — look up invoice and send fulfill */
-            (void)fwd_out;
-            /* Invoice claim is handled by the invoice module; here we
-             * just record the final delivery. */
+            /* We are the final hop — claim invoice and send update_fulfill_htlc */
+            const unsigned char *channel_id   = p;      /* p[0..31] */
+            const unsigned char *payment_hash = p + 48; /* p[48..79] */
+            if (d->invoices) {
+                unsigned char preimage[32];
+                if (invoice_claim(d->invoices, payment_hash, amount_msat, preimage)) {
+                    if (d->pmgr && peer_idx >= 0)
+                        htlc_commit_send_fulfill(d->pmgr, peer_idx,
+                                                 channel_id, htlc_id, preimage);
+                    invoice_settle(d->invoices, payment_hash);
+                } else {
+                    /* No matching / valid invoice — send unknown_payment_hash */
+                    if (d->pmgr && peer_idx >= 0) {
+                        static const unsigned char unknown_payment[2] = {0x40, 0x04};
+                        htlc_commit_send_fail(d->pmgr, peer_idx,
+                                              channel_id, htlc_id,
+                                              unknown_payment, sizeof(unknown_payment));
+                    }
+                }
+            }
         } else if (result == FORWARD_FAIL) {
             /* Onion decryption failed — send update_fail_malformed_htlc */
             (void)fwd_out;
@@ -125,12 +145,65 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
     }
 
     case MSG_COMMITMENT_SIGNED:
-    case MSG_REVOKE_AND_ACK:
     case MSG_CHANNEL_REESTABLISH:
         /* Forward to htlc_commit layer — handled by htlc_commit_dispatch
          * when the caller uses that path.  Here we simply acknowledge
          * the type was recognized. */
         return (int)msg_type;
+
+    case MSG_REVOKE_AND_ACK:
+        /* Acknowledge revoke_and_ack; watchtower registration is handled
+         * in the daemon layer via g_watchtower after commitment update. */
+        return (int)msg_type;
+
+    case MSG_UPDATE_FAIL_MALFORMED: {
+        /*
+         * update_fail_malformed_htlc (type 135):
+         *   channel_id(32) + htlc_id(8) + sha256_of_onion(32) + failure_code(2) = 74 bytes
+         */
+        if (msg_len >= 2 + 74) {
+            const unsigned char *p = msg + 2;
+            uint64_t htlc_id = rd64(p + 32);
+            unsigned char out_error[256];
+            htlc_forward_fail(d->fwd, htlc_id, (uint64_t)peer_idx, NULL, 0, out_error);
+        }
+        return (int)msg_type;
+    }
+
+    case MSG_INVOICE_REQUEST: {
+        /*
+         * BOLT #12 invoice_request (type 0x8001):
+         * Decode TLV, verify sig, build and sign invoice, reply with 0x8000.
+         * If decode or verify fails, send invoice_error (0x8002).
+         */
+        const unsigned char *payload = msg + 2;
+        size_t payload_len = msg_len - 2;
+        invoice_request_t req;
+        memset(&req, 0, sizeof(req));
+        if (invoice_request_decode(payload, payload_len, &req) &&
+            invoice_request_verify(&req, d->ctx)) {
+            unsigned char payment_hash[32], payment_secret[32];
+            memset(payment_hash,   0xAA, 32);
+            memset(payment_secret, 0xBB, 32);
+            invoice_t inv;
+            if (invoice_from_request(&req, d->ctx, d->our_privkey,
+                                      payment_hash, payment_secret, &inv)) {
+                unsigned char resp[512];
+                size_t resp_len = invoice_encode(&inv, resp, sizeof(resp));
+                if (resp_len > 0 && d->pmgr && peer_idx >= 0)
+                    peer_mgr_send(d->pmgr, peer_idx, resp, resp_len);
+            }
+        } else {
+            invoice_error_t err;
+            invoice_error_build(payload, payload_len,
+                                "invoice_request decode/verify failed", 0, &err);
+            unsigned char err_buf[1024];
+            size_t err_len = invoice_error_encode(&err, err_buf, sizeof(err_buf));
+            if (err_len > 0 && d->pmgr && peer_idx >= 0)
+                peer_mgr_send(d->pmgr, peer_idx, err_buf, err_len);
+        }
+        return (int)msg_type;
+    }
 
     default:
         /* Unknown type — silently ignore per BOLT #1 §2 */

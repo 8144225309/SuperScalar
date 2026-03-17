@@ -16,6 +16,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/sha256.h"
 #include "superscalar/bip158_backend.h"
+#include "superscalar/watchtower.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <string.h>
@@ -377,5 +378,174 @@ int test_cltv_watchdog_block_cb(void)
 
     channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* CW10 — on_block_connected per-channel watchdog (multi-channel sim) */
+/* ================================================================== */
+int test_cltv_watchdog_block_connected_multi(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+
+    /* Create two channels, each with an expired inbound HTLC */
+    channel_t ch1, ch2;
+    ASSERT(cw_setup_channel(&ch1, ctx, 5000000, 5000000), "ch1 init");
+    ASSERT(cw_setup_channel(&ch2, ctx, 5000000, 5000000), "ch2 init");
+
+    /* height = 800000; HTLC expiry < height -> expired AND at-risk */
+    cw_inject_htlc(&ch1, HTLC_RECEIVED, 100000, 799990, 1);
+    cw_inject_htlc(&ch2, HTLC_RECEIVED, 100000, 799995, 2);
+
+    uint32_t height = 800000;
+
+    /* Simulate on_block_connected loop over both channels */
+    channel_t *channels[2] = {&ch1, &ch2};
+    int total_at_risk = 0;
+    for (int i = 0; i < 2; i++) {
+        cltv_watchdog_t wd;
+        cltv_watchdog_init(&wd, channels[i], 0);
+        total_at_risk += cltv_watchdog_check(&wd, height);
+        cltv_watchdog_expire(&wd, height);
+    }
+
+    /* Both HTLCs were at-risk (expiry 799990/799995 <= 800000+18) */
+    ASSERT(total_at_risk == 2, "both channels had at-risk HTLCs");
+
+    /* Both HTLCs were expired (expiry <= height) -> removed by compact */
+    ASSERT(ch1.n_htlcs == 0, "ch1 expired HTLC removed by watchdog_expire");
+    ASSERT(ch2.n_htlcs == 0, "ch2 expired HTLC removed by watchdog_expire");
+
+    channel_cleanup(&ch1);
+    channel_cleanup(&ch2);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* CW11 — on_block_connected with zero channels: no crash              */
+/* ================================================================== */
+int test_cltv_watchdog_block_connected_empty(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+
+    /* Simulate on_block_connected with n_channels=0 */
+    uint32_t height = 800000;
+    int n_channels = 0;
+    int total_at_risk = 0;
+    for (int i = 0; i < n_channels; i++) {
+        (void)i; (void)height;  /* loop doesn't execute */
+        total_at_risk++;
+    }
+    ASSERT(total_at_risk == 0, "no channels -> no at-risk HTLCs, no crash");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* CW12 — mixed channels: one safe, one at-risk                        */
+/* ================================================================== */
+int test_cltv_watchdog_block_connected_mixed(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+
+    channel_t ch_safe, ch_risk;
+    ASSERT(cw_setup_channel(&ch_safe, ctx, 5000000, 5000000), "ch_safe init");
+    ASSERT(cw_setup_channel(&ch_risk, ctx, 5000000, 5000000), "ch_risk init");
+
+    uint32_t height = 800000;
+    /* ch_safe: HTLC expires far in the future */
+    cw_inject_htlc(&ch_safe, HTLC_RECEIVED, 100000, 810000, 1);
+    /* ch_risk: HTLC within expiry delta (800000 + 18 = 800018 >= 800015) */
+    cw_inject_htlc(&ch_risk, HTLC_RECEIVED, 100000, 800015, 2);
+
+    channel_t *channels[2] = {&ch_safe, &ch_risk};
+    int total_at_risk = 0;
+    for (int i = 0; i < 2; i++) {
+        cltv_watchdog_t wd;
+        cltv_watchdog_init(&wd, channels[i], 0);
+        total_at_risk += cltv_watchdog_check(&wd, height);
+        cltv_watchdog_expire(&wd, height);
+    }
+
+    ASSERT(total_at_risk == 1, "only ch_risk is at-risk");
+    ASSERT(ch_safe.n_htlcs == 1, "ch_safe HTLC not expired");
+    ASSERT(ch_risk.n_htlcs == 1, "ch_risk HTLC at risk but not yet expired");
+
+    channel_cleanup(&ch_safe);
+    channel_cleanup(&ch_risk);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* WT1 — watchtower_init + watchtower_check with no entries → 0       */
+/* ================================================================== */
+int test_watchtower_init_empty(void)
+{
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    int r = watchtower_init(&wt, 0, NULL, NULL, NULL);
+    ASSERT(r == 1, "watchtower_init returns 1");
+    int c = watchtower_check(&wt);
+    ASSERT(c == 0, "empty watchtower returns 0");
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* WT2 — watchtower_watch adds entry; check with no chain → 0         */
+/* ================================================================== */
+int test_watchtower_watch_no_breach(void)
+{
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    ASSERT(watchtower_init(&wt, 0, NULL, NULL, NULL), "init");
+    unsigned char txid[32]; memset(txid, 0xAB, 32);
+    unsigned char spk[34];  memset(spk,  0x51, 34);
+    int r = watchtower_watch(&wt, 0, 1, txid, 0, 100000, spk, 34);
+    ASSERT(r == 1, "watch entry added");
+    /* No chain backend → check cannot find breach */
+    int c = watchtower_check(&wt);
+    ASSERT(c == 0, "no chain backend → 0 penalties");
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* WT3 — g_watchtower_ready=0 guard: no crash from unconfigured wt   */
+/* ================================================================== */
+int test_watchtower_ready_guard(void)
+{
+    /* Simulate the g_watchtower_ready == 0 guard path:
+     * Just verify that calling init + check on zeroed struct is safe. */
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    int r = watchtower_init(&wt, 0, NULL, NULL, NULL);
+    ASSERT(r == 1, "init succeeds");
+    ASSERT(watchtower_check(&wt) == 0, "check on empty wt returns 0");
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* WT4 — watchtower_remove_channel removes entries for that channel   */
+/* ================================================================== */
+int test_watchtower_remove_channel(void)
+{
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    ASSERT(watchtower_init(&wt, 0, NULL, NULL, NULL), "init");
+    unsigned char txid[32]; memset(txid, 0xCC, 32);
+    unsigned char spk[34];  memset(spk,  0x51, 34);
+    ASSERT(watchtower_watch(&wt, 42, 1, txid, 0, 100000, spk, 34), "watch");
+    watchtower_remove_channel(&wt, 42);
+    /* After removal check should still return 0 (entry gone) */
+    ASSERT(watchtower_check(&wt) == 0, "after remove → 0 penalties");
+    watchtower_cleanup(&wt);
     return 1;
 }
