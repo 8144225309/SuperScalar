@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <secp256k1.h>
 #include "superscalar/bolt8.h"
+#include "superscalar/peer_mgr.h"
 
 /* Feature bits advertised in BOLT #1 init message */
 #define BOLT8_FEATURE_BIT_LSPS0       729   /* odd = optional, LSPS0 support */
@@ -33,6 +34,9 @@ typedef struct {
     uint16_t bolt8_port;            /* TCP port for BOLT #8 connections (default 9735) */
     unsigned char static_priv[32];  /* node static private key */
     secp256k1_context *ctx;         /* secp256k1 context (not owned) */
+
+    /* If set, accepted peers are registered in this peer_mgr (not owned) */
+    peer_mgr_t *peer_mgr;
 
     /* Callbacks for inbound messages */
     void *cb_userdata;

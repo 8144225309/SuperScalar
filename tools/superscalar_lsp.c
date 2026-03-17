@@ -43,6 +43,13 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
 #include "superscalar/bolt8_server.h"
+#include "superscalar/ln_dispatch.h"
+#include "superscalar/invoice.h"
+#include "superscalar/peer_mgr.h"
+#include "superscalar/htlc_forward.h"
+#include "superscalar/mpp.h"
+#include "superscalar/payment.h"
+#include "superscalar/cltv_watchdog.h"
 #include "superscalar/gossip_peer.h"
 #include "superscalar/gossip_store.h"
 #include <pthread.h>
@@ -57,6 +64,32 @@ static void *bolt8_server_thread(void *arg) {
     (void)arg;
     bolt8_server_run(&g_bolt8_cfg);
     return NULL;
+}
+
+/* LN peer message dispatch globals */
+static peer_mgr_t         g_peer_mgr;
+static htlc_forward_table_t g_fwd;
+static mpp_table_t         g_mpp;
+static payment_table_t     g_payments;
+static ln_dispatch_t       g_ln_dispatch;
+static bolt11_invoice_table_t g_invoice_tbl;
+
+static void *ln_dispatch_thread(void *arg) {
+    (void)arg;
+    ln_dispatch_run(&g_ln_dispatch);
+    return NULL;
+}
+
+/* Chain monitoring: called by bip158_backend after each new block is processed */
+static void on_block_connected(uint32_t height, void *cb_ctx)
+{
+    /* cb_ctx is unused — watchtower is a global in this daemon */
+    (void)cb_ctx;
+    /* Log new block; CLTV watchdog per-channel runs via htlc_commit layer */
+    printf("LSP: block %u connected\n", (unsigned)height);
+    /* Watchtower breach detection is wired separately via watchtower_check().
+     * Per-channel HTLC expiry monitoring uses cltv_watchdog_check() called
+     * from the HTLC commitment layer as channels process each new block. */
 }
 
 static void sigint_handler(int sig) {
@@ -685,6 +718,9 @@ static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
     /* Wire fee estimator if provided (enables per-block fee samples) */
     if (fee_est)
         bip158_backend_set_fee_estimator(&g_bip158, fee_est);
+
+    /* Wire block_connected callback for chain monitoring (CLTV watchdog) */
+    bip158_backend_set_block_connected_cb(&g_bip158, on_block_connected, NULL);
 
     watchtower_set_chain_backend(wt, &g_bip158.base);
     return 1;
@@ -1939,10 +1975,18 @@ int main(int argc, char *argv[]) {
             printf("LSP: gossip peers: none configured (use --gossip-peers HOST:PORT,...)\n");
 
         if (bolt8_listen_port > 0) {
+            /* Initialise LN payment/forward/MPP tables */
+            peer_mgr_init(&g_peer_mgr, ctx, lsp.nk_seckey);
+            htlc_forward_init(&g_fwd);
+            mpp_init(&g_mpp);
+            payment_init(&g_payments);
+            invoice_init(&g_invoice_tbl);
+
             memset(&g_bolt8_cfg, 0, sizeof(g_bolt8_cfg));
             g_bolt8_cfg.bolt8_port = bolt8_listen_port;
             memcpy(g_bolt8_cfg.static_priv, lsp.nk_seckey, 32);
             g_bolt8_cfg.ctx = ctx;
+            g_bolt8_cfg.peer_mgr = &g_peer_mgr;
             pthread_t bolt8_tid;
             if (pthread_create(&bolt8_tid, NULL, bolt8_server_thread, NULL) == 0) {
                 pthread_detach(bolt8_tid);
@@ -1952,6 +1996,23 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr,
                         "LSP: warning: failed to start BOLT #8 server on port %u\n",
                         (unsigned)bolt8_listen_port);
+            }
+
+            /* Spawn LN peer message dispatch thread */
+            memset(&g_ln_dispatch, 0, sizeof(g_ln_dispatch));
+            g_ln_dispatch.pmgr         = &g_peer_mgr;
+            g_ln_dispatch.fwd          = &g_fwd;
+            g_ln_dispatch.mpp          = &g_mpp;
+            g_ln_dispatch.payments     = &g_payments;
+            g_ln_dispatch.ctx          = ctx;
+            g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
+            memcpy(g_ln_dispatch.our_privkey, lsp.nk_seckey, 32);
+            pthread_t dispatch_tid;
+            if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
+                pthread_detach(dispatch_tid);
+                printf("LSP: LN peer dispatch thread started\n");
+            } else {
+                fprintf(stderr, "LSP: warning: failed to start LN dispatch thread\n");
             }
         }
 
