@@ -33,6 +33,7 @@
 #define SPLICE_MSG_SPLICE_INIT   78
 #define SPLICE_MSG_SPLICE_ACK    79
 #define SPLICE_MSG_SPLICE_LOCKED 80
+#define MSG_SPLICING_SIGNED      0x004b   /* mutual partial-sig exchange (BOLT #2 §4.9) */
 
 /* Quiescence state */
 #define SPLICE_STATE_NONE       0
@@ -120,6 +121,33 @@ size_t splice_build_splice_ack(const unsigned char channel_id32[32],
                                 int64_t relative_satoshis,
                                 const unsigned char local_funding_pubkey33[33],
                                 unsigned char *buf, size_t buf_cap);
+
+/*
+ * Parse a splice_ack wire message (type 79).
+ * Symmetric to splice_build_splice_ack.
+ * Returns 1 on success.
+ */
+int splice_parse_splice_ack(const unsigned char *msg, size_t msg_len,
+                              unsigned char channel_id32_out[32],
+                              int64_t *relative_satoshis_out,
+                              unsigned char pubkey_out[33]);
+
+/*
+ * Build a splicing_signed wire message (type 0x004b).
+ * type(2) + channel_id(32) + partial_sig(64) = 98 bytes.
+ * Returns bytes written, or 0 on error.
+ */
+size_t splice_build_splicing_signed(const unsigned char channel_id[32],
+                                     const unsigned char partial_sig64[64],
+                                     unsigned char *buf, size_t buf_cap);
+
+/*
+ * Parse a splicing_signed wire message (type 0x004b).
+ * Returns 1 on success.
+ */
+int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
+                                  unsigned char channel_id_out[32],
+                                  unsigned char partial_sig_out[64]);
 
 /*
  * Build a splice_locked wire message (type 80).

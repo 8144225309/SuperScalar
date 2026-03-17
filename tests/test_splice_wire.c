@@ -126,3 +126,103 @@ int test_splice_wire_buffer_small(void)
            "splice_locked returns 0 for small buffer");
     return 1;
 }
+
+/* ---- Test SW6: splice_ack build → parse roundtrip ---- */
+int test_splice_wire_parse_ack(void)
+{
+    unsigned char chan_id[32];
+    memset(chan_id, 0xDD, 32);
+    int64_t rel = -250000;
+    unsigned char pk[33];
+    memset(pk, 0x03, 33);
+    pk[1] = 0x77;
+
+    unsigned char buf[128];
+    size_t len = splice_build_splice_ack(chan_id, rel, pk, buf, sizeof(buf));
+    ASSERT(len == 75, "splice_ack is 75 bytes");
+
+    unsigned char chan_id_out[32];
+    int64_t rel_out = 0;
+    unsigned char pk_out[33];
+    ASSERT(splice_parse_splice_ack(buf, len, chan_id_out, &rel_out, pk_out),
+           "parse_splice_ack succeeds");
+    ASSERT(memcmp(chan_id_out, chan_id, 32) == 0, "channel_id matches");
+    ASSERT(rel_out == rel, "relative_satoshis matches");
+    ASSERT(memcmp(pk_out, pk, 33) == 0, "funding_pubkey matches");
+
+    return 1;
+}
+
+/* ---- Test SW7: splicing_signed build → parse roundtrip ---- */
+int test_splice_wire_splicing_signed(void)
+{
+    unsigned char chan_id[32];
+    memset(chan_id, 0xEE, 32);
+    unsigned char sig[64];
+    memset(sig, 0x55, 64);
+    sig[0] = 0xAB; sig[63] = 0xCD;
+
+    unsigned char buf[128];
+    size_t len = splice_build_splicing_signed(chan_id, sig, buf, sizeof(buf));
+    ASSERT(len == 98, "splicing_signed is 98 bytes");
+
+    uint16_t msg_type = ((uint16_t)buf[0] << 8) | buf[1];
+    ASSERT(msg_type == MSG_SPLICING_SIGNED, "correct wire type 0x004b");
+
+    unsigned char chan_id_out[32], sig_out[64];
+    ASSERT(splice_parse_splicing_signed(buf, len, chan_id_out, sig_out),
+           "parse splicing_signed succeeds");
+    ASSERT(memcmp(chan_id_out, chan_id, 32) == 0, "channel_id matches");
+    ASSERT(memcmp(sig_out, sig, 64) == 0, "partial_sig matches");
+
+    return 1;
+}
+
+/* ---- Test SW8: parse rejects wrong message type ---- */
+int test_splice_wire_wrong_type(void)
+{
+    unsigned char chan_id[32] = {0};
+    unsigned char sig[64] = {0};
+    unsigned char buf[128];
+
+    /* Build a valid splice_ack, then try to parse as splicing_signed */
+    unsigned char pk[33] = {0x02};
+    size_t len = splice_build_splice_ack(chan_id, 0, pk, buf, sizeof(buf));
+    ASSERT(len > 0, "build succeeds");
+    ASSERT(!splice_parse_splicing_signed(buf, len, chan_id, sig),
+           "wrong type rejected by splicing_signed parser");
+
+    /* Build valid splicing_signed, try to parse as splice_ack */
+    len = splice_build_splicing_signed(chan_id, sig, buf, sizeof(buf));
+    ASSERT(len > 0, "build succeeds");
+    unsigned char pk_out[33];
+    int64_t rel_out = 0;
+    ASSERT(!splice_parse_splice_ack(buf, len, chan_id, &rel_out, pk_out),
+           "wrong type rejected by splice_ack parser");
+
+    return 1;
+}
+
+/* ---- Test SW9: parse rejects truncated message ---- */
+int test_splice_wire_truncated(void)
+{
+    unsigned char chan_id[32] = {0};
+    unsigned char sig[64] = {0};
+    unsigned char buf[128];
+
+    /* splicing_signed requires 98 bytes; truncate to 50 */
+    size_t len = splice_build_splicing_signed(chan_id, sig, buf, sizeof(buf));
+    ASSERT(len == 98, "full build succeeded");
+    ASSERT(!splice_parse_splicing_signed(buf, 50, chan_id, sig),
+           "truncated splicing_signed rejected");
+
+    /* splice_ack requires 75 bytes; truncate to 40 */
+    unsigned char pk[33] = {0x02};
+    len = splice_build_splice_ack(chan_id, 0, pk, buf, sizeof(buf));
+    ASSERT(len == 75, "full ack build succeeded");
+    int64_t rel_out = 0;
+    ASSERT(!splice_parse_splice_ack(buf, 40, chan_id, &rel_out, pk),
+           "truncated splice_ack rejected");
+
+    return 1;
+}

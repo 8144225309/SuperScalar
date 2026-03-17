@@ -204,3 +204,43 @@ int splice_parse_splice_locked(const unsigned char *msg, size_t msg_len,
     if (splice_txid32_out) memcpy(splice_txid32_out, msg + 34, 32);
     return 1;
 }
+
+/* ---- Phase 4 additions: parse_splice_ack + splicing_signed ---- */
+
+int splice_parse_splice_ack(const unsigned char *msg, size_t msg_len,
+                              unsigned char channel_id32_out[32],
+                              int64_t *relative_satoshis_out,
+                              unsigned char pubkey_out[33])
+{
+    /* type(2) + channel_id(32) + relative_satoshis(8) + funding_pubkey(33) = 75 */
+    if (!msg || msg_len < 75) return 0;
+    if (get_u16_be(msg) != SPLICE_MSG_SPLICE_ACK) return 0;
+    if (channel_id32_out)       memcpy(channel_id32_out, msg + 2, 32);
+    if (relative_satoshis_out)  *relative_satoshis_out = get_i64_be(msg + 34);
+    if (pubkey_out)             memcpy(pubkey_out, msg + 42, 33);
+    return 1;
+}
+
+size_t splice_build_splicing_signed(const unsigned char channel_id[32],
+                                     const unsigned char partial_sig64[64],
+                                     unsigned char *buf, size_t buf_cap)
+{
+    /* type(2) + channel_id(32) + partial_sig(64) = 98 bytes */
+    if (buf_cap < 98) return 0;
+    size_t pos = 0;
+    put_u16_be(buf + pos, MSG_SPLICING_SIGNED); pos += 2;
+    memcpy(buf + pos, channel_id, 32);          pos += 32;
+    memcpy(buf + pos, partial_sig64, 64);        pos += 64;
+    return pos;
+}
+
+int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
+                                  unsigned char channel_id_out[32],
+                                  unsigned char partial_sig_out[64])
+{
+    if (!msg || msg_len < 98) return 0;
+    if (get_u16_be(msg) != MSG_SPLICING_SIGNED) return 0;
+    if (channel_id_out)   memcpy(channel_id_out,   msg + 2,  32);
+    if (partial_sig_out)  memcpy(partial_sig_out,  msg + 34, 64);
+    return 1;
+}
