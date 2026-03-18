@@ -160,3 +160,81 @@ int test_payment_keysend_hash(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ================================================================== */
+/* PAY6 — payment_check_timeouts: expired + max attempts → FAILED     */
+/* ================================================================== */
+int test_payment_timeout_expires_inflight(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+
+    payment_t *p = &pt.entries[0];
+    p->state       = PAY_STATE_INFLIGHT;
+    p->attempt_at  = 1000; /* long ago */
+    p->n_attempts  = PAYMENT_MAX_ATTEMPTS;
+    p->n_routes    = 0;
+    pt.count       = 1;
+
+    uint32_t now = 1000 + PAYMENT_TIMEOUT_SECS + 1;
+    int expired = payment_check_timeouts(&pt, NULL, NULL, NULL,
+                                          NULL, NULL, NULL, now);
+    ASSERT(expired == 1, "PAY6: 1 payment expired");
+    ASSERT(p->state == PAY_STATE_FAILED, "PAY6: state -> FAILED");
+    ASSERT(strlen(p->last_error) > 0, "PAY6: last_error populated");
+    return 1;
+}
+
+/* ================================================================== */
+/* PAY7 — payment_check_timeouts: not yet expired → unchanged         */
+/* ================================================================== */
+int test_payment_timeout_ignores_recent(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+
+    payment_t *p = &pt.entries[0];
+    p->state      = PAY_STATE_INFLIGHT;
+    p->attempt_at = 1000;
+    pt.count      = 1;
+
+    uint32_t now = 1000 + 10; /* only 10 s, well within 60 s */
+    int expired = payment_check_timeouts(&pt, NULL, NULL, NULL,
+                                          NULL, NULL, NULL, now);
+    ASSERT(expired == 0, "PAY7: no expiry on recent payment");
+    ASSERT(p->state == PAY_STATE_INFLIGHT, "PAY7: state unchanged");
+    return 1;
+}
+
+/* ================================================================== */
+/* PAY8 — payment_check_timeouts: non-inflight states ignored         */
+/* ================================================================== */
+int test_payment_timeout_ignores_non_inflight(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+
+    pt.entries[0].state = PAY_STATE_SUCCESS;  pt.entries[0].attempt_at = 0;
+    pt.entries[1].state = PAY_STATE_PENDING;  pt.entries[1].attempt_at = 0;
+    pt.entries[2].state = PAY_STATE_FAILED;   pt.entries[2].attempt_at = 0;
+    pt.count = 3;
+
+    int expired = payment_check_timeouts(&pt, NULL, NULL, NULL,
+                                          NULL, NULL, NULL, 9999999);
+    ASSERT(expired == 0, "PAY8: non-inflight states ignored");
+    ASSERT(pt.entries[0].state == PAY_STATE_SUCCESS, "PAY8: SUCCESS unchanged");
+    ASSERT(pt.entries[1].state == PAY_STATE_PENDING, "PAY8: PENDING unchanged");
+    ASSERT(pt.entries[2].state == PAY_STATE_FAILED,  "PAY8: FAILED unchanged");
+    return 1;
+}
+
+/* ================================================================== */
+/* PAY9 — payment_check_timeouts: NULL table → no crash               */
+/* ================================================================== */
+int test_payment_timeout_null_table(void)
+{
+    int r = payment_check_timeouts(NULL, NULL, NULL, NULL,
+                                    NULL, NULL, NULL, 12345);
+    ASSERT(r == 0, "PAY9: NULL table returns 0, no crash");
+    return 1;
+}

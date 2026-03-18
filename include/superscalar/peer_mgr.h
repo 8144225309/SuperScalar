@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <secp256k1.h>
 #include "bolt8.h"
+#include "channel.h"
 
 #define PEER_MGR_MAX_PEERS  64
 
@@ -27,6 +28,14 @@ typedef struct {
     uint32_t      connected_at;      /* Unix timestamp */
     int           has_channel;       /* 1 if a channel is open with this peer */
     uint16_t      peer_features;     /* features from their BOLT #1 init */
+    uint64_t      channel_scid;      /* short_channel_id of open channel (0=none) */
+    /* Phase O: reconnect state */
+    uint32_t      disconnected_at;   /* Unix ts of disconnect; 0 = connected */
+    int           reconnect_attempts;
+    uint32_t      next_reconnect_at; /* earliest time to retry */
+    unsigned char saved_pubkey[33];  /* preserved across disconnect */
+    char          saved_host[256];   /* preserved across disconnect */
+    uint16_t      saved_port;
 } peer_entry_t;
 
 typedef struct {
@@ -87,6 +96,26 @@ void peer_mgr_disconnect(peer_mgr_t *mgr, int peer_idx);
  * Returns peer index, or -1 if not connected.
  */
 int peer_mgr_find(const peer_mgr_t *mgr, const unsigned char pubkey33[33]);
+
+/*
+ * Find a connected peer by its short_channel_id.
+ * Returns peer index, or -1 if not found.
+ */
+int peer_mgr_find_by_scid(const peer_mgr_t *mgr, uint64_t scid);
+
+/*
+ * Mark a peer as transiently disconnected (close fd, set reconnect timer).
+ * Slot is retained; peer will be reconnected by peer_mgr_reconnect_all().
+ */
+void peer_mgr_mark_disconnected(peer_mgr_t *mgr, int peer_idx,
+                                 uint32_t backoff_secs);
+
+/*
+ * Attempt to reconnect all disconnected peers whose next_reconnect_at <= now.
+ * Runs BOLT #8 + BOLT #1 init on success. ch_table[peer_idx] if non-NULL
+ * triggers chan_reestablish after reconnect. Returns reconnected count.
+ */
+int peer_mgr_reconnect_all(peer_mgr_t *mgr, channel_t **ch_table, uint32_t now);
 
 /*
  * Configure a SOCKS5 proxy for outbound .onion connections.

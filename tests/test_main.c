@@ -200,6 +200,13 @@ extern int test_lsps2_pending_lookup_found(void);
 extern int test_ln_dispatch_jit_pending_wired(void);
 extern int test_lsps2_intercept_htlc_below_cost(void);
 
+/* PR #25: Phase M/N dispatch wiring */
+extern int test_ln_dispatch_routes_commitment_signed(void);
+extern int test_ln_dispatch_routes_revoke_and_ack(void);
+extern int test_ln_dispatch_routes_update_fee(void);
+extern int test_ln_dispatch_routes_channel_reestablish(void);
+extern int test_ln_dispatch_flush_relay_empty(void);
+
 /* Gap fixes: LSPS1 FAILED, LSPS2 expiry, JIT open callback */
 extern int test_lsps1_order_tick_fails(void);
 extern int test_lsps1_order_tick_already_failed(void);
@@ -249,6 +256,13 @@ extern int test_htlc_forward_settle(void);
 extern int test_htlc_forward_fail(void);
 extern int test_htlc_forward_init(void);
 
+/* PR #25: Phase N relay pump */
+extern int test_htlc_forward_entry_has_next_onion(void);
+extern int test_htlc_forward_relay_state_pending(void);
+extern int test_htlc_forward_in_channel_id_field(void);
+extern int test_htlc_forward_find_by_scid_empty(void);
+extern int test_htlc_forward_find_by_scid_found(void);
+
 /* PR #20 Phase 3: Peer Manager + BOLT #2 Channel Open */
 extern int test_peer_mgr_init(void);
 extern int test_peer_mgr_find_unknown(void);
@@ -264,6 +278,12 @@ extern int test_payment_send_no_route(void);
 extern int test_payment_on_settle(void);
 extern int test_payment_keysend_no_route(void);
 extern int test_payment_keysend_hash(void);
+
+/* PR #25: Phase P payment timeout */
+extern int test_payment_timeout_expires_inflight(void);
+extern int test_payment_timeout_ignores_recent(void);
+extern int test_payment_timeout_ignores_non_inflight(void);
+extern int test_payment_timeout_null_table(void);
 
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
@@ -327,6 +347,15 @@ extern int test_lsps0_lsps2_get_info(void);
 extern int test_peer_mgr_tor_proxy_set(void);
 extern int test_peer_mgr_onion_no_proxy(void);
 extern int test_peer_mgr_clearnet_bypass_tor(void);
+
+/* PR #25: Phase O reconnect */
+extern int test_peer_mgr_mark_disconnected_preserves(void);
+extern int test_peer_mgr_mark_disconnected_caps_backoff(void);
+extern int test_peer_mgr_mark_disconnected_increments(void);
+extern int test_peer_mgr_reconnect_all_skips_early(void);
+extern int test_peer_mgr_reconnect_all_fails_gracefully(void);
+extern int test_peer_mgr_reconnect_all_skips_connected(void);
+extern int test_peer_mgr_channel_scid_field(void);
 extern int test_tor_parse_proxy_arg_basic(void);
 /* PR #22 Phase 2: Invoice receivability */
 extern int test_invoice_create_decode(void);
@@ -1197,6 +1226,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ln_dispatch_jit_pending_wired);
     RUN_TEST(test_lsps2_intercept_htlc_below_cost);
 
+    printf("\n=== PR #25 Phase M: Commitment Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_routes_commitment_signed);
+    RUN_TEST(test_ln_dispatch_routes_revoke_and_ack);
+    RUN_TEST(test_ln_dispatch_routes_update_fee);
+    RUN_TEST(test_ln_dispatch_routes_channel_reestablish);
+    RUN_TEST(test_ln_dispatch_flush_relay_empty);
+
     printf("\n=== Gap Fixes: LSPS1 FAILED + LSPS2 Expiry + JIT Callback ===\n");
     RUN_TEST(test_lsps1_order_tick_fails);
     RUN_TEST(test_lsps1_order_tick_already_failed);
@@ -1305,6 +1341,13 @@ static void run_unit_tests(void) {
 
     printf("\n=== HTLC Forwarding ===\n");
     RUN_TEST(test_htlc_forward_init);
+
+    printf("\n=== PR #25 Phase N: Relay Pump ===\n");
+    RUN_TEST(test_htlc_forward_entry_has_next_onion);
+    RUN_TEST(test_htlc_forward_relay_state_pending);
+    RUN_TEST(test_htlc_forward_in_channel_id_field);
+    RUN_TEST(test_htlc_forward_find_by_scid_empty);
+    RUN_TEST(test_htlc_forward_find_by_scid_found);
     RUN_TEST(test_htlc_forward_final);
     RUN_TEST(test_htlc_forward_settle);
     RUN_TEST(test_htlc_forward_fail);
@@ -1314,6 +1357,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_peer_mgr_find_unknown);
     RUN_TEST(test_peer_mgr_connect_fail);
     RUN_TEST(test_peer_mgr_disconnect);
+
+    printf("\n=== PR #25 Phase O: Peer Reconnect ===\n");
+    RUN_TEST(test_peer_mgr_mark_disconnected_preserves);
+    RUN_TEST(test_peer_mgr_mark_disconnected_caps_backoff);
+    RUN_TEST(test_peer_mgr_mark_disconnected_increments);
+    RUN_TEST(test_peer_mgr_reconnect_all_skips_early);
+    RUN_TEST(test_peer_mgr_reconnect_all_fails_gracefully);
+    RUN_TEST(test_peer_mgr_reconnect_all_skips_connected);
+    RUN_TEST(test_peer_mgr_channel_scid_field);
 
     printf("\n=== BOLT #2 Channel Open ===\n");
     RUN_TEST(test_chan_open_build_open_channel);
@@ -1326,6 +1378,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_payment_on_settle);
     RUN_TEST(test_payment_keysend_no_route);
     RUN_TEST(test_payment_keysend_hash);
+
+    printf("\n=== PR #25 Phase P: Payment Timeout ===\n");
+    RUN_TEST(test_payment_timeout_expires_inflight);
+    RUN_TEST(test_payment_timeout_ignores_recent);
+    RUN_TEST(test_payment_timeout_ignores_non_inflight);
+    RUN_TEST(test_payment_timeout_null_table);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);

@@ -928,3 +928,97 @@ int test_jit_open_cb_null_guard(void)
     /* Reaching here without crash = pass */
     return 1;
 }
+
+/* ================================================================== */
+/* LD1 — ln_dispatch_process_msg routes type 132 (commitment_signed)  */
+/* ================================================================== */
+int test_ln_dispatch_routes_commitment_signed(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    /* No peer_channels → htlc_commit_dispatch skipped, returns type */
+
+    /* Build minimal commitment_signed: type(2) + channel_id(32) + sig(64) = 98 */
+    unsigned char msg[100];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 132; /* type 132 */
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 132, "LD1: type 132 routes correctly, returns 132");
+    return 1;
+}
+
+/* ================================================================== */
+/* LD2 — ln_dispatch_process_msg routes type 133 (revoke_and_ack)     */
+/* ================================================================== */
+int test_ln_dispatch_routes_revoke_and_ack(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    unsigned char msg[100];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 133;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 133, "LD2: type 133 routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* LD3 — ln_dispatch_process_msg routes type 134 (update_fee)         */
+/* ================================================================== */
+int test_ln_dispatch_routes_update_fee(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    /* update_fee: type(2) + channel_id(32) + feerate_per_kw(4) = 38 bytes */
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 134;
+    /* feerate at offset 34: 1000 sat/kw big-endian */
+    msg[34] = 0; msg[35] = 0; msg[36] = 0x03; msg[37] = 0xE8;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 134, "LD3: type 134 routes correctly, returns 134");
+    return 1;
+}
+
+/* ================================================================== */
+/* LD4 — ln_dispatch_process_msg routes type 136 (channel_reestablish)*/
+/* ================================================================== */
+int test_ln_dispatch_routes_channel_reestablish(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    unsigned char msg[120];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 136;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 136, "LD4: type 136 routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* LD5 — ln_dispatch_flush_relay with empty fwd → returns 0, no crash */
+/* ================================================================== */
+int test_ln_dispatch_flush_relay_empty(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    static htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    d.fwd = &fwd;
+
+    peer_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    d.pmgr = &mgr;
+
+    int r = ln_dispatch_flush_relay(&d);
+    ASSERT(r == 0, "LD5: empty fwd returns 0");
+    return 1;
+}

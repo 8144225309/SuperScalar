@@ -8,6 +8,8 @@
  */
 
 #include "superscalar/peer_mgr.h"
+#include "superscalar/chan_open.h"
+#include <time.h>
 #include "superscalar/bolt8.h"
 #include "superscalar/tor.h"
 #include "superscalar/bolt8_server.h"   /* bolt8_init_exchange */
@@ -242,4 +244,103 @@ void peer_mgr_set_proxy(peer_mgr_t *mgr, const char *host, int port) {
     if (host)
         strncpy(mgr->tor_proxy_host, host, sizeof(mgr->tor_proxy_host) - 1);
     mgr->tor_proxy_port = port;
+}
+
+int peer_mgr_find_by_scid(const peer_mgr_t *mgr, uint64_t scid)
+{
+    if (!mgr || scid == 0) return -1;
+    for (int i = 0; i < mgr->count; i++) {
+        if (mgr->peers[i].fd >= 0 &&
+            mgr->peers[i].channel_scid == scid)
+            return i;
+    }
+    return -1;
+}
+
+void peer_mgr_mark_disconnected(peer_mgr_t *mgr, int peer_idx,
+                                  uint32_t backoff_secs)
+{
+    if (!mgr || peer_idx < 0 || peer_idx >= mgr->count) return;
+    peer_entry_t *p = &mgr->peers[peer_idx];
+    if (p->fd >= 0) { close(p->fd); p->fd = -1; }
+    memcpy(p->saved_pubkey, p->pubkey, 33);
+    strncpy(p->saved_host, p->host, sizeof(p->saved_host) - 1);
+    p->saved_port = p->port;
+    p->disconnected_at = (uint32_t)time(NULL);
+    p->reconnect_attempts++;
+    uint32_t back = backoff_secs < 1   ? 1   :
+                    backoff_secs > 300 ? 300 : backoff_secs;
+    p->next_reconnect_at = p->disconnected_at + back;
+}
+
+int peer_mgr_reconnect_all(peer_mgr_t *mgr, channel_t **ch_table, uint32_t now)
+{
+    if (!mgr) return 0;
+    int reconnected = 0;
+    for (int i = 0; i < mgr->count; i++) {
+        peer_entry_t *p = &mgr->peers[i];
+        if (p->fd >= 0) continue;                    /* already connected */
+        if (p->disconnected_at == 0) continue;       /* never disconnected */
+        if (now < p->next_reconnect_at) continue;    /* too early */
+
+        /* Attempt TCP + BOLT #8 reconnect */
+        int fd = tcp_connect(p->saved_host, p->saved_port);
+        if (fd < 0) {
+            /* back off further */
+            uint32_t back = 5u << (p->reconnect_attempts < 6
+                                   ? (unsigned)p->reconnect_attempts : 6u);
+            if (back > 300) back = 300;
+            p->next_reconnect_at = now + back;
+            p->reconnect_attempts++;
+            continue;
+        }
+
+        /* Run BOLT #8 outbound (initiator) handshake */
+        {
+            int hs_ok = 0;
+            unsigned char eph[32], act1[BOLT8_ACT1_SIZE];
+            unsigned char act2[BOLT8_ACT2_SIZE], act3[BOLT8_ACT3_SIZE];
+            bolt8_hs_t hs;
+            bolt8_state_t new_st;
+            FILE *rnd = fopen("/dev/urandom", "rb");
+            if (rnd && fread(eph, 1, 32, rnd) == 32) {
+                fclose(rnd); rnd = NULL;
+                bolt8_hs_init(&hs, p->saved_pubkey);
+                if (bolt8_act1_create(&hs, mgr->ctx, eph, p->saved_pubkey, act1) &&
+                    send(fd, act1, BOLT8_ACT1_SIZE, 0) == BOLT8_ACT1_SIZE &&
+                    recv(fd, act2, BOLT8_ACT2_SIZE, MSG_WAITALL) == BOLT8_ACT2_SIZE &&
+                    bolt8_act2_process(&hs, mgr->ctx, act2) &&
+                    bolt8_act3_create(&hs, mgr->ctx, mgr->our_privkey, act3, &new_st) &&
+                    send(fd, act3, BOLT8_ACT3_SIZE, 0) == BOLT8_ACT3_SIZE &&
+                    bolt8_init_exchange(&new_st, fd)) {
+                    p->bolt8 = new_st;
+                    hs_ok = 1;
+                }
+            }
+            if (rnd) fclose(rnd);
+            if (!hs_ok) {
+                close(fd);
+                uint32_t back = 5u << (p->reconnect_attempts < 6
+                                       ? (unsigned)p->reconnect_attempts : 6u);
+                if (back > 300) back = 300;
+                p->next_reconnect_at = now + back;
+                p->reconnect_attempts++;
+                continue;
+            }
+        }
+
+        /* Success */
+        p->fd = fd;
+        memcpy(p->pubkey, p->saved_pubkey, 33);
+        strncpy(p->host, p->saved_host, sizeof(p->host) - 1);
+        p->port = p->saved_port;
+        p->disconnected_at   = 0;
+        p->reconnect_attempts = 0;
+        reconnected++;
+
+        /* Channel reestablish if we have a channel with this peer */
+        if (p->has_channel && ch_table && ch_table[i])
+            chan_reestablish(mgr, i, mgr->ctx, ch_table[i]);
+    }
+    return reconnected;
 }

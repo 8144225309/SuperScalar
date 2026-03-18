@@ -186,6 +186,16 @@ int onion_parse_tlv_payload(const unsigned char *payload, size_t payload_len,
                 out->has_payment_data = 1;
             }
             break;
+        case 6: /* short_channel_id: u64 BE (relay hop next-hop SCID) */
+            if (length == 8) {
+                out->short_channel_id = ((uint64_t)val[0] << 56)
+                    | ((uint64_t)val[1] << 48) | ((uint64_t)val[2] << 40)
+                    | ((uint64_t)val[3] << 32) | ((uint64_t)val[4] << 24)
+                    | ((uint64_t)val[5] << 16) | ((uint64_t)val[6] <<  8)
+                    |  (uint64_t)val[7];
+                out->has_scid = 1;
+            }
+            break;
         default:
             /* Unknown TLV: skip (even types are required, odd are optional).
                For simplicity, skip all unknown types. */

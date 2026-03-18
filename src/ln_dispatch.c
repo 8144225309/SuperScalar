@@ -14,11 +14,14 @@
 #include "superscalar/bolt12.h"
 #include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
+#include "superscalar/chan_open.h"
+#include "superscalar/payment.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <time.h>
 
 /* ---- Wire message type constants (BOLT #2) ---- */
 #define MSG_UPDATE_ADD_HTLC       128   /* 0x0080 */
@@ -126,7 +129,11 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             /* Onion decryption failed — send update_fail_malformed_htlc */
             (void)fwd_out;
         }
-        /* FORWARD_RELAY: queued for outbound relay (handled upstream) */
+        /* Phase N: copy in_channel_id into forward entry */
+        if (result == FORWARD_RELAY) {
+            htlc_forward_entry_t *fe = &d->fwd->entries[d->fwd->count - 1];
+            memcpy(fe->in_channel_id, p, 32); /* p[0..31] = channel_id */
+        }
         return (int)msg_type;
     }
 
@@ -163,16 +170,37 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
     }
 
     case MSG_COMMITMENT_SIGNED:
-    case MSG_CHANNEL_REESTABLISH:
-        /* Forward to htlc_commit layer — handled by htlc_commit_dispatch
-         * when the caller uses that path.  Here we simply acknowledge
-         * the type was recognized. */
+    case MSG_REVOKE_AND_ACK: {
+        /* Phase M: dispatch to htlc_commit layer for full round-trip */
+        if (msg_len < 2 + 32) return -1;
+        const unsigned char *channel_id = msg + 2;
+        channel_t *ch = (d->peer_channels && peer_idx >= 0)
+                        ? d->peer_channels[peer_idx] : NULL;
+        if (ch && d->pmgr)
+            htlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx,
+                                  channel_id, msg, msg_len);
         return (int)msg_type;
+    }
 
-    case MSG_REVOKE_AND_ACK:
-        /* Acknowledge revoke_and_ack; watchtower registration is handled
-         * in the daemon layer via g_watchtower after commitment update. */
+    case MSG_CHANNEL_REESTABLISH: {
+        /* Phase M: run channel reestablish after reconnect */
+        channel_t *ch = (d->peer_channels && peer_idx >= 0)
+                        ? d->peer_channels[peer_idx] : NULL;
+        if (ch && d->pmgr)
+            chan_reestablish(d->pmgr, peer_idx, d->ctx, ch);
         return (int)msg_type;
+    }
+
+    case 134: { /* update_fee: channel_id(32) + feerate_per_kw(4) */
+        if (msg_len < 2 + 32 + 4) return -1;
+        channel_t *ch = (d->peer_channels && peer_idx >= 0)
+                        ? d->peer_channels[peer_idx] : NULL;
+        if (ch)
+            htlc_commit_recv_update_fee(ch, msg, msg_len,
+                                         BOLT2_UPDATE_FEE_FLOOR,
+                                         BOLT2_UPDATE_FEE_CEILING);
+        return 134;
+    }
 
     case MSG_UPDATE_FAIL_MALFORMED: {
         /*
@@ -251,9 +279,11 @@ void ln_dispatch_run(ln_dispatch_t *d)
         }
 
         if (maxfd < 0) {
-            /* No connected peers — sleep briefly and retry */
+            /* No connected peers — attempt reconnects then sleep */
             struct timeval tv = { 0, 100000 };  /* 100 ms */
             select(0, NULL, NULL, NULL, &tv);
+            peer_mgr_reconnect_all(d->pmgr, d->peer_channels,
+                                    (uint32_t)time(NULL));
             continue;
         }
 
@@ -261,6 +291,13 @@ void ln_dispatch_run(ln_dispatch_t *d)
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         /* Gap 2: expire stale JIT pending entries on each tick */
         if (d->jit_pending) lsps2_pending_expire(d->jit_pending);
+        /* Phase O: reconnect any peers whose backoff timer has expired */
+        uint32_t now_ts = (uint32_t)time(NULL);
+        peer_mgr_reconnect_all(d->pmgr, d->peer_channels, now_ts);
+        /* Phase P: expire stale payment attempts */
+        if (d->payments)
+            payment_check_timeouts(d->payments, NULL, d->fwd, d->mpp,
+                                    d->pmgr, d->ctx, d->our_privkey, now_ts);
         if (sel <= 0) continue;
 
         for (int i = 0; i < d->pmgr->count && !*d->shutdown_flag; i++) {
@@ -270,11 +307,56 @@ void ln_dispatch_run(ln_dispatch_t *d)
             msg_len = sizeof(msg_buf);
             int r = peer_mgr_recv(d->pmgr, i, msg_buf, &msg_len, sizeof(msg_buf));
             if (!r) {
-                peer_mgr_disconnect(d->pmgr, i);
+                /* Phase O: transient disconnect — retain slot for reconnect */
+                uint32_t backoff = (uint32_t)(5u << (d->pmgr->peers[i].reconnect_attempts < 6
+                                              ? (unsigned)d->pmgr->peers[i].reconnect_attempts : 6u));
+                if (backoff > 300) backoff = 300;
+                peer_mgr_mark_disconnected(d->pmgr, i, backoff);
                 continue;
             }
 
             ln_dispatch_process_msg(d, i, msg_buf, msg_len);
+            ln_dispatch_flush_relay(d);
         }
     }
+}
+
+/* -----------------------------------------------------------------------
+ * Phase N: relay pump — flush FORWARD_STATE_PENDING_OUT HTLCs to next peers
+ * --------------------------------------------------------------------- */
+int ln_dispatch_flush_relay(ln_dispatch_t *d)
+{
+    if (!d || !d->fwd || !d->pmgr) return 0;
+    int sent = 0;
+
+    for (int i = 0; i < d->fwd->count; i++) {
+        htlc_forward_entry_t *e = &d->fwd->entries[i];
+        if (e->state != FORWARD_STATE_PENDING_OUT) continue;
+
+        /* Find outbound peer by SCID */
+        int out_idx = peer_mgr_find_by_scid(d->pmgr, e->next_hop_scid);
+        if (out_idx < 0) continue; /* peer not connected yet */
+
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[out_idx] : NULL;
+        if (!ch) continue; /* no channel state for this peer */
+
+        /* Use funding_txid as BOLT #2 channel_id (approximation) */
+        uint64_t htlc_id_out = 0;
+        int ok = htlc_commit_add_and_sign(d->pmgr, out_idx, ch, d->ctx,
+                                           ch->funding_txid,
+                                           e->out_amount_msat,
+                                           e->payment_hash,
+                                           e->out_cltv,
+                                           e->next_onion,
+                                           &htlc_id_out);
+        if (ok) {
+            e->out_htlc_id = htlc_id_out;
+            e->out_chan_id  = e->next_hop_scid;
+            e->state        = FORWARD_STATE_INFLIGHT;
+            sent++;
+        } else {
+            e->state = FORWARD_STATE_FAILED;
+        }
+    }
+    return sent;
 }

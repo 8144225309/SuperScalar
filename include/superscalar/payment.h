@@ -23,6 +23,7 @@
 #define PAYMENT_TABLE_MAX   64
 #define PAYMENT_MAX_ROUTES   8   /* MPP shards */
 #define PAYMENT_MAX_ATTEMPTS 3   /* retry limit (CLN/LDK default) */
+#define PAYMENT_TIMEOUT_SECS 60  /* BOLT #11 default: 60 s per attempt */
 
 typedef enum {
     PAY_STATE_PENDING = 0,
@@ -109,5 +110,21 @@ int payment_on_fail(payment_table_t *pt,
                     const unsigned char our_priv[32],
                     const unsigned char payment_hash[32],
                     const unsigned char *onion_error, size_t err_len);
+
+/*
+ * Check all INFLIGHT payments for timeout. Payments where
+ * (now - attempt_at) >= PAYMENT_TIMEOUT_SECS are retried
+ * (if n_attempts < PAYMENT_MAX_ATTEMPTS) or marked FAILED.
+ * gs/fwd/mpp/pmgr/ctx/our_priv may be NULL (skips retry send).
+ * Returns number of payments that expired.
+ */
+int payment_check_timeouts(payment_table_t *pt,
+                            gossip_store_t *gs,
+                            htlc_forward_table_t *fwd,
+                            mpp_table_t *mpp,
+                            peer_mgr_t *pmgr,
+                            secp256k1_context *ctx,
+                            const unsigned char *our_priv,
+                            uint32_t now);
 
 #endif /* SUPERSCALAR_PAYMENT_H */

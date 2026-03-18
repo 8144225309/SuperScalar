@@ -388,3 +388,64 @@ int payment_on_fail(payment_table_t *pt,
              pay->n_attempts);
     return 0;
 }
+
+/* -----------------------------------------------------------------------
+ * Phase P: payment timeout — retry or fail stale INFLIGHT payments
+ * --------------------------------------------------------------------- */
+int payment_check_timeouts(payment_table_t *pt,
+                             gossip_store_t *gs,
+                             htlc_forward_table_t *fwd,
+                             mpp_table_t *mpp,
+                             peer_mgr_t *pmgr,
+                             secp256k1_context *ctx,
+                             const unsigned char *our_priv,
+                             uint32_t now)
+{
+    if (!pt) return 0;
+    int expired = 0;
+    for (int i = 0; i < pt->count; i++) {
+        payment_t *p = &pt->entries[i];
+        if (p->state != PAY_STATE_INFLIGHT) continue;
+        if (now - p->attempt_at < PAYMENT_TIMEOUT_SECS) continue;
+        expired++;
+        if (p->n_attempts < PAYMENT_MAX_ATTEMPTS &&
+            gs && fwd && mpp && pmgr && ctx && our_priv &&
+            p->n_routes > 0) {
+            /* Retry: re-find route and re-send */
+            unsigned char our_pub[33];
+            secp256k1_pubkey pub;
+            if (secp256k1_ec_pubkey_create(ctx, &pub, our_priv)) {
+                size_t plen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, our_pub, &plen,
+                                               &pub, SECP256K1_EC_COMPRESSED);
+                p->n_attempts++;
+                p->attempt_at = now;
+                p->state = PAY_STATE_RETRYING;
+                unsigned char dest[33];
+                int last = p->routes[0].n_hops - 1;
+                if (last >= 0)
+                    memcpy(dest, p->routes[0].hops[last].node_id, 33);
+                pathfind_route_t new_route;
+                if (last >= 0 && pathfind_route(gs, our_pub, dest,
+                                                 p->amount_msat, &new_route)) {
+                    p->routes[0] = new_route;
+                    p->state = PAY_STATE_INFLIGHT;
+                    do_payment_send(p, gs, fwd, mpp, pmgr, ctx,
+                                    our_priv, our_pub, p->amount_msat, 0);
+                } else {
+                    p->state = PAY_STATE_FAILED;
+                    snprintf(p->last_error, sizeof(p->last_error),
+                             "timeout retry: no route");
+                }
+            } else {
+                p->state = PAY_STATE_FAILED;
+                snprintf(p->last_error, sizeof(p->last_error), "timeout");
+            }
+        } else {
+            p->state = PAY_STATE_FAILED;
+            snprintf(p->last_error, sizeof(p->last_error),
+                     "timeout after %d attempt(s)", p->n_attempts);
+        }
+    }
+    return expired;
+}
