@@ -21,6 +21,7 @@
 #include "payment.h"
 #include "invoice.h"
 #include "watchtower.h"
+#include "lsps.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -36,6 +37,7 @@ typedef struct {
     volatile int          *shutdown_flag; /* set non-zero to stop loop */
     bolt11_invoice_table_t *invoices;      /* inbound invoice registry; NULL = no lookup */
     watchtower_t           *watchtower;    /* breach watcher; NULL = disabled */
+    lsps2_pending_table_t  *jit_pending;   /* JIT intercept table; NULL = disabled */
 } ln_dispatch_t;
 
 /*
