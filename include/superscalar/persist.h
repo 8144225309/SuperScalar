@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 5
+#define PERSIST_SCHEMA_VERSION 8
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -503,5 +503,69 @@ int persist_save_pending_cs(persist_t *p, uint32_t channel_id,
 /* Load pending CS for channel_id into *cn_out. Returns 1 if found, 0 if none. */
 int persist_load_pending_cs(persist_t *p, uint32_t channel_id,
                              uint64_t *cn_out);
+/* --- LSP endpoint cache (schema v4) ---
+ *
+ * Cache the resolved host/port/pubkey for a domain so clients don't need to
+ * re-fetch /.well-known/lsps.json on every start.
+ */
+int persist_save_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               const char *host,
+                               uint16_t    port,
+                               const char *pubkey_hex);
+
+/* Returns 1 if found, 0 otherwise. host_out/pubkey_out buffers are NUL-terminated. */
+int persist_load_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               char *host_out,       size_t host_cap,
+                               uint16_t   *port_out,
+                               char *pubkey_hex_out, size_t pubkey_cap);
+
+/* -----------------------------------------------------------------------
+ * Schema v5: SCID registry + inbound HTLC tracking
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Upsert a factory leaf → fake SCID mapping.
+ * factory_id: 24-bit factory internal ID
+ * leaf_idx:   24-bit leaf index within the factory
+ * scid:       the encoded fake short_channel_id
+ */
+int persist_save_scid_entry(persist_t *p,
+                             uint32_t factory_id,
+                             uint32_t leaf_idx,
+                             uint64_t scid);
+
+/* Returns 1 if found, 0 otherwise. */
+int persist_load_scid_entry(persist_t *p,
+                             uint64_t scid,
+                             uint32_t *factory_id_out,
+                             uint32_t *leaf_idx_out);
+
+/* -----------------------------------------------------------------------
+ * Schema v6: inbound HTLC persistence (survive restarts)
+ * ----------------------------------------------------------------------- */
+
+#include "superscalar/htlc_inbound.h"
+
+/*
+ * Persist an inbound HTLC record (INSERT OR REPLACE).
+ * Call on htlc_inbound_add() and again on state transitions.
+ */
+int persist_save_htlc_inbound(persist_t *p, const htlc_inbound_t *h);
+
+/*
+ * Load all PENDING inbound HTLCs into tbl on startup.
+ * Returns number of HTLCs loaded, or -1 on error.
+ */
+int persist_load_htlc_inbound_pending(persist_t *p, htlc_inbound_table_t *tbl);
+
+/*
+ * Update state (and preimage) for an existing HTLC record.
+ * preimage may be NULL if state != HTLC_INBOUND_FULFILLED.
+ */
+int persist_update_htlc_inbound(persist_t *p, uint64_t htlc_id,
+                                 htlc_inbound_state_t state,
+                                 const unsigned char preimage[32]);
 
 #endif /* SUPERSCALAR_PERSIST_H */

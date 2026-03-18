@@ -1,4 +1,8 @@
 #include "superscalar/lsps.h"
+=======
+#include "superscalar/wire.h"
+>>>>>>> origin/superscalar-ln-parity-
+#include "superscalar/wire.h"
 #include <cJSON.h>
 #include <string.h>
 #include <stdio.h>
@@ -234,5 +238,353 @@ int test_lsps1_get_order(void)
            "get_order unknown id returns error response (handled)");
     cJSON_Delete(bad_req);
 
+    return 1;
+}
+=======
+
+/* ================================================================== */
+/* SM1 — lsps1_order_fund() transitions order 1 to "PENDING_FUNDING" */
+/*       (order 1 was created by E9 / test_lsps1_get_order)          */
+/* ================================================================== */
+int test_lsps1_order_fund_pending(void)
+{
+    /* Order 1 exists in CREATED state from E9 */
+    int r = lsps1_order_fund(1,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        100, -1);
+    ASSERT(r == 1, "lsps1_order_fund returns 1");
+
+    /* Second call on same order (now PENDING_FUNDING) must return 0 */
+    int r2 = lsps1_order_fund(1,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        101, -1);
+    ASSERT(r2 == 0, "double-fund returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM2 — lsps1_order_tick() below threshold: no state change         */
+/* ================================================================== */
+int test_lsps1_order_tick_below_threshold(void)
+{
+    /* funded_at=100, confs=3: threshold = 103. Tick at 102 → no change */
+    int r = lsps1_order_tick(1, 102);
+    ASSERT(r == 0, "tick below threshold returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM3 — lsps1_order_tick() at threshold: transitions to COMPLETED   */
+/* ================================================================== */
+int test_lsps1_order_tick_completes(void)
+{
+    int r = lsps1_order_tick(1, 103);
+    ASSERT(r == 1, "tick at threshold returns 1 (COMPLETED)");
+
+    /* Idempotent: another tick on completed order returns 0 */
+    int r2 = lsps1_order_tick(1, 110);
+    ASSERT(r2 == 0, "tick on completed order returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM4 — fresh order: fund + tick round-trip                          */
+/* ================================================================== */
+int test_lsps1_get_order_after_fund(void)
+{
+    /* Create a fresh order (will get id=2 — s_order_next_id was 2 after E9) */
+    cJSON *req = cJSON_CreateObject();
+    ASSERT(req != NULL, "alloc create_order req");
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps1.create_order");
+    cJSON_AddNumberToObject(req, "id", 40);
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "channel_balance_msat", 2000000);
+    cJSON_AddNumberToObject(p, "confirms_within_blocks", 6);
+    cJSON_AddItemToObject(req, "params", p);
+    ASSERT(lsps_handle_request(NULL, -1, req) == 1, "create_order ok");
+    cJSON_Delete(req);
+
+    /* Fund order 2 at height 200 */
+    ASSERT(lsps1_order_fund(2,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        200, -1) == 1, "fund fresh order ok");
+
+    /* Tick just below threshold (200+6-1=205) */
+    ASSERT(lsps1_order_tick(2, 205) == 0, "not yet completed at 205");
+
+    /* Tick at threshold (200+6=206) */
+    ASSERT(lsps1_order_tick(2, 206) == 1, "completed at 206");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM5 — COMPLETED notification JSON structure is correct             */
+/* ================================================================== */
+int test_lsps1_completion_notify_json(void)
+{
+    cJSON *note = cJSON_CreateObject();
+    ASSERT(note != NULL, "alloc note");
+    cJSON_AddStringToObject(note, "order_id",  "99");
+    cJSON_AddStringToObject(note, "new_state", "COMPLETED");
+
+    const cJSON *oid_f = cJSON_GetObjectItemCaseSensitive(note, "order_id");
+    ASSERT(oid_f && cJSON_IsString(oid_f) && strcmp(oid_f->valuestring, "99") == 0,
+           "order_id field correct");
+
+    const cJSON *ns_f = cJSON_GetObjectItemCaseSensitive(note, "new_state");
+    ASSERT(ns_f && cJSON_IsString(ns_f) &&
+           strcmp(ns_f->valuestring, "COMPLETED") == 0,
+           "new_state is COMPLETED");
+
+    /* wire_send with fd=-1 must not crash */
+    wire_send(-1, MSG_LSPS_NOTIFY, note);
+
+    cJSON_Delete(note);
+    return 1;
+}
+
+/* ================================================================== */
+/* FO1 — lsps1_order_tick() returns -1 (FAILED) when timeout exceeded */
+/* ================================================================== */
+int test_lsps1_order_tick_fails(void)
+{
+    /* Create a fresh order (will get next id) */
+    cJSON *req = cJSON_CreateObject();
+    ASSERT(req != NULL, "alloc create_order req FO1");
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps1.create_order");
+    cJSON_AddNumberToObject(req, "id", 50);
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "channel_balance_msat", 500000);
+    cJSON_AddNumberToObject(p, "confirms_within_blocks", 200); /* high: confs=200 so COMPLETED at 700, FAILED at 645 */
+    cJSON_AddItemToObject(req, "params", p);
+    ASSERT(lsps_handle_request(NULL, -1, req) == 1, "FO1 create_order");
+    cJSON_Delete(req);
+
+    /* Find out what order_id was assigned by querying s_order_next_id - 1.
+       We rely on the global: orders are sequential, so order id = 3 now. */
+    int oid = 3;
+    ASSERT(lsps1_order_fund(oid,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        500, -1) == 1, "FO1 fund ok");
+
+    /* Tick just before FAILED threshold: funded_at=500, confs=3, timeout=144
+       FAILED threshold = 500+144=644.  Tick at 644 → not yet failed (644 > 644 is FALSE) */
+    int r1 = lsps1_order_tick(oid, 644);
+    ASSERT(r1 == 0, "FO1: tick at 644 returns 0 (not yet failed)");
+
+    /* Tick at 645 (> 644) → FAILED */
+    int r2 = lsps1_order_tick(oid, 645);
+    ASSERT(r2 == -1, "FO1: tick at 645 returns -1 (FAILED)");
+    return 1;
+}
+
+/* ================================================================== */
+/* FO2 — tick on already-FAILED order returns 0 (no double-transition) */
+/* ================================================================== */
+int test_lsps1_order_tick_already_failed(void)
+{
+    /* Order 3 was just set to FAILED and deactivated in FO1 */
+    int r = lsps1_order_tick(3, 1000);
+    ASSERT(r == 0, "FO2: tick on inactive order returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* FO3 — FAILED notification JSON structure is correct                 */
+/* ================================================================== */
+int test_lsps1_failed_notify_json(void)
+{
+    cJSON *note = cJSON_CreateObject();
+    ASSERT(note != NULL, "alloc note FO3");
+    cJSON_AddStringToObject(note, "order_id",  "3");
+    cJSON_AddStringToObject(note, "new_state", "FAILED");
+
+    const cJSON *oid_f = cJSON_GetObjectItemCaseSensitive(note, "order_id");
+    ASSERT(oid_f && cJSON_IsString(oid_f) && strcmp(oid_f->valuestring, "3") == 0,
+           "FO3: order_id correct");
+
+    const cJSON *ns_f = cJSON_GetObjectItemCaseSensitive(note, "new_state");
+    ASSERT(ns_f && cJSON_IsString(ns_f) &&
+           strcmp(ns_f->valuestring, "FAILED") == 0,
+           "FO3: new_state is FAILED");
+
+    wire_send(-1, MSG_LSPS_NOTIFY, note);
+    cJSON_Delete(note);
+    return 1;
+}
+>>>>>>> origin/superscalar-ln-parity-
+
+/* ================================================================== */
+/* SM1 — lsps1_order_fund() transitions order 1 to "PENDING_FUNDING" */
+/*       (order 1 was created by E9 / test_lsps1_get_order)          */
+/* ================================================================== */
+int test_lsps1_order_fund_pending(void)
+{
+    /* Order 1 exists in CREATED state from E9 */
+    int r = lsps1_order_fund(1,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        100, -1);
+    ASSERT(r == 1, "lsps1_order_fund returns 1");
+
+    /* Second call on same order (now PENDING_FUNDING) must return 0 */
+    int r2 = lsps1_order_fund(1,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        101, -1);
+    ASSERT(r2 == 0, "double-fund returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM2 — lsps1_order_tick() below threshold: no state change         */
+/* ================================================================== */
+int test_lsps1_order_tick_below_threshold(void)
+{
+    /* funded_at=100, confs=3: threshold = 103. Tick at 102 → no change */
+    int r = lsps1_order_tick(1, 102);
+    ASSERT(r == 0, "tick below threshold returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM3 — lsps1_order_tick() at threshold: transitions to COMPLETED   */
+/* ================================================================== */
+int test_lsps1_order_tick_completes(void)
+{
+    int r = lsps1_order_tick(1, 103);
+    ASSERT(r == 1, "tick at threshold returns 1 (COMPLETED)");
+
+    /* Idempotent: another tick on completed order returns 0 */
+    int r2 = lsps1_order_tick(1, 110);
+    ASSERT(r2 == 0, "tick on completed order returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM4 — fresh order: fund + tick round-trip                          */
+/* ================================================================== */
+int test_lsps1_get_order_after_fund(void)
+{
+    /* Create a fresh order (will get id=2 — s_order_next_id was 2 after E9) */
+    cJSON *req = cJSON_CreateObject();
+    ASSERT(req != NULL, "alloc create_order req");
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps1.create_order");
+    cJSON_AddNumberToObject(req, "id", 40);
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "channel_balance_msat", 2000000);
+    cJSON_AddNumberToObject(p, "confirms_within_blocks", 6);
+    cJSON_AddItemToObject(req, "params", p);
+    ASSERT(lsps_handle_request(NULL, -1, req) == 1, "create_order ok");
+    cJSON_Delete(req);
+
+    /* Fund order 2 at height 200 */
+    ASSERT(lsps1_order_fund(2,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        200, -1) == 1, "fund fresh order ok");
+
+    /* Tick just below threshold (200+6-1=205) */
+    ASSERT(lsps1_order_tick(2, 205) == 0, "not yet completed at 205");
+
+    /* Tick at threshold (200+6=206) */
+    ASSERT(lsps1_order_tick(2, 206) == 1, "completed at 206");
+    return 1;
+}
+
+/* ================================================================== */
+/* SM5 — COMPLETED notification JSON structure is correct             */
+/* ================================================================== */
+int test_lsps1_completion_notify_json(void)
+{
+    cJSON *note = cJSON_CreateObject();
+    ASSERT(note != NULL, "alloc note");
+    cJSON_AddStringToObject(note, "order_id",  "99");
+    cJSON_AddStringToObject(note, "new_state", "COMPLETED");
+
+    const cJSON *oid_f = cJSON_GetObjectItemCaseSensitive(note, "order_id");
+    ASSERT(oid_f && cJSON_IsString(oid_f) && strcmp(oid_f->valuestring, "99") == 0,
+           "order_id field correct");
+
+    const cJSON *ns_f = cJSON_GetObjectItemCaseSensitive(note, "new_state");
+    ASSERT(ns_f && cJSON_IsString(ns_f) &&
+           strcmp(ns_f->valuestring, "COMPLETED") == 0,
+           "new_state is COMPLETED");
+
+    /* wire_send with fd=-1 must not crash */
+    wire_send(-1, MSG_LSPS_NOTIFY, note);
+
+    cJSON_Delete(note);
+    return 1;
+}
+
+/* ================================================================== */
+/* FO1 — lsps1_order_tick() returns -1 (FAILED) when timeout exceeded */
+/* ================================================================== */
+int test_lsps1_order_tick_fails(void)
+{
+    /* Create a fresh order (will get next id) */
+    cJSON *req = cJSON_CreateObject();
+    ASSERT(req != NULL, "alloc create_order req FO1");
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps1.create_order");
+    cJSON_AddNumberToObject(req, "id", 50);
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "channel_balance_msat", 500000);
+    cJSON_AddNumberToObject(p, "confirms_within_blocks", 200); /* high: confs=200 so COMPLETED at 700, FAILED at 645 */
+    cJSON_AddItemToObject(req, "params", p);
+    ASSERT(lsps_handle_request(NULL, -1, req) == 1, "FO1 create_order");
+    cJSON_Delete(req);
+
+    /* Find out what order_id was assigned by querying s_order_next_id - 1.
+       We rely on the global: orders are sequential, so order id = 3 now. */
+    int oid = 3;
+    ASSERT(lsps1_order_fund(oid,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        500, -1) == 1, "FO1 fund ok");
+
+    /* Tick just before FAILED threshold: funded_at=500, confs=3, timeout=144
+       FAILED threshold = 500+144=644.  Tick at 644 → not yet failed (644 > 644 is FALSE) */
+    int r1 = lsps1_order_tick(oid, 644);
+    ASSERT(r1 == 0, "FO1: tick at 644 returns 0 (not yet failed)");
+
+    /* Tick at 645 (> 644) → FAILED */
+    int r2 = lsps1_order_tick(oid, 645);
+    ASSERT(r2 == -1, "FO1: tick at 645 returns -1 (FAILED)");
+    return 1;
+}
+
+/* ================================================================== */
+/* FO2 — tick on already-FAILED order returns 0 (no double-transition) */
+/* ================================================================== */
+int test_lsps1_order_tick_already_failed(void)
+{
+    /* Order 3 was just set to FAILED and deactivated in FO1 */
+    int r = lsps1_order_tick(3, 1000);
+    ASSERT(r == 0, "FO2: tick on inactive order returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* FO3 — FAILED notification JSON structure is correct                 */
+/* ================================================================== */
+int test_lsps1_failed_notify_json(void)
+{
+    cJSON *note = cJSON_CreateObject();
+    ASSERT(note != NULL, "alloc note FO3");
+    cJSON_AddStringToObject(note, "order_id",  "3");
+    cJSON_AddStringToObject(note, "new_state", "FAILED");
+
+    const cJSON *oid_f = cJSON_GetObjectItemCaseSensitive(note, "order_id");
+    ASSERT(oid_f && cJSON_IsString(oid_f) && strcmp(oid_f->valuestring, "3") == 0,
+           "FO3: order_id correct");
+
+    const cJSON *ns_f = cJSON_GetObjectItemCaseSensitive(note, "new_state");
+    ASSERT(ns_f && cJSON_IsString(ns_f) &&
+           strcmp(ns_f->valuestring, "FAILED") == 0,
+           "FO3: new_state is FAILED");
+
+    wire_send(-1, MSG_LSPS_NOTIFY, note);
+    cJSON_Delete(note);
     return 1;
 }

@@ -453,12 +453,66 @@ int persist_open(persist_t *p, const char *path) {
             "CREATE TABLE IF NOT EXISTS pending_cs ("
             "  channel_id INTEGER PRIMARY KEY,"
             "  commitment_number INTEGER NOT NULL"
+    /* v6 migration: lsp_endpoints cache for client bootstrap */
+    if (db_version < 6) {
+        const char *sql_v4 =
+            "CREATE TABLE IF NOT EXISTS lsp_endpoints ("
+            "  domain     TEXT NOT NULL PRIMARY KEY,"
+            "  host       TEXT NOT NULL,"
+            "  port       INTEGER NOT NULL,"
+            "  pubkey_hex TEXT NOT NULL,"
+            "  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
             ");";
         char *merr4 = NULL;
         if (sqlite3_exec(p->db, sql_v4, NULL, NULL, &merr4) != SQLITE_OK) {
             fprintf(stderr, "persist_open: migration v4 failed: %s\n",
                     merr4 ? merr4 : "unknown");
             sqlite3_free(merr4);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v7 migration: scid_registry for factory leaf → fake SCID */
+    if (db_version < 7) {
+        const char *sql_v5 =
+            "CREATE TABLE IF NOT EXISTS scid_registry ("
+            "  scid        INTEGER NOT NULL PRIMARY KEY,"
+            "  factory_id  INTEGER NOT NULL,"
+            "  leaf_idx    INTEGER NOT NULL,"
+            "  created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr7 = NULL;
+        if (sqlite3_exec(p->db, sql_v5, NULL, NULL, &merr7) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v7 failed: %s\n",
+                    merr7 ? merr7 : "unknown");
+            sqlite3_free(merr7);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v8 migration: htlc_inbound for durable inbound HTLC state */
+    if (db_version < 8) {
+        const char *sql_v6 =
+            "CREATE TABLE IF NOT EXISTS htlc_inbound ("
+            "  htlc_id        INTEGER NOT NULL PRIMARY KEY,"
+            "  amount_msat    INTEGER NOT NULL,"
+            "  payment_hash   TEXT    NOT NULL,"
+            "  payment_secret TEXT    NOT NULL,"
+            "  cltv_expiry    INTEGER NOT NULL,"
+            "  scid           INTEGER NOT NULL,"
+            "  state          INTEGER NOT NULL DEFAULT 0,"
+            "  preimage       TEXT,"
+            "  created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr8 = NULL;
+        if (sqlite3_exec(p->db, sql_v6, NULL, NULL, &merr8) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v8 failed: %s\n",
+                    merr8 ? merr8 : "unknown");
+            sqlite3_free(merr8);
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
@@ -3132,8 +3186,195 @@ int persist_load_pending_cs(persist_t *p, uint32_t channel_id,
     int found = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         *cn_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+/* --- LSP endpoint cache (schema v4) --- */
+
+int persist_save_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               const char *host,
+                               uint16_t    port,
+                               const char *pubkey_hex) {
+    if (!p || !p->db || !domain || !host || !pubkey_hex) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO lsp_endpoints"
+            "  (domain, host, port, pubkey_hex, updated_at)"
+            "  VALUES (?, ?, ?, ?, strftime('%s','now'));",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, domain, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, host,   -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 3, (int)port);
+    sqlite3_bind_text(stmt, 4, pubkey_hex, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE);
+}
+
+int persist_load_lsp_endpoint(persist_t *p,
+                               const char *domain,
+                               char *host_out,       size_t host_cap,
+                               uint16_t   *port_out,
+                               char *pubkey_hex_out, size_t pubkey_cap) {
+    if (!p || !p->db || !domain || !host_out || !port_out || !pubkey_hex_out)
+        return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT host, port, pubkey_hex FROM lsp_endpoints"
+            "  WHERE domain = ? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, domain, -1, SQLITE_STATIC);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *h = (const char *)sqlite3_column_text(stmt, 0);
+        int          pt = sqlite3_column_int (stmt, 1);
+        const char *pk = (const char *)sqlite3_column_text(stmt, 2);
+        if (h && pk && pt > 0 && pt <= 65535) {
+            strncpy(host_out, h, host_cap - 1);
+            host_out[host_cap - 1] = '\0';
+            *port_out = (uint16_t)pt;
+            strncpy(pubkey_hex_out, pk, pubkey_cap - 1);
+            pubkey_hex_out[pubkey_cap - 1] = '\0';
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Schema v5: SCID registry --- */
+
+int persist_save_scid_entry(persist_t *p,
+                             uint32_t factory_id,
+                             uint32_t leaf_idx,
+                             uint64_t scid) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO scid_registry"
+            "  (scid, factory_id, leaf_idx)"
+            "  VALUES (?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)scid);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)factory_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)leaf_idx);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
+}
+
+int persist_load_scid_entry(persist_t *p,
+                             uint64_t scid,
+                             uint32_t *factory_id_out,
+                             uint32_t *leaf_idx_out) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT factory_id, leaf_idx FROM scid_registry"
+            "  WHERE scid = ? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)scid);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (factory_id_out) *factory_id_out = (uint32_t)sqlite3_column_int64(stmt, 0);
+        if (leaf_idx_out)   *leaf_idx_out   = (uint32_t)sqlite3_column_int64(stmt, 1);
         found = 1;
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+/* --- Schema v6: inbound HTLC persistence --- */
+
+int persist_save_htlc_inbound(persist_t *p, const htlc_inbound_t *h) {
+    if (!p || !p->db || !h) return 0;
+
+    char ph_hex[65], ps_hex[65];
+    hex_encode(h->payment_hash,   32, ph_hex);
+    hex_encode(h->payment_secret, 32, ps_hex);
+
+    char pre_hex[65] = "";
+    if (h->state == HTLC_INBOUND_FULFILLED)
+        hex_encode(h->preimage, 32, pre_hex);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO htlc_inbound"
+            "  (htlc_id, amount_msat, payment_hash, payment_secret,"
+            "   cltv_expiry, scid, state, preimage)"
+            "  VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)h->htlc_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)h->amount_msat);
+    sqlite3_bind_text (stmt, 3, ph_hex, -1, SQLITE_STATIC);
+    sqlite3_bind_text (stmt, 4, ps_hex, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)h->cltv_expiry);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)h->scid);
+    sqlite3_bind_int  (stmt, 7, (int)h->state);
+    if (pre_hex[0])
+        sqlite3_bind_text(stmt, 8, pre_hex, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(stmt, 8);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
+}
+
+int persist_load_htlc_inbound_pending(persist_t *p, htlc_inbound_table_t *tbl) {
+    if (!p || !p->db || !tbl) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT htlc_id, amount_msat, payment_hash, payment_secret,"
+            "       cltv_expiry, scid"
+            "  FROM htlc_inbound WHERE state = 0;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+
+    int n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && tbl->count < HTLC_INBOUND_MAX) {
+        htlc_inbound_t *e = &tbl->entries[tbl->count];
+        e->htlc_id    = (uint64_t)sqlite3_column_int64(stmt, 0);
+        e->amount_msat = (uint64_t)sqlite3_column_int64(stmt, 1);
+
+        const char *ph = (const char *)sqlite3_column_text(stmt, 2);
+        const char *ps = (const char *)sqlite3_column_text(stmt, 3);
+        if (ph) hex_decode(ph, e->payment_hash,   32);
+        if (ps) hex_decode(ps, e->payment_secret, 32);
+
+        e->cltv_expiry = (uint32_t)sqlite3_column_int64(stmt, 4);
+        e->scid        = (uint64_t)sqlite3_column_int64(stmt, 5);
+        e->state       = HTLC_INBOUND_PENDING;
+        memset(e->preimage, 0, 32);
+        tbl->count++;
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+int persist_update_htlc_inbound(persist_t *p, uint64_t htlc_id,
+                                 htlc_inbound_state_t state,
+                                 const unsigned char preimage[32]) {
+    if (!p || !p->db) return 0;
+
+    char pre_hex[65] = "";
+    if (state == HTLC_INBOUND_FULFILLED && preimage)
+        hex_encode(preimage, 32, pre_hex);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE htlc_inbound SET state = ?, preimage = ?"
+            "  WHERE htlc_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+
+    sqlite3_bind_int  (stmt, 1, (int)state);
+    if (pre_hex[0])
+        sqlite3_bind_text(stmt, 2, pre_hex, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(stmt, 2);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
 }

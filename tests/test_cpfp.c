@@ -568,3 +568,129 @@ int test_pending_persistence(void) {
     persist_close(&db);
     return 1;
 }
+
+/* ================================================================== */
+/* CP1 — watchtower_add_pending_tx() adds an entry to wt->pending    */
+/* ================================================================== */
+int test_watchtower_add_pending_tx(void)
+{
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    TEST_ASSERT(watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL),
+                "watchtower_init ok");
+
+    TEST_ASSERT_EQ((long)wt.n_pending, 0L, "initially empty");
+
+    int r = watchtower_add_pending_tx(&wt,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        1, 240);
+    TEST_ASSERT(r == 1, "add_pending_tx returns 1");
+    TEST_ASSERT_EQ((long)wt.n_pending, 1L, "n_pending = 1");
+    TEST_ASSERT(strncmp(wt.pending[0].txid, "cccc", 4) == 0, "txid stored");
+    TEST_ASSERT_EQ((long)wt.pending[0].anchor_vout,   1L,   "vout = 1");
+    TEST_ASSERT_EQ((long)wt.pending[0].anchor_amount, 240L, "amount = 240");
+    TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 0L, "cycles = 0");
+    TEST_ASSERT_EQ((long)wt.pending[0].bump_count,        0L, "bumps = 0");
+
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* CP2 — add_pending_tx() with full table returns 0                   */
+/* ================================================================== */
+int test_watchtower_add_pending_tx_full(void)
+{
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    TEST_ASSERT(watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL),
+                "watchtower_init ok");
+
+    char txid[65];
+    for (size_t i = 0; i < WATCHTOWER_MAX_PENDING; i++) {
+        snprintf(txid, sizeof(txid), "%064zx", i);
+        TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240) == 1,
+                    "add within capacity");
+    }
+    TEST_ASSERT_EQ((long)wt.n_pending, (long)WATCHTOWER_MAX_PENDING,
+                   "table full");
+
+    int r = watchtower_add_pending_tx(&wt,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        1, 240);
+    TEST_ASSERT(r == 0, "add with full table returns 0");
+    TEST_ASSERT_EQ((long)wt.n_pending, (long)WATCHTOWER_MAX_PENDING,
+                   "n_pending unchanged");
+
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* CP3 — add_pending_tx: bump-loop mechanics (cycles increment)       */
+/* ================================================================== */
+int test_watchtower_add_pending_bump_mechanics(void)
+{
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    TEST_ASSERT(watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL),
+                "watchtower_init ok");
+
+    TEST_ASSERT(watchtower_add_pending_tx(&wt,
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        1, 240) == 1, "add ok");
+    TEST_ASSERT_EQ((long)wt.n_pending, 1L, "1 pending entry");
+    TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 0L, "starts at 0");
+
+    /* Manually advance cycles (bump threshold is >= 2) */
+    wt.pending[0].cycles_in_mempool++;
+    wt.pending[0].cycles_in_mempool++;
+    TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 2L,
+                   "bump threshold reached");
+    TEST_ASSERT_EQ((long)wt.pending[0].bump_count, 0L, "no bumps yet");
+
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* ================================================================== */
+/* CP4 — add_pending_tx with db: persists immediately                 */
+/* ================================================================== */
+int test_watchtower_add_pending_persists(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    TEST_ASSERT(watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, &db),
+                "watchtower_init with db ok");
+
+    const char *txid =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240) == 1,
+                "add with db returns 1");
+    TEST_ASSERT_EQ((long)wt.n_pending, 1L, "n_pending = 1");
+
+    /* Verify persistence: reload from db */
+    char loaded_txids[WATCHTOWER_MAX_PENDING][65];
+    uint32_t loaded_vouts[WATCHTOWER_MAX_PENDING];
+    uint64_t loaded_amounts[WATCHTOWER_MAX_PENDING];
+    int loaded_cycles[WATCHTOWER_MAX_PENDING];
+    int loaded_bumps[WATCHTOWER_MAX_PENDING];
+    size_t n = persist_load_pending(&db, loaded_txids, loaded_vouts,
+                                     loaded_amounts, loaded_cycles,
+                                     loaded_bumps, WATCHTOWER_MAX_PENDING);
+    TEST_ASSERT_EQ((long)n, 1L, "1 entry persisted");
+    TEST_ASSERT(strncmp(loaded_txids[0], "ffff", 4) == 0, "txid starts ffff");
+    TEST_ASSERT_EQ((long)loaded_vouts[0],   1L,   "persisted vout = 1");
+    TEST_ASSERT_EQ((long)loaded_amounts[0], 240L, "persisted amount = 240");
+
+    watchtower_cleanup(&wt);
+    persist_close(&db);
+    return 1;
+}
