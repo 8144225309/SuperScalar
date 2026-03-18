@@ -155,6 +155,370 @@ extern int test_splice_state_machine(void);
 /* Gap fix: MuSig2 aggregate key for splice funding output */
 extern int test_splice_musig_funding_spk(void);
 
+/* PR #17 Phase 1: BOLT #8 transport */
+extern int test_bolt8_handshake_vectors(void);
+extern int test_bolt8_key_rotation(void);
+extern int test_bolt8_init_features(void);
+extern int test_bolt8_lsps_dispatch(void);
+
+/* PR #19: BOLT #8 outbound + timeouts */
+extern int test_bolt8_outbound_connect(void);
+extern int test_bolt8_phase_timeout_constants(void);
+
+/* PR #19: Gossip peer networking (commits 2-4) */
+extern int test_gossip_peer_timestamp_strategy(void);
+extern int test_gossip_reconnect_backoff(void);
+extern int test_gossip_reconnect_jitter(void);
+extern int test_gossip_peer_parse_list(void);
+/* Commit 3: stale pruning, rejection cache, 4-sig, waiting proof */
+extern int test_gossip_prune_stale_channel(void);
+extern int test_gossip_rejection_cache(void);
+extern int test_gossip_4sig_validation(void);
+extern int test_gossip_waiting_proof_buffer(void);
+/* Commit 4: rate limiting, refill, embargo */
+extern int test_gossip_rate_limit_token_bucket(void);
+extern int test_gossip_rate_refill(void);
+extern int test_gossip_peer_embargo(void);
+
+/* PR #19 Commit 5: MPP aggregation */
+extern int test_mpp_single_part(void);
+extern int test_mpp_three_parts(void);
+extern int test_mpp_timeout(void);
+extern int test_mpp_overpayment_guard(void);
+extern int test_mpp_table_full(void);
+
+/* Phase J: LSPS1 order state machine */
+extern int test_lsps1_order_fund_pending(void);
+extern int test_lsps1_order_tick_below_threshold(void);
+extern int test_lsps1_order_tick_completes(void);
+extern int test_lsps1_get_order_after_fund(void);
+extern int test_lsps1_completion_notify_json(void);
+
+/* Phase K: LSPS2 JIT pending lookup + dispatch intercept */
+extern int test_lsps2_pending_lookup_null(void);
+extern int test_lsps2_pending_lookup_found(void);
+extern int test_ln_dispatch_jit_pending_wired(void);
+extern int test_lsps2_intercept_htlc_below_cost(void);
+
+/* PR #25: Phase M/N dispatch wiring */
+extern int test_ln_dispatch_routes_commitment_signed(void);
+extern int test_ln_dispatch_routes_revoke_and_ack(void);
+extern int test_ln_dispatch_routes_update_fee(void);
+extern int test_ln_dispatch_routes_channel_reestablish(void);
+extern int test_ln_dispatch_flush_relay_empty(void);
+extern int test_ln_dispatch_routes_shutdown(void);
+extern int test_ln_dispatch_routes_closing_signed(void);
+extern int test_ln_dispatch_shutdown_state_recv(void);
+extern int test_ln_dispatch_close_fee_converge(void);
+extern int test_ln_dispatch_shutdown_too_short(void);
+extern int test_ln_dispatch_closing_signed_too_short(void);
+extern int test_ln_dispatch_close_fee_agree(void);
+extern int test_ln_dispatch_shutdown_mirrors(void);
+extern int test_ln_dispatch_shutdown_no_channels(void);
+extern int test_ln_dispatch_close_fee_midpoint(void);
+extern int test_ln_dispatch_close_negotiating_state(void);
+extern int test_ln_dispatch_close_fee_large_gap(void);
+
+/* Gap fixes: LSPS1 FAILED, LSPS2 expiry, JIT open callback */
+extern int test_lsps1_order_tick_fails(void);
+extern int test_lsps1_order_tick_already_failed(void);
+extern int test_lsps1_failed_notify_json(void);
+extern int test_lsps2_pending_expire_fresh(void);
+extern int test_lsps2_pending_expire_stale(void);
+extern int test_jit_open_cb_wires(void);
+extern int test_jit_open_cb_on_cost_covered(void);
+extern int test_jit_open_cb_null_guard(void);
+
+/* PR #19 Commit 5: LSPS2 deferred broadcast */
+extern int test_lsps2_deferred_no_immediate_channel(void);
+extern int test_lsps2_deferred_coverage_triggers_channel(void);
+extern int test_lsps2_unknown_scid(void);
+
+/* PR #17 Phase 2: LSP discovery */
+extern int test_wellknown_json_format(void);
+extern int test_client_bootstrap_from_domain(void);
+/* PR #17 Phase 3: BOLT #7 gossip */
+extern int test_gossip_node_announcement_sign_verify(void);
+extern int test_gossip_channel_announcement_fields(void);
+extern int test_gossip_channel_update_construction(void);
+extern int test_gossip_store_roundtrip(void);
+extern int test_gossip_channel_update_store_and_filter(void);
+extern int test_gossip_parse_query_scids(void);
+extern int test_gossip_build_reply_scids_end(void);
+extern int test_gossip_parse_query_range(void);
+extern int test_gossip_build_reply_range(void);
+extern int test_gossip_store_get_channels_by_scids(void);
+extern int test_gossip_store_get_channels_in_range(void);
+extern int test_gossip_store_range_empty(void);
+extern int test_ln_dispatch_routes_query_scids(void);
+extern int test_ln_dispatch_routes_query_range(void);
+extern int test_ln_dispatch_routes_reply_range(void);
+extern int test_ln_dispatch_gossip_no_gs_no_crash(void);
+extern int test_gossip_parse_query_scids_too_short(void);
+extern int test_gossip_build_reply_scids_end_incomplete(void);
+extern int test_gossip_parse_query_range_too_short(void);
+/* PR #17 Phase 4: factory entry/exit */
+extern int test_scid_encode_decode(void);
+extern int test_scid_route_hint_format(void);
+extern int test_scid_persist_roundtrip(void);
+extern int test_onion_last_hop_decrypt(void);
+
+/* PR #20 Phase 1: BOLT #11 + Pathfinding */
+extern int test_bolt11_decode_known(void);
+extern int test_bolt11_no_amount(void);
+extern int test_bolt11_route_hints(void);
+extern int test_bolt11_invalid_rejected(void);
+extern int test_pathfind_two_hops(void);
+extern int test_pathfind_one_hop(void);
+extern int test_pathfind_no_route(void);
+extern int test_pathfind_mpp(void);
+
+/* PR #20 Phase 2: Multi-hop Onion + HTLC Forwarding */
+extern int test_onion_single_hop(void);
+extern int test_onion_two_hops(void);
+extern int test_onion_keysend(void);
+extern int test_onion_amp_tlv14_present(void);
+extern int test_onion_amp_no_tlv14_when_disabled(void);
+extern int test_htlc_forward_final(void);
+extern int test_htlc_forward_settle(void);
+extern int test_htlc_forward_fail(void);
+extern int test_htlc_forward_init(void);
+
+/* PR #25: Phase N relay pump */
+extern int test_htlc_forward_entry_has_next_onion(void);
+extern int test_htlc_forward_relay_state_pending(void);
+extern int test_htlc_forward_in_channel_id_field(void);
+extern int test_htlc_forward_find_by_scid_empty(void);
+extern int test_htlc_forward_find_by_scid_found(void);
+
+/* PR #20 Phase 3: Peer Manager + BOLT #2 Channel Open */
+extern int test_peer_mgr_init(void);
+extern int test_peer_mgr_find_unknown(void);
+extern int test_peer_mgr_connect_fail(void);
+extern int test_peer_mgr_disconnect(void);
+extern int test_chan_open_build_open_channel(void);
+extern int test_chan_open_build_accept_channel(void);
+extern int test_chan_open_buffer_too_small(void);
+extern int test_chan_open_v2_accept_built(void);
+extern int test_chan_open_v2_too_short(void);
+extern int test_chan_open_v2_routes(void);
+extern int test_ln_dispatch_routes_open_channel2(void);
+extern int test_ln_dispatch_open_channel2_too_short(void);
+extern int test_chan_open_v2_null_mgr(void);
+extern int test_chan_open_v2_with_ctx(void);
+extern int test_chan_open_v2_accept_type(void);
+
+/* PR #20 Phase 4: Payment State Machine */
+extern int test_payment_init(void);
+extern int test_payment_send_no_route(void);
+extern int test_payment_on_settle(void);
+extern int test_payment_keysend_no_route(void);
+extern int test_payment_keysend_hash(void);
+
+/* PR #25: Phase P payment timeout */
+extern int test_payment_timeout_expires_inflight(void);
+extern int test_payment_timeout_ignores_recent(void);
+extern int test_payment_timeout_ignores_non_inflight(void);
+extern int test_payment_timeout_null_table(void);
+extern int test_payment_amp_produces_onion_tlv14(void);
+extern int test_payment_amp_set_id_consistent(void);
+extern int test_payment_amp_child_indices(void);
+extern int test_payment_amp_null_gs_fails(void);
+extern int test_payment_amp_fields_zero_default(void);
+extern int test_payment_amp_set_id_roundtrip(void);
+extern int test_payment_amp_zero_shards_fails(void);
+extern int test_payment_amp_hash_len(void);
+extern int test_payment_amp_routes_found(void);
+extern int test_payment_amp_set_id_stored(void);
+
+/* PR #26: Gossip real data, dual-fund basepoints, zero-conf, close broadcast */
+extern int test_gossip_query_scids_real_data(void);
+extern int test_gossip_query_range_real_scids(void);
+extern int test_chan_open_v2_basepoints_nonzero(void);
+extern int test_chan_open_accept_zero_conf_min_depth(void);
+extern int test_ln_dispatch_close_broadcast(void);
+
+/* PR #27: Admin RPC */
+extern int test_admin_rpc_getinfo_has_node_id(void);
+extern int test_admin_rpc_getinfo_node_id_hex(void);
+extern int test_admin_rpc_listpeers_is_array(void);
+extern int test_admin_rpc_listchannels_is_array(void);
+extern int test_admin_rpc_listpayments_is_array(void);
+extern int test_admin_rpc_listinvoices_is_array(void);
+extern int test_admin_rpc_createinvoice_has_bolt11(void);
+extern int test_admin_rpc_createinvoice_any_amount(void);
+extern int test_admin_rpc_pay_bad_bolt11(void);
+extern int test_admin_rpc_keysend_bad_dest(void);
+extern int test_admin_rpc_unknown_method(void);
+extern int test_admin_rpc_malformed_json(void);
+extern int test_admin_rpc_getroute_no_gossip(void);
+extern int test_admin_rpc_feerates_defaults(void);
+extern int test_admin_rpc_feerates_with_estimator(void);
+extern int test_admin_rpc_stop_sets_flag(void);
+extern int test_admin_rpc_listinvoices_after_create(void);
+extern int test_admin_rpc_listpayments_empty(void);
+extern int test_admin_rpc_closechannel_unknown(void);
+extern int test_admin_rpc_openchannel_deferred(void);
+
+/* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
+extern int test_splice_wire_init_roundtrip(void);
+extern int test_splice_wire_ack(void);
+extern int test_splice_wire_locked(void);
+extern int test_splice_wire_stfu(void);
+extern int test_splice_wire_buffer_small(void);
+extern int test_bolt12_offer_expiry(void);
+extern int test_bolt12_invoice_from_request(void);
+extern int test_bolt12_invoice_error(void);
+extern int test_bolt12_full_sign_verify(void);
+extern int test_bolt12_offer_encode_decode(void);
+/* PR #22 Phase 4: Splice wire completion */
+extern int test_splice_wire_parse_ack(void);
+extern int test_splice_wire_splicing_signed(void);
+extern int test_splice_wire_wrong_type(void);
+extern int test_splice_wire_truncated(void);
+/* PR #22 Phase 5: BOLT #12 completion */
+extern int test_bolt12_blinded_path_aead(void);
+extern int test_bolt12_merkle_root_nonempty(void);
+extern int test_bolt12_merkle_root_empty(void);
+extern int test_bolt12_sign_verify_merkle(void);
+extern int test_bolt12_invoice_error_wire(void);
+/* PR #24: merkle TLV boundaries (Phase A) */
+extern int test_bolt12_merkle_empty_deterministic(void);
+extern int test_bolt12_merkle_single_field(void);
+extern int test_bolt12_merkle_two_fields(void);
+extern int test_bolt12_merkle_three_fields_odd(void);
+extern int test_bolt12_merkle_regression_vs_old_chunking(void);
+extern int test_bolt12_merkle_zero_value_field(void);
+extern int test_bolt12_merkle_truncated_field(void);
+/* PR #24: invoice sign/verify merkle (Phase B) */
+extern int test_invoice_sign_verify_regression(void);
+extern int test_invoice_sign_tampered_amount(void);
+extern int test_invoice_sign_different_invoices(void);
+extern int test_invoice_sign_differs_from_old_approach(void);
+extern int test_invoice_request_decode_roundtrip(void);
+extern int test_invoice_request_decode_truncated(void);
+extern int test_invoice_encode_parseable(void);
+extern int test_ln_dispatch_invoice_request(void);
+extern int test_ln_dispatch_malformed_htlc(void);
+extern int test_ln_dispatch_invoice_request_bad_sig(void);
+/* PR #22 Phase 1: LN peer dispatch */
+extern int test_ln_dispatch_add_htlc(void);
+extern int test_ln_dispatch_fulfill(void);
+extern int test_ln_dispatch_unknown_type(void);
+extern int test_ln_dispatch_fail(void);
+extern int test_ln_dispatch_truncated(void);
+/* PR #24: FORWARD_FINAL invoice claim (Phase C) + fd race (Phase E) */
+extern int test_ln_dispatch_invoice_claim(void);
+extern int test_ln_dispatch_no_matching_invoice(void);
+extern int test_ln_dispatch_forward_final_no_invoices(void);
+extern int test_ln_dispatch_peer_idx_neg1(void);
+extern int test_bolt8_ln_dispatch_routing(void);
+extern int test_lsps0_get_info_response(void);
+extern int test_lsps0_unknown_method(void);
+extern int test_lsps0_invoice_create_tbs(void);
+extern int test_lsps0_invoice_any_amount(void);
+extern int test_lsps0_malformed_json(void);
+extern int test_lsps0_lsps2_get_info(void);
+extern int test_peer_mgr_tor_proxy_set(void);
+extern int test_peer_mgr_onion_no_proxy(void);
+extern int test_peer_mgr_clearnet_bypass_tor(void);
+
+/* PR #25: Phase O reconnect */
+extern int test_peer_mgr_mark_disconnected_preserves(void);
+extern int test_peer_mgr_mark_disconnected_caps_backoff(void);
+extern int test_peer_mgr_mark_disconnected_increments(void);
+extern int test_peer_mgr_reconnect_all_skips_early(void);
+extern int test_peer_mgr_reconnect_all_fails_gracefully(void);
+extern int test_peer_mgr_reconnect_all_skips_connected(void);
+extern int test_peer_mgr_channel_scid_field(void);
+extern int test_tor_parse_proxy_arg_basic(void);
+/* PR #22 Phase 2: Invoice receivability */
+extern int test_invoice_create_decode(void);
+extern int test_invoice_claim_success(void);
+extern int test_invoice_claim_underpay(void);
+extern int test_invoice_claim_double(void);
+extern int test_invoice_claim_expired(void);
+extern int test_invoice_settle(void);
+extern int test_invoice_any_amount(void);
+/* PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire */
+extern int test_htlc_commit_add_layout(void);
+extern int test_htlc_commit_commitment_signed_layout(void);
+extern int test_htlc_commit_revoke_and_ack_layout(void);
+extern int test_htlc_commit_fulfill_layout(void);
+extern int test_htlc_commit_fail_layout(void);
+extern int test_htlc_commit_fail_malformed_layout(void);
+extern int test_htlc_commit_dispatch_types(void);
+extern int test_htlc_commit_dust_excluded_from_tx(void);
+extern int test_htlc_commit_dust_tx_output_count(void);
+extern int test_htlc_commit_above_dust_counted(void);
+extern int test_htlc_commit_mixed_dust_counted(void);
+/* PR #21 Phase 5: update_fee */
+extern int test_htlc_commit_update_fee_layout(void);
+extern int test_htlc_commit_recv_update_fee_accepts(void);
+extern int test_htlc_commit_recv_update_fee_rejects_low(void);
+extern int test_htlc_commit_recv_update_fee_rejects_high(void);
+/* PR #21 Phase 3: CLTV watchdog */
+extern int test_cltv_watchdog_default_delta(void);
+extern int test_cltv_watchdog_no_htlcs(void);
+extern int test_cltv_watchdog_htlc_safe(void);
+extern int test_cltv_watchdog_htlc_at_risk(void);
+extern int test_cltv_watchdog_offered_ignored(void);
+extern int test_cltv_watchdog_expire(void);
+extern int test_cltv_watchdog_earliest_expiry(void);
+extern int test_cltv_watchdog_multi_htlc(void);
+extern int test_cltv_watchdog_block_cb(void);
+/* PR #24: CLTV watchdog on_block_connected multi-channel (Phase D) */
+extern int test_cltv_watchdog_block_connected_multi(void);
+extern int test_cltv_watchdog_block_connected_empty(void);
+extern int test_cltv_watchdog_block_connected_mixed(void);
+extern int test_watchtower_init_empty(void);
+extern int test_watchtower_watch_no_breach(void);
+extern int test_watchtower_ready_guard(void);
+extern int test_watchtower_remove_channel(void);
+/* PR #21 Phase 4: Cooperative close */
+extern int test_chan_close_shutdown_layout(void);
+extern int test_chan_close_closing_signed_layout(void);
+extern int test_chan_close_negotiate_fee_converge(void);
+extern int test_chan_close_negotiate_fee_equal(void);
+extern int test_chan_close_recv_shutdown_parse(void);
+extern int test_chan_close_recv_closing_signed_parse(void);
+extern int test_chan_close_negotiate_fee_steps(void);
+extern int test_chan_close_negotiate_fee_low_high(void);
+/* PR #21 Phase 6: Peer database */
+extern int test_peer_db_upsert_and_get(void);
+extern int test_peer_db_upsert_update(void);
+extern int test_peer_db_update_score(void);
+extern int test_peer_db_ban_and_is_banned(void);
+extern int test_peer_db_ban_expires(void);
+extern int test_peer_db_count(void);
+extern int test_peer_db_get_not_found(void);
+extern int test_peer_db_unban(void);
+/* PR #21 Phase 7: Probe + peer storage */
+extern int test_probe_build_hash(void);
+extern int test_probe_success_failure(void);
+extern int test_probe_liquidity_failure(void);
+extern int test_probe_classify_all_codes(void);
+extern int test_peer_storage_build_type7(void);
+extern int test_peer_storage_build_type9(void);
+extern int test_peer_storage_parse_roundtrip(void);
+extern int test_peer_storage_parse_errors(void);
+/* PR #21 Phase 8: BOLT spec vectors + integration */
+extern int test_bolt3_shachain_vector_zero_seed(void);
+extern int test_bolt3_shachain_vector_ff_seed(void);
+extern int test_bolt3_shachain_vector_ff_aaa(void);
+extern int test_bolt3_shachain_vector_01_seed(void);
+extern int test_it_shutdown_roundtrip(void);
+extern int test_it_closing_signed_roundtrip(void);
+extern int test_it_probe_peer_db_score(void);
+extern int test_it_watchdog_expire_chain(void);
+
+extern int test_onion_tlv_parse_partial(void);
+extern int test_htlc_inbound_fulfill_path(void);
+extern int test_htlc_inbound_timeout(void);
+extern int test_htlc_inbound_persist_roundtrip(void);
+extern int test_wellknown_json_parse(void);
+extern int test_wellknown_http_serve(void);
+
 extern int test_p2p_getcfilters_payload(void);
 extern int test_p2p_cfilter_parse(void);
 extern int test_p2p_cfilter_skips_ping(void);
@@ -241,6 +605,20 @@ extern int test_adaptor_taproot(void);
 extern int test_ptlc_key_turnover(void);
 extern int test_ptlc_lsp_sockpuppet(void);
 extern int test_ptlc_factory_coop_close_after_turnover(void);
+extern int test_channel_add_ptlc(void);
+extern int test_channel_settle_ptlc(void);
+extern int test_channel_fail_ptlc(void);
+extern int test_channel_ptlc_multiple(void);
+extern int test_ptlc_commit_dispatch_presig(void);
+extern int test_ptlc_commit_dispatch_adapted(void);
+extern int test_ptlc_commit_dispatch_complete(void);
+extern int test_ptlc_commit_dispatch_null_ch(void);
+extern int test_ln_dispatch_routes_ptlc_presig(void);
+extern int test_ln_dispatch_routes_ptlc_adapted(void);
+extern int test_channel_ptlc_grow(void);
+extern int test_channel_fail_ptlc_not_found(void);
+extern int test_channel_settle_ptlc_not_found(void);
+extern int test_ln_dispatch_routes_ptlc_complete(void);
 extern int test_regtest_ptlc_turnover(void);
 
 /* Phase 8: Factory lifecycle + distribution tx */
@@ -462,6 +840,12 @@ extern int test_penalty_fee_updated(void);
 extern int test_watchtower_anchor_init(void);
 extern int test_regtest_cpfp_penalty_bump(void);
 extern int test_regtest_breach_penalty_cpfp(void);
+
+/* Phase L: CPFP non-breach registration */
+extern int test_watchtower_add_pending_tx(void);
+extern int test_watchtower_add_pending_tx_full(void);
+extern int test_watchtower_add_pending_bump_mechanics(void);
+extern int test_watchtower_add_pending_persists(void);
 
 /* CPFP Audit & Remediation */
 extern int test_cpfp_sign_complete_check(void);
@@ -806,6 +1190,14 @@ extern int test_queue_null_payload(void);
 extern int test_queue_drain_limit(void);
 extern int test_queue_null_safety(void);
 extern int test_queue_get(void);
+extern int test_queue_ln_dispatch_poll_null_persist(void);
+extern int test_queue_ln_dispatch_done_null_persist(void);
+extern int test_queue_dispatch_poll_type_returned(void);
+extern int test_queue_dispatch_done_type_returned(void);
+extern int test_ln_dispatch_routes_queue_poll(void);
+extern int test_ln_dispatch_routes_queue_done(void);
+extern int test_queue_ln_dispatch_done_empty(void);
+extern int test_queue_ln_dispatch_done_too_short(void);
 
 /* Async Signing: Notification Dispatch */
 extern int test_notify_log_init(void);
@@ -918,6 +1310,50 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsps_malformed_json_returns_zero);
     RUN_TEST(test_lsps1_get_order);
 
+    printf("\n=== Phase J: LSPS1 Order State Machine ===\n");
+    RUN_TEST(test_lsps1_order_fund_pending);
+    RUN_TEST(test_lsps1_order_tick_below_threshold);
+    RUN_TEST(test_lsps1_order_tick_completes);
+    RUN_TEST(test_lsps1_get_order_after_fund);
+    RUN_TEST(test_lsps1_completion_notify_json);
+
+    printf("\n=== Phase K: LSPS2 JIT Intercept ===\n");
+    RUN_TEST(test_lsps2_pending_lookup_null);
+    RUN_TEST(test_lsps2_pending_lookup_found);
+    RUN_TEST(test_ln_dispatch_jit_pending_wired);
+    RUN_TEST(test_lsps2_intercept_htlc_below_cost);
+
+    printf("\n=== PR #25 Phase M: Commitment Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_routes_commitment_signed);
+    RUN_TEST(test_ln_dispatch_routes_revoke_and_ack);
+    RUN_TEST(test_ln_dispatch_routes_update_fee);
+    RUN_TEST(test_ln_dispatch_routes_channel_reestablish);
+    RUN_TEST(test_ln_dispatch_flush_relay_empty);
+
+    printf("\n=== Phase 1: Cooperative Close Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_routes_shutdown);
+    RUN_TEST(test_ln_dispatch_routes_closing_signed);
+    RUN_TEST(test_ln_dispatch_shutdown_state_recv);
+    RUN_TEST(test_ln_dispatch_close_fee_converge);
+    RUN_TEST(test_ln_dispatch_shutdown_too_short);
+    RUN_TEST(test_ln_dispatch_closing_signed_too_short);
+    RUN_TEST(test_ln_dispatch_close_fee_agree);
+    RUN_TEST(test_ln_dispatch_shutdown_mirrors);
+    RUN_TEST(test_ln_dispatch_shutdown_no_channels);
+    RUN_TEST(test_ln_dispatch_close_fee_midpoint);
+    RUN_TEST(test_ln_dispatch_close_negotiating_state);
+    RUN_TEST(test_ln_dispatch_close_fee_large_gap);
+
+    printf("\n=== Gap Fixes: LSPS1 FAILED + LSPS2 Expiry + JIT Callback ===\n");
+    RUN_TEST(test_lsps1_order_tick_fails);
+    RUN_TEST(test_lsps1_order_tick_already_failed);
+    RUN_TEST(test_lsps1_failed_notify_json);
+    RUN_TEST(test_lsps2_pending_expire_fresh);
+    RUN_TEST(test_lsps2_pending_expire_stale);
+    RUN_TEST(test_jit_open_cb_wires);
+    RUN_TEST(test_jit_open_cb_on_cost_covered);
+    RUN_TEST(test_jit_open_cb_null_guard);
+
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
     RUN_TEST(test_invoice_request_sign_verify);
@@ -940,6 +1376,343 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_splice_locked_roundtrip);
     RUN_TEST(test_splice_state_machine);
     RUN_TEST(test_splice_musig_funding_spk);
+
+    printf("\n=== PR #17 Phase 1: BOLT #8 Transport ===\n");
+    RUN_TEST(test_bolt8_handshake_vectors);
+    RUN_TEST(test_bolt8_key_rotation);
+    RUN_TEST(test_bolt8_init_features);
+    RUN_TEST(test_bolt8_lsps_dispatch);
+
+    printf("\n=== PR #19: BOLT #8 Outbound + Timeouts ===\n");
+    RUN_TEST(test_bolt8_outbound_connect);
+    RUN_TEST(test_bolt8_phase_timeout_constants);
+
+    printf("\n=== PR #19: Gossip Peer Networking ===\n");
+    RUN_TEST(test_gossip_peer_timestamp_strategy);
+    RUN_TEST(test_gossip_reconnect_backoff);
+    RUN_TEST(test_gossip_reconnect_jitter);
+    RUN_TEST(test_gossip_peer_parse_list);
+    /* Commit 3 */
+    RUN_TEST(test_gossip_prune_stale_channel);
+    RUN_TEST(test_gossip_rejection_cache);
+    RUN_TEST(test_gossip_4sig_validation);
+    RUN_TEST(test_gossip_waiting_proof_buffer);
+    /* Commit 4 */
+    RUN_TEST(test_gossip_rate_limit_token_bucket);
+    RUN_TEST(test_gossip_rate_refill);
+    RUN_TEST(test_gossip_peer_embargo);
+
+    printf("\n=== PR #19: MPP Aggregation ===\n");
+    RUN_TEST(test_mpp_single_part);
+    RUN_TEST(test_mpp_three_parts);
+    RUN_TEST(test_mpp_timeout);
+    RUN_TEST(test_mpp_overpayment_guard);
+    RUN_TEST(test_mpp_table_full);
+
+    printf("\n=== PR #19: LSPS2 Deferred Broadcast ===\n");
+    RUN_TEST(test_lsps2_deferred_no_immediate_channel);
+    RUN_TEST(test_lsps2_deferred_coverage_triggers_channel);
+    RUN_TEST(test_lsps2_unknown_scid);
+
+    printf("\n=== PR #17 Phase 2: LSP Discovery ===\n");
+    RUN_TEST(test_wellknown_json_format);
+    RUN_TEST(test_wellknown_json_parse);
+    RUN_TEST(test_wellknown_http_serve);
+    RUN_TEST(test_client_bootstrap_from_domain);
+
+    printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
+    RUN_TEST(test_gossip_node_announcement_sign_verify);
+    RUN_TEST(test_gossip_channel_announcement_fields);
+    RUN_TEST(test_gossip_channel_update_construction);
+    RUN_TEST(test_gossip_store_roundtrip);
+    RUN_TEST(test_gossip_channel_update_store_and_filter);
+
+    printf("\n=== Phase 2: BOLT #7 Gossip Query Handlers ===\n");
+    RUN_TEST(test_gossip_parse_query_scids);
+    RUN_TEST(test_gossip_build_reply_scids_end);
+    RUN_TEST(test_gossip_parse_query_range);
+    RUN_TEST(test_gossip_build_reply_range);
+    RUN_TEST(test_gossip_store_get_channels_by_scids);
+    RUN_TEST(test_gossip_store_get_channels_in_range);
+    RUN_TEST(test_gossip_store_range_empty);
+    RUN_TEST(test_ln_dispatch_routes_query_scids);
+    RUN_TEST(test_ln_dispatch_routes_query_range);
+    RUN_TEST(test_ln_dispatch_routes_reply_range);
+    RUN_TEST(test_ln_dispatch_gossip_no_gs_no_crash);
+    RUN_TEST(test_gossip_parse_query_scids_too_short);
+    RUN_TEST(test_gossip_build_reply_scids_end_incomplete);
+    RUN_TEST(test_gossip_parse_query_range_too_short);
+
+    printf("\n=== PR #17 Phase 4: Factory Entry/Exit ===\n");
+    RUN_TEST(test_scid_encode_decode);
+    RUN_TEST(test_scid_route_hint_format);
+    RUN_TEST(test_scid_persist_roundtrip);
+    RUN_TEST(test_onion_last_hop_decrypt);
+
+    printf("\n=== BOLT #11 Invoice ===\n");
+    RUN_TEST(test_bolt11_decode_known);
+    RUN_TEST(test_bolt11_no_amount);
+    RUN_TEST(test_bolt11_route_hints);
+    RUN_TEST(test_bolt11_invalid_rejected);
+
+    printf("\n=== Pathfinding (Dijkstra) ===\n");
+    RUN_TEST(test_pathfind_two_hops);
+    RUN_TEST(test_pathfind_one_hop);
+    RUN_TEST(test_pathfind_no_route);
+    RUN_TEST(test_pathfind_mpp);
+
+    printf("\n=== Multi-Hop Onion (BOLT #4) ===\n");
+    RUN_TEST(test_onion_single_hop);
+    RUN_TEST(test_onion_two_hops);
+    RUN_TEST(test_onion_keysend);
+    RUN_TEST(test_onion_amp_tlv14_present);
+    RUN_TEST(test_onion_amp_no_tlv14_when_disabled);
+
+    printf("\n=== HTLC Forwarding ===\n");
+    RUN_TEST(test_htlc_forward_init);
+
+    printf("\n=== PR #25 Phase N: Relay Pump ===\n");
+    RUN_TEST(test_htlc_forward_entry_has_next_onion);
+    RUN_TEST(test_htlc_forward_relay_state_pending);
+    RUN_TEST(test_htlc_forward_in_channel_id_field);
+    RUN_TEST(test_htlc_forward_find_by_scid_empty);
+    RUN_TEST(test_htlc_forward_find_by_scid_found);
+    RUN_TEST(test_htlc_forward_final);
+    RUN_TEST(test_htlc_forward_settle);
+    RUN_TEST(test_htlc_forward_fail);
+
+    printf("\n=== Peer Manager ===\n");
+    RUN_TEST(test_peer_mgr_init);
+    RUN_TEST(test_peer_mgr_find_unknown);
+    RUN_TEST(test_peer_mgr_connect_fail);
+    RUN_TEST(test_peer_mgr_disconnect);
+
+    printf("\n=== PR #25 Phase O: Peer Reconnect ===\n");
+    RUN_TEST(test_peer_mgr_mark_disconnected_preserves);
+    RUN_TEST(test_peer_mgr_mark_disconnected_caps_backoff);
+    RUN_TEST(test_peer_mgr_mark_disconnected_increments);
+    RUN_TEST(test_peer_mgr_reconnect_all_skips_early);
+    RUN_TEST(test_peer_mgr_reconnect_all_fails_gracefully);
+    RUN_TEST(test_peer_mgr_reconnect_all_skips_connected);
+    RUN_TEST(test_peer_mgr_channel_scid_field);
+
+    printf("\n=== BOLT #2 Channel Open ===\n");
+    RUN_TEST(test_chan_open_build_open_channel);
+    RUN_TEST(test_chan_open_build_accept_channel);
+    RUN_TEST(test_chan_open_buffer_too_small);
+
+    printf("\n=== Phase 5: Dual-Fund Basics ===\n");
+    RUN_TEST(test_chan_open_v2_accept_built);
+    RUN_TEST(test_chan_open_v2_too_short);
+    RUN_TEST(test_chan_open_v2_routes);
+    RUN_TEST(test_ln_dispatch_routes_open_channel2);
+    RUN_TEST(test_ln_dispatch_open_channel2_too_short);
+    RUN_TEST(test_chan_open_v2_null_mgr);
+    RUN_TEST(test_chan_open_v2_with_ctx);
+    RUN_TEST(test_chan_open_v2_accept_type);
+
+    printf("\n=== Payment State Machine ===\n");
+    RUN_TEST(test_payment_init);
+    RUN_TEST(test_payment_send_no_route);
+    RUN_TEST(test_payment_on_settle);
+    RUN_TEST(test_payment_keysend_no_route);
+    RUN_TEST(test_payment_keysend_hash);
+
+    printf("\n=== PR #25 Phase P: Payment Timeout ===\n");
+    RUN_TEST(test_payment_timeout_expires_inflight);
+    RUN_TEST(test_payment_timeout_ignores_recent);
+    RUN_TEST(test_payment_timeout_ignores_non_inflight);
+    RUN_TEST(test_payment_timeout_null_table);
+
+    printf("\n=== Phase 3: AMP Send Side ===\n");
+    RUN_TEST(test_payment_amp_produces_onion_tlv14);
+    RUN_TEST(test_payment_amp_set_id_consistent);
+    RUN_TEST(test_payment_amp_child_indices);
+    RUN_TEST(test_payment_amp_null_gs_fails);
+    RUN_TEST(test_payment_amp_fields_zero_default);
+    RUN_TEST(test_payment_amp_set_id_roundtrip);
+    RUN_TEST(test_payment_amp_zero_shards_fails);
+    RUN_TEST(test_payment_amp_hash_len);
+    RUN_TEST(test_payment_amp_routes_found);
+    RUN_TEST(test_payment_amp_set_id_stored);
+
+    printf("\n=== PR #26: Gossip Real Data + Dual-Fund Basepoints + Zero-Conf + Close Broadcast ===\n");
+    RUN_TEST(test_gossip_query_scids_real_data);
+    RUN_TEST(test_gossip_query_range_real_scids);
+    RUN_TEST(test_chan_open_v2_basepoints_nonzero);
+    RUN_TEST(test_chan_open_accept_zero_conf_min_depth);
+    RUN_TEST(test_ln_dispatch_close_broadcast);
+
+    printf("\n=== PR #27: Admin RPC (JSON-RPC 2.0) ===\n");
+    RUN_TEST(test_admin_rpc_getinfo_has_node_id);
+    RUN_TEST(test_admin_rpc_getinfo_node_id_hex);
+    RUN_TEST(test_admin_rpc_listpeers_is_array);
+    RUN_TEST(test_admin_rpc_listchannels_is_array);
+    RUN_TEST(test_admin_rpc_listpayments_is_array);
+    RUN_TEST(test_admin_rpc_listinvoices_is_array);
+    RUN_TEST(test_admin_rpc_createinvoice_has_bolt11);
+    RUN_TEST(test_admin_rpc_createinvoice_any_amount);
+    RUN_TEST(test_admin_rpc_pay_bad_bolt11);
+    RUN_TEST(test_admin_rpc_keysend_bad_dest);
+    RUN_TEST(test_admin_rpc_unknown_method);
+    RUN_TEST(test_admin_rpc_malformed_json);
+    RUN_TEST(test_admin_rpc_getroute_no_gossip);
+    RUN_TEST(test_admin_rpc_feerates_defaults);
+    RUN_TEST(test_admin_rpc_feerates_with_estimator);
+    RUN_TEST(test_admin_rpc_stop_sets_flag);
+    RUN_TEST(test_admin_rpc_listinvoices_after_create);
+    RUN_TEST(test_admin_rpc_listpayments_empty);
+    RUN_TEST(test_admin_rpc_closechannel_unknown);
+    RUN_TEST(test_admin_rpc_openchannel_deferred);
+
+    printf("\n=== Splice Wire Protocol ===\n");
+    RUN_TEST(test_splice_wire_init_roundtrip);
+    RUN_TEST(test_splice_wire_ack);
+    RUN_TEST(test_splice_wire_locked);
+    RUN_TEST(test_splice_wire_stfu);
+    RUN_TEST(test_splice_wire_buffer_small);
+    RUN_TEST(test_splice_wire_parse_ack);
+    RUN_TEST(test_splice_wire_splicing_signed);
+    RUN_TEST(test_splice_wire_wrong_type);
+    RUN_TEST(test_splice_wire_truncated);
+
+    printf("\n=== BOLT #12 Offers (Full) ===\n");
+    RUN_TEST(test_bolt12_offer_expiry);
+    RUN_TEST(test_bolt12_invoice_from_request);
+    RUN_TEST(test_bolt12_invoice_error);
+    RUN_TEST(test_bolt12_full_sign_verify);
+    RUN_TEST(test_bolt12_offer_encode_decode);
+    RUN_TEST(test_bolt12_blinded_path_aead);
+    RUN_TEST(test_bolt12_merkle_root_nonempty);
+    RUN_TEST(test_bolt12_merkle_root_empty);
+    RUN_TEST(test_bolt12_sign_verify_merkle);
+    RUN_TEST(test_bolt12_invoice_error_wire);
+    printf("\n=== PR #24 Phase A: BOLT #12 Merkle TLV Field Boundaries ===\n");
+    RUN_TEST(test_bolt12_merkle_empty_deterministic);
+    RUN_TEST(test_bolt12_merkle_single_field);
+    RUN_TEST(test_bolt12_merkle_two_fields);
+    RUN_TEST(test_bolt12_merkle_three_fields_odd);
+    RUN_TEST(test_bolt12_merkle_regression_vs_old_chunking);
+    RUN_TEST(test_bolt12_merkle_zero_value_field);
+    RUN_TEST(test_bolt12_merkle_truncated_field);
+    printf("\n=== PR #24 Phase B: invoice_sign/verify Merkle Sighash ===\n");
+    RUN_TEST(test_invoice_sign_verify_regression);
+    RUN_TEST(test_invoice_sign_tampered_amount);
+    RUN_TEST(test_invoice_sign_different_invoices);
+    RUN_TEST(test_invoice_sign_differs_from_old_approach);
+    RUN_TEST(test_invoice_request_decode_roundtrip);
+    RUN_TEST(test_invoice_request_decode_truncated);
+    RUN_TEST(test_invoice_encode_parseable);
+    RUN_TEST(test_ln_dispatch_invoice_request);
+    RUN_TEST(test_ln_dispatch_malformed_htlc);
+    RUN_TEST(test_ln_dispatch_invoice_request_bad_sig);
+    printf("\n=== PR #21 Phase 1+2: BOLT #2 HTLC Commitment Wire ===\n");
+    RUN_TEST(test_htlc_commit_add_layout);
+    RUN_TEST(test_htlc_commit_commitment_signed_layout);
+    RUN_TEST(test_htlc_commit_revoke_and_ack_layout);
+    RUN_TEST(test_htlc_commit_fulfill_layout);
+    RUN_TEST(test_htlc_commit_fail_layout);
+    RUN_TEST(test_htlc_commit_fail_malformed_layout);
+    RUN_TEST(test_htlc_commit_dispatch_types);
+    RUN_TEST(test_htlc_commit_dust_excluded_from_tx);
+    RUN_TEST(test_htlc_commit_dust_tx_output_count);
+    RUN_TEST(test_htlc_commit_above_dust_counted);
+    RUN_TEST(test_htlc_commit_mixed_dust_counted);
+    printf("\n=== PR #21 Phase 5: update_fee ===\n");
+    RUN_TEST(test_htlc_commit_update_fee_layout);
+    RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
+    RUN_TEST(test_htlc_commit_recv_update_fee_rejects_low);
+    RUN_TEST(test_htlc_commit_recv_update_fee_rejects_high);
+    printf("\n=== PR #21 Phase 3: CLTV Watchdog ===\n");
+    RUN_TEST(test_cltv_watchdog_default_delta);
+    RUN_TEST(test_cltv_watchdog_no_htlcs);
+    RUN_TEST(test_cltv_watchdog_htlc_safe);
+    RUN_TEST(test_cltv_watchdog_htlc_at_risk);
+    RUN_TEST(test_cltv_watchdog_offered_ignored);
+    RUN_TEST(test_cltv_watchdog_expire);
+    RUN_TEST(test_cltv_watchdog_earliest_expiry);
+    RUN_TEST(test_cltv_watchdog_multi_htlc);
+    RUN_TEST(test_cltv_watchdog_block_cb);
+    printf("\n=== PR #24 Phase D: CLTV Watchdog on_block_connected Multi-Channel ===\n");
+    RUN_TEST(test_cltv_watchdog_block_connected_multi);
+    RUN_TEST(test_cltv_watchdog_block_connected_empty);
+    RUN_TEST(test_cltv_watchdog_block_connected_mixed);
+    RUN_TEST(test_watchtower_init_empty);
+    RUN_TEST(test_watchtower_watch_no_breach);
+    RUN_TEST(test_watchtower_ready_guard);
+    RUN_TEST(test_watchtower_remove_channel);
+    printf("\n=== PR #21 Phase 4: Cooperative Close ===\n");
+    RUN_TEST(test_chan_close_shutdown_layout);
+    RUN_TEST(test_chan_close_closing_signed_layout);
+    RUN_TEST(test_chan_close_negotiate_fee_converge);
+    RUN_TEST(test_chan_close_negotiate_fee_equal);
+    RUN_TEST(test_chan_close_recv_shutdown_parse);
+    RUN_TEST(test_chan_close_recv_closing_signed_parse);
+    RUN_TEST(test_chan_close_negotiate_fee_steps);
+    RUN_TEST(test_chan_close_negotiate_fee_low_high);
+    printf("\n=== PR #21 Phase 6: Peer Database ===\n");
+    RUN_TEST(test_peer_db_upsert_and_get);
+    RUN_TEST(test_peer_db_upsert_update);
+    RUN_TEST(test_peer_db_update_score);
+    RUN_TEST(test_peer_db_ban_and_is_banned);
+    RUN_TEST(test_peer_db_ban_expires);
+    RUN_TEST(test_peer_db_count);
+    RUN_TEST(test_peer_db_get_not_found);
+    RUN_TEST(test_peer_db_unban);
+    printf("\n=== PR #21 Phase 7: Probe + Peer Storage ===\n");
+    RUN_TEST(test_probe_build_hash);
+    RUN_TEST(test_probe_success_failure);
+    RUN_TEST(test_probe_liquidity_failure);
+    RUN_TEST(test_probe_classify_all_codes);
+    RUN_TEST(test_peer_storage_build_type7);
+    RUN_TEST(test_peer_storage_build_type9);
+    RUN_TEST(test_peer_storage_parse_roundtrip);
+    RUN_TEST(test_peer_storage_parse_errors);
+    printf("\n=== PR #21 Phase 8: BOLT Spec Vectors + Integration ===\n");
+    RUN_TEST(test_bolt3_shachain_vector_zero_seed);
+    RUN_TEST(test_bolt3_shachain_vector_ff_seed);
+    RUN_TEST(test_bolt3_shachain_vector_ff_aaa);
+    RUN_TEST(test_bolt3_shachain_vector_01_seed);
+    RUN_TEST(test_it_shutdown_roundtrip);
+    RUN_TEST(test_it_closing_signed_roundtrip);
+    RUN_TEST(test_it_probe_peer_db_score);
+    RUN_TEST(test_it_watchdog_expire_chain);
+
+    printf("\n=== PR #22 Phase 1: LN Peer Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_add_htlc);
+    RUN_TEST(test_ln_dispatch_fulfill);
+    RUN_TEST(test_ln_dispatch_unknown_type);
+    RUN_TEST(test_ln_dispatch_fail);
+    RUN_TEST(test_ln_dispatch_truncated);
+    printf("\n=== PR #24 Phase C+E: FORWARD_FINAL Invoice Claim + fd Race Fix ===\n");
+    RUN_TEST(test_ln_dispatch_invoice_claim);
+    RUN_TEST(test_ln_dispatch_no_matching_invoice);
+    RUN_TEST(test_ln_dispatch_forward_final_no_invoices);
+    RUN_TEST(test_ln_dispatch_peer_idx_neg1);
+    RUN_TEST(test_bolt8_ln_dispatch_routing);
+    RUN_TEST(test_lsps0_get_info_response);
+    RUN_TEST(test_lsps0_unknown_method);
+    RUN_TEST(test_lsps0_invoice_create_tbs);
+    RUN_TEST(test_lsps0_invoice_any_amount);
+    RUN_TEST(test_lsps0_malformed_json);
+    RUN_TEST(test_lsps0_lsps2_get_info);
+    RUN_TEST(test_peer_mgr_tor_proxy_set);
+    RUN_TEST(test_peer_mgr_onion_no_proxy);
+    RUN_TEST(test_peer_mgr_clearnet_bypass_tor);
+    RUN_TEST(test_tor_parse_proxy_arg_basic);
+    printf("\n=== PR #22 Phase 2: Invoice Receivability ===\n");
+    RUN_TEST(test_invoice_create_decode);
+    RUN_TEST(test_invoice_claim_success);
+    RUN_TEST(test_invoice_claim_underpay);
+    RUN_TEST(test_invoice_claim_double);
+    RUN_TEST(test_invoice_claim_expired);
+    RUN_TEST(test_invoice_settle);
+    RUN_TEST(test_invoice_any_amount);
+
+    RUN_TEST(test_onion_tlv_parse_partial);
+    RUN_TEST(test_htlc_inbound_fulfill_path);
+    RUN_TEST(test_htlc_inbound_timeout);
+    RUN_TEST(test_htlc_inbound_persist_roundtrip);
 
     printf("\n=== P2P Bitcoin Protocol (BIP 157 client) ===\n");
     RUN_TEST(test_p2p_getcfilters_payload);
@@ -1021,6 +1794,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_adaptor_round_trip);
     RUN_TEST(test_adaptor_pre_sig_invalid);
     RUN_TEST(test_adaptor_taproot);
+
+    printf("\n=== Phase 6: PTLC State Machine ===\n");
+    RUN_TEST(test_channel_add_ptlc);
+    RUN_TEST(test_channel_settle_ptlc);
+    RUN_TEST(test_channel_fail_ptlc);
+    RUN_TEST(test_channel_ptlc_multiple);
+    RUN_TEST(test_ptlc_commit_dispatch_presig);
+    RUN_TEST(test_ptlc_commit_dispatch_adapted);
+    RUN_TEST(test_ptlc_commit_dispatch_complete);
+    RUN_TEST(test_ptlc_commit_dispatch_null_ch);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_presig);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_adapted);
+    RUN_TEST(test_channel_ptlc_grow);
+    RUN_TEST(test_channel_fail_ptlc_not_found);
+    RUN_TEST(test_channel_settle_ptlc_not_found);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_complete);
 
     printf("\n=== PTLC Key Turnover (Phase 8b) ===\n");
     RUN_TEST(test_ptlc_key_turnover);
@@ -1227,6 +2016,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cpfp_witness_offset_p2wpkh);
     RUN_TEST(test_cpfp_retry_bump);
     RUN_TEST(test_pending_persistence);
+
+    printf("\n=== Phase L: CPFP Non-Breach Registration ===\n");
+    RUN_TEST(test_watchtower_add_pending_tx);
+    RUN_TEST(test_watchtower_add_pending_tx_full);
+    RUN_TEST(test_watchtower_add_pending_bump_mechanics);
+    RUN_TEST(test_watchtower_add_pending_persists);
 
     printf("\n=== Continuous Ladder Daemon (Gap #3) ===\n");
     RUN_TEST(test_ladder_evict_expired);
@@ -1571,6 +2366,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_queue_drain_limit);
     RUN_TEST(test_queue_null_safety);
     RUN_TEST(test_queue_get);
+
+    printf("\n=== Phase 4: Async Signing Queue Dispatch ===\n");
+    RUN_TEST(test_queue_ln_dispatch_poll_null_persist);
+    RUN_TEST(test_queue_ln_dispatch_done_null_persist);
+    RUN_TEST(test_queue_dispatch_poll_type_returned);
+    RUN_TEST(test_queue_dispatch_done_type_returned);
+    RUN_TEST(test_ln_dispatch_routes_queue_poll);
+    RUN_TEST(test_ln_dispatch_routes_queue_done);
+    RUN_TEST(test_queue_ln_dispatch_done_empty);
+    RUN_TEST(test_queue_ln_dispatch_done_too_short);
 
     printf("\n=== Async Signing: Notification Dispatch ===\n");
     RUN_TEST(test_notify_log_init);

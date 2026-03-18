@@ -135,6 +135,13 @@ typedef struct {
     p2p_output_cb_t utxo_found_cb;
     p2p_input_cb_t  utxo_spent_cb;
     void           *utxo_cb_ctx;
+
+    /* Block-connected callback — fired once per block after tip_height is
+     * advanced (whether or not the filter matched).  Enables callers such as
+     * the CLTV watchdog and watchtower to react to new blocks without polling.
+     * Set via bip158_backend_set_block_connected_cb(); NULL = disabled. */
+    void           (*block_connected_cb)(uint32_t height, void *cb_ctx);
+    void            *block_connected_ctx;
 } bip158_backend_t;
 
 /* Parse a "HOST:PORT" string.  host_out receives the NUL-terminated hostname,
@@ -348,5 +355,15 @@ void bip158_backend_set_utxo_cb(bip158_backend_t *backend,
                                   p2p_output_cb_t found_cb,
                                   p2p_input_cb_t spent_cb,
                                   void *ctx);
+
+/*
+ * Register a block-connected callback.  Fired once per block after
+ * tip_height advances.  cb receives the new height and cb_ctx.
+ * Pass NULL cb to disable.  Caller retains ownership of cb_ctx.
+ */
+void bip158_backend_set_block_connected_cb(bip158_backend_t *backend,
+                                            void (*cb)(uint32_t height,
+                                                       void *cb_ctx),
+                                            void *cb_ctx);
 
 #endif /* SUPERSCALAR_BIP158_BACKEND_H */

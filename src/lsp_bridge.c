@@ -1,6 +1,7 @@
 /* Bridge/invoice support extracted from lsp_channels.c */
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/htlc_inbound.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,6 +186,22 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    (unsigned long long)dest_ch->remote_amount);
             free(old_dest_htlcs);
             return 1;
+        }
+
+        /* Record in htlc_inbound table (unified inbound HTLC tracking) */
+        {
+            static const unsigned char zero_secret[32] = {0};
+            htlc_inbound_add(&mgr->htlc_inbound, htlc_id, amount_msat,
+                             payment_hash, zero_secret, cltv_expiry, 0);
+            if (mgr->persist) {
+                htlc_inbound_t hi;
+                memset(&hi, 0, sizeof(hi));
+                hi.htlc_id      = htlc_id;
+                hi.amount_msat  = amount_msat;
+                memcpy(hi.payment_hash, payment_hash, 32);
+                hi.cltv_expiry  = cltv_expiry;
+                persist_save_htlc_inbound((persist_t *)mgr->persist, &hi);
+            }
         }
 
         /* Track bridge origin for back-propagation (with cltv for timeout) */

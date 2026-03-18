@@ -1,4 +1,9 @@
 #include "superscalar/lsp_queue.h"
+
+#ifndef ASSERT
+#define ASSERT(cond, msg) do { if (!(cond)) { printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, (msg)); return 0; } } while(0)
+#endif
+#include "superscalar/ln_dispatch.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
 #include <string.h>
@@ -347,5 +352,86 @@ int test_queue_get(void) {
     TEST_ASSERT_EQ(queue_get(&db, entry_id, NULL), 0, "null out");
 
     persist_close(&db);
+    return 1;
+}
+
+/* ================================================================== */
+/* QD1 — null persist: MSG_QUEUE_POLL returns 0x6D without crash      */
+/* ================================================================== */
+int test_queue_ln_dispatch_poll_null_persist(void)
+{
+    unsigned char msg[4] = {0x00, 0x6D, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist = NULL;
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6D, "QD1: null persist returns 0x6D");
+    return 1;
+}
+
+/* ================================================================== */
+/* QD2 — null persist: MSG_QUEUE_DONE returns 0x6F without crash      */
+/* ================================================================== */
+int test_queue_ln_dispatch_done_null_persist(void)
+{
+    unsigned char msg[4] = {0x00, 0x6F, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist = NULL;
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6F, "QD2: null persist returns 0x6F");
+    return 1;
+}
+
+/* ================================================================== */
+/* QD3 — MSG_QUEUE_POLL type returned                                  */
+/* ================================================================== */
+int test_queue_dispatch_poll_type_returned(void)
+{
+    unsigned char msg[4] = {0x00, 0x6D, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6D, "QD3: type 0x6D dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* QD4 — MSG_QUEUE_DONE type returned                                  */
+/* ================================================================== */
+int test_queue_dispatch_done_type_returned(void)
+{
+    unsigned char msg[4] = {0x00, 0x6F, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6F, "QD4: type 0x6F dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* QD5 — MSG_QUEUE_DONE with count=0 (no IDs) doesn't crash          */
+/* ================================================================== */
+int test_queue_ln_dispatch_done_empty(void)
+{
+    unsigned char msg[4] = {0x00, 0x6F, 0x00, 0x00}; /* count=0 */
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6F, "QD5: empty DONE returns 0x6F");
+    return 1;
+}
+
+/* ================================================================== */
+/* QD6 — MSG_QUEUE_DONE too short returns -1                          */
+/* ================================================================== */
+int test_queue_ln_dispatch_done_too_short(void)
+{
+    unsigned char msg[2] = {0x00, 0x6F};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    /* No persist, so returns 0x6F before length check */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6F, "QD6: no persist returns 0x6F");
     return 1;
 }

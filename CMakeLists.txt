@@ -12,6 +12,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(project_warnings INTERFACE)
 target_compile_options(project_warnings INTERFACE
     -Wall -Wextra -Werror
+    -Wno-unused-result
+    -Wno-stringop-truncation
 )
 
 # --- Sanitizers (opt-in) ---
@@ -46,6 +48,7 @@ include(FetchContent)
 set(SECP256K1_ENABLE_MODULE_MUSIG ON CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_SCHNORRSIG ON CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_EXTRAKEYS ON CACHE BOOL "" FORCE)
+set(SECP256K1_ENABLE_MODULE_RECOVERY ON CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_EXHAUSTIVE_TESTS OFF CACHE BOOL "" FORCE)
 set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
@@ -134,6 +137,33 @@ add_library(superscalar
     src/blinded_path.c
     src/splice.c
     src/bech32m.c
+    src/bolt8.c
+    src/bolt8_server.c
+    src/lsp_wellknown.c
+    src/gossip.c
+    src/gossip_store.c
+    src/mpp.c
+    src/scid_registry.c
+    src/onion_last_hop.c
+    src/htlc_inbound.c
+    src/gossip_peer.c
+    src/bolt11.c
+    src/pathfind.c
+    src/onion.c
+    src/htlc_forward.c
+    src/peer_mgr.c
+    src/chan_open.c
+    src/ptlc_commit.c
+    src/htlc_commit.c
+    src/cltv_watchdog.c
+    src/chan_close.c
+    src/peer_db.c
+    src/probe.c
+    src/peer_storage.c
+    src/payment.c
+    src/ln_dispatch.c
+    src/invoice.c
+    src/admin_rpc.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -184,6 +214,32 @@ add_executable(test_superscalar
     tests/test_lsps.c
     tests/test_bolt12.c
     tests/test_splice.c
+    tests/test_bolt8.c
+    tests/test_lsp_discovery.c
+    tests/test_gossip.c
+    tests/test_scid_registry.c
+    tests/test_onion_last_hop.c
+    tests/test_gossip_net.c
+    tests/test_mpp.c
+    tests/test_lsps2_deferred.c
+    tests/test_bolt11.c
+    tests/test_pathfind.c
+    tests/test_onion.c
+    tests/test_htlc_forward.c
+    tests/test_peer_mgr.c
+    tests/test_chan_open.c
+    tests/test_htlc_commit.c
+    tests/test_cltv_watchdog.c
+    tests/test_chan_close.c
+    tests/test_peer_db.c
+    tests/test_probe_storage.c
+    tests/test_spec_vectors.c
+    tests/test_payment.c
+    tests/test_splice_wire.c
+    tests/test_bolt12_full.c
+    tests/test_invoice.c
+    tests/test_ln_dispatch.c
+    tests/test_admin_rpc.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

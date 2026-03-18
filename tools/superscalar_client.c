@@ -18,6 +18,7 @@
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/splice.h"
+#include "superscalar/lsp_wellknown.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1909,6 +1910,7 @@ int main(int argc, char *argv[]) {
     int fee_rate = 1000;
     int auto_accept_jit = 0;
     const char *lsp_pubkey_hex = NULL;
+    const char *lsp_domain = NULL;      /* --lsp DOMAIN: bootstrap from well-known */
     const char *tor_proxy_arg = NULL;
     int tor_only = 0;
     int accept_risk = 0;
@@ -2037,6 +2039,8 @@ int main(int argc, char *argv[]) {
             test_splice = 1;
         } else if (strcmp(argv[i], "--lsp-pubkey") == 0 && i + 1 < argc) {
             lsp_pubkey_hex = argv[++i];
+        } else if (strcmp(argv[i], "--lsp") == 0 && i + 1 < argc) {
+            lsp_domain = argv[++i];
         } else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc) {
             tor_proxy_arg = argv[++i];
         } else if (strcmp(argv[i], "--tor-only") == 0) {
@@ -2227,6 +2231,32 @@ int main(int argc, char *argv[]) {
         memset(seckey, 0, 32);
         report_close(&rpt);
         return 1;
+    }
+
+    /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
+    static char wk_host_buf[256];
+    static char wk_pubkey_buf[128];
+    if (lsp_domain) {
+        uint16_t wk_port = 0;
+        printf("Client: fetching /.well-known/lsps.json from %s ...\n",
+               lsp_domain);
+        if (!lsp_wellknown_fetch_http(lsp_domain,
+                                      wk_host_buf, sizeof(wk_host_buf),
+                                      &wk_port, wk_pubkey_buf,
+                                      sizeof(wk_pubkey_buf))) {
+            fprintf(stderr, "Client: failed to fetch well-known from %s\n",
+                    lsp_domain);
+            memset(seckey, 0, 32);
+            report_close(&rpt);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        host = wk_host_buf;
+        port = (int)wk_port;
+        if (!lsp_pubkey_hex)
+            lsp_pubkey_hex = wk_pubkey_buf;
+        printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
+               lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
     }
 
     /* NK authentication: pin LSP static pubkey if provided */
