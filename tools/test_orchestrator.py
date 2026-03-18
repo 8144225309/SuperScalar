@@ -28,9 +28,11 @@ import sys
 import time
 
 
-def safe_pkill(pattern, sig="-15"):
+def safe_pkill(pattern, sig="-15", port=None):
     """Kill processes matching pattern without hitting SSH sessions.
-    Uses /proc/PID/cmdline to verify the match before killing."""
+    Uses /proc/PID/cmdline to verify the match before killing.
+    If port is given, only kills processes whose cmdline contains --port <port>,
+    preventing accidental termination of unrelated signet/testnet4 instances."""
     r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
     for pid in r.stdout.strip().split("\n"):
         if not pid:
@@ -38,6 +40,8 @@ def safe_pkill(pattern, sig="-15"):
         try:
             cmdline = open(f"/proc/{pid}/cmdline").read().replace("\0", " ")
             if any(x in cmdline for x in ["sshd", "ssh ", "/bin/bash -c"]):
+                continue
+            if port and f"--port {port}" not in cmdline:
                 continue
             if re.search(pattern, cmdline):
                 subprocess.run(["kill", sig, pid], capture_output=True)
@@ -336,8 +340,8 @@ class Orchestrator:
 
         # Kill any stale superscalar processes that might be reconnecting to
         # the port (e.g. daemon clients left over from a previous failed run).
-        safe_pkill("superscalar_lsp", "-9")
-        safe_pkill("superscalar_client", "-9")
+        safe_pkill("superscalar_lsp", "-9", port=self.port)
+        safe_pkill("superscalar_client", "-9", port=self.port)
 
         # Clean and recreate test directory
         if os.path.exists(self.test_dir):
@@ -2333,8 +2337,8 @@ def main():
     results = {}
 
     # Kill any stale superscalar processes from a previous session before starting
-    safe_pkill("superscalar_lsp", "-9")
-    safe_pkill("superscalar_client", "-9")
+    safe_pkill("superscalar_lsp", "-9", port=args.port)
+    safe_pkill("superscalar_client", "-9", port=args.port)
     time.sleep(1)
 
     for idx, name in enumerate(scenarios_to_run):
@@ -2345,8 +2349,8 @@ def main():
 
         # Kill stale processes and clean state between scenarios
         if idx > 0:
-            safe_pkill("superscalar_lsp", "-9")
-            safe_pkill("superscalar_client", "-9")
+            safe_pkill("superscalar_lsp", "-9", port=args.port)
+            safe_pkill("superscalar_client", "-9", port=args.port)
             time.sleep(2)
             # Clean state directory
             shutil.rmtree("/tmp/superscalar_test", ignore_errors=True)
