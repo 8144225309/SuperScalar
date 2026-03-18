@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 4
+#define PERSIST_SCHEMA_VERSION 5
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -428,7 +428,9 @@ int persist_save_hd_utxo(persist_t *p,
 int persist_mark_hd_utxo_spent(persist_t *p, const char *txid, uint32_t vout);
 
 /*
- * Find the best unspent UTXO with amount >= min_sats.
+ * Find the best unspent, unreserved UTXO with amount >= min_sats and
+ * atomically mark it reserved so concurrent callers skip it.
+ * Call persist_unreserve_hd_utxo() after broadcast (success or failure).
  * Returns 1 if found, 0 otherwise.
  */
 int persist_get_hd_utxo(persist_t *p,
@@ -437,6 +439,14 @@ int persist_get_hd_utxo(persist_t *p,
                           uint32_t *vout_out,
                           uint64_t *amount_out,
                           uint32_t *key_index_out);
+
+/* Release a reservation made by persist_get_hd_utxo (broadcast failed or
+ * done).  No-op if the coin is already marked spent. */
+int persist_unreserve_hd_utxo(persist_t *p, const char *txid, uint32_t vout);
+
+/* Clear all reservations on startup — coins reserved by a prior run that
+ * crashed before broadcast are made available again. */
+void persist_clear_hd_reserved(persist_t *p);
 
 /* Save / load the HD wallet's next unused address index. */
 int persist_save_hd_next_index(persist_t *p, uint32_t next_index);
