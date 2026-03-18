@@ -338,6 +338,28 @@ extern int test_chan_open_v2_basepoints_nonzero(void);
 extern int test_chan_open_accept_zero_conf_min_depth(void);
 extern int test_ln_dispatch_close_broadcast(void);
 
+/* PR #27: Admin RPC */
+extern int test_admin_rpc_getinfo_has_node_id(void);
+extern int test_admin_rpc_getinfo_node_id_hex(void);
+extern int test_admin_rpc_listpeers_is_array(void);
+extern int test_admin_rpc_listchannels_is_array(void);
+extern int test_admin_rpc_listpayments_is_array(void);
+extern int test_admin_rpc_listinvoices_is_array(void);
+extern int test_admin_rpc_createinvoice_has_bolt11(void);
+extern int test_admin_rpc_createinvoice_any_amount(void);
+extern int test_admin_rpc_pay_bad_bolt11(void);
+extern int test_admin_rpc_keysend_bad_dest(void);
+extern int test_admin_rpc_unknown_method(void);
+extern int test_admin_rpc_malformed_json(void);
+extern int test_admin_rpc_getroute_no_gossip(void);
+extern int test_admin_rpc_feerates_defaults(void);
+extern int test_admin_rpc_feerates_with_estimator(void);
+extern int test_admin_rpc_stop_sets_flag(void);
+extern int test_admin_rpc_listinvoices_after_create(void);
+extern int test_admin_rpc_listpayments_empty(void);
+extern int test_admin_rpc_closechannel_unknown(void);
+extern int test_admin_rpc_openchannel_deferred(void);
+
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
 extern int test_splice_wire_ack(void);
@@ -1520,6 +1542,28 @@ static void run_unit_tests(void) {
     RUN_TEST(test_chan_open_v2_basepoints_nonzero);
     RUN_TEST(test_chan_open_accept_zero_conf_min_depth);
     RUN_TEST(test_ln_dispatch_close_broadcast);
+
+    printf("\n=== PR #27: Admin RPC (JSON-RPC 2.0) ===\n");
+    RUN_TEST(test_admin_rpc_getinfo_has_node_id);
+    RUN_TEST(test_admin_rpc_getinfo_node_id_hex);
+    RUN_TEST(test_admin_rpc_listpeers_is_array);
+    RUN_TEST(test_admin_rpc_listchannels_is_array);
+    RUN_TEST(test_admin_rpc_listpayments_is_array);
+    RUN_TEST(test_admin_rpc_listinvoices_is_array);
+    RUN_TEST(test_admin_rpc_createinvoice_has_bolt11);
+    RUN_TEST(test_admin_rpc_createinvoice_any_amount);
+    RUN_TEST(test_admin_rpc_pay_bad_bolt11);
+    RUN_TEST(test_admin_rpc_keysend_bad_dest);
+    RUN_TEST(test_admin_rpc_unknown_method);
+    RUN_TEST(test_admin_rpc_malformed_json);
+    RUN_TEST(test_admin_rpc_getroute_no_gossip);
+    RUN_TEST(test_admin_rpc_feerates_defaults);
+    RUN_TEST(test_admin_rpc_feerates_with_estimator);
+    RUN_TEST(test_admin_rpc_stop_sets_flag);
+    RUN_TEST(test_admin_rpc_listinvoices_after_create);
+    RUN_TEST(test_admin_rpc_listpayments_empty);
+    RUN_TEST(test_admin_rpc_closechannel_unknown);
+    RUN_TEST(test_admin_rpc_openchannel_deferred);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);

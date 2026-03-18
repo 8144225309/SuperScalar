@@ -25,6 +25,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/musig.h"
 #include "superscalar/lsp_wellknown.h"
+#include "superscalar/admin_rpc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +88,10 @@ static lsps2_pending_table_t g_lsps2_pending;
 /* Watchtower: breach detection on every block */
 static watchtower_t g_watchtower;
 static int          g_watchtower_ready = 0;
+
+/* Admin RPC: JSON-RPC 2.0 Unix socket operator interface */
+static admin_rpc_t   g_admin_rpc;
+static gossip_store_t *g_gossip_store_ptr = NULL; /* set after gossip store init */
 
 static void *ln_dispatch_thread(void *arg) {
     (void)arg;
@@ -292,6 +297,7 @@ static void usage(const char *prog) {
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
         "  --settlement-interval N Blocks between profit settlements (default: 144)\n"
+        "  --rpc-file PATH     Unix socket path for JSON-RPC 2.0 admin interface\n"
         "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
@@ -913,6 +919,7 @@ int main(int argc, char *argv[]) {
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
+    const char *rpc_file_arg = NULL;
     const char *tor_proxy_arg = NULL;
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
@@ -1115,6 +1122,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rpc-file") == 0 && i + 1 < argc)
+            rpc_file_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc)
             tor_proxy_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-control") == 0 && i + 1 < argc)
@@ -2067,6 +2076,8 @@ int main(int argc, char *argv[]) {
             if (!s_gossip_store_opened) {
                 const char *gdb_path = db_path ? db_path : ":memory:";
                 s_gossip_store_opened = gossip_store_open(&s_gossip_store, gdb_path);
+                if (s_gossip_store_opened)
+                    g_gossip_store_ptr = &s_gossip_store;
             }
 
             if (s_gossip_store_opened) {
@@ -2163,6 +2174,27 @@ int main(int argc, char *argv[]) {
             } else {
                 fprintf(stderr, "LSP: warning: failed to start LN dispatch thread\n");
             }
+        }
+
+        /* Admin RPC: wire and start if --rpc-file is given */
+        if (rpc_file_arg) {
+            memset(&g_admin_rpc, 0, sizeof(g_admin_rpc));
+            g_admin_rpc.ctx          = ctx;
+            memcpy(g_admin_rpc.node_privkey, lsp.nk_seckey, 32);
+            g_admin_rpc.pmgr         = &g_peer_mgr;
+            g_admin_rpc.channel_mgr  = g_channel_mgr;
+            g_admin_rpc.payments     = &g_payments;
+            g_admin_rpc.invoices     = &g_invoice_tbl;
+            g_admin_rpc.gossip       = g_gossip_store_ptr;
+            g_admin_rpc.fwd          = &g_fwd;
+            g_admin_rpc.mpp          = &g_mpp;
+            g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
+            g_admin_rpc.block_height = NULL; /* TODO: wire block height in PR#28 */
+            if (admin_rpc_init(&g_admin_rpc, rpc_file_arg))
+                printf("LSP: admin RPC socket at %s\n", rpc_file_arg);
+            else
+                fprintf(stderr, "LSP: warning: failed to bind admin RPC socket %s\n",
+                        rpc_file_arg);
         }
 
         if (well_known_port > 0) {

@@ -327,8 +327,7 @@ int lsps1_order_fund(int order_id, const char *funding_txid_hex,
         if (!e->active || e->order_id != order_id) continue;
         if (strcmp(e->state, "CREATED") != 0) return 0;
 
-        strncpy(e->state, "PENDING_FUNDING", sizeof(e->state) - 1);
-        e->state[sizeof(e->state) - 1] = '\0';
+        snprintf(e->state, sizeof(e->state), "%s", "PENDING_FUNDING");
         if (funding_txid_hex)
             strncpy(e->funding_txid_hex, funding_txid_hex,
                     sizeof(e->funding_txid_hex) - 1);
