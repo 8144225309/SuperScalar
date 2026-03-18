@@ -453,15 +453,6 @@ int persist_open(persist_t *p, const char *path) {
             "CREATE TABLE IF NOT EXISTS pending_cs ("
             "  channel_id INTEGER PRIMARY KEY,"
             "  commitment_number INTEGER NOT NULL"
-    /* v6 migration: lsp_endpoints cache for client bootstrap */
-    if (db_version < 6) {
-        const char *sql_v4 =
-            "CREATE TABLE IF NOT EXISTS lsp_endpoints ("
-            "  domain     TEXT NOT NULL PRIMARY KEY,"
-            "  host       TEXT NOT NULL,"
-            "  port       INTEGER NOT NULL,"
-            "  pubkey_hex TEXT NOT NULL,"
-            "  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
             ");";
         char *merr4 = NULL;
         if (sqlite3_exec(p->db, sql_v4, NULL, NULL, &merr4) != SQLITE_OK) {
@@ -474,7 +465,27 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
-    /* v7 migration: scid_registry for factory leaf → fake SCID */
+    /* v6 migration: lsp_endpoints cache for client bootstrap */
+    if (db_version < 6) {
+        const char *sql_v6 =
+            "CREATE TABLE IF NOT EXISTS lsp_endpoints ("
+            "  domain     TEXT NOT NULL PRIMARY KEY,"
+            "  host       TEXT NOT NULL,"
+            "  port       INTEGER NOT NULL,"
+            "  pubkey_hex TEXT NOT NULL,"
+            "  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr6 = NULL;
+        if (sqlite3_exec(p->db, sql_v6, NULL, NULL, &merr6) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v6 failed: %s\n",
+                    merr6 ? merr6 : "unknown");
+            sqlite3_free(merr6);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     if (db_version < 7) {
         const char *sql_v5 =
             "CREATE TABLE IF NOT EXISTS scid_registry ("
@@ -3186,6 +3197,12 @@ int persist_load_pending_cs(persist_t *p, uint32_t channel_id,
     int found = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         *cn_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 /* --- LSP endpoint cache (schema v4) --- */
 
 int persist_save_lsp_endpoint(persist_t *p,

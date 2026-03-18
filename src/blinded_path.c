@@ -1,7 +1,4 @@
 #include "superscalar/blinded_path.h"
-=======
-#include "superscalar/crypto_aead.h"
->>>>>>> origin/superscalar-ln-parity-
 #include "superscalar/crypto_aead.h"
 #include "superscalar/sha256.h"
 #include <string.h>
@@ -9,7 +6,6 @@
 #include <secp256k1_ecdh.h>
 #include <secp256k1_extrakeys.h>
 
-=======
 /*
  * BOLT #12 blinded path implementation.
  *
@@ -48,44 +44,6 @@ static void derive_aead_key(const unsigned char shared_secret[32],
     sha256(buf, 64, key_out);
 }
 
->>>>>>> origin/superscalar-ln-parity-
-/*
- * BOLT #12 blinded path implementation.
- *
- * Build (sender side):
- *   intro_seckey32  = ephemeral secret e
- *   introduction_node_id = e*G  (= blinding_point, carried in the payment)
- *
- *   For each hop i:
- *     ss_i           = ECDH(e, node_pubkeys[i])
- *     blinding_factor= SHA256("blinded_node_id" || ss_i)
- *     blinded_node_i = node_pubkeys[i] * blinding_factor
- *     aead_key       = blinding_factor   (= SHA256("blinded_node_id"||ss_i))
- *     plaintext      = node_pubkeys[i+1] (next hop) || zero-pad to 48 bytes
- *     encrypted_data = ChaCha20-Poly1305(aead_key, nonce=0,
- *                                        aad=blinded_node_id, pt=plaintext)
- *                      → 48-byte ciphertext + 16-byte Poly1305 tag = 64 bytes
- *
- * Unblind (introduction node, hop 0 receiver):
- *   intro_seckey32  = hop 0's OWN private key   (≠ the ephemeral e)
- *   introduction_node_id stored in path = e*G
- *   ss_0            = ECDH(hop0_privkey, e*G)   = ECDH(e, hop0_pubkey) [same]
- *   Derive aead_key, decrypt hops[0].encrypted_recipient_data → next_node_id
- */
-
-/* ---- Helper: derive AEAD key from shared_secret ---- */
-static void derive_aead_key(const unsigned char shared_secret[32],
-                              unsigned char key_out[32])
-{
-    /* key = SHA256(SHA256("blinded_node_id") || shared_secret) */
-    const char *tag = "blinded_node_id";
-    unsigned char tag_hash[32];
-    sha256((const unsigned char *)tag, 15, tag_hash);
-    unsigned char buf[64];
-    memcpy(buf,      tag_hash,      32);
-    memcpy(buf + 32, shared_secret, 32);
-    sha256(buf, 64, key_out);
-}
 int blinded_path_build(blinded_path_t *path,
                         secp256k1_context *ctx,
                         const unsigned char (*node_pubkeys)[33],
@@ -99,7 +57,6 @@ int blinded_path_build(blinded_path_t *path,
     memset(path, 0, sizeof(*path));
     path->n_hops = n_hops;
 
-    /* First hop: introduction node = our own pubkey */
     /* introduction_node_id = e*G (the blinding_point carried in the payment) */
     secp256k1_keypair intro_kp;
     if (!secp256k1_keypair_create(ctx, &intro_kp, intro_seckey32)) return 0;
@@ -111,16 +68,6 @@ int blinded_path_build(blinded_path_t *path,
                                        &intro_pub, SECP256K1_EC_COMPRESSED);
     }
 
-    /* For each hop, compute ECDH blinded node id:
-       1. shared_secret = secp256k1_ecdh(intro_seckey, node_pubkey)
-       2. blinding_factor = SHA256("blinded_node_id" || shared_secret)
-       3. blinded_node_id = node_pubkey * blinding_factor  */
-    for (size_t i = 0; i < n_hops; i++) {
-        /* Parse hop pubkey */
-        secp256k1_pubkey hop_pub;
-        if (!secp256k1_ec_pubkey_parse(ctx, &hop_pub, node_pubkeys[i], 33)) return 0;
-
-        /* ECDH: shared = SHA256(x-coordinate of intro_seckey * hop_pub) */
     for (size_t i = 0; i < n_hops; i++) {
         secp256k1_pubkey hop_pub;
         if (!secp256k1_ec_pubkey_parse(ctx, &hop_pub, node_pubkeys[i], 33))
@@ -131,19 +78,6 @@ int blinded_path_build(blinded_path_t *path,
         if (!secp256k1_ecdh(ctx, shared_secret, &hop_pub, intro_seckey32,
                              NULL, NULL)) return 0;
 
-        /* Blinding factor = SHA256("blinded_node_id" || shared_secret) */
-        const char *tag = "blinded_node_id";
-        unsigned char bf_input[32 + 32];  /* tag hash + shared_secret */
-        unsigned char tag_hash[32];
-        sha256((const unsigned char *)tag, strlen(tag), tag_hash);
-        memcpy(bf_input, tag_hash, 32);
-        memcpy(bf_input + 32, shared_secret, 32);
-        unsigned char blinding_factor[32];
-        sha256(bf_input, 64, blinding_factor);
-
-        /* Blinded node id = hop_pub * blinding_factor */
-        secp256k1_pubkey blinded_pub = hop_pub;
-        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &blinded_pub, blinding_factor)) return 0;
         /* Blinding factor = SHA256("blinded_node_id" || ss_i) */
         unsigned char blinding_factor[32];
         derive_aead_key(shared_secret, blinding_factor);
@@ -158,12 +92,6 @@ int blinded_path_build(blinded_path_t *path,
                                            &blinded_pub, SECP256K1_EC_COMPRESSED);
         }
 
-        /* Encrypted data: SHA256(shared_secret || node_pubkey) as simplified placeholder */
-        unsigned char enc_input[64];
-        memcpy(enc_input, shared_secret, 32);
-        memcpy(enc_input + 32, node_pubkeys[i], 32);
-        sha256(enc_input, 64, path->hops[i].encrypted_recipient_data);
-        path->hops[i].encrypted_len = 32;
         /* AEAD key = blinding_factor (= SHA256("blinded_node_id" || ss_i)) */
         unsigned char aead_key[32];
         memcpy(aead_key, blinding_factor, 32);
@@ -203,9 +131,6 @@ int blinded_path_unblind_first_hop(const blinded_path_t *path,
     if (!path || !ctx || !intro_seckey32 || !next_node_id33) return 0;
     if (path->n_hops < 2) return 0;
 
-    /* Simplified: return the blinded node id of hop[1] directly */
-    memcpy(next_node_id33, path->hops[1].blinded_node_id, 33);
-    (void)intro_seckey32;
     /*
      * intro_seckey32 = hop 0's own private key.
      * path->introduction_node_id = e*G (blinding_point from sender).

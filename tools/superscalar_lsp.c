@@ -24,10 +24,6 @@
 #include "superscalar/notify.h"
 #include "superscalar/splice.h"
 #include "superscalar/musig.h"
-=======
-#include "superscalar/lsp_wellknown.h"
-#include "superscalar/admin_rpc.h"
->>>>>>> origin/superscalar-ln-parity-
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/admin_rpc.h"
 #include <stdio.h>
@@ -49,19 +45,6 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
-=======
-#include "superscalar/bolt8_server.h"
-#include "superscalar/ln_dispatch.h"
-#include "superscalar/invoice.h"
-#include "superscalar/peer_mgr.h"
-#include "superscalar/htlc_forward.h"
-#include "superscalar/mpp.h"
-#include "superscalar/payment.h"
-#include "superscalar/cltv_watchdog.h"
-#include "superscalar/gossip_peer.h"
-#include "superscalar/gossip_store.h"
-#include <pthread.h>
->>>>>>> origin/superscalar-ln-parity-
 #include "superscalar/bolt8_server.h"
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/invoice.h"
@@ -976,12 +959,6 @@ int main(int argc, char *argv[]) {
     int n_lc_fallbacks = 0;
     const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
     uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
-=======
-    uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
-    int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
-    char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
-    uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
->>>>>>> origin/superscalar-ln-parity-
     uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
     int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
     char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
@@ -1238,18 +1215,6 @@ int main(int argc, char *argv[]) {
             create_offer_desc = argv[++i];
         else if (strcmp(argv[i], "--offer-amount") == 0 && i + 1 < argc)
             create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
-=======
-        else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
-            well_known_port = (uint16_t)atoi(argv[++i]);
-        else if (strcmp(argv[i], "--clnbridge") == 0)
-            use_clnbridge = 1;
-        else if (strcmp(argv[i], "--gossip-peers") == 0 && i + 1 < argc) {
-            strncpy(gossip_peers, argv[++i], sizeof(gossip_peers) - 1);
-            gossip_peers[sizeof(gossip_peers) - 1] = '\0';
-        }
-        else if (strcmp(argv[i], "--bolt8-port") == 0 && i + 1 < argc)
-            bolt8_listen_port = (uint16_t)atoi(argv[++i]);
->>>>>>> origin/superscalar-ln-parity-
         else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
             well_known_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--clnbridge") == 0)
