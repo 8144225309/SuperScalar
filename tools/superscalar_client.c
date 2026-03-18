@@ -18,9 +18,6 @@
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/splice.h"
-=======
-#include "superscalar/lsp_wellknown.h"
->>>>>>> origin/superscalar-ln-parity-
 #include "superscalar/lsp_wellknown.h"
 #include <stdio.h>
 #include <stdlib.h>
