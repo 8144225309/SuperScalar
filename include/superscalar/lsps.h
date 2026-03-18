@@ -113,4 +113,56 @@ cJSON *lsps2_build_get_info_response(const lsps2_fee_params_t *params);
 int    lsps2_parse_buy(const cJSON *params,
                         uint64_t *amount_msat, uint64_t *fee_msat);
 
+/* -----------------------------------------------------------------------
+ * LSPS2 — Deferred funding broadcast (PR #19 Commit 5)
+ *
+ * Funding tx is withheld until intercepted HTLCs cover the channel-open cost.
+ * Set client_trusts_lsp = 1 in lsps_ctx_t for immediate broadcast (testnet).
+ * --------------------------------------------------------------------- */
+
+#define LSPS1_CONFIRM_TIMEOUT_BLOCKS 144 /* ~24 h of blocks: FAILED if confs not seen */
+#define LSPS2_HTLC_WAIT_SECS    5     /* LDK: LIQUIDITY_REQUEST_TIMEOUT */
+#define LSPS2_CLTV_DELTA       72     /* LDK: channel cltv expiry delta */
+#define LSPS2_PENDING_MAX      16     /* max concurrent JIT channels pending */
+
+typedef struct {
+    int      active;
+    uint64_t scid;                    /* intercept SCID assigned at buy */
+    uint64_t amount_msat;             /* client requested amount */
+    uint64_t fee_msat;                /* agreed fee */
+    uint64_t cost_msat;               /* channel-open cost (= fee_msat) */
+    uint64_t collected_msat;          /* sum of intercepted HTLCs so far */
+    char     funding_tx_hex[4096];    /* serialised funding tx (held until covered) */
+    uint32_t created_at;              /* unix timestamp */
+    size_t   client_idx;
+} lsps2_pending_t;
+
+typedef struct {
+    lsps2_pending_t entries[LSPS2_PENDING_MAX];
+    int count;
+} lsps2_pending_table_t;
+
+/*
+ * Called when an HTLC arrives on an intercept SCID.
+ * Accumulates collected_msat. If collected >= cost_msat, broadcast funding tx
+ * and call jit_channel_create(). Returns 1 if broadcast triggered, 0 if waiting.
+ * mgr and lsp may be NULL in unit tests (no actual channel created).
+ */
+int lsps2_handle_intercept_htlc(lsps2_pending_table_t *tbl,
+                                  uint64_t scid, uint64_t amount_msat,
+                                  void *mgr, void *lsp);
+
+/* Phase J: LSPS1 order state machine helpers */
+int  lsps1_order_fund(int order_id, const char *funding_txid_hex,
+                      uint32_t funded_at_height, int client_fd);
+int  lsps1_order_tick(int order_id, uint32_t current_height);
+void lsps1_orders_tick_all(uint32_t current_height);
+
+/* Phase K: LSPS2 JIT pending lookup */
+lsps2_pending_t *lsps2_pending_lookup(lsps2_pending_table_t *tbl,
+                                       uint64_t scid);
+
+/* Gap 2: expire HTLCs that have waited > LSPS2_HTLC_WAIT_SECS */
+void lsps2_pending_expire(lsps2_pending_table_t *tbl);
+
 #endif /* SUPERSCALAR_LSPS_H */

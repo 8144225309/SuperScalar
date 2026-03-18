@@ -32,6 +32,23 @@ typedef struct {
     uint64_t id;
 } htlc_t;
 
+/* PTLC (Point Time-Locked Contract) — adaptor-signature based payment */
+typedef enum { PTLC_OFFERED, PTLC_RECEIVED } ptlc_direction_t;
+typedef enum { PTLC_STATE_ACTIVE, PTLC_STATE_SETTLED, PTLC_STATE_FAILED } ptlc_state_t;
+
+typedef struct {
+    ptlc_direction_t direction;
+    ptlc_state_t     state;
+    uint64_t         amount_sats;
+    secp256k1_pubkey payment_point;   /* adaptor pubkey */
+    uint64_t         id;
+    uint32_t         cltv_expiry;
+    unsigned char    pre_sig[64];     /* adaptor pre-signature from LSP */
+    int              has_pre_sig;
+    unsigned char    adapted_sig[64]; /* final adapted signature from client */
+    int              has_adapted_sig;
+} ptlc_t;
+
 typedef struct {
     secp256k1_context *ctx;
 
@@ -93,6 +110,12 @@ typedef struct {
     size_t htlcs_cap;
     uint64_t next_htlc_id;
 
+    /* PTLCs */
+    ptlc_t          *ptlcs;
+    size_t           n_ptlcs;
+    size_t           ptlcs_cap;
+    uint64_t         next_ptlc_id;
+
     /* Config */
     uint32_t to_self_delay;
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
@@ -112,6 +135,16 @@ typedef struct {
     unsigned char       remote_pubnonces_ser[MUSIG_NONCE_POOL_MAX][66];
     size_t              remote_nonce_count;
     size_t              remote_nonce_next;
+
+    /* Cooperative close state (BOLT #2 §2.3) */
+    int           close_state;      /* 0=none 1=sent_shutdown 2=recv_shutdown 3=both 4=negotiating 5=done */
+    unsigned char close_our_spk[34]; /* our P2TR scriptpubkey for closing output */
+    uint16_t      close_our_spk_len;
+    uint64_t      close_our_fee_sat;   /* our preferred close fee */
+    uint64_t      close_their_fee_sat; /* peer's last proposed fee */
+    unsigned char close_remote_sig[64];  /* sig received in peer's closing_signed */
+    unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
+    uint16_t      close_their_spk_len;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */

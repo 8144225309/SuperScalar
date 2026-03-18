@@ -169,4 +169,12 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                uint32_t anchor_vout,
                                uint64_t anchor_amount);
 
+/* Phase L: register any broadcast tx for CPFP monitoring.
+   Mirrors what penalty-tx broadcast does internally. Returns 1 on success.
+   Returns 0 if table full or wt/txid_hex is NULL. */
+int watchtower_add_pending_tx(watchtower_t *wt,
+                               const char *txid_hex,
+                               uint32_t anchor_vout,
+                               uint64_t anchor_amount);
+
 #endif /* SUPERSCALAR_WATCHTOWER_H */

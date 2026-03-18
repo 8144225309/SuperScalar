@@ -2,6 +2,7 @@
 #define SUPERSCALAR_LSP_CHANNELS_H
 
 #include "channel.h"
+#include "htlc_inbound.h"
 #include "lsp.h"
 #include "wire.h"
 #include "watchtower.h"
@@ -156,6 +157,9 @@ typedef struct {
     /* Async rotation coordination (--async-rotation flag) */
     void *readiness;  /* readiness_tracker_t* or NULL */
     void *notify;     /* notify_t* or NULL */
+
+    /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
+    htlc_inbound_table_t htlc_inbound;
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

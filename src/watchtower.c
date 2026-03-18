@@ -880,6 +880,30 @@ done:
     return result;
 }
 
+/* Phase L: register any broadcast tx for CPFP monitoring */
+int watchtower_add_pending_tx(watchtower_t *wt,
+                               const char *txid_hex,
+                               uint32_t anchor_vout,
+                               uint64_t anchor_amount)
+{
+    if (!wt || !txid_hex) return 0;
+    if (wt->n_pending >= wt->pending_cap) return 0;
+
+    watchtower_pending_t *p = &wt->pending[wt->n_pending++];
+    strncpy(p->txid, txid_hex, 64);
+    p->txid[64] = '\0';
+    p->anchor_vout       = anchor_vout;
+    p->anchor_amount     = anchor_amount;
+    p->cycles_in_mempool = 0;
+    p->bump_count        = 0;
+    p->cycles_since_bump = 0;
+
+    if (wt->db && wt->db->db)
+        persist_save_pending(wt->db, p->txid, p->anchor_vout,
+                               p->anchor_amount, 0, 0);
+    return 1;
+}
+
 int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *old_txid32,
                                     const unsigned char *response_tx,
