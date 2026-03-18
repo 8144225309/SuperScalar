@@ -90,7 +90,11 @@ int htlc_forward_process(htlc_forward_table_t *fwd,
     e->out_cltv        = payload.outgoing_cltv_value;
     e->state           = FORWARD_STATE_PENDING_OUT;
     memcpy(e->onion_shared_secret, ss, 32);
-    /* next_hop_scid will be populated by the caller after consulting the channel table */
+    /* Phase N: store peeled onion for relay pump */
+    memcpy(e->next_onion, next_onion, ONION_PACKET_SIZE);
+    /* Phase N: set next_hop_scid from TLV type 6 if present */
+    if (payload.has_scid)
+        e->next_hop_scid = payload.short_channel_id;
 
     if (out) memcpy(out, e, sizeof(*e));
     return FORWARD_RELAY;

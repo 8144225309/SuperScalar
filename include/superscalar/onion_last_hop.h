@@ -26,6 +26,8 @@ typedef struct {
     int has_amt;
     int has_cltv;
     int has_payment_data;
+    uint64_t short_channel_id;   /* type 6: relay hop outgoing SCID */
+    int has_scid;
 } onion_hop_payload_t;
 
 /*

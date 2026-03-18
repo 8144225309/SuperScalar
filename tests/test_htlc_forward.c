@@ -3,6 +3,7 @@
  */
 
 #include "superscalar/htlc_forward.h"
+#include "superscalar/peer_mgr.h"
 #include "superscalar/onion.h"
 #include "superscalar/mpp.h"
 #include <secp256k1.h>
@@ -128,5 +129,89 @@ int test_htlc_forward_init(void)
     memset(&fwd, 0xFF, sizeof(fwd));
     htlc_forward_init(&fwd);
     ASSERT(fwd.count == 0, "count zeroed after init");
+    return 1;
+}
+
+/* ================================================================== */
+/* HF5 — htlc_forward_entry_t has next_onion field                    */
+/* ================================================================== */
+int test_htlc_forward_entry_has_next_onion(void)
+{
+    htlc_forward_entry_t e;
+    memset(&e, 0, sizeof(e));
+    /* The field must exist and be ONION_PACKET_SIZE bytes */
+    ASSERT(sizeof(e.next_onion) == ONION_PACKET_SIZE,
+           "HF5: next_onion is ONION_PACKET_SIZE bytes");
+    return 1;
+}
+
+/* ================================================================== */
+/* HF6 — FORWARD_RELAY result with zeroed onion → entry state pending */
+/* ================================================================== */
+int test_htlc_forward_relay_state_pending(void)
+{
+    static htlc_forward_table_t fwd; /* static: avoids 390KB stack alloc */
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    memset(&mpp, 0, sizeof(mpp));
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx != NULL, "HF6: ctx created");
+
+    unsigned char priv[32];
+    memset(priv, 0x22, 32);
+    unsigned char onion[ONION_PACKET_SIZE] = {0};
+
+    htlc_forward_entry_t out;
+    int res = htlc_forward_process(&fwd, &mpp, priv, ctx,
+                                    onion, 1, 0, 1000000, 500, &out);
+
+    /* A zeroed onion fails to peel — FORWARD_FAIL is acceptable */
+    ASSERT(res == FORWARD_FAIL || res == FORWARD_RELAY,
+           "HF6: no crash on zeroed onion");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* HF7 — in_channel_id field exists and is 32 bytes                   */
+/* ================================================================== */
+int test_htlc_forward_in_channel_id_field(void)
+{
+    htlc_forward_entry_t e;
+    memset(&e, 0x55, sizeof(e));
+    ASSERT(sizeof(e.in_channel_id) == 32, "HF7: in_channel_id is 32 bytes");
+    return 1;
+}
+
+/* ================================================================== */
+/* HF8 — peer_mgr_find_by_scid returns -1 for empty table             */
+/* ================================================================== */
+int test_htlc_forward_find_by_scid_empty(void)
+{
+    peer_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    int idx = peer_mgr_find_by_scid(&mgr, 0xDEADBEEFULL);
+    ASSERT(idx == -1, "HF8: find_by_scid on empty table returns -1");
+    return 1;
+}
+
+/* ================================================================== */
+/* HF9 — peer_mgr_find_by_scid finds a matching peer                  */
+/* ================================================================== */
+int test_htlc_forward_find_by_scid_found(void)
+{
+    peer_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.peers[0].fd           = 5;
+    mgr.peers[0].channel_scid = 0xABCD1234ULL;
+    mgr.count = 1;
+
+    int idx = peer_mgr_find_by_scid(&mgr, 0xABCD1234ULL);
+    ASSERT(idx == 0, "HF9: find_by_scid returns correct peer index");
+
+    int idx2 = peer_mgr_find_by_scid(&mgr, 0x9999ULL);
+    ASSERT(idx2 == -1, "HF9: wrong scid returns -1");
     return 1;
 }

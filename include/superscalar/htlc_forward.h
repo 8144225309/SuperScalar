@@ -45,7 +45,12 @@ typedef struct {
     uint64_t next_hop_scid;             /* outgoing short_channel_id */
     unsigned char next_hop_pubkey[33];  /* outgoing node pubkey */
     htlc_forward_state_t state;
+    /* Phase N: relay pump fields */
+    unsigned char next_onion[ONION_PACKET_SIZE]; /* peeled onion for next hop */
+    unsigned char in_channel_id[32];    /* BOLT #2 channel_id of inbound HTLC */
 } htlc_forward_entry_t;
+/* NOTE: htlc_forward_table_t is ~390 KB due to next_onion[]. Declare as
+ * global or heap-allocated, NOT on the stack. */
 
 typedef struct {
     htlc_forward_entry_t entries[FORWARD_TABLE_MAX];

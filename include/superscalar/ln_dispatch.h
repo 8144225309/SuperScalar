@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include <secp256k1.h>
 #include "peer_mgr.h"
+#include "channel.h"
+#include "chan_open.h"
 #include "htlc_forward.h"
 #include "mpp.h"
 #include "payment.h"
@@ -43,7 +45,16 @@ typedef struct {
                         uint64_t out_amount_msat, size_t in_peer_idx,
                         uint64_t in_htlc_id);
     void                   *jit_cb_ctx;
+    /* Phase M: per-peer channel state (indexed by peer_idx, may be NULL) */
+    channel_t             **peer_channels;
 } ln_dispatch_t;
+
+/*
+ * Flush all FORWARD_STATE_PENDING_OUT entries in d->fwd to next peers.
+ * Looks up next peer by next_hop_scid via peer_mgr_find_by_scid().
+ * Returns number of HTLCs successfully sent.
+ */
+int ln_dispatch_flush_relay(ln_dispatch_t *d);
 
 /*
  * Process a single plaintext BOLT #2 message already stripped of BOLT #8
