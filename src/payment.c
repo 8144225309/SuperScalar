@@ -92,6 +92,18 @@ static int do_payment_send(payment_t *pay,
                            /* final_cltv */ (uint32_t)(time(NULL) / 600) + 40,
                            pay->payment_secret, 0, NULL, hops)) return 0;
 
+    /* Inject AMP TLV (type 14) on the final hop for AMP shards */
+    {
+        unsigned char zero32[32] = {0};
+        if (memcmp(pay->amp_set_id, zero32, 32) != 0) {
+            onion_hop_t *final = &hops[route->n_hops - 1];
+            final->has_amp = 1;
+            memcpy(final->amp_set_id,     pay->amp_set_id,          32);
+            memcpy(final->amp_root_share, pay->amp_shares[route_idx], 32);
+            final->amp_child_index = (uint8_t)route_idx;
+        }
+    }
+
     /* Generate session key */
     unsigned char session_key[32];
     {
@@ -471,12 +483,18 @@ int payment_send_amp(payment_table_t *pt,
                       int n_shards,
                       unsigned char payment_hash_out[32])
 {
-    (void)our_pubkey;
-    (void)dest_pubkey;
-    (void)pmgr;
-    (void)ctx;
-    (void)our_privkey;
-    if (!pt || !gs || !fwd || !mpp || n_shards < 1 || n_shards > PAYMENT_MAX_ROUTES) return 0;
+    (void)our_pubkey; (void)fwd; (void)mpp;
+    if (!pt || n_shards < 1 || n_shards > PAYMENT_MAX_ROUTES) return 0;
+    if (!gs) return 0;  /* need gossip store for routing */
+    if (!ctx || !our_privkey || !dest_pubkey) return 0;
+    if (pt->count >= PAYMENT_TABLE_MAX) return 0;
+
+    /* Derive our pubkey */
+    unsigned char our_pub[33];
+    secp256k1_pubkey pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &pub, our_privkey)) return 0;
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub, &pub_len, &pub, SECP256K1_EC_COMPRESSED);
 
     /* Generate random root_shares */
     unsigned char shares[PAYMENT_MAX_ROUTES][32];
@@ -484,33 +502,51 @@ int payment_send_amp(payment_table_t *pt,
         if (channel_read_random_bytes(shares[i], 32) != 1) return 0;
     }
 
-    /* Compute XOR of all shares */
+    /* Compute XOR of all shares → AMP payment_hash = SHA256(xored) */
     unsigned char xored[32];
     memset(xored, 0, 32);
     for (int i = 0; i < n_shards; i++) xor32(xored, shares[i]);
-
-    /* AMP payment_hash = SHA256(xored) */
     unsigned char payment_hash[32];
     sha256(xored, 32, payment_hash);
     if (payment_hash_out) memcpy(payment_hash_out, payment_hash, 32);
 
-    /* set_id = same as payment_hash for simplicity */
+    /* set_id = payment_hash (standard AMP convention) */
     unsigned char set_id[32];
     memcpy(set_id, payment_hash, 32);
 
-    /* Create a payment entry in the table */
-    if (pt->count >= PAYMENT_TABLE_MAX) return 0;
+    /* Find route per shard before committing the entry */
+    uint64_t shard_msat = amount_msat / (uint64_t)n_shards;
+    pathfind_route_t routes[PAYMENT_MAX_ROUTES];
+    for (int i = 0; i < n_shards; i++) {
+        uint64_t s = (i == n_shards - 1) ?
+            amount_msat - shard_msat * (uint64_t)(n_shards - 1) : shard_msat;
+        if (!pathfind_route(gs, our_pub, dest_pubkey, s, &routes[i]))
+            return 0;  /* no route for this shard — fail before committing */
+    }
 
+    /* Commit the payment entry */
     payment_t *pay = &pt->entries[pt->count];
     memset(pay, 0, sizeof(*pay));
-    memcpy(pay->payment_hash, payment_hash, 32);
+    memcpy(pay->payment_hash,   payment_hash, 32);
+    memcpy(pay->payment_secret, set_id,        32);
+    memcpy(pay->amp_set_id,     set_id,        32);
+    for (int i = 0; i < n_shards; i++)
+        memcpy(pay->amp_shares[i], shares[i], 32);
+    for (int i = 0; i < n_shards; i++)
+        pay->routes[i] = routes[i];
     pay->amount_msat = amount_msat;
-    pay->state = PAY_STATE_INFLIGHT;
-    pay->n_routes = n_shards;
+    pay->n_routes    = n_shards;
+    pay->state       = PAY_STATE_INFLIGHT;
+    pay->attempt_at  = (uint32_t)time(NULL);
+    pay->n_attempts  = 1;
     pt->count++;
 
-    /* Mark as AMP by setting payment_secret = set_id */
-    memcpy(pay->payment_secret, set_id, 32);
+    /* Dispatch each shard via the existing HTLC send path */
+    for (int i = 0; i < n_shards; i++) {
+        uint64_t s = (i == n_shards - 1) ?
+            amount_msat - shard_msat * (uint64_t)(n_shards - 1) : shard_msat;
+        do_payment_send(pay, gs, NULL, NULL, pmgr, ctx, our_privkey, our_pub, s, i);
+    }
 
     return 1;
 }

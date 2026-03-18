@@ -48,6 +48,7 @@ typedef struct {
     uint64_t htlc_minimum_msat;     /* minimum HTLC size */
     uint16_t max_accepted_htlcs;    /* default 483 */
     int      announce_channel;      /* 1 = public channel */
+    int      zero_conf;             /* 1 = send minimum_depth=0 (LSPS2 / Phoenix compat) */
     /* Local channel keys (from channel_t) */
     unsigned char funding_pubkey[33];
     unsigned char revocation_basepoint[33];

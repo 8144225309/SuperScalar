@@ -1352,3 +1352,39 @@ int test_ln_dispatch_routes_ptlc_complete(void)
     ASSERT(r == 78, "PTLC-LD3: type 0x4E short msg -> 78");
     return 1;
 }
+
+/* ================================================================== */
+/* CB1 — closing_signed with matching fee → close_state == 5          */
+/* ================================================================== */
+int test_ln_dispatch_close_broadcast(void)
+{
+    /* Build closing_signed: type(2) + channel_id(32) + fee(8) + sig(64) = 106 */
+    unsigned char msg[106];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x27; /* type 39 = closing_signed */
+    /* channel_id = all zeros (matches any channel) */
+    /* fee = 1000 sat (big-endian u64) */
+    msg[40] = 0x03; msg[41] = 0xE8; /* 0x00000000000003E8 = 1000 */
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.close_state       = 3;       /* SENT_SHUTDOWN | RECV_SHUTDOWN */
+    ch.close_our_fee_sat = 1000;    /* same as peer fee → instant agree */
+    ch.local_amount      = 2000000; /* 2000 sat in msat */
+    ch.remote_amount     = 1000000; /* 1000 sat in msat */
+    /* minimal non-empty SPKs so broadcast path is entered */
+    ch.funding_spk[0]      = 0x51; ch.funding_spk[1] = 0x20;
+    ch.funding_spk_len     = 34;
+    ch.close_our_spk[0]    = 0x76; ch.close_our_spk_len   = 1;
+    ch.close_their_spk[0]  = 0x76; ch.close_their_spk_len = 1;
+
+    channel_t *channels[1] = { &ch };
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 39,       "CB1: closing_signed returns 39");
+    ASSERT(ch.close_state == 5, "CB1: close_state == 5 after fee agreement");
+    return 1;
+}

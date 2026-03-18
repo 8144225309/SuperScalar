@@ -544,3 +544,85 @@ int test_gossip_parse_query_range_too_short(void)
     ASSERT(r == 0, "GQ14: too short returns 0");
     return 1;
 }
+
+/* ================================================================== */
+/* GQ15 — channel_announcement for SCID in gossip store has type 256  */
+/* ================================================================== */
+int test_gossip_query_scids_real_data(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char priv1[32]; memset(priv1, 0x11, 32);
+    unsigned char priv2[32]; memset(priv2, 0x22, 32);
+    secp256k1_pubkey pk1, pk2;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pk1, priv1), "pk1");
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pk2, priv2), "pk2");
+    unsigned char node1[33], node2[33]; size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, node1, &plen, &pk1, SECP256K1_EC_COMPRESSED);
+    plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, node2, &plen, &pk2, SECP256K1_EC_COMPRESSED);
+
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open gs");
+    uint64_t scid = ((uint64_t)700100 << 40) | 1;
+    gossip_store_upsert_channel(&gs, scid, node1, node2, 500000, 0);
+    gossip_store_upsert_channel_update(&gs, scid, 0, 1000, 200, 40, 1);
+    gossip_store_upsert_channel_update(&gs, scid, 1, 1000, 200, 40, 1);
+
+    /* Verify channel_announcement builder produces type 256 */
+    /* type(2)+4*sig(64)+flen(2)+chain(32)+scid(8)+4*key(33)=432 bytes */
+    unsigned char ann[512];
+    size_t ann_len = gossip_build_channel_announcement_unsigned(
+        ann, sizeof(ann), GOSSIP_CHAIN_HASH_MAINNET, scid, node1, node2, node1, node2);
+    ASSERT(ann_len > 0, "GQ15: announcement built");
+    uint16_t ann_type = ((uint16_t)ann[0] << 8) | ann[1];
+    ASSERT(ann_type == 256, "GQ15: type is 256");
+
+    /* Verify channel_update builder produces type 258 */
+    unsigned char upd[160];
+    size_t upd_len = gossip_build_channel_update(
+        upd, sizeof(upd), ctx, priv1, GOSSIP_CHAIN_HASH_MAINNET, scid,
+        1, GOSSIP_UPDATE_MSGFLAG_HTLC_MAX, 0, 40, 1, 1000, 200, 0);
+    ASSERT(upd_len > 0, "GQ15: channel_update built");
+    uint16_t upd_type = ((uint16_t)upd[0] << 8) | upd[1];
+    ASSERT(upd_type == 258, "GQ15: type is 258");
+
+    gossip_store_close(&gs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ16 — reply_channel_range with real SCIDs has type 264            */
+/* ================================================================== */
+int test_gossip_query_range_real_scids(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open gs");
+
+    unsigned char n1[33]; memset(n1, 0x02, 33); n1[1] = 0xAA;
+    unsigned char n2[33]; memset(n2, 0x03, 33); n2[1] = 0xBB;
+    uint64_t scid = ((uint64_t)700200 << 40) | 2;
+    gossip_store_upsert_channel(&gs, scid, n1, n2, 100000, 0);
+
+    /* Verify channel is retrievable by range */
+    unsigned char node1_out[33], node2_out[33];
+    uint64_t cap; uint32_t ts;
+    int r = gossip_store_get_channel(&gs, scid, node1_out, node2_out, &cap, &ts);
+    ASSERT(r == 1, "GQ16: channel found");
+    ASSERT(cap == 100000, "GQ16: capacity correct");
+
+    /* Build reply_range with SCID and verify type 264 */
+    uint64_t scids_out[1] = {scid};
+    unsigned char reply[128];
+    size_t rlen = gossip_build_reply_range(reply, sizeof(reply),
+        GOSSIP_CHAIN_HASH_MAINNET, 700000, 1000, scids_out, 1, 1);
+    ASSERT(rlen > 0, "GQ16: reply_range built");
+    uint16_t rtype = ((uint16_t)reply[0] << 8) | reply[1];
+    ASSERT(rtype == 264, "GQ16: type is 264");
+
+    gossip_store_close(&gs);
+    return 1;
+}

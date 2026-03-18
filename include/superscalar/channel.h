@@ -142,6 +142,9 @@ typedef struct {
     uint16_t      close_our_spk_len;
     uint64_t      close_our_fee_sat;   /* our preferred close fee */
     uint64_t      close_their_fee_sat; /* peer's last proposed fee */
+    unsigned char close_remote_sig[64];  /* sig received in peer's closing_signed */
+    unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
+    uint16_t      close_their_spk_len;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
