@@ -424,6 +424,11 @@ int persist_open(persist_t *p, const char *path) {
         "ALTER TABLE hd_wallet_state ADD COLUMN lookahead INTEGER DEFAULT 100;",
         NULL, NULL, NULL);
 
+    /* v5: add reserved column to hd_utxos — silently ignore if already present */
+    sqlite3_exec(p->db,
+        "ALTER TABLE hd_utxos ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+
     /* v3 migration: offers table for BOLT 12 */
     if (db_version < 3) {
         const char *sql_v3 =
@@ -2835,26 +2840,79 @@ int persist_get_hd_utxo(persist_t *p,
                           uint32_t *key_index_out)
 {
     if (!p || !p->db) return 0;
-    sqlite3_stmt *stmt;
+
+    /* BEGIN IMMEDIATE acquires a write lock so the SELECT + UPDATE
+     * that follows is atomic — no concurrent caller can pick the same coin. */
+    if (sqlite3_exec(p->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK)
+        return 0;
+
+    char txid_buf[65] = {0};
+    uint32_t vout_val = 0;
+    uint64_t amount_val = 0;
+    uint32_t key_val = 0;
+    int found = 0;
+
+    sqlite3_stmt *sel;
     if (sqlite3_prepare_v2(p->db,
             "SELECT txid, vout, amount_sats, key_index FROM hd_utxos "
-            "WHERE spent=0 AND amount_sats>=? ORDER BY amount_sats ASC LIMIT 1;",
-            -1, &stmt, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)min_sats);
-    int found = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *txid = (const char *)sqlite3_column_text(stmt, 0);
-        if (txid && txid_out) {
-            strncpy(txid_out, txid, 64);
-            txid_out[64] = '\0';
+            "WHERE spent=0 AND reserved=0 AND amount_sats>=? "
+            "ORDER BY amount_sats ASC LIMIT 1;",
+            -1, &sel, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(sel, 1, (sqlite3_int64)min_sats);
+        if (sqlite3_step(sel) == SQLITE_ROW) {
+            const char *txid = (const char *)sqlite3_column_text(sel, 0);
+            if (txid) { strncpy(txid_buf, txid, 64); txid_buf[64] = '\0'; }
+            vout_val   = (uint32_t)sqlite3_column_int(sel, 1);
+            amount_val = (uint64_t)sqlite3_column_int64(sel, 2);
+            key_val    = (uint32_t)sqlite3_column_int(sel, 3);
+            found = 1;
         }
-        if (vout_out)      *vout_out      = (uint32_t)sqlite3_column_int(stmt, 1);
-        if (amount_out)    *amount_out    = (uint64_t)sqlite3_column_int64(stmt, 2);
-        if (key_index_out) *key_index_out = (uint32_t)sqlite3_column_int(stmt, 3);
-        found = 1;
+        sqlite3_finalize(sel);
     }
-    sqlite3_finalize(stmt);
+
+    if (found) {
+        /* Mark reserved so concurrent callers skip this coin */
+        sqlite3_stmt *upd;
+        if (sqlite3_prepare_v2(p->db,
+                "UPDATE hd_utxos SET reserved=1 WHERE txid=? AND vout=?;",
+                -1, &upd, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(upd, 1, txid_buf, -1, SQLITE_STATIC);
+            sqlite3_bind_int (upd, 2, (int)vout_val);
+            sqlite3_step(upd);
+            sqlite3_finalize(upd);
+        }
+        if (txid_out)      { strncpy(txid_out, txid_buf, 64); txid_out[64] = '\0'; }
+        if (vout_out)      *vout_out      = vout_val;
+        if (amount_out)    *amount_out    = amount_val;
+        if (key_index_out) *key_index_out = key_val;
+    }
+
+    sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL);
     return found;
+}
+
+int persist_unreserve_hd_utxo(persist_t *p, const char *txid, uint32_t vout)
+{
+    if (!p || !p->db || !txid) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE hd_utxos SET reserved=0 WHERE txid=? AND vout=? AND spent=0;",
+            -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, txid, -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 2, (int)vout);
+    int ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+void persist_clear_hd_reserved(persist_t *p)
+{
+    if (!p || !p->db) return;
+    /* On startup, release any reservations left by a prior run that crashed
+     * before broadcast — those coins are still spendable on-chain. */
+    sqlite3_exec(p->db,
+        "UPDATE hd_utxos SET reserved=0 WHERE spent=0;",
+        NULL, NULL, NULL);
 }
 
 int persist_save_hd_next_index(persist_t *p, uint32_t next_index)

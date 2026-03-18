@@ -80,6 +80,19 @@ int wallet_source_hd_derive(const wallet_source_hd_t *ws, uint32_t index,
 }
 
 /* -----------------------------------------------------------------------
+ * vtable: release_utxo — unreserve a coin after broadcast (success or fail).
+ * On success the BIP158 scanner will later call hd_utxo_spent to mark it
+ * spent=1.  On failure the coin is returned to the pool immediately.
+ * --------------------------------------------------------------------- */
+static void hd_release_utxo(wallet_source_t *self,
+                              const char *txid_hex, uint32_t vout)
+{
+    wallet_source_hd_t *ws = (wallet_source_hd_t *)self;
+    if (ws->db)
+        persist_unreserve_hd_utxo(ws->db, txid_hex, vout);
+}
+
+/* -----------------------------------------------------------------------
  * vtable: get_utxo
  * --------------------------------------------------------------------- */
 static int hd_get_utxo(wallet_source_t *self,
@@ -367,10 +380,11 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     if (!ws || !seed || seed_len == 0 || !ctx) return 0;
 
     memset(ws, 0, sizeof(*ws));
-    ws->base.get_utxo      = hd_get_utxo;
+    ws->base.get_utxo       = hd_get_utxo;
     ws->base.get_change_spk = hd_get_change_spk;
-    ws->base.sign_input    = hd_sign_input;
-    ws->base.free          = hd_free;
+    ws->base.sign_input     = hd_sign_input;
+    ws->base.release_utxo   = hd_release_utxo;
+    ws->base.free           = hd_free;
     ws->ctx      = ctx;
     ws->db       = db;
     ws->bip158   = bip158;
@@ -388,8 +402,11 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     }
 
     /* Load next_index from DB */
-    if (db)
+    if (db) {
         ws->next_index = persist_load_hd_next_index(db);
+        /* Release any reservations left by a prior run that crashed mid-broadcast */
+        persist_clear_hd_reserved(db);
+    }
 
     /* Set lookahead window size */
     ws->lookahead = (lookahead == 0) ? HD_WALLET_LOOKAHEAD : lookahead;
