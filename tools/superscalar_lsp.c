@@ -1,5 +1,6 @@
 #include "superscalar/version.h"
 #include "superscalar/lsp.h"
+#include "superscalar/lsps.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/tx_builder.h"
@@ -23,6 +24,12 @@
 #include "superscalar/notify.h"
 #include "superscalar/splice.h"
 #include "superscalar/musig.h"
+=======
+#include "superscalar/lsp_wellknown.h"
+#include "superscalar/admin_rpc.h"
+>>>>>>> origin/superscalar-ln-parity-
+#include "superscalar/lsp_wellknown.h"
+#include "superscalar/admin_rpc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,10 +49,189 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
+=======
+#include "superscalar/bolt8_server.h"
+#include "superscalar/ln_dispatch.h"
+#include "superscalar/invoice.h"
+#include "superscalar/peer_mgr.h"
+#include "superscalar/htlc_forward.h"
+#include "superscalar/mpp.h"
+#include "superscalar/payment.h"
+#include "superscalar/cltv_watchdog.h"
+#include "superscalar/gossip_peer.h"
+#include "superscalar/gossip_store.h"
+#include <pthread.h>
+>>>>>>> origin/superscalar-ln-parity-
+#include "superscalar/bolt8_server.h"
+#include "superscalar/ln_dispatch.h"
+#include "superscalar/invoice.h"
+#include "superscalar/peer_mgr.h"
+#include "superscalar/htlc_forward.h"
+#include "superscalar/mpp.h"
+#include "superscalar/payment.h"
+#include "superscalar/cltv_watchdog.h"
+#include "superscalar/gossip_peer.h"
+#include "superscalar/gossip_store.h"
+#include <pthread.h>
 
 static volatile sig_atomic_t g_shutdown = 0;
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
 static persist_t *g_db = NULL;  /* for broadcast audit logging */
+
+/* BOLT #8 server thread — owns g_bolt8_cfg; runs blocking accept loop */
+static bolt8_server_cfg_t g_bolt8_cfg;
+static void *bolt8_server_thread(void *arg) {
+    (void)arg;
+    bolt8_server_run(&g_bolt8_cfg);
+    return NULL;
+}
+
+/* LN peer message dispatch globals */
+static peer_mgr_t         g_peer_mgr;
+static htlc_forward_table_t g_fwd;
+static mpp_table_t         g_mpp;
+static payment_table_t     g_payments;
+static ln_dispatch_t       g_ln_dispatch;
+static bolt11_invoice_table_t g_invoice_tbl;
+
+/* CLTV watchdog: pointer to the active channel manager, set after each alloc */
+static lsp_channel_mgr_t *g_channel_mgr = NULL;
+
+/* LSPS0 context for bolt8_server callback */
+static lsps_ctx_t  g_lsps_ctx;
+
+/* LSPS2 JIT pending channel intercept table */
+static lsps2_pending_table_t g_lsps2_pending;
+
+/* Watchtower: breach detection on every block */
+static watchtower_t g_watchtower;
+static int          g_watchtower_ready = 0;
+
+/* Admin RPC: JSON-RPC 2.0 Unix socket operator interface */
+static admin_rpc_t   g_admin_rpc;
+static gossip_store_t *g_gossip_store_ptr = NULL; /* set after gossip store init */
+
+static void *ln_dispatch_thread(void *arg) {
+    (void)arg;
+    ln_dispatch_run(&g_ln_dispatch);
+    return NULL;
+}
+
+/* Gap 3: callback from ln_dispatch when JIT cost is covered.
+ * Opens a JIT channel for the client then relays the pending HTLC. */
+static void on_jit_open(void *cb_ctx, uint64_t scid,
+                         uint64_t out_amount_msat,
+                         size_t in_peer_idx, uint64_t in_htlc_id)
+{
+    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
+    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
+    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
+
+    /* Open the JIT channel (no-op if already open) */
+    if (!jit_channel_is_active(g_channel_mgr, client_idx))
+        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
+                            out_amount_msat * 2, "lsps2-jit");
+
+    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
+            client_idx, (unsigned long long)scid);
+}
+
+/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
+                           const char *json_req, char *resp_buf, size_t resp_cap)
+{
+    (void)state;
+    if (!json_req || !resp_buf || resp_cap == 0) return 0;
+    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
+
+    cJSON *json = cJSON_Parse(json_req);
+    if (!json) {
+        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
+        if (err) {
+            char *s = cJSON_PrintUnformatted(err);
+            if (s) {
+                size_t n = strlen(s);
+                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
+                free(s);
+            }
+            cJSON_Delete(err);
+        }
+        return 0;
+    }
+
+    int id = 0;
+    const char *method = lsps_parse_request(json, &id);
+    cJSON *resp = NULL;
+
+    if (!method) {
+        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
+    } else if (strcmp(method, "lsps1_get_info") == 0) {
+        lsps1_info_t info;
+        memset(&info, 0, sizeof(info));
+        info.min_channel_balance_msat = 100000000ULL;
+        info.max_channel_balance_msat = 10000000000ULL;
+        info.min_confirmations        = 1;
+        info.base_fee_msat            = 1000;
+        info.fee_ppm                  = 500;
+        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
+    } else if (strcmp(method, "lsps2_get_info") == 0) {
+        lsps2_fee_params_t params;
+        memset(&params, 0, sizeof(params));
+        params.min_fee_msat             = 1000;
+        params.fee_ppm                  = 500;
+        params.min_channel_balance_msat = 100000000ULL;
+        params.max_channel_balance_msat = 10000000000ULL;
+        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
+    } else if (lsps_handle_request(ctx, fd, json)) {
+        cJSON_Delete(json);
+        return 0;
+    } else {
+        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
+    }
+
+    cJSON_Delete(json);
+    int written = 0;
+    if (resp) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) {
+            size_t n = strlen(s);
+            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
+            free(s);
+        }
+        cJSON_Delete(resp);
+    }
+    return written;
+}
+
+/* Chain monitoring: called by bip158_backend after each new block is processed */
+static void on_block_connected(uint32_t height, void *cb_ctx)
+{
+    (void)cb_ctx;
+    if (!g_channel_mgr) return;
+
+    for (size_t i = 0; i < g_channel_mgr->n_channels; i++) {
+        channel_t *ch = &g_channel_mgr->entries[i].channel;
+        cltv_watchdog_t wd;
+        cltv_watchdog_init(&wd, ch, 0);          /* 0 = CLTV_EXPIRY_DELTA default */
+        int at_risk = cltv_watchdog_check(&wd, height);
+        if (at_risk > 0)
+            fprintf(stderr, "LSP: block %u: channel %zu has %d HTLC(s)"
+                    " within expiry delta — consider force-close\n",
+                    (unsigned)height, i, at_risk);
+        cltv_watchdog_expire(&wd, height);
+    }
+
+    /* Phase J: advance LSPS1 order confirmations */
+    lsps1_orders_tick_all(height);
+
+    /* Watchtower breach detection */
+    if (g_watchtower_ready) {
+        int penalties = watchtower_check(&g_watchtower);
+        if (penalties > 0)
+            fprintf(stderr, "LSP: block %u: broadcast %d penalty tx(s)\n",
+                    (unsigned)height, penalties);
+    }
+}
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -129,6 +315,7 @@ static void usage(const char *prog) {
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
         "  --settlement-interval N Blocks between profit settlements (default: 144)\n"
+        "  --rpc-file PATH     Unix socket path for JSON-RPC 2.0 admin interface\n"
         "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --tor-control HOST:PORT Tor control port (default: 127.0.0.1:9051)\n"
         "  --tor-password PASS   Tor control auth password (default: empty)\n"
@@ -154,6 +341,7 @@ static void usage(const char *prog) {
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
+        "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -673,6 +861,9 @@ static int attach_light_client(watchtower_t *wt, persist_t *db_ptr,
     if (fee_est)
         bip158_backend_set_fee_estimator(&g_bip158, fee_est);
 
+    /* Wire block_connected callback for chain monitoring (CLTV watchdog) */
+    bip158_backend_set_block_connected_cb(&g_bip158, on_block_connected, NULL);
+
     watchtower_set_chain_backend(wt, &g_bip158.base);
     return 1;
 }
@@ -746,6 +937,7 @@ int main(int argc, char *argv[]) {
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
+    const char *rpc_file_arg = NULL;
     const char *tor_proxy_arg = NULL;
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
@@ -784,6 +976,16 @@ int main(int argc, char *argv[]) {
     int n_lc_fallbacks = 0;
     const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
     uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
+=======
+    uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
+    int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
+    char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
+    uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
+>>>>>>> origin/superscalar-ln-parity-
+    uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
+    int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
+    char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
+    uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -944,6 +1146,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rpc-file") == 0 && i + 1 < argc)
+            rpc_file_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc)
             tor_proxy_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-control") == 0 && i + 1 < argc)
@@ -1034,6 +1238,28 @@ int main(int argc, char *argv[]) {
             create_offer_desc = argv[++i];
         else if (strcmp(argv[i], "--offer-amount") == 0 && i + 1 < argc)
             create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
+=======
+        else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
+            well_known_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--clnbridge") == 0)
+            use_clnbridge = 1;
+        else if (strcmp(argv[i], "--gossip-peers") == 0 && i + 1 < argc) {
+            strncpy(gossip_peers, argv[++i], sizeof(gossip_peers) - 1);
+            gossip_peers[sizeof(gossip_peers) - 1] = '\0';
+        }
+        else if (strcmp(argv[i], "--bolt8-port") == 0 && i + 1 < argc)
+            bolt8_listen_port = (uint16_t)atoi(argv[++i]);
+>>>>>>> origin/superscalar-ln-parity-
+        else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
+            well_known_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--clnbridge") == 0)
+            use_clnbridge = 1;
+        else if (strcmp(argv[i], "--gossip-peers") == 0 && i + 1 < argc) {
+            strncpy(gossip_peers, argv[++i], sizeof(gossip_peers) - 1);
+            gossip_peers[sizeof(gossip_peers) - 1] = '\0';
+        }
+        else if (strcmp(argv[i], "--bolt8-port") == 0 && i + 1 < argc)
+            bolt8_listen_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1553,6 +1779,7 @@ int main(int argc, char *argv[]) {
             /* Initialize channels from DB */
             lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
             if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+            g_channel_mgr = mgr;
             mgr->fee = fee_est;
             if (!lsp_channels_init_from_db(mgr, ctx, &lsp.factory, lsp_seckey,
                                              rec_n_clients, &db)) {
@@ -1871,6 +2098,169 @@ int main(int argc, char *argv[]) {
         hex_encode(nk_pub_ser, 33, nk_hex);
         printf("LSP: NK static pubkey: %s\n", nk_hex);
         printf("LSP: clients should use --lsp-pubkey %s\n", nk_hex);
+
+        if (use_clnbridge)
+            printf("LSP: inbound HTLC routing: CLN bridge (--clnbridge)\n");
+        else
+            printf("LSP: inbound HTLC routing: native (fake-SCID / htlc_inbound)\n");
+
+        if (gossip_peers[0]) {
+            printf("LSP: gossip peers configured: %s\n", gossip_peers);
+
+            static gossip_store_t s_gossip_store;
+            static int s_gossip_store_opened = 0;
+            if (!s_gossip_store_opened) {
+                const char *gdb_path = db_path ? db_path : ":memory:";
+                s_gossip_store_opened = gossip_store_open(&s_gossip_store, gdb_path);
+                if (s_gossip_store_opened)
+                    g_gossip_store_ptr = &s_gossip_store;
+            }
+
+            if (s_gossip_store_opened) {
+                static gossip_peer_mgr_cfg_t s_gp_cfg;
+                memset(&s_gp_cfg, 0, sizeof(s_gp_cfg));
+                s_gp_cfg.n_peers = gossip_peer_parse_list(gossip_peers,
+                    s_gp_cfg.peers, GOSSIP_PEER_MAX);
+                s_gp_cfg.ctx = ctx;
+                s_gp_cfg.store = &s_gossip_store;
+                memcpy(s_gp_cfg.our_priv32, lsp.nk_seckey, 32);
+                s_gp_cfg.network = network;
+                s_gp_cfg.shutdown_flag = (volatile int *)&g_shutdown;
+
+                if (s_gp_cfg.n_peers > 0) {
+                    static pthread_t s_gp_tids[GOSSIP_PEER_MAX];
+                    int started = gossip_peer_mgr_start(&s_gp_cfg, s_gp_tids);
+                    if (started > 0)
+                        printf("LSP: gossip peer manager started (%d peers)\n",
+                               started);
+                    else
+                        fprintf(stderr, "LSP: warning: gossip peer manager failed to start\n");
+                }
+            }
+        } else
+            printf("LSP: gossip peers: none configured (use --gossip-peers HOST:PORT,...)\n");
+
+        if (bolt8_listen_port > 0) {
+            /* Initialise LN payment/forward/MPP tables */
+            peer_mgr_init(&g_peer_mgr, ctx, lsp.nk_seckey);
+            htlc_forward_init(&g_fwd);
+            mpp_init(&g_mpp);
+            payment_init(&g_payments);
+            invoice_init(&g_invoice_tbl);
+
+            memset(&g_bolt8_cfg, 0, sizeof(g_bolt8_cfg));
+            g_bolt8_cfg.bolt8_port = bolt8_listen_port;
+            memcpy(g_bolt8_cfg.static_priv, lsp.nk_seckey, 32);
+            g_bolt8_cfg.ctx = ctx;
+            g_bolt8_cfg.peer_mgr = &g_peer_mgr;
+            g_bolt8_cfg.ln_dispatch = &g_ln_dispatch;
+            pthread_t bolt8_tid;
+            if (pthread_create(&bolt8_tid, NULL, bolt8_server_thread, NULL) == 0) {
+                pthread_detach(bolt8_tid);
+                printf("LSP: BOLT #8 server listening on port %u\n",
+                       (unsigned)bolt8_listen_port);
+            } else {
+                fprintf(stderr,
+                        "LSP: warning: failed to start BOLT #8 server on port %u\n",
+                        (unsigned)bolt8_listen_port);
+            }
+
+            /* Spawn LN peer message dispatch thread */
+            memset(&g_ln_dispatch, 0, sizeof(g_ln_dispatch));
+            g_ln_dispatch.pmgr         = &g_peer_mgr;
+            g_ln_dispatch.fwd          = &g_fwd;
+            g_ln_dispatch.mpp          = &g_mpp;
+            g_ln_dispatch.payments     = &g_payments;
+            g_ln_dispatch.ctx          = ctx;
+            g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
+            memcpy(g_ln_dispatch.our_privkey, lsp.nk_seckey, 32);
+            g_ln_dispatch.invoices = &g_invoice_tbl;
+
+            /* Wire LSPS0 callback */
+            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
+            g_lsps_ctx.mgr = g_channel_mgr;
+            g_lsps_ctx.lsp = g_lsp;
+            g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
+            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+
+            /* Wire Tor proxy for .onion outbound peers */
+            if (tor_proxy_arg) {
+                char px_host[256]; int px_port;
+                if (tor_parse_proxy_arg(tor_proxy_arg, px_host, sizeof(px_host), &px_port))
+                    peer_mgr_set_proxy(&g_peer_mgr, px_host, px_port);
+            }
+
+            /* Watchtower: init and wire into dispatch */
+            watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, NULL, g_db);
+            if (g_bip158.base.get_block_height)
+                watchtower_set_chain_backend(&g_watchtower, &g_bip158.base);
+            for (size_t _wi = 0; _wi < g_channel_mgr->n_channels; _wi++)
+                watchtower_set_channel(&g_watchtower, _wi,
+                                       &g_channel_mgr->entries[_wi].channel);
+            g_watchtower_ready = 1;
+            g_ln_dispatch.watchtower  = &g_watchtower;
+    g_ln_dispatch.jit_pending = &g_lsps2_pending;
+    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_cb_ctx  = NULL;
+
+            pthread_t dispatch_tid;
+            if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
+                pthread_detach(dispatch_tid);
+                printf("LSP: LN peer dispatch thread started\n");
+            } else {
+                fprintf(stderr, "LSP: warning: failed to start LN dispatch thread\n");
+            }
+        }
+
+        /* Admin RPC: wire and start if --rpc-file is given */
+        if (rpc_file_arg) {
+            memset(&g_admin_rpc, 0, sizeof(g_admin_rpc));
+            g_admin_rpc.ctx          = ctx;
+            memcpy(g_admin_rpc.node_privkey, lsp.nk_seckey, 32);
+            g_admin_rpc.pmgr         = &g_peer_mgr;
+            g_admin_rpc.channel_mgr  = g_channel_mgr;
+            g_admin_rpc.payments     = &g_payments;
+            g_admin_rpc.invoices     = &g_invoice_tbl;
+            g_admin_rpc.gossip       = g_gossip_store_ptr;
+            g_admin_rpc.fwd          = &g_fwd;
+            g_admin_rpc.mpp          = &g_mpp;
+            g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
+            g_admin_rpc.block_height = NULL; /* TODO: wire block height in PR#28 */
+            if (admin_rpc_init(&g_admin_rpc, rpc_file_arg))
+                printf("LSP: admin RPC socket at %s\n", rpc_file_arg);
+            else
+                fprintf(stderr, "LSP: warning: failed to bind admin RPC socket %s\n",
+                        rpc_file_arg);
+        }
+
+        if (well_known_port > 0) {
+            char wk_pubkey[67] = {0};
+            secp256k1_pubkey wk_pub;
+            if (secp256k1_ec_pubkey_create(ctx, &wk_pub, lsp_seckey)) {
+                unsigned char wk_ser[33]; size_t wk_len = 33;
+                secp256k1_ec_pubkey_serialize(ctx, wk_ser, &wk_len, &wk_pub,
+                                              SECP256K1_EC_COMPRESSED);
+                hex_encode(wk_ser, 33, wk_pubkey);
+            }
+            lsp_wellknown_cfg_t wk_cfg = {
+                .pubkey_hex       = wk_pubkey,
+                .host             = bind_addr ? bind_addr : "",
+                .bolt8_port       = (uint16_t)port,
+                .native_port      = (uint16_t)port,
+                .network          = network,
+                .fee_ppm          = (uint32_t)routing_fee_ppm,
+                .min_channel_sats = 100000,
+                .max_channel_sats = 10000000,
+                .version          = SUPERSCALAR_VERSION,
+            };
+            if (lsp_wellknown_serve_fork(&wk_cfg, well_known_port))
+                printf("LSP: well-known HTTP server on port %u\n",
+                       (unsigned)well_known_port);
+            else
+                fprintf(stderr,
+                        "LSP: warning: well-known server on port %u failed\n",
+                        (unsigned)well_known_port);
+        }
     }
 
     signal(SIGINT, sigint_handler);
@@ -2247,6 +2637,7 @@ int main(int argc, char *argv[]) {
     /* === Phase 4b: Channel Operations === */
     lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
     if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+    g_channel_mgr = mgr;
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
@@ -3701,6 +4092,16 @@ int main(int argc, char *argv[]) {
 
             printf("\n=== FORCE CLOSE COMPLETE ===\n");
             printf("All %zu nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+            /* Phase L: register root node tx for CPFP monitoring */
+            if (g_watchtower_ready && lsp.factory.n_nodes > 0) {
+                char root_txid_hex[65];
+                unsigned char root_txid_rev[32];
+                memcpy(root_txid_rev, lsp.factory.nodes[0].txid, 32);
+                reverse_bytes(root_txid_rev, 32);
+                hex_encode(root_txid_rev, 32, root_txid_hex);
+                watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
+                                           1, WATCHTOWER_ANCHOR_AMOUNT);
+            }
 
             /* Skip cooperative close — factory already spent */
             report_add_string(&rpt, "result", "force_close_complete");

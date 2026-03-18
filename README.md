@@ -6,6 +6,7 @@
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
 > v0.1.6 — 656 tests (553 unit + 42 regtest + 36 orchestrator), LSPS0/1/2, BOLT 12 offers, BIP 39 mnemonic recovery, splicing, async factory rotation, watchtower breach detection fixes.
+> v0.1.6 — 656 tests (553 unit + 42 regtest + 36 orchestrator: 32/36 pass), LSPS0/1/2, BOLT 12 offers, BIP 39 mnemonic recovery, splicing, async factory rotation, watchtower breach detection fixes.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -28,6 +29,7 @@ A Bitcoin channel factory protocol combining:
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
 | **Testing** | 553 unit + 42 regtest + 36 orchestrator + 25 manual flag tests, CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 553 unit + 42 regtest + 36 orchestrator (32/36 passing) + 25 manual flag tests, CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -75,6 +77,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 ## Tests
 
 631 automated tests (553 unit + 42 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 36 orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+631 automated tests (553 unit + 42 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 36 orchestrator scenarios (32/36 passing). CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
