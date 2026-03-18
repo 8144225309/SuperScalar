@@ -374,3 +374,97 @@ int test_payment_amp_hash_len(void)
     ASSERT(hash[0] == 0xAA, "AMP8: hash unchanged on failure");
     return 1;
 }
+
+/* ================================================================== */
+/* AMP9 — payment_send_amp with real gossip store finds routes        */
+/* ================================================================== */
+int test_payment_amp_routes_found(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    /* Our private key and derived pubkey */
+    unsigned char our_priv[32]; memset(our_priv, 0x42, 32);
+    secp256k1_pubkey our_pub_obj;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub_obj, our_priv), "pubkey");
+    unsigned char our_pub[33]; size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub, &plen, &our_pub_obj, SECP256K1_EC_COMPRESSED);
+
+    /* Destination pubkey */
+    unsigned char dest_priv[32]; memset(dest_priv, 0x77, 32);
+    secp256k1_pubkey dest_pub_obj;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &dest_pub_obj, dest_priv), "dest pubkey");
+    unsigned char dest_pub[33]; plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, dest_pub, &plen, &dest_pub_obj, SECP256K1_EC_COMPRESSED);
+
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open gs");
+
+    /* Insert a channel: our_pub → dest_pub */
+    uint64_t scid = ((uint64_t)700000 << 40) | 1;
+    gossip_store_upsert_channel(&gs, scid, our_pub, dest_pub, 1000000, 0);
+    gossip_store_upsert_channel_update(&gs, scid, 0, 1000, 100, 40, 1);
+    gossip_store_upsert_channel_update(&gs, scid, 1, 1000, 100, 40, 1);
+
+    payment_table_t pt;
+    payment_init(&pt);
+
+    unsigned char hash_out[32];
+    int r = payment_send_amp(&pt, &gs, NULL, NULL, NULL, ctx,
+                              our_priv, our_pub, dest_pub, 2000, 1, hash_out);
+    ASSERT(r == 1, "AMP9: returns 1 with real route");
+    ASSERT(pt.count == 1, "AMP9: 1 entry in table");
+    ASSERT(pt.entries[0].state == PAY_STATE_INFLIGHT, "AMP9: state is INFLIGHT");
+    ASSERT(pt.entries[0].n_routes == 1, "AMP9: 1 route");
+
+    gossip_store_close(&gs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP10 — AMP amp_set_id stored in payment entry                     */
+/* ================================================================== */
+int test_payment_amp_set_id_stored(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char our_priv[32]; memset(our_priv, 0x42, 32);
+    secp256k1_pubkey our_pub_obj;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub_obj, our_priv), "pubkey");
+    unsigned char our_pub[33]; size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub, &plen, &our_pub_obj, SECP256K1_EC_COMPRESSED);
+
+    unsigned char dest_priv[32]; memset(dest_priv, 0x77, 32);
+    secp256k1_pubkey dest_pub_obj;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &dest_pub_obj, dest_priv), "dest pubkey");
+    unsigned char dest_pub[33]; plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, dest_pub, &plen, &dest_pub_obj, SECP256K1_EC_COMPRESSED);
+
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open gs");
+    uint64_t scid = ((uint64_t)700001 << 40) | 1;
+    gossip_store_upsert_channel(&gs, scid, our_pub, dest_pub, 1000000, 0);
+    gossip_store_upsert_channel_update(&gs, scid, 0, 1000, 100, 40, 1);
+    gossip_store_upsert_channel_update(&gs, scid, 1, 1000, 100, 40, 1);
+
+    payment_table_t pt; payment_init(&pt);
+    unsigned char hash_out[32]; memset(hash_out, 0, 32);
+
+    int r = payment_send_amp(&pt, &gs, NULL, NULL, NULL, ctx,
+                              our_priv, our_pub, dest_pub, 1000, 1, hash_out);
+    ASSERT(r == 1, "AMP10: success");
+    unsigned char zero32[32] = {0};
+    ASSERT(memcmp(pt.entries[0].amp_set_id, zero32, 32) != 0,
+           "AMP10: amp_set_id non-zero");
+    ASSERT(memcmp(pt.entries[0].amp_set_id, hash_out, 32) == 0,
+           "AMP10: amp_set_id == payment_hash");
+
+    gossip_store_close(&gs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+

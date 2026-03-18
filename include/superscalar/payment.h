@@ -47,6 +47,9 @@ typedef struct {
     char          last_error[128];
     /* Session keys used for onion construction (for error decryption) */
     unsigned char session_keys[PAYMENT_MAX_ROUTES][32];
+    /* AMP fields: set by payment_send_amp, checked in do_payment_send */
+    unsigned char amp_set_id[32];                    /* all-zero = not AMP */
+    unsigned char amp_shares[PAYMENT_MAX_ROUTES][32]; /* root share per shard */
 } payment_t;
 
 typedef struct {

@@ -328,6 +328,15 @@ extern int test_payment_amp_fields_zero_default(void);
 extern int test_payment_amp_set_id_roundtrip(void);
 extern int test_payment_amp_zero_shards_fails(void);
 extern int test_payment_amp_hash_len(void);
+extern int test_payment_amp_routes_found(void);
+extern int test_payment_amp_set_id_stored(void);
+
+/* PR #26: Gossip real data, dual-fund basepoints, zero-conf, close broadcast */
+extern int test_gossip_query_scids_real_data(void);
+extern int test_gossip_query_range_real_scids(void);
+extern int test_chan_open_v2_basepoints_nonzero(void);
+extern int test_chan_open_accept_zero_conf_min_depth(void);
+extern int test_ln_dispatch_close_broadcast(void);
 
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
@@ -1502,6 +1511,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_payment_amp_set_id_roundtrip);
     RUN_TEST(test_payment_amp_zero_shards_fails);
     RUN_TEST(test_payment_amp_hash_len);
+    RUN_TEST(test_payment_amp_routes_found);
+    RUN_TEST(test_payment_amp_set_id_stored);
+
+    printf("\n=== PR #26: Gossip Real Data + Dual-Fund Basepoints + Zero-Conf + Close Broadcast ===\n");
+    RUN_TEST(test_gossip_query_scids_real_data);
+    RUN_TEST(test_gossip_query_range_real_scids);
+    RUN_TEST(test_chan_open_v2_basepoints_nonzero);
+    RUN_TEST(test_chan_open_accept_zero_conf_min_depth);
+    RUN_TEST(test_ln_dispatch_close_broadcast);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);

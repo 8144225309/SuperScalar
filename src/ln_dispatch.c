@@ -22,6 +22,7 @@
 #include "superscalar/lsp_queue.h"
 #include "superscalar/persist.h"
 #include "superscalar/ptlc_commit.h"
+#include "superscalar/tx_builder.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
@@ -55,6 +56,59 @@ static uint32_t rd32(const unsigned char *b)
 {
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16)
          | ((uint32_t)b[2] <<  8) |  (uint32_t)b[3];
+}
+
+/* ---- Gossip query helper ---- */
+typedef struct {
+    ln_dispatch_t *d;
+    int peer_idx;
+    /* For range queries: collect SCIDs to include in reply_channel_range */
+    uint64_t scids[256];
+    int n_scids;
+} gossip_send_ctx_t;
+
+/* Called per-channel from gossip_store_get_channels_by_scids / _in_range.
+   Sends channel_announcement + channel_update(s) to the querying peer. */
+static void send_channel_data_cb(uint64_t scid,
+                                  const unsigned char *node1,
+                                  const unsigned char *node2,
+                                  void *userdata)
+{
+    gossip_send_ctx_t *ctx = (gossip_send_ctx_t *)userdata;
+    ln_dispatch_t *d = ctx->d;
+    int peer_idx = ctx->peer_idx;
+
+    /* Collect SCID for range reply */
+    if (ctx->n_scids < 256)
+        ctx->scids[ctx->n_scids++] = scid;
+
+    if (!d->pmgr || peer_idx < 0) return;
+
+    /* channel_announcement (unsigned — we relay what we have) */
+    unsigned char ann[300];
+    size_t ann_len = gossip_build_channel_announcement_unsigned(
+        ann, sizeof(ann), GOSSIP_CHAIN_HASH_MAINNET, scid,
+        node1, node2, node1, node2);
+    if (ann_len > 0)
+        peer_mgr_send(d->pmgr, peer_idx, ann, ann_len);
+
+    /* channel_update for each direction we have data for */
+    for (int dir = 0; dir <= 1; dir++) {
+        uint32_t fee_base = 0, fee_ppm = 0;
+        uint16_t cltv = 0;
+        uint32_t ts = 0;
+        if (!gossip_store_get_channel_update(d->gs, scid, dir,
+                                              &fee_base, &fee_ppm, &cltv, &ts))
+            continue;
+        unsigned char upd[160];
+        size_t upd_len = gossip_build_channel_update(
+            upd, sizeof(upd), d->ctx, d->our_privkey,
+            GOSSIP_CHAIN_HASH_MAINNET, scid, ts,
+            GOSSIP_UPDATE_MSGFLAG_HTLC_MAX, (uint8_t)dir,
+            cltv, 1, fee_base, fee_ppm, 0);
+        if (upd_len > 0)
+            peer_mgr_send(d->pmgr, peer_idx, upd, upd_len);
+    }
 }
 
 int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
@@ -322,6 +376,14 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         uint64_t scids[QS_MAX];
         int n = gossip_parse_query_scids(msg, msg_len, NULL, scids, QS_MAX);
         if (n < 0) return -1;
+        /* Send channel_announcement + channel_update(s) for each known SCID */
+        gossip_send_ctx_t gctx;
+        memset(&gctx, 0, sizeof(gctx));
+        gctx.d = d; gctx.peer_idx = peer_idx;
+        if (n > 0)
+            gossip_store_get_channels_by_scids(d->gs, scids, n,
+                                               send_channel_data_cb, &gctx);
+        /* reply_short_channel_ids_end: complete=1 */
         unsigned char reply[35];
         size_t rlen = gossip_build_reply_scids_end(reply, sizeof(reply),
                                                     GOSSIP_CHAIN_HASH_MAINNET, 1);
@@ -338,10 +400,17 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         unsigned char ch32[32];
         if (!gossip_parse_query_range(msg, msg_len, ch32, &first_block, &num_blocks_val))
             return -1;
+        /* Collect SCIDs and send channel data for each */
+        gossip_send_ctx_t gctx;
+        memset(&gctx, 0, sizeof(gctx));
+        gctx.d = d; gctx.peer_idx = peer_idx;
+        gossip_store_get_channels_in_range(d->gs, first_block, num_blocks_val,
+                                           send_channel_data_cb, &gctx);
+        /* reply_channel_range with the collected SCID list */
         unsigned char reply[1024];
         size_t rlen = gossip_build_reply_range(reply, sizeof(reply),
                                                 ch32, first_block, num_blocks_val,
-                                                NULL, 0, 1);
+                                                gctx.scids, gctx.n_scids, 1);
         if (rlen > 0 && d->pmgr && peer_idx >= 0)
             peer_mgr_send(d->pmgr, peer_idx, reply, rlen);
         return 263;
@@ -359,6 +428,9 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             return -1;
         channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
         if (ch) {
+            /* Store peer's closing scriptpubkey */
+            memcpy(ch->close_their_spk, their_spk, their_spk_len);
+            ch->close_their_spk_len = their_spk_len;
             ch->close_state |= 2; /* RECV_SHUTDOWN */
             if (!(ch->close_state & 1)) {
                 /* Mirror: send our shutdown too */
@@ -385,6 +457,32 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             ch->close_their_fee_sat = their_fee;
             if (counter == their_fee) {
                 ch->close_state = 5; /* DONE — fees agreed */
+                memcpy(ch->close_remote_sig, sig, 64);
+                /* Build and broadcast the closing tx */
+                if (d->broadcast_tx_cb && ch->funding_spk_len > 0 &&
+                    ch->close_our_spk_len > 0 && ch->close_their_spk_len > 0) {
+                    uint64_t agreed_fee = their_fee;
+                    tx_output_t outs[2];
+                    memset(outs, 0, sizeof(outs));
+                    memcpy(outs[0].script_pubkey, ch->close_our_spk,   ch->close_our_spk_len);
+                    outs[0].script_pubkey_len = ch->close_our_spk_len;
+                    outs[0].amount_sats = (ch->local_amount > agreed_fee * 1000 ?
+                                           (ch->local_amount - agreed_fee * 1000) / 1000 : 0);
+                    memcpy(outs[1].script_pubkey, ch->close_their_spk, ch->close_their_spk_len);
+                    outs[1].script_pubkey_len = ch->close_their_spk_len;
+                    outs[1].amount_sats = ch->remote_amount / 1000;
+                    tx_buf_t close_tx;
+                    memset(&close_tx, 0, sizeof(close_tx));
+                    if (channel_build_cooperative_close_tx(
+                            ch, &close_tx, NULL,
+                            &ch->local_funding_keypair,
+                            outs, 2) &&
+                        close_tx.data && close_tx.len > 0) {
+                        d->broadcast_tx_cb(d->broadcast_tx_ctx,
+                                           close_tx.data, close_tx.len);
+                    }
+                    tx_buf_free(&close_tx);
+                }
             } else {
                 ch->close_our_fee_sat = counter;
                 ch->close_state = 4; /* NEGOTIATING */

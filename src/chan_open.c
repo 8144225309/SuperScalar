@@ -113,7 +113,7 @@ size_t chan_build_accept_channel(const unsigned char temp_chan_id[32],
     put_u64(buf + pos, p->max_htlc_value_msat); pos += 8;
     put_u64(buf + pos, p->channel_reserve_sats); pos += 8;
     put_u64(buf + pos, p->htlc_minimum_msat); pos += 8;
-    put_u32(buf + pos, 3); pos += 4; /* minimum_depth: 3 confirmations */
+    put_u32(buf + pos, p->zero_conf ? 0 : 3); pos += 4; /* minimum_depth */
     put_u16(buf + pos, (uint16_t)p->to_self_delay); pos += 2;
     put_u16(buf + pos, p->max_accepted_htlcs); pos += 2;
     memcpy(buf + pos, p->funding_pubkey, 33); pos += 33;
@@ -409,14 +409,62 @@ int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
     accept[70] = 0x00; accept[71] = 0x90;
     /* max_accepted_htlcs at offset 72: 483 = 0x01E3 */
     accept[72] = 0x01; accept[73] = 0xE3;
-    /* funding_pubkey at offset 74: serialize from ch_out */
+    /* Generate random basepoints and per-commitment secrets for this channel */
+    if (!channel_generate_random_basepoints(ch_out)) return 0;
+    /* Generate local per-commitment secrets for commitments 0 and 1 */
+    channel_generate_local_pcs(ch_out, 0);
+    channel_generate_local_pcs(ch_out, 1);
+
+    /* funding_pubkey at offset 74 */
     {
+        /* Generate funding keypair if not yet set.
+           Check raw internal bytes to avoid serializing a zeroed (invalid) pubkey. */
+        unsigned char zero64[64] = {0};
+        if (memcmp(ch_out->local_funding_pubkey.data, zero64, 64) == 0) {
+            unsigned char fsec[32];
+            if (!channel_read_random_bytes(fsec, 32)) return 0;
+            memcpy(ch_out->local_funding_secret, fsec, 32);
+            if (!secp256k1_ec_pubkey_create(ctx, &ch_out->local_funding_pubkey, fsec)) return 0;
+            if (!secp256k1_keypair_create(ctx, &ch_out->local_funding_keypair, fsec))
+                return 0;
+        }
         size_t plen = 33;
         secp256k1_ec_pubkey_serialize(ctx, accept + 74, &plen,
                                        &ch_out->local_funding_pubkey,
                                        SECP256K1_EC_COMPRESSED);
     }
-    /* Remaining basepoints and PCPs: zeros */
+
+    /* Serialize five basepoints at offsets 107, 140, 173, 206, 239
+       Layout: rev_bp(33) pay_bp(33) delay_bp(33) htlc_bp(33) first_pcp(33) second_pcp(33) */
+    {
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, accept + 107, &plen,
+            &ch_out->local_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+        plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, accept + 140, &plen,
+            &ch_out->local_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, accept + 173, &plen,
+            &ch_out->local_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, accept + 206, &plen,
+            &ch_out->local_htlc_basepoint, SECP256K1_EC_COMPRESSED);
+    }
+
+    /* First and second per-commitment points at offsets 239 and 272 */
+    {
+        secp256k1_pubkey pcp0, pcp1;
+        if (channel_get_per_commitment_point(ch_out, 0, &pcp0)) {
+            size_t plen = 33;
+            secp256k1_ec_pubkey_serialize(ctx, accept + 239, &plen,
+                &pcp0, SECP256K1_EC_COMPRESSED);
+        }
+        if (channel_get_per_commitment_point(ch_out, 1, &pcp1)) {
+            size_t plen = 33;
+            secp256k1_ec_pubkey_serialize(ctx, accept + 272, &plen,
+                &pcp1, SECP256K1_EC_COMPRESSED);
+        }
+    }
 
     if (peer_mgr_send(mgr, peer_idx, accept, sizeof(accept)) <= 0) return 0;
     return 1;
