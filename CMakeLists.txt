@@ -151,6 +151,7 @@ add_library(superscalar
     src/htlc_forward.c
     src/peer_mgr.c
     src/chan_open.c
+    src/ptlc_commit.c
     src/htlc_commit.c
     src/cltv_watchdog.c
     src/chan_close.c

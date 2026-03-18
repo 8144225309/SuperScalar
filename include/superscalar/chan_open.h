@@ -115,4 +115,16 @@ size_t chan_build_accept_channel(const unsigned char temp_chan_id[32],
                                  const chan_open_params_t *p,
                                  unsigned char *buf, size_t buf_cap);
 
+/*
+ * Process an inbound open_channel2 message (type 78, BOLT #2 v2 dual-fund).
+ * Zero-contribution mode: we accept with no funding input of our own.
+ * Sends accept_channel2 (type 79) with funding_satoshis=0.
+ * msg includes the 2-byte type prefix (type 78).
+ * Returns 1 on success, 0 on validation failure.
+ */
+int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
+                          const unsigned char *msg, size_t msg_len,
+                          secp256k1_context *ctx,
+                          channel_t *ch_out);
+
 #endif /* SUPERSCALAR_CHAN_OPEN_H */

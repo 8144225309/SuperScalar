@@ -24,6 +24,8 @@
 #include "invoice.h"
 #include "watchtower.h"
 #include "lsps.h"
+#include "gossip_store.h"
+#include "chan_close.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -47,6 +49,11 @@ typedef struct {
     void                   *jit_cb_ctx;
     /* Phase M: per-peer channel state (indexed by peer_idx, may be NULL) */
     channel_t             **peer_channels;
+    gossip_store_t        *gs;            /* gossip store for query responses; NULL=disabled */
+    struct persist_t      *persist;       /* factory work queue; NULL=disabled */
+    /* Cooperative close: callback to broadcast signed closing tx */
+    void (*broadcast_tx_cb)(void *ctx, const unsigned char *tx, size_t tx_len);
+    void  *broadcast_tx_ctx;
 } ln_dispatch_t;
 
 /*

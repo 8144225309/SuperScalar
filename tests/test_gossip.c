@@ -4,6 +4,8 @@
 
 #include "superscalar/gossip.h"
 #include "superscalar/gossip_store.h"
+#include "superscalar/ln_dispatch.h"
+#include "superscalar/gossip_store.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
@@ -261,5 +263,284 @@ int test_gossip_channel_update_store_and_filter(void)
     ASSERT(memcmp(buf + 2, GOSSIP_CHAIN_HASH_MAINNET, 32) == 0, "chain_hash in filter");
 
     gossip_store_close(&gs);
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ1 — parse query_short_channel_ids (type 261)                     */
+/* ================================================================== */
+int test_gossip_parse_query_scids(void)
+{
+    /* type(2) + chain_hash(32) + encoded_len(2) + encoding_type(1) + scids(2*8) */
+    unsigned char msg[2 + 32 + 2 + 1 + 16];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x05; /* type 261 */
+    /* chain_hash: zeros */
+    /* encoded_len = 17 (1 + 2*8) */
+    msg[34] = 0; msg[35] = 17;
+    msg[36] = 0x00; /* encoding_type = uncompressed */
+    /* scid1 = 0x0102030405060708 */
+    msg[37]=0x01; msg[38]=0x02; msg[39]=0x03; msg[40]=0x04;
+    msg[41]=0x05; msg[42]=0x06; msg[43]=0x07; msg[44]=0x08;
+    /* scid2 = 0x0102030405060709 */
+    msg[45]=0x01; msg[46]=0x02; msg[47]=0x03; msg[48]=0x04;
+    msg[49]=0x05; msg[50]=0x06; msg[51]=0x07; msg[52]=0x09;
+    uint64_t scids[10];
+    int n = gossip_parse_query_scids(msg, sizeof(msg), NULL, scids, 10);
+    ASSERT(n == 2, "GQ1: 2 SCIDs parsed");
+    ASSERT(scids[0] == 0x0102030405060708ULL, "GQ1: scid[0] correct");
+    ASSERT(scids[1] == 0x0102030405060709ULL, "GQ1: scid[1] correct");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ2 — build reply_short_channel_ids_end (type 262)                 */
+/* ================================================================== */
+int test_gossip_build_reply_scids_end(void)
+{
+    unsigned char buf[64];
+    size_t len = gossip_build_reply_scids_end(buf, sizeof(buf),
+                                               GOSSIP_CHAIN_HASH_MAINNET, 1);
+    ASSERT(len == 35, "GQ2: length == 35");
+    uint16_t t = ((uint16_t)buf[0] << 8) | buf[1];
+    ASSERT(t == 262, "GQ2: type == 262");
+    ASSERT(memcmp(buf + 2, GOSSIP_CHAIN_HASH_MAINNET, 32) == 0, "GQ2: chain_hash matches");
+    ASSERT(buf[34] == 1, "GQ2: complete == 1");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ3 — parse query_channel_range (type 263)                         */
+/* ================================================================== */
+int test_gossip_parse_query_range(void)
+{
+    unsigned char msg[42];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x07; /* type 263 */
+    /* chain_hash zeros */
+    /* first_blocknum = 700000 = 0x000AAE60 */
+    msg[34] = 0x00; msg[35] = 0x0A; msg[36] = 0xAE; msg[37] = 0x60;
+    /* num_blocks = 1000 = 0x000003E8 */
+    msg[38] = 0x00; msg[39] = 0x00; msg[40] = 0x03; msg[41] = 0xE8;
+
+    unsigned char ch32[32];
+    uint32_t first_block = 0, num_blocks = 0;
+    int r = gossip_parse_query_range(msg, sizeof(msg), ch32, &first_block, &num_blocks);
+    ASSERT(r == 1, "GQ3: parse succeeded");
+    ASSERT(first_block == 700000, "GQ3: first_blocknum == 700000");
+    ASSERT(num_blocks == 1000, "GQ3: num_blocks == 1000");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ4 — build reply_channel_range (type 264)                         */
+/* ================================================================== */
+int test_gossip_build_reply_range(void)
+{
+    uint64_t scids[2] = {0xABCDEF0012345678ULL, 0x0000001000020000ULL};
+    unsigned char buf[256];
+    size_t len = gossip_build_reply_range(buf, sizeof(buf),
+                                           GOSSIP_CHAIN_HASH_MAINNET,
+                                           700000, 1000,
+                                           scids, 2, 1);
+    /* type(2)+chain(32)+first_block(4)+num_blocks(4)+complete(1)+enc_len(2)+enc_type(1)+2*8 */
+    size_t expected = 2 + 32 + 4 + 4 + 1 + 2 + 1 + 16;
+    ASSERT(len == expected, "GQ4: length correct");
+    uint16_t t = ((uint16_t)buf[0] << 8) | buf[1];
+    ASSERT(t == 264, "GQ4: type == 264");
+    ASSERT(buf[42] == 1, "GQ4: complete == 1");
+    /* Parse back first SCID */
+    uint64_t s = 0;
+    for (int i = 0; i < 8; i++) s = (s << 8) | buf[46 + i];
+    ASSERT(s == scids[0], "GQ4: scid[0] roundtrips");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ5 — gossip_store get_channels_by_scids found / not found         */
+/* ================================================================== */
+static uint64_t g_bysc_scid = 0;
+static int g_bysc_count = 0;
+static void bysc_cb(uint64_t scid, const unsigned char *n1, const unsigned char *n2, void *ud)
+{
+    (void)n1; (void)n2; (void)ud;
+    g_bysc_scid = scid;
+    g_bysc_count++;
+}
+int test_gossip_store_get_channels_by_scids(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open store");
+
+    unsigned char pk1[33], pk2[33];
+    memset(pk1, 0x02, 33); memset(pk2, 0x03, 33);
+    uint64_t scid = 0x000100020003ULL;
+    gossip_store_upsert_channel(&gs, scid, pk1, pk2, 1000000, 1700000000);
+
+    g_bysc_count = 0;
+    g_bysc_scid = 0;
+    int n = gossip_store_get_channels_by_scids(&gs, &scid, 1, bysc_cb, NULL);
+    ASSERT(n == 1, "GQ5: found 1 channel");
+    ASSERT(g_bysc_scid == scid, "GQ5: correct scid returned");
+
+    /* Not found */
+    uint64_t missing = 0xDEADBEEFULL;
+    g_bysc_count = 0;
+    int m = gossip_store_get_channels_by_scids(&gs, &missing, 1, bysc_cb, NULL);
+    ASSERT(m == 0, "GQ5: missing scid returns 0");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* Simple accumulator callback for range test */
+static uint64_t g_range_scids[64];
+static int g_range_count = 0;
+static void range_cb(uint64_t scid, const unsigned char *n1, const unsigned char *n2, void *ud)
+{
+    (void)n1; (void)n2; (void)ud;
+    if (g_range_count < 64) g_range_scids[g_range_count++] = scid;
+}
+
+/* ================================================================== */
+/* GQ6 — gossip_store get_channels_in_range                           */
+/* ================================================================== */
+int test_gossip_store_get_channels_in_range(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open store");
+
+    unsigned char pk1[33], pk2[33];
+    memset(pk1, 0x02, 33); memset(pk2, 0x03, 33);
+    /* block 700 = 0x2BC, SCID = (700 << 40) | tx<<16 | out */
+    uint64_t scid1 = ((uint64_t)700 << 40) | (1 << 16) | 0;
+    uint64_t scid2 = ((uint64_t)800 << 40) | (1 << 16) | 0; /* outside range */
+    gossip_store_upsert_channel(&gs, scid1, pk1, pk2, 1000000, 1700000000);
+    gossip_store_upsert_channel(&gs, scid2, pk1, pk2, 1000000, 1700000000);
+
+    g_range_count = 0;
+    int n = gossip_store_get_channels_in_range(&gs, 600, 200, range_cb, NULL);
+    ASSERT(n == 1, "GQ6: one channel in range [600,800)");
+    ASSERT(g_range_scids[0] == scid1, "GQ6: correct scid");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ7 — gossip_store get_channels_in_range empty                     */
+/* ================================================================== */
+int test_gossip_store_range_empty(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "open store");
+
+    g_range_count = 0;
+    int n = gossip_store_get_channels_in_range(&gs, 0, 1000000, range_cb, NULL);
+    ASSERT(n == 0, "GQ7: empty store returns 0");
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ8 — dispatch type 261 (query_scids) no gs → returns 261 no crash */
+/* ================================================================== */
+int test_ln_dispatch_routes_query_scids(void)
+{
+    /* Build minimal query_scids: type(2)+chain(32)+enc_len(2)+enc_type(1)+no scids */
+    unsigned char msg[37];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x05; /* type 261 */
+    msg[35] = 1; /* enc_len = 1 (just encoding type, no scids) */
+    msg[36] = 0x00;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gs = NULL; /* no gs */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 261, "GQ8: type 261 routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ9 — dispatch type 263 (query_range) no gs → returns 263          */
+/* ================================================================== */
+int test_ln_dispatch_routes_query_range(void)
+{
+    unsigned char msg[42];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x07; /* type 263 */
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gs = NULL;
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 263, "GQ9: type 263 routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ10 — dispatch type 264 (reply_range) → returns 264               */
+/* ================================================================== */
+int test_ln_dispatch_routes_reply_range(void)
+{
+    unsigned char msg[50];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x08; /* type 264 */
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 264, "GQ10: type 264 routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ11 — dispatch type 261 with NULL gs doesn't crash                */
+/* ================================================================== */
+int test_ln_dispatch_gossip_no_gs_no_crash(void)
+{
+    unsigned char msg[37];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x05;
+    msg[35] = 1; msg[36] = 0x00;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    /* gs = NULL, pmgr = NULL */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 261, "GQ11: no crash without gs");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ12 — parse query_scids: too short returns -1                     */
+/* ================================================================== */
+int test_gossip_parse_query_scids_too_short(void)
+{
+    unsigned char msg[10]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x05;
+    int n = gossip_parse_query_scids(msg, sizeof(msg), NULL, NULL, 0);
+    ASSERT(n == -1, "GQ12: too short returns -1");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ13 — build reply_scids_end with complete=0                       */
+/* ================================================================== */
+int test_gossip_build_reply_scids_end_incomplete(void)
+{
+    unsigned char buf[64];
+    size_t len = gossip_build_reply_scids_end(buf, sizeof(buf), NULL, 0);
+    ASSERT(len == 35, "GQ13: length == 35");
+    ASSERT(buf[34] == 0, "GQ13: complete == 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* GQ14 — parse query_range: too short returns 0                      */
+/* ================================================================== */
+int test_gossip_parse_query_range_too_short(void)
+{
+    unsigned char msg[20]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x07;
+    int r = gossip_parse_query_range(msg, sizeof(msg), NULL, NULL, NULL);
+    ASSERT(r == 0, "GQ14: too short returns 0");
     return 1;
 }

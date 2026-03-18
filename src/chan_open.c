@@ -337,3 +337,87 @@ int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
     }
     return 1;
 }
+
+/* ---- Dual-Fund v2: inbound open_channel2 (type 78) ---- */
+
+int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
+                          const unsigned char *msg, size_t msg_len,
+                          secp256k1_context *ctx, channel_t *ch_out)
+{
+    if (!mgr || !msg || !ch_out || msg_len < 350) return 0;
+    if (!ctx) return 0;
+
+    /* Skip type bytes if present (type 78 = 0x004E) */
+    const unsigned char *p = msg;
+    size_t len = msg_len;
+    if (len >= 2 && p[0] == 0 && p[1] == 78) { p += 2; len -= 2; }
+    if (len < 348) return 0;
+
+    /* Parse open_channel2 payload (no type prefix):
+       chain_hash(32) + temp_channel_id(32) + funding_feerate(4) +
+       commitment_feerate(4) + funding_satoshis(8) + dust_limit(8) +
+       max_htlc(8) + htlc_min(8) + to_self_delay(2) + max_htlcs(2) +
+       locktime(4) + funding_pubkey(33) + rev_bp(33) + pay_bp(33) +
+       delay_bp(33) + htlc_bp(33) + first_pcp(33) + second_pcp(33) +
+       channel_flags(1) = 348 bytes */
+    const unsigned char *q = p;
+    /* chain_hash(32) */     q += 32;
+    unsigned char temp_id[32]; memcpy(temp_id, q, 32); q += 32;
+    /* feerate(4+4) */       q += 8;
+    /* funding_sats(8) */    q += 8;
+    /* dust_limit(8) */      q += 8;
+    /* max_htlc(8) */        q += 8;
+    /* htlc_min(8) */        q += 8;
+    /* to_self_delay(2) */   uint16_t their_delay = ((uint16_t)q[0]<<8)|q[1]; q += 2;
+    /* max_htlcs(2) */       q += 2;
+    /* locktime(4) */        q += 4;
+    /* funding_pubkey(33) */
+    if (ctx) {
+        secp256k1_pubkey their_key;
+        if (secp256k1_ec_pubkey_parse(ctx, &their_key, q, 33))
+            ch_out->remote_funding_pubkey = their_key;
+    }
+    q += 33;
+    /* Skip remaining basepoints and PCPs */
+    q += 5*33 + 33 + 33;
+    /* channel_flags(1) */   q += 1;
+
+    ch_out->to_self_delay = their_delay;
+    ch_out->fee_rate_sat_per_kvb = 1000;
+    if (ch_out->ctx == NULL) ch_out->ctx = ctx;
+
+    /* Build accept_channel2 (type 79):
+       type(2) + temp_channel_id(32) + funding_satoshis(8)=0 +
+       dust_limit(8) + max_htlc(8) + htlc_min(8) + minimum_depth(4) +
+       to_self_delay(2) + max_htlcs(2) + funding_pubkey(33) +
+       rev_bp(33) + pay_bp(33) + delay_bp(33) + htlc_bp(33) +
+       first_pcp(33) + second_pcp(33) = 314 bytes */
+    unsigned char accept[314];
+    memset(accept, 0, sizeof(accept));
+    accept[0] = 0x00; accept[1] = 0x4F; /* type 79 */
+    memcpy(accept + 2, temp_id, 32);    /* temp_channel_id */
+    /* funding_satoshis = 0 (8 bytes already zero at offset 34) */
+    /* dust_limit at offset 42: 546 sats = 0x222 */
+    accept[48] = 0x02; accept[49] = 0x22;
+    /* max_htlc at offset 50: 0xFFFF (all ones) */
+    memset(accept + 50, 0xFF, 8);
+    /* htlc_min at offset 58: 1 msat */
+    accept[65] = 0x01;
+    /* minimum_depth at offset 66: 3 */
+    accept[69] = 0x03;
+    /* to_self_delay at offset 70: 144 = 0x0090 */
+    accept[70] = 0x00; accept[71] = 0x90;
+    /* max_accepted_htlcs at offset 72: 483 = 0x01E3 */
+    accept[72] = 0x01; accept[73] = 0xE3;
+    /* funding_pubkey at offset 74: serialize from ch_out */
+    {
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, accept + 74, &plen,
+                                       &ch_out->local_funding_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+    }
+    /* Remaining basepoints and PCPs: zeros */
+
+    if (peer_mgr_send(mgr, peer_idx, accept, sizeof(accept)) <= 0) return 0;
+    return 1;
+}

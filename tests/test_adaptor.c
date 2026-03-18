@@ -1,4 +1,6 @@
 #include "superscalar/adaptor.h"
+#include "superscalar/ln_dispatch.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/factory.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
@@ -658,5 +660,239 @@ int test_regtest_ptlc_turnover(void) {
     tx_buf_free(&close_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC1 — channel_add_ptlc: adds PTLC, assigns id, state ACTIVE     */
+/* ================================================================== */
+int test_channel_add_ptlc(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+
+    secp256k1_pubkey payment_pt;
+    unsigned char sec[32]; memset(sec, 0x22, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &payment_pt, sec), "create pubkey");
+
+    uint64_t id = 0xFFFF;
+    int r = channel_add_ptlc(&ch, PTLC_OFFERED, 50000, &payment_pt, 700100, &id);
+    TEST_ASSERT(r == 1, "PTLC1: add succeeded");
+    TEST_ASSERT(id == 0, "PTLC1: first id = 0");
+    TEST_ASSERT(ch.n_ptlcs == 1, "PTLC1: n_ptlcs == 1");
+    TEST_ASSERT(ch.ptlcs[0].state == PTLC_STATE_ACTIVE, "PTLC1: state ACTIVE");
+    TEST_ASSERT(ch.ptlcs[0].amount_sats == 50000, "PTLC1: amount");
+    TEST_ASSERT(ch.ptlcs[0].direction == PTLC_OFFERED, "PTLC1: direction OFFERED");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC2 — channel_settle_ptlc: state transitions to SETTLED          */
+/* ================================================================== */
+int test_channel_settle_ptlc(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+
+    uint64_t id = 0;
+    int r = channel_add_ptlc(&ch, PTLC_RECEIVED, 10000, NULL, 700200, &id);
+    TEST_ASSERT(r == 1, "PTLC2: add ok");
+
+    unsigned char sig[64]; memset(sig, 0xAB, 64);
+    r = channel_settle_ptlc(&ch, id, sig);
+    TEST_ASSERT(r == 1, "PTLC2: settle ok");
+    TEST_ASSERT(ch.ptlcs[0].state == PTLC_STATE_SETTLED, "PTLC2: state SETTLED");
+    TEST_ASSERT(ch.ptlcs[0].has_adapted_sig == 1, "PTLC2: has_adapted_sig");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC3 — channel_fail_ptlc: state transitions to FAILED             */
+/* ================================================================== */
+int test_channel_fail_ptlc(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+
+    uint64_t id = 0;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 20000, NULL, 700300, &id);
+
+    int r = channel_fail_ptlc(&ch, id);
+    TEST_ASSERT(r == 1, "PTLC3: fail ok");
+    TEST_ASSERT(ch.ptlcs[0].state == PTLC_STATE_FAILED, "PTLC3: state FAILED");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC4 — add 3 PTLCs, settle middle one                            */
+/* ================================================================== */
+int test_channel_ptlc_multiple(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+
+    uint64_t id0, id1, id2;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 1000, NULL, 700000, &id0);
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 2000, NULL, 700000, &id1);
+    channel_add_ptlc(&ch, PTLC_OFFERED, 3000, NULL, 700000, &id2);
+    TEST_ASSERT(ch.n_ptlcs == 3, "PTLC4: 3 ptlcs");
+
+    channel_settle_ptlc(&ch, id1, NULL);
+    TEST_ASSERT(ch.ptlcs[0].state == PTLC_STATE_ACTIVE,  "PTLC4: ptlc[0] still active");
+    TEST_ASSERT(ch.ptlcs[1].state == PTLC_STATE_SETTLED, "PTLC4: ptlc[1] settled");
+    TEST_ASSERT(ch.ptlcs[2].state == PTLC_STATE_ACTIVE,  "PTLC4: ptlc[2] still active");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC5 — ptlc_commit_dispatch: type 0x4C processed                 */
+/* ================================================================== */
+int test_ptlc_commit_dispatch_presig(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
+
+    /* Add a PTLC to receive presig for */
+    uint64_t id = 0;
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 5000, NULL, 700000, &id);
+
+    /* Build PTLC_PRESIG message: type(2) + id(8) + pre_sig(64) = 74 bytes */
+    unsigned char msg[74]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4C;
+    /* id = 0 at bytes 2..9 */
+    /* pre_sig at bytes 10..73 */
+    memset(msg + 10, 0xBB, 64);
+
+    int r = ptlc_commit_dispatch(&pmgr, 0, &ch, NULL, msg, sizeof(msg));
+    TEST_ASSERT(r == 0x4C, "PTLC5: returns 0x4C");
+    TEST_ASSERT(ch.ptlcs[0].has_pre_sig == 1, "PTLC5: pre_sig stored");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC6 — ptlc_commit_dispatch: type 0x4D processed                 */
+/* ================================================================== */
+int test_ptlc_commit_dispatch_adapted(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
+
+    uint64_t id = 0;
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 5000, NULL, 700000, &id);
+
+    unsigned char msg[74]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4D;
+    memset(msg + 10, 0xCC, 64);
+
+    int r = ptlc_commit_dispatch(&pmgr, 0, &ch, NULL, msg, sizeof(msg));
+    TEST_ASSERT(r == 0x4D, "PTLC6: returns 0x4D");
+    TEST_ASSERT(ch.ptlcs[0].state == PTLC_STATE_SETTLED, "PTLC6: SETTLED");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC7 — ptlc_commit_dispatch: type 0x4E processed                 */
+/* ================================================================== */
+int test_ptlc_commit_dispatch_complete(void)
+{
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
+
+    uint64_t id = 0;
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 5000, NULL, 700000, &id);
+    channel_settle_ptlc(&ch, id, NULL);
+
+    unsigned char msg[10]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4E;
+
+    int r = ptlc_commit_dispatch(&pmgr, 0, &ch, NULL, msg, sizeof(msg));
+    TEST_ASSERT(r == 0x4E, "PTLC7: returns 0x4E");
+
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC8 — ptlc_commit_dispatch: NULL ch doesn't crash               */
+/* ================================================================== */
+int test_ptlc_commit_dispatch_null_ch(void)
+{
+    peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
+    unsigned char msg[74]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4C;
+    int r = ptlc_commit_dispatch(&pmgr, 0, NULL, NULL, msg, sizeof(msg));
+    TEST_ASSERT(r == 0x4C, "PTLC8: NULL ch returns 0x4C no crash");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC9 — channel_add_ptlc grows cap beyond initial 8                */
+/* ================================================================== */
+int test_channel_ptlc_grow(void)
+{
+    channel_t ch; memset(&ch, 0, sizeof(ch));
+    /* Add 10 PTLCs to force realloc */
+    for (int i = 0; i < 10; i++) {
+        uint64_t id = 0;
+        int r = channel_add_ptlc(&ch, PTLC_OFFERED, 1000 * (i+1), NULL, 700000 + i, &id);
+        TEST_ASSERT(r == 1, "PTLC9: add ok");
+        TEST_ASSERT((uint64_t)i == id, "PTLC9: id sequential");
+    }
+    TEST_ASSERT(ch.n_ptlcs == 10, "PTLC9: 10 ptlcs added");
+    free(ch.ptlcs);
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC10 — channel_fail_ptlc with non-existent id returns 0         */
+/* ================================================================== */
+int test_channel_fail_ptlc_not_found(void)
+{
+    channel_t ch; memset(&ch, 0, sizeof(ch));
+    int r = channel_fail_ptlc(&ch, 999);
+    TEST_ASSERT(r == 0, "PTLC10: not found returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC11 — channel_settle_ptlc with non-existent id returns 0       */
+/* ================================================================== */
+int test_channel_settle_ptlc_not_found(void)
+{
+    channel_t ch; memset(&ch, 0, sizeof(ch));
+    unsigned char sig[64]; memset(sig, 0, 64);
+    int r = channel_settle_ptlc(&ch, 999, sig);
+    TEST_ASSERT(r == 0, "PTLC11: not found returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC12 — dispatch type 0x4E (PTLC_COMPLETE) on same path as 78    */
+/* ================================================================== */
+int test_ptlc_complete_via_dispatch(void)
+{
+    /* type 78 = 0x4E with 10-byte msg goes to PTLC path */
+    unsigned char msg[10]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4E;
+    ln_dispatch_t d; memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    TEST_ASSERT(r == 78, "PTLC12: type 0x4E dispatched as 78");
     return 1;
 }

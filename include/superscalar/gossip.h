@@ -148,4 +148,35 @@ size_t gossip_build_timestamp_filter(
 int gossip_validate_channel_announcement(secp256k1_context *ctx,
                                           const unsigned char *msg, size_t msg_len);
 
+/* BOLT #7 gossip query message types */
+#define GOSSIP_MSG_QUERY_SCIDS         261
+#define GOSSIP_MSG_REPLY_SCIDS_END     262
+#define GOSSIP_MSG_QUERY_RANGE         263
+#define GOSSIP_MSG_REPLY_RANGE         264
+
+/* Parse a query_short_channel_ids message (type 261).
+   scids_out: array to fill, scids_cap: max entries.
+   Returns number of SCIDs parsed, or -1 on error. */
+int gossip_parse_query_scids(const unsigned char *msg, size_t msg_len,
+                              const unsigned char chain_hash[32],
+                              uint64_t *scids_out, int scids_cap);
+
+/* Build a reply_short_channel_ids_end (type 262).
+   complete: 1 if all SCIDs were sent, 0 otherwise. */
+size_t gossip_build_reply_scids_end(unsigned char *out, size_t out_cap,
+                                     const unsigned char chain_hash[32],
+                                     int complete);
+
+/* Parse a query_channel_range message (type 263). */
+int gossip_parse_query_range(const unsigned char *msg, size_t msg_len,
+                              unsigned char chain_hash_out[32],
+                              uint32_t *first_blocknum, uint32_t *num_blocks);
+
+/* Build a reply_channel_range message (type 264). */
+size_t gossip_build_reply_range(unsigned char *out, size_t out_cap,
+                                 const unsigned char chain_hash[32],
+                                 uint32_t first_blocknum, uint32_t num_blocks,
+                                 const uint64_t *scids, int n_scids,
+                                 int complete);
+
 #endif /* SUPERSCALAR_GOSSIP_H */

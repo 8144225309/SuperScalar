@@ -206,6 +206,18 @@ extern int test_ln_dispatch_routes_revoke_and_ack(void);
 extern int test_ln_dispatch_routes_update_fee(void);
 extern int test_ln_dispatch_routes_channel_reestablish(void);
 extern int test_ln_dispatch_flush_relay_empty(void);
+extern int test_ln_dispatch_routes_shutdown(void);
+extern int test_ln_dispatch_routes_closing_signed(void);
+extern int test_ln_dispatch_shutdown_state_recv(void);
+extern int test_ln_dispatch_close_fee_converge(void);
+extern int test_ln_dispatch_shutdown_too_short(void);
+extern int test_ln_dispatch_closing_signed_too_short(void);
+extern int test_ln_dispatch_close_fee_agree(void);
+extern int test_ln_dispatch_shutdown_mirrors(void);
+extern int test_ln_dispatch_shutdown_no_channels(void);
+extern int test_ln_dispatch_close_fee_midpoint(void);
+extern int test_ln_dispatch_close_negotiating_state(void);
+extern int test_ln_dispatch_close_fee_large_gap(void);
 
 /* Gap fixes: LSPS1 FAILED, LSPS2 expiry, JIT open callback */
 extern int test_lsps1_order_tick_fails(void);
@@ -231,6 +243,20 @@ extern int test_gossip_channel_announcement_fields(void);
 extern int test_gossip_channel_update_construction(void);
 extern int test_gossip_store_roundtrip(void);
 extern int test_gossip_channel_update_store_and_filter(void);
+extern int test_gossip_parse_query_scids(void);
+extern int test_gossip_build_reply_scids_end(void);
+extern int test_gossip_parse_query_range(void);
+extern int test_gossip_build_reply_range(void);
+extern int test_gossip_store_get_channels_by_scids(void);
+extern int test_gossip_store_get_channels_in_range(void);
+extern int test_gossip_store_range_empty(void);
+extern int test_ln_dispatch_routes_query_scids(void);
+extern int test_ln_dispatch_routes_query_range(void);
+extern int test_ln_dispatch_routes_reply_range(void);
+extern int test_ln_dispatch_gossip_no_gs_no_crash(void);
+extern int test_gossip_parse_query_scids_too_short(void);
+extern int test_gossip_build_reply_scids_end_incomplete(void);
+extern int test_gossip_parse_query_range_too_short(void);
 /* PR #17 Phase 4: factory entry/exit */
 extern int test_scid_encode_decode(void);
 extern int test_scid_route_hint_format(void);
@@ -251,6 +277,8 @@ extern int test_pathfind_mpp(void);
 extern int test_onion_single_hop(void);
 extern int test_onion_two_hops(void);
 extern int test_onion_keysend(void);
+extern int test_onion_amp_tlv14_present(void);
+extern int test_onion_amp_no_tlv14_when_disabled(void);
 extern int test_htlc_forward_final(void);
 extern int test_htlc_forward_settle(void);
 extern int test_htlc_forward_fail(void);
@@ -271,6 +299,14 @@ extern int test_peer_mgr_disconnect(void);
 extern int test_chan_open_build_open_channel(void);
 extern int test_chan_open_build_accept_channel(void);
 extern int test_chan_open_buffer_too_small(void);
+extern int test_chan_open_v2_accept_built(void);
+extern int test_chan_open_v2_too_short(void);
+extern int test_chan_open_v2_routes(void);
+extern int test_ln_dispatch_routes_open_channel2(void);
+extern int test_ln_dispatch_open_channel2_too_short(void);
+extern int test_chan_open_v2_null_mgr(void);
+extern int test_chan_open_v2_with_ctx(void);
+extern int test_chan_open_v2_accept_type(void);
 
 /* PR #20 Phase 4: Payment State Machine */
 extern int test_payment_init(void);
@@ -284,6 +320,14 @@ extern int test_payment_timeout_expires_inflight(void);
 extern int test_payment_timeout_ignores_recent(void);
 extern int test_payment_timeout_ignores_non_inflight(void);
 extern int test_payment_timeout_null_table(void);
+extern int test_payment_amp_produces_onion_tlv14(void);
+extern int test_payment_amp_set_id_consistent(void);
+extern int test_payment_amp_child_indices(void);
+extern int test_payment_amp_null_gs_fails(void);
+extern int test_payment_amp_fields_zero_default(void);
+extern int test_payment_amp_set_id_roundtrip(void);
+extern int test_payment_amp_zero_shards_fails(void);
+extern int test_payment_amp_hash_len(void);
 
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
@@ -530,6 +574,20 @@ extern int test_adaptor_taproot(void);
 extern int test_ptlc_key_turnover(void);
 extern int test_ptlc_lsp_sockpuppet(void);
 extern int test_ptlc_factory_coop_close_after_turnover(void);
+extern int test_channel_add_ptlc(void);
+extern int test_channel_settle_ptlc(void);
+extern int test_channel_fail_ptlc(void);
+extern int test_channel_ptlc_multiple(void);
+extern int test_ptlc_commit_dispatch_presig(void);
+extern int test_ptlc_commit_dispatch_adapted(void);
+extern int test_ptlc_commit_dispatch_complete(void);
+extern int test_ptlc_commit_dispatch_null_ch(void);
+extern int test_ln_dispatch_routes_ptlc_presig(void);
+extern int test_ln_dispatch_routes_ptlc_adapted(void);
+extern int test_channel_ptlc_grow(void);
+extern int test_channel_fail_ptlc_not_found(void);
+extern int test_channel_settle_ptlc_not_found(void);
+extern int test_ln_dispatch_routes_ptlc_complete(void);
 extern int test_regtest_ptlc_turnover(void);
 
 /* Phase 8: Factory lifecycle + distribution tx */
@@ -1101,6 +1159,14 @@ extern int test_queue_null_payload(void);
 extern int test_queue_drain_limit(void);
 extern int test_queue_null_safety(void);
 extern int test_queue_get(void);
+extern int test_queue_ln_dispatch_poll_null_persist(void);
+extern int test_queue_ln_dispatch_done_null_persist(void);
+extern int test_queue_dispatch_poll_type_returned(void);
+extern int test_queue_dispatch_done_type_returned(void);
+extern int test_ln_dispatch_routes_queue_poll(void);
+extern int test_ln_dispatch_routes_queue_done(void);
+extern int test_queue_ln_dispatch_done_empty(void);
+extern int test_queue_ln_dispatch_done_too_short(void);
 
 /* Async Signing: Notification Dispatch */
 extern int test_notify_log_init(void);
@@ -1233,6 +1299,20 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ln_dispatch_routes_channel_reestablish);
     RUN_TEST(test_ln_dispatch_flush_relay_empty);
 
+    printf("\n=== Phase 1: Cooperative Close Dispatch ===\n");
+    RUN_TEST(test_ln_dispatch_routes_shutdown);
+    RUN_TEST(test_ln_dispatch_routes_closing_signed);
+    RUN_TEST(test_ln_dispatch_shutdown_state_recv);
+    RUN_TEST(test_ln_dispatch_close_fee_converge);
+    RUN_TEST(test_ln_dispatch_shutdown_too_short);
+    RUN_TEST(test_ln_dispatch_closing_signed_too_short);
+    RUN_TEST(test_ln_dispatch_close_fee_agree);
+    RUN_TEST(test_ln_dispatch_shutdown_mirrors);
+    RUN_TEST(test_ln_dispatch_shutdown_no_channels);
+    RUN_TEST(test_ln_dispatch_close_fee_midpoint);
+    RUN_TEST(test_ln_dispatch_close_negotiating_state);
+    RUN_TEST(test_ln_dispatch_close_fee_large_gap);
+
     printf("\n=== Gap Fixes: LSPS1 FAILED + LSPS2 Expiry + JIT Callback ===\n");
     RUN_TEST(test_lsps1_order_tick_fails);
     RUN_TEST(test_lsps1_order_tick_already_failed);
@@ -1316,6 +1396,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_gossip_store_roundtrip);
     RUN_TEST(test_gossip_channel_update_store_and_filter);
 
+    printf("\n=== Phase 2: BOLT #7 Gossip Query Handlers ===\n");
+    RUN_TEST(test_gossip_parse_query_scids);
+    RUN_TEST(test_gossip_build_reply_scids_end);
+    RUN_TEST(test_gossip_parse_query_range);
+    RUN_TEST(test_gossip_build_reply_range);
+    RUN_TEST(test_gossip_store_get_channels_by_scids);
+    RUN_TEST(test_gossip_store_get_channels_in_range);
+    RUN_TEST(test_gossip_store_range_empty);
+    RUN_TEST(test_ln_dispatch_routes_query_scids);
+    RUN_TEST(test_ln_dispatch_routes_query_range);
+    RUN_TEST(test_ln_dispatch_routes_reply_range);
+    RUN_TEST(test_ln_dispatch_gossip_no_gs_no_crash);
+    RUN_TEST(test_gossip_parse_query_scids_too_short);
+    RUN_TEST(test_gossip_build_reply_scids_end_incomplete);
+    RUN_TEST(test_gossip_parse_query_range_too_short);
+
     printf("\n=== PR #17 Phase 4: Factory Entry/Exit ===\n");
     RUN_TEST(test_scid_encode_decode);
     RUN_TEST(test_scid_route_hint_format);
@@ -1338,6 +1434,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_onion_single_hop);
     RUN_TEST(test_onion_two_hops);
     RUN_TEST(test_onion_keysend);
+    RUN_TEST(test_onion_amp_tlv14_present);
+    RUN_TEST(test_onion_amp_no_tlv14_when_disabled);
 
     printf("\n=== HTLC Forwarding ===\n");
     RUN_TEST(test_htlc_forward_init);
@@ -1372,6 +1470,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_chan_open_build_accept_channel);
     RUN_TEST(test_chan_open_buffer_too_small);
 
+    printf("\n=== Phase 5: Dual-Fund Basics ===\n");
+    RUN_TEST(test_chan_open_v2_accept_built);
+    RUN_TEST(test_chan_open_v2_too_short);
+    RUN_TEST(test_chan_open_v2_routes);
+    RUN_TEST(test_ln_dispatch_routes_open_channel2);
+    RUN_TEST(test_ln_dispatch_open_channel2_too_short);
+    RUN_TEST(test_chan_open_v2_null_mgr);
+    RUN_TEST(test_chan_open_v2_with_ctx);
+    RUN_TEST(test_chan_open_v2_accept_type);
+
     printf("\n=== Payment State Machine ===\n");
     RUN_TEST(test_payment_init);
     RUN_TEST(test_payment_send_no_route);
@@ -1384,6 +1492,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_payment_timeout_ignores_recent);
     RUN_TEST(test_payment_timeout_ignores_non_inflight);
     RUN_TEST(test_payment_timeout_null_table);
+
+    printf("\n=== Phase 3: AMP Send Side ===\n");
+    RUN_TEST(test_payment_amp_produces_onion_tlv14);
+    RUN_TEST(test_payment_amp_set_id_consistent);
+    RUN_TEST(test_payment_amp_child_indices);
+    RUN_TEST(test_payment_amp_null_gs_fails);
+    RUN_TEST(test_payment_amp_fields_zero_default);
+    RUN_TEST(test_payment_amp_set_id_roundtrip);
+    RUN_TEST(test_payment_amp_zero_shards_fails);
+    RUN_TEST(test_payment_amp_hash_len);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);
@@ -1614,6 +1732,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_adaptor_round_trip);
     RUN_TEST(test_adaptor_pre_sig_invalid);
     RUN_TEST(test_adaptor_taproot);
+
+    printf("\n=== Phase 6: PTLC State Machine ===\n");
+    RUN_TEST(test_channel_add_ptlc);
+    RUN_TEST(test_channel_settle_ptlc);
+    RUN_TEST(test_channel_fail_ptlc);
+    RUN_TEST(test_channel_ptlc_multiple);
+    RUN_TEST(test_ptlc_commit_dispatch_presig);
+    RUN_TEST(test_ptlc_commit_dispatch_adapted);
+    RUN_TEST(test_ptlc_commit_dispatch_complete);
+    RUN_TEST(test_ptlc_commit_dispatch_null_ch);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_presig);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_adapted);
+    RUN_TEST(test_channel_ptlc_grow);
+    RUN_TEST(test_channel_fail_ptlc_not_found);
+    RUN_TEST(test_channel_settle_ptlc_not_found);
+    RUN_TEST(test_ln_dispatch_routes_ptlc_complete);
 
     printf("\n=== PTLC Key Turnover (Phase 8b) ===\n");
     RUN_TEST(test_ptlc_key_turnover);
@@ -2170,6 +2304,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_queue_drain_limit);
     RUN_TEST(test_queue_null_safety);
     RUN_TEST(test_queue_get);
+
+    printf("\n=== Phase 4: Async Signing Queue Dispatch ===\n");
+    RUN_TEST(test_queue_ln_dispatch_poll_null_persist);
+    RUN_TEST(test_queue_ln_dispatch_done_null_persist);
+    RUN_TEST(test_queue_dispatch_poll_type_returned);
+    RUN_TEST(test_queue_dispatch_done_type_returned);
+    RUN_TEST(test_ln_dispatch_routes_queue_poll);
+    RUN_TEST(test_ln_dispatch_routes_queue_done);
+    RUN_TEST(test_queue_ln_dispatch_done_empty);
+    RUN_TEST(test_queue_ln_dispatch_done_too_short);
 
     printf("\n=== Async Signing: Notification Dispatch ===\n");
     RUN_TEST(test_notify_log_init);

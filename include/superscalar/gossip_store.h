@@ -111,4 +111,20 @@ int gossip_store_prune_stale(gossip_store_t *gs, uint32_t now_unix);
 int gossip_store_mark_channel_spent(gossip_store_t *gs,
                                      uint64_t scid, uint32_t now_unix);
 
+/* Callback type for channel iteration */
+typedef void (*gossip_store_channel_cb_t)(uint64_t scid,
+    const unsigned char node1[33], const unsigned char node2[33],
+    void *userdata);
+
+/* Iterate channels matching a list of SCIDs. Calls cb for each found channel. */
+int gossip_store_get_channels_by_scids(gossip_store_t *gs,
+    const uint64_t *scids, int n_scids,
+    gossip_store_channel_cb_t cb, void *userdata);
+
+/* Iterate channels whose SCID block is in [first_blocknum, first_blocknum+num_blocks).
+   SCID block = scid >> 40. */
+int gossip_store_get_channels_in_range(gossip_store_t *gs,
+    uint32_t first_blocknum, uint32_t num_blocks,
+    gossip_store_channel_cb_t cb, void *userdata);
+
 #endif /* SUPERSCALAR_GOSSIP_STORE_H */

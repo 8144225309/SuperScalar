@@ -127,4 +127,23 @@ int payment_check_timeouts(payment_table_t *pt,
                             const unsigned char *our_priv,
                             uint32_t now);
 
+/*
+ * Send an AMP (Atomic Multi-Path) payment with n_shards independent shards.
+ * Each shard has an independent root_share derived from a random set_id.
+ * payment_hash: the aggregate hash for this AMP set (SHA256 of XOR of shares).
+ * Returns 1 on success (routes found and HTLCs sent), 0 on failure.
+ */
+int payment_send_amp(payment_table_t *pt,
+                      gossip_store_t *gs,
+                      htlc_forward_table_t *fwd,
+                      mpp_table_t *mpp,
+                      peer_mgr_t *pmgr,
+                      secp256k1_context *ctx,
+                      const unsigned char *our_privkey,
+                      const unsigned char *our_pubkey,
+                      const unsigned char dest_pubkey[33],
+                      uint64_t amount_msat,
+                      int n_shards,
+                      unsigned char payment_hash_out[32]);
+
 #endif /* SUPERSCALAR_PAYMENT_H */
