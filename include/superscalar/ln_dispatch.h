@@ -38,6 +38,11 @@ typedef struct {
     bolt11_invoice_table_t *invoices;      /* inbound invoice registry; NULL = no lookup */
     watchtower_t           *watchtower;    /* breach watcher; NULL = disabled */
     lsps2_pending_table_t  *jit_pending;   /* JIT intercept table; NULL = disabled */
+    /* Gap 3: callback invoked when JIT cost covered — open channel then relay HTLC */
+    void (*jit_open_cb)(void *cb_ctx, uint64_t scid,
+                        uint64_t out_amount_msat, size_t in_peer_idx,
+                        uint64_t in_htlc_id);
+    void                   *jit_cb_ctx;
 } ln_dispatch_t;
 
 /*

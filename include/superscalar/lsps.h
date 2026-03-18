@@ -120,6 +120,7 @@ int    lsps2_parse_buy(const cJSON *params,
  * Set client_trusts_lsp = 1 in lsps_ctx_t for immediate broadcast (testnet).
  * --------------------------------------------------------------------- */
 
+#define LSPS1_CONFIRM_TIMEOUT_BLOCKS 144 /* ~24 h of blocks: FAILED if confs not seen */
 #define LSPS2_HTLC_WAIT_SECS    5     /* LDK: LIQUIDITY_REQUEST_TIMEOUT */
 #define LSPS2_CLTV_DELTA       72     /* LDK: channel cltv expiry delta */
 #define LSPS2_PENDING_MAX      16     /* max concurrent JIT channels pending */
@@ -160,5 +161,8 @@ void lsps1_orders_tick_all(uint32_t current_height);
 /* Phase K: LSPS2 JIT pending lookup */
 lsps2_pending_t *lsps2_pending_lookup(lsps2_pending_table_t *tbl,
                                        uint64_t scid);
+
+/* Gap 2: expire HTLCs that have waited > LSPS2_HTLC_WAIT_SECS */
+void lsps2_pending_expire(lsps2_pending_table_t *tbl);
 
 #endif /* SUPERSCALAR_LSPS_H */

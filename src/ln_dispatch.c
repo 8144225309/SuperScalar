@@ -85,15 +85,21 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             &fwd_out);
 
 
-        /* Phase K: JIT intercept — check if outgoing SCID is a pending JIT channel */
+        /* Phase K / Gap 3: JIT intercept */
         if (result == FORWARD_RELAY && d->jit_pending) {
             lsps2_pending_t *jit = lsps2_pending_lookup(d->jit_pending,
                                                           fwd_out.next_hop_scid);
-            if (jit)
-                lsps2_handle_intercept_htlc(d->jit_pending,
-                                             fwd_out.next_hop_scid,
-                                             fwd_out.out_amount_msat,
-                                             NULL, NULL);
+            if (jit) {
+                int covered = lsps2_handle_intercept_htlc(d->jit_pending,
+                                                            fwd_out.next_hop_scid,
+                                                            fwd_out.out_amount_msat,
+                                                            NULL, NULL);
+                /* Gap 3: cost covered — open channel then relay */
+                if (covered == 1 && d->jit_open_cb)
+                    d->jit_open_cb(d->jit_cb_ctx, fwd_out.next_hop_scid,
+                                   fwd_out.out_amount_msat,
+                                   (size_t)peer_idx, htlc_id);
+            }
         }
         if (result == FORWARD_FINAL) {
             /* We are the final hop — claim invoice and send update_fulfill_htlc */
@@ -253,6 +259,8 @@ void ln_dispatch_run(ln_dispatch_t *d)
 
         struct timeval tv = { 0, 100000 };  /* 100 ms timeout */
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        /* Gap 2: expire stale JIT pending entries on each tick */
+        if (d->jit_pending) lsps2_pending_expire(d->jit_pending);
         if (sel <= 0) continue;
 
         for (int i = 0; i < d->pmgr->count && !*d->shutdown_flag; i++) {

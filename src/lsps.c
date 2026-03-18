@@ -357,6 +357,28 @@ int lsps1_order_tick(int order_id, uint32_t current_height)
         lsps1_order_entry_t *e = &s_orders[i];
         if (!e->active || e->order_id != order_id) continue;
         if (strcmp(e->state, "PENDING_FUNDING") != 0) return 0;
+
+        /* Gap 1: FAILED timeout — funding tx not confirmed within 144 blocks
+         * of being seen (tx dropped from mempool / RBF evicted). */
+        if (e->funded_at_height > 0 &&
+            current_height > e->funded_at_height + LSPS1_CONFIRM_TIMEOUT_BLOCKS) {
+            strncpy(e->state, "FAILED", sizeof(e->state) - 1);
+            e->state[sizeof(e->state) - 1] = '\0';
+            e->active = 0;
+            if (e->client_fd >= 0) {
+                cJSON *note = cJSON_CreateObject();
+                if (note) {
+                    char id_buf[16];
+                    snprintf(id_buf, sizeof(id_buf), "%d", order_id);
+                    cJSON_AddStringToObject(note, "order_id",  id_buf);
+                    cJSON_AddStringToObject(note, "new_state", "FAILED");
+                    wire_send(e->client_fd, MSG_LSPS_NOTIFY, note);
+                    cJSON_Delete(note);
+                }
+            }
+            return -1; /* signals FAILED */
+        }
+
         if (current_height < e->funded_at_height + e->confs) return 0;
 
         strncpy(e->state, "COMPLETED", sizeof(e->state) - 1);
@@ -398,4 +420,23 @@ lsps2_pending_t *lsps2_pending_lookup(lsps2_pending_table_t *tbl, uint64_t scid)
             return &tbl->entries[i];
     }
     return NULL;
+}
+
+/* -----------------------------------------------------------------------
+ * Gap 2: lsps2_pending_expire — evict HTLCs that have waited too long
+ * --------------------------------------------------------------------- */
+#include <time.h>
+
+void lsps2_pending_expire(lsps2_pending_table_t *tbl)
+{
+    if (!tbl) return;
+    uint32_t now = (uint32_t)time(NULL);
+    for (int i = 0; i < LSPS2_PENDING_MAX; i++) {
+        lsps2_pending_t *e = &tbl->entries[i];
+        if (!e->active) continue;
+        if (now >= e->created_at + LSPS2_HTLC_WAIT_SECS) {
+            e->active = 0;
+            tbl->count--;
+        }
+    }
 }

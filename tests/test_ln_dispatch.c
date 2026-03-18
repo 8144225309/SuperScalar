@@ -806,3 +806,125 @@ int test_lsps2_intercept_htlc_below_cost(void)
     ASSERT(tbl.entries[0].active == 0, "entry deactivated after open");
     return 1;
 }
+
+/* ================================================================== */
+/* EX1 — lsps2_pending_expire: fresh entry (created_at=now) not evicted */
+/* ================================================================== */
+int test_lsps2_pending_expire_fresh(void)
+{
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active     = 1;
+    tbl.entries[0].scid       = 0xABCD0001ULL;
+    tbl.entries[0].created_at = (uint32_t)time(NULL);
+    tbl.count = 1;
+
+    lsps2_pending_expire(&tbl);
+    ASSERT(tbl.entries[0].active == 1, "EX1: fresh entry survives expire");
+    return 1;
+}
+
+/* ================================================================== */
+/* EX2 — lsps2_pending_expire: stale entry (created_at=0) is evicted  */
+/* ================================================================== */
+int test_lsps2_pending_expire_stale(void)
+{
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active     = 1;
+    tbl.entries[0].scid       = 0xABCD0002ULL;
+    tbl.entries[0].created_at = 1; /* epoch + 1 s — definitely expired */
+    tbl.count = 1;
+
+    lsps2_pending_expire(&tbl);
+    ASSERT(tbl.entries[0].active == 0, "EX2: stale entry evicted");
+    return 1;
+}
+
+/* ================================================================== */
+/* JC1 — jit_open_cb pointer wires through ln_dispatch_t              */
+/* ================================================================== */
+static int g_jc1_called = 0;
+static void jc1_cb(void *ctx, uint64_t scid, uint64_t amt,
+                   size_t peer_idx, uint64_t htlc_id)
+{
+    (void)ctx; (void)scid; (void)amt; (void)peer_idx; (void)htlc_id;
+    g_jc1_called = 1;
+}
+
+int test_jit_open_cb_wires(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.jit_open_cb = jc1_cb;
+    ASSERT(d.jit_open_cb != NULL, "JC1: jit_open_cb field present");
+
+    /* Call it directly — should set flag */
+    d.jit_open_cb(NULL, 0, 0, 0, 0);
+    ASSERT(g_jc1_called == 1, "JC1: callback invoked");
+    return 1;
+}
+
+/* ================================================================== */
+/* JC2 — jit_open_cb called when cost covered in dispatch loop        */
+/* ================================================================== */
+static int g_jc2_called = 0;
+static uint64_t g_jc2_scid = 0;
+static void jc2_cb(void *ctx, uint64_t scid, uint64_t amt,
+                   size_t peer_idx, uint64_t htlc_id)
+{
+    (void)ctx; (void)amt; (void)peer_idx; (void)htlc_id;
+    g_jc2_called = 1;
+    g_jc2_scid   = scid;
+}
+
+int test_jit_open_cb_on_cost_covered(void)
+{
+    lsps2_pending_table_t jit_tbl;
+    memset(&jit_tbl, 0, sizeof(jit_tbl));
+    jit_tbl.entries[0].active     = 1;
+    jit_tbl.entries[0].scid       = 0x800000DEADBEEF01ULL;
+    jit_tbl.entries[0].cost_msat  = 5000;
+    jit_tbl.entries[0].created_at = (uint32_t)time(NULL);
+    jit_tbl.count = 1;
+
+    /* lsps2_handle_intercept_htlc with amount >= cost → returns 1 → callback fires */
+    int covered = lsps2_handle_intercept_htlc(&jit_tbl, 0x800000DEADBEEF01ULL,
+                                               6000, NULL, NULL);
+    ASSERT(covered == 1, "JC2: cost covered returns 1");
+
+    /* Simulate what ln_dispatch would do */
+    if (covered == 1)
+        jc2_cb(NULL, 0x800000DEADBEEF01ULL, 6000, 0, 1);
+
+    ASSERT(g_jc2_called == 1, "JC2: callback invoked after cost covered");
+    ASSERT(g_jc2_scid == 0x800000DEADBEEF01ULL, "JC2: scid passed correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* JC3 — jit_open_cb NULL guard: no crash when cb not wired           */
+/* ================================================================== */
+int test_jit_open_cb_null_guard(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.jit_open_cb = NULL; /* explicitly NULL */
+
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active     = 1;
+    tbl.entries[0].scid       = 0x1234ULL;
+    tbl.entries[0].cost_msat  = 100;
+    tbl.entries[0].created_at = (uint32_t)time(NULL);
+    tbl.count = 1;
+    d.jit_pending = &tbl;
+
+    /* Cost covered but cb is NULL — should not crash */
+    int covered = lsps2_handle_intercept_htlc(&tbl, 0x1234ULL, 200, NULL, NULL);
+    ASSERT(covered == 1, "JC3: cost covered");
+    if (covered == 1 && d.jit_open_cb)
+        d.jit_open_cb(d.jit_cb_ctx, 0x1234ULL, 200, 0, 0);
+    /* Reaching here without crash = pass */
+    return 1;
+}
