@@ -570,8 +570,9 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
     cJSON *params = cJSON_GetObjectItemCaseSensitive(req, "params");
 
     if (!cJSON_IsString(method)) {
+        size_t n = build_error(id, -32600, "Invalid Request", json_out, out_cap);
         cJSON_Delete(req);
-        return build_error(id, -32600, "Invalid Request", json_out, out_cap);
+        return n;
     }
     const char *m = method->valuestring;
 
@@ -606,8 +607,9 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
     } else {
+        size_t n = build_error(id, -32601, "Method not found", json_out, out_cap);
         cJSON_Delete(req);
-        return build_error(id, -32601, "Method not found", json_out, out_cap);
+        return n;
     }
 
     if (result) {
