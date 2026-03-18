@@ -19,6 +19,9 @@ typedef struct {
     uint32_t confs;
     char     state[16];
     int      active;
+    char     funding_txid_hex[65]; /* set when funded; empty until then */
+    int      client_fd;            /* fd for async notify; -1 = none */
+    uint32_t funded_at_height;     /* block height when funding seen */
 } lsps1_order_entry_t;
 
 static lsps1_order_entry_t s_orders[LSPS1_MAX_ORDERS];
@@ -107,6 +110,9 @@ int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
                 s_orders[slot].confs       = confs;
                 strncpy(s_orders[slot].state, "CREATED", sizeof(s_orders[slot].state) - 1);
                 s_orders[slot].active      = 1;
+                s_orders[slot].client_fd        = -1;
+                s_orders[slot].funded_at_height = 0;
+                s_orders[slot].funding_txid_hex[0] = '\0';
 
                 cJSON *result = cJSON_CreateObject();
                 if (!result) {
@@ -307,4 +313,89 @@ int lsps2_handle_intercept_htlc(lsps2_pending_table_t *tbl,
         return 0;
     }
     return 0;  /* scid not found */
+}
+
+/* -----------------------------------------------------------------------
+ * LSPS1 order state machine helpers (Phase J)
+ * --------------------------------------------------------------------- */
+
+int lsps1_order_fund(int order_id, const char *funding_txid_hex,
+                     uint32_t funded_at_height, int client_fd)
+{
+    for (int i = 0; i < LSPS1_MAX_ORDERS; i++) {
+        lsps1_order_entry_t *e = &s_orders[i];
+        if (!e->active || e->order_id != order_id) continue;
+        if (strcmp(e->state, "CREATED") != 0) return 0;
+
+        strncpy(e->state, "PENDING_FUNDING", sizeof(e->state) - 1);
+        e->state[sizeof(e->state) - 1] = '\0';
+        if (funding_txid_hex)
+            strncpy(e->funding_txid_hex, funding_txid_hex,
+                    sizeof(e->funding_txid_hex) - 1);
+        e->funded_at_height = funded_at_height;
+        e->client_fd        = client_fd;
+
+        if (client_fd >= 0) {
+            cJSON *note = cJSON_CreateObject();
+            if (note) {
+                char id_buf[16];
+                snprintf(id_buf, sizeof(id_buf), "%d", order_id);
+                cJSON_AddStringToObject(note, "order_id",  id_buf);
+                cJSON_AddStringToObject(note, "new_state", "PENDING_FUNDING");
+                wire_send(client_fd, MSG_LSPS_NOTIFY, note);
+                cJSON_Delete(note);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int lsps1_order_tick(int order_id, uint32_t current_height)
+{
+    for (int i = 0; i < LSPS1_MAX_ORDERS; i++) {
+        lsps1_order_entry_t *e = &s_orders[i];
+        if (!e->active || e->order_id != order_id) continue;
+        if (strcmp(e->state, "PENDING_FUNDING") != 0) return 0;
+        if (current_height < e->funded_at_height + e->confs) return 0;
+
+        strncpy(e->state, "COMPLETED", sizeof(e->state) - 1);
+        e->state[sizeof(e->state) - 1] = '\0';
+
+        if (e->client_fd >= 0) {
+            cJSON *note = cJSON_CreateObject();
+            if (note) {
+                char id_buf[16];
+                snprintf(id_buf, sizeof(id_buf), "%d", order_id);
+                cJSON_AddStringToObject(note, "order_id",  id_buf);
+                cJSON_AddStringToObject(note, "new_state", "COMPLETED");
+                wire_send(e->client_fd, MSG_LSPS_NOTIFY, note);
+                cJSON_Delete(note);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+void lsps1_orders_tick_all(uint32_t current_height)
+{
+    for (int i = 0; i < LSPS1_MAX_ORDERS; i++) {
+        if (s_orders[i].active)
+            lsps1_order_tick(s_orders[i].order_id, current_height);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * LSPS2 pending lookup (Phase K)
+ * --------------------------------------------------------------------- */
+
+lsps2_pending_t *lsps2_pending_lookup(lsps2_pending_table_t *tbl, uint64_t scid)
+{
+    if (!tbl) return NULL;
+    for (int i = 0; i < LSPS2_PENDING_MAX; i++) {
+        if (tbl->entries[i].active && tbl->entries[i].scid == scid)
+            return &tbl->entries[i];
+    }
+    return NULL;
 }

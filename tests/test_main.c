@@ -187,6 +187,19 @@ extern int test_mpp_timeout(void);
 extern int test_mpp_overpayment_guard(void);
 extern int test_mpp_table_full(void);
 
+/* Phase J: LSPS1 order state machine */
+extern int test_lsps1_order_fund_pending(void);
+extern int test_lsps1_order_tick_below_threshold(void);
+extern int test_lsps1_order_tick_completes(void);
+extern int test_lsps1_get_order_after_fund(void);
+extern int test_lsps1_completion_notify_json(void);
+
+/* Phase K: LSPS2 JIT pending lookup + dispatch intercept */
+extern int test_lsps2_pending_lookup_null(void);
+extern int test_lsps2_pending_lookup_found(void);
+extern int test_ln_dispatch_jit_pending_wired(void);
+extern int test_lsps2_intercept_htlc_below_cost(void);
+
 /* PR #19 Commit 5: LSPS2 deferred broadcast */
 extern int test_lsps2_deferred_no_immediate_channel(void);
 extern int test_lsps2_deferred_coverage_triggers_channel(void);
@@ -700,6 +713,12 @@ extern int test_watchtower_anchor_init(void);
 extern int test_regtest_cpfp_penalty_bump(void);
 extern int test_regtest_breach_penalty_cpfp(void);
 
+/* Phase L: CPFP non-breach registration */
+extern int test_watchtower_add_pending_tx(void);
+extern int test_watchtower_add_pending_tx_full(void);
+extern int test_watchtower_add_pending_bump_mechanics(void);
+extern int test_watchtower_add_pending_persists(void);
+
 /* CPFP Audit & Remediation */
 extern int test_cpfp_sign_complete_check(void);
 extern int test_cpfp_witness_offset_p2wpkh(void);
@@ -1154,6 +1173,19 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsps_null_ctx_returns_error);
     RUN_TEST(test_lsps_malformed_json_returns_zero);
     RUN_TEST(test_lsps1_get_order);
+
+    printf("\n=== Phase J: LSPS1 Order State Machine ===\n");
+    RUN_TEST(test_lsps1_order_fund_pending);
+    RUN_TEST(test_lsps1_order_tick_below_threshold);
+    RUN_TEST(test_lsps1_order_tick_completes);
+    RUN_TEST(test_lsps1_get_order_after_fund);
+    RUN_TEST(test_lsps1_completion_notify_json);
+
+    printf("\n=== Phase K: LSPS2 JIT Intercept ===\n");
+    RUN_TEST(test_lsps2_pending_lookup_null);
+    RUN_TEST(test_lsps2_pending_lookup_found);
+    RUN_TEST(test_ln_dispatch_jit_pending_wired);
+    RUN_TEST(test_lsps2_intercept_htlc_below_cost);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -1710,6 +1742,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cpfp_witness_offset_p2wpkh);
     RUN_TEST(test_cpfp_retry_bump);
     RUN_TEST(test_pending_persistence);
+
+    printf("\n=== Phase L: CPFP Non-Breach Registration ===\n");
+    RUN_TEST(test_watchtower_add_pending_tx);
+    RUN_TEST(test_watchtower_add_pending_tx_full);
+    RUN_TEST(test_watchtower_add_pending_bump_mechanics);
+    RUN_TEST(test_watchtower_add_pending_persists);
 
     printf("\n=== Continuous Ladder Daemon (Gap #3) ===\n");
     RUN_TEST(test_ladder_evict_expired);

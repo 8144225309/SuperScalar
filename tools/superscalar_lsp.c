@@ -81,6 +81,9 @@ static lsp_channel_mgr_t *g_channel_mgr = NULL;
 /* LSPS0 context for bolt8_server callback */
 static lsps_ctx_t  g_lsps_ctx;
 
+/* LSPS2 JIT pending channel intercept table */
+static lsps2_pending_table_t g_lsps2_pending;
+
 /* Watchtower: breach detection on every block */
 static watchtower_t g_watchtower;
 static int          g_watchtower_ready = 0;
@@ -175,6 +178,9 @@ static void on_block_connected(uint32_t height, void *cb_ctx)
                     (unsigned)height, i, at_risk);
         cltv_watchdog_expire(&wd, height);
     }
+
+    /* Phase J: advance LSPS1 order confirmations */
+    lsps1_orders_tick_all(height);
 
     /* Watchtower breach detection */
     if (g_watchtower_ready) {
@@ -2126,7 +2132,8 @@ int main(int argc, char *argv[]) {
                 watchtower_set_channel(&g_watchtower, _wi,
                                        &g_channel_mgr->entries[_wi].channel);
             g_watchtower_ready = 1;
-            g_ln_dispatch.watchtower = &g_watchtower;
+            g_ln_dispatch.watchtower  = &g_watchtower;
+    g_ln_dispatch.jit_pending = &g_lsps2_pending;
 
             pthread_t dispatch_tid;
             if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
@@ -3979,6 +3986,16 @@ int main(int argc, char *argv[]) {
 
             printf("\n=== FORCE CLOSE COMPLETE ===\n");
             printf("All %zu nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+            /* Phase L: register root node tx for CPFP monitoring */
+            if (g_watchtower_ready && lsp.factory.n_nodes > 0) {
+                char root_txid_hex[65];
+                unsigned char root_txid_rev[32];
+                memcpy(root_txid_rev, lsp.factory.nodes[0].txid, 32);
+                reverse_bytes(root_txid_rev, 32);
+                hex_encode(root_txid_rev, 32, root_txid_hex);
+                watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
+                                           1, WATCHTOWER_ANCHOR_AMOUNT);
+            }
 
             /* Skip cooperative close — factory already spent */
             report_add_string(&rpt, "result", "force_close_complete");
