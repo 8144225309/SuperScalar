@@ -200,6 +200,16 @@ extern int test_lsps2_pending_lookup_found(void);
 extern int test_ln_dispatch_jit_pending_wired(void);
 extern int test_lsps2_intercept_htlc_below_cost(void);
 
+/* Gap fixes: LSPS1 FAILED, LSPS2 expiry, JIT open callback */
+extern int test_lsps1_order_tick_fails(void);
+extern int test_lsps1_order_tick_already_failed(void);
+extern int test_lsps1_failed_notify_json(void);
+extern int test_lsps2_pending_expire_fresh(void);
+extern int test_lsps2_pending_expire_stale(void);
+extern int test_jit_open_cb_wires(void);
+extern int test_jit_open_cb_on_cost_covered(void);
+extern int test_jit_open_cb_null_guard(void);
+
 /* PR #19 Commit 5: LSPS2 deferred broadcast */
 extern int test_lsps2_deferred_no_immediate_channel(void);
 extern int test_lsps2_deferred_coverage_triggers_channel(void);
@@ -1186,6 +1196,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsps2_pending_lookup_found);
     RUN_TEST(test_ln_dispatch_jit_pending_wired);
     RUN_TEST(test_lsps2_intercept_htlc_below_cost);
+
+    printf("\n=== Gap Fixes: LSPS1 FAILED + LSPS2 Expiry + JIT Callback ===\n");
+    RUN_TEST(test_lsps1_order_tick_fails);
+    RUN_TEST(test_lsps1_order_tick_already_failed);
+    RUN_TEST(test_lsps1_failed_notify_json);
+    RUN_TEST(test_lsps2_pending_expire_fresh);
+    RUN_TEST(test_lsps2_pending_expire_stale);
+    RUN_TEST(test_jit_open_cb_wires);
+    RUN_TEST(test_jit_open_cb_on_cost_covered);
+    RUN_TEST(test_jit_open_cb_null_guard);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);

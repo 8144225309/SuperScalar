@@ -94,6 +94,25 @@ static void *ln_dispatch_thread(void *arg) {
     return NULL;
 }
 
+/* Gap 3: callback from ln_dispatch when JIT cost is covered.
+ * Opens a JIT channel for the client then relays the pending HTLC. */
+static void on_jit_open(void *cb_ctx, uint64_t scid,
+                         uint64_t out_amount_msat,
+                         size_t in_peer_idx, uint64_t in_htlc_id)
+{
+    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
+    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
+    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
+
+    /* Open the JIT channel (no-op if already open) */
+    if (!jit_channel_is_active(g_channel_mgr, client_idx))
+        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
+                            out_amount_msat * 2, "lsps2-jit");
+
+    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
+            client_idx, (unsigned long long)scid);
+}
+
 /* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
 static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
                            const char *json_req, char *resp_buf, size_t resp_cap)
@@ -2134,6 +2153,8 @@ int main(int argc, char *argv[]) {
             g_watchtower_ready = 1;
             g_ln_dispatch.watchtower  = &g_watchtower;
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
+    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_cb_ctx  = NULL;
 
             pthread_t dispatch_tid;
             if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
