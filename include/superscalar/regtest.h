@@ -105,11 +105,17 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
                                     int timeout_secs);
 
 /* Find a wallet UTXO suitable for CPFP bump funding.
+   Locks the selected UTXO via lockunspent so concurrent callers cannot
+   pick the same coin.  Call regtest_release_utxo() after broadcast.
    Returns 1 on success with UTXO details filled. */
 int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
                                 char *txid_out, uint32_t *vout_out,
                                 uint64_t *amount_out,
                                 unsigned char *spk_out, size_t *spk_len_out);
+
+/* Release a UTXO previously locked by regtest_get_utxo_for_bump.
+   Calls lockunspent true so the wallet can reuse the coin. */
+void regtest_release_utxo(regtest_t *rt, const char *txid_hex, uint32_t vout);
 
 /* Sign a raw tx using the wallet's keys. Returns signed hex (caller frees).
    prevtxs_json: JSON array of prevtx objects for non-wallet inputs, or NULL.

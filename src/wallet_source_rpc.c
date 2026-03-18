@@ -220,15 +220,26 @@ static int rpc_sign_input(wallet_source_t *self,
 }
 
 /* -----------------------------------------------------------------------
+ * release_utxo: unlock a UTXO previously locked by rpc_get_utxo.
+ * --------------------------------------------------------------------- */
+static void rpc_release_utxo(wallet_source_t *self,
+                              const char *txid_hex, uint32_t vout)
+{
+    wallet_source_rpc_t *ws = (wallet_source_rpc_t *)self;
+    regtest_release_utxo((regtest_t *)ws->rt, txid_hex, vout);
+}
+
+/* -----------------------------------------------------------------------
  * Public init
  * --------------------------------------------------------------------- */
 void wallet_source_rpc_init(wallet_source_rpc_t *ws, void *rt)
 {
     if (!ws) return;
     memset(ws, 0, sizeof(*ws));
-    ws->base.get_utxo      = rpc_get_utxo;
+    ws->base.get_utxo       = rpc_get_utxo;
     ws->base.get_change_spk = rpc_get_change_spk;
-    ws->base.sign_input    = rpc_sign_input;
-    ws->base.free          = NULL;
+    ws->base.sign_input     = rpc_sign_input;
+    ws->base.release_utxo   = rpc_release_utxo;
+    ws->base.free           = NULL;
     ws->rt = rt;
 }

@@ -53,6 +53,15 @@ struct wallet_source {
                       const unsigned char *spk, size_t spk_len,
                       uint64_t amount_sats);
 
+    /*
+     * Release a UTXO previously selected by get_utxo.  Implementations
+     * should call lockunspent true so the wallet can reuse the coin if the
+     * broadcast failed.  Called on every exit path after get_utxo succeeds,
+     * whether or not the broadcast succeeded.  May be NULL (e.g. HD wallet).
+     */
+    void (*release_utxo)(wallet_source_t *self,
+                         const char *txid_hex, uint32_t vout);
+
     /* Optional cleanup.  NULL if no heap allocs. */
     void (*free)(wallet_source_t *self);
 };
