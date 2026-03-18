@@ -45,6 +45,12 @@ All notable changes to SuperScalar are documented here.
 
 - **Test orchestrator reliability (`tools/test_orchestrator.py`)**: Four timing fixes for the full `--scenario all` suite: (1) added pre-suite `safe_pkill` before scenario 0 (previously only `idx > 0` received cleanup, leaving stale processes able to interfere with the first scenario); (2) removed non-existent `--watchtower` flag from `scenario_watchtower_late_arrival`; (3) increased regtest `factory_timeout` from 60s to 90s to handle heavier VPS load late in long runs; (4) increased inter-scenario sleep from 1s to 2s to give daemon-mode LSPs more time to release listen sockets.
 
+- **Test orchestrator `safe_pkill` port scoping (`tools/test_orchestrator.py`)**: `safe_pkill` matched processes by binary name alone, killing any `superscalar_lsp`/`superscalar_client` on the machine — including unrelated signet or testnet4 exhibition runs on different ports and networks. Added a `port` parameter; `safe_pkill` now reads `/proc/<pid>/cmdline` and skips processes whose command line does not contain `--port <port>`. All four call sites updated. Fixes #23.
+
+- **UTXO double-selection race in CPFP wallet (`src/regtest.c`, `src/wallet_source_rpc.c`, `src/watchtower.c`)**: `regtest_get_utxo_for_bump` selected a UTXO via `listunspent` but did not lock it, leaving a window where concurrent callers sharing a wallet (e.g. two LSP instances using the same faucet wallet) could select the same coin and have one `sendrawtransaction` fail with `txn-mempool-conflict`. Fixed by calling `lockunspent false` immediately after selection. Added `regtest_release_utxo` (`lockunspent true`) as the counterpart, called after broadcast. Added a `release_utxo` slot to the `wallet_source_t` vtable (NULL-safe; the RPC implementation fills it; the HD wallet leaves it NULL). Refactored `watchtower_build_cpfp_tx` to use a single `done:` cleanup label so `release_utxo` is guaranteed on every exit path, including all error returns.
+
+- **Docs: README scenario count and stale pass/fail counts**: Removed hardcoded `32/36` pass/fail counts from the tagline, feature table, and test section — counts go stale immediately and mislead readers. Fixed the orchestrator scenario count from 30 to 36 in two locations.
+
 
 ### Removed
 

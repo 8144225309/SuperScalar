@@ -1367,12 +1367,31 @@ int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
             }
         }
 
+        /* Lock the selected UTXO so concurrent callers don't pick the same
+         * coin.  Released by regtest_release_utxo() after broadcast. */
+        {
+            char lp[160];
+            snprintf(lp, sizeof(lp),
+                     "false [{\"txid\":\"%s\",\"vout\":%u}]",
+                     txid_out, *vout_out);
+            char *lr = regtest_exec(rt, "lockunspent", lp);
+            if (lr) free(lr);
+        }
+
         found = 1;
         break;
     }
 
     cJSON_Delete(json);
     return found;
+}
+
+void regtest_release_utxo(regtest_t *rt, const char *txid_hex, uint32_t vout) {
+    char params[160];
+    snprintf(params, sizeof(params),
+             "true [{\"txid\":\"%s\",\"vout\":%u}]", txid_hex, vout);
+    char *r = regtest_exec(rt, "lockunspent", params);
+    if (r) free(r);
 }
 
 int regtest_derive_p2tr_address(const regtest_t *rt,

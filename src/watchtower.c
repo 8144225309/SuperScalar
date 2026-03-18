@@ -787,12 +787,20 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
         return 0;
     }
 
-    /* Get a wallet UTXO to fund the CPFP child */
+    /* Declare all locals upfront so goto done: is safe on every exit path */
     char wallet_txid_hex[65];
-    uint32_t wallet_vout;
-    uint64_t wallet_amount;
+    uint32_t wallet_vout = 0;
+    uint64_t wallet_amount = 0;
     unsigned char wallet_spk[64];
     size_t wallet_spk_len = 0;
+    unsigned char anchor_txid[32], wallet_txid[32];
+    unsigned char change_spk[64];
+    size_t change_spk_len = 0;
+    uint64_t total_in, change_amount;
+    size_t signed_len;
+    tx_buf_t unsigned_tx = {0};   /* tx_buf_free(NULL data) is safe */
+    unsigned char *signed_buf = NULL;
+    int result = 0;
 
     uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 200;
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
@@ -801,32 +809,28 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                wallet_txid_hex, &wallet_vout,
                                &wallet_amount, wallet_spk, &wallet_spk_len)) {
         fprintf(stderr, "CPFP: no suitable wallet UTXO for bump\n");
-        return 0;
+        return 0;  /* UTXO not locked — plain return */
     }
 
+    /* UTXO is now locked; all subsequent exits must go through done: */
+
     /* Decode txid hex strings to internal byte order */
-    unsigned char anchor_txid[32], wallet_txid[32];
-    if (hex_decode(parent_txid, anchor_txid, 32) != 32)
-        return 0;
+    if (hex_decode(parent_txid, anchor_txid, 32) != 32) goto done;
     reverse_bytes(anchor_txid, 32);
-    if (hex_decode(wallet_txid_hex, wallet_txid, 32) != 32)
-        return 0;
+    if (hex_decode(wallet_txid_hex, wallet_txid, 32) != 32) goto done;
     reverse_bytes(wallet_txid, 32);
 
-    /* Change output: wallet amount + anchor amount - fee, sent to a new wallet address */
-    uint64_t total_in = wallet_amount + anchor_amount;
-    uint64_t change_amount = total_in > cpfp_fee ? total_in - cpfp_fee : 0;
-    if (change_amount == 0) return 0;
+    /* Change output: wallet amount + anchor amount - fee */
+    total_in = wallet_amount + anchor_amount;
+    change_amount = total_in > cpfp_fee ? total_in - cpfp_fee : 0;
+    if (change_amount == 0) goto done;
 
     /* Get change scriptPubKey from wallet */
-    unsigned char change_spk[64];
-    size_t change_spk_len = 0;
     if (!wt->wallet->get_change_spk(wt->wallet, change_spk, &change_spk_len))
-        return 0;
-    if (change_spk_len == 0) return 0;
+        goto done;
+    if (change_spk_len == 0) goto done;
 
     /* Build unsigned 2-input, 1-output tx (non-segwit serialization) */
-    tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
     tx_buf_write_u32_le(&unsigned_tx, 3);           /* nVersion=3 (TRUC): penalty tx is V3, so this
                                                        child can also be V3; enables package relay */
@@ -851,29 +855,29 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
 
     /* Sign input 1 (wallet UTXO) via the wallet_source vtable.
        Input 0 (P2A anchor) is anyone-can-spend — no signature needed. */
-    size_t signed_len = unsigned_tx.len + 512; /* room for witness data */
-    unsigned char *signed_buf = (unsigned char *)malloc(signed_len);
-    if (!signed_buf) {
-        tx_buf_free(&unsigned_tx);
-        return 0;
-    }
+    signed_len = unsigned_tx.len + 512; /* room for witness data */
+    signed_buf = (unsigned char *)malloc(signed_len);
+    if (!signed_buf) goto done;
     memcpy(signed_buf, unsigned_tx.data, unsigned_tx.len);
     signed_len = unsigned_tx.len;
-    tx_buf_free(&unsigned_tx);
+    tx_buf_free(&unsigned_tx);  /* done with unsigned form; safe to re-free at done: */
 
     if (!wt->wallet->sign_input(wt->wallet, signed_buf, &signed_len,
                                  1 /* input_idx */,
                                  wallet_spk, wallet_spk_len,
-                                 wallet_amount)) {
-        free(signed_buf);
-        return 0;
-    }
+                                 wallet_amount))
+        goto done;
 
     tx_buf_reset(cpfp_tx_out);
     tx_buf_write_bytes(cpfp_tx_out, signed_buf, signed_len);
-    free(signed_buf);
+    result = 1;
 
-    return 1;
+done:
+    free(signed_buf);
+    tx_buf_free(&unsigned_tx);  /* no-op if already freed or never init'd */
+    if (wt->wallet->release_utxo)
+        wt->wallet->release_utxo(wt->wallet, wallet_txid_hex, wallet_vout);
+    return result;
 }
 
 int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
