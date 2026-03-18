@@ -151,4 +151,14 @@ int lsps2_handle_intercept_htlc(lsps2_pending_table_t *tbl,
                                   uint64_t scid, uint64_t amount_msat,
                                   void *mgr, void *lsp);
 
+/* Phase J: LSPS1 order state machine helpers */
+int  lsps1_order_fund(int order_id, const char *funding_txid_hex,
+                      uint32_t funded_at_height, int client_fd);
+int  lsps1_order_tick(int order_id, uint32_t current_height);
+void lsps1_orders_tick_all(uint32_t current_height);
+
+/* Phase K: LSPS2 JIT pending lookup */
+lsps2_pending_t *lsps2_pending_lookup(lsps2_pending_table_t *tbl,
+                                       uint64_t scid);
+
 #endif /* SUPERSCALAR_LSPS_H */
