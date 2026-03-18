@@ -13,7 +13,7 @@ add_library(project_warnings INTERFACE)
 target_compile_options(project_warnings INTERFACE
     -Wall -Wextra -Werror
     -Wno-unused-result
-    -Wno-stringop-truncation
+    $<$<C_COMPILER_ID:GNU>:-Wno-stringop-truncation>
 )
 
 # --- Sanitizers (opt-in) ---
