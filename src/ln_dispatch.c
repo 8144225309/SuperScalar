@@ -39,6 +39,7 @@
 #define MSG_CHANNEL_REESTABLISH   136   /* 0x0088 */
 #define MSG_UPDATE_FAIL_MALFORMED 135   /* 0x0087 */
 #define MSG_INVOICE_REQUEST      0x8001 /* BOLT #12 direct wire */
+#define MSG_ERROR                  17   /* 0x0011: peer force-closing */
 
 static uint16_t rd16(const unsigned char *b)
 {
@@ -492,6 +493,21 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             }
         }
         return 39;
+    }
+    case MSG_ERROR: {
+        /* Peer is force-closing this channel (BOLT #2 §2.3.1).
+         * Register the channel for HTLC sweep monitoring via the watchtower.
+         * We use a zero txid — the commitment txid is unknown until chain confirmation;
+         * watchtower's CLTV-based sweep loop handles HTLCs without requiring a specific txid. */
+        if (d->watchtower && d->peer_channels && peer_idx >= 0) {
+            channel_t *fc_ch = d->peer_channels[peer_idx];
+            if (fc_ch) {
+                unsigned char zero_txid[32] = {0};
+                watchtower_watch_force_close(d->watchtower, (uint32_t)peer_idx,
+                                             zero_txid, NULL, 0);
+            }
+        }
+        return MSG_ERROR;
     }
     default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
