@@ -12,6 +12,7 @@
 #include "superscalar/htlc_commit.h"
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
+#include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include <string.h>
 #include <stdio.h>
@@ -83,6 +84,17 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             amount_msat, cltv,
             &fwd_out);
 
+
+        /* Phase K: JIT intercept — check if outgoing SCID is a pending JIT channel */
+        if (result == FORWARD_RELAY && d->jit_pending) {
+            lsps2_pending_t *jit = lsps2_pending_lookup(d->jit_pending,
+                                                          fwd_out.next_hop_scid);
+            if (jit)
+                lsps2_handle_intercept_htlc(d->jit_pending,
+                                             fwd_out.next_hop_scid,
+                                             fwd_out.out_amount_msat,
+                                             NULL, NULL);
+        }
         if (result == FORWARD_FINAL) {
             /* We are the final hop — claim invoice and send update_fulfill_htlc */
             const unsigned char *channel_id   = p;      /* p[0..31] */

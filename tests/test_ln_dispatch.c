@@ -709,3 +709,100 @@ int test_tor_parse_proxy_arg_basic(void)
     ASSERT(port == 9050, "port correct");
     return 1;
 }
+
+/* ================================================================== */
+/* JI1 — lsps2_pending_lookup: unknown SCID returns NULL             */
+/* ================================================================== */
+int test_lsps2_pending_lookup_null(void)
+{
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active = 1;
+    tbl.entries[0].scid   = 0x1111111111111111ULL;
+    tbl.count = 1;
+    ASSERT(lsps2_pending_lookup(&tbl, 0x2222222222222222ULL) == NULL,
+           "unknown SCID returns NULL");
+    ASSERT(lsps2_pending_lookup(NULL, 0x1111111111111111ULL) == NULL,
+           "NULL table returns NULL");
+    return 1;
+}
+
+/* ================================================================== */
+/* JI2 — lsps2_pending_lookup: matching SCID returns entry pointer   */
+/* ================================================================== */
+int test_lsps2_pending_lookup_found(void)
+{
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active    = 1;
+    tbl.entries[0].scid      = 0xDEADBEEF00000001ULL;
+    tbl.entries[0].cost_msat = 5000;
+    tbl.count = 1;
+
+    lsps2_pending_t *p = lsps2_pending_lookup(&tbl, 0xDEADBEEF00000001ULL);
+    ASSERT(p != NULL, "matching SCID returns non-NULL");
+    ASSERT(p->scid      == 0xDEADBEEF00000001ULL, "scid matches");
+    ASSERT(p->cost_msat == 5000, "cost_msat matches");
+    return 1;
+}
+
+/* ================================================================== */
+/* JI3 — ln_dispatch with jit_pending set: no crash on type-128      */
+/* ================================================================== */
+int test_ln_dispatch_jit_pending_wired(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx alloc");
+
+    htlc_forward_table_t fwd; htlc_forward_init(&fwd);
+    mpp_table_t          mpp; mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+
+    lsps2_pending_table_t jit_tbl;
+    memset(&jit_tbl, 0, sizeof(jit_tbl));
+    jit_tbl.entries[0].active    = 1;
+    jit_tbl.entries[0].scid      = 0xABCD000000000001ULL;
+    jit_tbl.entries[0].cost_msat = 9999999999ULL;
+    jit_tbl.count = 1;
+    d.jit_pending = &jit_tbl;
+
+    /* A zeroed onion → FORWARD_FAIL; no crash expected */
+    unsigned char buf[2048];
+    size_t len = build_update_add_htlc(buf, 99, 1000, 800100);
+    int rc = ln_dispatch_process_msg(&d, 0, buf, len);
+    ASSERT(rc == 128 || rc == -1, "type-128 with jit_pending wired: no crash");
+
+    /* Entry not modified since onion was invalid (no relay) */
+    ASSERT(jit_tbl.entries[0].collected_msat == 0, "no spurious collection");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* JI4 — lsps2_handle_intercept_htlc below cost: accumulates, no open*/
+/* ================================================================== */
+int test_lsps2_intercept_htlc_below_cost(void)
+{
+    lsps2_pending_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.entries[0].active    = 1;
+    tbl.entries[0].scid      = 0xCCCCCCCC00000001ULL;
+    tbl.entries[0].cost_msat = 10000;
+    tbl.count = 1;
+
+    /* 3000 msat — below 10000 cost */
+    int r = lsps2_handle_intercept_htlc(&tbl, 0xCCCCCCCC00000001ULL,
+                                          3000, NULL, NULL);
+    ASSERT(r == 0, "below cost returns 0");
+    ASSERT(tbl.entries[0].collected_msat == 3000, "3000 accumulated");
+    ASSERT(tbl.entries[0].active == 1, "entry still active");
+
+    /* Another 8000 → now >= 10000, channel-open triggered */
+    int r2 = lsps2_handle_intercept_htlc(&tbl, 0xCCCCCCCC00000001ULL,
+                                           8000, NULL, NULL);
+    ASSERT(r2 == 1, "cost covered returns 1");
+    ASSERT(tbl.entries[0].active == 0, "entry deactivated after open");
+    return 1;
+}
