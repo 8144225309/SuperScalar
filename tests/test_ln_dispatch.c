@@ -9,6 +9,7 @@
  */
 
 #include "superscalar/ln_dispatch.h"
+#include "superscalar/chan_close.h"
 #include "superscalar/htlc_forward.h"
 #include "superscalar/invoice.h"
 #include "superscalar/mpp.h"
@@ -1020,5 +1021,334 @@ int test_ln_dispatch_flush_relay_empty(void)
 
     int r = ln_dispatch_flush_relay(&d);
     ASSERT(r == 0, "LD5: empty fwd returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC1 — shutdown (type 38) dispatched                                 */
+/* ================================================================== */
+int test_ln_dispatch_routes_shutdown(void)
+{
+    /* type(2) + channel_id(32) + spk_len(2) + spk(2) = 38 bytes */
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 38;
+    msg[34] = 0; msg[35] = 2;
+    msg[36] = 0x51; msg[37] = 0x01;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 38, "CC1: shutdown routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC2 — closing_signed (type 39) dispatched                           */
+/* ================================================================== */
+int test_ln_dispatch_routes_closing_signed(void)
+{
+    /* type(2) + channel_id(32) + fee(8) + sig(64) = 106 bytes */
+    unsigned char msg[106];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 39;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 39, "CC2: closing_signed routes correctly");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC3 — shutdown advances close_state (RECV_SHUTDOWN set)            */
+/* ================================================================== */
+int test_ln_dispatch_shutdown_state_recv(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    channel_t *chp = &ch;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.pmgr = &pmgr;
+    d.peer_channels = &chp;
+
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 38;
+    msg[34] = 0; msg[35] = 2;
+    msg[36] = 0x51; msg[37] = 0x01;
+    ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(ch.close_state & 2, "CC3: RECV_SHUTDOWN set");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC4 — fee negotiation: midpoint convergence                         */
+/* ================================================================== */
+int test_ln_dispatch_close_fee_converge(void)
+{
+    uint64_t our = 1000, their = 2000;
+    uint64_t mid = chan_close_negotiate_fee(our, their);
+    ASSERT(mid == 1500, "CC4: midpoint");
+    our = their;
+    mid = chan_close_negotiate_fee(our, their);
+    ASSERT(mid == their, "CC4: equal converges");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC5 — shutdown too short returns -1                                 */
+/* ================================================================== */
+int test_ln_dispatch_shutdown_too_short(void)
+{
+    unsigned char msg[10] = {0, 38, 0};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == -1, "CC5: too short returns -1");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC6 — closing_signed too short returns -1                           */
+/* ================================================================== */
+int test_ln_dispatch_closing_signed_too_short(void)
+{
+    unsigned char msg[10] = {0, 39, 0};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == -1, "CC6: too short returns -1");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC7 — closing_signed with matching fees => state=5 (DONE)          */
+/* ================================================================== */
+int test_ln_dispatch_close_fee_agree(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.close_state = 3;
+    ch.close_our_fee_sat = 1000;
+    channel_t *chp = &ch;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.pmgr = &pmgr;
+    d.peer_channels = &chp;
+
+    unsigned char msg[106];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 39;
+    /* fee = 1000 at offset 34..41 big-endian: 0x00000000000003e8 */
+    msg[40] = 0x03; msg[41] = 0xe8;
+    ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(ch.close_state == 5, "CC7: fees agreed, state=5");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC8 — shutdown mirrors: sets both sent and recv bits                */
+/* ================================================================== */
+int test_ln_dispatch_shutdown_mirrors(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.close_state = 0;
+    channel_t *chp = &ch;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.pmgr = &pmgr;
+    d.peer_channels = &chp;
+
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 38;
+    msg[34] = 0; msg[35] = 2;
+    msg[36] = 0x51; msg[37] = 0x01;
+    ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT((ch.close_state & 3) == 3, "CC8: both bits set after mirror");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC9 — no crash when peer_channels is NULL during shutdown          */
+/* ================================================================== */
+int test_ln_dispatch_shutdown_no_channels(void)
+{
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 38;
+    msg[34] = 0; msg[35] = 2;
+    msg[36] = 0x51; msg[37] = 0x01;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 38, "CC9: no crash with NULL peer_channels");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC10 — fee midpoint: 500 and 1500 gives 1000                       */
+/* ================================================================== */
+int test_ln_dispatch_close_fee_midpoint(void)
+{
+    uint64_t counter = chan_close_negotiate_fee(500, 1500);
+    ASSERT(counter == 1000, "CC10: midpoint is 1000");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC11 — closing_signed negotiating: state=4 after counter proposed  */
+/* ================================================================== */
+int test_ln_dispatch_close_negotiating_state(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.close_state = 3;
+    ch.close_our_fee_sat = 500;
+    channel_t *chp = &ch;
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.pmgr = &pmgr;
+    d.peer_channels = &chp;
+
+    unsigned char msg[106];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 39;
+    /* their_fee = 2000 = 0x7d0 at offset 34..41 */
+    msg[40] = 0x07; msg[41] = 0xd0;
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 39, "CC11: returns 39");
+    ASSERT(ch.close_state == 4, "CC11: negotiating state=4");
+    return 1;
+}
+
+/* ================================================================== */
+/* CC12 — fee convergence: midpoint always moves toward their_fee     */
+/* ================================================================== */
+int test_ln_dispatch_close_fee_large_gap(void)
+{
+    /* The negotiate_fee returns (our+their)/2, which monotonically
+       moves our fee toward their fee. Test that each step reduces the gap. */
+    uint64_t our = 500, their = 1000;
+    uint64_t prev_gap = their - our;
+    for (int i = 0; i < 10; i++) {
+        uint64_t counter = chan_close_negotiate_fee(our, their);
+        if (counter == their) break; /* converged */
+        ASSERT(counter >= our, "CC12: counter moves toward their_fee");
+        uint64_t new_gap = their - counter;
+        ASSERT(new_gap <= prev_gap, "CC12: gap shrinks or stays same");
+        prev_gap = new_gap;
+        our = counter;
+    }
+    /* Test equal values converge immediately */
+    uint64_t result = chan_close_negotiate_fee(750, 750);
+    ASSERT(result == 750, "CC12: equal values converge immediately");
+    return 1;
+}
+
+/* ================================================================== */
+/* QLD1 — routes type 0x6D (queue poll)                               */
+/* ================================================================== */
+int test_ln_dispatch_routes_queue_poll(void)
+{
+    unsigned char msg[4] = {0x00, 0x6D, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6D, "QLD1: type 0x6D dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* QLD2 — routes type 0x6F (queue done)                               */
+/* ================================================================== */
+int test_ln_dispatch_routes_queue_done(void)
+{
+    unsigned char msg[4] = {0x00, 0x6F, 0x00, 0x00};
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x6F, "QLD2: type 0x6F dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* DF-LD1 — dispatch type 78 (open_channel2)                          */
+/* ================================================================== */
+int test_ln_dispatch_routes_open_channel2(void)
+{
+    unsigned char msg[350];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4E; /* type 78 */
+    /* Fill minimal valid sizes */
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 78, "DF-LD1: type 78 dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* DF-LD2 — open_channel2 too short routes to PTLC path (returns 78) */
+/* ================================================================== */
+int test_ln_dispatch_open_channel2_too_short(void)
+{
+    /* A short type-78 message is treated as PTLC_COMPLETE (same wire type 0x4E)
+       and returns 78 (not -1) since the combined case handles both */
+    unsigned char msg[10];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4E; /* type 78 = 0x4E */
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 78, "DF-LD2: short type-78 returns 78 (PTLC path)");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC-LD1 — dispatch type 0x4C (PTLC_PRESIG)                       */
+/* ================================================================== */
+int test_ln_dispatch_routes_ptlc_presig(void)
+{
+    unsigned char msg[74]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4C;
+    ln_dispatch_t d; memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x4C, "PTLC-LD1: type 0x4C dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC-LD2 — dispatch type 0x4D (PTLC_ADAPTED_SIG)                  */
+/* ================================================================== */
+int test_ln_dispatch_routes_ptlc_adapted(void)
+{
+    unsigned char msg[74]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4D;
+    ln_dispatch_t d; memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 0x4D, "PTLC-LD2: type 0x4D dispatched");
+    return 1;
+}
+
+/* ================================================================== */
+/* PTLC-LD3 — type 0x4E with short msg returns 78 (PTLC path)        */
+/* ================================================================== */
+int test_ln_dispatch_routes_ptlc_complete(void)
+{
+    unsigned char msg[10]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x00; msg[1] = 0x4E;
+    ln_dispatch_t d; memset(&d, 0, sizeof(d));
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 78, "PTLC-LD3: type 0x4E short msg -> 78");
     return 1;
 }

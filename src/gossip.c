@@ -439,3 +439,108 @@ int gossip_validate_channel_announcement(secp256k1_context *ctx,
 
     return 1;
 }
+
+/* ---- BOLT #7 Gossip Query Message Parsing/Building ---- */
+
+/* query_short_channel_ids (261):
+   type(2) + chain_hash(32) + encoded_len(2) + encoding_type(1=0x00) + scids[N*8] */
+int gossip_parse_query_scids(const unsigned char *msg, size_t msg_len,
+                              const unsigned char chain_hash[32],
+                              uint64_t *scids_out, int scids_cap)
+{
+    (void)chain_hash; /* optional chain_hash validation */
+    if (!msg || msg_len < 37) return -1;
+    /* type bytes at [0..1], chain_hash at [2..33], encoded_len at [34..35] */
+    size_t off = 2; /* skip type */
+    off += 32;      /* skip chain_hash */
+    if (off + 2 > msg_len) return -1;
+    uint16_t enc_len = ((uint16_t)msg[off] << 8) | msg[off+1]; off += 2;
+    if (off + enc_len > msg_len) return -1;
+    if (enc_len < 1) return 0;
+    /* encoding_type */
+    if (msg[off] != 0x00) return -1; /* only uncompressed supported */
+    off += 1;
+    int n = 0;
+    while (off + 8 <= msg_len && off < (size_t)(2 + 32 + 2 + enc_len) && n < scids_cap) {
+        uint64_t scid = 0;
+        for (int b = 0; b < 8; b++) scid = (scid << 8) | msg[off++];
+        if (scids_out) scids_out[n] = scid;
+        n++;
+    }
+    return n;
+}
+
+/* reply_short_channel_ids_end (262):
+   type(2) + chain_hash(32) + complete(1) = 35 bytes */
+size_t gossip_build_reply_scids_end(unsigned char *out, size_t out_cap,
+                                     const unsigned char chain_hash[32],
+                                     int complete)
+{
+    if (!out || out_cap < 35) return 0;
+    out[0] = 0x01; out[1] = 0x06; /* type 262 */
+    if (chain_hash)
+        memcpy(out + 2, chain_hash, 32);
+    else
+        memset(out + 2, 0, 32);
+    out[34] = complete ? 1 : 0;
+    return 35;
+}
+
+/* query_channel_range (263):
+   type(2) + chain_hash(32) + first_blocknum(4) + number_of_blocks(4) = 42 bytes */
+int gossip_parse_query_range(const unsigned char *msg, size_t msg_len,
+                              unsigned char chain_hash_out[32],
+                              uint32_t *first_blocknum, uint32_t *num_blocks)
+{
+    if (!msg || msg_len < 42) return 0;
+    if (chain_hash_out) memcpy(chain_hash_out, msg + 2, 32);
+    if (first_blocknum)
+        *first_blocknum = ((uint32_t)msg[34] << 24) | ((uint32_t)msg[35] << 16)
+                        | ((uint32_t)msg[36] << 8) | msg[37];
+    if (num_blocks)
+        *num_blocks = ((uint32_t)msg[38] << 24) | ((uint32_t)msg[39] << 16)
+                    | ((uint32_t)msg[40] << 8) | msg[41];
+    return 1;
+}
+
+/* reply_channel_range (264):
+   type(2) + chain_hash(32) + first_blocknum(4) + num_blocks(4) + complete(1)
+   + encoded_len(2) + encoding_type(1) + scids[N*8] */
+size_t gossip_build_reply_range(unsigned char *out, size_t out_cap,
+                                 const unsigned char chain_hash[32],
+                                 uint32_t first_blocknum, uint32_t num_blocks,
+                                 const uint64_t *scids, int n_scids,
+                                 int complete)
+{
+    size_t needed = 2 + 32 + 4 + 4 + 1 + 2 + 1 + (size_t)n_scids * 8;
+    if (!out || out_cap < needed) return 0;
+    out[0] = 0x01; out[1] = 0x08; /* type 264 */
+    if (chain_hash)
+        memcpy(out + 2, chain_hash, 32);
+    else
+        memset(out + 2, 0, 32);
+    /* first_blocknum */
+    out[34] = (first_blocknum >> 24) & 0xFF;
+    out[35] = (first_blocknum >> 16) & 0xFF;
+    out[36] = (first_blocknum >>  8) & 0xFF;
+    out[37] =  first_blocknum        & 0xFF;
+    /* num_blocks */
+    out[38] = (num_blocks >> 24) & 0xFF;
+    out[39] = (num_blocks >> 16) & 0xFF;
+    out[40] = (num_blocks >>  8) & 0xFF;
+    out[41] =  num_blocks        & 0xFF;
+    /* complete */
+    out[42] = complete ? 1 : 0;
+    /* encoded_len = 1 + n_scids*8 */
+    uint16_t enc_len = (uint16_t)(1 + n_scids * 8);
+    out[43] = (enc_len >> 8) & 0xFF;
+    out[44] = enc_len & 0xFF;
+    /* encoding_type = 0x00 (uncompressed) */
+    out[45] = 0x00;
+    size_t off = 46;
+    for (int i = 0; i < n_scids && scids; i++) {
+        uint64_t s = scids[i];
+        for (int b = 7; b >= 0; b--) out[off++] = (s >> (b*8)) & 0xFF;
+    }
+    return off;
+}

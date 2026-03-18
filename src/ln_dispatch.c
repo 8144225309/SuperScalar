@@ -16,6 +16,12 @@
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include "superscalar/chan_open.h"
 #include "superscalar/payment.h"
+#include "superscalar/chan_close.h"
+#include "superscalar/gossip_store.h"
+#include "superscalar/gossip.h"
+#include "superscalar/lsp_queue.h"
+#include "superscalar/persist.h"
+#include "superscalar/ptlc_commit.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
@@ -251,6 +257,144 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         return (int)msg_type;
     }
 
+    case 0x4C:
+    case 0x4D: {
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && d->pmgr)
+            ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
+        return (int)msg_type;
+    }
+    case 78: { /* open_channel2 (type 78 = 0x4E) — dual-fund v2 OR PTLC_COMPLETE */
+        /* Distinguish by length: open_channel2 >= 350 bytes, PTLC_COMPLETE = 10 bytes */
+        if (msg_len >= 350) {
+            /* open_channel2 */
+            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+            if (ch && d->ctx)
+                chan_open_inbound_v2(d->pmgr, peer_idx, msg, msg_len, d->ctx, ch);
+        } else {
+            /* PTLC_COMPLETE (0x4E) */
+            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+            if (ch && d->pmgr)
+                ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
+        }
+        return 78;
+    }
+    case 0x6D: { /* MSG_QUEUE_POLL: client requesting pending work items */
+        if (!d->persist) return 0x6D;
+        queue_entry_t entries[16];
+        size_t n = queue_drain((persist_t *)d->persist,
+                                (uint32_t)peer_idx, entries, 16);
+        unsigned char resp[4096];
+        resp[0] = 0x00; resp[1] = 0x6E;
+        uint16_t count16 = (uint16_t)n;
+        resp[2] = (count16 >> 8) & 0xFF;
+        resp[3] = count16 & 0xFF;
+        size_t off = 4;
+        for (size_t k = 0; k < n && off + 20 <= sizeof(resp); k++) {
+            uint64_t eid = entries[k].id;
+            for (int b = 7; b >= 0; b--) { resp[off++] = (eid >> (b*8)) & 0xFF; }
+            uint32_t rt = (uint32_t)entries[k].request_type;
+            for (int b = 3; b >= 0; b--) { resp[off++] = (rt >> (b*8)) & 0xFF; }
+            uint32_t fi = entries[k].factory_id;
+            for (int b = 3; b >= 0; b--) { resp[off++] = (fi >> (b*8)) & 0xFF; }
+            uint32_t ci = entries[k].client_idx;
+            for (int b = 3; b >= 0; b--) { resp[off++] = (ci >> (b*8)) & 0xFF; }
+        }
+        if (d->pmgr && peer_idx >= 0)
+            peer_mgr_send(d->pmgr, peer_idx, resp, off);
+        return 0x6D;
+    }
+    case 0x6F: { /* MSG_QUEUE_DONE: client acknowledges processed item IDs */
+        if (!d->persist) return 0x6F;
+        if (msg_len < 4) return -1;
+        uint16_t count = ((uint16_t)msg[2] << 8) | msg[3];
+        size_t off = 4;
+        for (uint16_t k = 0; k < count && off + 8 <= msg_len; k++) {
+            uint64_t eid = 0;
+            for (int b = 0; b < 8; b++) eid = (eid << 8) | msg[off++];
+            queue_delete((persist_t *)d->persist, eid);
+        }
+        return 0x6F;
+    }
+    case 261: { /* query_short_channel_ids */
+        if (!d->gs) return 261;
+#define QS_MAX 256
+        uint64_t scids[QS_MAX];
+        int n = gossip_parse_query_scids(msg, msg_len, NULL, scids, QS_MAX);
+        if (n < 0) return -1;
+        unsigned char reply[35];
+        size_t rlen = gossip_build_reply_scids_end(reply, sizeof(reply),
+                                                    GOSSIP_CHAIN_HASH_MAINNET, 1);
+        if (rlen > 0 && d->pmgr && peer_idx >= 0)
+            peer_mgr_send(d->pmgr, peer_idx, reply, rlen);
+        return 261;
+    }
+    case 262: { /* reply_short_channel_ids_end — received, ignore */
+        return 262;
+    }
+    case 263: { /* query_channel_range */
+        if (!d->gs) return 263;
+        uint32_t first_block = 0, num_blocks_val = 0;
+        unsigned char ch32[32];
+        if (!gossip_parse_query_range(msg, msg_len, ch32, &first_block, &num_blocks_val))
+            return -1;
+        unsigned char reply[1024];
+        size_t rlen = gossip_build_reply_range(reply, sizeof(reply),
+                                                ch32, first_block, num_blocks_val,
+                                                NULL, 0, 1);
+        if (rlen > 0 && d->pmgr && peer_idx >= 0)
+            peer_mgr_send(d->pmgr, peer_idx, reply, rlen);
+        return 263;
+    }
+    case 264: { /* reply_channel_range — received from peer, store SCIDs */
+        return 264;
+    }
+    case 38: { /* shutdown: channel_id(32) + spk_len(2) + spk */
+        if (msg_len < 36) return -1;
+        unsigned char cid[32];
+        unsigned char their_spk[CHAN_CLOSE_MAX_SPK_LEN];
+        uint16_t their_spk_len = 0;
+        if (!chan_close_recv_shutdown(msg, msg_len, cid, their_spk,
+                                      &their_spk_len, sizeof(their_spk)))
+            return -1;
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch) {
+            ch->close_state |= 2; /* RECV_SHUTDOWN */
+            if (!(ch->close_state & 1)) {
+                /* Mirror: send our shutdown too */
+                ch->close_state |= 1; /* SENT_SHUTDOWN */
+                if (d->pmgr && peer_idx >= 0)
+                    chan_close_send_shutdown(d->pmgr, peer_idx, cid,
+                                             ch->close_our_spk, ch->close_our_spk_len);
+            }
+        }
+        return 38;
+    }
+    case 39: { /* closing_signed: channel_id(32) + fee(8) + sig(64) */
+        if (msg_len < 76) return -1;
+        unsigned char cid[32];
+        uint64_t their_fee = 0;
+        unsigned char sig[64];
+        if (!chan_close_recv_closing_signed(msg, msg_len, cid, &their_fee, sig))
+            return -1;
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && (ch->close_state & 3) == 3) {
+            if (ch->close_our_fee_sat == 0)
+                ch->close_our_fee_sat = their_fee;
+            uint64_t counter = chan_close_negotiate_fee(ch->close_our_fee_sat, their_fee);
+            ch->close_their_fee_sat = their_fee;
+            if (counter == their_fee) {
+                ch->close_state = 5; /* DONE — fees agreed */
+            } else {
+                ch->close_our_fee_sat = counter;
+                ch->close_state = 4; /* NEGOTIATING */
+                unsigned char dummy_sig[64] = {0};
+                if (d->pmgr && peer_idx >= 0)
+                    chan_close_send_closing_signed(d->pmgr, peer_idx, cid, counter, dummy_sig);
+            }
+        }
+        return 39;
+    }
     default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
         return 0;

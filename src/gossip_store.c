@@ -385,3 +385,66 @@ int gossip_store_mark_channel_spent(gossip_store_t *gs,
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 1 : 0;
 }
+
+int gossip_store_get_channels_by_scids(gossip_store_t *gs,
+    const uint64_t *scids, int n_scids,
+    gossip_store_channel_cb_t cb, void *userdata)
+{
+    if (!gs || !gs->db || !scids || n_scids <= 0 || !cb) return 0;
+    int found = 0;
+    for (int i = 0; i < n_scids; i++) {
+        unsigned char n1[33], n2[33];
+        uint64_t cap; uint32_t lu;
+        if (gossip_store_get_channel(gs, scids[i], n1, n2, &cap, &lu)) {
+            cb(scids[i], n1, n2, userdata);
+            found++;
+        }
+    }
+    return found;
+}
+
+int gossip_store_get_channels_in_range(gossip_store_t *gs,
+    uint32_t first_blocknum, uint32_t num_blocks,
+    gossip_store_channel_cb_t cb, void *userdata)
+{
+    if (!gs || !gs->db || !cb) return 0;
+    sqlite3_stmt *stmt;
+    /* SCID block number = (scid >> 40) */
+    int rc = sqlite3_prepare_v2(gs->db,
+        "SELECT scid, node1_hex, node2_hex FROM gossip_channels"
+        " WHERE ((scid >> 40) >= ? AND (scid >> 40) < ?) AND pruned_at = 0;",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)first_blocknum);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)((uint64_t)first_blocknum + num_blocks));
+    int found = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t scid = (uint64_t)sqlite3_column_int64(stmt, 0);
+        unsigned char n1[33], n2[33];
+        const char *h1 = (const char *)sqlite3_column_text(stmt, 1);
+        const char *h2 = (const char *)sqlite3_column_text(stmt, 2);
+        /* decode hex to bytes using inline helper */
+        if (h1) {
+            for (int j = 0; j < 33 && h1[j*2] && h1[j*2+1]; j++) {
+                unsigned char hi = (unsigned char)h1[j*2];
+                unsigned char lo = (unsigned char)h1[j*2+1];
+                hi = (hi >= 'a') ? hi-'a'+10 : (hi >= 'A') ? hi-'A'+10 : hi-'0';
+                lo = (lo >= 'a') ? lo-'a'+10 : (lo >= 'A') ? lo-'A'+10 : lo-'0';
+                n1[j] = (hi << 4) | lo;
+            }
+        }
+        if (h2) {
+            for (int j = 0; j < 33 && h2[j*2] && h2[j*2+1]; j++) {
+                unsigned char hi = (unsigned char)h2[j*2];
+                unsigned char lo = (unsigned char)h2[j*2+1];
+                hi = (hi >= 'a') ? hi-'a'+10 : (hi >= 'A') ? hi-'A'+10 : hi-'0';
+                lo = (lo >= 'a') ? lo-'a'+10 : (lo >= 'A') ? lo-'A'+10 : lo-'0';
+                n2[j] = (hi << 4) | lo;
+            }
+        }
+        cb(scid, n1, n2, userdata);
+        found++;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}

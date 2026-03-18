@@ -30,6 +30,11 @@ typedef struct {
     /* Keysend: preimage embedded in TLV type 5482373484 */
     unsigned char keysend_preimage[32];
     int           has_keysend;
+    /* AMP (Atomic Multi-Path) fields — TLV type 14 per BOLT draft */
+    unsigned char amp_root_share[32]; /* per-shard secret share */
+    unsigned char amp_set_id[32];     /* identifies the AMP set */
+    uint8_t       amp_child_index;    /* shard index 0..N-1 */
+    int           has_amp;
 } onion_hop_t;
 
 /*

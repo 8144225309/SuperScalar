@@ -120,6 +120,16 @@ static size_t build_hop_payload(const onion_hop_t *hop,
             if (pos + 32 > buf_cap) return 0;
             memcpy(buf + pos, hop->keysend_preimage, 32); pos += 32;
         }
+        /* AMP TLV type 14: set_id(32) + child_index(1) + share(32) = 65 bytes */
+        if (hop->has_amp) {
+            if (pos + 2 + 65 <= buf_cap) {
+                buf[pos++] = 14;    /* type */
+                buf[pos++] = 65;    /* length */
+                memcpy(buf + pos, hop->amp_set_id, 32); pos += 32;
+                buf[pos++] = hop->amp_child_index;
+                memcpy(buf + pos, hop->amp_root_share, 32); pos += 32;
+            }
+        }
     }
 
     return pos;

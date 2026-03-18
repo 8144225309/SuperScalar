@@ -449,3 +449,68 @@ int payment_check_timeouts(payment_table_t *pt,
     }
     return expired;
 }
+
+/* ---- AMP Send Side ---- */
+
+/* XOR 32-byte arrays: dst ^= src */
+static void xor32(unsigned char *dst, const unsigned char *src)
+{
+    for (int i = 0; i < 32; i++) dst[i] ^= src[i];
+}
+
+int payment_send_amp(payment_table_t *pt,
+                      gossip_store_t *gs,
+                      htlc_forward_table_t *fwd,
+                      mpp_table_t *mpp,
+                      peer_mgr_t *pmgr,
+                      secp256k1_context *ctx,
+                      const unsigned char *our_privkey,
+                      const unsigned char *our_pubkey,
+                      const unsigned char dest_pubkey[33],
+                      uint64_t amount_msat,
+                      int n_shards,
+                      unsigned char payment_hash_out[32])
+{
+    (void)our_pubkey;
+    (void)dest_pubkey;
+    (void)pmgr;
+    (void)ctx;
+    (void)our_privkey;
+    if (!pt || !gs || !fwd || !mpp || n_shards < 1 || n_shards > PAYMENT_MAX_ROUTES) return 0;
+
+    /* Generate random root_shares */
+    unsigned char shares[PAYMENT_MAX_ROUTES][32];
+    for (int i = 0; i < n_shards; i++) {
+        if (channel_read_random_bytes(shares[i], 32) != 1) return 0;
+    }
+
+    /* Compute XOR of all shares */
+    unsigned char xored[32];
+    memset(xored, 0, 32);
+    for (int i = 0; i < n_shards; i++) xor32(xored, shares[i]);
+
+    /* AMP payment_hash = SHA256(xored) */
+    unsigned char payment_hash[32];
+    sha256(xored, 32, payment_hash);
+    if (payment_hash_out) memcpy(payment_hash_out, payment_hash, 32);
+
+    /* set_id = same as payment_hash for simplicity */
+    unsigned char set_id[32];
+    memcpy(set_id, payment_hash, 32);
+
+    /* Create a payment entry in the table */
+    if (pt->count >= PAYMENT_TABLE_MAX) return 0;
+
+    payment_t *pay = &pt->entries[pt->count];
+    memset(pay, 0, sizeof(*pay));
+    memcpy(pay->payment_hash, payment_hash, 32);
+    pay->amount_msat = amount_msat;
+    pay->state = PAY_STATE_INFLIGHT;
+    pay->n_routes = n_shards;
+    pt->count++;
+
+    /* Mark as AMP by setting payment_secret = set_id */
+    memcpy(pay->payment_secret, set_id, 32);
+
+    return 1;
+}

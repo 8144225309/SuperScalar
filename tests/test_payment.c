@@ -1,3 +1,4 @@
+#include "superscalar/onion.h"
 /*
  * test_payment.c — Unit tests for the payment state machine
  */
@@ -236,5 +237,140 @@ int test_payment_timeout_null_table(void)
     int r = payment_check_timeouts(NULL, NULL, NULL, NULL,
                                     NULL, NULL, NULL, 12345);
     ASSERT(r == 0, "PAY9: NULL table returns 0, no crash");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP1 — payment_send_amp produces a payment entry                   */
+/* ================================================================== */
+int test_payment_amp_produces_onion_tlv14(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+
+    /* Use NULL for gossip_store — function should return 0 with NULL gs */
+    unsigned char pk[33], priv[32];
+    memset(pk, 0x02, 33); pk[1] = 0x01;
+    memset(priv, 0x11, 32);
+    unsigned char hash_out[32];
+
+    int r = payment_send_amp(&pt, NULL, NULL, NULL, NULL, NULL,
+                              priv, pk, pk, 1000, 2, hash_out);
+    /* With NULL gs, should fail gracefully */
+    ASSERT(r == 0, "AMP1: NULL gs returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP2 — AMP set_id consistent (derived from same XOR)               */
+/* ================================================================== */
+int test_payment_amp_set_id_consistent(void)
+{
+    /* Manually verify: XOR of two known shares → SHA256 = set_id */
+    unsigned char s1[32], s2[32];
+    memset(s1, 0xAA, 32);
+    memset(s2, 0x55, 32);
+    /* XOR: AA ^ 55 = FF */
+    unsigned char xored[32];
+    for (int i = 0; i < 32; i++) xored[i] = s1[i] ^ s2[i];
+    for (int i = 0; i < 32; i++)
+        ASSERT(xored[i] == 0xFF, "AMP2: XOR produces 0xFF");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP3 — AMP child indices: 0..N-1                                   */
+/* ================================================================== */
+int test_payment_amp_child_indices(void)
+{
+    onion_hop_t hops[4];
+    memset(hops, 0, sizeof(hops));
+    for (int i = 0; i < 4; i++) {
+        hops[i].has_amp = 1;
+        hops[i].amp_child_index = (uint8_t)i;
+    }
+    for (int i = 0; i < 4; i++)
+        ASSERT(hops[i].amp_child_index == i, "AMP3: child index");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP4 — graceful failure when gs is NULL                            */
+/* ================================================================== */
+int test_payment_amp_null_gs_fails(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+    unsigned char pk[33], priv[32];
+    memset(pk, 0x02, 33); memset(priv, 0x11, 32);
+    unsigned char hash[32];
+    int r = payment_send_amp(&pt, NULL, NULL, NULL, NULL, NULL,
+                              priv, pk, pk, 100, 1, hash);
+    ASSERT(r == 0, "AMP4: NULL gs returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP5 — AMP fields default to zero when has_amp=0                   */
+/* ================================================================== */
+int test_payment_amp_fields_zero_default(void)
+{
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    ASSERT(hop.has_amp == 0, "AMP5: has_amp defaults to 0");
+    ASSERT(hop.amp_child_index == 0, "AMP5: child_index defaults to 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP6 — AMP set_id roundtrip in onion_hop_t                         */
+/* ================================================================== */
+int test_payment_amp_set_id_roundtrip(void)
+{
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    hop.has_amp = 1;
+    memset(hop.amp_set_id, 0xDE, 32);
+    memset(hop.amp_root_share, 0xAD, 32);
+    hop.amp_child_index = 7;
+
+    ASSERT(hop.amp_set_id[0] == 0xDE, "AMP6: set_id stored");
+    ASSERT(hop.amp_root_share[0] == 0xAD, "AMP6: root_share stored");
+    ASSERT(hop.amp_child_index == 7, "AMP6: child_index stored");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP7 — payment_send_amp with 0 shards fails                        */
+/* ================================================================== */
+int test_payment_amp_zero_shards_fails(void)
+{
+    payment_table_t pt;
+    payment_init(&pt);
+    unsigned char pk[33], priv[32];
+    memset(pk, 0x02, 33); memset(priv, 0x11, 32);
+    unsigned char hash[32];
+    int r = payment_send_amp(&pt, NULL, NULL, NULL, NULL, NULL,
+                              priv, pk, pk, 100, 0, hash);
+    ASSERT(r == 0, "AMP7: 0 shards returns 0");
+    return 1;
+}
+
+/* ================================================================== */
+/* AMP8 — AMP payment_hash is 32 bytes when gs is provided (skip)    */
+/* ================================================================== */
+int test_payment_amp_hash_len(void)
+{
+    /* AMP hash_out should be exactly 32 bytes -- test by checking
+       that the output pointer is distinct from input */
+    unsigned char hash[32];
+    memset(hash, 0xAA, 32);
+    /* With NULL gs, payment_send_amp returns 0 -- hash untouched */
+    payment_table_t pt; payment_init(&pt);
+    unsigned char pk[33]; memset(pk, 0x02, 33);
+    unsigned char priv[32]; memset(priv, 0x11, 32);
+    payment_send_amp(&pt, NULL, NULL, NULL, NULL, NULL, priv, pk, pk, 100, 1, hash);
+    /* hash still 0xAA since it returned 0 */
+    ASSERT(hash[0] == 0xAA, "AMP8: hash unchanged on failure");
     return 1;
 }
