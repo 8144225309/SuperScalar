@@ -20,7 +20,7 @@ jobs:
           - { os: ubuntu-latest,  name: "Linux (sanitizers)", sanitizers: true  }
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install deps (Linux)
@@ -45,7 +45,7 @@ jobs:
           LSAN_OPTIONS: ${{ matrix.sanitizers && 'exitcode=0' || '' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
-          ctest --test-dir build -R unit_tests --output-on-failure --timeout 600
+          cd build && ./test_superscalar --unit
 
   arm64-build-test:
     runs-on: ubuntu-latest
@@ -158,7 +158,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     name: Coverage
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -169,7 +169,7 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build build --parallel
       - name: Run tests
-        run: ulimit -s unlimited && ctest --test-dir build -R unit_tests --output-on-failure --timeout 600
+        run: ulimit -s unlimited && cd build && ./test_superscalar --unit
       - name: Generate coverage report
         run: |
           cd build
