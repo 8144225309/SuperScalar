@@ -216,7 +216,8 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;  /* LSP is funder and local */
-        if (_fe) channel_set_fee_rate(&entry->channel, _fe->get_rate(_fe, FEE_TARGET_NORMAL));
+        /* Do NOT override fee_rate from estimatesmartfee: client always uses the
+           default 1000 sat/kvB from channel_init, so both sides must agree. */
 
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {
@@ -336,7 +337,8 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;
-        if (_fe2) channel_set_fee_rate(&entry->channel, _fe2->get_rate(_fe2, FEE_TARGET_NORMAL));
+        /* Do NOT override fee_rate from estimatesmartfee: client always uses the
+           default 1000 sat/kvB from channel_init, so both sides must agree. */
 
         /* Load basepoints from DB instead of generating random ones */
         unsigned char local_secrets[4][32];
