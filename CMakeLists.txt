@@ -162,6 +162,7 @@ add_library(superscalar
     src/peer_storage.c
     src/payment.c
     src/rgs.c
+    src/onion_msg.c
     src/payment_uri.c
     src/trampoline.c
     src/hold_invoice.c
@@ -246,6 +247,7 @@ add_executable(test_superscalar
     tests/test_splice_wire.c
     tests/test_circuit_breaker.c
     tests/test_rgs.c
+    tests/test_onion_msg.c
     tests/test_payment_uri.c
     tests/test_trampoline.c
     tests/test_hold_invoice.c
