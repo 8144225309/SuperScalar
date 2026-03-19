@@ -518,6 +518,21 @@ extern int test_onion_msg_encode_null_safety(void);
 extern int test_onion_msg_decode_null_safety(void);
 extern int test_onion_msg_build_null_safety(void);
 extern int test_onion_msg_encode_small_buf(void);
+/* PR #41: Mission Control — payment failure channel scoring */
+extern int test_mc_init(void);
+extern int test_mc_record_failure_stores(void);
+extern int test_mc_is_penalized_recent(void);
+extern int test_mc_is_penalized_decayed(void);
+extern int test_mc_success_clears_penalty(void);
+extern int test_mc_amount_threshold(void);
+extern int test_mc_direction_independent(void);
+extern int test_mc_penalty_decays(void);
+extern int test_mc_prune_stale(void);
+extern int test_mc_prune_keeps_success(void);
+extern int test_mc_multiple_failures(void);
+extern int test_mc_penalty_scales_with_count(void);
+extern int test_mc_unknown_channel(void);
+extern int test_mc_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1868,6 +1883,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_onion_msg_decode_null_safety);
     RUN_TEST(test_onion_msg_build_null_safety);
     RUN_TEST(test_onion_msg_encode_small_buf);
+
+    printf("\n=== PR #41: Mission Control (payment failure scoring) ===\n");
+    RUN_TEST(test_mc_init);
+    RUN_TEST(test_mc_record_failure_stores);
+    RUN_TEST(test_mc_is_penalized_recent);
+    RUN_TEST(test_mc_is_penalized_decayed);
+    RUN_TEST(test_mc_success_clears_penalty);
+    RUN_TEST(test_mc_amount_threshold);
+    RUN_TEST(test_mc_direction_independent);
+    RUN_TEST(test_mc_penalty_decays);
+    RUN_TEST(test_mc_prune_stale);
+    RUN_TEST(test_mc_prune_keeps_success);
+    RUN_TEST(test_mc_multiple_failures);
+    RUN_TEST(test_mc_penalty_scales_with_count);
+    RUN_TEST(test_mc_unknown_channel);
+    RUN_TEST(test_mc_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
