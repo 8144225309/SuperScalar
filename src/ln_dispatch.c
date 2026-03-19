@@ -12,6 +12,7 @@
 #include "superscalar/htlc_commit.h"
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
+#include "superscalar/onion_message.h"
 #include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include "superscalar/chan_open.h"
@@ -39,6 +40,7 @@
 #define MSG_CHANNEL_REESTABLISH   136   /* 0x0088 */
 #define MSG_UPDATE_FAIL_MALFORMED 135   /* 0x0087 */
 #define MSG_INVOICE_REQUEST      0x8001 /* BOLT #12 direct wire */
+#define MSG_ONION_MESSAGE        0x0201 /* 513: BOLT #4 onion message */
 
 static uint16_t rd16(const unsigned char *b)
 {
@@ -417,6 +419,37 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
     }
     case 264: { /* reply_channel_range — received from peer, store SCIDs */
         return 264;
+    }
+    case MSG_ONION_MESSAGE: { /* type 513: BOLT #4 onion message (BOLT #12 transport) */
+        /* Parse wire: blinding_point(33) + onion_len(2 BE) + onion_bytes */
+        onion_msg_t omsg;
+        if (!onion_msg_parse(msg, msg_len, &omsg)) return -1;
+
+        /* Attempt final-hop decryption if we have our private key */
+        if (d->our_privkey[0] | d->our_privkey[1]) { /* non-null privkey check */
+            unsigned char payload[ONION_MSG_MAX_PAYLOAD];
+            size_t plen = onion_msg_decrypt_final(&omsg, d->ctx,
+                                                   d->our_privkey,
+                                                   payload, sizeof(payload));
+            if (plen >= 2) {
+                /* Route by TLV type: invoice_request (64), invoice (66), error (68) */
+                uint8_t tlv_type = payload[0];
+                if (tlv_type == ONION_MSG_TLV_INVOICE_REQUEST) {
+                    /* Decode and process invoice_request (same as MSG_INVOICE_REQUEST) */
+                    invoice_request_t req;
+                    if (invoice_request_decode(payload + 1, plen - 1, &req) &&
+                        invoice_request_verify(&req, d->ctx)) {
+                        /* TODO: send invoice reply via reply_path if present */
+                        (void)req;
+                    }
+                } else if (tlv_type == ONION_MSG_TLV_INVOICE) {
+                    /* Received invoice in response to our offer request */
+                    /* TODO: decode invoice and initiate payment */
+                }
+                /* tlv_type == ONION_MSG_TLV_INVOICE_ERROR: log and ignore for now */
+            }
+        }
+        return MSG_ONION_MESSAGE;
     }
     case 38: { /* shutdown: channel_id(32) + spk_len(2) + spk */
         if (msg_len < 36) return -1;

@@ -94,6 +94,23 @@ typedef struct {
     uint32_t      erroneous_field;      /* TLV type that caused the error, or 0 */
 } invoice_error_t;
 
+/*
+ * Create a new offer from our node's keys.
+ * our_seckey32: 32-byte node private key (stored in offer for later signing).
+ * our_pubkey33: 33-byte compressed node public key (becomes offer node_id).
+ * amount_msat: offer amount in millisatoshis; 0 = any-amount offer.
+ * description: human-readable description string (may be NULL → empty).
+ * absolute_expiry: Unix timestamp after which offer is invalid; 0 = no expiry.
+ * Returns 1 on success.
+ */
+int offer_create(offer_t *o_out,
+                 secp256k1_context *ctx,
+                 const unsigned char our_seckey32[32],
+                 const unsigned char our_pubkey33[33],
+                 uint64_t amount_msat,
+                 const char *description,
+                 uint64_t absolute_expiry);
+
 /* Encode an offer_t to a bech32m string (`lno1...`).
    Returns 1 on success, 0 on error. */
 int offer_encode(const offer_t *o, char *out, size_t out_cap);
