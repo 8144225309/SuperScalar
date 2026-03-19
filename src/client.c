@@ -132,6 +132,23 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     channel_set_remote_basepoints(ch, remote_payment_bp, remote_delayed_bp, remote_revocation_bp);
     channel_set_remote_htlc_basepoint(ch, remote_htlc_bp);
 
+    /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering.
+       channel_init's SPK-match heuristic fails for CLTV-taptree outputs
+       (cltv_timeout > 0), falling back to [local, remote] = [client, lsp] which
+       is coincidentally correct here, but with wrong signer_idx vs LSP's fallback.
+       Override explicitly to guarantee consistent ordering on both sides. */
+    {
+        secp256k1_pubkey ch_pks[2] = { my_pubkey, *lsp_pubkey };
+        if (!musig_aggregate_keys(ctx, &ch->funding_keyagg, ch_pks, 2)) {
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+        ch->local_funding_signer_idx = 0;  /* client at index 0 */
+    }
+    /* Set CLTV taptree merkle root so MuSig2 session uses correct tweak */
+    if (factory->cltv_timeout > 0)
+        channel_set_cltv_merkle_root(ch, factory->cltv_timeout, lsp_pubkey);
+
     memset(my_seckey, 0, 32);
     return 1;
 }

@@ -219,6 +219,20 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
 
+        /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering.
+           channel_init's SPK-match heuristic fails for CLTV-taptree outputs
+           (cltv_timeout > 0), falling back to [local, remote] = [lsp, client].
+           Override to match the factory's actual ordering. */
+        {
+            secp256k1_pubkey ch_pks[2] = { *client_pubkey, lsp_pubkey };
+            if (!musig_aggregate_keys(ctx, &entry->channel.funding_keyagg, ch_pks, 2))
+                return 0;
+            entry->channel.local_funding_signer_idx = 1;  /* LSP at index 1 */
+        }
+        /* Set CLTV taptree merkle root so MuSig2 session uses correct tweak */
+        if (factory->cltv_timeout > 0)
+            channel_set_cltv_merkle_root(&entry->channel, factory->cltv_timeout, &lsp_pubkey);
+
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {
             fprintf(stderr, "LSP: random basepoint generation failed for channel %zu\n", c);
@@ -339,6 +353,16 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.funder_is_local = 1;
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
+
+        /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering */
+        {
+            secp256k1_pubkey ch_pks2[2] = { *client_pubkey, lsp_pubkey };
+            if (!musig_aggregate_keys(ctx, &entry->channel.funding_keyagg, ch_pks2, 2))
+                return 0;
+            entry->channel.local_funding_signer_idx = 1;  /* LSP at index 1 */
+        }
+        if (factory->cltv_timeout > 0)
+            channel_set_cltv_merkle_root(&entry->channel, factory->cltv_timeout, &lsp_pubkey);
 
         /* Load basepoints from DB instead of generating random ones */
         unsigned char local_secrets[4][32];

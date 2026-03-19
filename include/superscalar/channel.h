@@ -145,6 +145,12 @@ typedef struct {
     unsigned char close_remote_sig[64];  /* sig received in peer's closing_signed */
     unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
     uint16_t      close_their_spk_len;
+
+    /* CLTV taptree merkle root for commitment signing.
+       Set when factory leaf output has a CLTV timeout script (cltv_timeout > 0).
+       Both sides must use the same root in musig_session_finalize_nonces. */
+    unsigned char chan_merkle_root[32];
+    int has_chan_merkle_root;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
@@ -186,6 +192,12 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                   uint32_t to_self_delay);
 
 void channel_cleanup(channel_t *ch);
+
+/* Set the CLTV taptree merkle root used for commitment signing.
+   Must be called after channel_init when the factory has cltv_timeout > 0.
+   lsp_pubkey: the LSP's funding pubkey (participant 0 in factory keyagg). */
+void channel_set_cltv_merkle_root(channel_t *ch, uint32_t cltv_timeout,
+                                   const secp256k1_pubkey *lsp_pubkey);
 
 int channel_set_local_basepoints(channel_t *ch,
                                    const unsigned char *payment_secret32,

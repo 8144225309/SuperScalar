@@ -1,4 +1,5 @@
 #include "superscalar/channel.h"
+#include "superscalar/tapscript.h"
 #include "superscalar/fee_estimator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -311,6 +312,21 @@ void channel_cleanup(channel_t *ch) {
     ch->revocations_cap = 0;
 }
 
+void channel_set_cltv_merkle_root(channel_t *ch, uint32_t cltv_timeout,
+                                   const secp256k1_pubkey *lsp_pubkey) {
+    if (!ch || !lsp_pubkey || cltv_timeout == 0) return;
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &lsp_xonly, NULL, lsp_pubkey))
+        return;
+    tapscript_leaf_t cltv_leaf;
+    if (!tapscript_build_cltv_timeout(&cltv_leaf, cltv_timeout, &lsp_xonly, ch->ctx))
+        return;
+    tapscript_compute_leaf_hash(&cltv_leaf);
+    if (!tapscript_merkle_root(ch->chan_merkle_root, &cltv_leaf, 1))
+        return;
+    ch->has_chan_merkle_root = 1;
+}
+
 int channel_set_local_basepoints(channel_t *ch,
                                    const unsigned char *payment_secret32,
                                    const unsigned char *delayed_payment_secret32,
@@ -571,7 +587,6 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
     } else if (!channel_get_per_commitment_point(ch, ch->commitment_number, &pcp)) {
         return 0;
     }
-
     /* 2. Derive revocation pubkey (from remote's revocation_basepoint + our pcp) */
     secp256k1_pubkey revocation_pubkey;
     if (!channel_derive_revocation_pubkey(ch->ctx, &revocation_pubkey,
@@ -1299,9 +1314,12 @@ int channel_create_commitment_partial_sig(
         musig_session_set_pubnonce(&session, 1, &my_pubnonce);
     }
 
-    /* Finalize with key-path-only taproot tweak (merkle_root = NULL) */
-    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL))
-        return 0;
+    /* Finalize with taproot tweak; use CLTV taptree root if present */
+    {
+        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, mr, NULL))
+            return 0;
+    }
 
     /* 6. Create partial sig */
     secp256k1_musig_partial_sig psig;
@@ -1378,9 +1396,12 @@ int channel_verify_and_aggregate_commitment_sig(
         musig_session_set_pubnonce(&session, 1, &my_pubnonce);
     }
 
-    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL)) {
-        fprintf(stderr, "verify_agg: finalize_nonces failed\n");
-        return 0;
+    {
+        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, mr, NULL)) {
+            fprintf(stderr, "verify_agg: finalize_nonces failed\n");
+            return 0;
+        }
     }
 
     /* 5. Parse peer's partial sig */
