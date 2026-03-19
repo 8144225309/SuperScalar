@@ -236,6 +236,7 @@ add_executable(test_superscalar
     tests/test_spec_vectors.c
     tests/test_payment.c
     tests/test_splice_wire.c
+    tests/test_splice_interactive.c
     tests/test_bolt12_full.c
     tests/test_invoice.c
     tests/test_ln_dispatch.c

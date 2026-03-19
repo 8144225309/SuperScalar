@@ -376,6 +376,22 @@ extern int test_splice_wire_parse_ack(void);
 extern int test_splice_wire_splicing_signed(void);
 extern int test_splice_wire_wrong_type(void);
 extern int test_splice_wire_truncated(void);
+/* PR #30: Interactive Tx Construction + Splice Dispatch */
+extern int test_splice_tx_add_input(void);
+extern int test_splice_tx_add_output(void);
+extern int test_splice_tx_remove_input(void);
+extern int test_splice_tx_remove_output(void);
+extern int test_splice_tx_complete(void);
+extern int test_splice_tx_signatures(void);
+extern int test_splice_tx_buf_small(void);
+extern int test_splice_tx_truncated(void);
+extern int test_splice_tx_wrong_type(void);
+extern int test_splice_dispatch_stfu(void);
+extern int test_splice_dispatch_splice_init_quiescent(void);
+extern int test_splice_dispatch_splice_ack(void);
+extern int test_splice_dispatch_splice_locked(void);
+extern int test_splice_dispatch_tx_complete(void);
+extern int test_splice_dispatch_tx_add_input(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1575,6 +1591,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_splice_wire_splicing_signed);
     RUN_TEST(test_splice_wire_wrong_type);
     RUN_TEST(test_splice_wire_truncated);
+    printf("\n=== PR #30: Interactive Tx Construction + Splice Dispatch ===\n");
+    RUN_TEST(test_splice_tx_add_input);
+    RUN_TEST(test_splice_tx_add_output);
+    RUN_TEST(test_splice_tx_remove_input);
+    RUN_TEST(test_splice_tx_remove_output);
+    RUN_TEST(test_splice_tx_complete);
+    RUN_TEST(test_splice_tx_signatures);
+    RUN_TEST(test_splice_tx_buf_small);
+    RUN_TEST(test_splice_tx_truncated);
+    RUN_TEST(test_splice_tx_wrong_type);
+    RUN_TEST(test_splice_dispatch_stfu);
+    RUN_TEST(test_splice_dispatch_splice_init_quiescent);
+    RUN_TEST(test_splice_dispatch_splice_ack);
+    RUN_TEST(test_splice_dispatch_splice_locked);
+    RUN_TEST(test_splice_dispatch_tx_complete);
+    RUN_TEST(test_splice_dispatch_tx_add_input);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
