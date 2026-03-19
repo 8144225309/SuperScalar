@@ -48,6 +48,10 @@ int persist_in_transaction(const persist_t *p);
 
 /* --- Factory persistence --- */
 
+/* Mark a factory as closed (all on-chain outputs settled).
+   Called by factory_recovery_scan() when all leaf TXs are confirmed. */
+int persist_mark_factory_closed(persist_t *p, uint32_t factory_id);
+
 /* Save factory metadata (funding info, participants, step_blocks, etc.).
    factory_id is caller-assigned (typically 0 for single-factory PoC). */
 int persist_save_factory(persist_t *p, const factory_t *f,

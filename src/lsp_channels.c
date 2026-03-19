@@ -1,5 +1,6 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/factory_recovery.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/lsps.h"
 #include "superscalar/splice.h"
@@ -3229,6 +3230,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         int h = regtest_get_block_height(mgr->watchtower->rt);
         if (h > 0)
             mgr->last_settlement_block = (uint32_t)h;
+    }
+
+    /* Startup recovery: reconcile DB tree nodes with on-chain reality */
+    {
+        persist_t       *p_rec     = (persist_t *)mgr->persist;
+        chain_backend_t *chain_rec = mgr->watchtower ? mgr->watchtower->chain : NULL;
+        factory_recovery_scan(p_rec, chain_rec);
     }
 
     /* Pre-allocate poll arrays (clients + bridge + listen + stdin) */

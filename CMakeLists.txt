@@ -164,6 +164,7 @@ add_library(superscalar
     src/ln_dispatch.c
     src/invoice.c
     src/admin_rpc.c
+    src/factory_recovery.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
