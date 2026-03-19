@@ -533,6 +533,21 @@ extern int test_mc_multiple_failures(void);
 extern int test_mc_penalty_scales_with_count(void);
 extern int test_mc_unknown_channel(void);
 extern int test_mc_null_safety(void);
+/* PR #42: Route Policy Enforcement (BOLT #7 channel_update) */
+extern int test_route_policy_fee_ok(void);
+extern int test_route_policy_fee_insufficient(void);
+extern int test_route_policy_htlc_too_small(void);
+extern int test_route_policy_htlc_too_large(void);
+extern int test_route_policy_disabled(void);
+extern int test_route_policy_cltv_too_small(void);
+extern int test_route_policy_expiry_too_soon(void);
+extern int test_route_policy_compute_fee(void);
+extern int test_route_policy_channel_update_roundtrip(void);
+extern int test_route_policy_channel_update_no_max(void);
+extern int test_route_policy_table_upsert_find(void);
+extern int test_route_policy_set_disabled(void);
+extern int test_route_policy_null_safety(void);
+extern int test_route_policy_parse_wrong_type(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1899,6 +1914,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_mc_penalty_scales_with_count);
     RUN_TEST(test_mc_unknown_channel);
     RUN_TEST(test_mc_null_safety);
+
+    printf("\n=== PR #42: Route Policy Enforcement (BOLT #7 channel_update) ===\n");
+    RUN_TEST(test_route_policy_fee_ok);
+    RUN_TEST(test_route_policy_fee_insufficient);
+    RUN_TEST(test_route_policy_htlc_too_small);
+    RUN_TEST(test_route_policy_htlc_too_large);
+    RUN_TEST(test_route_policy_disabled);
+    RUN_TEST(test_route_policy_cltv_too_small);
+    RUN_TEST(test_route_policy_expiry_too_soon);
+    RUN_TEST(test_route_policy_compute_fee);
+    RUN_TEST(test_route_policy_channel_update_roundtrip);
+    RUN_TEST(test_route_policy_channel_update_no_max);
+    RUN_TEST(test_route_policy_table_upsert_find);
+    RUN_TEST(test_route_policy_set_disabled);
+    RUN_TEST(test_route_policy_null_safety);
+    RUN_TEST(test_route_policy_parse_wrong_type);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
