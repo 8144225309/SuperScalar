@@ -603,6 +603,20 @@ extern int test_pe_table_full(void);
 extern int test_pe_no_duplicate(void);
 extern int test_pe_null_safety(void);
 extern int test_pe_empty_excludes_nothing(void);
+/* PR #47: Stateless Invoice (HMAC-derived payment secrets) */
+extern int test_si_derive_secret_deterministic(void);
+extern int test_si_different_keys(void);
+extern int test_si_different_hashes(void);
+extern int test_si_verify_secret_correct(void);
+extern int test_si_verify_secret_wrong(void);
+extern int test_si_derive_preimage_deterministic(void);
+extern int test_si_from_nonce(void);
+extern int test_si_claim_success(void);
+extern int test_si_claim_wrong_nonce(void);
+extern int test_si_claim_wrong_secret(void);
+extern int test_si_check_preimage(void);
+extern int test_si_generate_l1(void);
+extern int test_si_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -2044,6 +2058,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_pe_no_duplicate);
     RUN_TEST(test_pe_null_safety);
     RUN_TEST(test_pe_empty_excludes_nothing);
+
+    printf("\n=== PR #47: Stateless Invoice (HMAC-derived payment secrets) ===\n");
+    RUN_TEST(test_si_derive_secret_deterministic);
+    RUN_TEST(test_si_different_keys);
+    RUN_TEST(test_si_different_hashes);
+    RUN_TEST(test_si_verify_secret_correct);
+    RUN_TEST(test_si_verify_secret_wrong);
+    RUN_TEST(test_si_derive_preimage_deterministic);
+    RUN_TEST(test_si_from_nonce);
+    RUN_TEST(test_si_claim_success);
+    RUN_TEST(test_si_claim_wrong_nonce);
+    RUN_TEST(test_si_claim_wrong_secret);
+    RUN_TEST(test_si_check_preimage);
+    RUN_TEST(test_si_generate_l1);
+    RUN_TEST(test_si_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
