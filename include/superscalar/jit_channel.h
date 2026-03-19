@@ -2,7 +2,6 @@
 #define SUPERSCALAR_JIT_CHANNEL_H
 
 #include "channel.h"
-#include "regtest.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
@@ -83,7 +82,7 @@ int jit_channels_check_funding(void *mgr_ptr);
    Spends the JIT UTXO to the LSP wallet. Returns 1 on success. */
 int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
                                    const unsigned char *extracted_client_key,
-                                   regtest_t *rt);
+                                   void *chain_be);
 
 /* Clean up JIT channel resources. */
 void jit_channels_cleanup(void *mgr_ptr);

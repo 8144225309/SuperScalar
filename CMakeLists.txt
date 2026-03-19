@@ -116,6 +116,7 @@ add_library(superscalar
     src/fee_estimator_api.c
     src/wallet_source_rpc.c
     src/wallet_source_hd.c
+    src/lsp_fund.c
     src/superscalar_sdk.c
     src/watchtower.c
     src/crypto_aead.c

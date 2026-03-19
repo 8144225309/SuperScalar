@@ -1,5 +1,6 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/factory_recovery.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/lsps.h"
@@ -3396,7 +3397,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 /* Auto-broadcast distribution TX on EXPIRED */
                                 if (lf->cached_state == FACTORY_EXPIRED &&
                                     lf->distribution_tx.len > 0 &&
-                                    mgr->watchtower && mgr->watchtower->rt) {
+                                    mgr->chain_be) {
+                                    chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
                                     char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
                                     if (dhex) {
                                         extern void hex_encode(const unsigned char *,
@@ -3404,8 +3406,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         hex_encode(lf->distribution_tx.data,
                                                    lf->distribution_tx.len, dhex);
                                         char dtxid[65];
-                                        if (regtest_send_raw_tx(mgr->watchtower->rt,
-                                                                 dhex, dtxid))
+                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
                                             printf("LSP: distribution TX broadcast: %s\n",
                                                    dtxid);
                                         free(dhex);
@@ -3545,7 +3546,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                mret, lf->factory_id);
                                         fflush(stdout);
                                         if (lf->distribution_tx.len > 0 &&
-                                            mgr->watchtower && mgr->watchtower->rt) {
+                                            mgr->chain_be) {
+                                            chain_backend_t *_cb =
+                                                (chain_backend_t *)mgr->chain_be;
                                             char *dhex = malloc(
                                                 lf->distribution_tx.len * 2 + 1);
                                             if (dhex) {
@@ -3556,9 +3559,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                            lf->distribution_tx.len,
                                                            dhex);
                                                 char dtxid[65];
-                                                if (regtest_send_raw_tx(
-                                                        mgr->watchtower->rt, dhex,
-                                                        dtxid))
+                                                if (_cb->send_raw_tx(_cb, dhex, dtxid))
                                                     printf("LSP: fallback distribution "
                                                            "TX: %s\n", dtxid);
                                                 else

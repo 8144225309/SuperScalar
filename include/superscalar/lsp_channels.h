@@ -158,6 +158,10 @@ typedef struct {
     void *readiness;  /* readiness_tracker_t* or NULL */
     void *notify;     /* notify_t* or NULL */
 
+    /* Chain backend and wallet source for mode-agnostic funding/broadcast */
+    void *chain_be;   /* chain_backend_t* — regtest or bip158 */
+    void *wallet_src; /* wallet_source_t* — rpc or hd */
+
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
 } lsp_channel_mgr_t;

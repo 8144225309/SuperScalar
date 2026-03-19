@@ -3,6 +3,8 @@
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/wire.h"
 #include "superscalar/jit_channel.h"
+#include "superscalar/lsp_fund.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
@@ -249,8 +251,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* Phase A.5: Close active JIT channels using extracted keys */
     if (mgr->jit_channels) {
         ladder_factory_t *dying_lf = ladder_get_by_id(lad, dying_id);
-        regtest_t *jit_rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
-        if (jit_rt) {
+        chain_backend_t *jit_chain_be = (chain_backend_t *)mgr->chain_be;
+        if (jit_chain_be) {
             for (size_t c = 0; c < mgr->n_channels; c++) {
                 if (!jit_channel_is_active(mgr, c)) continue;
                 size_t pidx = c + 1; /* participant index: 0=LSP, 1..N=clients */
@@ -260,7 +262,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                     continue;
                 }
                 if (jit_channel_cooperative_close(mgr, c,
-                        dying_lf->extracted_keys[pidx], jit_rt)) {
+                        dying_lf->extracted_keys[pidx], jit_chain_be)) {
                     printf("LSP rotate: closed JIT channel for client %zu\n", c);
                 } else {
                     fprintf(stderr, "LSP rotate: WARNING: could not close JIT "
@@ -302,8 +304,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* --- Phase B: Cooperative close OR partial retirement --- */
     regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
-    if (!rt) {
-        fprintf(stderr, "LSP rotate: no regtest connection\n");
+    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+    wallet_source_t *wallet_src = (wallet_source_t *)mgr->wallet_src;
+    if (!rt && !chain_be) {
+        fprintf(stderr, "LSP rotate: no chain connection\n");
         return 0;
     }
 
@@ -318,11 +322,17 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         const unsigned char *close_spk = NULL;
         size_t close_spk_len = 0;
 
-        if (regtest_get_new_address(rt, wallet_addr, sizeof(wallet_addr)) &&
+        if (rt &&
+            regtest_get_new_address(rt, wallet_addr, sizeof(wallet_addr)) &&
             regtest_get_address_scriptpubkey(rt, wallet_addr, wallet_spk, &wallet_spk_len)) {
             close_spk = wallet_spk;
             close_spk_len = wallet_spk_len;
             printf("LSP rotate: close outputs to wallet address %s\n", wallet_addr);
+        } else if (!rt && wallet_src &&
+                   wallet_src->get_change_spk(wallet_src, wallet_spk, &wallet_spk_len)) {
+            close_spk = wallet_spk;
+            close_spk_len = wallet_spk_len;
+            printf("LSP rotate: close outputs to HD wallet SPK\n");
         } else {
             fprintf(stderr, "LSP rotate: WARNING: wallet address fetch failed, "
                     "using factory funding SPK (funds may strand)\n");
@@ -359,7 +369,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         tx_buf_t rot_close_tx;
         tx_buf_init(&rot_close_tx, 512);
         if (!ladder_build_close(lad, dying_id, &rot_close_tx, rot_outputs, n_close,
-                                  rt ? (uint32_t)regtest_get_block_height(rt) : 0)) {
+                                  chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
+                                  (rt ? (uint32_t)regtest_get_block_height(rt) : 0))) {
             fprintf(stderr, "LSP rotate: ladder_build_close failed\n");
             tx_buf_free(&rot_close_tx);
             return 0;
@@ -373,7 +384,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
         char rc_txid[65];
-        int rc_sent = regtest_send_raw_tx(rt, rc_hex, rc_txid);
+        int rc_sent = chain_be ? chain_be->send_raw_tx(chain_be, rc_hex, rc_txid) :
+                                 regtest_send_raw_tx(rt, rc_hex, rc_txid);
         if (mgr->persist) {
             persist_log_broadcast((persist_t *)mgr->persist,
                                   rc_sent ? rc_txid : "?", "rotation_close",
@@ -395,14 +407,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             printf("LSP rotate: waiting for close TX confirmation...\n");
             int confirmed = 0;
             for (int attempt = 0; attempt < 2; attempt++) {
-                if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
-                    confirmed = 1;
-                    break;
-                }
-                if (regtest_is_in_mempool(rt, rc_txid)) {
-                    fprintf(stderr, "LSP rotate: close TX still in mempool, "
-                            "extending wait (attempt %d)\n", attempt + 1);
-                    continue;
+                if (chain_be) {
+                    if (lsp_wait_for_confirmation(chain_be, rc_txid, rot_timeout)) {
+                        confirmed = 1; break;
+                    }
+                    if (chain_be->is_in_mempool(chain_be, rc_txid)) {
+                        fprintf(stderr, "LSP rotate: close TX still in mempool, "
+                                "extending wait (attempt %d)\n", attempt + 1);
+                        continue;
+                    }
+                } else {
+                    if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
+                        confirmed = 1; break;
+                    }
+                    if (regtest_is_in_mempool(rt, rc_txid)) {
+                        fprintf(stderr, "LSP rotate: close TX still in mempool, "
+                                "extending wait (attempt %d)\n", attempt + 1);
+                        continue;
+                    }
                 }
                 fprintf(stderr, "LSP rotate: close TX %s dropped from mempool\n",
                         rc_txid);
@@ -442,7 +464,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (bal < 0.01) {
             regtest_mine_blocks(rt, 10, mgr->rot_mine_addr);
         }
-    } else {
+    } else if (rt) {
         double bal = regtest_get_balance(rt);
         double needed = (double)mgr->rot_funding_sats / 100000000.0;
         if (bal < needed) {
@@ -451,12 +473,26 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             return 0;
         }
     }
+    /* In light-client mode: skip balance check; lsp_fund_spk will fail if no UTXO */
 
-    double funding_btc = (double)mgr->rot_funding_sats / 100000000.0;
     char fund_txid_hex[65];
-    if (!regtest_fund_address(rt, mgr->rot_fund_addr, funding_btc, fund_txid_hex)) {
-        fprintf(stderr, "LSP rotate: fund new factory failed\n");
-        return 0;
+    if (rt) {
+        double funding_btc = (double)mgr->rot_funding_sats / 100000000.0;
+        if (!regtest_fund_address(rt, mgr->rot_fund_addr, funding_btc, fund_txid_hex)) {
+            fprintf(stderr, "LSP rotate: fund new factory failed\n");
+            return 0;
+        }
+    } else {
+        if (!wallet_src || !chain_be) {
+            fprintf(stderr, "LSP rotate: no wallet/chain for light-client funding\n");
+            return 0;
+        }
+        if (!lsp_fund_spk(wallet_src, chain_be,
+                          mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                          mgr->rot_funding_sats, 0, fund_txid_hex)) {
+            fprintf(stderr, "LSP rotate: light-client fund new factory failed\n");
+            return 0;
+        }
     }
     if (mgr->rot_is_regtest) {
         regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
@@ -466,21 +502,30 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: waiting for funding confirmation...\n");
         int confirmed = 0;
         for (int attempt = 0; attempt < 2; attempt++) {
-            if (regtest_wait_for_confirmation(rt, fund_txid_hex, rot_timeout) >= 1) {
-                confirmed = 1;
-                break;
+            if (chain_be) {
+                if (lsp_wait_for_confirmation(chain_be, fund_txid_hex, rot_timeout)) {
+                    confirmed = 1; break;
+                }
+                if (chain_be->is_in_mempool(chain_be, fund_txid_hex)) {
+                    fprintf(stderr, "LSP rotate: funding TX still in mempool, "
+                            "extending wait (attempt %d)\n", attempt + 1);
+                    continue;
+                }
+            } else {
+                if (regtest_wait_for_confirmation(rt, fund_txid_hex, rot_timeout) >= 1) {
+                    confirmed = 1; break;
+                }
+                if (regtest_is_in_mempool(rt, fund_txid_hex)) {
+                    fprintf(stderr, "LSP rotate: funding TX still in mempool, "
+                            "extending wait (attempt %d)\n", attempt + 1);
+                    continue;
+                }
             }
-            if (regtest_is_in_mempool(rt, fund_txid_hex)) {
-                fprintf(stderr, "LSP rotate: funding TX still in mempool, "
-                        "extending wait (attempt %d)\n", attempt + 1);
-                continue;
-            }
-            fprintf(stderr, "LSP rotate: funding TX %s dropped from mempool\n",
-                    fund_txid_hex);
+            fprintf(stderr, "LSP rotate: funding TX dropped from mempool\n");
             break;
         }
         if (!confirmed) {
-            fprintf(stderr, "LSP rotate: funding not confirmed after retries\n");
+            fprintf(stderr, "LSP rotate: funding TX not confirmed after retries\n");
             return 0;
         }
     }

@@ -20,6 +20,9 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
+#include "superscalar/lsp_fund.h"
+#include "superscalar/chain_backend.h"
+#include "superscalar/wallet_source.h"
 #include "superscalar/readiness.h"
 #include "superscalar/notify.h"
 #include "superscalar/splice.h"
@@ -1662,6 +1665,22 @@ int main(int argc, char *argv[]) {
     /* Alias fee_est for existing code below that references fee_est */
     fee_estimator_t *fee_est = fee_est_ptr;
 
+    /* === Chain backend and wallet source (mode-agnostic) === */
+    static chain_backend_t g_chain_be_rpc;
+    static wallet_source_rpc_t g_ws_rpc;
+    chain_backend_t *chain_be;
+    wallet_source_t *wallet_src;
+
+    if (rt_ok) {
+        chain_backend_regtest_init(&g_chain_be_rpc, &rt);
+        chain_be = &g_chain_be_rpc;
+        wallet_source_rpc_init(&g_ws_rpc, &rt);
+        wallet_src = &g_ws_rpc.base;
+    } else {
+        chain_be = (chain_backend_t *)&g_bip158;
+        wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
+    }
+
     /* === Recovery probe: skip ceremony if factory exists in DB === */
     if (use_db && daemon_mode) {
         factory_t *rec_f = calloc(1, sizeof(factory_t));
@@ -1811,6 +1830,8 @@ int main(int argc, char *argv[]) {
             for (size_t c = 0; c < mgr->n_channels; c++)
                 watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
             mgr->watchtower = &rec_wt;
+            mgr->chain_be  = chain_be;
+            mgr->wallet_src = wallet_src;
             if (light_client_arg) {
                 attach_light_client(&rec_wt, use_db ? &db : NULL,
                                     light_client_arg, network,
@@ -2322,61 +2343,91 @@ int main(int argc, char *argv[]) {
     }
 
     char fund_addr[128];
-    if (!regtest_derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
-        fprintf(stderr, "LSP: failed to derive funding address\n");
-        lsp_cleanup(&lsp);
-        secp256k1_context_destroy(ctx);
-        return 1;
+    if (rt_ok) {
+        if (!regtest_derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
+            fprintf(stderr, "LSP: failed to derive funding address\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    } else {
+        /* Light-client: display SPK hex as address proxy */
+        static const char hx[] = "0123456789abcdef";
+        for (int ii = 0; ii < 34; ii++) {
+            fund_addr[ii*2]   = hx[(fund_spk[ii]>>4)&0xf];
+            fund_addr[ii*2+1] = hx[ fund_spk[ii]    &0xf];
+        }
+        fund_addr[68] = '\0';
     }
     printf("LSP: funding address: %s\n", fund_addr);
 
     /* === Phase 3: Fund the factory === */
-    char mine_addr[128];
-    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) {
-        fprintf(stderr, "LSP: failed to get mining address\n");
-        lsp_cleanup(&lsp);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-
-    if (is_regtest) {
-        regtest_mine_blocks(&rt, 101, mine_addr);
-        if (!ensure_funded(&rt, mine_addr)) {
-            fprintf(stderr, "LSP: failed to fund wallet (exhausted regtest?)\n");
+    char mine_addr[128] = {0};
+    if (rt_ok) {
+        if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) {
+            fprintf(stderr, "LSP: failed to get mining address\n");
             lsp_cleanup(&lsp);
             secp256k1_context_destroy(ctx);
             return 1;
+        }
+        if (is_regtest) {
+            regtest_mine_blocks(&rt, 101, mine_addr);
+            if (!ensure_funded(&rt, mine_addr)) {
+                fprintf(stderr, "LSP: failed to fund wallet (exhausted regtest?)\n");
+                lsp_cleanup(&lsp);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        } else {
+            double bal = regtest_get_balance(&rt);
+            double needed = (double)funding_sats / 100000000.0;
+            if (bal < needed) {
+                fprintf(stderr, "LSP: wallet balance %.8f BTC insufficient (need %.8f). "
+                        "Fund via faucet first.\n", bal, needed);
+                lsp_cleanup(&lsp);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("LSP: wallet balance: %.8f BTC (sufficient)\n", bal);
         }
     } else {
-        /* Signet/testnet/mainnet: check wallet balance, no mining */
-        double bal = regtest_get_balance(&rt);
-        double needed = (double)funding_sats / 100000000.0;
-        if (bal < needed) {
-            fprintf(stderr, "LSP: wallet balance %.8f BTC insufficient (need %.8f). "
-                    "Fund via faucet first.\n", bal, needed);
+        /* Light-client mode: HD wallet must be pre-funded externally */
+        if (!wallet_src) {
+            fprintf(stderr, "LSP: no wallet available in light-client mode\n");
             lsp_cleanup(&lsp);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        printf("LSP: wallet balance: %.8f BTC (sufficient)\n", bal);
+        printf("LSP: light-client mode — HD wallet must be pre-funded at %s\n", fund_addr);
     }
 
-    double funding_btc = (double)funding_sats / 100000000.0;
     char funding_txid_hex[65];
-    if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
-        fprintf(stderr, "LSP: failed to fund factory address\n");
-        lsp_cleanup(&lsp);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-    if (is_regtest) {
-        regtest_mine_blocks(&rt, 1, mine_addr);
+    if (rt_ok) {
+        double funding_btc = (double)funding_sats / 100000000.0;
+        if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
+            fprintf(stderr, "LSP: failed to fund factory address\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        if (is_regtest) {
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        } else {
+            printf("LSP: waiting for funding tx confirmation on %s...\n", network);
+            int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex,
+                                                        confirm_timeout_secs);
+            if (conf < 1) {
+                fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+                lsp_cleanup(&lsp);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
     } else {
-        printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex,
-                                                    confirm_timeout_secs);
-        if (conf < 1) {
-            fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+        if (!lsp_fund_spk(wallet_src, chain_be,
+                          fund_spk, sizeof(fund_spk),
+                          funding_sats, fee_rate, funding_txid_hex)) {
+            fprintf(stderr, "LSP: light-client factory funding failed\n");
             lsp_cleanup(&lsp);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -2757,6 +2808,8 @@ int main(int argc, char *argv[]) {
         for (size_t c = 0; c < mgr->n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
         mgr->watchtower = &wt;
+        mgr->chain_be  = chain_be;
+        mgr->wallet_src = wallet_src;
         if (light_client_arg) {
             attach_light_client(&wt, use_db ? &db : NULL,
                                  light_client_arg, network,
@@ -6250,6 +6303,7 @@ int main(int argc, char *argv[]) {
     tx_buf_init(&close_tx, 512);
 
     if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close_outputs,
+                                      chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
                                       (uint32_t)regtest_get_block_height(&rt))) {
         fprintf(stderr, "LSP: cooperative close failed\n");
         tx_buf_free(&close_tx);
@@ -6262,7 +6316,8 @@ int main(int argc, char *argv[]) {
     char close_hex[close_tx.len * 2 + 1];
     hex_encode(close_tx.data, close_tx.len, close_hex);
     char close_txid[65];
-    if (!regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+    if (!(chain_be ? chain_be->send_raw_tx(chain_be, close_hex, close_txid) :
+                     regtest_send_raw_tx(&rt, close_hex, close_txid))) {
         if (g_db)
             persist_log_broadcast(g_db, "?", "cooperative_close",
                 close_hex, "failed");

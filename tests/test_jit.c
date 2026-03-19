@@ -10,6 +10,7 @@
 #include "superscalar/fee.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/regtest.h"
+#include "superscalar/chain_backend.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -512,9 +513,9 @@ int test_jit_cooperative_close(void) {
        and state prerequisites work correctly */
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active");
 
-    /* Call with NULL rt — should return 0 (no crash) */
+    /* Call with NULL chain_be — should return 0 (no crash) */
     int ret = jit_channel_cooperative_close(&mgr, 1, cli_sec, NULL);
-    TEST_ASSERT_EQ(ret, 0, "should fail with NULL regtest");
+    TEST_ASSERT_EQ(ret, 0, "should fail with NULL chain_be");
     TEST_ASSERT(jits[0].state == JIT_STATE_OPEN,
                 "state should remain OPEN after failed close");
 
@@ -550,10 +551,10 @@ int test_jit_cooperative_close_key_mismatch(void) {
     jits[0].channel.remote_funding_pubkey = cli_pk;
     mgr.n_jit_channels = 1;
 
-    /* Provide wrong extracted key */
-    regtest_t dummy_rt;
-    memset(&dummy_rt, 0, sizeof(dummy_rt));
-    int ret = jit_channel_cooperative_close(&mgr, 2, wrong_sec, &dummy_rt);
+    /* Provide wrong extracted key — function exits before using chain_be vtable */
+    chain_backend_t dummy_be;
+    memset(&dummy_be, 0, sizeof(dummy_be));
+    int ret = jit_channel_cooperative_close(&mgr, 2, wrong_sec, &dummy_be);
     TEST_ASSERT_EQ(ret, 0, "should fail with wrong key");
     TEST_ASSERT(jits[0].state == JIT_STATE_OPEN,
                 "state should remain OPEN on key mismatch");
