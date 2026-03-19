@@ -561,6 +561,20 @@ extern int test_fwd_history_prune(void);
 extern int test_fwd_history_ring_wrap(void);
 extern int test_fwd_history_range_all(void);
 extern int test_fwd_history_null_safety(void);
+/* PR #44: HTLC Inbound Acceptance (BOLT #4 final-hop validation) */
+extern int test_htlc_accept_ok(void);
+extern int test_htlc_accept_unknown_hash(void);
+extern int test_htlc_accept_expired(void);
+extern int test_htlc_accept_amount_low(void);
+extern int test_htlc_accept_any_amount(void);
+extern int test_htlc_accept_missing_secret(void);
+extern int test_htlc_accept_wrong_secret(void);
+extern int test_htlc_accept_already_paid(void);
+extern int test_htlc_accept_cltv_too_low(void);
+extern int test_htlc_accept_no_cltv_check(void);
+extern int test_htlc_accept_find(void);
+extern int test_htlc_accept_prune(void);
+extern int test_htlc_accept_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1957,6 +1971,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_fwd_history_ring_wrap);
     RUN_TEST(test_fwd_history_range_all);
     RUN_TEST(test_fwd_history_null_safety);
+
+    printf("\n=== PR #44: HTLC Inbound Acceptance (BOLT #4 final-hop) ===\n");
+    RUN_TEST(test_htlc_accept_ok);
+    RUN_TEST(test_htlc_accept_unknown_hash);
+    RUN_TEST(test_htlc_accept_expired);
+    RUN_TEST(test_htlc_accept_amount_low);
+    RUN_TEST(test_htlc_accept_any_amount);
+    RUN_TEST(test_htlc_accept_missing_secret);
+    RUN_TEST(test_htlc_accept_wrong_secret);
+    RUN_TEST(test_htlc_accept_already_paid);
+    RUN_TEST(test_htlc_accept_cltv_too_low);
+    RUN_TEST(test_htlc_accept_no_cltv_check);
+    RUN_TEST(test_htlc_accept_find);
+    RUN_TEST(test_htlc_accept_prune);
+    RUN_TEST(test_htlc_accept_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
