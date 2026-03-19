@@ -13,6 +13,8 @@
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/tapscript.h"
+#include "superscalar/musig.h"
 #include "superscalar/types.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
@@ -611,8 +613,222 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
             }
 
             if (!is_lsp_key_path) {
-                cJSON_AddStringToObject(entry, "status", "requires_client_key");
-                cJSON_AddItemToArray(results, entry);
+                /*
+                 * Try CLTV script-path sweep: output key is
+                 * taptweak(MuSig2_agg(client, LSP), CLTV_leaf_hash).
+                 * The LSP can spend via the script leaf after cltv_timeout
+                 * blocks using only its own private key.
+                 */
+                int handled = 0;
+                do {
+                    if (cltv_timeout == 0) break;
+                    if (spk_lens[vout] != 34 ||
+                        spks[vout][0] != 0x51 || spks[vout][1] != 0x20)
+                        break;
+
+                    /* Find client pubkey: channels.slot → factory_participants.slot+1 */
+                    secp256k1_pubkey client_pub;
+                    int have_client = 0;
+                    {
+                        sqlite3_stmt *cst;
+                        if (sqlite3_prepare_v2(p->db,
+                                "SELECT slot FROM channels "
+                                "WHERE factory_id=? AND funding_txid=?"
+                                "  AND funding_vout=?",
+                                -1, &cst, NULL) == SQLITE_OK) {
+                            sqlite3_bind_int (cst, 1, (int)factory_id);
+                            sqlite3_bind_text(cst, 2, txid, -1, SQLITE_STATIC);
+                            sqlite3_bind_int (cst, 3, vout);
+                            if (sqlite3_step(cst) == SQLITE_ROW) {
+                                int ch_slot = sqlite3_column_int(cst, 0);
+                                sqlite3_stmt *pst;
+                                if (sqlite3_prepare_v2(p->db,
+                                        "SELECT pubkey FROM factory_participants "
+                                        "WHERE factory_id=? AND slot=?",
+                                        -1, &pst, NULL) == SQLITE_OK) {
+                                    sqlite3_bind_int(pst, 1, (int)factory_id);
+                                    sqlite3_bind_int(pst, 2, ch_slot + 1);
+                                    if (sqlite3_step(pst) == SQLITE_ROW) {
+                                        const char *pk_hex =
+                                            (const char *)sqlite3_column_text(pst, 0);
+                                        if (pk_hex && strlen(pk_hex) == 66) {
+                                            unsigned char pb[33];
+                                            int ok2 = 1;
+                                            for (int b2 = 0; b2 < 33 && ok2; b2++) {
+                                                unsigned char h2 = nibble(pk_hex[2*b2]);
+                                                unsigned char l2 = nibble(pk_hex[2*b2+1]);
+                                                if (h2 == 0xFF || l2 == 0xFF)
+                                                    ok2 = 0;
+                                                else
+                                                    pb[b2] = (unsigned char)(h2 << 4 | l2);
+                                            }
+                                            if (ok2 && secp256k1_ec_pubkey_parse(
+                                                    ctx, &client_pub, pb, 33))
+                                                have_client = 1;
+                                        }
+                                    }
+                                    sqlite3_finalize(pst);
+                                }
+                            }
+                            sqlite3_finalize(cst);
+                        }
+                    }
+                    if (!have_client) break;
+
+                    /* Reconstruct output key: taptweak(MuSig2(client,LSP), CLTV_leaf) */
+                    secp256k1_pubkey pks[2] = { client_pub, lsp_pub };
+                    musig_keyagg_t ka;
+                    if (!musig_aggregate_keys(ctx, &ka, pks, 2)) break;
+
+                    tapscript_leaf_t cltv_leaf;
+                    if (!tapscript_build_cltv_timeout(&cltv_leaf, cltv_timeout,
+                                                       &lsp_xonly, ctx)) break;
+
+                    unsigned char merkle_root[32];
+                    tapscript_merkle_root(merkle_root, &cltv_leaf, 1);
+
+                    secp256k1_xonly_pubkey tweaked;
+                    int parity = 0;
+                    if (!tapscript_tweak_pubkey(ctx, &tweaked, &parity,
+                                                 &ka.agg_pubkey, merkle_root)) break;
+
+                    unsigned char tweaked_bytes[32];
+                    secp256k1_xonly_pubkey_serialize(ctx, tweaked_bytes, &tweaked);
+                    if (memcmp(tweaked_bytes, spks[vout] + 2, 32) != 0) break;
+
+                    /* Key matches: this is a CLTV output */
+                    handled = 1;
+                    int block_height = chain ? chain->get_block_height(chain) : 0;
+                    if (block_height < (int)cltv_timeout) {
+                        cJSON_AddStringToObject(entry, "status", "cltv_not_mature");
+                        cJSON_AddNumberToObject(entry, "cltv_timeout",
+                                                (double)cltv_timeout);
+                        cJSON_AddNumberToObject(entry, "current_height",
+                                                (double)block_height);
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+                    if (amounts[vout] <= fee_sats) {
+                        cJSON_AddStringToObject(entry, "status", "insufficient_funds");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+                    if (dry_run || !chain || !dest_spk || dest_spk_len == 0) {
+                        cJSON_AddStringToObject(entry, "status", "dry_run_cltv");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* Build unsigned sweep TX */
+                    tx_output_t sweep_out;
+                    sweep_out.amount_sats = amounts[vout] - fee_sats;
+                    size_t splen = dest_spk_len < 34 ? dest_spk_len : 34;
+                    memcpy(sweep_out.script_pubkey, dest_spk, splen);
+                    sweep_out.script_pubkey_len = splen;
+
+                    tx_buf_t unsigned_tx2;
+                    tx_buf_init(&unsigned_tx2, 512);
+                    int built2 = build_unsigned_tx_with_locktime(
+                        &unsigned_tx2, NULL,
+                        txid_internal, (uint32_t)vout,
+                        0xFFFFFFFE, cltv_timeout,
+                        &sweep_out, 1);
+                    if (!built2 || unsigned_tx2.oom) {
+                        tx_buf_free(&unsigned_tx2);
+                        cJSON_AddStringToObject(entry, "status", "build_failed");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* BIP-342 script-path sighash */
+                    unsigned char sighash2[32];
+                    int sh2_ok = compute_tapscript_sighash(
+                        sighash2,
+                        unsigned_tx2.data, unsigned_tx2.len,
+                        0,
+                        spks[vout], spk_lens[vout],
+                        amounts[vout], 0xFFFFFFFE,
+                        &cltv_leaf);
+                    if (!sh2_ok) {
+                        tx_buf_free(&unsigned_tx2);
+                        cJSON_AddStringToObject(entry, "status", "sighash_failed");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* Sign with LSP key (the key inside the CLTV script) */
+                    unsigned char sig2[64];
+                    unsigned char aux2[32] = {0};
+                    if (!secp256k1_schnorrsig_sign32(ctx, sig2, sighash2,
+                                                      &lsp_kp, aux2)) {
+                        tx_buf_free(&unsigned_tx2);
+                        cJSON_AddStringToObject(entry, "status", "sign_failed");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* Control block: (0xC0|parity) || internal_xonly[32] */
+                    unsigned char ctrl[33];
+                    size_t ctrl_len = 0;
+                    if (!tapscript_build_control_block(ctrl, &ctrl_len, parity,
+                                                        &ka.agg_pubkey, ctx)) {
+                        tx_buf_free(&unsigned_tx2);
+                        cJSON_AddStringToObject(entry, "status", "ctrl_failed");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* Finalize script-path witness: [sig, script, control_block] */
+                    tx_buf_t signed_tx2;
+                    tx_buf_init(&signed_tx2, unsigned_tx2.len + 200);
+                    int fin2 = finalize_script_path_tx(
+                        &signed_tx2,
+                        unsigned_tx2.data, unsigned_tx2.len,
+                        sig2,
+                        cltv_leaf.script, cltv_leaf.script_len,
+                        ctrl, ctrl_len);
+                    tx_buf_free(&unsigned_tx2);
+                    if (!fin2 || signed_tx2.oom) {
+                        tx_buf_free(&signed_tx2);
+                        cJSON_AddStringToObject(entry, "status", "finalize_failed");
+                        cJSON_AddItemToArray(results, entry);
+                        break;
+                    }
+
+                    /* Hex-encode, broadcast, log */
+                    size_t hlen2 = signed_tx2.len * 2 + 1;
+                    char *tx_hex2 = malloc(hlen2);
+                    if (tx_hex2)
+                        hex_encode(signed_tx2.data, signed_tx2.len, tx_hex2);
+                    char rtxid2[65] = {0};
+                    int bcast2 = chain->send_raw_tx(chain, tx_hex2, rtxid2);
+                    char src2[52];
+                    snprintf(src2, sizeof(src2), "cltvsweep%u_n%d_v%d",
+                             factory_id, node_idx, vout);
+                    persist_log_broadcast(p,
+                        rtxid2[0] ? rtxid2 : txid,
+                        src2,
+                        tx_hex2 ? tx_hex2 : "",
+                        bcast2 ? "ok" : "failed");
+                    free(tx_hex2);
+                    tx_buf_free(&signed_tx2);
+
+                    if (bcast2) {
+                        cJSON_AddStringToObject(entry, "status", "swept_cltv");
+                        cJSON_AddStringToObject(entry, "sweep_txid", rtxid2);
+                        printf("CLTV sweep: factory %u node %d vout %d -> %s\n",
+                               factory_id, node_idx, vout, rtxid2);
+                        fflush(stdout);
+                    } else {
+                        cJSON_AddStringToObject(entry, "status", "broadcast_failed");
+                    }
+                    cJSON_AddItemToArray(results, entry);
+                } while (0);
+
+                if (!handled) {
+                    cJSON_AddStringToObject(entry, "status", "requires_client_key");
+                    cJSON_AddItemToArray(results, entry);
+                }
                 continue;
             }
 

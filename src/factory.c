@@ -318,25 +318,47 @@ static int setup_leaf_outputs(
 
     node->n_outputs = 3;
 
-    /* Channel A: MuSig(client_a, LSP) */
+    /*
+     * Build the CLTV recovery merkle root for channel outputs (once, reused
+     * for both channels on this leaf node).  When cltv_timeout > 0 we embed a
+     * single-leaf taptree whose script is:
+     *   <cltv_timeout> OP_CLTV OP_DROP <lsp_xonly> OP_CHECKSIG
+     * so the LSP can sweep the output unilaterally after the factory expires,
+     * without requiring the client to cooperate.  When cltv_timeout == 0 the
+     * outputs remain key-path-only (pure MuSig2 spend).
+     */
+    unsigned char chan_cltv_merkle[32];
+    tapscript_leaf_t chan_cltv_leaf;
+    const unsigned char *chan_merkle_root = NULL;
+    if (f->cltv_timeout > 0) {
+        secp256k1_xonly_pubkey lsp_xonly;
+        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
+            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
+                                         &lsp_xonly, f->ctx)) {
+            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
+            chan_merkle_root = chan_cltv_merkle;
+        }
+    }
+
+    /* Channel A: MuSig(client_a, LSP) [+ CLTV recovery leaf] */
     {
         secp256k1_pubkey pks[2] = { f->pubkeys[client_a_idx], f->pubkeys[0] };
         musig_keyagg_t ka;
         secp256k1_xonly_pubkey tw;
         if (!build_musig_p2tr_spk(f->ctx, node->outputs[0].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, NULL))
+                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
         node->outputs[0].amount_sats = per_output;
     }
 
-    /* Channel B: MuSig(client_b, LSP) */
+    /* Channel B: MuSig(client_b, LSP) [+ CLTV recovery leaf] */
     {
         secp256k1_pubkey pks[2] = { f->pubkeys[client_b_idx], f->pubkeys[0] };
         musig_keyagg_t ka;
         secp256k1_xonly_pubkey tw;
         if (!build_musig_p2tr_spk(f->ctx, node->outputs[1].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, NULL))
+                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
             return 0;
         node->outputs[1].script_pubkey_len = 34;
         node->outputs[1].amount_sats = per_output;
