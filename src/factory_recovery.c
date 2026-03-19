@@ -179,23 +179,34 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
     int funding_confs = get_confs(chain, funding_txid);
     refresh_confs(chain, nodes, n);
 
+    /* Track which nodes were broadcast this call to avoid re-sending the
+     * same TX repeatedly when it is already in the mempool (send_raw_tx
+     * can succeed multiple times for a mempool TX, which would spin the
+     * progress loop forever). */
+    int broadcast_done[FR_MAX_NODES];
+    memset(broadcast_done, 0, sizeof(broadcast_done));
+
     int total_broadcast = 0;
     int progress = 1;
     while (progress) {
         progress = 0;
         for (int i = 0; i < n; i++) {
             fr_node_t *nd = &nodes[i];
-            if (nd->confs >= 1) continue;    /* already confirmed */
+            /* Skip if already confirmed or already broadcast this call */
+            if (nd->confs >= 1 || broadcast_done[i]) continue;
             if (!nd->signed_tx_hex) continue; /* not yet signed — skip */
 
-            /* Determine whether parent is confirmed */
+            /* Determine whether parent is confirmed (or just broadcast
+             * this call — in-mempool parent is sufficient for child). */
             int parent_ok = 0;
             if (nd->parent_index < 0) {
                 /* Root node: depends on the factory funding TX */
                 parent_ok = (funding_confs >= 1);
             } else {
                 fr_node_t *par = find_node(nodes, n, nd->parent_index);
-                parent_ok = par && (par->confs >= 1);
+                int par_i = par ? (int)(par - nodes) : -1;
+                parent_ok = par && ((par->confs >= 1) ||
+                                    (par_i >= 0 && broadcast_done[par_i]));
             }
             if (!parent_ok) continue;
 
@@ -203,6 +214,7 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
             if (ok) {
                 /* Treat as in-mempool so children can be queued in same pass */
                 nd->confs = 0;
+                broadcast_done[i] = 1;
                 total_broadcast++;
                 progress = 1;
             }
