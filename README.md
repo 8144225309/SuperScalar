@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.2.0 — 890 tests (848 unit + 42 regtest + 36 orchestrator), full BOLT 2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, onion routing, Dijkstra pathfinding, PTLC state machine, gossip, async factory rotation, watchtower, BIP 39 restore.
+> v0.1.7 — 890 tests (848 unit + 42 regtest + 36 orchestrator), full BOLT 2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, onion routing, Dijkstra pathfinding, PTLC state machine, gossip, async factory rotation, watchtower, BIP 39 restore.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
