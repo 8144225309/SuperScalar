@@ -96,8 +96,8 @@ def _find_bitcoin_cli():
     found = shutil.which("bitcoin-cli")
     if found:
         return found
-    # Common WSL / Linux install paths
-    for p in ["/home/pirq/bin/bitcoin-cli", "/usr/local/bin/bitcoin-cli",
+    # Common Linux install paths
+    for p in ["/usr/local/bin/bitcoin-cli",
                "/usr/bin/bitcoin-cli", os.path.expanduser("~/bin/bitcoin-cli")]:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
