@@ -631,6 +631,20 @@ extern int test_omr_peel_truncated(void);
 extern int test_omr_build_hop_null_safety(void);
 extern int test_omr_peel_null_safety(void);
 extern int test_omr_next_path_key_null_safety(void);
+/* PR #49: Deadline-Aware HTLC Fee Bumper (LND LinearFeeFunction) */
+extern int test_hfb_init_fields(void);
+extern int test_hfb_feerate_at_start(void);
+extern int test_hfb_feerate_at_deadline(void);
+extern int test_hfb_feerate_midpoint(void);
+extern int test_hfb_feerate_past_deadline(void);
+extern int test_hfb_should_bump_initial(void);
+extern int test_hfb_should_bump_recent(void);
+extern int test_hfb_should_bump_urgent(void);
+extern int test_hfb_is_urgent(void);
+extern int test_hfb_blocks_remaining(void);
+extern int test_hfb_confirm(void);
+extern int test_hfb_budget_limits_max(void);
+extern int test_hfb_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -2102,6 +2116,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_omr_build_hop_null_safety);
     RUN_TEST(test_omr_peel_null_safety);
     RUN_TEST(test_omr_next_path_key_null_safety);
+
+    printf("\n=== PR #49: Deadline-Aware HTLC Fee Bumper (LND LinearFeeFunction) ===\n");
+    RUN_TEST(test_hfb_init_fields);
+    RUN_TEST(test_hfb_feerate_at_start);
+    RUN_TEST(test_hfb_feerate_at_deadline);
+    RUN_TEST(test_hfb_feerate_midpoint);
+    RUN_TEST(test_hfb_feerate_past_deadline);
+    RUN_TEST(test_hfb_should_bump_initial);
+    RUN_TEST(test_hfb_should_bump_recent);
+    RUN_TEST(test_hfb_should_bump_urgent);
+    RUN_TEST(test_hfb_is_urgent);
+    RUN_TEST(test_hfb_blocks_remaining);
+    RUN_TEST(test_hfb_confirm);
+    RUN_TEST(test_hfb_budget_limits_max);
+    RUN_TEST(test_hfb_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
