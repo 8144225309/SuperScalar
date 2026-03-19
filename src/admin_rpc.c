@@ -3,7 +3,7 @@
  *
  * Methods: getinfo, listpeers, listchannels, listpayments, listinvoices,
  *          createinvoice, pay, keysend, openchannel, closechannel,
- *          getroute, feerates, stop
+ *          getroute, feerates, listfactories, recoverfactory, stop
  *
  * Transport: one newline-terminated JSON request per connection.
  * Auth: Unix file-system permissions on the socket file.
@@ -14,10 +14,13 @@
 #include "superscalar/admin_rpc.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/chan_close.h"
+#include "superscalar/factory_recovery.h"
 #include "superscalar/invoice.h"
 #include "superscalar/payment.h"
 #include "superscalar/peer_mgr.h"
 #include "superscalar/pathfind.h"
+#include "superscalar/persist.h"
+#include "superscalar/watchtower.h"
 #include <cJSON.h>
 #include <secp256k1.h>
 #include <string.h>
@@ -540,6 +543,52 @@ static cJSON *method_feerates(admin_rpc_t *rpc)
 }
 
 /* ------------------------------------------------------------------ */
+/* Method: listfactories                                                 */
+/* ------------------------------------------------------------------ */
+static cJSON *method_listfactories(admin_rpc_t *rpc)
+{
+    persist_t       *p     = rpc->channel_mgr
+                             ? (persist_t *)rpc->channel_mgr->persist : NULL;
+    chain_backend_t *chain = (rpc->channel_mgr && rpc->channel_mgr->watchtower)
+                             ? rpc->channel_mgr->watchtower->chain : NULL;
+    return factory_recovery_list(p, chain);
+}
+
+/* ------------------------------------------------------------------ */
+/* Method: recoverfactory                                               */
+/* ------------------------------------------------------------------ */
+static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
+                                    char *errmsg, size_t errcap)
+{
+    persist_t       *p     = rpc->channel_mgr
+                             ? (persist_t *)rpc->channel_mgr->persist : NULL;
+    chain_backend_t *chain = (rpc->channel_mgr && rpc->channel_mgr->watchtower)
+                             ? rpc->channel_mgr->watchtower->chain : NULL;
+    if (!p) {
+        snprintf(errmsg, errcap, "persist not available");
+        return NULL;
+    }
+
+    uint32_t factory_id = 0;
+    if (cJSON_IsObject(params)) {
+        cJSON *f = cJSON_GetObjectItemCaseSensitive(params, "factory_id");
+        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+    } else if (cJSON_IsArray(params)) {
+        cJSON *f = cJSON_GetArrayItem(params, 0);
+        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+    }
+
+    char status[256] = {0};
+    int ok = factory_recovery_run(p, chain, factory_id, status, sizeof(status));
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "factory_id",       (double)factory_id);
+    cJSON_AddStringToObject(r, "status",           status[0] ? status : "no action needed");
+    cJSON_AddBoolToObject  (r, "broadcasts_made",  ok);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
 /* Method: stop                                                          */
 /* ------------------------------------------------------------------ */
 static cJSON *method_stop(admin_rpc_t *rpc)
@@ -604,6 +653,10 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_getroute(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "feerates") == 0) {
         result = method_feerates(rpc);
+    } else if (strcmp(m, "listfactories") == 0) {
+        result = method_listfactories(rpc);
+    } else if (strcmp(m, "recoverfactory") == 0) {
+        result = method_recoverfactory(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
     } else {

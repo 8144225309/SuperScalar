@@ -21,6 +21,8 @@
  * AR18: listpayments empty → empty array
  * AR19: closechannel unknown id → error response
  * AR20: openchannel → error response (deferred to PR#28)
+ * AR21: listfactories with no persist → returns empty array
+ * AR22: recoverfactory with no persist → returns error
  */
 
 #include "superscalar/admin_rpc.h"
@@ -507,6 +509,44 @@ int test_admin_rpc_openchannel_deferred(void)
     cJSON *r = cJSON_Parse(out);
     cJSON *err = cJSON_GetObjectItemCaseSensitive(r, "error");
     ASSERT(cJSON_IsObject(err), "AR20: openchannel returns error (pending PR#28)");
+    cJSON_Delete(r);
+    return 1;
+}
+
+/* ================================================================== */
+/* AR21 — listfactories with no channel_mgr → empty array             */
+/* ================================================================== */
+int test_admin_rpc_listfactories_no_persist(void)
+{
+    admin_rpc_t rpc; memset(&rpc, 0, sizeof(rpc)); rpc.listen_fd = -1;
+    char out[512];
+    dispatch(&rpc,
+        "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"listfactories\",\"params\":{}}",
+        out, sizeof(out));
+    cJSON *r = cJSON_Parse(out);
+    ASSERT(r, "AR21: parse response");
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(r, "result");
+    ASSERT(cJSON_IsArray(res), "AR21: listfactories returns array when persist=NULL");
+    ASSERT(cJSON_GetArraySize(res) == 0, "AR21: empty array when no factories");
+    cJSON_Delete(r);
+    return 1;
+}
+
+/* ================================================================== */
+/* AR22 — recoverfactory with no persist → error response             */
+/* ================================================================== */
+int test_admin_rpc_recoverfactory_no_persist(void)
+{
+    admin_rpc_t rpc; memset(&rpc, 0, sizeof(rpc)); rpc.listen_fd = -1;
+    char out[512];
+    dispatch(&rpc,
+        "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"recoverfactory\","
+        "\"params\":{\"factory_id\":0}}",
+        out, sizeof(out));
+    cJSON *r = cJSON_Parse(out);
+    ASSERT(r, "AR22: parse response");
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(r, "error");
+    ASSERT(cJSON_IsObject(err), "AR22: error when persist not available");
     cJSON_Delete(r);
     return 1;
 }

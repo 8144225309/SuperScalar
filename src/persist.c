@@ -700,6 +700,19 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     return 1;
 }
 
+int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE factories SET state='closed' WHERE id=?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
