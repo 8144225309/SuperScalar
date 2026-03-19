@@ -360,6 +360,18 @@ extern int test_admin_rpc_listpayments_empty(void);
 extern int test_admin_rpc_closechannel_unknown(void);
 extern int test_admin_rpc_openchannel_deferred(void);
 
+/* PR #31: Liquidity Advertisements */
+extern int test_liqad_tlv_roundtrip(void);
+extern int test_liqad_compact_deterministic(void);
+extern int test_liqad_fee_calc(void);
+extern int test_liqad_lease_request_roundtrip(void);
+extern int test_liqad_parse_truncated(void);
+extern int test_liqad_wrong_type(void);
+extern int test_liqad_fee_zero_rate(void);
+extern int test_liqad_null_ad(void);
+extern int test_liqad_node_announcement(void);
+extern int test_liqad_node_announcement_no_ad(void);
+
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
 extern int test_splice_wire_ack(void);
@@ -1564,6 +1576,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_listpayments_empty);
     RUN_TEST(test_admin_rpc_closechannel_unknown);
     RUN_TEST(test_admin_rpc_openchannel_deferred);
+
+    printf("\n=== PR #31: Liquidity Advertisements ===\n");
+    RUN_TEST(test_liqad_tlv_roundtrip);
+    RUN_TEST(test_liqad_compact_deterministic);
+    RUN_TEST(test_liqad_fee_calc);
+    RUN_TEST(test_liqad_lease_request_roundtrip);
+    RUN_TEST(test_liqad_parse_truncated);
+    RUN_TEST(test_liqad_wrong_type);
+    RUN_TEST(test_liqad_fee_zero_rate);
+    RUN_TEST(test_liqad_null_ad);
+    RUN_TEST(test_liqad_node_announcement);
+    RUN_TEST(test_liqad_node_announcement_no_ad);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);
