@@ -61,4 +61,39 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
                          uint32_t factory_id,
                          char *status_out, size_t cap);
 
+/*
+ * Sweep unspent leaf outputs of a specific factory.
+ *
+ * Finds all confirmed leaf state TXs, parses their outputs, and for each
+ * unspent output whose P2TR key matches the LSP's x-only pubkey attempts a
+ * key-path Schnorr spend sending funds to dest_spk.
+ *
+ * Precision: only sweeps outputs where the LSP is the sole key-path signer.
+ * MuSig2 (client+LSP) outputs are reported as "requires_client_key" without
+ * attempting a broadcast.
+ *
+ * Parameters:
+ *   ctx           — secp256k1 context (SIGN|VERIFY)
+ *   lsp_seckey32  — LSP's 32-byte private key
+ *   factory_id    — which factory to sweep
+ *   dest_spk      — destination scriptPubKey (e.g. P2TR of LSP wallet)
+ *   dest_spk_len  — length of dest_spk (34 for P2TR)
+ *   fee_sats      — fee per sweep TX (flat)
+ *   dry_run       — 1 = report only, 0 = broadcast
+ *
+ * Returns a JSON array of per-output result objects:
+ *   {txid, vout, amount_sats, spk_hex, status}
+ * where status is one of: "swept", "dry_run", "requires_client_key",
+ *   "insufficient_funds", "broadcast_failed", "already_spent".
+ * Caller must cJSON_Delete() the result.
+ */
+cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
+                         secp256k1_context *ctx,
+                         const unsigned char *lsp_seckey32,
+                         uint32_t factory_id,
+                         const unsigned char *dest_spk,
+                         size_t dest_spk_len,
+                         uint64_t fee_sats,
+                         int dry_run);
+
 #endif /* SUPERSCALAR_FACTORY_RECOVERY_H */

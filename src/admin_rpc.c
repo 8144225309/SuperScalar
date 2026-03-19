@@ -3,7 +3,8 @@
  *
  * Methods: getinfo, listpeers, listchannels, listpayments, listinvoices,
  *          createinvoice, pay, keysend, openchannel, closechannel,
- *          getroute, feerates, listfactories, recoverfactory, stop
+ *          getroute, feerates, listfactories, recoverfactory, sweepfactory,
+ *          stop
  *
  * Transport: one newline-terminated JSON request per connection.
  * Auth: Unix file-system permissions on the socket file.
@@ -589,6 +590,86 @@ static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
 }
 
 /* ------------------------------------------------------------------ */
+/* Method: sweepfactory                                                  */
+/* ------------------------------------------------------------------ */
+/*
+ * Params (object):
+ *   factory_id   — uint32, required
+ *   dest_spk_hex — hex-encoded scriptPubKey for sweep destination, required
+ *   fee_sats     — uint64, sat fee per sweep TX (default 500)
+ *   dry_run      — bool, 1 = report only, 0 = broadcast (default 1)
+ *
+ * Returns JSON array of per-output results from factory_sweep_run().
+ */
+static cJSON *method_sweepfactory(admin_rpc_t *rpc, const cJSON *params,
+                                   char *errmsg, size_t errcap)
+{
+    persist_t       *p     = rpc->channel_mgr
+                             ? (persist_t *)rpc->channel_mgr->persist : NULL;
+    chain_backend_t *chain = (rpc->channel_mgr && rpc->channel_mgr->watchtower)
+                             ? rpc->channel_mgr->watchtower->chain : NULL;
+    if (!p) {
+        snprintf(errmsg, errcap, "persist not available");
+        return NULL;
+    }
+
+    uint32_t    factory_id   = 0;
+    const char *dest_spk_hex = NULL;
+    uint64_t    fee_sats     = 500;
+    int         dry_run      = 1;
+
+    if (cJSON_IsObject(params)) {
+        cJSON *f = cJSON_GetObjectItemCaseSensitive(params, "factory_id");
+        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+        cJSON *d = cJSON_GetObjectItemCaseSensitive(params, "dest_spk_hex");
+        if (cJSON_IsString(d)) dest_spk_hex = d->valuestring;
+        cJSON *fee = cJSON_GetObjectItemCaseSensitive(params, "fee_sats");
+        if (cJSON_IsNumber(fee)) fee_sats = (uint64_t)fee->valuedouble;
+        cJSON *dr = cJSON_GetObjectItemCaseSensitive(params, "dry_run");
+        if (cJSON_IsBool(dr)) dry_run = cJSON_IsTrue(dr) ? 1 : 0;
+        else if (cJSON_IsNumber(dr)) dry_run = (int)dr->valuedouble ? 1 : 0;
+    } else if (cJSON_IsArray(params)) {
+        cJSON *f = cJSON_GetArrayItem(params, 0);
+        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+        cJSON *d = cJSON_GetArrayItem(params, 1);
+        if (cJSON_IsString(d)) dest_spk_hex = d->valuestring;
+        cJSON *fee = cJSON_GetArrayItem(params, 2);
+        if (cJSON_IsNumber(fee)) fee_sats = (uint64_t)fee->valuedouble;
+        cJSON *dr = cJSON_GetArrayItem(params, 3);
+        if (cJSON_IsNumber(dr)) dry_run = (int)dr->valuedouble ? 1 : 0;
+    }
+
+    if (!dest_spk_hex) {
+        snprintf(errmsg, errcap, "missing dest_spk_hex parameter");
+        return NULL;
+    }
+    size_t hex_len = strlen(dest_spk_hex);
+    if (hex_len < 2 || hex_len > 68 || hex_len % 2 != 0) {
+        snprintf(errmsg, errcap, "dest_spk_hex must be 2-68 hex chars (even length)");
+        return NULL;
+    }
+    size_t spk_len = hex_len / 2;
+    unsigned char dest_spk[34];
+    if (!hex_to_bytes(dest_spk_hex, dest_spk, spk_len)) {
+        snprintf(errmsg, errcap, "invalid dest_spk_hex");
+        return NULL;
+    }
+
+    cJSON *arr = factory_sweep_run(p, chain,
+                                   rpc->ctx,
+                                   rpc->node_privkey,
+                                   factory_id,
+                                   dest_spk, spk_len,
+                                   fee_sats,
+                                   dry_run);
+    if (!arr) {
+        snprintf(errmsg, errcap, "sweep failed (factory %u not found or no leaf nodes)",
+                 factory_id);
+    }
+    return arr;
+}
+
+/* ------------------------------------------------------------------ */
 /* Method: stop                                                          */
 /* ------------------------------------------------------------------ */
 static cJSON *method_stop(admin_rpc_t *rpc)
@@ -657,6 +738,8 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_listfactories(rpc);
     } else if (strcmp(m, "recoverfactory") == 0) {
         result = method_recoverfactory(rpc, params, errmsg, sizeof(errmsg));
+    } else if (strcmp(m, "sweepfactory") == 0) {
+        result = method_sweepfactory(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
     } else {
