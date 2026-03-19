@@ -450,6 +450,21 @@ extern int test_lnurl_bip353_parse_offer(void);
 extern int test_lnurl_bip353_validate(void);
 extern int test_lnurl_encode_edge_cases(void);
 extern int test_lnurl_decode_edge_cases(void);
+/* PR #36: Hold Invoices (async payment delivery) */
+extern int test_hold_invoice_init(void);
+extern int test_hold_invoice_add(void);
+extern int test_hold_invoice_table_full(void);
+extern int test_hold_invoice_accept(void);
+extern int test_hold_invoice_underpay(void);
+extern int test_hold_invoice_settle(void);
+extern int test_hold_invoice_settle_wrong_preimage(void);
+extern int test_hold_invoice_double_settle(void);
+extern int test_hold_invoice_cancel(void);
+extern int test_hold_invoice_cancel_after_settle(void);
+extern int test_hold_invoice_unknown_htlc(void);
+extern int test_hold_invoice_remove(void);
+extern int test_hold_invoice_null_safety(void);
+extern int test_hold_invoice_any_amount(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1727,6 +1742,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lnurl_bip353_validate);
     RUN_TEST(test_lnurl_encode_edge_cases);
     RUN_TEST(test_lnurl_decode_edge_cases);
+
+    printf("\n=== PR #36: Hold Invoices (async payment delivery) ===\n");
+    RUN_TEST(test_hold_invoice_init);
+    RUN_TEST(test_hold_invoice_add);
+    RUN_TEST(test_hold_invoice_table_full);
+    RUN_TEST(test_hold_invoice_accept);
+    RUN_TEST(test_hold_invoice_underpay);
+    RUN_TEST(test_hold_invoice_settle);
+    RUN_TEST(test_hold_invoice_settle_wrong_preimage);
+    RUN_TEST(test_hold_invoice_double_settle);
+    RUN_TEST(test_hold_invoice_cancel);
+    RUN_TEST(test_hold_invoice_cancel_after_settle);
+    RUN_TEST(test_hold_invoice_unknown_htlc);
+    RUN_TEST(test_hold_invoice_remove);
+    RUN_TEST(test_hold_invoice_null_safety);
+    RUN_TEST(test_hold_invoice_any_amount);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
