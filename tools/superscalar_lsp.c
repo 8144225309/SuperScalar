@@ -3997,9 +3997,11 @@ int main(int argc, char *argv[]) {
             printf("Bridge: invoice registered for client %zu (amount=%llu msat)\n",
                    dest_client, (unsigned long long)amount_msat);
 
-            /* Send MSG_BRIDGE_ADD_HTLC from bridge side */
+            /* Send MSG_BRIDGE_ADD_HTLC from bridge side.
+               cltv must be above current chain tip — use +144 blocks. */
+            uint32_t bridge_cltv = (uint32_t)regtest_get_block_height(&rt) + 144;
             cJSON *add_msg = wire_build_bridge_add_htlc(test_hash,
-                                                           amount_msat, 500, 42);
+                                                           amount_msat, bridge_cltv, 42);
             if (!wire_send(bridge_test_fd, MSG_BRIDGE_ADD_HTLC, add_msg)) {
                 fprintf(stderr, "BRIDGE TEST: send ADD_HTLC failed\n");
                 cJSON_Delete(add_msg);
