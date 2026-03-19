@@ -645,6 +645,20 @@ extern int test_hfb_blocks_remaining(void);
 extern int test_hfb_confirm(void);
 extern int test_hfb_budget_limits_max(void);
 extern int test_hfb_null_safety(void);
+/* PR #50: BOLT #4 Onion Failure Message Parser */
+extern int test_bf_temporary_channel_failure(void);
+extern int test_bf_channel_disabled(void);
+extern int test_bf_permanent_channel_failure(void);
+extern int test_bf_invalid_onion_hmac(void);
+extern int test_bf_unknown_payment_hash(void);
+extern int test_bf_amount_below_minimum(void);
+extern int test_bf_incorrect_payment_details(void);
+extern int test_bf_is_permanent_codes(void);
+extern int test_bf_is_node_failure_codes(void);
+extern int test_bf_incorrect_cltv_expiry(void);
+extern int test_bf_failure_str(void);
+extern int test_bf_fee_insufficient(void);
+extern int test_bf_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -2131,6 +2145,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hfb_confirm);
     RUN_TEST(test_hfb_budget_limits_max);
     RUN_TEST(test_hfb_null_safety);
+
+    printf("\n=== PR #50: BOLT #4 Onion Failure Message Parser ===\n");
+    RUN_TEST(test_bf_temporary_channel_failure);
+    RUN_TEST(test_bf_channel_disabled);
+    RUN_TEST(test_bf_permanent_channel_failure);
+    RUN_TEST(test_bf_invalid_onion_hmac);
+    RUN_TEST(test_bf_unknown_payment_hash);
+    RUN_TEST(test_bf_amount_below_minimum);
+    RUN_TEST(test_bf_incorrect_payment_details);
+    RUN_TEST(test_bf_is_permanent_codes);
+    RUN_TEST(test_bf_is_node_failure_codes);
+    RUN_TEST(test_bf_incorrect_cltv_expiry);
+    RUN_TEST(test_bf_failure_str);
+    RUN_TEST(test_bf_fee_insufficient);
+    RUN_TEST(test_bf_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
