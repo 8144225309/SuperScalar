@@ -349,7 +349,7 @@ int htlc_commit_recv_update_fee(channel_t *ch,
     uint32_t feerate = get_u32(msg + 34); /* after type(2) + channel_id(32) */
     if (feerate < feerate_floor || feerate > feerate_ceiling) return 0;
 
-    ch->fee_rate_sat_per_kvb = (uint64_t)feerate;
+    ch->fee_rate_sat_per_kvb = (uint64_t)feerate * 4; /* sat/kw -> sat/kvb */
     return 1;
 }
 
@@ -604,7 +604,7 @@ int htlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
         uint32_t feerate = get_u32(payload + 32);
         if (feerate < BOLT2_UPDATE_FEE_FLOOR || feerate > BOLT2_UPDATE_FEE_CEILING)
             return -1;
-        ch->fee_rate_sat_per_kvb = (uint64_t)feerate;
+        ch->fee_rate_sat_per_kvb = (uint64_t)feerate * 4; /* sat/kw -> sat/kvb */
         return type;
     }
 

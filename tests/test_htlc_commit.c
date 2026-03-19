@@ -614,7 +614,7 @@ int test_htlc_commit_update_fee_layout(void) {
     ASSERT(rd32(buf + 34) == 1000U, "feerate_per_kw at offset 34");
 
     /* Bounds: floor=250, ceiling=100000 */
-    ASSERT(BOLT2_UPDATE_FEE_FLOOR  == 250,    "floor = 250");
+    ASSERT(BOLT2_UPDATE_FEE_FLOOR  == 25,     "floor = 25 sat/kw (0.1 sat/vB)");
     ASSERT(BOLT2_UPDATE_FEE_CEILING == 100000, "ceiling = 100000");
 
     return 1;
@@ -640,7 +640,7 @@ int test_htlc_commit_recv_update_fee_accepts(void) {
                                           BOLT2_UPDATE_FEE_FLOOR,
                                           BOLT2_UPDATE_FEE_CEILING);
     ASSERT(ok == 1, "valid feerate accepted");
-    ASSERT(ch.fee_rate_sat_per_kvb == 5000, "fee_rate updated to 5000");
+    ASSERT(ch.fee_rate_sat_per_kvb == 20000, "fee_rate updated to 20000 sat/kvb (5000 sat/kw * 4)");
 
     return 1;
 }
@@ -657,12 +657,12 @@ int test_htlc_commit_recv_update_fee_rejects_low(void) {
     unsigned char msg[38];
     memset(msg, 0, sizeof(msg));
     wr16(msg, BOLT2_UPDATE_FEE);
-    wr32(msg + 34, 100U);  /* below BOLT2_UPDATE_FEE_FLOOR = 250 */
+    wr32(msg + 34, 10U);   /* below BOLT2_UPDATE_FEE_FLOOR = 25 */
 
     int ok = htlc_commit_recv_update_fee(&ch, msg, sizeof(msg),
                                           BOLT2_UPDATE_FEE_FLOOR,
                                           BOLT2_UPDATE_FEE_CEILING);
-    ASSERT(ok == 0, "feerate 100 (below floor 250) rejected");
+    ASSERT(ok == 0, "feerate 10 (below floor 25) rejected");
     ASSERT(ch.fee_rate_sat_per_kvb == 1000, "fee_rate unchanged on rejection");
 
     /* Edge case: exactly at floor is accepted */
