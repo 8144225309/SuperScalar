@@ -2659,7 +2659,7 @@ int main(int argc, char *argv[]) {
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
-        test_dual_factory || test_dw_exhibition || test_splice) {
+        test_dual_factory || test_dw_exhibition || test_splice || test_bridge) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -2755,9 +2755,10 @@ int main(int argc, char *argv[]) {
                 printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
         }
 
-        /* Set fee rate on all channels */
-        for (size_t c = 0; c < mgr->n_channels; c++)
-            mgr->entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
+        /* Do NOT override channel.fee_rate_sat_per_kvb with --fee-rate:
+           The channel commitment TX fee rate must match the client, which always
+           uses the default 1000 sat/kvB from channel_init. The --fee-rate flag
+           controls on-chain transaction fees (funding, sweep) only. */
 
         if (!lsp_channels_send_ready(mgr, &lsp)) {
             fprintf(stderr, "LSP: send CHANNEL_READY failed\n");
