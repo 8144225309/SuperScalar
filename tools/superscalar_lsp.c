@@ -5749,8 +5749,9 @@ int main(int argc, char *argv[]) {
         printf("Phase C: Creating Factory 1\n");
 
         /* Fund new factory (same address since same participants) */
+        double fund2_btc = (double)funding_sats / 100000000.0;
         char fund2_txid_hex[65];
-        if (!regtest_fund_address(&rt, fund_addr, funding_btc, fund2_txid_hex)) {
+        if (!regtest_fund_address(&rt, fund_addr, fund2_btc, fund2_txid_hex)) {
             fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
