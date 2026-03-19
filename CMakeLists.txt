@@ -170,6 +170,7 @@ add_library(superscalar
     src/gossip_ingest.c
     src/pathfind_exclude.c
     src/stateless_invoice.c
+    src/onion_msg_relay.c
     src/payment_uri.c
     src/trampoline.c
     src/hold_invoice.c
@@ -262,6 +263,7 @@ add_executable(test_superscalar
     tests/test_gossip_ingest.c
     tests/test_pathfind_exclude.c
     tests/test_stateless_invoice.c
+    tests/test_onion_msg_relay.c
     tests/test_payment_uri.c
     tests/test_trampoline.c
     tests/test_hold_invoice.c
