@@ -167,6 +167,7 @@ add_library(superscalar
     src/route_policy.c
     src/fwd_history.c
     src/htlc_accept.c
+    src/gossip_ingest.c
     src/payment_uri.c
     src/trampoline.c
     src/hold_invoice.c
@@ -256,6 +257,7 @@ add_executable(test_superscalar
     tests/test_route_policy.c
     tests/test_fwd_history.c
     tests/test_htlc_accept.c
+    tests/test_gossip_ingest.c
     tests/test_payment_uri.c
     tests/test_trampoline.c
     tests/test_hold_invoice.c
