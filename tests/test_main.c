@@ -361,6 +361,8 @@ extern int test_admin_rpc_closechannel_unknown(void);
 extern int test_admin_rpc_openchannel_deferred(void);
 extern int test_admin_rpc_listfactories_no_persist(void);
 extern int test_admin_rpc_recoverfactory_no_persist(void);
+extern int test_admin_rpc_sweepfactory_no_persist(void);
+extern int test_admin_rpc_sweepfactory_missing_dest(void);
 
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
@@ -1568,6 +1570,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_openchannel_deferred);
     RUN_TEST(test_admin_rpc_listfactories_no_persist);
     RUN_TEST(test_admin_rpc_recoverfactory_no_persist);
+    RUN_TEST(test_admin_rpc_sweepfactory_no_persist);
+    RUN_TEST(test_admin_rpc_sweepfactory_missing_dest);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);

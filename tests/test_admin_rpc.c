@@ -23,6 +23,8 @@
  * AR20: openchannel → error response (deferred to PR#28)
  * AR21: listfactories with no persist → returns empty array
  * AR22: recoverfactory with no persist → returns error
+ * AR23: sweepfactory with no persist → returns error
+ * AR24: sweepfactory missing dest_spk_hex → returns error
  */
 
 #include "superscalar/admin_rpc.h"
@@ -547,6 +549,44 @@ int test_admin_rpc_recoverfactory_no_persist(void)
     ASSERT(r, "AR22: parse response");
     cJSON *err = cJSON_GetObjectItemCaseSensitive(r, "error");
     ASSERT(cJSON_IsObject(err), "AR22: error when persist not available");
+    cJSON_Delete(r);
+    return 1;
+}
+
+/* ================================================================== */
+/* AR23 — sweepfactory with no persist → error response               */
+/* ================================================================== */
+int test_admin_rpc_sweepfactory_no_persist(void)
+{
+    admin_rpc_t rpc; memset(&rpc, 0, sizeof(rpc)); rpc.listen_fd = -1;
+    char out[512];
+    dispatch(&rpc,
+        "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"sweepfactory\","
+        "\"params\":{\"factory_id\":1,\"dest_spk_hex\":\"51200000000000000000000000000000000000000000000000000000000000000001\"}}",
+        out, sizeof(out));
+    cJSON *r = cJSON_Parse(out);
+    ASSERT(r, "AR23: parse response");
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(r, "error");
+    ASSERT(cJSON_IsObject(err), "AR23: error when persist not available");
+    cJSON_Delete(r);
+    return 1;
+}
+
+/* ================================================================== */
+/* AR24 — sweepfactory missing dest_spk_hex → error response          */
+/* ================================================================== */
+int test_admin_rpc_sweepfactory_missing_dest(void)
+{
+    admin_rpc_t rpc; memset(&rpc, 0, sizeof(rpc)); rpc.listen_fd = -1;
+    char out[512];
+    dispatch(&rpc,
+        "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"sweepfactory\","
+        "\"params\":{\"factory_id\":1}}",
+        out, sizeof(out));
+    cJSON *r = cJSON_Parse(out);
+    ASSERT(r, "AR24: parse response");
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(r, "error");
+    ASSERT(cJSON_IsObject(err), "AR24: error when dest_spk_hex missing");
     cJSON_Delete(r);
     return 1;
 }

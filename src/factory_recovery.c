@@ -12,6 +12,11 @@
 #include "superscalar/factory_recovery.h"
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
+#include "superscalar/tx_builder.h"
+#include "superscalar/types.h"
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include <sqlite3.h>
 #include <cJSON.h>
 #include <stdio.h>
@@ -355,4 +360,385 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
                  factory_id, state[0] ? state : "?", n, n == 1 ? "" : "s");
     }
     return n > 0 ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* factory_sweep_run                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Decode one hex nibble. Returns 0xFF on invalid char. */
+static unsigned char nibble(char c)
+{
+    if (c >= '0' && c <= '9') return (unsigned char)(c - '0');
+    if (c >= 'a' && c <= 'f') return (unsigned char)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (unsigned char)(c - 'A' + 10);
+    return 0xFF;
+}
+
+/* Hex-decode up to n bytes from hex into out. Returns bytes written or -1. */
+static int hex_decode(const char *hex, unsigned char *out, size_t n)
+{
+    size_t hex_len = strlen(hex);
+    if (hex_len != 2 * n) return -1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char hi = nibble(hex[2*i]);
+        unsigned char lo = nibble(hex[2*i+1]);
+        if (hi == 0xFF || lo == 0xFF) return -1;
+        out[i] = (unsigned char)(hi << 4 | lo);
+    }
+    return (int)n;
+}
+
+/* Hex-encode n bytes into out (must have room for 2n+1 bytes). */
+static void hex_encode(const unsigned char *in, size_t n, char *out)
+{
+    static const char hx[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2*i]   = hx[in[i] >> 4];
+        out[2*i+1] = hx[in[i] & 0xF];
+    }
+    out[2*n] = '\0';
+}
+
+/* Read a Bitcoin varint from buf at *pos. Advances *pos. Returns value or -1. */
+static int64_t read_varint(const unsigned char *buf, size_t len, size_t *pos)
+{
+    if (*pos >= len) return -1;
+    unsigned char first = buf[(*pos)++];
+    if (first < 0xFD) return (int64_t)first;
+    if (first == 0xFD) {
+        if (*pos + 2 > len) return -1;
+        uint16_t v = (uint16_t)buf[*pos] | ((uint16_t)buf[*pos+1] << 8);
+        *pos += 2;
+        return (int64_t)v;
+    }
+    if (first == 0xFE) {
+        if (*pos + 4 > len) return -1;
+        uint32_t v = (uint32_t)buf[*pos]       | ((uint32_t)buf[*pos+1] << 8) |
+                     ((uint32_t)buf[*pos+2] << 16) | ((uint32_t)buf[*pos+3] << 24);
+        *pos += 4;
+        return (int64_t)v;
+    }
+    /* 0xFF — 8-byte varint, uncommon in practice */
+    if (*pos + 8 > len) return -1;
+    uint64_t v = 0;
+    for (int b = 0; b < 8; b++) v |= ((uint64_t)buf[*pos+b] << (8*b));
+    *pos += 8;
+    return (int64_t)v;
+}
+
+/*
+ * Parse a raw segwit Bitcoin TX (as hex) and extract outputs.
+ * Fills amounts_out[] and spks_out[][34] up to max entries.
+ * spk_lens_out[i] is set to the actual scriptPubKey length.
+ * Returns number of outputs parsed, -1 on error.
+ */
+static int tx_parse_outputs(const char *hex,
+                             uint64_t *amounts_out,
+                             unsigned char (*spks_out)[34],
+                             size_t *spk_lens_out,
+                             int max)
+{
+    size_t hex_len = strlen(hex);
+    if (hex_len % 2 != 0) return -1;
+    size_t len = hex_len / 2;
+    unsigned char *tx = malloc(len);
+    if (!tx) return -1;
+
+    /* Hex-decode the full TX */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char hi = nibble(hex[2*i]);
+        unsigned char lo = nibble(hex[2*i+1]);
+        if (hi == 0xFF || lo == 0xFF) { free(tx); return -1; }
+        tx[i] = (unsigned char)(hi << 4 | lo);
+    }
+
+    size_t pos = 0;
+
+    /* nVersion (4 bytes) */
+    if (pos + 4 > len) { free(tx); return -1; }
+    pos += 4;
+
+    /* Segwit marker: 0x00 0x01 */
+    int segwit = 0;
+    if (pos + 2 <= len && tx[pos] == 0x00 && tx[pos+1] == 0x01) {
+        segwit = 1;
+        pos += 2;
+    }
+
+    /* Input count */
+    int64_t n_inputs = read_varint(tx, len, &pos);
+    if (n_inputs < 0) { free(tx); return -1; }
+
+    /* Skip inputs: txid(32) + vout(4) + scriptLen + script + sequence(4) */
+    for (int64_t i = 0; i < n_inputs; i++) {
+        if (pos + 36 > len) { free(tx); return -1; }
+        pos += 36;  /* txid + vout */
+        int64_t script_len = read_varint(tx, len, &pos);
+        if (script_len < 0) { free(tx); return -1; }
+        pos += (size_t)script_len + 4;  /* script + sequence */
+        if (pos > len) { free(tx); return -1; }
+    }
+
+    /* Output count */
+    int64_t n_outputs = read_varint(tx, len, &pos);
+    if (n_outputs < 0) { free(tx); return -1; }
+
+    int count = 0;
+    for (int64_t i = 0; i < n_outputs; i++) {
+        if (pos + 8 > len) { free(tx); return -1; }
+        uint64_t amount = 0;
+        for (int b = 0; b < 8; b++) amount |= ((uint64_t)tx[pos+b] << (8*b));
+        pos += 8;
+
+        int64_t spk_len = read_varint(tx, len, &pos);
+        if (spk_len < 0) { free(tx); return -1; }
+        if (pos + (size_t)spk_len > len) { free(tx); return -1; }
+
+        if (count < max) {
+            amounts_out[count] = amount;
+            size_t copy = (size_t)spk_len < 34 ? (size_t)spk_len : 34;
+            memcpy(spks_out[count], tx + pos, copy);
+            spk_lens_out[count] = copy;
+            count++;
+        }
+        pos += (size_t)spk_len;
+    }
+
+    (void)segwit;
+    free(tx);
+    return count;
+}
+
+cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
+                         secp256k1_context *ctx,
+                         const unsigned char *lsp_seckey32,
+                         uint32_t factory_id,
+                         const unsigned char *dest_spk,
+                         size_t dest_spk_len,
+                         uint64_t fee_sats,
+                         int dry_run)
+{
+    cJSON *results = cJSON_CreateArray();
+    if (!p || !p->db || !ctx || !lsp_seckey32) return results;
+
+    /* Derive LSP x-only pubkey for comparison against output keys */
+    secp256k1_pubkey lsp_pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pub, lsp_seckey32))
+        return results;
+
+    secp256k1_xonly_pubkey lsp_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pub);
+    unsigned char lsp_xonly_bytes[32];
+    secp256k1_xonly_pubkey_serialize(ctx, lsp_xonly_bytes, &lsp_xonly);
+
+    /* Build the LSP keypair for signing */
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_seckey32))
+        return results;
+
+    /* Get factory CLTV timeout (needed for nLockTime on sweep TXs) */
+    uint32_t cltv_timeout = 0;
+    {
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(p->db,
+                "SELECT cltv_timeout FROM factories WHERE id=?",
+                -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(st, 1, (int)factory_id);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                cltv_timeout = (uint32_t)sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+    }
+
+    /*
+     * Find all confirmed leaf state nodes: type='state' nodes with no
+     * children in tree_nodes (bottom of the DW tree).
+     */
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT tn.node_index, tn.txid, tn.signed_tx_hex "
+        "FROM tree_nodes tn "
+        "WHERE tn.factory_id=? AND tn.type='state' "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM tree_nodes child "
+        "    WHERE child.factory_id=tn.factory_id "
+        "      AND child.parent_index=tn.node_index"
+        "  ) "
+        "ORDER BY tn.node_index ASC";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return results;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int    node_idx  = sqlite3_column_int(stmt, 0);
+        const char *txid = (const char *)sqlite3_column_text(stmt, 1);
+        const char *hex  = (const char *)sqlite3_column_text(stmt, 2);
+
+        if (!txid || !hex || !hex[0]) continue;
+
+        /* Check this state TX is confirmed */
+        int confs = chain ? chain->get_confirmations(chain, txid) : -1;
+        if (confs < 1) continue;  /* not confirmed — skip */
+
+        /* Parse outputs from the raw TX */
+#define MAX_LEAF_OUTS 8
+        uint64_t amounts[MAX_LEAF_OUTS];
+        unsigned char spks[MAX_LEAF_OUTS][34];
+        size_t spk_lens[MAX_LEAF_OUTS];
+        int n_outs = tx_parse_outputs(hex, amounts, spks, spk_lens, MAX_LEAF_OUTS);
+        if (n_outs <= 0) continue;
+
+        /* Convert txid to internal-order bytes (display txid is reversed) */
+        unsigned char txid_internal[32];
+        if (strlen(txid) == 64) {
+            for (int b = 0; b < 32; b++) {
+                unsigned char hi = nibble(txid[2*(31-b)]);
+                unsigned char lo = nibble(txid[2*(31-b)+1]);
+                txid_internal[b] = (unsigned char)(hi << 4 | lo);
+            }
+        }
+
+        for (int vout = 0; vout < n_outs; vout++) {
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "txid", txid);
+            cJSON_AddNumberToObject(entry, "vout", (double)vout);
+            cJSON_AddNumberToObject(entry, "amount_sats", (double)amounts[vout]);
+            cJSON_AddNumberToObject(entry, "node_index", (double)node_idx);
+
+            /* Encode the output scriptPubKey as hex for reporting */
+            char spk_hex[69] = {0};
+            if (spk_lens[vout] > 0)
+                hex_encode(spks[vout], spk_lens[vout], spk_hex);
+            cJSON_AddStringToObject(entry, "spk_hex", spk_hex);
+
+            /*
+             * Determine if this is a key-path-only LSP output:
+             *   P2TR = OP_1(0x51) PUSHBYTES_32(0x20) <32-byte-xonly-key>
+             * If the 32-byte key matches the LSP x-only pubkey, we can sign.
+             */
+            int is_lsp_key_path = 0;
+            if (spk_lens[vout] == 34 &&
+                spks[vout][0] == 0x51 && spks[vout][1] == 0x20 &&
+                memcmp(spks[vout] + 2, lsp_xonly_bytes, 32) == 0) {
+                is_lsp_key_path = 1;
+            }
+
+            if (!is_lsp_key_path) {
+                cJSON_AddStringToObject(entry, "status", "requires_client_key");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            if (amounts[vout] <= fee_sats) {
+                cJSON_AddStringToObject(entry, "status", "insufficient_funds");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            if (dry_run || !chain || !dest_spk || dest_spk_len == 0) {
+                cJSON_AddStringToObject(entry, "status", "dry_run");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            /* Build sweep TX: single input, single output to dest_spk */
+            tx_output_t sweep_out;
+            sweep_out.amount_sats = amounts[vout] - fee_sats;
+            memcpy(sweep_out.script_pubkey, dest_spk,
+                   dest_spk_len < 34 ? dest_spk_len : 34);
+            sweep_out.script_pubkey_len = dest_spk_len < 34 ? dest_spk_len : 34;
+
+            tx_buf_t unsigned_tx;
+            tx_buf_init(&unsigned_tx, 256);
+            int built = build_unsigned_tx_with_locktime(
+                &unsigned_tx, NULL,
+                txid_internal, (uint32_t)vout,
+                0xFFFFFFFE,        /* nSequence: enables nLockTime */
+                cltv_timeout,      /* nLockTime: satisfies CLTV if any */
+                &sweep_out, 1);
+
+            if (!built || unsigned_tx.oom) {
+                tx_buf_free(&unsigned_tx);
+                cJSON_AddStringToObject(entry, "status", "build_failed");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            /* BIP-341 key-path sighash */
+            unsigned char sighash[32];
+            int ok = compute_taproot_sighash(
+                sighash,
+                unsigned_tx.data, unsigned_tx.len,
+                0,                         /* input index */
+                spks[vout], spk_lens[vout], /* prevout scriptPubKey */
+                amounts[vout],              /* prevout amount */
+                0xFFFFFFFE);               /* nSequence */
+
+            if (!ok) {
+                tx_buf_free(&unsigned_tx);
+                cJSON_AddStringToObject(entry, "status", "sighash_failed");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            /* Schnorr sign */
+            unsigned char sig64[64];
+            unsigned char aux[32] = {0};
+            if (!secp256k1_schnorrsig_sign32(ctx, sig64, sighash, &lsp_kp, aux)) {
+                tx_buf_free(&unsigned_tx);
+                cJSON_AddStringToObject(entry, "status", "sign_failed");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            /* Attach witness */
+            tx_buf_t signed_tx;
+            tx_buf_init(&signed_tx, unsigned_tx.len + 80);
+            ok = finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len, sig64);
+            tx_buf_free(&unsigned_tx);
+
+            if (!ok || signed_tx.oom) {
+                tx_buf_free(&signed_tx);
+                cJSON_AddStringToObject(entry, "status", "finalize_failed");
+                cJSON_AddItemToArray(results, entry);
+                continue;
+            }
+
+            /* Hex-encode the signed TX for broadcast + audit */
+            size_t tx_hex_len = signed_tx.len * 2 + 1;
+            char *tx_hex_str = malloc(tx_hex_len);
+            if (tx_hex_str) hex_encode(signed_tx.data, signed_tx.len, tx_hex_str);
+
+            char result_txid[65] = {0};
+            int broadcast_ok = chain->send_raw_tx(chain, tx_hex_str, result_txid);
+
+            char source[48];
+            snprintf(source, sizeof(source), "sweep_factory%u_node%d_vout%d",
+                     factory_id, node_idx, vout);
+            persist_log_broadcast(p,
+                result_txid[0] ? result_txid : txid,
+                source,
+                tx_hex_str ? tx_hex_str : "",
+                broadcast_ok ? "ok" : "failed");
+
+            free(tx_hex_str);
+            tx_buf_free(&signed_tx);
+
+            if (broadcast_ok) {
+                cJSON_AddStringToObject(entry, "status", "swept");
+                cJSON_AddStringToObject(entry, "sweep_txid", result_txid);
+                printf("LSP sweep: factory %u node %d vout %d -> %s\n",
+                       factory_id, node_idx, vout, result_txid);
+                fflush(stdout);
+            } else {
+                /* Likely already spent or invalid sig (MuSig output we misidentified) */
+                cJSON_AddStringToObject(entry, "status", "broadcast_failed");
+            }
+
+            cJSON_AddItemToArray(results, entry);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return results;
 }
