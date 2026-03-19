@@ -1251,12 +1251,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (fee_rate < 1000) {
-        fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
-                "default minrelaytxfee (1 sat/vB).\n"
-                "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or rely on "
-                "package relay (Bitcoin Core v28+).\n"
-                "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
-                (unsigned long long)fee_rate, (double)fee_rate / 1000.0);
+        int is_mainnet = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
+        if (is_mainnet) {
+            fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
+                    "default minrelaytxfee (1 sat/vB).\n"
+                    "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or use package relay "
+                    "(Bitcoin Core v28+; v30 adds full ephemeral anchor support).\n"
+                    "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
+                    (unsigned long long)fee_rate, (double)fee_rate / 1000.0);
+        } else {
+            /* signet/testnet4/regtest: low fees are normal with -minrelaytxfee=0.0000001 */
+            fprintf(stderr, "NOTE: fee rate %llu sat/kvB (%.1f sat/vB); ensure bitcoind has "
+                    "-minrelaytxfee=0.0000001 (standard for signet/testnet4).\n"
+                    "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
+                    (unsigned long long)fee_rate, (double)fee_rate / 1000.0);
+        }
     }
 
     /* --- Backup / Restore / Verify (early exit) --- */
