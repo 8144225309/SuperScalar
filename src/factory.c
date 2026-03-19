@@ -643,13 +643,27 @@ static int setup_single_leaf_outputs(
 
     node->n_outputs = 2;
 
-    /* Channel: MuSig(client, LSP) */
+    /* CLTV recovery leaf (same construction as setup_leaf_outputs) */
+    unsigned char chan_cltv_merkle[32];
+    tapscript_leaf_t chan_cltv_leaf;
+    const unsigned char *chan_merkle_root = NULL;
+    if (f->cltv_timeout > 0) {
+        secp256k1_xonly_pubkey lsp_xonly;
+        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
+            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
+                                         &lsp_xonly, f->ctx)) {
+            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
+            chan_merkle_root = chan_cltv_merkle;
+        }
+    }
+
+    /* Channel: MuSig(client, LSP) [+ CLTV recovery leaf] */
     {
         secp256k1_pubkey pks[2] = { f->pubkeys[client_idx], f->pubkeys[0] };
         musig_keyagg_t ka;
         secp256k1_xonly_pubkey tw;
         if (!build_musig_p2tr_spk(f->ctx, node->outputs[0].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, NULL))
+                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
         node->outputs[0].amount_sats = per_output;
