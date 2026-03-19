@@ -434,6 +434,22 @@ extern int test_liqad_fee_zero_rate(void);
 extern int test_liqad_null_ad(void);
 extern int test_liqad_node_announcement(void);
 extern int test_liqad_node_announcement_no_ad(void);
+/* PR #35: LNURL + Lightning Address + BIP 353 */
+extern int test_lnurl_lnaddr_split(void);
+extern int test_lnurl_lnaddr_to_url(void);
+extern int test_lnurl_lnaddr_onion(void);
+extern int test_lnurl_encode_decode_roundtrip(void);
+extern int test_lnurl_is_lnurl(void);
+extern int test_lnurl_parse_pay_params(void);
+extern int test_lnurl_parse_pay_params_missing(void);
+extern int test_lnurl_build_pay_request(void);
+extern int test_lnurl_parse_pay_invoice(void);
+extern int test_lnurl_bip353_dns_name(void);
+extern int test_lnurl_bip353_parse_bolt11(void);
+extern int test_lnurl_bip353_parse_offer(void);
+extern int test_lnurl_bip353_validate(void);
+extern int test_lnurl_encode_edge_cases(void);
+extern int test_lnurl_decode_edge_cases(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1694,6 +1710,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_liqad_null_ad);
     RUN_TEST(test_liqad_node_announcement);
     RUN_TEST(test_liqad_node_announcement_no_ad);
+
+    printf("\n=== PR #35: LNURL + Lightning Address + BIP 353 ===\n");
+    RUN_TEST(test_lnurl_lnaddr_split);
+    RUN_TEST(test_lnurl_lnaddr_to_url);
+    RUN_TEST(test_lnurl_lnaddr_onion);
+    RUN_TEST(test_lnurl_encode_decode_roundtrip);
+    RUN_TEST(test_lnurl_is_lnurl);
+    RUN_TEST(test_lnurl_parse_pay_params);
+    RUN_TEST(test_lnurl_parse_pay_params_missing);
+    RUN_TEST(test_lnurl_build_pay_request);
+    RUN_TEST(test_lnurl_parse_pay_invoice);
+    RUN_TEST(test_lnurl_bip353_dns_name);
+    RUN_TEST(test_lnurl_bip353_parse_bolt11);
+    RUN_TEST(test_lnurl_bip353_parse_offer);
+    RUN_TEST(test_lnurl_bip353_validate);
+    RUN_TEST(test_lnurl_encode_edge_cases);
+    RUN_TEST(test_lnurl_decode_edge_cases);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
