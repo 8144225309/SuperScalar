@@ -161,6 +161,7 @@ add_library(superscalar
     src/probe.c
     src/peer_storage.c
     src/payment.c
+    src/bolt1.c
     src/circuit_breaker.c
     src/ln_dispatch.c
     src/invoice.c
@@ -238,6 +239,7 @@ add_executable(test_superscalar
     tests/test_payment.c
     tests/test_splice_wire.c
     tests/test_circuit_breaker.c
+    tests/test_bolt1.c
     tests/test_bolt12_full.c
     tests/test_invoice.c
     tests/test_ln_dispatch.c

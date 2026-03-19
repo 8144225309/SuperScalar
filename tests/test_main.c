@@ -393,6 +393,21 @@ extern int test_channel_type_decode_wrong_type(void);
 extern int test_cb_set_limits_clamp_tokens(void);
 extern int test_channel_type_encode_small_buf(void);
 extern int test_cb_htlc_interceptor_iface(void);
+/* PR #33: BOLT #1 Fundamental Messages */
+extern int test_bolt1_init_roundtrip(void);
+extern int test_bolt1_init_parse_fields(void);
+extern int test_bolt1_ping_build(void);
+extern int test_bolt1_pong_build(void);
+extern int test_bolt1_error_build(void);
+extern int test_bolt1_warning_build(void);
+extern int test_bolt1_dispatch_init(void);
+extern int test_bolt1_dispatch_error(void);
+extern int test_bolt1_dispatch_warning(void);
+extern int test_bolt1_dispatch_ping(void);
+extern int test_bolt1_has_feature(void);
+extern int test_bolt1_mandatory_feature_check(void);
+extern int test_bolt1_init_wrong_type(void);
+extern int test_bolt1_init_zero_features(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1610,6 +1625,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cb_set_limits_clamp_tokens);
     RUN_TEST(test_channel_type_encode_small_buf);
     RUN_TEST(test_cb_htlc_interceptor_iface);
+
+    printf("\n=== PR #33: BOLT #1 Fundamental Messages ===\n");
+    RUN_TEST(test_bolt1_init_roundtrip);
+    RUN_TEST(test_bolt1_init_parse_fields);
+    RUN_TEST(test_bolt1_ping_build);
+    RUN_TEST(test_bolt1_pong_build);
+    RUN_TEST(test_bolt1_error_build);
+    RUN_TEST(test_bolt1_warning_build);
+    RUN_TEST(test_bolt1_dispatch_init);
+    RUN_TEST(test_bolt1_dispatch_error);
+    RUN_TEST(test_bolt1_dispatch_warning);
+    RUN_TEST(test_bolt1_dispatch_ping);
+    RUN_TEST(test_bolt1_has_feature);
+    RUN_TEST(test_bolt1_mandatory_feature_check);
+    RUN_TEST(test_bolt1_init_wrong_type);
+    RUN_TEST(test_bolt1_init_zero_features);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);

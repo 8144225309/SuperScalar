@@ -12,6 +12,7 @@
 #include "superscalar/htlc_commit.h"
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
+#include "superscalar/bolt1.h"
 #include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include "superscalar/chan_open.h"
@@ -23,6 +24,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/splice.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
@@ -318,20 +320,22 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
         return (int)msg_type;
     }
-    case 78: { /* open_channel2 (type 78 = 0x4E) — dual-fund v2 OR PTLC_COMPLETE */
-        /* Distinguish by length: open_channel2 >= 350 bytes, PTLC_COMPLETE = 10 bytes */
-        if (msg_len >= 350) {
+    case 78: { /* open_channel2 (0x4E) / splice_init (quiescent) / PTLC_COMPLETE */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && ch->channel_quiescent && msg_len == 79) {
+            /* splice_init: 2(type)+32(cid)+8(amount)+4(feerate)+33(funding_pubkey) = 79 */
+            memset(ch->splice_pending_txid, 0, 32);
+            ch->channel_quiescent = SPLICE_STATE_PENDING;
+        } else if (msg_len >= 350) {
             /* open_channel2 */
-            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
             if (ch && d->ctx)
                 chan_open_inbound_v2(d->pmgr, peer_idx, msg, msg_len, d->ctx, ch);
         } else {
             /* PTLC_COMPLETE (0x4E) */
-            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
             if (ch && d->pmgr)
                 ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
         }
-        return 78;
+        return (int)SPLICE_MSG_SPLICE_INIT;
     }
     case 0x6D: { /* MSG_QUEUE_POLL: client requesting pending work items */
         if (!d->persist) return 0x6D;
@@ -493,7 +497,64 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         }
         return 39;
     }
-    default:
+    case 0x68: { /* MSG_STFU - channel quiescence request */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch) ch->channel_quiescent = 1;
+        return (int)SPLICE_MSG_STFU;
+    }
+    case 0x69: /* MSG_STFU_ACK */
+        return (int)SPLICE_MSG_STFU_ACK;
+    case SPLICE_MSG_SPLICE_ACK: /* splice_ack: pass through */
+        return (int)SPLICE_MSG_SPLICE_ACK;
+    case MSG_TX_ADD_INPUT:
+        return MSG_TX_ADD_INPUT;
+    case MSG_TX_ADD_OUTPUT:
+        return MSG_TX_ADD_OUTPUT;
+    case MSG_TX_REMOVE_INPUT:
+        return MSG_TX_REMOVE_INPUT;
+    case MSG_TX_REMOVE_OUTPUT:
+        return MSG_TX_REMOVE_OUTPUT;
+    case MSG_TX_COMPLETE: { /* tx_complete - both sides done adding inputs/outputs */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && ch->channel_quiescent) ch->channel_quiescent = 2;
+        return MSG_TX_COMPLETE;
+    }
+    case MSG_TX_SIGNATURES:
+        return MSG_TX_SIGNATURES;
+    case SPLICE_MSG_SPLICE_LOCKED: { /* splice_locked (80): apply new funding */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && msg_len >= 66) {
+            unsigned char splice_txid[32];
+            if (splice_parse_splice_locked(msg, msg_len, NULL, splice_txid))
+                channel_apply_splice_update(ch, splice_txid, 0, ch->funding_amount);
+        }
+        return (int)SPLICE_MSG_SPLICE_LOCKED;
+    }
+        case BOLT1_MSG_WARNING: /* warning (type 1) - log and continue */
+        return BOLT1_MSG_WARNING;
+    case BOLT1_MSG_INIT: { /* init (type 16) - feature negotiation */
+        bolt1_init_t init_parsed;
+        bolt1_parse_init(msg, msg_len, &init_parsed);
+        /* Store negotiated features if peer_mgr supports it */
+        return BOLT1_MSG_INIT;
+    }
+    case BOLT1_MSG_ERROR: /* error (type 17) - log and return */
+        return BOLT1_MSG_ERROR;
+    case BOLT1_MSG_PING: { /* ping (type 18) - send pong */
+        bolt1_ping_t ping;
+        if (bolt1_parse_ping(msg, msg_len, &ping) &&
+            d->pmgr && peer_idx >= 0 && ping.num_pong_bytes <= 65531) {
+            unsigned char pong_buf[65535];
+            size_t pong_len = bolt1_build_pong(ping.num_pong_bytes,
+                                                pong_buf, sizeof(pong_buf));
+            if (pong_len > 0)
+                peer_mgr_send(d->pmgr, peer_idx, pong_buf, pong_len);
+        }
+        return BOLT1_MSG_PING;
+    }
+    case BOLT1_MSG_PONG: /* pong (type 19) - ignore */
+        return BOLT1_MSG_PONG;
+        default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
         return 0;
     }
