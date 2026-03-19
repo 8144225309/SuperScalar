@@ -2,6 +2,51 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.2.0 — 2026-03-19
+
+890/890 unit tests pass. Full BOLT Lightning wire protocol stack integrated on top of the SuperScalar factory layer.
+
+### Added
+
+- **Full Lightning Network wire protocol stack (PRs #19–#26, merged via #27, +32,093 lines)**:
+  - **BOLT #8 Noise_XK transport** (`bolt8.c`, `bolt8_server.c`): 3-act handshake, ChaCha20-Poly1305 encryption with key rotation, phase-specific timeouts (60s handshake / 30s init / 300s idle)
+  - **BOLT #7 gossip** (`gossip.c`, `gossip_peer.c`, `gossip_store.c`): `node_announcement` (257), `channel_announcement` (256), `channel_update` (258), `gossip_timestamp_filter` (265); SQLite gossip store; exponential reconnect backoff; stale channel pruning (14-day); rate limiting (token-bucket 10/60s per direction); gossip query handlers (types 261–264); sends real channel data on query
+  - **BOLT #11 invoice** (`bolt11.c`): full bech32 decode/encode, tagged fields, route hints, recoverable ECDSA signature verification
+  - **BOLT #4 multi-hop onion** (`onion.c`): 1366-byte Sphinx onion build/peel with correct HMAC tail-zeroing filler, keysend TLV (type 5482373484)
+  - **BOLT #2 commitment messages**: all 7 types — `update_add_htlc` (128), `update_fulfill_htlc` (130), `update_fail_htlc` (131), `update_fail_malformed_htlc` (135), `commitment_signed` (132), `revoke_and_ack` (133), `update_fee` (134); BOLT #3 dust guard; MuSig2 partial-sig packing in 64-byte sig field
+  - **BOLT #12 offers**: expiry TLV, `invoice_request` → invoice merkle+Schnorr flow, blinded path hints, `invoice_error`
+  - **Dijkstra pathfinding** (`pathfind.c`): over gossip_store SQLite graph, fee+CLTV penalties (LDK risk model), MPP route splitting
+  - **MPP aggregation** (`mpp.c`): 32 concurrent payments × 10 parts, 60s incomplete-set timeout, 2× overpayment guard
+  - **AMP send side**: TLV type 14 encoding, `payment_send_amp()` with independent root shares; real per-shard routes committed before state change
+  - **HTLC forwarding engine** (`htlc_forward.c`): inbound HTLC processing, settle/fail propagation, forward table; TLV type 6 relay pump routing via SCID lookup
+  - **Payment state machine** (`payment.c`): invoice-driven, keysend, MPP sharding, onion error decryption, 3-attempt retry with penalty-box updates; timeout retry/fail at 60s
+  - **PTLC state machine** (`ptlc_commit.c`): add/settle/fail wire types 0x4C–0x4E
+  - **External peer manager** (`peer_mgr.c`): connect/accept/disconnect/send over BOLT #8 sessions; reconnect with backoff (5s × 2^n, cap 300s)
+  - **Channel open/accept** (`chan_open.c`): `open_channel` (321), `accept_channel` (272), `channel_reestablish` with DLP detection; dual-fund v2 (`open_channel2` type 78) with zero-contribution accept and real random basepoints; zero-conf channels (sends `channel_ready` when `min_depth=0`)
+  - **Cooperative close dispatch**: `shutdown` (38) / `closing_signed` (39), BOLT #2 meet-in-the-middle fee negotiation; broadcasts TX on completion
+  - **LSPS0/1/2**: `lsps1.get_info`, `lsps2.get_info` over BOLT #8 (Zeus/Blixt/Phoenix compatible); LSPS1 order state machine (CREATED → PENDING_FUNDING → COMPLETED); LSPS2 JIT HTLC interception with deferred factory-open until HTLCs cover cost; stale JIT entry expiry
+  - **Factory entry/exit + fake SCIDs** (`scid_registry.c`, `htlc_inbound.c`): BOLT #4 last-hop intercept, `htlc_inbound` state machine, JIT channel creation on HTLC intercept
+  - **LSP discovery**: `/.well-known/lsps.json` endpoint, DNS SRV fallback
+  - **Watchtower breach wired to block events**: `watchtower_check()` on every block, justice tx auto-broadcast on breach; CPFP bump for non-breach TXs
+  - **Tor SOCKS5 proxy**: `.onion` peers routed through proxy, `--tor-proxy HOST:PORT`
+  - **Async signing queue dispatch**: `MSG_QUEUE_POLL` / `MSG_QUEUE_DONE` dispatch wired
+  - **Invoice CLI**: `--invoice <amount_msat> [description]`
+
+- **CLTV recovery leaf for single-client (arity-1) leaf outputs** (`src/factory.c`): `setup_single_leaf_outputs()` was missing the CLTV recovery leaf added to `setup_leaf_outputs()` in v0.1.6. Both arity-2 and arity-1 tree nodes now embed the LSP unilateral recovery script when `cltv_timeout > 0`.
+
+- **CLTV script-path sweep in factory recovery** (`src/factory_recovery.c`): `factory_sweep_run` now identifies MuSig2+CLTV channel outputs by reconstructing `taptweak(MuSig2_agg(client, LSP), CLTV_leaf_hash)` and comparing to on-chain SPK. After CLTV maturity, builds a BIP-342 script-path TX signed by the LSP key and broadcasts it. Outputs without a matching CLTV leaf remain marked `"requires_client_key"`.
+
+### Removed
+
+- **`gen_scripts.py`**: VPS-specific exhibition script generator with hardcoded `/root` paths. Superseded by `test_orchestrator.py` and the `ss_signet_runner.py` local tool.
+- **`launch_exhibition.sh`**: VPS-specific one-off exhibition launcher with hardcoded paths.
+
+### Fixed
+
+- **`bitcoin-cli` finder path** (`tools/test_orchestrator.py`): Removed a stale developer-specific fallback path and the associated "WSL / Linux" comment from the `find_bitcoin_cli()` function.
+
+---
+
 ## 0.1.6 — 2026-03-15
 
 36/36 orchestrator scenarios pass. 553/553 unit tests pass.
