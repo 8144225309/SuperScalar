@@ -492,6 +492,17 @@ extern int test_nwc_build_make_invoice(void);
 extern int test_nwc_parse_response_ok(void);
 extern int test_nwc_parse_response_error(void);
 extern int test_nwc_parse_bad_uri(void);
+/* PR #39: Rapid Gossip Sync (RGS) */
+extern int test_rgs_roundtrip(void);
+extern int test_rgs_node_ids_preserved(void);
+extern int test_rgs_find_channel(void);
+extern int test_rgs_get_update(void);
+extern int test_rgs_disabled_channel(void);
+extern int test_rgs_count_active(void);
+extern int test_rgs_bad_magic(void);
+extern int test_rgs_truncated(void);
+extern int test_rgs_build_small_buf(void);
+extern int test_rgs_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1814,6 +1825,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_nwc_parse_response_ok);
     RUN_TEST(test_nwc_parse_response_error);
     RUN_TEST(test_nwc_parse_bad_uri);
+
+    printf("\n=== PR #39: Rapid Gossip Sync (RGS) ===\n");
+    RUN_TEST(test_rgs_roundtrip);
+    RUN_TEST(test_rgs_node_ids_preserved);
+    RUN_TEST(test_rgs_find_channel);
+    RUN_TEST(test_rgs_get_update);
+    RUN_TEST(test_rgs_disabled_channel);
+    RUN_TEST(test_rgs_count_active);
+    RUN_TEST(test_rgs_bad_magic);
+    RUN_TEST(test_rgs_truncated);
+    RUN_TEST(test_rgs_build_small_buf);
+    RUN_TEST(test_rgs_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
