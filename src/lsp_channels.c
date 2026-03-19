@@ -3201,6 +3201,14 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         } else {
             printf("CLI: usage: invoice <client> <amount_msat>\n");
         }
+    } else if (strcmp(line, "reset") == 0) {
+        printf("CLI: triggering distributed epoch reset...\n");
+        fflush(stdout);
+        if (lsp_epoch_reset_distributed(mgr, lsp_ptr))
+            printf("CLI: epoch reset complete — DW counter back to 0\n");
+        else
+            printf("CLI: epoch reset FAILED\n");
+        fflush(stdout);
     } else if (strcmp(line, "help") == 0) {
         printf("Commands:\n");
         printf("  pay <from> <to> <amount>     Send payment between clients\n");
@@ -3208,6 +3216,7 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  invoice <client> <msat>      Create external invoice for LN receive\n");
         printf("  status                       Show factory/channel/bridge state\n");
         printf("  rotate                       Force factory rotation\n");
+        printf("  reset                        Cooperative DW epoch reset (counter → 0)\n");
         printf("  close                        Cooperative close and shutdown\n");
         printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
         printf("  help                         Show this help\n");
