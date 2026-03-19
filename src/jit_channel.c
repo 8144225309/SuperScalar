@@ -4,6 +4,8 @@
 #include "superscalar/wire.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
+#include "superscalar/lsp_fund.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
 #include "superscalar/tx_builder.h"
@@ -182,8 +184,10 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
 
     /* Fund the JIT channel on-chain */
     regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
-    if (!rt) {
-        fprintf(stderr, "LSP JIT: no regtest connection for funding\n");
+    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+    wallet_source_t *wallet_src = (wallet_source_t *)mgr->wallet_src;
+    if (!rt && !chain_be) {
+        fprintf(stderr, "LSP JIT: no chain connection for funding\n");
         memset(lsp_seckey, 0, 32);
         return 0;
     }
@@ -222,23 +226,38 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     build_p2tr_script_pubkey(funding_spk, &tweaked_xonly);
     size_t funding_spk_len = 34;
 
-    /* Derive bech32m address from the JIT tweaked key */
-    unsigned char tweaked_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, tweaked_ser, &tweaked_xonly))
-        { memset(lsp_seckey, 0, 32); return 0; }
-    char funding_addr[128];
-    if (!regtest_derive_p2tr_address(rt, tweaked_ser, funding_addr, sizeof(funding_addr))) {
-        fprintf(stderr, "LSP JIT: failed to derive JIT funding address\n");
-        memset(lsp_seckey, 0, 32);
-        return 0;
-    }
-
-    double funding_btc = (double)funding_amount / 100000000.0;
     char fund_txid_hex[65];
-    if (!regtest_fund_address(rt, funding_addr, funding_btc, fund_txid_hex)) {
-        fprintf(stderr, "LSP JIT: funding failed\n");
-        memset(lsp_seckey, 0, 32);
-        return 0;
+    if (rt) {
+        /* Full-node mode: Core wallet funds via sendtoaddress */
+        unsigned char tweaked_ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, tweaked_ser, &tweaked_xonly))
+            { memset(lsp_seckey, 0, 32); return 0; }
+        char funding_addr[128];
+        if (!regtest_derive_p2tr_address(rt, tweaked_ser, funding_addr, sizeof(funding_addr))) {
+            fprintf(stderr, "LSP JIT: failed to derive JIT funding address\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        double funding_btc = (double)funding_amount / 100000000.0;
+        if (!regtest_fund_address(rt, funding_addr, funding_btc, fund_txid_hex)) {
+            fprintf(stderr, "LSP JIT: funding failed\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+    } else {
+        /* Light-client mode: HD wallet builds and signs funding tx */
+        if (!wallet_src) {
+            fprintf(stderr, "LSP JIT: no wallet for light-client funding\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        if (!lsp_fund_spk(wallet_src, chain_be,
+                          funding_spk, funding_spk_len,
+                          funding_amount, 0, fund_txid_hex)) {
+            fprintf(stderr, "LSP JIT: light-client funding failed\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
     }
 
     /* Confirm funding */
@@ -483,9 +502,11 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
 
 int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
                                    const unsigned char *extracted_client_key,
-                                   regtest_t *rt) {
+                                   void *chain_be_ptr) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
-    if (!mgr || !extracted_client_key || !rt) return 0;
+    chain_backend_t *chain_be = (chain_backend_t *)chain_be_ptr;
+    if (!mgr || !extracted_client_key || !chain_be) return 0;
+    regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
 
     jit_channel_t *jit = jit_channel_find(mgr, client_idx);
     if (!jit || jit->state != JIT_STATE_OPEN) return 0;
@@ -518,15 +539,24 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
         return 0;
     }
 
-    /* Get fresh wallet address for close output */
-    char close_addr[128];
+    /* Get fresh wallet address/SPK for close output */
     unsigned char close_spk[64];
     size_t close_spk_len = 0;
-    if (!regtest_get_new_address(rt, close_addr, sizeof(close_addr)) ||
-        !regtest_get_address_scriptpubkey(rt, close_addr, close_spk, &close_spk_len)) {
-        fprintf(stderr, "LSP JIT close: failed to get wallet address for client %zu\n",
-                client_idx);
-        return 0;
+    if (rt) {
+        char close_addr[128];
+        if (!regtest_get_new_address(rt, close_addr, sizeof(close_addr)) ||
+            !regtest_get_address_scriptpubkey(rt, close_addr, close_spk, &close_spk_len)) {
+            fprintf(stderr, "LSP JIT close: failed to get wallet address for client %zu\n",
+                    client_idx);
+            return 0;
+        }
+    } else {
+        wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+        if (!ws || !ws->get_change_spk(ws, close_spk, &close_spk_len)) {
+            fprintf(stderr, "LSP JIT close: failed to get HD wallet SPK for client %zu\n",
+                    client_idx);
+            return 0;
+        }
     }
 
     /* Calculate fee: 1-in-1-out P2TR close ~111 vbytes */
@@ -558,7 +588,7 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     if (!close_hex) { tx_buf_free(&close_tx); return 0; }
     hex_encode(close_tx.data, close_tx.len, close_hex);
     char close_txid[65];
-    int sent = regtest_send_raw_tx(rt, close_hex, close_txid);
+    int sent = chain_be->send_raw_tx(chain_be, close_hex, close_txid);
     if (mgr->persist) {
         persist_log_broadcast((persist_t *)mgr->persist,
                               sent ? close_txid : "?", "jit_cooperative_close",
@@ -579,7 +609,8 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     } else {
         int timeout = mgr->confirm_timeout_secs > 0 ?
                       mgr->confirm_timeout_secs : 7200;
-        if (regtest_wait_for_confirmation(rt, close_txid, timeout) < 1) {
+        int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout);
+        if (!confirmed) {
             fprintf(stderr, "LSP JIT close: confirmation timeout for client %zu\n",
                     client_idx);
             return 0;

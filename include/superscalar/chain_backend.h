@@ -67,4 +67,13 @@ struct chain_backend {
     void *ctx;
 };
 
+/*
+ * Regtest (bitcoin-cli RPC) implementation.
+ * Defined in src/chain_backend_regtest.c.
+ * Callers must also include "regtest.h" for the regtest_t type.
+ */
+#ifdef SUPERSCALAR_REGTEST_H
+void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt);
+#endif
+
 #endif /* SUPERSCALAR_CHAIN_BACKEND_H */
