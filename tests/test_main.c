@@ -548,6 +548,19 @@ extern int test_route_policy_table_upsert_find(void);
 extern int test_route_policy_set_disabled(void);
 extern int test_route_policy_null_safety(void);
 extern int test_route_policy_parse_wrong_type(void);
+/* PR #43: Forwarding History (CLN listforwards / LND fwdinghistory) */
+extern int test_fwd_history_init(void);
+extern int test_fwd_history_add_settled(void);
+extern int test_fwd_history_add_failed(void);
+extern int test_fwd_history_fee_total(void);
+extern int test_fwd_history_volume(void);
+extern int test_fwd_history_count(void);
+extern int test_fwd_history_avg_fee(void);
+extern int test_fwd_history_top_channel(void);
+extern int test_fwd_history_prune(void);
+extern int test_fwd_history_ring_wrap(void);
+extern int test_fwd_history_range_all(void);
+extern int test_fwd_history_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1930,6 +1943,20 @@ static void run_unit_tests(void) {
     RUN_TEST(test_route_policy_set_disabled);
     RUN_TEST(test_route_policy_null_safety);
     RUN_TEST(test_route_policy_parse_wrong_type);
+
+    printf("\n=== PR #43: Forwarding History (fee accounting) ===\n");
+    RUN_TEST(test_fwd_history_init);
+    RUN_TEST(test_fwd_history_add_settled);
+    RUN_TEST(test_fwd_history_add_failed);
+    RUN_TEST(test_fwd_history_fee_total);
+    RUN_TEST(test_fwd_history_volume);
+    RUN_TEST(test_fwd_history_count);
+    RUN_TEST(test_fwd_history_avg_fee);
+    RUN_TEST(test_fwd_history_top_channel);
+    RUN_TEST(test_fwd_history_prune);
+    RUN_TEST(test_fwd_history_ring_wrap);
+    RUN_TEST(test_fwd_history_range_all);
+    RUN_TEST(test_fwd_history_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
