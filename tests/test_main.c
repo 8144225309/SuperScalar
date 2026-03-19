@@ -503,6 +503,21 @@ extern int test_rgs_bad_magic(void);
 extern int test_rgs_truncated(void);
 extern int test_rgs_build_small_buf(void);
 extern int test_rgs_null_safety(void);
+/* PR #40: Onion Messages (BOLT #12 type 513) */
+extern int test_onion_msg_encode_type(void);
+extern int test_onion_msg_decode_roundtrip(void);
+extern int test_onion_msg_decode_wrong_type(void);
+extern int test_onion_msg_decode_truncated(void);
+extern int test_onion_msg_build_recv_roundtrip(void);
+extern int test_onion_msg_tlv_type_preserved(void);
+extern int test_onion_msg_invoice_error_type(void);
+extern int test_onion_msg_wrong_privkey(void);
+extern int test_onion_msg_bad_version(void);
+extern int test_onion_msg_full_wire_roundtrip(void);
+extern int test_onion_msg_encode_null_safety(void);
+extern int test_onion_msg_decode_null_safety(void);
+extern int test_onion_msg_build_null_safety(void);
+extern int test_onion_msg_encode_small_buf(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1837,6 +1852,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rgs_truncated);
     RUN_TEST(test_rgs_build_small_buf);
     RUN_TEST(test_rgs_null_safety);
+
+    printf("\n=== PR #40: Onion Messages (BOLT #12 type 513) ===\n");
+    RUN_TEST(test_onion_msg_encode_type);
+    RUN_TEST(test_onion_msg_decode_roundtrip);
+    RUN_TEST(test_onion_msg_decode_wrong_type);
+    RUN_TEST(test_onion_msg_decode_truncated);
+    RUN_TEST(test_onion_msg_build_recv_roundtrip);
+    RUN_TEST(test_onion_msg_tlv_type_preserved);
+    RUN_TEST(test_onion_msg_invoice_error_type);
+    RUN_TEST(test_onion_msg_wrong_privkey);
+    RUN_TEST(test_onion_msg_bad_version);
+    RUN_TEST(test_onion_msg_full_wire_roundtrip);
+    RUN_TEST(test_onion_msg_encode_null_safety);
+    RUN_TEST(test_onion_msg_decode_null_safety);
+    RUN_TEST(test_onion_msg_build_null_safety);
+    RUN_TEST(test_onion_msg_encode_small_buf);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
