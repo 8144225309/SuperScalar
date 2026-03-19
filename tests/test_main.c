@@ -465,6 +465,17 @@ extern int test_hold_invoice_unknown_htlc(void);
 extern int test_hold_invoice_remove(void);
 extern int test_hold_invoice_null_safety(void);
 extern int test_hold_invoice_any_amount(void);
+/* PR #37: Trampoline Routing (Phoenix/BOLT #4 PR #716) */
+extern int test_trampoline_build_hop_payload(void);
+extern int test_trampoline_hop_payload_roundtrip(void);
+extern int test_trampoline_fee_estimate(void);
+extern int test_trampoline_path_fees(void);
+extern int test_trampoline_single_hop_path(void);
+extern int test_trampoline_invoice_hint_build(void);
+extern int test_trampoline_invoice_hint_roundtrip(void);
+extern int test_trampoline_hint_not_trampoline(void);
+extern int test_trampoline_null_safety(void);
+extern int test_trampoline_bigsize_encoding(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1758,6 +1769,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hold_invoice_remove);
     RUN_TEST(test_hold_invoice_null_safety);
     RUN_TEST(test_hold_invoice_any_amount);
+
+    printf("\n=== PR #37: Trampoline Routing ===\n");
+    RUN_TEST(test_trampoline_build_hop_payload);
+    RUN_TEST(test_trampoline_hop_payload_roundtrip);
+    RUN_TEST(test_trampoline_fee_estimate);
+    RUN_TEST(test_trampoline_path_fees);
+    RUN_TEST(test_trampoline_single_hop_path);
+    RUN_TEST(test_trampoline_invoice_hint_build);
+    RUN_TEST(test_trampoline_invoice_hint_roundtrip);
+    RUN_TEST(test_trampoline_hint_not_trampoline);
+    RUN_TEST(test_trampoline_null_safety);
+    RUN_TEST(test_trampoline_bigsize_encoding);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
