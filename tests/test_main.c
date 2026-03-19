@@ -617,6 +617,20 @@ extern int test_si_claim_wrong_secret(void);
 extern int test_si_check_preimage(void);
 extern int test_si_generate_l1(void);
 extern int test_si_null_safety(void);
+/* PR #48: Onion Message Relay (BOLT #7 / BOLT #12 multi-hop) */
+extern int test_omr_peel_final_hop(void);
+extern int test_omr_build_hop_payload(void);
+extern int test_omr_peel_relay_hop(void);
+extern int test_omr_full_2hop_roundtrip(void);
+extern int test_omr_hmac_tamper(void);
+extern int test_omr_next_path_key_changes(void);
+extern int test_omr_next_path_key_key_domain(void);
+extern int test_omr_hop_payload_too_large(void);
+extern int test_omr_wrong_relay_privkey(void);
+extern int test_omr_peel_truncated(void);
+extern int test_omr_build_hop_null_safety(void);
+extern int test_omr_peel_null_safety(void);
+extern int test_omr_next_path_key_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -2073,6 +2087,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_si_check_preimage);
     RUN_TEST(test_si_generate_l1);
     RUN_TEST(test_si_null_safety);
+
+    printf("\n=== PR #48: Onion Message Relay (BOLT #7 / BOLT #12 multi-hop) ===\n");
+    RUN_TEST(test_omr_peel_final_hop);
+    RUN_TEST(test_omr_build_hop_payload);
+    RUN_TEST(test_omr_peel_relay_hop);
+    RUN_TEST(test_omr_full_2hop_roundtrip);
+    RUN_TEST(test_omr_hmac_tamper);
+    RUN_TEST(test_omr_next_path_key_changes);
+    RUN_TEST(test_omr_next_path_key_key_domain);
+    RUN_TEST(test_omr_hop_payload_too_large);
+    RUN_TEST(test_omr_wrong_relay_privkey);
+    RUN_TEST(test_omr_peel_truncated);
+    RUN_TEST(test_omr_build_hop_null_safety);
+    RUN_TEST(test_omr_peel_null_safety);
+    RUN_TEST(test_omr_next_path_key_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
