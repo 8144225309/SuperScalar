@@ -840,8 +840,11 @@ int channel_sign_commitment(const channel_t *ch,
 
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
-    if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2, &keyagg_copy, NULL))
-        return 0;
+    {
+        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2, &keyagg_copy, mr))
+            return 0;
+    }
 
     /* Finalize */
     if (!finalize_signed_tx(signed_tx_out, unsigned_tx->data, unsigned_tx->len,
@@ -1677,10 +1680,13 @@ int channel_build_cooperative_close_tx(
 
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
-    if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2,
-                             &keyagg_copy, NULL)) {
-        tx_buf_free(&unsigned_tx);
-        return 0;
+    {
+        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2,
+                                 &keyagg_copy, mr)) {
+            tx_buf_free(&unsigned_tx);
+            return 0;
+        }
     }
 
     /* 4. Finalize */
