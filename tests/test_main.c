@@ -589,6 +589,20 @@ extern int test_gossip_ingest_timestamp_filter(void);
 extern int test_gossip_ingest_message_dispatch(void);
 extern int test_gossip_ingest_malformed(void);
 extern int test_gossip_ingest_null_safety(void);
+/* PR #46: Pathfind Exclusion List (channel exclusion for payment retry) */
+extern int test_pe_add_is_excluded(void);
+extern int test_pe_remove(void);
+extern int test_pe_direction_specific(void);
+extern int test_pe_direction_both(void);
+extern int test_pe_clear(void);
+extern int test_pe_from_mc_penalized(void);
+extern int test_pe_from_mc_clean(void);
+extern int test_pe_from_mc_success_cleared(void);
+extern int test_pe_from_mc_amount_threshold(void);
+extern int test_pe_table_full(void);
+extern int test_pe_no_duplicate(void);
+extern int test_pe_null_safety(void);
+extern int test_pe_empty_excludes_nothing(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -2015,6 +2029,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_gossip_ingest_message_dispatch);
     RUN_TEST(test_gossip_ingest_malformed);
     RUN_TEST(test_gossip_ingest_null_safety);
+
+    printf("\n=== PR #46: Pathfind Exclusion List (payment retry routing) ===\n");
+    RUN_TEST(test_pe_add_is_excluded);
+    RUN_TEST(test_pe_remove);
+    RUN_TEST(test_pe_direction_specific);
+    RUN_TEST(test_pe_direction_both);
+    RUN_TEST(test_pe_clear);
+    RUN_TEST(test_pe_from_mc_penalized);
+    RUN_TEST(test_pe_from_mc_clean);
+    RUN_TEST(test_pe_from_mc_success_cleared);
+    RUN_TEST(test_pe_from_mc_amount_threshold);
+    RUN_TEST(test_pe_table_full);
+    RUN_TEST(test_pe_no_duplicate);
+    RUN_TEST(test_pe_null_safety);
+    RUN_TEST(test_pe_empty_excludes_nothing);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
