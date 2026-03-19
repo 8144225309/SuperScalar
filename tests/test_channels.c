@@ -1481,7 +1481,7 @@ int test_cltv_delta_enforcement(void) {
 /* --- Fee estimator integration tests (Phase 2: 2.1) --- */
 
 int test_fee_estimator_wiring(void) {
-    /* Non-default fee rate propagates through mgr to commitment fee */
+    /* Fee estimator wiring: channel.fee_rate_sat_per_kvb stays at default (not wired from estimator) */
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -1524,10 +1524,12 @@ int test_fee_estimator_wiring(void) {
     mgr.lsp_balance_pct = 50;
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec, 4), "init with fee");
 
-    /* All channels should have the non-default fee rate */
+    /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator —
+     * client always uses the default 1000 sat/kvB from channel_init, so both
+     * sides must agree on the same value or commitment sighashes diverge. */
     for (size_t c = 0; c < 4; c++) {
-        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)2000,
-                       "channel has 2000 sat/kvB");
+        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
+                       "channel uses default 1000 sat/kvB (not wired from estimator)");
     }
 
     factory_free(&f);
