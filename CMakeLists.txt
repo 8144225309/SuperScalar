@@ -172,6 +172,7 @@ add_library(superscalar
     src/stateless_invoice.c
     src/onion_msg_relay.c
     src/htlc_fee_bump.c
+    src/bolt4_failure.c
     src/payment_uri.c
     src/trampoline.c
     src/hold_invoice.c
@@ -266,6 +267,7 @@ add_executable(test_superscalar
     tests/test_stateless_invoice.c
     tests/test_onion_msg_relay.c
     tests/test_htlc_fee_bump.c
+    tests/test_bolt4_failure.c
     tests/test_payment_uri.c
     tests/test_trampoline.c
     tests/test_hold_invoice.c
