@@ -476,6 +476,22 @@ extern int test_trampoline_invoice_hint_roundtrip(void);
 extern int test_trampoline_hint_not_trampoline(void);
 extern int test_trampoline_null_safety(void);
 extern int test_trampoline_bigsize_encoding(void);
+/* PR #38: BIP 21 Payment URIs + Nostr Wallet Connect (NIP-47) */
+extern int test_bip21_parse_address_only(void);
+extern int test_bip21_parse_amount(void);
+extern int test_bip21_parse_unified_qr(void);
+extern int test_bip21_parse_label_message(void);
+extern int test_bip21_parse_invoice_only(void);
+extern int test_bip21_build(void);
+extern int test_bip21_build_invoice_only(void);
+extern int test_bip21_parse_bad_scheme(void);
+extern int test_nwc_parse_connection(void);
+extern int test_nwc_build_pay_invoice(void);
+extern int test_nwc_build_get_balance(void);
+extern int test_nwc_build_make_invoice(void);
+extern int test_nwc_parse_response_ok(void);
+extern int test_nwc_parse_response_error(void);
+extern int test_nwc_parse_bad_uri(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1781,6 +1797,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_trampoline_hint_not_trampoline);
     RUN_TEST(test_trampoline_null_safety);
     RUN_TEST(test_trampoline_bigsize_encoding);
+
+    printf("\n=== PR #38: BIP 21 Payment URIs + Nostr Wallet Connect ===\n");
+    RUN_TEST(test_bip21_parse_address_only);
+    RUN_TEST(test_bip21_parse_amount);
+    RUN_TEST(test_bip21_parse_unified_qr);
+    RUN_TEST(test_bip21_parse_label_message);
+    RUN_TEST(test_bip21_parse_invoice_only);
+    RUN_TEST(test_bip21_build);
+    RUN_TEST(test_bip21_build_invoice_only);
+    RUN_TEST(test_bip21_parse_bad_scheme);
+    RUN_TEST(test_nwc_parse_connection);
+    RUN_TEST(test_nwc_build_pay_invoice);
+    RUN_TEST(test_nwc_build_get_balance);
+    RUN_TEST(test_nwc_build_make_invoice);
+    RUN_TEST(test_nwc_parse_response_ok);
+    RUN_TEST(test_nwc_parse_response_error);
+    RUN_TEST(test_nwc_parse_bad_uri);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
