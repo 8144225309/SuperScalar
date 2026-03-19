@@ -50,7 +50,7 @@
 #define BOLT2_MAX_MSG_SIZE  1500
 
 /* update_fee feerate bounds (sat/kw) */
-#define BOLT2_UPDATE_FEE_FLOOR    250    /* minimum (1 sat/4vB) */
+#define BOLT2_UPDATE_FEE_FLOOR    25     /* minimum (0.1 sat/vB = 100 sat/kvB / 4) */
 #define BOLT2_UPDATE_FEE_CEILING  100000 /* maximum (prevents griefing) */
 
 /*

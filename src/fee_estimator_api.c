@@ -179,9 +179,9 @@ static int parse_mempool_json(const char *body, uint64_t cached[4])
     if (minimum && cJSON_IsNumber(minimum) && minimum->valuedouble > 0)
         cached[FEE_RPC_IDX_MINIMUM] = (uint64_t)(minimum->valuedouble * 1000.0 + 0.5);
 
-    /* Clamp all to minimum 1000 sat/kvB */
+    /* Clamp all to minimum relay fee */
     for (int i = 0; i < 4; i++)
-        if (cached[i] < 1000) cached[i] = 1000;
+        if (cached[i] < FEE_FLOOR_SAT_PER_KVB) cached[i] = FEE_FLOOR_SAT_PER_KVB;
 
     cJSON_Delete(json);
     return ok;
