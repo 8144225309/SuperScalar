@@ -575,6 +575,20 @@ extern int test_htlc_accept_no_cltv_check(void);
 extern int test_htlc_accept_find(void);
 extern int test_htlc_accept_prune(void);
 extern int test_htlc_accept_null_safety(void);
+/* PR #45: Gossip Ingest (BOLT #7 verify+store types 256/257/258/265) */
+extern int test_gossip_ingest_channel_ann_ok(void);
+extern int test_gossip_ingest_channel_ann_bad_sig(void);
+extern int test_gossip_ingest_node_ann_ok(void);
+extern int test_gossip_ingest_node_ann_bad_sig(void);
+extern int test_gossip_ingest_chan_update_ok(void);
+extern int test_gossip_ingest_chan_update_bad_sig(void);
+extern int test_gossip_ingest_chan_update_orphan(void);
+extern int test_gossip_ingest_rate_limit(void);
+extern int test_gossip_ingest_rate_limit_expired(void);
+extern int test_gossip_ingest_timestamp_filter(void);
+extern int test_gossip_ingest_message_dispatch(void);
+extern int test_gossip_ingest_malformed(void);
+extern int test_gossip_ingest_null_safety(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1986,6 +2000,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_accept_find);
     RUN_TEST(test_htlc_accept_prune);
     RUN_TEST(test_htlc_accept_null_safety);
+
+    printf("\n=== PR #45: Gossip Ingest (BOLT #7 verify+store) ===\n");
+    RUN_TEST(test_gossip_ingest_channel_ann_ok);
+    RUN_TEST(test_gossip_ingest_channel_ann_bad_sig);
+    RUN_TEST(test_gossip_ingest_node_ann_ok);
+    RUN_TEST(test_gossip_ingest_node_ann_bad_sig);
+    RUN_TEST(test_gossip_ingest_chan_update_ok);
+    RUN_TEST(test_gossip_ingest_chan_update_bad_sig);
+    RUN_TEST(test_gossip_ingest_chan_update_orphan);
+    RUN_TEST(test_gossip_ingest_rate_limit);
+    RUN_TEST(test_gossip_ingest_rate_limit_expired);
+    RUN_TEST(test_gossip_ingest_timestamp_filter);
+    RUN_TEST(test_gossip_ingest_message_dispatch);
+    RUN_TEST(test_gossip_ingest_malformed);
+    RUN_TEST(test_gossip_ingest_null_safety);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
