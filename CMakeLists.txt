@@ -164,6 +164,7 @@ add_library(superscalar
     src/rgs.c
     src/onion_msg.c
     src/mission_control.c
+    src/route_policy.c
     src/payment_uri.c
     src/trampoline.c
     src/hold_invoice.c
@@ -250,6 +251,7 @@ add_executable(test_superscalar
     tests/test_rgs.c
     tests/test_onion_msg.c
     tests/test_mission_control.c
+    tests/test_route_policy.c
     tests/test_payment_uri.c
     tests/test_trampoline.c
     tests/test_hold_invoice.c
