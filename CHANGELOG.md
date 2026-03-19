@@ -2,7 +2,7 @@
 
 All notable changes to SuperScalar are documented here.
 
-## 0.2.0 — 2026-03-19
+## 0.1.7 — 2026-03-19
 
 890/890 unit tests pass. Full BOLT Lightning wire protocol stack integrated on top of the SuperScalar factory layer.
 
