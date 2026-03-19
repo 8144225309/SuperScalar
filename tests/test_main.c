@@ -360,6 +360,20 @@ extern int test_admin_rpc_listpayments_empty(void);
 extern int test_admin_rpc_closechannel_unknown(void);
 extern int test_admin_rpc_openchannel_deferred(void);
 
+/* PR #29: Onion Messages + BOLT #12 Production Path */
+extern int test_onion_msg_parse_valid(void);
+extern int test_onion_msg_parse_bad_type(void);
+extern int test_onion_msg_parse_too_short(void);
+extern int test_onion_msg_build_and_parse(void);
+extern int test_onion_msg_decrypt_roundtrip(void);
+extern int test_onion_msg_dispatch_type513(void);
+extern int test_onion_msg_dispatch_short(void);
+extern int test_offer_create_node_id(void);
+extern int test_offer_create_encode_lno(void);
+extern int test_offer_create_with_amount(void);
+extern int test_offer_create_no_amount(void);
+extern int test_admin_rpc_createoffer_lno(void);
+
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
 extern int test_splice_wire_ack(void);
@@ -1564,6 +1578,20 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_listpayments_empty);
     RUN_TEST(test_admin_rpc_closechannel_unknown);
     RUN_TEST(test_admin_rpc_openchannel_deferred);
+
+    printf("\n=== PR #29: Onion Messages + BOLT #12 Production Path ===\n");
+    RUN_TEST(test_onion_msg_parse_valid);
+    RUN_TEST(test_onion_msg_parse_bad_type);
+    RUN_TEST(test_onion_msg_parse_too_short);
+    RUN_TEST(test_onion_msg_build_and_parse);
+    RUN_TEST(test_onion_msg_decrypt_roundtrip);
+    RUN_TEST(test_onion_msg_dispatch_type513);
+    RUN_TEST(test_onion_msg_dispatch_short);
+    RUN_TEST(test_offer_create_node_id);
+    RUN_TEST(test_offer_create_encode_lno);
+    RUN_TEST(test_offer_create_with_amount);
+    RUN_TEST(test_offer_create_no_amount);
+    RUN_TEST(test_admin_rpc_createoffer_lno);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);
