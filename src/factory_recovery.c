@@ -375,20 +375,6 @@ static unsigned char nibble(char c)
     return 0xFF;
 }
 
-/* Hex-decode up to n bytes from hex into out. Returns bytes written or -1. */
-static int hex_decode(const char *hex, unsigned char *out, size_t n)
-{
-    size_t hex_len = strlen(hex);
-    if (hex_len != 2 * n) return -1;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char hi = nibble(hex[2*i]);
-        unsigned char lo = nibble(hex[2*i+1]);
-        if (hi == 0xFF || lo == 0xFF) return -1;
-        out[i] = (unsigned char)(hi << 4 | lo);
-    }
-    return (int)n;
-}
-
 /* Hex-encode n bytes into out (must have room for 2n+1 bytes). */
 static void hex_encode(const unsigned char *in, size_t n, char *out)
 {
