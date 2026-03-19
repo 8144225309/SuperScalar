@@ -376,6 +376,23 @@ extern int test_splice_wire_parse_ack(void);
 extern int test_splice_wire_splicing_signed(void);
 extern int test_splice_wire_wrong_type(void);
 extern int test_splice_wire_truncated(void);
+/* PR #32: Circuit Breaker + Dynamic Commitments */
+extern int test_cb_init(void);
+extern int test_cb_check_add_accepts(void);
+extern int test_cb_check_add_rejects_count(void);
+extern int test_cb_check_add_rejects_msat(void);
+extern int test_cb_record_settled(void);
+extern int test_cb_token_bucket_rate_limit(void);
+extern int test_cb_token_refill(void);
+extern int test_channel_type_encode_decode(void);
+extern int test_channel_type_negotiate(void);
+extern int test_update_fee_validate_floor(void);
+extern int test_update_fee_validate_ceiling(void);
+extern int test_cb_unknown_peer_defaults(void);
+extern int test_channel_type_decode_wrong_type(void);
+extern int test_cb_set_limits_clamp_tokens(void);
+extern int test_channel_type_encode_small_buf(void);
+extern int test_cb_htlc_interceptor_iface(void);
 /* PR #22 Phase 5: BOLT #12 completion */
 extern int test_bolt12_blinded_path_aead(void);
 extern int test_bolt12_merkle_root_nonempty(void);
@@ -1575,6 +1592,24 @@ static void run_unit_tests(void) {
     RUN_TEST(test_splice_wire_splicing_signed);
     RUN_TEST(test_splice_wire_wrong_type);
     RUN_TEST(test_splice_wire_truncated);
+
+    printf("\n=== PR #32: Circuit Breaker + Dynamic Commitments ===\n");
+    RUN_TEST(test_cb_init);
+    RUN_TEST(test_cb_check_add_accepts);
+    RUN_TEST(test_cb_check_add_rejects_count);
+    RUN_TEST(test_cb_check_add_rejects_msat);
+    RUN_TEST(test_cb_record_settled);
+    RUN_TEST(test_cb_token_bucket_rate_limit);
+    RUN_TEST(test_cb_token_refill);
+    RUN_TEST(test_channel_type_encode_decode);
+    RUN_TEST(test_channel_type_negotiate);
+    RUN_TEST(test_update_fee_validate_floor);
+    RUN_TEST(test_update_fee_validate_ceiling);
+    RUN_TEST(test_cb_unknown_peer_defaults);
+    RUN_TEST(test_channel_type_decode_wrong_type);
+    RUN_TEST(test_cb_set_limits_clamp_tokens);
+    RUN_TEST(test_channel_type_encode_small_buf);
+    RUN_TEST(test_cb_htlc_interceptor_iface);
 
     printf("\n=== BOLT #12 Offers (Full) ===\n");
     RUN_TEST(test_bolt12_offer_expiry);
