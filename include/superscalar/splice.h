@@ -33,7 +33,7 @@
 #define SPLICE_MSG_SPLICE_INIT   78
 #define SPLICE_MSG_SPLICE_ACK    79
 #define SPLICE_MSG_SPLICE_LOCKED 80
-#define MSG_SPLICING_SIGNED      0x004b   /* mutual partial-sig exchange (BOLT #2 §4.9) */
+#define MSG_SPLICING_SIGNED      0x004b   /* mutual partial-sig exchange (BOLT #2 ss4.9) */
 
 /* Quiescence state */
 #define SPLICE_STATE_NONE       0
@@ -123,33 +123,6 @@ size_t splice_build_splice_ack(const unsigned char channel_id32[32],
                                 unsigned char *buf, size_t buf_cap);
 
 /*
- * Parse a splice_ack wire message (type 79).
- * Symmetric to splice_build_splice_ack.
- * Returns 1 on success.
- */
-int splice_parse_splice_ack(const unsigned char *msg, size_t msg_len,
-                              unsigned char channel_id32_out[32],
-                              int64_t *relative_satoshis_out,
-                              unsigned char pubkey_out[33]);
-
-/*
- * Build a splicing_signed wire message (type 0x004b).
- * type(2) + channel_id(32) + partial_sig(64) = 98 bytes.
- * Returns bytes written, or 0 on error.
- */
-size_t splice_build_splicing_signed(const unsigned char channel_id[32],
-                                     const unsigned char partial_sig64[64],
-                                     unsigned char *buf, size_t buf_cap);
-
-/*
- * Parse a splicing_signed wire message (type 0x004b).
- * Returns 1 on success.
- */
-int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
-                                  unsigned char channel_id_out[32],
-                                  unsigned char partial_sig_out[64]);
-
-/*
  * Build a splice_locked wire message (type 80).
  * splice_txid32: 32-byte txid of the confirmed splice transaction.
  * Returns bytes written.
@@ -176,5 +149,110 @@ int channel_apply_splice_update(channel_t *ch,
                                   const unsigned char *new_txid32,
                                   uint32_t new_vout,
                                   uint64_t new_funding_amount);
+
+/* ---- BOLT #2 §4.9.2 Interactive Transaction Construction ---- */
+
+/* Wire message types for dual-funding / splicing interactive tx */
+#define MSG_TX_ADD_INPUT      66
+#define MSG_TX_ADD_OUTPUT     67
+#define MSG_TX_REMOVE_INPUT   68
+#define MSG_TX_REMOVE_OUTPUT  69
+#define MSG_TX_COMPLETE       70
+#define MSG_TX_SIGNATURES     71
+
+#define SPLICE_TX_MAX_SCRIPT  520  /* max scriptPubKey length */
+
+/*
+ * Build tx_add_input (type 66).
+ * Wire: type(2)+channel_id(32)+serial_id(8)+prevtxid(32)+vout(4)+sequence(4) = 82 bytes
+ */
+size_t splice_build_tx_add_input(const unsigned char channel_id[32],
+                                  uint64_t serial_id,
+                                  const unsigned char prevtxid[32],
+                                  uint32_t prevtx_vout,
+                                  uint32_t sequence,
+                                  unsigned char *buf, size_t buf_cap);
+
+int splice_parse_tx_add_input(const unsigned char *msg, size_t msg_len,
+                               unsigned char channel_id_out[32],
+                               uint64_t *serial_id_out,
+                               unsigned char prevtxid_out[32],
+                               uint32_t *prevtx_vout_out,
+                               uint32_t *sequence_out);
+
+/*
+ * Build tx_add_output (type 67).
+ * Wire: type(2)+channel_id(32)+serial_id(8)+sats(8)+script_len(2)+script = 52+script_len
+ */
+size_t splice_build_tx_add_output(const unsigned char channel_id[32],
+                                   uint64_t serial_id,
+                                   uint64_t sats,
+                                   const unsigned char *script,
+                                   uint16_t script_len,
+                                   unsigned char *buf, size_t buf_cap);
+
+int splice_parse_tx_add_output(const unsigned char *msg, size_t msg_len,
+                                unsigned char channel_id_out[32],
+                                uint64_t *serial_id_out,
+                                uint64_t *sats_out,
+                                unsigned char *script_out,
+                                uint16_t *script_len_out);
+
+/*
+ * Build tx_remove_input/output (type 68/69).
+ * Wire: type(2)+channel_id(32)+serial_id(8) = 42 bytes
+ */
+size_t splice_build_tx_remove_input(const unsigned char channel_id[32],
+                                     uint64_t serial_id,
+                                     unsigned char *buf, size_t buf_cap);
+
+size_t splice_build_tx_remove_output(const unsigned char channel_id[32],
+                                      uint64_t serial_id,
+                                      unsigned char *buf, size_t buf_cap);
+
+int splice_parse_tx_remove(const unsigned char *msg, size_t msg_len,
+                            uint16_t expected_type,
+                            unsigned char channel_id_out[32],
+                            uint64_t *serial_id_out);
+
+/*
+ * Build/parse tx_complete (type 70).
+ * Wire: type(2)+channel_id(32) = 34 bytes
+ */
+size_t splice_build_tx_complete(const unsigned char channel_id[32],
+                                 unsigned char *buf, size_t buf_cap);
+
+int splice_parse_tx_complete(const unsigned char *msg, size_t msg_len,
+                              unsigned char channel_id_out[32]);
+
+/*
+ * Build/parse tx_signatures (type 71).
+ * Wire: type(2)+channel_id(32)+txid(32)+witness_len(2)+witness = 68+witness_len
+ */
+size_t splice_build_tx_signatures(const unsigned char channel_id[32],
+                                   const unsigned char txid[32],
+                                   const unsigned char *witness,
+                                   uint16_t witness_len,
+                                   unsigned char *buf, size_t buf_cap);
+
+int splice_parse_tx_signatures(const unsigned char *msg, size_t msg_len,
+                                unsigned char channel_id_out[32],
+                                unsigned char txid_out[32],
+                                unsigned char *witness_out,
+                                uint16_t *witness_len_out);
+
+/* Phase 4: parse_splice_ack + splicing_signed */
+int splice_parse_splice_ack(const unsigned char *msg, size_t msg_len,
+                              unsigned char channel_id32_out[32],
+                              int64_t *relative_satoshis_out,
+                              unsigned char pubkey_out[33]);
+
+size_t splice_build_splicing_signed(const unsigned char channel_id[32],
+                                     const unsigned char partial_sig64[64],
+                                     unsigned char *buf, size_t buf_cap);
+
+int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
+                                  unsigned char channel_id_out[32],
+                                  unsigned char partial_sig_out[64]);
 
 #endif /* SUPERSCALAR_SPLICE_H */
