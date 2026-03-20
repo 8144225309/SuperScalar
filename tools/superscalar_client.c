@@ -682,13 +682,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     }
 
     while (!g_shutdown) {
-        /* Fix 3: Drain messages queued by recv_or_handle_ptlc before blocking.
-           MSG_COMMITMENT_SIGNED can arrive while we wait for a different message;
-           the inbox ensures it is processed rather than lost.
-           IMPORTANT: we must NOT call client_recv_lsp_revocation here because
-           it blocks on the socket and would consume the next real message.
-           MSG_LSP_REVOKE_AND_ACK will arrive naturally and be handled by the
-           case MSG_LSP_REVOKE_AND_ACK branch in the daemon switch below. */
+        wire_msg_t msg;
+
+        /* Drain messages queued by recv_or_handle_ptlc before blocking.
+           MSG_COMMITMENT_SIGNED is handled inline (needs immediate revocation
+           exchange).  ALL other message types are re-dispatched through the
+           main daemon switch via goto so nothing is silently dropped. */
         {
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
@@ -699,65 +698,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         persist_update_channel_balance(cbd->db, my_index - 1,
                             ch->local_amount, ch->remote_amount,
                             ch->commitment_number);
-                } else if (imsg.msg_type == MSG_LSPS_RESPONSE) {
-                    /* LSPS response queued during HTLC processing — re-dispatch */
-                    wire_msg_t lsps_msg = imsg;
-                    /* Fall through to main switch by pushing back */
-                    /* Simpler: handle inline using the same logic as case MSG_LSPS_RESPONSE */
-                    cJSON *result = lsps_msg.json
-                        ? cJSON_GetObjectItem(lsps_msg.json, "result") : NULL;
-                    if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
-                        int ok = (result != NULL &&
-                                  cJSON_GetObjectItem(result, "min_fee_msat") != NULL);
-                        printf("LSPS2 GET_INFO: %s\n", ok ? "OK" : "FAIL");
-                        fflush(stdout);
-                        cbd->test_lsps2_done = 1;
-                        if (!cbd->test_lsps2_buy) {
-                            cJSON_Delete(lsps_msg.json);
-                            return 2;
-                        }
-                        if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
-                            cJSON *buy_req = cJSON_CreateObject();
-                            if (buy_req) {
-                                cJSON_AddStringToObject(buy_req, "jsonrpc", "2.0");
-                                cJSON_AddNumberToObject(buy_req, "id", 2);
-                                cJSON_AddStringToObject(buy_req, "method", "lsps2.buy");
-                                cJSON *params = cJSON_CreateObject();
-                                if (params) {
-                                    cJSON *fee_params = cJSON_CreateObject();
-                                    cJSON *min_fee = cJSON_GetObjectItem(result, "min_fee_msat");
-                                    if (fee_params && min_fee)
-                                        cJSON_AddNumberToObject(fee_params, "min_fee_msat",
-                                                                min_fee->valuedouble);
-                                    cJSON_AddItemToObject(params, "opening_fee_params", fee_params);
-                                    cJSON_AddNumberToObject(params, "payment_size_msat", 100000.0);
-                                    cJSON_AddItemToObject(buy_req, "params", params);
-                                }
-                                wire_send(fd, MSG_LSPS_REQUEST, buy_req);
-                                cJSON_Delete(buy_req);
-                                printf("Client %u: sent lsps2.buy request (from inbox)\n", my_index);
-                                fflush(stdout);
-                            }
-                        }
-                    } else if (cbd && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
-                        int ok = 0;
-                        if (result) {
-                            cJSON *scid_j = cJSON_GetObjectItem(result, "jit_channel_scid");
-                            if (scid_j && cJSON_IsString(scid_j) && scid_j->valuestring) {
-                                unsigned int a, b, c;
-                                ok = (sscanf(scid_j->valuestring, "%ux%ux%u", &a, &b, &c) == 3);
-                            }
-                        }
-                        printf("LSPS2 BUY: %s\n", ok ? "OK" : "FAIL");
-                        fflush(stdout);
-                        cbd->test_lsps2_buy_done = 1;
-                        cJSON_Delete(lsps_msg.json);
-                        return 2;
-                    }
-                    cJSON_Delete(lsps_msg.json);
                 } else {
-                    /* Unknown queued message — discard */
-                    cJSON_Delete(imsg.json);
+                    /* Re-dispatch through main switch instead of discarding */
+                    msg = imsg;
+                    goto handle_message;
                 }
             }
         }
@@ -777,12 +721,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             continue;
         }
 
-        wire_msg_t msg;
         if (!wire_recv(fd, &msg)) {
             fprintf(stderr, "Client %u: daemon recv failed (disconnected)\n", my_index);
             return 0;  /* signal disconnect — main() will retry */
         }
 
+handle_message:
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
