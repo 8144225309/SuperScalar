@@ -27,6 +27,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/stateless_invoice.h"
 #include "superscalar/circuit_breaker.h"
+#include "superscalar/peer_storage.h"
 #include "superscalar/sha256.h"
 #include <string.h>
 #include <stdio.h>
@@ -647,6 +648,22 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             const unsigned char *payload = msg;
             gossip_ingest_message(d->gi, payload, msg_len, (uint32_t)time(NULL));
         }
+        return (int)msg_type;
+    }
+
+    case BOLT9_PEER_STORAGE: {   /* type 7: peer asks us to store a blob */
+        if (msg_len < 4) return -1;
+        uint16_t blen = rd16(msg + 2);
+        if (msg_len < (size_t)(4 + blen)) return -1;
+        if (d->persist && d->pmgr && peer_idx >= 0 && peer_idx < d->pmgr->count) {
+            persist_save_peer_storage((persist_t *)d->persist,
+                                       d->pmgr->peers[peer_idx].pubkey,
+                                       msg + 4, blen);
+        }
+        return (int)msg_type;
+    }
+    case BOLT9_YOUR_PEER_STORAGE: {  /* type 9: peer returns our stored blob */
+        /* Application layer handles retrieval; just acknowledge receipt */
         return (int)msg_type;
     }
 

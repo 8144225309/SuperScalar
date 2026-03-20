@@ -7,6 +7,7 @@
 #include "superscalar/gossip_store.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 
 /* Helper: encode 33-byte pubkey as 66-char hex string (+ NUL) */
@@ -556,4 +557,96 @@ int gossip_store_enumerate_channels_since(gossip_store_t *gs,
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* === RGS snapshot export (wire gossip_store → rgs_snapshot_t) === */
+
+#include "superscalar/rgs.h"
+
+size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t out_cap) {
+    if (!gs || !gs->db || !out) return 0;
+
+    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
+    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    uint32_t n_nodes = 0, n_channels = 0;
+
+    /* Collect unique node IDs from channels */
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(gs->db,
+            "SELECT node1_hex, node2_hex, scid, capacity_sat "
+            "FROM gossip_channels LIMIT ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, RGS_MAX_CHANNELS);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW && n_channels < RGS_MAX_CHANNELS) {
+        /* node IDs are hex strings; decode to 33-byte pubkeys */
+        const char *n1_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *n2_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (!n1_hex || !n2_hex || strlen(n1_hex) < 66 || strlen(n2_hex) < 66)
+            continue;
+        unsigned char n1_raw[33], n2_raw[33];
+        for (int b = 0; b < 33; b++) {
+            unsigned int v;
+            sscanf(n1_hex + b*2, "%02x", &v); n1_raw[b] = (unsigned char)v;
+            sscanf(n2_hex + b*2, "%02x", &v); n2_raw[b] = (unsigned char)v;
+        }
+        const unsigned char *n1 = n1_raw;
+        const unsigned char *n2 = n2_raw;
+
+        /* Find or add node IDs */
+        uint32_t idx1 = n_nodes, idx2 = n_nodes;
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            if (memcmp(nodes[i].pubkey, n1, 33) == 0) { idx1 = i; break; }
+        }
+        if (idx1 == n_nodes && n_nodes < RGS_MAX_NODE_IDS) {
+            memcpy(nodes[n_nodes].pubkey, n1, 33);
+            idx1 = n_nodes++;
+        }
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            if (memcmp(nodes[i].pubkey, n2, 33) == 0) { idx2 = i; break; }
+        }
+        if (idx2 == n_nodes && n_nodes < RGS_MAX_NODE_IDS) {
+            memcpy(nodes[n_nodes].pubkey, n2, 33);
+            idx2 = n_nodes++;
+        }
+
+        rgs_channel_t *ch = &channels[n_channels];
+        memset(ch, 0, sizeof(*ch));
+        ch->short_channel_id = (uint64_t)sqlite3_column_int64(stmt, 2);
+        ch->node_id_1_idx = idx1;
+        ch->node_id_2_idx = idx2;
+        ch->funding_satoshis = (uint64_t)sqlite3_column_int64(stmt, 3);
+        ch->update_count = 0;
+        n_channels++;
+    }
+    sqlite3_finalize(stmt);
+
+    /* Load channel updates */
+    for (uint32_t i = 0; i < n_channels; i++) {
+        for (int dir = 0; dir <= 1; dir++) {
+            uint32_t fee_base = 0, fee_ppm = 0;
+            uint16_t cltv = 0;
+            uint32_t ts = 0;
+            if (gossip_store_get_channel_update(gs, channels[i].short_channel_id,
+                                                  dir, &fee_base, &fee_ppm, &cltv, &ts)) {
+                int ui = channels[i].update_count;
+                if (ui < RGS_MAX_UPDATES_PER_CHAN) {
+                    channels[i].updates[ui].direction = dir;
+                    channels[i].updates[ui].fee_base_msat = fee_base;
+                    channels[i].updates[ui].fee_proportional_millionths = fee_ppm;
+                    channels[i].updates[ui].cltv_expiry_delta = cltv;
+                    channels[i].updates[ui].timestamp = ts;
+                    channels[i].update_count++;
+                }
+            }
+        }
+    }
+
+    rgs_snapshot_t snap;
+    snap.last_sync_timestamp = (uint32_t)time(NULL);
+    snap.node_id_count = n_nodes;
+    snap.channel_count = n_channels;
+
+    return rgs_build(&snap, nodes, channels, out, out_cap);
 }

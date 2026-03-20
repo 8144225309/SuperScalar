@@ -1594,6 +1594,15 @@ extern int test_cb_p1_save_load_limits(void);
 extern int test_cb_p2_save_3_peers(void);
 extern int test_cb_p3_upsert_limits(void);
 extern int test_cb_p4_null_persist(void);
+extern int test_ptlc_p1_persist_roundtrip(void);
+extern int test_ptlc_p2_delete(void);
+extern int test_ps_blob1_roundtrip(void);
+extern int test_rgs_e1_export(void);
+extern int test_bip353_dns_name(void);
+extern int test_bip353_validate(void);
+extern int test_chantype_roundtrip(void);
+extern int test_chantype_negotiate(void);
+extern int test_ptlc_commitment_output(void);
 
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
@@ -3237,6 +3246,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cb_p2_save_3_peers);
     RUN_TEST(test_cb_p3_upsert_limits);
     RUN_TEST(test_cb_p4_null_persist);
+    RUN_TEST(test_ptlc_p1_persist_roundtrip);
+    RUN_TEST(test_ptlc_p2_delete);
+    RUN_TEST(test_ps_blob1_roundtrip);
+    RUN_TEST(test_rgs_e1_export);
+    RUN_TEST(test_bip353_dns_name);
+    RUN_TEST(test_bip353_validate);
+    RUN_TEST(test_chantype_roundtrip);
+    RUN_TEST(test_chantype_negotiate);
+    RUN_TEST(test_ptlc_commitment_output);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);

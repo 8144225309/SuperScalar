@@ -1,5 +1,9 @@
 #include "superscalar/persist.h"
 #include "superscalar/circuit_breaker.h"
+#include "superscalar/gossip_store.h"
+#include "superscalar/rgs.h"
+#include "superscalar/lnurl.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
@@ -2470,5 +2474,212 @@ int test_cb_p4_null_persist(void) {
                 "CB_P4: NULL persist load returns -1");
     TEST_ASSERT(persist_load_circuit_breaker_peers(NULL, NULL) == -1,
                 "CB_P4: NULL both returns -1");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #78 tests: PTLC persistence, peer storage, RGS export,
+ * BIP 353, dynamic commitments, BIP 158 RPC elimination
+ * ========================================================================== */
+
+/* PTLC_P1: save + load PTLC round-trip */
+int test_ptlc_p1_persist_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PTLC_P1: open");
+
+    ptlc_t pt;
+    memset(&pt, 0, sizeof(pt));
+    pt.id = 42;
+    pt.direction = PTLC_OFFERED;
+    pt.state = PTLC_STATE_ACTIVE;
+    pt.amount_sats = 100000;
+    pt.cltv_expiry = 700000;
+
+    TEST_ASSERT(persist_save_ptlc(&db, 1, &pt), "PTLC_P1: save");
+
+    ptlc_t loaded[4];
+    size_t n = persist_load_ptlcs(&db, 1, loaded, 4);
+    TEST_ASSERT_EQ(n, 1, "PTLC_P1: loaded 1");
+    TEST_ASSERT_EQ(loaded[0].id, 42, "PTLC_P1: id matches");
+    TEST_ASSERT_EQ(loaded[0].direction, PTLC_OFFERED, "PTLC_P1: direction");
+    TEST_ASSERT_EQ((long long)loaded[0].amount_sats, 100000LL, "PTLC_P1: amount");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PTLC_P2: delete PTLC */
+int test_ptlc_p2_delete(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PTLC_P2: open");
+
+    ptlc_t pt;
+    memset(&pt, 0, sizeof(pt));
+    pt.id = 7;
+    pt.direction = PTLC_RECEIVED;
+    pt.state = PTLC_STATE_ACTIVE;
+    pt.amount_sats = 50000;
+
+    persist_save_ptlc(&db, 1, &pt);
+    TEST_ASSERT(persist_delete_ptlc(&db, 1, 7), "PTLC_P2: delete");
+
+    ptlc_t loaded[4];
+    size_t n = persist_load_ptlcs(&db, 1, loaded, 4);
+    TEST_ASSERT_EQ(n, 0, "PTLC_P2: empty after delete");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_BLOB1: peer storage save + load round-trip */
+int test_ps_blob1_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_BLOB1: open");
+
+    unsigned char pk[33];
+    memset(pk, 0x42, 33);
+    unsigned char blob[] = "encrypted_backup_data_here";
+    uint16_t blen = sizeof(blob) - 1;
+
+    TEST_ASSERT(persist_save_peer_storage(&db, pk, blob, blen), "PS_BLOB1: save");
+
+    unsigned char loaded[256];
+    uint16_t loaded_len = 0;
+    TEST_ASSERT(persist_load_peer_storage(&db, pk, loaded, &loaded_len, sizeof(loaded)),
+                "PS_BLOB1: load");
+    TEST_ASSERT_EQ(loaded_len, blen, "PS_BLOB1: length matches");
+    TEST_ASSERT(memcmp(loaded, blob, blen) == 0, "PS_BLOB1: data matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* RGS_E1: RGS export produces valid blob with magic header */
+int test_rgs_e1_export(void) {
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RGS_E1: open store");
+
+    unsigned char out[4096];
+    size_t len = gossip_store_export_rgs(&gs, out, sizeof(out));
+    /* Empty store produces a minimal RGS blob (17 bytes: magic+ts+node_count+chan_count) */
+    TEST_ASSERT(len > 0, "RGS_E1: blob produced");
+    if (len >= 5)
+        TEST_ASSERT(memcmp(out, "RGSV1", 5) == 0, "RGS_E1: magic header");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* BIP353_1: bip353_to_dns_name produces correct DNS name */
+int test_bip353_dns_name(void) {
+    char dns[512];
+    int ok = bip353_to_dns_name("satoshi@bitcoin.org", dns, sizeof(dns));
+    TEST_ASSERT(ok, "BIP353_1: conversion ok");
+    TEST_ASSERT(strcmp(dns, "satoshi._bitcoin-payment.bitcoin.org") == 0,
+                "BIP353_1: DNS name matches");
+    return 1;
+}
+
+/* BIP353_2: bip353_validate_address accepts valid, rejects invalid */
+int test_bip353_validate(void) {
+    TEST_ASSERT(bip353_validate_address("user@example.com") == 1,
+                "BIP353_2: valid address");
+    TEST_ASSERT(bip353_validate_address("noatsign") == 0,
+                "BIP353_2: no @ rejected");
+    TEST_ASSERT(bip353_validate_address("@nodomain") == 0,
+                "BIP353_2: empty user rejected");
+    return 1;
+}
+
+/* CHANTYPE_1: channel_type TLV encode/decode round-trip */
+int test_chantype_roundtrip(void) {
+    uint32_t bits = (1 << 12) | (1 << 22);  /* static_remote_key + anchors */
+    unsigned char buf[16];
+    size_t len = channel_type_encode(bits, buf, sizeof(buf));
+    TEST_ASSERT(len > 0, "CHANTYPE_1: encode ok");
+
+    uint32_t decoded = 0;
+    TEST_ASSERT(channel_type_decode(buf, len, &decoded), "CHANTYPE_1: decode ok");
+    TEST_ASSERT_EQ(decoded, bits, "CHANTYPE_1: round-trip matches");
+    return 1;
+}
+
+/* CHANTYPE_2: negotiate = AND of local and remote bits */
+int test_chantype_negotiate(void) {
+    uint32_t local  = (1 << 12) | (1 << 22) | (1 << 4);
+    uint32_t remote = (1 << 12) | (1 << 6);
+    uint32_t agreed = channel_type_negotiate(local, remote);
+    TEST_ASSERT_EQ(agreed, (uint32_t)(1 << 12), "CHANTYPE_2: only shared bit");
+    return 1;
+}
+
+/* PTLC_COMMIT_1: commitment tx with PTLC has extra output */
+int test_ptlc_commitment_output(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx, "PTLC_CO1: ctx");
+
+    channel_t ch;
+    unsigned char local_priv[32], remote_priv[32];
+    memset(local_priv, 0x01, 32); local_priv[31] = 0x01;
+    memset(remote_priv, 0x02, 32); remote_priv[31] = 0x02;
+
+    secp256k1_pubkey local_pk, remote_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_pk, local_priv);
+    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_priv);
+
+    unsigned char txid[32] = {0};
+    unsigned char spk[34] = {0x51, 0x20};
+    channel_init(&ch, ctx, local_priv, &local_pk, &remote_pk,
+                  txid, 0, 1000000, spk, 34, 500000, 400000, 144);
+
+    /* Set up basepoints */
+    unsigned char bp1[32], bp2[32], bp3[32], bp4[32];
+    memset(bp1, 0x11, 32); bp1[0] = 0x01;
+    memset(bp2, 0x12, 32); bp2[0] = 0x01;
+    memset(bp3, 0x13, 32); bp3[0] = 0x01;
+    memset(bp4, 0x14, 32); bp4[0] = 0x01;
+    channel_set_local_basepoints(&ch, bp1, bp2, bp3);
+    channel_set_local_htlc_basepoint(&ch, bp4);
+
+    secp256k1_pubkey rbp, pbp, dbp, hbp;
+    secp256k1_ec_pubkey_create(ctx, &rbp, bp3);
+    secp256k1_ec_pubkey_create(ctx, &pbp, bp1);
+    secp256k1_ec_pubkey_create(ctx, &dbp, bp2);
+    secp256k1_ec_pubkey_create(ctx, &hbp, bp4);
+    channel_set_remote_basepoints(&ch, &pbp, &dbp, &rbp);
+    channel_set_remote_htlc_basepoint(&ch, &hbp);
+
+    channel_generate_local_pcs(&ch, 0);
+
+    /* Build commitment tx WITHOUT PTLC */
+    tx_buf_t tx1;
+    unsigned char txid1[32];
+    int r1 = channel_build_commitment_tx(&ch, &tx1, txid1);
+    TEST_ASSERT(r1, "PTLC_CO1: commitment without PTLC");
+    size_t len1 = tx1.len;
+
+    /* Add a PTLC */
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x77, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t ptlc_id;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 10000, &pp, 800000, &ptlc_id);
+
+    /* Build commitment tx WITH PTLC */
+    tx_buf_t tx2;
+    unsigned char txid2[32];
+    int r2 = channel_build_commitment_tx(&ch, &tx2, txid2);
+    TEST_ASSERT(r2, "PTLC_CO1: commitment with PTLC");
+
+    /* TX with PTLC should be larger (has extra output) */
+    TEST_ASSERT(tx2.len > len1, "PTLC_CO1: tx with PTLC is larger");
+
+    tx_buf_free(&tx1);
+    tx_buf_free(&tx2);
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

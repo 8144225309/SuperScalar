@@ -650,4 +650,19 @@ int persist_save_circuit_breaker_peer(persist_t *p,
  */
 int persist_load_circuit_breaker_peers(persist_t *p, circuit_breaker_t *cb);
 
+/* --- PTLC persistence (schema v10) --- */
+
+int persist_save_ptlc(persist_t *p, uint32_t channel_id, const ptlc_t *ptlc);
+size_t persist_load_ptlcs(persist_t *p, uint32_t channel_id,
+                            ptlc_t *ptlcs_out, size_t max_ptlcs);
+int persist_delete_ptlc(persist_t *p, uint32_t channel_id, uint64_t ptlc_id);
+
+/* --- Peer storage persistence (schema v10) --- */
+
+int persist_save_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
+                                const unsigned char *blob, uint16_t blob_len);
+int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
+                                unsigned char *blob_out, uint16_t *blob_len_out,
+                                size_t blob_cap);
+
 #endif /* SUPERSCALAR_PERSIST_H */

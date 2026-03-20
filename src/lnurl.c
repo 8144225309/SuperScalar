@@ -393,3 +393,44 @@ int bip353_validate_address(const char *address)
     if (!has_dot && strstr(domain, ".onion") == NULL) return 0;
     return 1;
 }
+
+/* === BIP 353 DNS query (production wiring) === */
+
+/*
+ * Resolve a BIP 353 address by shelling out to `dig` for TXT records.
+ * This avoids linking libresolv; production deployments should use
+ * getdns or c-ares for async DNS resolution.
+ */
+int bip353_dns_resolve(const char *address, char *invoice_out, size_t inv_cap) {
+    if (!address || !invoice_out || inv_cap < 64) return 0;
+
+    char dns_name[512];
+    if (!bip353_to_dns_name(address, dns_name, sizeof(dns_name))) return 0;
+
+    /* Use popen("dig +short TXT ...") for portable DNS TXT lookup */
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "dig +short TXT %s 2>/dev/null", dns_name);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+
+    char line[2048];
+    int result = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        /* dig output is quoted: "bitcoin:?lightning=lnbc..." */
+        /* Strip outer quotes if present */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = 0;
+        char *txt = line;
+        if (len >= 2 && txt[0] == '"' && txt[len-1] == '"') {
+            txt[len-1] = 0;
+            txt++;
+        }
+
+        result = bip353_parse_txt_record(txt, invoice_out, inv_cap);
+        if (result > 0) break;
+    }
+    pclose(fp);
+    return result;
+}
