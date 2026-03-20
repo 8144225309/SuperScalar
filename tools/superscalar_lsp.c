@@ -2028,6 +2028,27 @@ int main(int argc, char *argv[]) {
             printf("LSP recovery: entering daemon mode "
                    "(waiting for client reconnections)...\n");
             fflush(stdout);
+
+            /* Admin RPC: initialize for recovery daemon mode */
+            if (rpc_file_arg) {
+                payment_init(&g_payments);
+                invoice_init(&g_invoice_tbl);
+                memset(&g_admin_rpc, 0, sizeof(g_admin_rpc));
+                g_admin_rpc.ctx           = ctx;
+                memcpy(g_admin_rpc.node_privkey, lsp_seckey, 32);
+                g_admin_rpc.channel_mgr   = mgr;
+                g_admin_rpc.payments      = &g_payments;
+                g_admin_rpc.invoices      = &g_invoice_tbl;
+                g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
+                if (admin_rpc_init(&g_admin_rpc, rpc_file_arg)) {
+                    printf("LSP: admin RPC socket at %s\n", rpc_file_arg);
+                    mgr->admin_rpc = &g_admin_rpc;
+                } else {
+                    fprintf(stderr, "LSP: warning: failed to bind admin RPC socket %s\n",
+                            rpc_file_arg);
+                }
+            }
+
             lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
 
             /* Persist updated channel balances on shutdown */
@@ -4484,6 +4505,10 @@ int main(int argc, char *argv[]) {
 
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
+
+            /* Wire admin RPC into daemon loop if initialized */
+            if (g_admin_rpc.listen_fd >= 0)
+                mgr->admin_rpc = &g_admin_rpc;
 
             lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
         }

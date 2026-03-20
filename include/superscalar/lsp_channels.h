@@ -162,6 +162,9 @@ typedef struct {
     void *chain_be;   /* chain_backend_t* — regtest or bip158 */
     void *wallet_src; /* wallet_source_t* — rpc or hd */
 
+    /* Admin RPC (JSON-RPC 2.0 Unix socket — serviced in daemon loop) */
+    void *admin_rpc;  /* admin_rpc_t* or NULL */
+
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
 } lsp_channel_mgr_t;
