@@ -1562,12 +1562,20 @@ int factory_session_finalize_node(factory_t *f, size_t node_idx) {
     factory_node_t *node = &f->nodes[node_idx];
 
     unsigned char sighash[32];
-    if (!compute_node_sighash(f, node, sighash))
+    if (!compute_node_sighash(f, node, sighash)) {
+        fprintf(stderr, "DEBUG finalize_node %zu: compute_node_sighash FAILED\n", node_idx);
         return 0;
+    }
 
     const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
-    return musig_session_finalize_nonces(f->ctx, &node->signing_session,
-                                          sighash, mr, NULL);
+    int ok = musig_session_finalize_nonces(f->ctx, &node->signing_session,
+                                            sighash, mr, NULL);
+    if (!ok)
+        fprintf(stderr, "DEBUG finalize_node %zu: musig_session_finalize_nonces FAILED "
+                "(n_signers=%zu, nonces_received=%d, has_taptree=%d)\n",
+                node_idx, node->n_signers,
+                node->signing_session.nonces_received, node->has_taptree);
+    return ok;
 }
 
 int factory_session_complete_node(factory_t *f, size_t node_idx) {
