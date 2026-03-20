@@ -1791,7 +1791,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
             /* The leaf outputs map to: output 0 = channel A, output 1 = channel B,
                output 2 = L-stock.  Update funding amount based on this client's output. */
-            entry->channel.funding_amount = amounts[ci] * 1000;  /* sats → msat */
+            entry->channel.funding_amount = amounts[ci];  /* sats, matching channel_init */
             /* Recalculate using lsp_balance_pct (matching channel init logic) */
             uint16_t pct = mgr->lsp_balance_pct;
             if (pct == 0) pct = 50;
@@ -1800,7 +1800,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
             if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
             uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
-            uint64_t usable_ra = amounts[ci] * 1000 > commit_fee_ra ? amounts[ci] * 1000 - commit_fee_ra : 0;
+            uint64_t usable_ra = amounts[ci] > commit_fee_ra ? amounts[ci] - commit_fee_ra : 0;
             entry->channel.local_amount = (usable_ra * pct) / 100;
             entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
         }
