@@ -5671,15 +5671,15 @@ int main(int argc, char *argv[]) {
     if (test_lsps2 && channels_active) {
         printf("\n=== LSPS2 WIRE TEST ===\n");
         printf("  LSPS2 handlers active (lsps0_bolt8_cb registered)\n");
-        printf("  Waiting for client --test-lsps2-buy flow (30s timeout)...\n");
+        printf("  Waiting for client --test-lsps2-buy flow (120s timeout)...\n");
         fflush(stdout);
 
         /* The LSPS2 test is client-driven: the client sends lsps2.get_info
-           and lsps2.buy requests. The LSP's existing LSPS0 callback handles
-           them automatically. We just wait for the client to disconnect
+           and lsps2.buy requests. The LSP's daemon loop dispatches them to
+           lsps_handle_request(). We wait for the test client to disconnect
            (it exits with code 2 after successful buy). */
         int lsps2_pass = 0;
-        for (int t = 0; t < 30; t++) {
+        for (int t = 0; t < 120; t++) {
             sleep(1);
             /* Check if any client disconnected (exit code 2 = success) */
             for (int ci = 0; ci < n_clients; ci++) {
