@@ -53,7 +53,7 @@ def cli_cmd(*args):
     CLN v25 sets lightning-dir to the network-specific subdir (e.g., .../cln/regtest),
     but lightning-cli --lightning-dir expects the parent dir and appends its own
     network subdir.  Split the path so both sides agree."""
-    cmd = [LIGHTNING_CLI]
+    cmd = LIGHTNING_CLI.split()
     if LIGHTNING_DIR:
         import os
         tail = os.path.basename(LIGHTNING_DIR)
