@@ -1,4 +1,5 @@
 #include "superscalar/persist.h"
+#include "superscalar/circuit_breaker.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
@@ -2142,6 +2143,8 @@ typedef struct {
     uint64_t       last_local;
     uint64_t       last_remote;
     int            last_state;
+    char           last_host[256];
+    uint16_t       last_port;
 } pc_cb_ctx_t;
 
 static void pc_callback(const unsigned char channel_id[32],
@@ -2150,6 +2153,8 @@ static void pc_callback(const unsigned char channel_id[32],
                          uint64_t local_balance_msat,
                          uint64_t remote_balance_msat,
                          int state,
+                         const char *peer_host,
+                         uint16_t peer_port,
                          void *ctx) {
     pc_cb_ctx_t *c = (pc_cb_ctx_t *)ctx;
     c->count++;
@@ -2157,6 +2162,8 @@ static void pc_callback(const unsigned char channel_id[32],
     c->last_local  = local_balance_msat;
     c->last_remote = remote_balance_msat;
     c->last_state  = state;
+    if (peer_host) strncpy(c->last_host, peer_host, sizeof(c->last_host) - 1);
+    c->last_port = peer_port;
     (void)peer_pubkey; (void)capacity_sat;
 }
 
@@ -2170,7 +2177,7 @@ int test_ps_n5_save_load_peer_channel(void) {
     memset(ppk, 0xBB, 33);
 
     TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
-                    1000000, 500000, 500000, 1),
+                    1000000, 500000, 500000, 1, NULL, 0),
                 "save channel");
 
     pc_cb_ctx_t ctx;
@@ -2193,9 +2200,9 @@ int test_ps_n6_save_2_channels(void) {
     memset(cid2, 0x22, 32);
     memset(ppk,  0x33, 33);
 
-    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid1, ppk, 1000000, 500000, 500000, 0),
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid1, ppk, 1000000, 500000, 500000, 0, NULL, 0),
                 "save channel 1");
-    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid2, ppk, 2000000, 900000, 1100000, 0),
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid2, ppk, 2000000, 900000, 1100000, 0, NULL, 0),
                 "save channel 2");
 
     pc_cb_ctx_t ctx;
@@ -2217,10 +2224,10 @@ int test_ps_n7_update_channel(void) {
     memset(ppk, 0x66, 33);
 
     TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
-                    1000000, 600000, 400000, 0),
+                    1000000, 600000, 400000, 0, NULL, 0),
                 "initial save");
     TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
-                    1000000, 300000, 700000, 2),
+                    1000000, 300000, 700000, 2, NULL, 0),
                 "updated save");
 
     pc_cb_ctx_t ctx;
@@ -2247,7 +2254,221 @@ int test_ps_n8_null_db(void) {
     memset(cid, 0xAA, 32);
     memset(ppk, 0xBB, 33);
     TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
-                    100, 50, 50, 0) == 0,
+                    100, 50, 50, 0, NULL, 0) == 0,
                 "null db channel returns 0");
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase A tests: host/port persistence (PS_10A through PS_10D)
+ * ========================================================================== */
+
+/* PS_10A: Save channel with host/port -> load -> host/port match */
+int test_ps_10a_host_port_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10A: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xA1, 32);
+    memset(ppk, 0xA2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 500000, 500000, 1,
+                    "localhost", 9735),
+                "PS_10A: save with host/port");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10A: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10A: callback fired once");
+    TEST_ASSERT(strcmp(ctx.last_host, "localhost") == 0, "PS_10A: host matches");
+    TEST_ASSERT_EQ(ctx.last_port, 9735, "PS_10A: port matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10B: Save with empty host (ephemeral peer) -> load -> no crash, host is empty */
+int test_ps_10b_empty_host(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10B: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xB1, 32);
+    memset(ppk, 0xB2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    500000, 200000, 300000, 0,
+                    NULL, 0),
+                "PS_10B: save with NULL host");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10B: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10B: callback fired once");
+    TEST_ASSERT(strlen(ctx.last_host) == 0, "PS_10B: host is empty");
+    TEST_ASSERT_EQ(ctx.last_port, 0, "PS_10B: port is 0");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10C: Schema v10 applied; peer_host/peer_port columns exist */
+int test_ps_10c_schema_v10(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10C: open");
+    int ver = persist_schema_version(&db);
+    TEST_ASSERT(ver == 10, "PS_10C: schema version is 10");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xC1, 32);
+    memset(ppk, 0xC2, 33);
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    800000, 400000, 400000, 0,
+                    "192.168.1.1", 9735),
+                "PS_10C: save with IP");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10C: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10C: one row");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10D: persist_load_ln_peer_channels delivers host/port to callback */
+int test_ps_10d_host_in_callback(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10D: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xD1, 32);
+    memset(ppk, 0xD2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    2000000, 1000000, 1000000, 1,
+                    "node.example.com", 9736),
+                "PS_10D: save");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    persist_load_ln_peer_channels(&db, pc_callback, &ctx);
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10D: got callback");
+    TEST_ASSERT(strcmp(ctx.last_host, "node.example.com") == 0, "PS_10D: host delivered");
+    TEST_ASSERT_EQ(ctx.last_port, 9736, "PS_10D: port delivered");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase D tests: circuit breaker persistence (CB_P1 through CB_P4)
+ * ========================================================================== */
+
+/* CB_P1: save + load circuit breaker limits -> match */
+int test_cb_p1_save_load_limits(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P1: open");
+
+    unsigned char pk[33];
+    memset(pk, 0xE1, 33);
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 100, 50000000000ULL, 1800) == 1,
+                "CB_P1: save");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n >= 1, "CB_P1: loaded at least 1");
+
+    int found = 0;
+    for (int i = 0; i < cb.n_peers; i++) {
+        if (cb.peers[i].active && memcmp(cb.peers[i].peer_pubkey, pk, 33) == 0) {
+            TEST_ASSERT_EQ(cb.peers[i].max_pending_htlcs, 100, "CB_P1: max_pending_htlcs");
+            TEST_ASSERT_EQ((long long)cb.peers[i].max_pending_msat, 50000000000LL,
+                           "CB_P1: max_pending_msat");
+            TEST_ASSERT_EQ(cb.peers[i].max_htlcs_per_hour, 1800, "CB_P1: max_htlcs_per_hour");
+            found = 1; break;
+        }
+    }
+    TEST_ASSERT(found, "CB_P1: peer slot found in circuit breaker");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P2: Save 3 peers -> load -> all 3 in circuit_breaker_t */
+int test_cb_p2_save_3_peers(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P2: open");
+
+    unsigned char pk1[33], pk2[33], pk3[33];
+    memset(pk1, 0x11, 33); pk1[0] = 0x02;
+    memset(pk2, 0x22, 33); pk2[0] = 0x02;
+    memset(pk3, 0x33, 33); pk3[0] = 0x02;
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk1, 10, 1000000ULL, 100) == 1,
+                "CB_P2: save 1");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk2, 20, 2000000ULL, 200) == 1,
+                "CB_P2: save 2");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk3, 30, 3000000ULL, 300) == 1,
+                "CB_P2: save 3");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n == 3, "CB_P2: loaded 3 peers");
+    TEST_ASSERT(cb.n_peers == 3, "CB_P2: n_peers == 3");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P3: Upsert same pubkey with new limits -> load -> sees new limits (no duplicate) */
+int test_cb_p3_upsert_limits(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P3: open");
+
+    unsigned char pk[33];
+    memset(pk, 0xAB, 33);
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 50, 9999ULL, 60) == 1,
+                "CB_P3: initial save");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 75, 8888ULL, 120) == 1,
+                "CB_P3: upsert");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n == 1, "CB_P3: only 1 row (upsert)");
+
+    int found = 0;
+    for (int i = 0; i < cb.n_peers; i++) {
+        if (cb.peers[i].active && memcmp(cb.peers[i].peer_pubkey, pk, 33) == 0) {
+            TEST_ASSERT_EQ(cb.peers[i].max_pending_htlcs, 75, "CB_P3: updated htlcs");
+            TEST_ASSERT_EQ((long long)cb.peers[i].max_pending_msat, 8888LL,
+                           "CB_P3: updated msat");
+            TEST_ASSERT_EQ(cb.peers[i].max_htlcs_per_hour, 120, "CB_P3: updated hourly");
+            found = 1; break;
+        }
+    }
+    TEST_ASSERT(found, "CB_P3: upserted peer found");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P4: NULL persist -> save returns -1, no crash */
+int test_cb_p4_null_persist(void) {
+    TEST_ASSERT(persist_save_circuit_breaker_peer(NULL, NULL, 0, 0, 0) == -1,
+                "CB_P4: NULL persist returns -1");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    TEST_ASSERT(persist_load_circuit_breaker_peers(NULL, &cb) == -1,
+                "CB_P4: NULL persist load returns -1");
+    TEST_ASSERT(persist_load_circuit_breaker_peers(NULL, NULL) == -1,
+                "CB_P4: NULL both returns -1");
     return 1;
 }

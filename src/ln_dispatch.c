@@ -26,6 +26,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/splice.h"
 #include "superscalar/stateless_invoice.h"
+#include "superscalar/circuit_breaker.h"
 #include "superscalar/sha256.h"
 #include <string.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@
 #define MSG_REVOKE_AND_ACK        133   /* 0x0085 */
 #define MSG_CHANNEL_REESTABLISH   136   /* 0x0088 */
 #define MSG_UPDATE_FAIL_MALFORMED 135   /* 0x0087 */
+#define MSG_ANNOUNCEMENT_SIGS     259   /* 0x0103 */
 #define MSG_INVOICE_REQUEST      0x8001 /* BOLT #12 direct wire */
 
 static uint16_t rd16(const unsigned char *b)
@@ -648,6 +650,27 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         return (int)msg_type;
     }
 
+    case MSG_ANNOUNCEMENT_SIGS: {
+        /* announcement_signatures (type 259):
+         * channel_id(32) + scid(8) + node_sig(64) + bitcoin_sig(64) = 168 + 2 type */
+        if (msg_len < 2 + 32 + 8 + 64 + 64) return -1;
+        const unsigned char *p = msg + 2;
+        /* p[0..31] = channel_id, p[32..39] = scid,
+           p[40..103] = node_sig, p[104..167] = bitcoin_sig */
+        const unsigned char *channel_id = p;
+        const unsigned char *node_sig   = p + 40;
+        const unsigned char *btc_sig    = p + 104;
+        if (d->peer_channels && peer_idx >= 0 && peer_idx < PEER_MGR_MAX_PEERS) {
+            channel_t *ch = d->peer_channels[peer_idx];
+            if (ch && memcmp(ch->funding_txid, channel_id, 32) == 0) {
+                memcpy(ch->remote_node_sig,    node_sig, 64);
+                memcpy(ch->remote_bitcoin_sig, btc_sig,  64);
+                ch->ann_sigs_recv = 1;
+            }
+        }
+        return (int)msg_type;
+    }
+
         default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
         return 0;
@@ -775,12 +798,13 @@ static void restore_channel_cb(const unsigned char channel_id[32],
                                 uint64_t local_balance_msat,
                                 uint64_t remote_balance_msat,
                                 int state,
+                                const char *peer_host,
+                                uint16_t peer_port,
                                 void *ctx_)
 {
     channel_restore_ctx_t *ctx = (channel_restore_ctx_t *)ctx_;
     ln_dispatch_t *d = ctx->d;
     (void)state;
-    (void)peer_pubkey;
 
     if (!d->peer_channels) return;
 
@@ -795,6 +819,9 @@ static void restore_channel_cb(const unsigned char channel_id[32],
             ch->local_amount        = local_balance_msat / 1000;
             ch->remote_amount       = remote_balance_msat / 1000;
             ctx->count++;
+            /* Trigger reconnect if we have a host/port saved */
+            if (d->pmgr && peer_host && strlen(peer_host) > 0 && peer_port > 0)
+                peer_mgr_connect(d->pmgr, peer_host, peer_port, peer_pubkey);
             break;
         }
     }
@@ -818,6 +845,10 @@ int ln_dispatch_load_state(ln_dispatch_t *d)
         persist_load_ln_peer_channels((persist_t *)d->persist,
                                       restore_channel_cb, &cctx);
         total += cctx.count;
+
+    /* Load circuit breaker limits from DB */
+    if (d->cb)
+        persist_load_circuit_breaker_peers((persist_t *)d->persist, d->cb);
     }
 
     return total;

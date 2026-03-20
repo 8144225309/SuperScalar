@@ -621,3 +621,146 @@ int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
     if (peer_mgr_send(mgr, peer_idx, accept, sizeof(accept)) <= 0) return 0;
     return 1;
 }
+
+/* -----------------------------------------------------------------------
+ * announcement_signatures (BOLT #7 type 259)
+ * ----------------------------------------------------------------------- */
+
+#include "superscalar/gossip.h"
+#include <secp256k1_schnorrsig.h>
+#include <secp256k1_extrakeys.h>
+#include <stdlib.h>
+#include <time.h>
+
+/* Sign the channel_announcement signable data with a given privkey.
+ * channel_announcement layout: type(2) | 4xsig(64) | features_len(2) | ...
+ * Signable = SHA256(SHA256(type(2) || msg[2+4*64..end]))
+ * Returns 1 on success, 0 on error. */
+static int sign_chan_ann(unsigned char sig64_out[64],
+                          secp256k1_context *ctx,
+                          const unsigned char privkey32[32],
+                          const unsigned char *ann, size_t ann_len)
+{
+    if (ann_len < 258) return 0;  /* type(2) + 4*sig(64) = 258 minimum */
+
+    /* Signable = type(2) || data_after_all_sigs */
+    size_t data_len = 2 + (ann_len - 258);
+    unsigned char *data = (unsigned char *)malloc(data_len);
+    if (!data) return 0;
+
+    memcpy(data, ann, 2);
+    memcpy(data + 2, ann + 258, ann_len - 258);
+
+    unsigned char hash[32];
+    sha256_double(data, data_len, hash);
+    free(data);
+
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, privkey32)) return 0;
+
+    int ok = secp256k1_schnorrsig_sign32(ctx, sig64_out, hash, &kp, NULL);
+    /* zeroise keypair */
+    memset(&kp, 0, sizeof(kp));
+    return ok;
+}
+
+int chan_send_announcement_sigs(peer_mgr_t *pmgr, int peer_idx,
+                                 secp256k1_context *ctx,
+                                 const unsigned char node_privkey[32],
+                                 channel_t *ch,
+                                 const unsigned char chain_hash[32])
+{
+    if (!ch || !ctx || !node_privkey || !chain_hash) return -1;
+    if (ch->short_channel_id == 0) return -1;  /* no SCID yet */
+
+    /* Derive our node pubkey (33 bytes) from node_privkey */
+    unsigned char our_node_pub[33];
+    {
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, node_privkey)) return -1;
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, our_node_pub, &plen,
+                                       &pub, SECP256K1_EC_COMPRESSED);
+    }
+
+    /* Peer's node pubkey — take from peer_mgr if available */
+    unsigned char peer_node_pub[33];
+    if (pmgr && peer_idx >= 0 && peer_idx < pmgr->count) {
+        memcpy(peer_node_pub, pmgr->peers[peer_idx].pubkey, 33);
+    } else {
+        /* Use remote_funding_pubkey serialized as placeholder */
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, peer_node_pub, &plen,
+                                       &ch->remote_funding_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+    }
+
+    /* Our bitcoin pubkey */
+    unsigned char our_btc_pub[33];
+    {
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, our_btc_pub, &plen,
+                                       &ch->local_funding_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+    }
+
+    /* Peer's bitcoin pubkey */
+    unsigned char peer_btc_pub[33];
+    {
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, peer_btc_pub, &plen,
+                                       &ch->remote_funding_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+    }
+
+    /* Determine node ordering (node_id_1 < node_id_2 lexicographically) */
+    const unsigned char *node_id_1, *node_id_2;
+    const unsigned char *btc_key_1, *btc_key_2;
+    if (memcmp(our_node_pub, peer_node_pub, 33) <= 0) {
+        node_id_1 = our_node_pub;  node_id_2 = peer_node_pub;
+        btc_key_1 = our_btc_pub;   btc_key_2 = peer_btc_pub;
+    } else {
+        node_id_1 = peer_node_pub; node_id_2 = our_node_pub;
+        btc_key_1 = peer_btc_pub;  btc_key_2 = our_btc_pub;
+    }
+
+    /* Build unsigned channel_announcement */
+    unsigned char ann[512];
+    size_t ann_len = gossip_build_channel_announcement_unsigned(
+        ann, sizeof(ann), chain_hash, ch->short_channel_id,
+        node_id_1, node_id_2, btc_key_1, btc_key_2);
+    if (ann_len == 0) return -1;
+
+    /* Sign with our node key */
+    if (!sign_chan_ann(ch->local_node_sig, ctx, node_privkey, ann, ann_len))
+        return -1;
+
+    /* Sign with our bitcoin funding key */
+    if (!sign_chan_ann(ch->local_bitcoin_sig, ctx,
+                        ch->local_funding_secret, ann, ann_len))
+        return -1;
+
+    /* Build announcement_signatures wire message (type 259, 170 bytes):
+       type(2) + channel_id(32) + scid(8) + node_sig(64) + btc_sig(64) */
+    unsigned char wire[2 + 32 + 8 + 64 + 64];
+    wire[0] = 0x01; wire[1] = 0x03;   /* type 259 */
+    memcpy(wire + 2, ch->funding_txid, 32);  /* channel_id = funding_txid */
+    /* SCID big-endian */
+    uint64_t scid = ch->short_channel_id;
+    wire[34] = (unsigned char)(scid >> 56);
+    wire[35] = (unsigned char)(scid >> 48);
+    wire[36] = (unsigned char)(scid >> 40);
+    wire[37] = (unsigned char)(scid >> 32);
+    wire[38] = (unsigned char)(scid >> 24);
+    wire[39] = (unsigned char)(scid >> 16);
+    wire[40] = (unsigned char)(scid >>  8);
+    wire[41] = (unsigned char)(scid);
+    memcpy(wire + 42, ch->local_node_sig, 64);
+    memcpy(wire + 106, ch->local_bitcoin_sig, 64);
+
+    if (pmgr && peer_idx >= 0)
+        peer_mgr_send(pmgr, peer_idx, wire, sizeof(wire));
+
+    ch->ann_sigs_sent = 1;
+    return 0;
+}

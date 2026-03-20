@@ -145,6 +145,15 @@ typedef struct {
     unsigned char close_remote_sig[64];  /* sig received in peer's closing_signed */
     unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
     uint16_t      close_their_spk_len;
+
+    /* announcement_signatures (BOLT #7 type 259) */
+    uint64_t      short_channel_id;          /* block<<40 | tx_idx<<16 | vout */
+    unsigned char local_node_sig[64];        /* our Schnorr sig over channel_announcement */
+    unsigned char local_bitcoin_sig[64];     /* our bitcoin key sig over channel_announcement */
+    unsigned char remote_node_sig[64];       /* peer's node key sig */
+    unsigned char remote_bitcoin_sig[64];    /* peer's bitcoin key sig */
+    int           ann_sigs_sent;             /* 1 = we sent announcement_signatures */
+    int           ann_sigs_recv;             /* 1 = peer sent us announcement_signatures */
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */

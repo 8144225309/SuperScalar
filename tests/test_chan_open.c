@@ -534,3 +534,194 @@ int test_chan_open_p2wsh_null_guard(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ==========================================================================
+ * Phase B tests: announcement_signatures type 259 (ANN1 through ANN6)
+ * ========================================================================== */
+
+#include "superscalar/gossip.h"
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <string.h>
+#include <stdio.h>
+
+/* ANN1: chan_send_announcement_sigs with valid channel -> ann_sigs_sent=1, node_sig non-zero */
+int test_ann1_send_announcement_sigs(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN1: ctx");
+
+    /* Build a minimal channel_t */
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+    ch.short_channel_id = (700000ULL << 40) | (1ULL << 16) | 0;
+
+    /* Generate funding keys */
+    unsigned char local_priv[32];
+    memset(local_priv, 0x11, 32);
+    local_priv[0] = 0x01; /* ensure valid */
+    secp256k1_ec_pubkey_create(ctx, &ch.local_funding_pubkey, local_priv);
+    memcpy(ch.local_funding_secret, local_priv, 32);
+
+    unsigned char remote_priv[32];
+    memset(remote_priv, 0x22, 32);
+    remote_priv[0] = 0x02;
+    secp256k1_ec_pubkey_create(ctx, &ch.remote_funding_pubkey, remote_priv);
+
+    /* Generate node privkey */
+    unsigned char node_priv[32];
+    memset(node_priv, 0x33, 32);
+    node_priv[0] = 0x01;
+
+    /* Call without pmgr (NULL) — should still sign */
+    int result = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                              GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(result == 0, "ANN1: returns 0");
+    ASSERT(ch.ann_sigs_sent == 1, "ANN1: ann_sigs_sent = 1");
+
+    /* Verify node_sig is non-zero */
+    int nonzero = 0;
+    for (int i = 0; i < 64; i++) if (ch.local_node_sig[i] != 0) { nonzero = 1; break; }
+    ASSERT(nonzero, "ANN1: local_node_sig non-zero");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ANN2: chan_send_announcement_sigs with NULL pmgr -> returns -1 only if scid=0 */
+int test_ann2_null_pmgr_no_crash(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN2: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+    ch.short_channel_id = 0;  /* scid=0 -> guard triggers */
+
+    unsigned char node_priv[32];
+    memset(node_priv, 0x55, 32); node_priv[0] = 0x01;
+
+    /* scid=0 -> must return -1 without crash */
+    int result = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                              GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(result == -1, "ANN2: scid=0 returns -1");
+    ASSERT(ch.ann_sigs_sent == 0, "ANN2: ann_sigs_sent stays 0");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ANN3: Dispatch type 259 valid 170-byte msg -> ann_sigs_recv=1, remote sigs stored */
+int test_ann3_dispatch_type_259(void) {
+    /* Build a 170-byte wire message */
+    unsigned char msg[170];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;  /* type 259 */
+    /* channel_id at msg[2..33]: use a known pattern */
+    memset(msg + 2, 0xAA, 32);     /* channel_id */
+    /* scid at msg[34..41] */
+    msg[34] = 0x00; msg[35] = 0x0A; msg[36] = 0xBC; msg[37] = 0xDE;
+    msg[38] = 0x00; msg[39] = 0x01; msg[40] = 0x00; msg[41] = 0x00;
+    /* node_sig at msg[42..105] */
+    memset(msg + 42, 0xBB, 64);
+    /* bitcoin_sig at msg[106..169] */
+    memset(msg + 106, 0xCC, 64);
+
+    /* Set up ln_dispatch with a channel matching channel_id */
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    memset(ch.funding_txid, 0xAA, 32);  /* matches channel_id above */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+    channels[0] = &ch;
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 259, "ANN3: returns 259");
+    ASSERT(ch.ann_sigs_recv == 1, "ANN3: ann_sigs_recv = 1");
+
+    /* Verify remote sigs were stored */
+    int node_ok = 1, btc_ok = 1;
+    for (int i = 0; i < 64; i++) {
+        if (ch.remote_node_sig[i] != 0xBB) { node_ok = 0; break; }
+    }
+    for (int i = 0; i < 64; i++) {
+        if (ch.remote_bitcoin_sig[i] != 0xCC) { btc_ok = 0; break; }
+    }
+    ASSERT(node_ok, "ANN3: remote_node_sig stored correctly");
+    ASSERT(btc_ok, "ANN3: remote_bitcoin_sig stored correctly");
+
+    return 1;
+}
+
+/* ANN4: Dispatch type 259 truncated (< 170 bytes) -> returns -1 */
+int test_ann4_dispatch_truncated(void) {
+    unsigned char msg[100];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;  /* type 259 */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == -1, "ANN4: truncated returns -1");
+    return 1;
+}
+
+/* ANN5: ann_sigs_sent=1 + receive type 259 -> both flags set */
+int test_ann5_both_flags(void) {
+    unsigned char msg[170];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;
+    memset(msg + 2, 0xDD, 32);   /* channel_id */
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    memset(ch.funding_txid, 0xDD, 32);
+    ch.ann_sigs_sent = 1;  /* already sent */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+    channels[3] = &ch;
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    ln_dispatch_process_msg(&d, 3, msg, sizeof(msg));
+    ASSERT(ch.ann_sigs_sent == 1, "ANN5: ann_sigs_sent remains 1");
+    ASSERT(ch.ann_sigs_recv == 1, "ANN5: ann_sigs_recv set to 1");
+    return 1;
+}
+
+/* ANN6: ch->short_channel_id=0 -> chan_send_announcement_sigs returns -1 */
+int test_ann6_zero_scid(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN6: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.short_channel_id = 0;
+
+    unsigned char node_priv[32];
+    memset(node_priv, 0x77, 32); node_priv[0] = 0x01;
+
+    int r = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                         GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(r == -1, "ANN6: scid=0 returns -1");
+    ASSERT(ch.ann_sigs_sent == 0, "ANN6: ann_sigs_sent stays 0");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

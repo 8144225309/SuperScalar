@@ -8,6 +8,7 @@
  */
 
 #include "superscalar/peer_mgr.h"
+#include "superscalar/gossip.h"
 #include "superscalar/chan_open.h"
 #include <time.h>
 #include "superscalar/bolt8.h"
@@ -138,6 +139,17 @@ int peer_mgr_connect(peer_mgr_t *mgr, const char *host, uint16_t port,
     p->fd         = fd;
     p->bolt8      = state;
     p->initiated  = 1;
+    /* Send gossip_timestamp_filter to bootstrap routing graph sync */
+    if (mgr->gs) {
+        unsigned char ts_filter[42];
+        uint32_t first_ts = (uint32_t)((uint32_t)time(NULL) > 14*24*3600
+                                        ? (uint32_t)time(NULL) - 14*24*3600 : 0);
+        size_t ts_len = gossip_build_timestamp_filter(
+            ts_filter, sizeof(ts_filter),
+            GOSSIP_CHAIN_HASH_MAINNET, first_ts, 0xFFFFFFFFu);
+        if (ts_len == 42)
+            peer_mgr_send(mgr, idx, ts_filter, ts_len);
+    }
     return idx;
 }
 
@@ -341,6 +353,17 @@ int peer_mgr_reconnect_all(peer_mgr_t *mgr, channel_t **ch_table, uint32_t now)
         /* Channel reestablish if we have a channel with this peer */
         if (p->has_channel && ch_table && ch_table[i])
             chan_reestablish(mgr, i, mgr->ctx, ch_table[i]);
+        /* Send gossip_timestamp_filter to re-bootstrap routing graph */
+        if (mgr->gs) {
+            unsigned char ts_filter[42];
+            uint32_t first_ts = (uint32_t)(now > 14*24*3600
+                                            ? now - 14*24*3600 : 0);
+            size_t ts_len = gossip_build_timestamp_filter(
+                ts_filter, sizeof(ts_filter),
+                GOSSIP_CHAIN_HASH_MAINNET, first_ts, 0xFFFFFFFFu);
+            if (ts_len == 42)
+                peer_mgr_send(mgr, i, ts_filter, ts_len);
+        }
     }
     return reconnected;
 }

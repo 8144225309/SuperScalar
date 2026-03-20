@@ -626,3 +626,57 @@ int test_gossip_query_range_real_scids(void)
     gossip_store_close(&gs);
     return 1;
 }
+
+/* ==========================================================================
+ * Phase C tests: gossip timestamp filter (GTF1 through GTF3)
+ * ========================================================================== */
+
+/* GTF1: gossip_build_timestamp_filter returns 42 bytes, first 2 bytes = {0x01,0x09} (type 265) */
+int test_gtf1_timestamp_filter_length(void) {
+    unsigned char buf[64];
+    uint32_t first_ts = 1700000000u;
+    size_t len = gossip_build_timestamp_filter(buf, sizeof(buf),
+                                                GOSSIP_CHAIN_HASH_MAINNET,
+                                                first_ts, 0xFFFFFFFFu);
+    ASSERT(len == 42, "GTF1: length == 42");
+    ASSERT(buf[0] == 0x01, "GTF1: type byte 0 = 0x01");
+    ASSERT(buf[1] == 0x09, "GTF1: type byte 1 = 0x09 (type 265)");
+    return 1;
+}
+
+/* GTF2: Encoded first_timestamp and range match input values (big-endian at bytes 34..41) */
+int test_gtf2_encoded_values(void) {
+    unsigned char buf[64];
+    uint32_t first_ts = 0x12345678u;
+    uint32_t ts_range = 0xABCDEF01u;
+    size_t len = gossip_build_timestamp_filter(buf, sizeof(buf),
+                                                GOSSIP_CHAIN_HASH_MAINNET,
+                                                first_ts, ts_range);
+    ASSERT(len == 42, "GTF2: length == 42");
+
+    /* first_timestamp at bytes 34..37 (big-endian) */
+    uint32_t got_ts = ((uint32_t)buf[34] << 24) | ((uint32_t)buf[35] << 16)
+                    | ((uint32_t)buf[36] <<  8) | (uint32_t)buf[37];
+    ASSERT(got_ts == first_ts, "GTF2: first_timestamp matches");
+
+    /* timestamp_range at bytes 38..41 (big-endian) */
+    uint32_t got_range = ((uint32_t)buf[38] << 24) | ((uint32_t)buf[39] << 16)
+                       | ((uint32_t)buf[40] <<  8) | (uint32_t)buf[41];
+    ASSERT(got_range == ts_range, "GTF2: timestamp_range matches");
+
+    return 1;
+}
+
+/* GTF3: GOSSIP_CHAIN_HASH_MAINNET is non-zero and 32 bytes (spot-check byte 0) */
+int test_gtf3_chain_hash_mainnet(void) {
+    /* The hash should be the Bitcoin mainnet genesis SHA256d */
+    ASSERT(GOSSIP_CHAIN_HASH_MAINNET[0] == 0x6f, "GTF3: byte 0 = 0x6f (mainnet)");
+
+    /* Verify the filter uses it (check bytes 2..33 of the filter = chain_hash) */
+    unsigned char buf[64];
+    gossip_build_timestamp_filter(buf, sizeof(buf),
+                                   GOSSIP_CHAIN_HASH_MAINNET, 0, 0);
+    ASSERT(memcmp(buf + 2, GOSSIP_CHAIN_HASH_MAINNET, 32) == 0,
+           "GTF3: chain_hash embedded correctly in filter");
+    return 1;
+}

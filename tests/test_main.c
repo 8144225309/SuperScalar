@@ -393,6 +393,9 @@ extern int test_payment_amp_set_id_stored(void);
 /* PR #26: Gossip real data, dual-fund basepoints, zero-conf, close broadcast */
 extern int test_gossip_query_scids_real_data(void);
 extern int test_gossip_query_range_real_scids(void);
+extern int test_gtf1_timestamp_filter_length(void);
+extern int test_gtf2_encoded_values(void);
+extern int test_gtf3_chain_hash_mainnet(void);
 extern int test_chan_open_v2_basepoints_nonzero(void);
 extern int test_chan_open_accept_zero_conf_min_depth(void);
 /* PR #62: Funding flow — P2WSH 2-of-2 */
@@ -403,6 +406,12 @@ extern int test_chan_open_p2wsh_unique_per_keypair(void);
 extern int test_chan_open_p2wsh_null_guard(void);
 extern int test_chan_open_inbound_valid_funding_pk(void);
 extern int test_chan_open_inbound_unique_funding_pk(void);
+extern int test_ann1_send_announcement_sigs(void);
+extern int test_ann2_null_pmgr_no_crash(void);
+extern int test_ann3_dispatch_type_259(void);
+extern int test_ann4_dispatch_truncated(void);
+extern int test_ann5_both_flags(void);
+extern int test_ann6_zero_scid(void);
 extern int test_ln_dispatch_close_broadcast(void);
 
 /* PR #27: Admin RPC */
@@ -1577,6 +1586,14 @@ extern int test_ps_n5_save_load_peer_channel(void);
 extern int test_ps_n6_save_2_channels(void);
 extern int test_ps_n7_update_channel(void);
 extern int test_ps_n8_null_db(void);
+extern int test_ps_10a_host_port_roundtrip(void);
+extern int test_ps_10b_empty_host(void);
+extern int test_ps_10c_schema_v10(void);
+extern int test_ps_10d_host_in_callback(void);
+extern int test_cb_p1_save_load_limits(void);
+extern int test_cb_p2_save_3_peers(void);
+extern int test_cb_p3_upsert_limits(void);
+extern int test_cb_p4_null_persist(void);
 
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
@@ -2045,6 +2062,9 @@ static void run_unit_tests(void) {
     printf("\n=== PR #26: Gossip Real Data + Dual-Fund Basepoints + Zero-Conf + Close Broadcast ===\n");
     RUN_TEST(test_gossip_query_scids_real_data);
     RUN_TEST(test_gossip_query_range_real_scids);
+    RUN_TEST(test_gtf1_timestamp_filter_length);
+    RUN_TEST(test_gtf2_encoded_values);
+    RUN_TEST(test_gtf3_chain_hash_mainnet);
     RUN_TEST(test_chan_open_v2_basepoints_nonzero);
     RUN_TEST(test_chan_open_accept_zero_conf_min_depth);
 
@@ -2056,6 +2076,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_chan_open_p2wsh_null_guard);
     RUN_TEST(test_chan_open_inbound_valid_funding_pk);
     RUN_TEST(test_chan_open_inbound_unique_funding_pk);
+    RUN_TEST(test_ann1_send_announcement_sigs);
+    RUN_TEST(test_ann2_null_pmgr_no_crash);
+    RUN_TEST(test_ann3_dispatch_type_259);
+    RUN_TEST(test_ann4_dispatch_truncated);
+    RUN_TEST(test_ann5_both_flags);
+    RUN_TEST(test_ann6_zero_scid);
     RUN_TEST(test_ln_dispatch_close_broadcast);
 
     printf("\n=== PR #27: Admin RPC (JSON-RPC 2.0) ===\n");
@@ -3203,6 +3229,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ps_n6_save_2_channels);
     RUN_TEST(test_ps_n7_update_channel);
     RUN_TEST(test_ps_n8_null_db);
+    RUN_TEST(test_ps_10a_host_port_roundtrip);
+    RUN_TEST(test_ps_10b_empty_host);
+    RUN_TEST(test_ps_10c_schema_v10);
+    RUN_TEST(test_ps_10d_host_in_callback);
+    RUN_TEST(test_cb_p1_save_load_limits);
+    RUN_TEST(test_cb_p2_save_3_peers);
+    RUN_TEST(test_cb_p3_upsert_limits);
+    RUN_TEST(test_cb_p4_null_persist);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);
