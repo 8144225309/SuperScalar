@@ -569,6 +569,32 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v10 migration: peer host/port + circuit_breaker_peers */
+    if (db_version < 10) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE ln_peer_channels ADD COLUMN peer_host TEXT DEFAULT '';",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ln_peer_channels ADD COLUMN peer_port INTEGER DEFAULT 0;",
+            NULL, NULL, NULL);
+        const char *sql_v10_cb =
+            "CREATE TABLE IF NOT EXISTS circuit_breaker_peers ("
+            "  peer_pubkey        BLOB PRIMARY KEY,"
+            "  max_pending_htlcs  INTEGER NOT NULL DEFAULT 483,"
+            "  max_pending_msat   INTEGER NOT NULL DEFAULT 100000000000,"
+            "  max_htlcs_per_hour INTEGER NOT NULL DEFAULT 3600"
+            ");";
+        char *merr10 = NULL;
+        if (sqlite3_exec(p->db, sql_v10_cb, NULL, NULL, &merr10) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v10 failed: %s\n",
+                    merr10 ? merr10 : "unknown");
+            sqlite3_free(merr10);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -3545,7 +3571,9 @@ int persist_save_ln_peer_channel(persist_t *p,
                                   uint64_t capacity_sat,
                                   uint64_t local_balance_msat,
                                   uint64_t remote_balance_msat,
-                                  int state) {
+                                  int state,
+                                  const char *peer_host,
+                                  uint16_t peer_port) {
     if (!p || !p->db || !channel_id || !peer_pubkey) return 0;
 
     sqlite3_stmt *stmt;
@@ -3554,8 +3582,8 @@ int persist_save_ln_peer_channel(persist_t *p,
             "(channel_id, peer_pubkey, capacity_sat, "
             " local_balance_msat, remote_balance_msat, "
             " our_funding_pubkey, their_funding_pubkey, "
-            " state, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?);",
+            " state, updated_at, peer_host, peer_port) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?);",
             -1, &stmt, NULL) != SQLITE_OK)
         return 0;
 
@@ -3566,6 +3594,8 @@ int persist_save_ln_peer_channel(persist_t *p,
     sqlite3_bind_int64(stmt, 5, (sqlite3_int64)remote_balance_msat);
     sqlite3_bind_int  (stmt, 6, state);
     sqlite3_bind_int64(stmt, 7, (sqlite3_int64)time(NULL));
+    sqlite3_bind_text (stmt, 8, peer_host ? peer_host : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (stmt, 9, (int)peer_port);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -3579,6 +3609,8 @@ int persist_load_ln_peer_channels(persist_t *p,
                                               uint64_t local_balance_msat,
                                               uint64_t remote_balance_msat,
                                               int state,
+                                              const char *peer_host,
+                                              uint16_t peer_port,
                                               void *ctx),
                                    void *ctx) {
     if (!p || !p->db || !cb) return 0;
@@ -3586,7 +3618,8 @@ int persist_load_ln_peer_channels(persist_t *p,
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db,
             "SELECT channel_id, peer_pubkey, capacity_sat, "
-            "       local_balance_msat, remote_balance_msat, state "
+            "       local_balance_msat, remote_balance_msat, state, "
+            "       COALESCE(peer_host, ''), COALESCE(peer_port, 0) "
             "  FROM ln_peer_channels;",
             -1, &stmt, NULL) != SQLITE_OK)
         return 0;
@@ -3605,9 +3638,67 @@ int persist_load_ln_peer_channels(persist_t *p,
         uint64_t local  = (uint64_t)sqlite3_column_int64(stmt, 3);
         uint64_t remote = (uint64_t)sqlite3_column_int64(stmt, 4);
         int      st     = sqlite3_column_int(stmt, 5);
+        const char *host = (const char *)sqlite3_column_text(stmt, 6);
+        uint16_t port   = (uint16_t)sqlite3_column_int(stmt, 7);
 
-        cb(cid, ppk, cap, local, remote, st, ctx);
+        cb(cid, ppk, cap, local, remote, st, host ? host : "", port, ctx);
     }
     sqlite3_finalize(stmt);
     return 1;
+}
+
+/* === Circuit breaker persistence (schema v10) === */
+
+#include "superscalar/circuit_breaker.h"
+
+int persist_save_circuit_breaker_peer(persist_t *p,
+                                       const unsigned char peer_pubkey[33],
+                                       uint16_t max_pending_htlcs,
+                                       uint64_t max_pending_msat,
+                                       uint32_t max_htlcs_per_hour) {
+    if (!p || !p->db || !peer_pubkey) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO circuit_breaker_peers "
+            "(peer_pubkey, max_pending_htlcs, max_pending_msat, max_htlcs_per_hour) "
+            "VALUES (?, ?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_blob (stmt, 1, peer_pubkey, 33, SQLITE_STATIC);
+    sqlite3_bind_int  (stmt, 2, (int)max_pending_htlcs);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)max_pending_msat);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)max_htlcs_per_hour);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 1 : 0;
+}
+
+int persist_load_circuit_breaker_peers(persist_t *p, circuit_breaker_t *cb) {
+    if (!p || !p->db || !cb) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT peer_pubkey, max_pending_htlcs, max_pending_msat, max_htlcs_per_hour "
+            "  FROM circuit_breaker_peers;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        unsigned char pk[33] = {0};
+        const void *pk_blob = sqlite3_column_blob(stmt, 0);
+        if (pk_blob) memcpy(pk, pk_blob, 33);
+
+        uint16_t max_htlcs = (uint16_t)sqlite3_column_int(stmt, 1);
+        uint64_t max_msat  = (uint64_t)sqlite3_column_int64(stmt, 2);
+        uint32_t max_hour  = (uint32_t)sqlite3_column_int64(stmt, 3);
+
+        circuit_breaker_set_peer_limits(cb, pk, max_htlcs, max_msat, max_hour);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }

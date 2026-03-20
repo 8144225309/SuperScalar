@@ -27,6 +27,7 @@
 #include "gossip_store.h"
 #include "chan_close.h"
 #include "gossip_ingest.h"
+#include "circuit_breaker.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -56,6 +57,7 @@ typedef struct {
     /* Cooperative close: callback to broadcast signed closing tx */
     void (*broadcast_tx_cb)(void *ctx, const unsigned char *tx, size_t tx_len);
     void  *broadcast_tx_ctx;
+    circuit_breaker_t     *cb;           /* per-peer HTLC limits; NULL=disabled */
 } ln_dispatch_t;
 
 /*

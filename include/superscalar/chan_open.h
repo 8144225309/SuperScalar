@@ -143,4 +143,20 @@ int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
                           secp256k1_context *ctx,
                           channel_t *ch_out);
 
+/*
+ * Send announcement_signatures (type 259) to peer.
+ * Builds the channel_announcement hash, signs with node_privkey and
+ * ch->local_funding_secret, then sends the 170-byte wire message.
+ *
+ * Guards: ch->short_channel_id == 0 returns -1.
+ * Sets ch->ann_sigs_sent = 1 on success.
+ * chain_hash: 32-byte chain hash (use GOSSIP_CHAIN_HASH_MAINNET).
+ * Returns 0 on success, -1 on error.
+ */
+int chan_send_announcement_sigs(peer_mgr_t *pmgr, int peer_idx,
+                                 secp256k1_context *ctx,
+                                 const unsigned char node_privkey[32],
+                                 channel_t *ch,
+                                 const unsigned char chain_hash[32]);
+
 #endif /* SUPERSCALAR_CHAN_OPEN_H */

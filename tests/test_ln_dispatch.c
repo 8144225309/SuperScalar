@@ -1658,7 +1658,7 @@ int test_ln_dispatch_boot5_channel_restore(void)
     uint64_t local_ms  = 300000000;
     uint64_t remote_ms = 200000000;
     ASSERT(persist_save_ln_peer_channel(&db, channel_id, peer_pk,
-                                         cap_sat, local_ms, remote_ms, 0),
+                                         cap_sat, local_ms, remote_ms, 0, NULL, 0),
            "BOOT5: persist_save_ln_peer_channel");
 
     channel_t ch;

@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 9
+#define PERSIST_SCHEMA_VERSION 10
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -608,11 +608,13 @@ int persist_save_ln_peer_channel(persist_t *p,
                                   uint64_t capacity_sat,
                                   uint64_t local_balance_msat,
                                   uint64_t remote_balance_msat,
-                                  int state);
+                                  int state,
+                                  const char *peer_host,
+                                  uint16_t peer_port);
 
 /*
  * Enumerate all rows in ln_peer_channels, calling cb() once per row.
- * cb receives channel_id, peer_pubkey, balances, state, and caller ctx.
+ * cb receives channel_id, peer_pubkey, balances, state, host, port, and caller ctx.
  * Returns 1 on success, 0 on error.
  */
 int persist_load_ln_peer_channels(persist_t *p,
@@ -622,7 +624,30 @@ int persist_load_ln_peer_channels(persist_t *p,
                                               uint64_t local_balance_msat,
                                               uint64_t remote_balance_msat,
                                               int state,
+                                              const char *peer_host,
+                                              uint16_t peer_port,
                                               void *ctx),
                                    void *ctx);
+
+/* --- Circuit breaker persistence (schema v10) --- */
+
+#include "superscalar/circuit_breaker.h"
+
+/*
+ * Save (upsert) per-peer circuit breaker limits.
+ * Keyed on peer_pubkey (33 bytes). Returns 1 on success, 0 on error.
+ */
+int persist_save_circuit_breaker_peer(persist_t *p,
+                                       const unsigned char peer_pubkey[33],
+                                       uint16_t max_pending_htlcs,
+                                       uint64_t max_pending_msat,
+                                       uint32_t max_htlcs_per_hour);
+
+/*
+ * Load all saved circuit breaker peers into cb.
+ * Calls circuit_breaker_set_peer_limits() for each row.
+ * Returns number loaded, or -1 on error.
+ */
+int persist_load_circuit_breaker_peers(persist_t *p, circuit_breaker_t *cb);
 
 #endif /* SUPERSCALAR_PERSIST_H */
