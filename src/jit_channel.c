@@ -149,25 +149,34 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     }
     cJSON_Delete(offer);
 
-    /* Wait for MSG_JIT_ACCEPT (30s timeout) */
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(lsp->client_fds[client_idx], &rfds);
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-    int ret = select(lsp->client_fds[client_idx] + 1, &rfds, NULL, NULL, &tv);
-    if (ret <= 0) {
+    /* Wait for MSG_JIT_ACCEPT — drain any stale messages (e.g. REGISTER_INVOICE
+       from demo phase) that arrive before the accept.  30s total timeout. */
+    wire_msg_t accept_msg;
+    int got_accept = 0;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[client_idx], &rfds);
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int ret = select(lsp->client_fds[client_idx] + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) continue;  /* 1s timeout, retry */
+        if (!wire_recv(lsp->client_fds[client_idx], &accept_msg)) {
+            fprintf(stderr, "LSP JIT: wire_recv failed waiting for JIT_ACCEPT\n");
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        if (accept_msg.msg_type == MSG_JIT_ACCEPT) {
+            got_accept = 1;
+            break;
+        }
+        /* Discard stale message and keep waiting */
+        fprintf(stderr, "LSP JIT: discarding stale msg 0x%02x while waiting for JIT_ACCEPT\n",
+                accept_msg.msg_type);
+        cJSON_Delete(accept_msg.json);
+    }
+    if (!got_accept) {
         fprintf(stderr, "LSP JIT: timeout waiting for JIT_ACCEPT from client %zu\n",
                 client_idx);
-        memset(lsp_seckey, 0, 32);
-        return 0;
-    }
-
-    wire_msg_t accept_msg;
-    if (!wire_recv(lsp->client_fds[client_idx], &accept_msg) ||
-        accept_msg.msg_type != MSG_JIT_ACCEPT) {
-        if (accept_msg.json) cJSON_Delete(accept_msg.json);
-        fprintf(stderr, "LSP JIT: expected JIT_ACCEPT, got 0x%02x\n",
-                accept_msg.msg_type);
         memset(lsp_seckey, 0, 32);
         return 0;
     }
