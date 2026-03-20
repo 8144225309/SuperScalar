@@ -612,3 +612,57 @@ int htlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
         return -1;
     }
 }
+
+/* === Dynamic commitment upgrade wire protocol === */
+
+/* Encode channel_type TLV for commitment_signed extension.
+ * Appends TLV type 5 (channel_type) after the standard commitment_signed body.
+ * buf must have space for up to 8 extra bytes.
+ * Returns bytes written to buf. */
+size_t commitment_signed_encode_channel_type_tlv(
+    unsigned char *buf, size_t buf_cap, uint32_t channel_type_bits)
+{
+    if (!buf || buf_cap < 8 || channel_type_bits == 0) return 0;
+
+    /* TLV: type(1) + len(1) + value(up to 4 bytes) */
+    unsigned char val[4];
+    int val_len = 0;
+    uint32_t v = channel_type_bits;
+    /* Encode big-endian, minimal length */
+    if (v > 0xFFFFFF) { val[val_len++] = (unsigned char)(v >> 24); }
+    if (v > 0xFFFF)   { val[val_len++] = (unsigned char)(v >> 16); }
+    if (v > 0xFF)     { val[val_len++] = (unsigned char)(v >> 8); }
+    val[val_len++] = (unsigned char)(v);
+
+    if ((size_t)(2 + val_len) > buf_cap) return 0;
+    buf[0] = 5;           /* TLV type = channel_type */
+    buf[1] = (unsigned char)val_len;
+    memcpy(buf + 2, val, (size_t)val_len);
+    return (size_t)(2 + val_len);
+}
+
+/* Decode channel_type TLV from commitment_signed extension bytes.
+ * Returns 1 if found, 0 if not present or error. */
+int commitment_signed_decode_channel_type_tlv(
+    const unsigned char *tlv_data, size_t tlv_len,
+    uint32_t *channel_type_bits_out)
+{
+    if (!tlv_data || tlv_len < 2 || !channel_type_bits_out) return 0;
+
+    size_t pos = 0;
+    while (pos + 2 <= tlv_len) {
+        uint8_t t = tlv_data[pos];
+        uint8_t l = tlv_data[pos + 1];
+        if (pos + 2 + l > tlv_len) break;
+
+        if (t == 5 && l > 0 && l <= 4) {
+            uint32_t bits = 0;
+            for (int i = 0; i < l; i++)
+                bits = (bits << 8) | tlv_data[pos + 2 + i];
+            *channel_type_bits_out = bits;
+            return 1;
+        }
+        pos += 2 + l;
+    }
+    return 0;
+}

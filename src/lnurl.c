@@ -12,6 +12,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <ctype.h>
+#ifdef BIP353_USE_RESOLV
+#include <resolv.h>
+#include <arpa/nameser.h>
+#endif
 
 /* ---- Internal bech32 helpers ---- */
 
@@ -447,11 +451,40 @@ int bip353_dns_resolve(const char *address, char *invoice_out, size_t inv_cap) {
  */
 int bip353_dns_resolve_native(const char *address, char *invoice_out, size_t inv_cap) {
 #ifdef BIP353_USE_RESOLV
-    /* Native resolver implementation would go here using res_query/ns_parse */
-    (void)address; (void)invoice_out; (void)inv_cap;
-    return 0;  /* placeholder */
+    if (!address || !invoice_out || inv_cap < 64) return 0;
+
+    char dns_name[512];
+    if (!bip353_to_dns_name(address, dns_name, sizeof(dns_name))) return 0;
+
+    unsigned char answer[4096];
+    int alen = res_query(dns_name, ns_c_in, ns_t_txt, answer, sizeof(answer));
+    if (alen < 0) return 0;
+
+    ns_msg msg;
+    if (ns_initparse(answer, alen, &msg) < 0) return 0;
+
+    int n = ns_msg_count(msg, ns_s_an);
+    for (int i = 0; i < n; i++) {
+        ns_rr rr;
+        if (ns_parserr(&msg, ns_s_an, i, &rr) < 0) continue;
+        if (ns_rr_type(rr) != ns_t_txt) continue;
+
+        const unsigned char *rdata = ns_rr_rdata(rr);
+        int rdlen = ns_rr_rdlen(rr);
+        if (rdlen < 2) continue;
+
+        int txt_len = rdata[0];
+        if (txt_len > rdlen - 1) txt_len = rdlen - 1;
+
+        char txt[1024];
+        memcpy(txt, rdata + 1, (size_t)txt_len);
+        txt[txt_len] = '\0';
+
+        int result = bip353_parse_txt_record(txt, invoice_out, inv_cap);
+        if (result > 0) return result;
+    }
+    return 0;
 #else
-    /* Fall back to dig-based resolver */
     return bip353_dns_resolve(address, invoice_out, inv_cap);
 #endif
 }

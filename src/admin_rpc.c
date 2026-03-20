@@ -12,6 +12,7 @@
  */
 
 #include "superscalar/admin_rpc.h"
+#include "superscalar/rgs.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/chan_close.h"
 #include "superscalar/chan_open.h"
@@ -662,6 +663,71 @@ static cJSON *method_feerates(admin_rpc_t *rpc)
 /* ------------------------------------------------------------------ */
 /* Method: stop                                                          */
 /* ------------------------------------------------------------------ */
+/* Method: exportrgs — export gossip store as RGS binary blob (hex-encoded) */
+static cJSON *method_exportrgs(admin_rpc_t *rpc)
+{
+    if (!rpc->gossip) return NULL;
+
+    unsigned char blob[256 * 1024];  /* 256 KB max */
+    size_t blen = gossip_store_export_rgs(rpc->gossip, blob, sizeof(blob));
+    if (blen == 0) return NULL;
+
+    /* Hex-encode the blob */
+    char *hex = (char *)malloc(blen * 2 + 1);
+    if (!hex) return NULL;
+    for (size_t i = 0; i < blen; i++)
+        sprintf(hex + i * 2, "%02x", blob[i]);
+    hex[blen * 2] = 0;
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddStringToObject(result, "rgs_hex", hex);
+    cJSON_AddNumberToObject(result, "rgs_bytes", (double)blen);
+    free(hex);
+    return result;
+}
+
+/* Method: importrgs — import RGS binary blob (hex-encoded) into gossip store */
+static cJSON *method_importrgs(admin_rpc_t *rpc, const cJSON *params,
+                                 char *errmsg, size_t errmsg_cap)
+{
+    if (!rpc->gossip) {
+        snprintf(errmsg, errmsg_cap, "no gossip store");
+        return NULL;
+    }
+    const cJSON *hex_item = cJSON_GetObjectItemCaseSensitive(params, "rgs_hex");
+    if (!cJSON_IsString(hex_item)) {
+        snprintf(errmsg, errmsg_cap, "missing rgs_hex parameter");
+        return NULL;
+    }
+    const char *hex = hex_item->valuestring;
+    size_t hex_len = strlen(hex);
+    if (hex_len < 2 || hex_len % 2 != 0) {
+        snprintf(errmsg, errmsg_cap, "invalid hex length");
+        return NULL;
+    }
+    size_t blob_len = hex_len / 2;
+    unsigned char *blob = (unsigned char *)malloc(blob_len);
+    if (!blob) { snprintf(errmsg, errmsg_cap, "alloc failed"); return NULL; }
+
+    for (size_t i = 0; i < blob_len; i++) {
+        unsigned int v;
+        sscanf(hex + i * 2, "%02x", &v);
+        blob[i] = (unsigned char)v;
+    }
+
+    int imported = gossip_store_import_rgs(rpc->gossip, blob, blob_len);
+    free(blob);
+
+    if (imported < 0) {
+        snprintf(errmsg, errmsg_cap, "RGS parse error");
+        return NULL;
+    }
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddNumberToObject(result, "channels_imported", imported);
+    return result;
+}
+
 static cJSON *method_stop(admin_rpc_t *rpc)
 {
     if (rpc->shutdown_flag)
@@ -724,6 +790,10 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_getroute(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "feerates") == 0) {
         result = method_feerates(rpc);
+    } else if (strcmp(m, "exportrgs") == 0) {
+        result = method_exportrgs(rpc);
+    } else if (strcmp(m, "importrgs") == 0) {
+        result = method_importrgs(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
     } else {
