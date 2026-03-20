@@ -41,7 +41,7 @@ static size_t build_unsigned_tx(unsigned char *out,
     WU64LE(amt1);                       /* output 1 amount */
     WU8((unsigned char)spk1_len);
     memcpy(out+pos, spk1, spk1_len); pos += spk1_len;
-    if (n_outputs >= 2) {
+    if (n_outputs >= 2 && spk2) {
         WU64LE(amt2);                   /* output 2 amount */
         WU8((unsigned char)spk2_len);
         memcpy(out+pos, spk2, spk2_len); pos += spk2_len;
