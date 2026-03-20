@@ -5634,15 +5634,13 @@ int main(int argc, char *argv[]) {
     /* === JIT Lifecycle Test === */
     if (test_jit && channels_active) {
         printf("\n=== JIT LIFECYCLE TEST ===\n");
-        printf("  Waiting 10s for clients to finish HTLC processing...\n");
         fflush(stdout);
-        sleep(10);  /* Let clients drain recv_or_handle_ptlc and return to daemon loop */
         int jit_pass = 1;
         uint64_t jit_amount = mgr->jit_funding_sats;
         if (jit_amount == 0) jit_amount = 50000;  /* default 50k sats */
 
-        /* Create 1 JIT channel to prove the lifecycle (each takes ~10 min
-           on signet for on-chain confirmation; 4 sequential = ~40 min) */
+        /* Client uses non-blocking state machine for JIT — no delays needed.
+           Create 1 JIT channel (each needs ~10 min on-chain confirmation). */
         for (int ci = 0; ci < 1; ci++) {
             printf("  Creating JIT channel for client %d (%llu sats)...\n",
                    ci, (unsigned long long)jit_amount);

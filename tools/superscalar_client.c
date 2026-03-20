@@ -398,6 +398,15 @@ static int client_inbox_pop(client_inbox_t *ib, wire_msg_t *out)
 }
 
 
+/* JIT channel state machine (non-blocking) */
+typedef enum {
+    JIT_PHASE_NONE = 0,
+    JIT_PHASE_WAITING_BASEPOINTS,
+    JIT_PHASE_WAITING_NONCES,
+    JIT_PHASE_WAITING_READY,
+    JIT_PHASE_COMPLETE
+} jit_phase_t;
+
 /* Data passed through daemon callback's user_data */
 typedef struct {
     persist_t *db;
@@ -415,6 +424,9 @@ typedef struct {
     int test_lsps2_buy;     /* 1 = also send lsps2.buy after get_info */
     int test_lsps2_buy_done;/* 1 = LSPS2 buy response verified */
     int test_splice;        /* 1 = exit cleanly after first SPLICE_LOCKED */
+    jit_phase_t jit_phase;
+    size_t jit_offer_cidx;        /* client index from the offer */
+    uint64_t jit_offer_amount;     /* funding amount from the offer */
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -1105,7 +1117,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
         case MSG_JIT_OFFER: {
-            /* LSP offers a JIT channel */
+            /* LSP offers a JIT channel — non-blocking state machine */
             size_t jit_cidx;
             uint64_t jit_amount;
             char jit_reason[64];
@@ -1138,25 +1150,20 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             wire_send(fd, MSG_JIT_ACCEPT, accept);
             cJSON_Delete(accept);
 
-            /* Wait for basepoints exchange — LSP needs time to fund and
-               confirm the JIT channel on-chain (up to ~10 min on signet).
-               Discard any stale messages from the demo phase. */
-            wire_msg_t bp_msg;
-            int got_bp = 0;
-            for (int bp_try = 0; bp_try < 720; bp_try++) {  /* up to 12 min */
-                if (!wire_recv_timeout(fd, &bp_msg, 1))
-                    continue;  /* 1s timeout, retry */
-                if (bp_msg.msg_type == MSG_CHANNEL_BASEPOINTS) {
-                    got_bp = 1;
-                    break;
-                }
-                /* Discard non-basepoint messages (stale demo HTLCs etc.) */
-                fprintf(stderr, "Client %u: JIT recv got 0x%02x, waiting for BASEPOINTS\n",
-                        my_index, bp_msg.msg_type);
-                cJSON_Delete(bp_msg.json);
-            }
-            if (!got_bp) {
-                fprintf(stderr, "Client %u: timeout waiting for JIT CHANNEL_BASEPOINTS\n", my_index);
+            /* Save offer context and transition to non-blocking wait */
+            cbd->jit_offer_cidx = jit_cidx;
+            cbd->jit_offer_amount = jit_amount;
+            cbd->jit_phase = JIT_PHASE_WAITING_BASEPOINTS;
+            printf("Client %u: JIT phase -> WAITING_BASEPOINTS\n", my_index);
+            break;
+        }
+
+        case MSG_CHANNEL_BASEPOINTS: {
+            /* JIT basepoints exchange (non-blocking) */
+            if (cbd->jit_phase != JIT_PHASE_WAITING_BASEPOINTS) {
+                fprintf(stderr, "Client %u: unexpected CHANNEL_BASEPOINTS "
+                        "(jit_phase=%d)\n", my_index, cbd->jit_phase);
+                cJSON_Delete(msg.json);
                 break;
             }
 
@@ -1164,35 +1171,32 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (!cbd->jit_ch) {
                 cbd->jit_ch = calloc(1, sizeof(jit_channel_t));
                 if (!cbd->jit_ch) {
-                    cJSON_Delete(bp_msg.json);
+                    fprintf(stderr, "Client %u: JIT channel alloc failed\n", my_index);
+                    cbd->jit_phase = JIT_PHASE_NONE;
+                    cJSON_Delete(msg.json);
                     break;
                 }
             }
-            jit_channel_t *jit = cbd->jit_ch;
+            jit_channel_t *jit_bp = cbd->jit_ch;
 
             /* Parse LSP's basepoints */
             uint32_t bp_ch_id;
             secp256k1_pubkey pay_bp, delay_bp, revoc_bp, htlc_bp, first_pcp, second_pcp;
-            if (!wire_parse_channel_basepoints(bp_msg.json, &bp_ch_id, ctx,
+            if (!wire_parse_channel_basepoints(msg.json, &bp_ch_id, ctx,
                                                  &pay_bp, &delay_bp, &revoc_bp, &htlc_bp,
                                                  &first_pcp, &second_pcp)) {
-                cJSON_Delete(bp_msg.json);
+                fprintf(stderr, "Client %u: bad JIT CHANNEL_BASEPOINTS\n", my_index);
+                cJSON_Delete(msg.json);
                 break;
             }
-            cJSON_Delete(bp_msg.json);
+            cJSON_Delete(msg.json);
 
-            jit->jit_channel_id = bp_ch_id;
-            jit->client_idx = jit_cidx;
-
-            /* For the client, "local" = client, "remote" = LSP.
-               We'll init the channel_t when we get JIT_READY with funding info.
-               For now, store the LSP's basepoints temporarily. */
+            jit_bp->jit_channel_id = bp_ch_id;
+            jit_bp->client_idx = cbd->jit_offer_cidx;
 
             /* Send client's basepoints back */
             {
-                /* We need a temporary channel_t context to generate basepoints.
-                   Use a stack-local secp ctx. */
-                channel_t *jch = &jit->channel;
+                channel_t *jch = &jit_bp->channel;
                 jch->ctx = ctx;
 
                 /* Generate client basepoints */
@@ -1222,103 +1226,117 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 channel_set_remote_pcp(jch, 1, &second_pcp);
             }
 
-            /* Exchange nonces */
-            {
-                wire_msg_t nm;
-                if (!wire_recv(fd, &nm) || nm.msg_type != MSG_CHANNEL_NONCES) {
-                    if (nm.json) cJSON_Delete(nm.json);
-                    break;
-                }
-                uint32_t nm_ch_id;
-                unsigned char lsp_nonces[MUSIG_NONCE_POOL_MAX][66];
-                size_t lsp_nc;
-                wire_parse_channel_nonces(nm.json, &nm_ch_id, lsp_nonces,
-                                            MUSIG_NONCE_POOL_MAX, &lsp_nc);
-                cJSON_Delete(nm.json);
+            cbd->jit_phase = JIT_PHASE_WAITING_NONCES;
+            printf("Client %u: JIT phase -> WAITING_NONCES\n", my_index);
+            break;
+        }
 
-                /* Init nonce pool and send client's nonces */
-                channel_init_nonce_pool(&jit->channel, MUSIG_NONCE_POOL_MAX);
-                channel_set_remote_pubnonces(&jit->channel,
-                    (const unsigned char (*)[66])lsp_nonces, lsp_nc);
-
-                size_t nc = jit->channel.local_nonce_pool.count;
-                unsigned char (*pn_ser)[66] = calloc(nc, 66);
-                if (pn_ser) {
-                    for (size_t i = 0; i < nc; i++)
-                        musig_pubnonce_serialize(ctx, pn_ser[i],
-                            &jit->channel.local_nonce_pool.nonces[i].pubnonce);
-                    cJSON *cnm = wire_build_channel_nonces(bp_ch_id,
-                        (const unsigned char (*)[66])pn_ser, nc);
-                    wire_send(fd, MSG_CHANNEL_NONCES, cnm);
-                    cJSON_Delete(cnm);
-                    free(pn_ser);
-                }
+        case MSG_CHANNEL_NONCES: {
+            /* JIT nonce exchange (non-blocking) */
+            if (cbd->jit_phase != JIT_PHASE_WAITING_NONCES) {
+                fprintf(stderr, "Client %u: unexpected CHANNEL_NONCES "
+                        "(jit_phase=%d)\n", my_index, cbd->jit_phase);
+                cJSON_Delete(msg.json);
+                break;
             }
 
-            /* Wait for JIT_READY */
-            {
-                wire_msg_t ready_msg;
-                if (!wire_recv(fd, &ready_msg) ||
-                    ready_msg.msg_type != MSG_JIT_READY) {
-                    if (ready_msg.json) cJSON_Delete(ready_msg.json);
-                    fprintf(stderr, "Client %u: expected JIT_READY\n", my_index);
-                    break;
-                }
+            jit_channel_t *jit_nc = cbd->jit_ch;
+            uint32_t nm_ch_id;
+            unsigned char lsp_nonces[MUSIG_NONCE_POOL_MAX][66];
+            size_t lsp_nc;
+            wire_parse_channel_nonces(msg.json, &nm_ch_id, lsp_nonces,
+                                        MUSIG_NONCE_POOL_MAX, &lsp_nc);
+            cJSON_Delete(msg.json);
 
-                uint32_t jit_ch_id;
-                char fund_txid_hex[65];
-                uint32_t fund_vout;
-                uint64_t fund_amount, local_amt, remote_amt;
-                if (!wire_parse_jit_ready(ready_msg.json, &jit_ch_id,
-                                            fund_txid_hex, sizeof(fund_txid_hex),
-                                            &fund_vout, &fund_amount,
-                                            &local_amt, &remote_amt)) {
-                    cJSON_Delete(ready_msg.json);
-                    break;
-                }
-                cJSON_Delete(ready_msg.json);
+            /* Init nonce pool and send client's nonces */
+            channel_init_nonce_pool(&jit_nc->channel, MUSIG_NONCE_POOL_MAX);
+            channel_set_remote_pubnonces(&jit_nc->channel,
+                (const unsigned char (*)[66])lsp_nonces, lsp_nc);
 
-                /* Finalize JIT channel init — for client, swap local/remote
-                   since LSP's local is client's remote */
-                jit->jit_channel_id = jit_ch_id;
-                memcpy(jit->funding_txid_hex, fund_txid_hex, 64);
-                jit->funding_txid_hex[64] = '\0';
-                jit->funding_amount = fund_amount;
-                jit->funding_vout = fund_vout;
-                jit->funding_confirmed = 1;
+            size_t nc = jit_nc->channel.local_nonce_pool.count;
+            unsigned char (*pn_ser)[66] = calloc(nc, 66);
+            if (pn_ser) {
+                for (size_t i = 0; i < nc; i++)
+                    musig_pubnonce_serialize(ctx, pn_ser[i],
+                        &jit_nc->channel.local_nonce_pool.nonces[i].pubnonce);
+                cJSON *cnm = wire_build_channel_nonces(jit_nc->jit_channel_id,
+                    (const unsigned char (*)[66])pn_ser, nc);
+                wire_send(fd, MSG_CHANNEL_NONCES, cnm);
+                cJSON_Delete(cnm);
+                free(pn_ser);
+            }
 
-                /* Set balances: from client perspective, local_amt is LSP's local
-                   (= our remote), remote_amt is LSP's remote (= our local) */
-                jit->channel.local_amount = remote_amt;
-                jit->channel.remote_amount = local_amt;
-                jit->channel.funding_amount = fund_amount;
-                jit->channel.funder_is_local = 0;
+            cbd->jit_phase = JIT_PHASE_WAITING_READY;
+            printf("Client %u: JIT phase -> WAITING_READY\n", my_index);
+            break;
+        }
 
-                jit->state = JIT_STATE_OPEN;
+        case MSG_JIT_READY: {
+            /* JIT channel funded and ready (non-blocking) */
+            if (cbd->jit_phase != JIT_PHASE_WAITING_READY) {
+                fprintf(stderr, "Client %u: unexpected JIT_READY "
+                        "(jit_phase=%d)\n", my_index, cbd->jit_phase);
+                cJSON_Delete(msg.json);
+                break;
+            }
 
-                /* Register JIT channel with client watchtower */
-                if (cbd && cbd->wt)
-                    watchtower_set_channel(cbd->wt, 0, &jit->channel);
+            jit_channel_t *jit_rd = cbd->jit_ch;
+            uint32_t jit_ch_id;
+            char fund_txid_hex[65];
+            uint32_t fund_vout;
+            uint64_t fund_amount, local_amt, remote_amt;
+            if (!wire_parse_jit_ready(msg.json, &jit_ch_id,
+                                        fund_txid_hex, sizeof(fund_txid_hex),
+                                        &fund_vout, &fund_amount,
+                                        &local_amt, &remote_amt)) {
+                fprintf(stderr, "Client %u: bad JIT_READY\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
 
-                /* Persist JIT channel */
-                if (cbd && cbd->db) {
-                    if (persist_begin(cbd->db)) {
-                        if (persist_save_jit_channel(cbd->db, jit) &&
-                            persist_save_basepoints(cbd->db, jit->jit_channel_id,
-                                                      &jit->channel)) {
-                            persist_commit(cbd->db);
-                        } else {
-                            fprintf(stderr, "Client %u: JIT persist failed, rolling back\n", my_index);
-                            persist_rollback(cbd->db);
-                        }
+            /* Finalize JIT channel init — for client, swap local/remote
+               since LSP's local is client's remote */
+            jit_rd->jit_channel_id = jit_ch_id;
+            memcpy(jit_rd->funding_txid_hex, fund_txid_hex, 64);
+            jit_rd->funding_txid_hex[64] = '\0';
+            jit_rd->funding_amount = fund_amount;
+            jit_rd->funding_vout = fund_vout;
+            jit_rd->funding_confirmed = 1;
+
+            /* Set balances: from client perspective, local_amt is LSP's local
+               (= our remote), remote_amt is LSP's remote (= our local) */
+            jit_rd->channel.local_amount = remote_amt;
+            jit_rd->channel.remote_amount = local_amt;
+            jit_rd->channel.funding_amount = fund_amount;
+            jit_rd->channel.funder_is_local = 0;
+
+            jit_rd->state = JIT_STATE_OPEN;
+
+            /* Register JIT channel with client watchtower */
+            if (cbd && cbd->wt)
+                watchtower_set_channel(cbd->wt, 0, &jit_rd->channel);
+
+            /* Persist JIT channel */
+            if (cbd && cbd->db) {
+                if (persist_begin(cbd->db)) {
+                    if (persist_save_jit_channel(cbd->db, jit_rd) &&
+                        persist_save_basepoints(cbd->db, jit_rd->jit_channel_id,
+                                                  &jit_rd->channel)) {
+                        persist_commit(cbd->db);
                     } else {
-                        fprintf(stderr, "Client %u: persist_begin failed for JIT channel\n", my_index);
+                        fprintf(stderr, "Client %u: JIT persist failed, rolling back\n", my_index);
+                        persist_rollback(cbd->db);
                     }
+                } else {
+                    fprintf(stderr, "Client %u: persist_begin failed for JIT channel\n", my_index);
                 }
-
-                printf("Client %u: JIT channel %08x open (%llu sats)\n",
-                       my_index, jit_ch_id, (unsigned long long)fund_amount);
             }
+
+            cbd->jit_phase = JIT_PHASE_COMPLETE;
+            printf("Client %u: JIT channel %08x OPEN (%llu sats)\n",
+                   my_index, jit_ch_id, (unsigned long long)fund_amount);
+            printf("Client %u: JIT phase -> COMPLETE\n", my_index);
             break;
         }
 
