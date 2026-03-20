@@ -127,4 +127,34 @@ int gossip_store_get_channels_in_range(gossip_store_t *gs,
     uint32_t first_blocknum, uint32_t num_blocks,
     gossip_store_channel_cb_t cb, void *userdata);
 
+/* Callback for gossip_store_enumerate_channels.
+ * Called once per (scid, direction) row that has a channel_update.
+ * src_pubkey/dst_pubkey reflect the direction: direction 0 means node1 is src,
+ * direction 1 means node2 is src. */
+typedef void (*gossip_store_full_channel_cb_t)(
+    uint64_t scid,
+    const unsigned char src_pubkey[33],
+    const unsigned char dst_pubkey[33],
+    uint32_t fee_base_msat,
+    uint32_t fee_ppm,
+    uint16_t cltv_delta,
+    uint64_t htlc_min_msat,
+    uint64_t htlc_max_msat,
+    uint64_t capacity_sat,
+    void *ctx);
+
+/* Enumerate all (channel, channel_update) directed edges from the gossip store.
+ * Calls cb() once per (scid, direction) row.  Returns count of edges, -1 on error. */
+int gossip_store_enumerate_channels(gossip_store_t *gs,
+                                     gossip_store_full_channel_cb_t cb,
+                                     void *ctx);
+
+/* Like gossip_store_enumerate_channels() but only returns directed edges whose
+ * channel_update timestamp > since_ts.  Used for incremental graph refresh.
+ * Returns count of edges, -1 on error. */
+int gossip_store_enumerate_channels_since(gossip_store_t *gs,
+                                           uint32_t since_ts,
+                                           gossip_store_full_channel_cb_t cb,
+                                           void *ctx);
+
 #endif /* SUPERSCALAR_GOSSIP_STORE_H */

@@ -64,6 +64,10 @@ int htlc_forward_process(htlc_forward_table_t *fwd,
         e->in_cltv       = cltv;
         e->state         = FORWARD_STATE_SETTLED;
         memcpy(e->onion_shared_secret, ss, 32);
+        if (payload.has_payment_data) {
+            memcpy(e->payment_secret,  payload.payment_secret, 32);
+            e->has_payment_secret = 1;
+        }
         if (payload.has_amt)
             memcpy(out, e, sizeof(*e));
         return FORWARD_FINAL;

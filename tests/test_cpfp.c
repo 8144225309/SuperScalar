@@ -309,8 +309,7 @@ int test_watchtower_pending_tracking(void) {
     p->anchor_vout = 1;
     p->anchor_amount = 240;
     p->cycles_in_mempool = 0;
-    p->bump_count = 0;
-    p->cycles_since_bump = 0;
+    /* fee_bump zeroed by memset */
     TEST_ASSERT_EQ(wt.n_pending, 1, "1 pending after add");
 
     /* Increment cycles */
@@ -454,63 +453,29 @@ int test_cpfp_witness_offset_p2wpkh(void) {
     return 1;
 }
 
-/* Test 8: CPFP retry bump logic — bump_count increments correctly */
+/* Test 8: CPFP retry bump logic — uses htlc_fee_bump_t API */
 int test_cpfp_retry_bump(void) {
-    watchtower_pending_t p;
-    memset(&p, 0, sizeof(p));
-    strncpy(p.txid, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 64);
-    p.txid[64] = '\0';
-    p.anchor_vout = 1;
-    p.anchor_amount = 240;
-    p.cycles_in_mempool = 0;
-    p.bump_count = 0;
-    p.cycles_since_bump = 0;
+    htlc_fee_bump_t fb;
+    memset(&fb, 0, sizeof(fb));
 
-    /* Simulate cycling — should NOT bump at cycle 0 or 1 */
-    int should_bump;
+    /* Init: start_block=100, deadline=244 (144 blocks), budget=240sat, vsize=200 */
+    htlc_fee_bump_init(&fb, 100, 244, 240, HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT, 200, 1000);
 
-    p.cycles_in_mempool = 1;
-    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
-    TEST_ASSERT_EQ(should_bump, 0, "no bump at cycle 1");
+    /* Block 100: first check — should bump (never broadcast) */
+    TEST_ASSERT(htlc_fee_bump_should_bump(&fb, 100), "should bump at start_block");
+    uint64_t fr1 = htlc_fee_bump_calc_feerate(&fb, 100);
+    TEST_ASSERT(fr1 >= 1000, "feerate >= start_feerate");
+    htlc_fee_bump_record_broadcast(&fb, 100, fr1);
 
-    /* Should bump at cycle 2 (first bump) */
-    p.cycles_in_mempool = 2;
-    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
-    TEST_ASSERT(should_bump, "bump at cycle 2");
-    p.bump_count = 1;
-    p.cycles_since_bump = 0;
+    /* Block 101: feerate increase < 25% — should NOT re-bump */
+    TEST_ASSERT(!htlc_fee_bump_should_bump(&fb, 101), "no re-bump at block 101");
 
-    /* Should NOT bump again until 6 more cycles */
-    for (int c = 1; c <= 5; c++) {
-        p.cycles_since_bump = c;
-        should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                       (p.bump_count == 0 || p.cycles_since_bump >= 6));
-        TEST_ASSERT_EQ(should_bump, 0, "no re-bump within 6 cycles");
-    }
+    /* Block near deadline (238 = deadline - 6): urgent — should bump regardless */
+    TEST_ASSERT(htlc_fee_bump_is_urgent(&fb, 238), "urgent near deadline");
 
-    /* Should bump again at 6 cycles since last bump */
-    p.cycles_since_bump = 6;
-    p.cycles_in_mempool = 8;
-    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
-    TEST_ASSERT(should_bump, "second bump at cycle 6 since last");
-    p.bump_count = 2;
-    p.cycles_since_bump = 0;
-
-    /* Third bump after another 6 cycles */
-    p.cycles_since_bump = 6;
-    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
-    TEST_ASSERT(should_bump, "third bump");
-    p.bump_count = 3;
-
-    /* No more bumps after 3 */
-    p.cycles_since_bump = 100;
-    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
-                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
-    TEST_ASSERT_EQ(should_bump, 0, "no bump after 3 attempts");
+    /* After confirm — no more bumps */
+    htlc_fee_bump_record_confirm(&fb, 110);
+    TEST_ASSERT(!htlc_fee_bump_should_bump(&fb, 115), "no bump after confirm");
 
     return 1;
 }
@@ -591,7 +556,7 @@ int test_watchtower_add_pending_tx(void)
     TEST_ASSERT_EQ((long)wt.pending[0].anchor_vout,   1L,   "vout = 1");
     TEST_ASSERT_EQ((long)wt.pending[0].anchor_amount, 240L, "amount = 240");
     TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 0L, "cycles = 0");
-    TEST_ASSERT_EQ((long)wt.pending[0].bump_count,        0L, "bumps = 0");
+    TEST_ASSERT_EQ((long)wt.pending[0].fee_bump.last_bump_block, 0L, "no bumps yet");
 
     watchtower_cleanup(&wt);
     return 1;
@@ -650,7 +615,7 @@ int test_watchtower_add_pending_bump_mechanics(void)
     wt.pending[0].cycles_in_mempool++;
     TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 2L,
                    "bump threshold reached");
-    TEST_ASSERT_EQ((long)wt.pending[0].bump_count, 0L, "no bumps yet");
+    TEST_ASSERT_EQ((long)wt.pending[0].fee_bump.last_bump_block, 0L, "no bumps yet (fee_bump)");
 
     watchtower_cleanup(&wt);
     return 1;
@@ -692,5 +657,87 @@ int test_watchtower_add_pending_persists(void)
 
     watchtower_cleanup(&wt);
     persist_close(&db);
+    return 1;
+}
+
+
+/* ================================================================== */
+/* WFB1 — fee_bump init: should_bump=1 on first block (never broadcast) */
+/* ================================================================== */
+int test_watchtower_fee_bump_init_should_bump(void)
+{
+    watchtower_pending_t p;
+    memset(&p, 0, sizeof(p));
+    strcpy(p.txid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    p.anchor_vout   = 1;
+    p.anchor_amount = 240;
+    p.cycles_in_mempool = 0;
+
+    /* Initialize fee_bump */
+    int ok = htlc_fee_bump_init(&p.fee_bump, 100, 244, 240,
+                                  HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT, 200, 1000);
+    TEST_ASSERT(ok == 1, "WFB1: init ok");
+
+    /* Never broadcast yet (last_feerate == 0) → should_bump = 1 */
+    TEST_ASSERT(htlc_fee_bump_should_bump(&p.fee_bump, 100) == 1,
+                "WFB1: should_bump=1 on first block");
+    return 1;
+}
+
+/* ================================================================== */
+/* WFB2 — broadcast at N; feerate+10% only → should_bump=0           */
+/* ================================================================== */
+int test_watchtower_fee_bump_rbf_threshold(void)
+{
+    htlc_fee_bump_t fb;
+    int ok = htlc_fee_bump_init(&fb, 100, 244, 240,
+                                  HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT, 200, 1000);
+    TEST_ASSERT(ok == 1, "WFB2: init ok");
+
+    /* Broadcast at block 100 with feerate 1000 */
+    htlc_fee_bump_record_broadcast(&fb, 100, 1000);
+
+    /* At block 110: computed feerate = start + ~7% increase → below 25% threshold */
+    /* should_bump = 0 unless urgent */
+    int r = htlc_fee_bump_should_bump(&fb, 105);
+    /* With 144 blocks window, at block 105 = 5/144 * way through: not urgent */
+    /* The scheduled feerate is only slightly above start → no bump needed */
+    TEST_ASSERT(r == 0, "WFB2: no bump when feerate increase < 25%");
+    return 1;
+}
+
+/* ================================================================== */
+/* WFB3 — near deadline (within 6 blocks) → is_urgent=1, should_bump=1 */
+/* ================================================================== */
+int test_watchtower_fee_bump_urgent_deadline(void)
+{
+    htlc_fee_bump_t fb;
+    htlc_fee_bump_init(&fb, 100, 115, 240,
+                        HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT, 200, 1000);
+
+    /* Broadcast at block 100 */
+    htlc_fee_bump_record_broadcast(&fb, 100, 1000);
+
+    /* At block 110: deadline=115, 5 blocks remaining → urgent */
+    TEST_ASSERT(htlc_fee_bump_is_urgent(&fb, 110) == 1,
+                "WFB3: is_urgent within 6 blocks");
+    TEST_ASSERT(htlc_fee_bump_should_bump(&fb, 110) == 1,
+                "WFB3: should_bump=1 when urgent");
+    return 1;
+}
+
+/* ================================================================== */
+/* WFB4 — after confirm: is_confirmed=1, should_bump=0               */
+/* ================================================================== */
+int test_watchtower_fee_bump_confirmed(void)
+{
+    htlc_fee_bump_t fb;
+    htlc_fee_bump_init(&fb, 100, 244, 240,
+                        HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT, 200, 1000);
+    htlc_fee_bump_record_broadcast(&fb, 100, 1000);
+    htlc_fee_bump_record_confirm(&fb, 105);
+
+    TEST_ASSERT(htlc_fee_bump_is_confirmed(&fb),  "WFB4: is_confirmed=1");
+    TEST_ASSERT(!htlc_fee_bump_should_bump(&fb, 110), "WFB4: should_bump=0");
     return 1;
 }

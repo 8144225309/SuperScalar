@@ -417,3 +417,72 @@ int splice_parse_tx_signatures(const unsigned char *msg, size_t msg_len,
     if (witness_out && wlen > 0) memcpy(witness_out, msg + 68, wlen);
     return 1;
 }
+
+/* ---- BOLT #2 Quiescence Handshake (types 140 / 141) ---- */
+
+/*
+ * splice_send_stfu — send stfu (type 140) to initiate quiescence.
+ * Wire: type(2) + channel_id(32) = 34 bytes total.
+ * Returns 0 on success, -1 on error.
+ */
+int splice_send_stfu(peer_mgr_t *pmgr, int peer_idx,
+                     const unsigned char channel_id[32])
+{
+    if (!pmgr || !channel_id || peer_idx < 0) return -1;
+    unsigned char msg[34];
+    msg[0] = 0x00;
+    msg[1] = 0x8C;  /* type 140 = MSG_STFU */
+    memcpy(msg + 2, channel_id, 32);
+    return peer_mgr_send(pmgr, peer_idx, msg, 34) ? 0 : -1;
+}
+
+/*
+ * splice_handle_stfu — handle incoming stfu (type 140).
+ *
+ * Cross-initiation: if both sides sent stfu simultaneously (*qs_state ==
+ * QUIESCE_INITIATED), the channel becomes quiescent immediately; no reply
+ * needed because the peer will receive our stfu as its own reply.
+ *
+ * Normal case: reply with stfu_reply (type 141) and mark QUIESCE_ACTIVE.
+ *
+ * Returns 0 on success, -1 on send error in normal case.
+ */
+int splice_handle_stfu(peer_mgr_t *pmgr, int peer_idx,
+                       const unsigned char channel_id[32],
+                       quiesce_state_t *qs_state)
+{
+    if (!qs_state || !channel_id) return -1;
+
+    if (*qs_state == QUIESCE_INITIATED) {
+        /* Cross-initiation: both sent stfu; channel is now quiescent */
+        *qs_state = QUIESCE_ACTIVE;
+        return 0;
+    }
+
+    /* Send stfu_reply (type 141) back to peer.
+     * Update state first; a failed send is non-fatal for quiescence tracking. */
+    *qs_state = QUIESCE_ACTIVE;
+    if (pmgr && peer_idx >= 0) {
+        unsigned char reply[34];
+        reply[0] = 0x00;
+        reply[1] = 0x8D;  /* type 141 = MSG_STFU_REPLY */
+        memcpy(reply + 2, channel_id, 32);
+        if (!peer_mgr_send(pmgr, peer_idx, reply, 34)) return -1;
+    }
+    return 0;
+}
+
+/*
+ * splice_handle_stfu_reply — handle incoming stfu_reply (type 141).
+ * We must have been in QUIESCE_INITIATED state (i.e. we sent stfu first).
+ * Returns 0 on success, -1 if the reply was unexpected.
+ */
+int splice_handle_stfu_reply(const unsigned char channel_id[32],
+                              quiesce_state_t *qs_state)
+{
+    (void)channel_id;  /* channel_id not used here; caller already routed by it */
+    if (!qs_state) return -1;
+    if (*qs_state != QUIESCE_INITIATED) return -1;
+    *qs_state = QUIESCE_ACTIVE;
+    return 0;
+}

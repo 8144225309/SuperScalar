@@ -282,3 +282,115 @@ int test_cb_htlc_interceptor_iface(void)
            "zero-limit peer always rejected = INTERCEPT_FAIL");
     return 1;
 }
+
+/* ================================================================== */
+/* CB_BAN1: token exhaustion triggers ban_fn with correct pubkey      */
+/* ================================================================== */
+static unsigned char g_ban_last_pubkey[33];
+static uint32_t      g_ban_duration;
+static int           g_ban_call_count;
+
+static void test_ban_fn(void *ctx, const unsigned char pk[33], uint32_t dur)
+{
+    (void)ctx;
+    memcpy(g_ban_last_pubkey, pk, 33);
+    g_ban_duration   = dur;
+    g_ban_call_count++;
+}
+
+int test_cb_ban_fn_called_on_token_exhaustion(void)
+{
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    unsigned char pk[33]; make_pubkey(pk, 0x91);
+
+    /* Give peer exactly 1 token → one HTLC accepted, second triggers ban */
+    circuit_breaker_set_peer_limits(&cb, pk, 100, 0, 1);
+    cb.ban_fn = test_ban_fn;
+    cb.ban_duration_secs = 600;
+    g_ban_call_count = 0;
+
+    /* First HTLC: consumes the 1 token — accepted */
+    ASSERT(circuit_breaker_check_add(&cb, pk, 1000, 0) == 1,
+           "CB_BAN1: first HTLC accepted");
+    ASSERT(g_ban_call_count == 0, "CB_BAN1: no ban yet after first HTLC");
+
+    /* Second HTLC: tokens=0 → ban_fn called, HTLC rejected */
+    ASSERT(circuit_breaker_check_add(&cb, pk, 1000, 0) == 0,
+           "CB_BAN1: second HTLC rejected (token exhausted)");
+    ASSERT(g_ban_call_count == 1, "CB_BAN1: ban_fn called once");
+    ASSERT(memcmp(g_ban_last_pubkey, pk, 33) == 0,
+           "CB_BAN1: ban_fn called with correct pubkey");
+    ASSERT(g_ban_duration == 600, "CB_BAN1: ban_duration_secs correct");
+
+    return 1;
+}
+
+/* ================================================================== */
+/* CB_BAN2: ban_fn NOT called when tokens are available               */
+/* ================================================================== */
+int test_cb_ban_fn_not_called_with_tokens(void)
+{
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    unsigned char pk[33]; make_pubkey(pk, 0x92);
+
+    circuit_breaker_set_peer_limits(&cb, pk, 100, 0, 10);
+    cb.ban_fn = test_ban_fn;
+    cb.ban_duration_secs = 300;
+    g_ban_call_count = 0;
+
+    /* Accept 5 HTLCs — all have tokens, no ban */
+    for (int i = 0; i < 5; i++) {
+        ASSERT(circuit_breaker_check_add(&cb, pk, 100, 0) == 1,
+               "CB_BAN2: HTLC accepted");
+    }
+    ASSERT(g_ban_call_count == 0, "CB_BAN2: ban_fn not called");
+
+    return 1;
+}
+
+/* ================================================================== */
+/* CB_BAN3: NULL ban_fn with tokens=0 → no crash, returns 0          */
+/* ================================================================== */
+int test_cb_ban_fn_null_no_crash(void)
+{
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    unsigned char pk[33]; make_pubkey(pk, 0x93);
+
+    /* 1 token, no ban_fn */
+    circuit_breaker_set_peer_limits(&cb, pk, 100, 0, 1);
+    ASSERT(cb.ban_fn == NULL, "CB_BAN3: ban_fn initially NULL");
+
+    ASSERT(circuit_breaker_check_add(&cb, pk, 1000, 0) == 1, "first HTLC ok");
+    /* Second HTLC with tokens=0, ban_fn=NULL → just return 0, no crash */
+    ASSERT(circuit_breaker_check_add(&cb, pk, 1000, 0) == 0,
+           "CB_BAN3: null ban_fn + no tokens → 0, no crash");
+
+    return 1;
+}
+
+/* ================================================================== */
+/* CB_BAN4: ban escalation fires again on repeated exhaustion         */
+/* ================================================================== */
+int test_cb_ban_fn_repeated_exhaustion(void)
+{
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    unsigned char pk[33]; make_pubkey(pk, 0x94);
+
+    /* Peer starts with 0 tokens (max_htlcs_per_hour=0) */
+    circuit_breaker_set_peer_limits(&cb, pk, 100, 0, 0);
+    cb.ban_fn = test_ban_fn;
+    cb.ban_duration_secs = 120;
+    g_ban_call_count = 0;
+
+    /* Every HTLC should be rejected and ban_fn called */
+    ASSERT(circuit_breaker_check_add(&cb, pk, 500, 0) == 0, "rejected 1");
+    ASSERT(circuit_breaker_check_add(&cb, pk, 500, 0) == 0, "rejected 2");
+    ASSERT(circuit_breaker_check_add(&cb, pk, 500, 0) == 0, "rejected 3");
+    ASSERT(g_ban_call_count == 3, "CB_BAN4: ban_fn called 3 times");
+
+    return 1;
+}

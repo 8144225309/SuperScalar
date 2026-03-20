@@ -584,8 +584,22 @@ static int cb_get_confirmations(chain_backend_t *self, const char *txid_hex)
 
 static bool cb_is_in_mempool(chain_backend_t *self, const char *txid_hex)
 {
-    /* TODO: query peer mempool via BIP 157 connection */
-    (void)self; (void)txid_hex;
+    bip158_backend_t *b = (bip158_backend_t *)self;
+    if (!txid_hex || strlen(txid_hex) != 64) return false;
+
+    /* Parse display-order hex → internal bytes (reversed) */
+    unsigned char txid[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        if (sscanf(txid_hex + (31 - i) * 2, "%02x", &byte) != 1) return false;
+        txid[i] = (unsigned char)byte;
+    }
+
+    int count = b->mempool_cache_count < BIP158_MEMPOOL_CACHE_SIZE
+                ? b->mempool_cache_count : BIP158_MEMPOOL_CACHE_SIZE;
+    for (int i = 0; i < count; i++) {
+        if (memcmp(b->mempool_cache[i], txid, 32) == 0) return true;
+    }
     return false;
 }
 
@@ -860,7 +874,7 @@ void bip158_backend_set_mempool_cb(bip158_backend_t *backend,
 
 int bip158_backend_poll_mempool(bip158_backend_t *backend)
 {
-    if (!backend || backend->peers[backend->current_peer].fd < 0 || !backend->mempool_cb) return 0;
+    if (!backend || backend->peers[backend->current_peer].fd < 0) return 0;
 
     /* Subscribe to mempool (BIP 35) on first call */
     if (!backend->mempool_subscribed) {
@@ -872,16 +886,26 @@ int bip158_backend_poll_mempool(bip158_backend_t *backend)
     uint8_t txids[256][32];
     int n = p2p_poll_inv(&backend->peers[backend->current_peer], txids, 256, 100);
 
-    /* Convert each txid to display-order hex and fire the callback */
+    /* Convert each txid to display-order hex, fire callback, cache raw bytes */
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < n; i++) {
-        char hex[65];
-        for (int b = 0; b < 32; b++) {
-            hex[(31 - b) * 2]     = hx[(txids[i][b] >> 4) & 0xf];
-            hex[(31 - b) * 2 + 1] = hx[txids[i][b] & 0xf];
+        /* Store raw bytes in the ring buffer */
+        int slot = backend->mempool_cache_head % BIP158_MEMPOOL_CACHE_SIZE;
+        memcpy(backend->mempool_cache[slot], txids[i], 32);
+        backend->mempool_cache_head++;
+        if (backend->mempool_cache_count < BIP158_MEMPOOL_CACHE_SIZE)
+            backend->mempool_cache_count++;
+
+        /* Fire callback with display-order hex */
+        if (backend->mempool_cb) {
+            char hex[65];
+            for (int b = 0; b < 32; b++) {
+                hex[(31 - b) * 2]     = hx[(txids[i][b] >> 4) & 0xf];
+                hex[(31 - b) * 2 + 1] = hx[txids[i][b] & 0xf];
+            }
+            hex[64] = '\0';
+            backend->mempool_cb(hex, backend->mempool_ctx);
         }
-        hex[64] = '\0';
-        backend->mempool_cb(hex, backend->mempool_ctx);
     }
     return n;
 }

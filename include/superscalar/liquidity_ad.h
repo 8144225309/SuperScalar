@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <secp256k1.h>
 
 /*
  * Liquidity Advertisements (option_will_fund, BOLT #878 draft).
@@ -97,6 +98,7 @@ uint64_t liquidity_ad_fee(const liquidity_ad_t *ad,
  */
 size_t liquidity_ad_build_node_announcement(
     unsigned char *out, size_t out_cap,
+    secp256k1_context *ctx,
     const unsigned char node_priv32[32],
     uint32_t timestamp,
     const unsigned char rgb[3],

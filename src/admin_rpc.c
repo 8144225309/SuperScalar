@@ -14,6 +14,7 @@
 #include "superscalar/admin_rpc.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/chan_close.h"
+#include "superscalar/chan_open.h"
 #include "superscalar/invoice.h"
 #include "superscalar/payment.h"
 #include "superscalar/peer_mgr.h"
@@ -336,8 +337,9 @@ static cJSON *method_pay(admin_rpc_t *rpc, const cJSON *params,
         snprintf(errmsg, errcap, "invalid bolt11 invoice");
         return NULL;
     }
+    uint32_t bh = rpc->block_height ? *rpc->block_height : 0;
     int idx = payment_send(rpc->payments, rpc->gossip, rpc->fwd, rpc->mpp,
-                            rpc->pmgr, rpc->ctx, rpc->node_privkey, &inv);
+                            rpc->pmgr, rpc->ctx, rpc->node_privkey, bh, &inv);
     if (idx < 0) {
         snprintf(errmsg, errcap, "payment_send failed");
         return NULL;
@@ -383,9 +385,10 @@ static cJSON *method_keysend(admin_rpc_t *rpc, const cJSON *params,
         snprintf(errmsg, errcap, "invalid destination pubkey");
         return NULL;
     }
+    uint32_t bh2 = rpc->block_height ? *rpc->block_height : 0;
     int idx = payment_keysend(rpc->payments, rpc->gossip, rpc->fwd, rpc->mpp,
                                rpc->pmgr, rpc->ctx, rpc->node_privkey,
-                               dest, amount_msat, NULL);
+                               bh2, dest, amount_msat, NULL);
     if (idx < 0) {
         snprintf(errmsg, errcap, "keysend failed");
         return NULL;
@@ -405,10 +408,110 @@ static cJSON *method_keysend(admin_rpc_t *rpc, const cJSON *params,
 static cJSON *method_openchannel(admin_rpc_t *rpc, const cJSON *params,
                                   char *errmsg, size_t errcap)
 {
-    (void)rpc; (void)params;
-    /* openchannel requires on-chain funding; full implementation in PR #28 */
-    snprintf(errmsg, errcap, "openchannel: use --connect + --channel CLI (chain funding in PR#28)");
-    return NULL;
+    if (!rpc->pmgr || !rpc->ctx) {
+        snprintf(errmsg, errcap, "peer manager not available");
+        return NULL;
+    }
+
+    const char *peer_id_hex = NULL;
+    uint64_t    amount_sat  = 0;
+    uint64_t    push_msat   = 0;
+    uint32_t    feerate     = 253;   /* BOLT #11 feerate floor; CLN default */
+    const char *host        = NULL;
+    uint16_t    port        = 9735;
+
+    if (cJSON_IsObject(params)) {
+        cJSON *p  = cJSON_GetObjectItemCaseSensitive(params, "peer_id");
+        if (cJSON_IsString(p)) peer_id_hex = p->valuestring;
+        cJSON *a  = cJSON_GetObjectItemCaseSensitive(params, "amount_sat");
+        if (cJSON_IsNumber(a)) amount_sat = (uint64_t)a->valuedouble;
+        cJSON *pm = cJSON_GetObjectItemCaseSensitive(params, "push_msat");
+        if (cJSON_IsNumber(pm)) push_msat = (uint64_t)pm->valuedouble;
+        cJSON *fr = cJSON_GetObjectItemCaseSensitive(params, "feerate_per_kw");
+        if (cJSON_IsNumber(fr)) feerate = (uint32_t)fr->valuedouble;
+        cJSON *h  = cJSON_GetObjectItemCaseSensitive(params, "host");
+        if (cJSON_IsString(h)) host = h->valuestring;
+        cJSON *po = cJSON_GetObjectItemCaseSensitive(params, "port");
+        if (cJSON_IsNumber(po)) port = (uint16_t)po->valuedouble;
+    } else if (cJSON_IsArray(params)) {
+        cJSON *p = cJSON_GetArrayItem(params, 0);
+        if (cJSON_IsString(p)) peer_id_hex = p->valuestring;
+        cJSON *a = cJSON_GetArrayItem(params, 1);
+        if (cJSON_IsNumber(a)) amount_sat = (uint64_t)a->valuedouble;
+    }
+
+    if (!peer_id_hex || amount_sat == 0) {
+        snprintf(errmsg, errcap, "missing peer_id or amount_sat");
+        return NULL;
+    }
+
+    unsigned char peer_pubkey[33];
+    if (!hex_to_bytes(peer_id_hex, peer_pubkey, 33)) {
+        snprintf(errmsg, errcap, "invalid peer pubkey");
+        return NULL;
+    }
+
+    /* Find existing peer; if not found and host provided, connect */
+    int peer_idx = peer_mgr_find(rpc->pmgr, peer_pubkey);
+    if (peer_idx < 0 && host) {
+        peer_idx = peer_mgr_connect(rpc->pmgr, host, port, peer_pubkey);
+    }
+    if (peer_idx < 0) {
+        snprintf(errmsg, errcap, "peer not connected");
+        return NULL;
+    }
+
+    /* Derive local funding pubkey from node private key */
+    unsigned char local_fpk[33];
+    {
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(rpc->ctx, &pub, rpc->node_privkey)) {
+            snprintf(errmsg, errcap, "key derivation failed");
+            return NULL;
+        }
+        size_t pk_len = 33;
+        secp256k1_ec_pubkey_serialize(rpc->ctx, local_fpk, &pk_len,
+                                      &pub, SECP256K1_EC_COMPRESSED);
+    }
+
+    /* Build chan_open_params_t with CLN-compatible defaults (BOLT #2) */
+    chan_open_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.funding_sats         = amount_sat;
+    p.push_msat            = push_msat;
+    p.feerate_per_kw       = feerate ? feerate : 253;
+    p.to_self_delay        = 144;                         /* ~1 day CSV */
+    p.max_htlc_value_msat  = amount_sat * 900;            /* 90% of channel in msat */
+    p.channel_reserve_sats = amount_sat / 100;            /* 1% reserve (BOLT #2) */
+    p.htlc_minimum_msat    = 1000;                        /* 1 sat minimum HTLC */
+    p.max_accepted_htlcs   = 483;                         /* BOLT #2 maximum */
+    p.wallet               = rpc->wallet;
+    memcpy(p.funding_pubkey,             local_fpk, 33);
+    memcpy(p.revocation_basepoint,       local_fpk, 33);
+    memcpy(p.payment_basepoint,          local_fpk, 33);
+    memcpy(p.delayed_payment_basepoint,  local_fpk, 33);
+    memcpy(p.htlc_basepoint,             local_fpk, 33);
+    memcpy(p.first_per_commitment_point, local_fpk, 33);
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    if (!chan_open_outbound(rpc->pmgr, peer_idx, &p, rpc->ctx, &ch)) {
+        snprintf(errmsg, errcap, "channel open failed");
+        return NULL;
+    }
+
+    /* Funding txid: internal byte order → display hex (reverse) */
+    char txid_hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(txid_hex + i * 2, 3, "%02x", ch.funding_txid[31 - i]);
+    txid_hex[64] = '\0';
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "funding_txid", txid_hex);
+    cJSON_AddNumberToObject(r, "funding_vout",  (double)ch.funding_vout);
+    cJSON_AddNumberToObject(r, "capacity_sat",  (double)amount_sat);
+    cJSON_AddStringToObject(r, "status", "funding_created");
+    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,7 +538,24 @@ static cJSON *method_closechannel(admin_rpc_t *rpc, const cJSON *params,
         if (e->channel_id == channel_id) {
             /* Send shutdown to peer at index i */
             unsigned char cid[32] = {0};
-            unsigned char spk[34] = {0x51, 0x20}; /* placeholder P2TR prefix */
+            /* Build P2TR shutdown scriptpubkey: OP_1 <x-only-pubkey> (BOLT #2 §2.3).
+             * Derive output key from node privkey; x-only = bytes [1..32] of compressed pub. */
+            unsigned char spk[34];
+            spk[0] = 0x51; spk[1] = 0x20;  /* OP_1 PUSH32 */
+            if (rpc->ctx && rpc->node_privkey[0]) {
+                secp256k1_pubkey node_pub;
+                if (secp256k1_ec_pubkey_create(rpc->ctx, &node_pub, rpc->node_privkey)) {
+                    unsigned char pub33[33];
+                    size_t plen = 33;
+                    secp256k1_ec_pubkey_serialize(rpc->ctx, pub33, &plen,
+                                                  &node_pub, SECP256K1_EC_COMPRESSED);
+                    memcpy(spk + 2, pub33 + 1, 32);  /* x-only: skip parity prefix byte */
+                } else {
+                    memset(spk + 2, 0, 32);
+                }
+            } else {
+                memset(spk + 2, 0, 32);
+            }
             int r = chan_close_send_shutdown(rpc->pmgr, (int)i,
                                              cid, spk, 34);
             cJSON *res = cJSON_CreateObject();

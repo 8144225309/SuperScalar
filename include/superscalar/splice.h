@@ -7,6 +7,7 @@
 #include "channel.h"
 #include "tx_builder.h"
 #include "musig.h"
+#include "peer_mgr.h"
 
 /*
  * Channel splicing implementation (BOLT 2 §4.9 + CLN/Eclair/LDK implementations).
@@ -20,8 +21,10 @@
  *   6. channel_apply_splice_update() updates channel state
  *
  * Wire message types:
- *   0x68: MSG_STFU
- *   0x69: MSG_STFU_ACK
+ *   0x68: MSG_STFU (legacy)
+ *   0x69: MSG_STFU_ACK (legacy)
+ *   140:  stfu (BOLT #2 quiescence, type 0x008C)
+ *   141:  stfu_reply (BOLT #2 quiescence, type 0x008D)
  *   78:   splice_init
  *   79:   splice_ack
  *   80:   splice_locked
@@ -34,6 +37,10 @@
 #define SPLICE_MSG_SPLICE_ACK    79
 #define SPLICE_MSG_SPLICE_LOCKED 80
 #define MSG_SPLICING_SIGNED      0x004b   /* mutual partial-sig exchange (BOLT #2 ss4.9) */
+
+/* BOLT #2 quiescence handshake (latest spec, required for splice) */
+#define BOLT2_STFU        140   /* 0x008C - quiescence request (BOLT #2 latest spec) */
+#define BOLT2_STFU_REPLY  141   /* 0x008D - quiescence acknowledgement (BOLT #2 latest spec) */
 
 /* Quiescence state */
 #define SPLICE_STATE_NONE       0
@@ -254,5 +261,48 @@ size_t splice_build_splicing_signed(const unsigned char channel_id[32],
 int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
                                   unsigned char channel_id_out[32],
                                   unsigned char partial_sig_out[64]);
+
+/* ---- BOLT #2 Quiescence Handshake (types 140/141) ---- */
+
+/*
+ * Per-channel quiescence state (BOLT #2 §2.7).
+ * Used by splice_send_stfu / splice_handle_stfu / splice_handle_stfu_reply.
+ */
+typedef enum {
+    QUIESCE_NONE      = 0,  /* normal operation */
+    QUIESCE_INITIATED = 1,  /* we sent stfu, waiting for stfu_reply */
+    QUIESCE_RECEIVED  = 2,  /* peer sent stfu, we must reply */
+    QUIESCE_ACTIVE    = 3,  /* both sides quiesced; safe to splice */
+} quiesce_state_t;
+
+typedef struct {
+    unsigned char channel_id[32];
+    quiesce_state_t state;
+    int initiator;   /* 1 = we initiated, 0 = peer initiated */
+} channel_quiesce_t;
+
+/*
+ * Send stfu (type 140) to peer to begin quiescence on channel_id.
+ * Returns 0 on success, -1 on error.
+ */
+int splice_send_stfu(peer_mgr_t *pmgr, int peer_idx,
+                     const unsigned char channel_id[32]);
+
+/*
+ * Handle incoming stfu (type 140) -- send stfu_reply (type 141) back.
+ * If *qs_state == QUIESCE_INITIATED (cross-initiation), sets QUIESCE_ACTIVE
+ * without sending a reply (both sides already sent stfu).
+ * Returns 0 on success, -1 on error.
+ */
+int splice_handle_stfu(peer_mgr_t *pmgr, int peer_idx,
+                       const unsigned char channel_id[32],
+                       quiesce_state_t *qs_state);
+
+/*
+ * Handle incoming stfu_reply (type 141) -- marks channel as fully quiesced.
+ * Returns 0 on success, -1 if not in QUIESCE_INITIATED state (unexpected).
+ */
+int splice_handle_stfu_reply(const unsigned char channel_id[32],
+                              quiesce_state_t *qs_state);
 
 #endif /* SUPERSCALAR_SPLICE_H */

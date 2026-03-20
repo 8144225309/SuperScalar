@@ -19,6 +19,10 @@
 #include "mpp.h"
 #include "peer_mgr.h"
 #include "gossip_store.h"
+#include "mission_control.h"
+#include "pathfind_exclude.h"
+#include "gossip_ingest.h"
+#include "bolt4_failure.h"
 
 #define PAYMENT_TABLE_MAX   64
 #define PAYMENT_MAX_ROUTES   8   /* MPP shards */
@@ -50,11 +54,16 @@ typedef struct {
     /* AMP fields: set by payment_send_amp, checked in do_payment_send */
     unsigned char amp_set_id[32];                    /* all-zero = not AMP */
     unsigned char amp_shares[PAYMENT_MAX_ROUTES][32]; /* root share per shard */
+    /* CLTV: stored from invoice so retries can recompute final_cltv correctly */
+    uint32_t      min_final_cltv;  /* BOLT #11 field 'c'; 18 for keysend */
 } payment_t;
 
 typedef struct {
-    payment_t entries[PAYMENT_TABLE_MAX];
-    int       count;
+    payment_t       entries[PAYMENT_TABLE_MAX];
+    int             count;
+    mc_table_t     *mc;               /* mission control for failure recording; NULL = disabled */
+    gossip_ingest_t *gi;              /* gossip ingest for embedded channel_updates; NULL = skip */
+    uint32_t        last_block_height; /* most recent tip passed to payment_send/keysend */
 } payment_table_t;
 
 /* Initialise an empty payment table. */
@@ -72,6 +81,7 @@ int payment_send(payment_table_t *pt,
                  peer_mgr_t *pmgr,
                  secp256k1_context *ctx,
                  const unsigned char our_priv[32],
+                 uint32_t current_block_height,
                  const bolt11_invoice_t *inv);
 
 /*
@@ -87,6 +97,7 @@ int payment_keysend(payment_table_t *pt,
                     peer_mgr_t *pmgr,
                     secp256k1_context *ctx,
                     const unsigned char our_priv[32],
+                    uint32_t current_block_height,
                     const unsigned char dest_pubkey[33],
                     uint64_t amount_msat,
                     const unsigned char preimage[32]);
@@ -148,5 +159,36 @@ int payment_send_amp(payment_table_t *pt,
                       uint64_t amount_msat,
                       int n_shards,
                       unsigned char payment_hash_out[32]);
+
+/*
+ * Trampoline payment: route to a trampoline node, let it find the rest.
+ * The outer route (us -> trampoline) is found via pathfind_route_ex with MC.
+ * The trampoline node routes the inner payment to final_dest autonomously.
+ *
+ * Reference: BOLT #4 PR #716 (trampoline), Phoenix wallet.
+ */
+typedef struct {
+    unsigned char trampoline_pubkey[33];  /* intermediate trampoline node */
+    unsigned char final_dest[33];          /* ultimate destination pubkey */
+    uint64_t      amount_msat;             /* amount to deliver to final_dest */
+    uint32_t      cltv_expiry;             /* CLTV for the trampoline hop */
+    unsigned char payment_hash[32];
+    unsigned char payment_secret[32];
+    int           has_payment_secret;
+} trampoline_payment_t;
+
+/*
+ * Send a trampoline payment: find a route to tp->trampoline_pubkey (applying
+ * MC exclusions), then record the payment with the trampoline as first-hop
+ * and final_dest as the ultimate destination.
+ * Returns 0 on success (payment entry added), -1 on error.
+ */
+int payment_send_trampoline(payment_table_t *pt,
+                             gossip_store_t *gs,
+                             peer_mgr_t *pmgr,
+                             secp256k1_context *ctx,
+                             const unsigned char our_privkey[32],
+                             uint32_t current_block_height,
+                             const trampoline_payment_t *tp);
 
 #endif /* SUPERSCALAR_PAYMENT_H */

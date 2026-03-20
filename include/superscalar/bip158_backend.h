@@ -35,9 +35,10 @@
 #define BIP158_M  784931ULL    /* False-positive rate denominator (1/M) */
 
 /* Capacity limits */
-#define BIP158_MAX_SCRIPTS     512   /* watched scriptPubKeys             */
-#define BIP158_TX_CACHE_SIZE   256   /* confirmed tx entries              */
-#define BIP158_MAX_PEERS         8   /* maximum P2P peer connections      */
+#define BIP158_MAX_SCRIPTS       512   /* watched scriptPubKeys             */
+#define BIP158_TX_CACHE_SIZE     256   /* confirmed tx entries              */
+#define BIP158_MAX_PEERS           8   /* maximum P2P peer connections      */
+#define BIP158_MEMPOOL_CACHE_SIZE 64   /* unconfirmed txid ring buffer      */
 
 /* Header ring buffer: one difficulty-adjustment window of block hashes.
    Indexed by (height % BIP158_HEADER_WINDOW) — wraps safely for long chains. */
@@ -122,6 +123,11 @@ typedef struct {
     void           (*mempool_cb)(const char *txid_hex, void *ctx);
     void            *mempool_ctx;
     int              mempool_subscribed; /* 1 after mempool message sent */
+    /* Mempool ring buffer: most-recently-seen unconfirmed txids (internal
+       byte order, i.e. raw from p2p_poll_inv). Used by is_in_mempool(). */
+    unsigned char    mempool_cache[BIP158_MEMPOOL_CACHE_SIZE][32];
+    int              mempool_cache_count; /* 0..BIP158_MEMPOOL_CACHE_SIZE */
+    int              mempool_cache_head;  /* next ring slot to overwrite */
 
     /* Optional fee estimator — receives per-block fee samples after each
        full-block download.  Set by bip158_backend_set_fee_estimator().

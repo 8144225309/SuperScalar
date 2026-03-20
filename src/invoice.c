@@ -10,6 +10,7 @@
 #include "superscalar/invoice.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/sha256.h"
+#include "superscalar/stateless_invoice.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,12 +60,20 @@ int invoice_create(bolt11_invoice_table_t *tbl,
     bolt11_invoice_entry_t *e = &tbl->entries[slot];
     memset(e, 0, sizeof(*e));
 
-    /* Generate random preimage and payment_secret */
-    invoice_rand_bytes(e->preimage, 32);
-    invoice_rand_bytes(e->payment_secret, 32);
-
-    /* payment_hash = SHA256(preimage) */
-    sha256(e->preimage, 32, e->payment_hash);
+    /* Level 2 stateless: generate nonce, derive preimage + secret deterministically.
+     * Nonce is embedded in invoice metadata (BOLT #11 type 27) so the receiver
+     * can re-derive the preimage on demand without storing it. */
+    if (!stateless_invoice_gen_nonce(e->stateless_nonce)) {
+        /* /dev/urandom unavailable — fallback to rand() (test-only quality) */
+        invoice_rand_bytes(e->stateless_nonce, 32);
+    }
+    if (!stateless_invoice_from_nonce(node_privkey, e->stateless_nonce,
+                                      e->payment_hash, e->preimage,
+                                      e->payment_secret)) {
+        return 0;
+    }
+    e->has_stateless_secret   = 1;
+    e->has_stateless_preimage = 1;
 
     e->amount_msat = amount_msat;
     e->created_at  = (uint32_t)time(NULL);
@@ -96,6 +105,11 @@ int invoice_create(bolt11_invoice_table_t *tbl,
     memcpy(inv.payment_hash,   e->payment_hash,   32);
     memcpy(inv.payment_secret, e->payment_secret, 32);
     inv.has_payment_secret = 1;
+
+    /* Level 2: embed nonce in BOLT #11 metadata (tagged field type 27) */
+    memcpy(inv.metadata, e->stateless_nonce, 32);
+    inv.metadata_len = 32;
+    inv.has_metadata = 1;
 
     if (description) {
         strncpy(inv.description, description,

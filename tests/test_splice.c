@@ -1,4 +1,5 @@
 #include "superscalar/splice.h"
+#include "superscalar/peer_mgr.h"
 #include "superscalar/channel.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wire.h"
@@ -254,5 +255,72 @@ int test_splice_musig_funding_spk(void)
     ASSERT(memcmp(spk, spk2, 34) == 0, "splice_compute_funding_spk is deterministic");
 
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- QS1-QS5: BOLT #2 Quiescence Handshake Tests ---- */
+
+/* QS1: splice_send_stfu with zeroed peer_mgr -- no crash */
+int test_splice_quiesce_send_stfu(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    unsigned char channel_id[32];
+    memset(channel_id, 0xAB, 32);
+    int r = splice_send_stfu(&pmgr, -1, channel_id);
+    ASSERT(r == -1, "splice_send_stfu peer_idx -1 returns -1");
+    int r2 = splice_send_stfu(NULL, 0, channel_id);
+    ASSERT(r2 == -1, "splice_send_stfu NULL pmgr returns -1");
+    return 1;
+}
+
+/* QS2: splice_handle_stfu in QUIESCE_NONE -- sets QUIESCE_ACTIVE */
+int test_splice_quiesce_handle_stfu_none(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    unsigned char channel_id[32];
+    memset(channel_id, 0xCD, 32);
+    quiesce_state_t qs = QUIESCE_NONE;
+    splice_handle_stfu(&pmgr, 0, channel_id, &qs);
+    ASSERT(qs == QUIESCE_ACTIVE, "QS2: state becomes QUIESCE_ACTIVE");
+    return 1;
+}
+
+/* QS3: splice_handle_stfu in QUIESCE_INITIATED (cross-init) -- QUIESCE_ACTIVE */
+int test_splice_quiesce_handle_stfu_cross(void)
+{
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    unsigned char channel_id[32];
+    memset(channel_id, 0xEF, 32);
+    quiesce_state_t qs = QUIESCE_INITIATED;
+    int r = splice_handle_stfu(&pmgr, 0, channel_id, &qs);
+    ASSERT(r == 0, "QS3: cross-initiation returns 0");
+    ASSERT(qs == QUIESCE_ACTIVE, "QS3: cross-init sets QUIESCE_ACTIVE");
+    return 1;
+}
+
+/* QS4: splice_handle_stfu_reply in QUIESCE_INITIATED -- sets QUIESCE_ACTIVE */
+int test_splice_quiesce_handle_stfu_reply_ok(void)
+{
+    unsigned char channel_id[32];
+    memset(channel_id, 0x12, 32);
+    quiesce_state_t qs = QUIESCE_INITIATED;
+    int r = splice_handle_stfu_reply(channel_id, &qs);
+    ASSERT(r == 0, "QS4: stfu_reply in INITIATED returns 0");
+    ASSERT(qs == QUIESCE_ACTIVE, "QS4: stfu_reply sets QUIESCE_ACTIVE");
+    return 1;
+}
+
+/* QS5: splice_handle_stfu_reply in QUIESCE_NONE (unexpected) -- returns -1 */
+int test_splice_quiesce_handle_stfu_reply_unexpected(void)
+{
+    unsigned char channel_id[32];
+    memset(channel_id, 0x34, 32);
+    quiesce_state_t qs = QUIESCE_NONE;
+    int r = splice_handle_stfu_reply(channel_id, &qs);
+    ASSERT(r == -1, "QS5: unexpected stfu_reply returns -1");
+    ASSERT(qs == QUIESCE_NONE, "QS5: state unchanged");
     return 1;
 }

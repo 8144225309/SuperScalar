@@ -354,6 +354,18 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
+        case 27: { /* m: payment_metadata */
+            unsigned char mbytes[64];
+            size_t mlen = fivebit_to_bytes(fdata5, fdata5_len,
+                                            mbytes, sizeof(mbytes));
+            if (mlen > 0) {
+                if (mlen > 64) mlen = 64;
+                memcpy(out->metadata, mbytes, mlen);
+                out->metadata_len = mlen;
+                out->has_metadata  = 1;
+            }
+            break;
+        }
         case 20: { /* f (features) */
             if (fdata5_len <= 4) {
                 uint16_t feat = 0;
@@ -492,6 +504,14 @@ int bolt11_encode(const bolt11_invoice_t *inv,
         uint8_t f[52];
         bytes_to_5bit(inv->payment_secret, 32, f, 52);
         WRITE_FIELD(18, f, 52);
+    }
+
+    /* m: payment_metadata (type 27) */
+    if (inv->has_metadata && inv->metadata_len > 0) {
+        uint8_t f[128];
+        size_t f_len = bytes_to_5bit(inv->metadata, inv->metadata_len,
+                                      f, sizeof(f));
+        if (f_len > 0) WRITE_FIELD(27, f, f_len);
     }
 
     /* d: description */
