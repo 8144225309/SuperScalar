@@ -1572,9 +1572,9 @@ int factory_session_finalize_node(factory_t *f, size_t node_idx) {
                                             sighash, mr, NULL);
     if (!ok)
         fprintf(stderr, "DEBUG finalize_node %zu: musig_session_finalize_nonces FAILED "
-                "(n_signers=%zu, nonces_received=%d, has_taptree=%d)\n",
+                "(n_signers=%zu, nonces_collected=%d, has_taptree=%d)\n",
                 node_idx, node->n_signers,
-                node->signing_session.nonces_received, node->has_taptree);
+                node->signing_session.nonces_collected, node->has_taptree);
     return ok;
 }
 
