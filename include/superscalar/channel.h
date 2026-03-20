@@ -396,4 +396,16 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     uint64_t old_commitment_num, size_t htlc_index,
     const unsigned char *anchor_spk, size_t anchor_spk_len);
 
+/* --- PTLC resolution transactions (Phase 5: production wiring) --- */
+
+int channel_build_ptlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index);
+
+int channel_build_ptlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index);
+
 #endif /* SUPERSCALAR_CHANNEL_H */
