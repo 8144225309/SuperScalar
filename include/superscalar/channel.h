@@ -146,6 +146,9 @@ typedef struct {
     unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
     uint16_t      close_their_spk_len;
 
+    /* Dynamic commitment: negotiated channel type (BOLT #2 PR #880) */
+    uint32_t      channel_type_bits;         /* feature bits from channel_type TLV */
+
     /* announcement_signatures (BOLT #7 type 259) */
     uint64_t      short_channel_id;          /* block<<40 | tx_idx<<16 | vout */
     unsigned char local_node_sig[64];        /* our Schnorr sig over channel_announcement */

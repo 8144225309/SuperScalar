@@ -1331,9 +1331,9 @@ int bip158_backend_connect_all(bip158_backend_t *backend)
  *   3. Filter hits download full block via P2P; on failure, fall back to
  *      regtest_scan_block_txs() if rpc_ctx is available.
  *
- * RPC path (legacy fallback, when P2P is not connected):
- *   Uses regtest_get_block_height, regtest_get_block_hash,
- *   regtest_get_block_filter, and regtest_scan_block_txs.
+ * Fallback path (P2P down, ring buffer + RPC last resort):
+ *   Uses ring-buffer block hashes when available, then regtest_get_block_hash,
+ *   regtest_get_block_filter, and regtest_scan_block_txs as last resort.
  *
  * Returns number of matched blocks, or -1 on hard error.
  */
@@ -1507,14 +1507,37 @@ int bip158_backend_scan(bip158_backend_t *backend)
             if (!batch_ok) break;
             h = batch_end + 1;
         }
-    } else if (backend->peers[backend->current_peer].fd < 0 && rt) {
-        /* === RPC path (no P2P connection) === */
+    } else if (backend->peers[backend->current_peer].fd < 0) {
+        /* === Fallback path: ring-buffer hashes + P2P reconnect + RPC last resort === */
+        /* Phase 5: when P2P is down but we have header data in the ring buffer,
+           attempt to reconnect and use P2P for filters + blocks.
+           Only fall back to RPC if both P2P and ring buffer are unavailable. */
+        if (backend->n_peers > 0)
+            bip158_backend_reconnect(backend);
+
+        /* If reconnect succeeded, re-enter P2P path on next scan call */
+        if (backend->peers[backend->current_peer].fd >= 0)
+            return 0;  /* will use P2P path on next poll */
+
+        /* True fallback: RPC path for environments without P2P peers */
+        if (!rt) return 0;  /* no RPC either; caller retries later */
         for (int h = start; h <= tip; h++) {
             char          hash_hex[65];
             size_t        filter_len = 0;
             unsigned char key[16];
 
-            if (!regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex))) {
+            /* Use ring buffer hash if available, else RPC */
+            int have_hash = 0;
+            if (backend->headers_synced >= h && h >= 0) {
+                const uint8_t *bh = backend->header_hashes[h % BIP158_HEADER_WINDOW];
+                for (int b = 0; b < 32; b++)
+                    sprintf(hash_hex + b*2, "%02x", bh[31 - b]);
+                hash_hex[64] = 0;
+                have_hash = 1;
+            } else {
+                have_hash = regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex));
+            }
+            if (!have_hash) {
                 backend->tip_height = h;
                 if (backend->block_connected_cb)
                     backend->block_connected_cb((uint32_t)h,
@@ -1547,6 +1570,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                              backend->block_connected_ctx);
         }
     }
+
 
     free(filter_buf);
 #undef FILTER_BUF_MAX

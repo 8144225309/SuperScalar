@@ -157,4 +157,8 @@ int gossip_store_enumerate_channels_since(gossip_store_t *gs,
                                            gossip_store_full_channel_cb_t cb,
                                            void *ctx);
 
+/* Export current gossip store state as an RGS (Rapid Gossip Sync) binary blob.
+ * Returns bytes written to out, or 0 on error. */
+size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t out_cap);
+
 #endif /* SUPERSCALAR_GOSSIP_STORE_H */

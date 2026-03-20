@@ -130,4 +130,12 @@ int bip353_parse_txt_record(const char *txt,
  */
 int bip353_validate_address(const char *address);
 
+/*
+ * Resolve a BIP 353 address via DNS TXT query.
+ * Returns LNURL_BIP353_BOLT11 (1) or LNURL_BIP353_OFFER (2) on success,
+ * 0 on DNS lookup failure or no matching TXT record.
+ * invoice_out receives the extracted BOLT11 invoice or BOLT12 offer string.
+ */
+int bip353_dns_resolve(const char *address, char *invoice_out, size_t inv_cap);
+
 #endif /* SUPERSCALAR_LNURL_H */
