@@ -40,6 +40,14 @@ typedef struct {
     uint32_t      last_refill_unix;        /* when tokens were last replenished */
 } circuit_breaker_peer_t;
 
+/*
+ * Ban escalation callback: called when a peer exhausts its token bucket.
+ * The handler may call peer_db_ban() or similar to block the peer.
+ */
+typedef void (*circuit_breaker_ban_fn_t)(void *ctx,
+                                          const unsigned char peer_pubkey[33],
+                                          uint32_t duration_secs);
+
 typedef struct {
     circuit_breaker_peer_t peers[CIRCUIT_BREAKER_MAX_PEERS];
     int                    n_peers;
@@ -48,6 +56,11 @@ typedef struct {
     uint16_t default_max_pending_htlcs;
     uint64_t default_max_pending_msat;
     uint32_t default_max_htlcs_per_hour;
+
+    /* Ban escalation: called on token exhaustion (NULL = disabled) */
+    circuit_breaker_ban_fn_t ban_fn;
+    void                    *ban_ctx;
+    uint32_t                 ban_duration_secs;
 } circuit_breaker_t;
 
 /* Initialise circuit_breaker_t with default limits. */

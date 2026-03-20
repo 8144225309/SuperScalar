@@ -7,6 +7,7 @@
 #include "fee.h"
 #include "chain_backend.h"
 #include "wallet_source.h"
+#include "htlc_fee_bump.h"
 #include <secp256k1.h>
 
 #define WATCHTOWER_MAX_WATCH 128
@@ -62,8 +63,7 @@ typedef struct {
     uint32_t anchor_vout;       /* anchor output index (always 1) */
     uint64_t anchor_amount;     /* 240 sats (P2A) */
     int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
-    int bump_count;             /* how many CPFP bumps attempted (max 3) */
-    int cycles_since_bump;      /* cycles since last bump attempt */
+    htlc_fee_bump_t fee_bump;   /* deadline-aware fee escalation (replaces bump_count) */
 } watchtower_pending_t;
 
 typedef struct {

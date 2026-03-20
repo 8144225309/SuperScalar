@@ -10,6 +10,8 @@
 
 #include "superscalar/pathfind.h"
 #include "superscalar/gossip_store.h"
+#include "superscalar/mission_control.h"
+#include "superscalar/pathfind_exclude.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -37,12 +39,13 @@ typedef struct {
 } edge_t;
 
 /* ---- Graph ---- */
-typedef struct {
+struct pathfind_graph_s {
     node_entry_t nodes[MAX_NODES];
     int          n_nodes;
     edge_t       edges[MAX_EDGES];
     int          n_edges;
-} graph_t;
+};
+typedef struct pathfind_graph_s graph_t;
 
 static int node_find_or_add(graph_t *g, const unsigned char pubkey[33]) {
     for (int i = 0; i < g->n_nodes; i++)
@@ -281,4 +284,341 @@ int pathfind_mpp_routes(gossip_store_t *gs,
             found++;
     }
     return found;
+}
+
+/* ---- pathfind_route_ex: route with MC exclusion ---- */
+/*
+ * Runs Dijkstra over the gossip graph, skipping edges whose (scid, direction)
+ * is currently penalised by mc.  This lets the router avoid failed channels
+ * on the INITIAL route attempt rather than only on retries.
+ */
+int pathfind_route_ex(gossip_store_t *gs,
+                      const unsigned char our_node[33],
+                      const unsigned char dest_pubkey[33],
+                      uint64_t amount_msat,
+                      uint32_t current_height,
+                      mc_table_t *mc,
+                      pathfind_route_t *out)
+{
+    /* Without MC, fall back to plain Dijkstra */
+    if (!mc)
+        return pathfind_route(gs, our_node, dest_pubkey, amount_msat, out);
+
+    if (!gs || !our_node || !dest_pubkey || !out || amount_msat == 0) return 0;
+
+    /* Build exclusion list from mission control */
+    pathfind_exclude_t ex;
+    pathfind_exclude_init(&ex);
+    pathfind_exclude_from_mc(&ex, mc, amount_msat, current_height);
+
+    /* Load graph */
+    graph_t *g = (graph_t *)malloc(sizeof(graph_t));
+    if (!g) return 0;
+    if (!load_graph(gs, g)) { free(g); return 0; }
+
+    int src = -1, dst = -1;
+    for (int i = 0; i < g->n_nodes; i++) {
+        if (memcmp(g->nodes[i].pubkey, our_node,    33) == 0) src = i;
+        if (memcmp(g->nodes[i].pubkey, dest_pubkey, 33) == 0) dst = i;
+    }
+    if (src < 0 || dst < 0 || src == dst) { free(g); return 0; }
+
+    /* Mark excluded edges so Dijkstra skips them.
+     * We temporarily set htlc_max_msat=0 for excluded edges; Dijkstra
+     * already skips edges where amount_msat > htlc_max_msat > 0.
+     * We save/restore to avoid corrupting the graph for future calls.
+     */
+    uint64_t saved_max[MAX_EDGES];
+    for (int ei = 0; ei < g->n_edges; ei++) {
+        edge_t *e = &g->edges[ei];
+        saved_max[ei] = e->htlc_max_msat;
+        /* Determine direction for this edge: direction 0 means from < to */
+        int dir = (e->from_idx < e->to_idx) ? 0 : 1;
+        if (pathfind_exclude_is_excluded(&ex, e->scid, dir) ||
+            pathfind_exclude_is_excluded(&ex, e->scid, 1 - dir) ||
+            pathfind_exclude_is_excluded(&ex, e->scid, -1)) {
+            /* Poison edge: set max below amount so Dijkstra skips it */
+            e->htlc_max_msat = (amount_msat > 0) ? (amount_msat - 1) : 0;
+        }
+    }
+
+    dijk_node_t *dn = (dijk_node_t *)malloc(g->n_nodes * sizeof(dijk_node_t));
+    int ok = 0;
+    if (dn) {
+        ok = dijkstra(g, src, dst, amount_msat, dn);
+        if (ok) ok = extract_path(g, dn, src, dst, amount_msat, out);
+        free(dn);
+    }
+
+    /* Restore poisoned edge max values */
+    for (int ei = 0; ei < g->n_edges; ei++)
+        g->edges[ei].htlc_max_msat = saved_max[ei];
+
+    free(g);
+    return ok;
+}
+
+/* ---- Public graph management API ---- */
+
+pathfind_graph_t *pathfind_graph_alloc(void) {
+    graph_t *g = (graph_t *)calloc(1, sizeof(graph_t));
+    return (pathfind_graph_t *)g;
+}
+
+void pathfind_graph_free(pathfind_graph_t *g) {
+    free(g);
+}
+
+/*
+ * pathfind_graph_load_from_gossip — populate a graph from live gossip data.
+ *
+ * Uses gossip_store_enumerate_channels() which joins gossip_channels with
+ * gossip_channel_updates to emit one directed edge per (scid, direction).
+ * The graph is cleared before loading.
+ *
+ * Returns number of directed edges loaded, or -1 on error.
+ */
+
+typedef struct {
+    graph_t *g;
+    int      count;
+} load_ctx_t;
+
+static void load_edge_cb(uint64_t scid,
+                          const unsigned char src_pubkey[33],
+                          const unsigned char dst_pubkey[33],
+                          uint32_t fee_base_msat,
+                          uint32_t fee_ppm,
+                          uint16_t cltv_delta,
+                          uint64_t htlc_min_msat,
+                          uint64_t htlc_max_msat,
+                          uint64_t capacity_sat,
+                          void *ctx)
+{
+    load_ctx_t *lc = (load_ctx_t *)ctx;
+    graph_t    *g  = lc->g;
+
+    (void)capacity_sat; /* already encoded in htlc_max_msat */
+
+    int idx_src = node_find_or_add(g, src_pubkey);
+    int idx_dst = node_find_or_add(g, dst_pubkey);
+    if (idx_src < 0 || idx_dst < 0) return;
+    if (g->n_edges >= MAX_EDGES) return;
+
+    edge_t *e       = &g->edges[g->n_edges++];
+    e->scid         = scid;
+    e->from_idx     = idx_src;
+    e->to_idx       = idx_dst;
+    e->fee_base_msat = fee_base_msat;
+    e->fee_ppm      = fee_ppm;
+    e->cltv_delta   = cltv_delta;
+    e->htlc_min_msat = htlc_min_msat;
+    e->htlc_max_msat = htlc_max_msat;
+
+    lc->count++;
+}
+
+int pathfind_graph_load_from_gossip(pathfind_graph_t *g, gossip_store_t *gs)
+{
+    if (!g || !gs) return -1;
+    /* Clear the graph */
+    memset(g, 0, sizeof(graph_t));
+
+    load_ctx_t lc = { (graph_t *)g, 0 };
+    int ret = gossip_store_enumerate_channels(gs, load_edge_cb, &lc);
+    if (ret < 0) return -1;
+    return lc.count;
+}
+
+/* ================================================================== */
+/* PR #70: Incremental graph cache                                     */
+/* ================================================================== */
+
+struct pathfind_graph_cache {
+    graph_t  *g;               /* heap-allocated graph; NULL if not yet loaded */
+    uint32_t  last_gossip_ts;  /* MAX(timestamp) across all loaded edges */
+    uint32_t  loaded_at;       /* Unix time of last full reload */
+};
+
+pathfind_graph_cache_t *pathfind_graph_cache_create(void)
+{
+    pathfind_graph_cache_t *c =
+        (pathfind_graph_cache_t *)calloc(1, sizeof(pathfind_graph_cache_t));
+    return c;
+}
+
+void pathfind_graph_cache_destroy(pathfind_graph_cache_t *c)
+{
+    if (!c) return;
+    free(c->g);
+    free(c);
+}
+
+/* Context passed to patch_edge_cb during incremental refresh */
+typedef struct {
+    graph_t  *g;
+    int       count;
+} patch_ctx_t;
+
+/*
+ * patch_edge_cb -- update an existing edge in-place or append a new edge.
+ * Called by gossip_store_enumerate_channels_since() for each updated edge.
+ * If the (scid, direction encoded as from_idx == idx_src, to_idx == idx_dst)
+ * edge already exists, its fee/cltv fields are overwritten.
+ * Otherwise a new edge is appended.
+ */
+static void patch_edge_cb(uint64_t scid,
+                           const unsigned char src_pubkey[33],
+                           const unsigned char dst_pubkey[33],
+                           uint32_t fee_base_msat,
+                           uint32_t fee_ppm,
+                           uint16_t cltv_delta,
+                           uint64_t htlc_min_msat,
+                           uint64_t htlc_max_msat,
+                           uint64_t capacity_sat,
+                           void *ctx)
+{
+    patch_ctx_t *pc = (patch_ctx_t *)ctx;
+    graph_t     *g  = pc->g;
+
+    (void)capacity_sat;
+
+    int idx_src = node_find_or_add(g, src_pubkey);
+    int idx_dst = node_find_or_add(g, dst_pubkey);
+    if (idx_src < 0 || idx_dst < 0) return;
+
+    /* Search for existing edge with same scid and same direction */
+    for (int ei = 0; ei < g->n_edges; ei++) {
+        edge_t *e = &g->edges[ei];
+        if (e->scid == scid &&
+            e->from_idx == idx_src &&
+            e->to_idx   == idx_dst) {
+            /* Update in-place */
+            e->fee_base_msat  = fee_base_msat;
+            e->fee_ppm        = fee_ppm;
+            e->cltv_delta     = cltv_delta;
+            e->htlc_min_msat  = htlc_min_msat;
+            e->htlc_max_msat  = htlc_max_msat;
+            pc->count++;
+            return;
+        }
+    }
+
+    /* New edge -- append */
+    if (g->n_edges >= MAX_EDGES) return;
+    edge_t *e       = &g->edges[g->n_edges++];
+    e->scid         = scid;
+    e->from_idx     = idx_src;
+    e->to_idx       = idx_dst;
+    e->fee_base_msat = fee_base_msat;
+    e->fee_ppm      = fee_ppm;
+    e->cltv_delta   = cltv_delta;
+    e->htlc_min_msat = htlc_min_msat;
+    e->htlc_max_msat = htlc_max_msat;
+    pc->count++;
+}
+
+/*
+ * query_max_ts -- query MAX(timestamp) from gossip_channel_updates.
+ * If since_ts == 0, returns the global max (used after full reload).
+ * If since_ts > 0, returns the max among rows with timestamp > since_ts
+ *   (used to detect whether an incremental patch is needed).
+ * Returns 0 if no rows found or on error.
+ */
+static uint32_t query_max_ts(gossip_store_t *gs, uint32_t since_ts)
+{
+    if (!gs || !gs->db) return 0;
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql_all   = "SELECT MAX(timestamp) FROM gossip_channel_updates;";
+    const char *sql_since = "SELECT MAX(timestamp) FROM gossip_channel_updates WHERE timestamp > ?;";
+
+    const char *sql = (since_ts == 0) ? sql_all : sql_since;
+    if (sqlite3_prepare_v2(gs->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    if (since_ts != 0)
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)since_ts);
+
+    uint32_t result = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW &&
+        sqlite3_column_type(stmt, 0) != SQLITE_NULL)
+        result = (uint32_t)sqlite3_column_int64(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+int pathfind_route_cached(gossip_store_t *gs,
+                           pathfind_graph_cache_t *c,
+                           const unsigned char our_node[33],
+                           const unsigned char dest_pubkey[33],
+                           uint64_t amount_msat,
+                           uint32_t now_unix,
+                           pathfind_route_t *out)
+{
+    if (!gs || !c || !our_node || !dest_pubkey || !out || amount_msat == 0)
+        return 0;
+
+    int need_full = (c->g == NULL) ||
+                    ((now_unix - c->loaded_at) > PATHFIND_CACHE_TTL_SECS);
+
+    if (need_full) {
+        /* Full reload */
+        if (!c->g) {
+            c->g = (graph_t *)malloc(sizeof(graph_t));
+            if (!c->g) return 0;
+        }
+        memset(c->g, 0, sizeof(graph_t));
+
+        load_ctx_t lc = { c->g, 0 };
+        gossip_store_enumerate_channels(gs, load_edge_cb, &lc);
+
+        c->loaded_at      = now_unix;
+        c->last_gossip_ts = query_max_ts(gs, 0);
+
+    } else {
+        /* Check for incremental updates newer than what we loaded */
+        uint32_t newer_ts = query_max_ts(gs, c->last_gossip_ts);
+        if (newer_ts > c->last_gossip_ts) {
+            /* Incremental patch -- only reload changed edges */
+            patch_ctx_t pc = { c->g, 0 };
+            gossip_store_enumerate_channels_since(gs, c->last_gossip_ts,
+                                                  patch_edge_cb, &pc);
+            c->last_gossip_ts = newer_ts;
+        }
+        /* else: graph is fully up to date -- no DB access needed */
+    }
+
+    /* Run Dijkstra on the cached graph */
+    graph_t *g = c->g;
+    if (!g || g->n_nodes == 0) return 0;
+
+    int src = -1, dst = -1;
+    for (int i = 0; i < g->n_nodes; i++) {
+        if (memcmp(g->nodes[i].pubkey, our_node,    33) == 0) src = i;
+        if (memcmp(g->nodes[i].pubkey, dest_pubkey, 33) == 0) dst = i;
+    }
+    if (src < 0 || dst < 0 || src == dst) return 0;
+
+    dijk_node_t *dn = (dijk_node_t *)malloc(g->n_nodes * sizeof(dijk_node_t));
+    if (!dn) return 0;
+
+    int ok = dijkstra(g, src, dst, amount_msat, dn);
+    if (ok) ok = extract_path(g, dn, src, dst, amount_msat, out);
+
+    free(dn);
+    return ok;
+}
+
+/* ---- Cache accessors (used by tests) ---- */
+
+uint32_t pathfind_graph_cache_loaded_at(const pathfind_graph_cache_t *c)
+{
+    return c ? c->loaded_at : 0;
+}
+
+uint32_t pathfind_graph_cache_last_gossip_ts(const pathfind_graph_cache_t *c)
+{
+    return c ? c->last_gossip_ts : 0;
 }

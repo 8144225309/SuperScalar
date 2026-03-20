@@ -69,8 +69,12 @@ void mc_record_success(mc_table_t *mc, uint64_t scid, int direction,
     if (!mc) return;
     mc_entry_t *e = find_entry(mc, scid, direction);
     if (!e) {
-        /* No prior failure — nothing to update */
-        return;
+        /* No prior failure entry: create one to track success */
+        if (mc->count >= MC_MAX_ENTRIES) return;
+        e = &mc->entries[mc->count++];
+        memset(e, 0, sizeof(*e));
+        e->scid      = scid;
+        e->direction = direction;
     }
     (void)amount_msat;
     e->success_time = now_unix;

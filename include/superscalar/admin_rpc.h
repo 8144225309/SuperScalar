@@ -24,6 +24,7 @@
 #include "gossip_store.h"
 #include "fee_estimator.h"
 #include "pathfind.h"
+#include "wallet_source.h"
 
 #define ADMIN_RPC_RESPONSE_MAX  65536
 
@@ -44,6 +45,7 @@ typedef struct {
     mpp_table_t            *mpp;
     fee_estimator_t        *fee_est;
     uint32_t               *block_height;       /* current chain tip; may be NULL */
+    wallet_source_t        *wallet;             /* on-chain wallet; NULL = no channel open */
     volatile int           *shutdown_flag;
 
     /* Unix socket state */

@@ -106,8 +106,12 @@ int circuit_breaker_check_add(circuit_breaker_t *cb,
     if (p->max_pending_msat > 0 &&
         p->pending_msat + amount_msat > p->max_pending_msat) return 0;
 
-    /* Check rate limit token */
-    if (p->tokens == 0) return 0;
+    /* Check rate limit token; escalate to ban on exhaustion */
+    if (p->tokens == 0) {
+        if (cb->ban_fn)
+            cb->ban_fn(cb->ban_ctx, peer_pubkey, cb->ban_duration_secs);
+        return 0;
+    }
 
     /* Accept: consume token and increment counters */
     p->tokens--;

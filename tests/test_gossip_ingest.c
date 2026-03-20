@@ -555,3 +555,74 @@ int test_gossip_ingest_null_safety(void)
 
     return 1;
 }
+
+/* ================================================================== */
+/* PR #69: gossip_store_enumerate_channels tests                      */
+/* ================================================================== */
+
+/* Static state for enumerate callbacks */
+static uint64_t ge_en_got_scid;
+static int      ge_en_call_count;
+
+static void ge_en_channel_cb(uint64_t scid,
+                              const unsigned char *src,
+                              const unsigned char *dst,
+                              uint32_t fee_base,
+                              uint32_t fee_ppm,
+                              uint16_t cltv_delta,
+                              uint64_t htlc_min,
+                              uint64_t htlc_max,
+                              uint64_t capacity_sat,
+                              void *ctx)
+{
+    (void)src; (void)dst; (void)fee_base; (void)fee_ppm;
+    (void)cltv_delta; (void)htlc_min; (void)htlc_max;
+    (void)capacity_sat; (void)ctx;
+    ge_en_got_scid = scid;
+    ge_en_call_count++;
+}
+
+/* GE_EN1: Ingest a channel_update, then enumerate ->
+ *         callback fires with the correct scid. */
+int test_ge_en1_enumerate_after_update(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "GE_EN1: open gs");
+
+    unsigned char n1[33], n2[33];
+    memset(n1, 0x02, 33); n1[1] = 0x11;
+    memset(n2, 0x03, 33); n2[1] = 0x22;
+
+    uint64_t scid = ((uint64_t)700000 << 40) | 1;
+    uint32_t now  = 1700000000u;
+
+    gossip_store_upsert_channel(&gs, scid, n1, n2, 1000000, now);
+    gossip_store_upsert_channel_update(&gs, scid, 0, 1000, 200, 40, now);
+
+    ge_en_got_scid   = 0;
+    ge_en_call_count = 0;
+
+    int cnt = gossip_store_enumerate_channels(&gs, ge_en_channel_cb, NULL);
+    ASSERT(cnt == 1, "GE_EN1: enumerate count == 1");
+    ASSERT(ge_en_call_count == 1, "GE_EN1: callback fired once");
+    ASSERT(ge_en_got_scid == scid, "GE_EN1: correct scid in callback");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* GE_EN2: Empty gossip_store -> enumerate returns 0, no crash. */
+int test_ge_en2_enumerate_empty(void)
+{
+    gossip_store_t gs;
+    ASSERT(gossip_store_open_in_memory(&gs), "GE_EN2: open gs");
+
+    ge_en_call_count = 0;
+
+    int cnt = gossip_store_enumerate_channels(&gs, ge_en_channel_cb, NULL);
+    ASSERT(cnt == 0, "GE_EN2: enumerate count == 0");
+    ASSERT(ge_en_call_count == 0, "GE_EN2: callback never fired");
+
+    gossip_store_close(&gs);
+    return 1;
+}

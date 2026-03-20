@@ -21,6 +21,7 @@
 #include <secp256k1.h>
 #include "channel.h"
 #include "peer_mgr.h"
+#include "wallet_source.h"
 
 /* BOLT #2 wire message types */
 #define CHAN_MSG_OPEN_CHANNEL        32
@@ -49,6 +50,8 @@ typedef struct {
     uint16_t max_accepted_htlcs;    /* default 483 */
     int      announce_channel;      /* 1 = public channel */
     int      zero_conf;             /* 1 = send minimum_depth=0 (LSPS2 / Phoenix compat) */
+    /* Wallet for UTXO selection and signing (NULL = skip tx building) */
+    wallet_source_t *wallet;
     /* Local channel keys (from channel_t) */
     unsigned char funding_pubkey[33];
     unsigned char revocation_basepoint[33];
@@ -97,6 +100,18 @@ int chan_open_inbound(peer_mgr_t *mgr, int peer_idx,
 int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
                      secp256k1_context *ctx,
                      channel_t *ch);
+
+/*
+ * Build the P2WSH 2-of-2 multisig scriptPubKey for the funding output.
+ * Pubkeys are sorted lexicographically (BOLT #3).
+ * spk_out must be at least 34 bytes.
+ * Returns 1 on success, 0 on failure.
+ */
+int chan_build_p2wsh_funding_output(
+    secp256k1_context *ctx,
+    const unsigned char local_pk[33],
+    const unsigned char remote_pk[33],
+    unsigned char spk_out[34]);
 
 /*
  * Build a raw open_channel message payload.

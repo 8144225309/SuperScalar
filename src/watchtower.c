@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/htlc_fee_bump.h"
 #include "superscalar/wallet_source.h"
 #include "superscalar/types.h"
 #include "superscalar/persist.h"
@@ -127,8 +128,8 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             p->anchor_vout = pending_vouts[i];
             p->anchor_amount = pending_amounts[i];
             p->cycles_in_mempool = pending_cycles[i];
-            p->bump_count = pending_bumps[i];
-            p->cycles_since_bump = 0;
+            memset(&p->fee_bump, 0, sizeof(p->fee_bump));
+            p->fee_bump.last_bump_block = (uint32_t)pending_bumps[i];
         }
     }
 
@@ -571,8 +572,7 @@ int watchtower_check(watchtower_t *wt) {
             p->anchor_vout = 1;
             p->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
             p->cycles_in_mempool = 0;
-            p->bump_count = 0;
-            p->cycles_since_bump = 0;
+            memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             if (wt->db && wt->db->db) {
                 persist_save_pending(wt->db, p->txid, p->anchor_vout,
                                        p->anchor_amount, 0, 0);
@@ -727,12 +727,21 @@ int watchtower_check(watchtower_t *wt) {
             continue;
         }
         p->cycles_in_mempool++;
-        /* Bump if: stuck >= 2 cycles, under 3 bump attempts,
-           and enough cycles since last bump (first bump at cycle 2,
-           subsequent bumps every 6 cycles = ~30 seconds) */
-        if (p->cycles_in_mempool >= 2 && p->bump_count < 3 &&
-            (p->bump_count == 0 || p->cycles_since_bump >= 6)) {
-            /* Stuck in mempool — attempt CPFP bump */
+        /* Initialize fee_bump schedule on first encounter */
+        if (p->fee_bump.start_block == 0) {
+            uint32_t cur = (uint32_t)p->cycles_in_mempool; /* approx block proxy */
+            uint64_t start_fr = wt->fee ? (uint64_t)wt->fee->get_rate(wt->fee, FEE_TARGET_NORMAL) : 1000;
+            if (start_fr < HTLC_FEE_BUMP_FLOOR_SAT_PER_KVB)
+                start_fr = HTLC_FEE_BUMP_FLOOR_SAT_PER_KVB;
+            htlc_fee_bump_init(&p->fee_bump, cur, cur + 144,
+                               p->anchor_amount,
+                               HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT,
+                               200, start_fr);
+        }
+        /* Use deadline-aware fee scheduler */
+        uint32_t cur_block = (uint32_t)p->cycles_in_mempool;
+        if (htlc_fee_bump_should_bump(&p->fee_bump, cur_block)) {
+            uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
             tx_buf_t cpfp;
             tx_buf_init(&cpfp, 512);
             if (watchtower_build_cpfp_tx(wt, &cpfp, p->txid,
@@ -742,14 +751,14 @@ int watchtower_check(watchtower_t *wt) {
                     hex_encode(cpfp.data, cpfp.len, cpfp_hex);
                     char cpfp_txid[65];
                     if (wt->chain->send_raw_tx(wt->chain, cpfp_hex, cpfp_txid)) {
-                        printf("  CPFP child broadcast (attempt %d): %s\n",
-                               p->bump_count + 1, cpfp_txid);
-                        p->bump_count++;
-                        p->cycles_since_bump = 0;
+                        htlc_fee_bump_record_broadcast(&p->fee_bump, cur_block, fr);
+                        printf("  CPFP child broadcast (feerate %llu): %s\n",
+                               (unsigned long long)fr, cpfp_txid);
                         if (wt->db && wt->db->db) {
                             persist_save_pending(wt->db, p->txid,
                                 p->anchor_vout, p->anchor_amount,
-                                p->cycles_in_mempool, p->bump_count);
+                                p->cycles_in_mempool,
+                                (int)p->fee_bump.last_bump_block);
                             persist_log_broadcast(wt->db, cpfp_txid,
                                                   "cpfp", cpfp_hex, "ok");
                         }
@@ -764,7 +773,6 @@ int watchtower_check(watchtower_t *wt) {
             }
             tx_buf_free(&cpfp);
         }
-        p->cycles_since_bump++;
         i++;
     }
 
@@ -895,8 +903,7 @@ int watchtower_add_pending_tx(watchtower_t *wt,
     p->anchor_vout       = anchor_vout;
     p->anchor_amount     = anchor_amount;
     p->cycles_in_mempool = 0;
-    p->bump_count        = 0;
-    p->cycles_since_bump = 0;
+    memset(&p->fee_bump, 0, sizeof(p->fee_bump));
 
     if (wt->db && wt->db->db)
         persist_save_pending(wt->db, p->txid, p->anchor_vout,

@@ -448,3 +448,112 @@ int gossip_store_get_channels_in_range(gossip_store_t *gs,
     sqlite3_finalize(stmt);
     return found;
 }
+
+/* ---- Channel enumeration for pathfinding ---- */
+
+int gossip_store_enumerate_channels(gossip_store_t *gs,
+                                     gossip_store_full_channel_cb_t cb,
+                                     void *ctx)
+{
+    if (!gs || !gs->db || !cb) return -1;
+
+    sqlite3_stmt *stmt;
+    /*
+     * Join channels with their channel_updates to emit one directed edge per
+     * (scid, direction) row.  We use capacity_sat * 1000 as a conservative
+     * htlc_max_msat because the gossip_channel_updates table does not store
+     * the htlc_maximum_msat field (it is optional in BOLT #7 and was not
+     * added to the schema).  htlc_min_msat is set to 1 msat (permissive).
+     */
+    const char *sql =
+        "SELECT c.scid, c.node1_hex, c.node2_hex, c.capacity_sat, "
+        "       u.direction, u.fee_base_msat, u.fee_ppm, u.cltv_delta "
+        "FROM gossip_channels c "
+        "JOIN gossip_channel_updates u ON c.scid = u.scid "
+        "WHERE c.pruned_at = 0;";
+
+    int rc = sqlite3_prepare_v2(gs->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t scid        = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *n1_hex   = (const char *)sqlite3_column_text(stmt, 1);
+        const char *n2_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        uint64_t cap_sat     = (uint64_t)sqlite3_column_int64(stmt, 3);
+        int direction        = sqlite3_column_int(stmt, 4);
+        uint32_t fee_base    = (uint32_t)sqlite3_column_int64(stmt, 5);
+        uint32_t fee_ppm     = (uint32_t)sqlite3_column_int64(stmt, 6);
+        uint16_t cltv        = (uint16_t)sqlite3_column_int(stmt, 7);
+
+        if (!n1_hex || !n2_hex) continue;
+
+        unsigned char pk1[33], pk2[33];
+        if (!hex_to_pubkey(n1_hex, pk1)) continue;
+        if (!hex_to_pubkey(n2_hex, pk2)) continue;
+
+        /* direction 0: node1 is src; direction 1: node2 is src */
+        const unsigned char *src = (direction == 0) ? pk1 : pk2;
+        const unsigned char *dst = (direction == 0) ? pk2 : pk1;
+
+        uint64_t htlc_max = cap_sat * 1000ULL; /* conservative upper bound */
+
+        cb(scid, src, dst, fee_base, fee_ppm, cltv,
+           1ULL /* htlc_min_msat */, htlc_max, cap_sat, ctx);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* ---- Incremental channel enumeration (since a given timestamp) ---- */
+
+int gossip_store_enumerate_channels_since(gossip_store_t *gs,
+                                           uint32_t since_ts,
+                                           gossip_store_full_channel_cb_t cb,
+                                           void *ctx)
+{
+    if (!gs || !gs->db || !cb) return -1;
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT c.scid, c.node1_hex, c.node2_hex, c.capacity_sat, "
+        "       u.direction, u.fee_base_msat, u.fee_ppm, u.cltv_delta "
+        "FROM gossip_channels c "
+        "JOIN gossip_channel_updates u ON c.scid = u.scid "
+        "WHERE c.pruned_at = 0 AND u.timestamp > ?;";
+
+    int rc = sqlite3_prepare_v2(gs->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)since_ts);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t scid        = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *n1_hex   = (const char *)sqlite3_column_text(stmt, 1);
+        const char *n2_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        uint64_t cap_sat     = (uint64_t)sqlite3_column_int64(stmt, 3);
+        int direction        = sqlite3_column_int(stmt, 4);
+        uint32_t fee_base    = (uint32_t)sqlite3_column_int64(stmt, 5);
+        uint32_t fee_ppm     = (uint32_t)sqlite3_column_int64(stmt, 6);
+        uint16_t cltv        = (uint16_t)sqlite3_column_int(stmt, 7);
+
+        if (!n1_hex || !n2_hex) continue;
+
+        unsigned char pk1[33], pk2[33];
+        if (!hex_to_pubkey(n1_hex, pk1)) continue;
+        if (!hex_to_pubkey(n2_hex, pk2)) continue;
+
+        const unsigned char *src = (direction == 0) ? pk1 : pk2;
+        const unsigned char *dst = (direction == 0) ? pk2 : pk1;
+
+        uint64_t htlc_max = cap_sat * 1000ULL;
+
+        cb(scid, src, dst, fee_base, fee_ppm, cltv,
+           1ULL /* htlc_min_msat */, htlc_max, cap_sat, ctx);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}

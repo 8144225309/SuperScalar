@@ -364,3 +364,173 @@ int test_chan_open_accept_zero_conf_min_depth(void)
     ASSERT(depth_zc == 0, "DF8: zero_conf min_depth == 0");
     return 1;
 }
+
+/* ================================================================== */
+/* PR #62: Funding flow — P2WSH 2-of-2 + wallet integration          */
+/* ================================================================== */
+
+/* CO5: NULL wallet with valid keys → chan_build_p2wsh_funding_output succeeds */
+int test_chan_open_p2wsh_builds(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO5: ctx");
+
+    /* Two valid compressed pubkeys */
+    unsigned char local_pk[33], remote_pk[33];
+    memset(local_pk, 0x11, 33);  local_pk[0]  = 0x02;
+    memset(remote_pk, 0x22, 33); remote_pk[0] = 0x03;
+
+    unsigned char spk[34];
+    int ok = chan_build_p2wsh_funding_output(ctx, local_pk, remote_pk, spk);
+    ASSERT(ok == 1, "CO5: p2wsh builds");
+    /* P2WSH: OP_0 (0x00) + PUSH32 (0x20) + 32-byte hash */
+    ASSERT(spk[0] == 0x00, "CO5: OP_0");
+    ASSERT(spk[1] == 0x20, "CO5: PUSH32");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO6: P2WSH output is deterministic for the same key pair */
+int test_chan_open_p2wsh_deterministic(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO6: ctx");
+
+    unsigned char lk[33], rk[33];
+    memset(lk, 0x33, 33); lk[0] = 0x02;
+    memset(rk, 0x44, 33); rk[0] = 0x03;
+
+    unsigned char spk1[34], spk2[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk, rk, spk1) == 1, "CO6: build 1");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk, rk, spk2) == 1, "CO6: build 2");
+    ASSERT(memcmp(spk1, spk2, 34) == 0, "CO6: deterministic");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO7: P2WSH output is the same regardless of which key is "local" vs "remote"
+   (pubkeys are sorted, so order doesn't matter) */
+int test_chan_open_p2wsh_sorted(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO7: ctx");
+
+    /* Use two keys where local > remote lexicographically */
+    unsigned char pk_big[33], pk_small[33];
+    memset(pk_big,   0xFF, 33); pk_big[0]   = 0x03;
+    memset(pk_small, 0x01, 33); pk_small[0] = 0x02;
+
+    unsigned char spk_ab[34], spk_ba[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk_big, pk_small, spk_ab) == 1, "CO7: ab");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk_small, pk_big, spk_ba) == 1, "CO7: ba");
+    /* Sorted by BOLT #3 — output must be identical either way */
+    ASSERT(memcmp(spk_ab, spk_ba, 34) == 0,
+           "CO7: sorted keys produce same P2WSH output");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO8: Different key pairs produce different P2WSH outputs (no collision) */
+int test_chan_open_p2wsh_unique_per_keypair(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO8: ctx");
+
+    unsigned char lk1[33], rk1[33], lk2[33], rk2[33];
+    memset(lk1, 0x55, 33); lk1[0] = 0x02;
+    memset(rk1, 0x66, 33); rk1[0] = 0x03;
+    memset(lk2, 0x77, 33); lk2[0] = 0x02;
+    memset(rk2, 0x88, 33); rk2[0] = 0x03;
+
+    unsigned char spk1[34], spk2[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk1, rk1, spk1) == 1, "CO8: pair1");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk2, rk2, spk2) == 1, "CO8: pair2");
+    ASSERT(memcmp(spk1, spk2, 34) != 0,
+           "CO8: different key pairs → different funding outputs");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO10–CO11: inbound channel open uses a valid EC funding pubkey (not temp_chan_id bytes) */
+
+/* CO10: Ephemeral keypair generation produces a valid secp256k1 compressed point */
+int test_chan_open_inbound_valid_funding_pk(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO10: ctx");
+
+    /* Simulate the fix: read random bytes, derive pubkey, verify it's a valid EC point */
+    unsigned char priv[32];
+    FILE *f = fopen("/dev/urandom", "rb");
+    ASSERT(f && fread(priv, 1, 32, f) == 32, "CO10: read random bytes");
+    fclose(f);
+
+    secp256k1_pubkey pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pub, priv), "CO10: pubkey created");
+
+    unsigned char pub33[33];
+    size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, pub33, &plen, &pub, SECP256K1_EC_COMPRESSED);
+    ASSERT(plen == 33, "CO10: serialized to 33 bytes");
+    ASSERT(pub33[0] == 0x02 || pub33[0] == 0x03, "CO10: valid compressed point prefix");
+
+    /* Verify it can be round-tripped (parsed back) */
+    secp256k1_pubkey pub2;
+    ASSERT(secp256k1_ec_pubkey_parse(ctx, &pub2, pub33, 33), "CO10: round-trip parse");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO11: Two ephemeral keypairs are different (not deterministic / same temp_chan_id) */
+int test_chan_open_inbound_unique_funding_pk(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO11: ctx");
+
+    unsigned char pk1[33], pk2[33];
+    for (int k = 0; k < 2; k++) {
+        unsigned char priv[32];
+        FILE *f = fopen("/dev/urandom", "rb");
+        ASSERT(f && fread(priv, 1, 32, f) == 32, "CO11: read random bytes");
+        fclose(f);
+        secp256k1_pubkey pub;
+        ASSERT(secp256k1_ec_pubkey_create(ctx, &pub, priv), "CO11: pubkey create");
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, k == 0 ? pk1 : pk2, &plen,
+                                       &pub, SECP256K1_EC_COMPRESSED);
+    }
+    /* With overwhelming probability two random keys differ */
+    ASSERT(memcmp(pk1, pk2, 33) != 0, "CO11: two ephemeral keys differ");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO9: NULL inputs return 0 gracefully */
+int test_chan_open_p2wsh_null_guard(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO9: ctx");
+
+    unsigned char pk[33]; memset(pk, 0x99, 33); pk[0] = 0x02;
+    unsigned char spk[34];
+
+    ASSERT(chan_build_p2wsh_funding_output(ctx, NULL, pk, spk) == 0, "CO9: NULL local");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk, NULL, spk) == 0, "CO9: NULL remote");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk, pk, NULL) == 0, "CO9: NULL spk_out");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

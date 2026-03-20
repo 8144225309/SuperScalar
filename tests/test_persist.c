@@ -2032,3 +2032,222 @@ int test_persist_transaction_rollback(void) {
     persist_close(&db);
     return 1;
 }
+
+/* ================================================================
+ * PS_N1 – PS_N8: LN invoice + peer channel persistence (schema v9)
+ * ================================================================ */
+
+#include "superscalar/invoice.h"
+
+/* helper: make a deterministic bolt11_invoice_entry_t */
+static bolt11_invoice_entry_t make_test_invoice(unsigned char seed) {
+    bolt11_invoice_entry_t e;
+    memset(&e, 0, sizeof(e));
+    memset(e.payment_hash,   seed,     32);
+    memset(e.preimage,       seed + 1, 32);
+    memset(e.payment_secret, seed + 2, 32);
+    e.amount_msat  = 100000ULL + seed;
+    e.expiry       = 3600;
+    e.created_at   = 1700000000U + seed;
+    e.settled      = 0;
+    e.active       = 1;
+    snprintf(e.description, sizeof(e.description), "test invoice %d", (int)seed);
+    return e;
+}
+
+/* PS_N1: save one invoice, reload, hash matches */
+int test_ps_n1_save_load_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x01);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 1, "count == 1");
+    TEST_ASSERT(memcmp(tbl.entries[0].payment_hash, inv.payment_hash, 32) == 0,
+                "payment_hash matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N2: save 3 invoices, load, all 3 present */
+int test_ps_n2_save_3_invoices(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    for (unsigned char s = 1; s <= 3; s++) {
+        bolt11_invoice_entry_t inv = make_test_invoice(s * 10);
+        TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+    }
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 3, "count == 3");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N3: delete invoice, reload, count = 0 */
+int test_ps_n3_delete_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x42);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+    TEST_ASSERT(persist_delete_ln_invoice(&db, inv.payment_hash), "delete invoice");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 0, "count == 0 after delete");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N4: upsert – same payment_hash twice → count = 1 */
+int test_ps_n4_upsert_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x07);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save first");
+    inv.amount_msat = 999999;
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save second (upsert)");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 1, "count == 1 after upsert");
+    TEST_ASSERT_EQ((long long)tbl.entries[0].amount_msat, 999999LL, "updated amount");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* callback context for peer channel tests */
+typedef struct {
+    int            count;
+    unsigned char  last_channel_id[32];
+    uint64_t       last_local;
+    uint64_t       last_remote;
+    int            last_state;
+} pc_cb_ctx_t;
+
+static void pc_callback(const unsigned char channel_id[32],
+                         const unsigned char peer_pubkey[33],
+                         uint64_t capacity_sat,
+                         uint64_t local_balance_msat,
+                         uint64_t remote_balance_msat,
+                         int state,
+                         void *ctx) {
+    pc_cb_ctx_t *c = (pc_cb_ctx_t *)ctx;
+    c->count++;
+    memcpy(c->last_channel_id, channel_id, 32);
+    c->last_local  = local_balance_msat;
+    c->last_remote = remote_balance_msat;
+    c->last_state  = state;
+    (void)peer_pubkey; (void)capacity_sat;
+}
+
+/* PS_N5: save one channel, load via callback, channel_id matches */
+int test_ps_n5_save_load_peer_channel(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xAA, 32);
+    memset(ppk, 0xBB, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 500000, 500000, 1),
+                "save channel");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "callback fired once");
+    TEST_ASSERT(memcmp(ctx.last_channel_id, cid, 32) == 0, "channel_id matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N6: save 2 channels, callback fires twice */
+int test_ps_n6_save_2_channels(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid1[32], cid2[32], ppk[33];
+    memset(cid1, 0x11, 32);
+    memset(cid2, 0x22, 32);
+    memset(ppk,  0x33, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid1, ppk, 1000000, 500000, 500000, 0),
+                "save channel 1");
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid2, ppk, 2000000, 900000, 1100000, 0),
+                "save channel 2");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 2, "callback fired twice");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N7: update channel (same channel_id, different balance), sees updated */
+int test_ps_n7_update_channel(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0x55, 32);
+    memset(ppk, 0x66, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 600000, 400000, 0),
+                "initial save");
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 300000, 700000, 2),
+                "updated save");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "only one row");
+    TEST_ASSERT_EQ((long long)ctx.last_local,  300000LL, "updated local");
+    TEST_ASSERT_EQ((long long)ctx.last_remote, 700000LL, "updated remote");
+    TEST_ASSERT_EQ(ctx.last_state, 2, "updated state");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N8: NULL db → save returns 0 (no crash) */
+int test_ps_n8_null_db(void) {
+    persist_t db;
+    memset(&db, 0, sizeof(db));  /* db.db == NULL */
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0xFF);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv) == 0, "null db returns 0");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xAA, 32);
+    memset(ppk, 0xBB, 33);
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    100, 50, 50, 0) == 0,
+                "null db channel returns 0");
+    return 1;
+}

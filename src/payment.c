@@ -8,6 +8,10 @@
  */
 
 #include "superscalar/payment.h"
+#include "superscalar/bolt4_failure.h"
+#include "superscalar/mission_control.h"
+#include "superscalar/pathfind_exclude.h"
+#include "superscalar/gossip_ingest.h"
 #include "superscalar/pathfind.h"
 #include "superscalar/onion.h"
 #include "superscalar/bolt11.h"
@@ -20,6 +24,8 @@
 void payment_init(payment_table_t *pt) {
     if (!pt) return;
     memset(pt, 0, sizeof(*pt));
+    pt->mc = NULL;
+    pt->gi = NULL;
 }
 
 /* Build onion hops from a pathfind_route + invoice fields */
@@ -80,7 +86,8 @@ static int do_payment_send(payment_t *pay,
                             const unsigned char our_priv[32],
                             const unsigned char our_node[33],
                             uint64_t shard_msat,
-                            int route_idx) {
+                            int route_idx,
+                            uint32_t final_cltv) {
     (void)fwd; (void)mpp;
 
     pathfind_route_t *route = &pay->routes[route_idx];
@@ -88,8 +95,7 @@ static int do_payment_send(payment_t *pay,
 
     /* Build onion hops */
     onion_hop_t hops[PATHFIND_MAX_HOPS];
-    if (!build_onion_hops(route, shard_msat,
-                           /* final_cltv */ (uint32_t)(time(NULL) / 600) + 40,
+    if (!build_onion_hops(route, shard_msat, final_cltv,
                            pay->payment_secret, 0, NULL, hops)) return 0;
 
     /* Inject AMP TLV (type 14) on the final hop for AMP shards */
@@ -138,8 +144,12 @@ static int do_payment_send(payment_t *pay,
         memset(htlc_msg + pos, 0, 8); pos += 8;          /* htlc_id */
         for (int i = 7; i >= 0; i--) htlc_msg[pos++] = (unsigned char)(shard_msat >> (i*8));
         memcpy(htlc_msg + pos, pay->payment_hash, 32); pos += 32;
-        htlc_msg[pos++] = 0; htlc_msg[pos++] = 0;
-        htlc_msg[pos++] = 0; htlc_msg[pos++] = 40;     /* cltv_expiry placeholder */
+        /* cltv_expiry = first hop's absolute CLTV (BOLT #2 update_add_htlc) */
+        uint32_t first_cltv = hops[0].cltv_expiry;
+        htlc_msg[pos++] = (unsigned char)(first_cltv >> 24);
+        htlc_msg[pos++] = (unsigned char)(first_cltv >> 16);
+        htlc_msg[pos++] = (unsigned char)(first_cltv >> 8);
+        htlc_msg[pos++] = (unsigned char)(first_cltv);
         memcpy(htlc_msg + pos, onion_pkt, ONION_PACKET_SIZE); pos += ONION_PACKET_SIZE;
         peer_mgr_send(pmgr, peer_idx, htlc_msg, pos);
     }
@@ -159,7 +169,9 @@ int payment_send(payment_table_t *pt,
                  peer_mgr_t *pmgr,
                  secp256k1_context *ctx,
                  const unsigned char our_priv[32],
+                 uint32_t current_block_height,
                  const bolt11_invoice_t *inv) {
+    if (pt) pt->last_block_height = current_block_height;  /* store for retry paths */
     if (!pt || !gs || !ctx || !our_priv || !inv) return -1;
     if (pt->count >= PAYMENT_TABLE_MAX) return -1;
 
@@ -179,17 +191,38 @@ int payment_send(payment_table_t *pt,
     pay->max_cltv_delta = 2016; /* ~2 weeks */
     pay->state          = PAY_STATE_PENDING;
     pay->attempt_at     = (uint32_t)time(NULL);
+    /* BOLT #11 field 'c' (min_final_cltv_expiry); default 18 per spec */
+    pay->min_final_cltv = (inv->min_final_cltv_expiry > 0)
+                          ? (uint32_t)inv->min_final_cltv_expiry : 18;
 
-    /* Find route to destination */
-    int n_routes = pathfind_mpp_routes(gs, our_pub, inv->payee_pubkey,
+    /* Find route to destination -- apply MC exclusions on initial attempt */
+    int n_routes;
+    if (pt->mc) {
+        pathfind_route_t single_route;
+        int r = pathfind_route_ex(gs, our_pub, inv->payee_pubkey,
+                                   inv->amount_msat, current_block_height,
+                                   pt->mc, &single_route);
+        if (r <= 0) {
+            snprintf(pay->last_error, sizeof(pay->last_error), "no route found");
+            pay->state = PAY_STATE_FAILED;
+            return pt->count++;
+        }
+        pay->routes[0] = single_route;
+        n_routes = 1;
+    } else {
+        n_routes = pathfind_mpp_routes(gs, our_pub, inv->payee_pubkey,
                                         inv->amount_msat, 1,
                                         pay->routes, PAYMENT_MAX_ROUTES);
-    if (n_routes <= 0) {
-        snprintf(pay->last_error, sizeof(pay->last_error), "no route found");
-        pay->state = PAY_STATE_FAILED;
-        return pt->count++;
+        if (n_routes <= 0) {
+            snprintf(pay->last_error, sizeof(pay->last_error), "no route found");
+            pay->state = PAY_STATE_FAILED;
+            return pt->count++;
+        }
     }
     pay->n_routes = n_routes;
+
+    /* final_cltv for this attempt: tip + min_final_cltv_expiry (BOLT #11 §8) */
+    uint32_t final_cltv = current_block_height + pay->min_final_cltv;
 
     /* Send each shard */
     uint64_t shard = inv->amount_msat / (uint64_t)n_routes;
@@ -199,7 +232,7 @@ int payment_send(payment_table_t *pt,
     for (int i = 0; i < n_routes; i++) {
         uint64_t s = (i == n_routes - 1) ?
                      inv->amount_msat - shard * (uint64_t)(n_routes - 1) : shard;
-        if (!do_payment_send(pay, gs, fwd, mpp, pmgr, ctx, our_priv, our_pub, s, i)) {
+        if (!do_payment_send(pay, gs, fwd, mpp, pmgr, ctx, our_priv, our_pub, s, i, final_cltv)) {
             snprintf(pay->last_error, sizeof(pay->last_error), "onion build failed");
             pay->state = PAY_STATE_FAILED;
             return pt->count++;
@@ -218,9 +251,11 @@ int payment_keysend(payment_table_t *pt,
                     peer_mgr_t *pmgr,
                     secp256k1_context *ctx,
                     const unsigned char our_priv[32],
+                    uint32_t current_block_height,
                     const unsigned char dest_pubkey[33],
                     uint64_t amount_msat,
                     const unsigned char preimage[32]) {
+    if (pt) pt->last_block_height = current_block_height;  /* store for retry paths */
     if (!pt || !gs || !ctx || !our_priv || !dest_pubkey || !preimage) return -1;
     if (pt->count >= PAYMENT_TABLE_MAX) return -1;
 
@@ -238,13 +273,15 @@ int payment_keysend(payment_table_t *pt,
     memset(pay, 0, sizeof(*pay));
     memcpy(pay->payment_hash, payment_hash, 32);
     memcpy(pay->payment_preimage, preimage, 32);
-    pay->amount_msat = amount_msat;
-    pay->state       = PAY_STATE_PENDING;
-    pay->attempt_at  = (uint32_t)time(NULL);
+    pay->amount_msat    = amount_msat;
+    pay->state          = PAY_STATE_PENDING;
+    pay->attempt_at     = (uint32_t)time(NULL);
+    pay->min_final_cltv = 18; /* BOLT #11 default for spontaneous payments (CLN/LDK use 18) */
 
-    /* Find route */
-    int n_routes = pathfind_route(gs, our_pub, dest_pubkey, amount_msat,
-                                   &pay->routes[0]);
+    /* Find route -- apply MC exclusions on initial attempt */
+    int n_routes = pathfind_route_ex(gs, our_pub, dest_pubkey, amount_msat,
+                                      current_block_height, pt->mc,
+                                      &pay->routes[0]);
     if (!n_routes) {
         snprintf(pay->last_error, sizeof(pay->last_error), "keysend: no route");
         pay->state = PAY_STATE_FAILED;
@@ -252,10 +289,12 @@ int payment_keysend(payment_table_t *pt,
     }
     pay->n_routes = 1;
 
+    /* final_cltv = tip + 18 (keysend default, per CLN/LDK) */
+    uint32_t final_cltv = current_block_height + pay->min_final_cltv;
+
     /* Build onion with keysend preimage */
     onion_hop_t hops[PATHFIND_MAX_HOPS];
-    if (!build_onion_hops(&pay->routes[0], amount_msat,
-                           (uint32_t)(time(NULL) / 600) + 40,
+    if (!build_onion_hops(&pay->routes[0], amount_msat, final_cltv,
                            NULL, 1, preimage, hops)) {
         pay->state = PAY_STATE_FAILED;
         return pt->count++;
@@ -296,8 +335,12 @@ int payment_keysend(payment_table_t *pt,
             memset(htlc_msg + pos, 0, 8); pos += 8;
             for (int i = 7; i >= 0; i--) htlc_msg[pos++] = (unsigned char)(amount_msat >> (i*8));
             memcpy(htlc_msg + pos, payment_hash, 32); pos += 32;
-            htlc_msg[pos++] = 0; htlc_msg[pos++] = 0;
-            htlc_msg[pos++] = 0; htlc_msg[pos++] = 40;
+            /* cltv_expiry = first hop's absolute CLTV */
+            uint32_t first_cltv = hops[0].cltv_expiry;
+            htlc_msg[pos++] = (unsigned char)(first_cltv >> 24);
+            htlc_msg[pos++] = (unsigned char)(first_cltv >> 16);
+            htlc_msg[pos++] = (unsigned char)(first_cltv >> 8);
+            htlc_msg[pos++] = (unsigned char)(first_cltv);
             memcpy(htlc_msg + pos, onion_pkt, ONION_PACKET_SIZE); pos += ONION_PACKET_SIZE;
             peer_mgr_send(pmgr, peer_idx, htlc_msg, pos);
         }
@@ -319,6 +362,12 @@ void payment_on_settle(payment_table_t *pt,
             p->state == PAY_STATE_INFLIGHT) {
             p->state = PAY_STATE_SUCCESS;
             if (preimage) memcpy(p->payment_preimage, preimage, 32);
+            /* Record success in mission control for each hop */
+            if (pt->mc && p->n_routes > 0) {
+                for (int h = 0; h < p->routes[0].n_hops; h++)
+                    mc_record_success(pt->mc, p->routes[0].hops[h].scid,
+                                      0, p->amount_msat, (uint32_t)time(NULL));
+            }
             return;
         }
     }
@@ -347,21 +396,43 @@ int payment_on_fail(payment_table_t *pt,
     if (!pay || pay->state != PAY_STATE_INFLIGHT) return 0;
 
     /* Decrypt error to identify failing hop */
-    if (onion_error && err_len >= 256 && ctx && pay->n_routes > 0) {
-        unsigned char plaintext[256];
-        int failing_hop = -1;
-        onion_error_decrypt(
-            (const unsigned char (*)[32])pay->session_keys,
-            pay->routes[0].n_hops, ctx,
-            onion_error, plaintext, &failing_hop);
+    unsigned char plaintext[256];
+    int failing_hop = -1;
+    if (onion_error && err_len >= 256 && pay->n_routes > 0) {
+        if (ctx) {
+            onion_error_decrypt(
+                (const unsigned char (*)[32])pay->session_keys,
+                pay->routes[0].n_hops, ctx,
+                onion_error, plaintext, &failing_hop);
+        } else {
+            /* ctx=NULL: treat onion_error as raw plaintext (test/simplified path) */
+            memcpy(plaintext, onion_error, 256);
+            failing_hop = 0; /* assume first hop */
+        }
 
-        if (failing_hop >= 0 && failing_hop < pay->routes[0].n_hops) {
-            /* Mark the failing channel as disabled in gossip store */
-            uint64_t bad_scid = pay->routes[0].hops[failing_hop].scid;
-            if (gs && bad_scid) {
-                /* Mark as spent/disabled (soft-delete from routing) */
-                gossip_store_mark_channel_spent(gs, bad_scid, (uint32_t)time(NULL));
+        /* Parse BOLT #4 failure semantics */
+        bolt4_failure_t failure;
+        if (bolt4_failure_parse(plaintext, 256, &failure)) {
+            if (failure.is_permanent || failure.is_node_failure) {
+                snprintf(pay->last_error, sizeof(pay->last_error),
+                         "%s", bolt4_failure_str(failure.failure_code));
+                pay->state = PAY_STATE_FAILED;
+                return 0;
             }
+            /* Apply embedded channel_update if present */
+            if (failure.has_channel_update && failure.channel_update_len > 0 && pt->gi)
+                gossip_ingest_channel_update(pt->gi, failure.channel_update_buf,
+                                             failure.channel_update_len,
+                                             (uint32_t)time(NULL));
+        }
+        if (failing_hop >= 0 && failing_hop < pay->routes[0].n_hops) {
+            uint64_t bad_scid = pay->routes[0].hops[failing_hop].scid;
+            if (gs && bad_scid)
+                gossip_store_mark_channel_spent(gs, bad_scid, (uint32_t)time(NULL));
+            /* Record failure in mission control */
+            if (pt->mc && bad_scid)
+                mc_record_failure(pt->mc, bad_scid, 0,
+                                  pay->amount_msat, (uint32_t)time(NULL));
         }
     }
 
@@ -384,11 +455,36 @@ int payment_on_fail(payment_table_t *pt,
                     memcpy(dest, pay->routes[0].hops[pay->routes[0].n_hops-1].node_id, 33);
                     pathfind_route_t new_route;
                     if (pathfind_route(gs, our_pub, dest, pay->amount_msat, &new_route)) {
-                        pay->routes[0] = new_route;
-                        pay->state = PAY_STATE_INFLIGHT;
-                        do_payment_send(pay, gs, fwd, mpp, pmgr, ctx,
-                                        our_priv, our_pub, pay->amount_msat, 0);
-                        return 1;
+                        /* Check MC exclusions before accepting route */
+                        int excluded = 0;
+                        if (pt->mc) {
+                            pathfind_exclude_t ex;
+                            pathfind_exclude_init(&ex);
+                            pathfind_exclude_from_mc(&ex, pt->mc, pay->amount_msat,
+                                                     (uint32_t)time(NULL));
+                            for (int h = 0; h < new_route.n_hops; h++) {
+                                if (pathfind_exclude_is_excluded(&ex, new_route.hops[h].scid, 0) ||
+                                    pathfind_exclude_is_excluded(&ex, new_route.hops[h].scid, 1)) {
+                                    excluded = 1; break;
+                                }
+                            }
+                        }
+                        if (!excluded) {
+                            pay->routes[0] = new_route;
+                            pay->state = PAY_STATE_INFLIGHT;
+                            /* Recompute final_cltv from stored block height + min_final_cltv */
+                            uint32_t retry_cltv = (pt->last_block_height > 0
+                                                   ? pt->last_block_height
+                                                   : (uint32_t)(time(NULL) / 600))
+                                                  + pay->min_final_cltv;
+                            do_payment_send(pay, gs, fwd, mpp, pmgr, ctx,
+                                            our_priv, our_pub, pay->amount_msat, 0,
+                                            retry_cltv);
+                            return 1;
+                        } else {
+                            snprintf(pay->last_error, sizeof(pay->last_error),
+                                     "retry route excluded by mission control");
+                        }
                     }
                 }
             }
@@ -442,8 +538,13 @@ int payment_check_timeouts(payment_table_t *pt,
                                                  p->amount_msat, &new_route)) {
                     p->routes[0] = new_route;
                     p->state = PAY_STATE_INFLIGHT;
+                    uint32_t retry_cltv2 = (pt->last_block_height > 0
+                                            ? pt->last_block_height
+                                            : (uint32_t)(time(NULL) / 600))
+                                           + p->min_final_cltv;
                     do_payment_send(p, gs, fwd, mpp, pmgr, ctx,
-                                    our_priv, our_pub, p->amount_msat, 0);
+                                    our_priv, our_pub, p->amount_msat, 0,
+                                    retry_cltv2);
                 } else {
                     p->state = PAY_STATE_FAILED;
                     snprintf(p->last_error, sizeof(p->last_error),
@@ -545,8 +646,58 @@ int payment_send_amp(payment_table_t *pt,
     for (int i = 0; i < n_shards; i++) {
         uint64_t s = (i == n_shards - 1) ?
             amount_msat - shard_msat * (uint64_t)(n_shards - 1) : shard_msat;
-        do_payment_send(pay, gs, NULL, NULL, pmgr, ctx, our_privkey, our_pub, s, i);
+        uint32_t amp_cltv = (pt->last_block_height > 0
+                             ? pt->last_block_height
+                             : (uint32_t)(time(NULL) / 600)) + 18;
+        do_payment_send(pay, gs, NULL, NULL, pmgr, ctx, our_privkey, our_pub, s, i, amp_cltv);
     }
 
     return 1;
+}
+
+/* ---- payment_send_trampoline ---- */
+
+int payment_send_trampoline(payment_table_t *pt,
+                             gossip_store_t *gs,
+                             peer_mgr_t *pmgr,
+                             secp256k1_context *ctx,
+                             const unsigned char our_privkey[32],
+                             uint32_t current_block_height,
+                             const trampoline_payment_t *tp)
+{
+    if (!pt || !tp || !gs || !ctx || !our_privkey) return -1;
+    if (pt->count >= PAYMENT_TABLE_MAX) return -1;
+
+    /* Derive our pubkey */
+    unsigned char our_pub[33];
+    secp256k1_pubkey pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &pub, our_privkey)) return -1;
+    size_t pub_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, our_pub, &pub_len, &pub,
+                                   SECP256K1_EC_COMPRESSED);
+
+    /* Route to the trampoline node — it handles routing to final_dest */
+    pathfind_route_t route;
+    int r = pathfind_route_ex(gs, our_pub, tp->trampoline_pubkey,
+                               tp->amount_msat, current_block_height,
+                               pt->mc, &route);
+    if (r <= 0) return -1; /* no path to trampoline */
+
+    /* Commit the payment entry */
+    payment_t *pay = &pt->entries[pt->count];
+    memset(pay, 0, sizeof(*pay));
+    memcpy(pay->payment_hash, tp->payment_hash, 32);
+    if (tp->has_payment_secret)
+        memcpy(pay->payment_secret, tp->payment_secret, 32);
+    pay->amount_msat    = tp->amount_msat;
+    pay->state          = PAY_STATE_PENDING;
+    pay->attempt_at     = (uint32_t)time(NULL);
+    pay->routes[0]      = route;
+    pay->n_routes       = 1;
+    /* Store CLTV from caller; trampoline adds its own delta outward */
+    pay->min_final_cltv = tp->cltv_expiry > 0 ? tp->cltv_expiry : 18;
+    pt->count++;
+
+    (void)pmgr; /* HTLC dispatch handled by caller after route inspection */
+    return 0;
 }
