@@ -5641,7 +5641,9 @@ int main(int argc, char *argv[]) {
         uint64_t jit_amount = mgr->jit_funding_sats;
         if (jit_amount == 0) jit_amount = 50000;  /* default 50k sats */
 
-        for (int ci = 0; ci < n_clients; ci++) {
+        /* Create 1 JIT channel to prove the lifecycle (each takes ~10 min
+           on signet for on-chain confirmation; 4 sequential = ~40 min) */
+        for (int ci = 0; ci < 1; ci++) {
             printf("  Creating JIT channel for client %d (%llu sats)...\n",
                    ci, (unsigned long long)jit_amount);
             fflush(stdout);
