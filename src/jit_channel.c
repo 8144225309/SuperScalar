@@ -176,6 +176,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     secp256k1_pubkey client_pubkey;
     if (!wire_parse_jit_accept(accept_msg.json, mgr->ctx, &parsed_cidx,
                                  &client_pubkey)) {
+        fprintf(stderr, "LSP JIT: wire_parse_jit_accept failed\n");
         cJSON_Delete(accept_msg.json);
         memset(lsp_seckey, 0, 32);
         return 0;
@@ -202,11 +203,11 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     secp256k1_pubkey agg_pk;
     secp256k1_xonly_pubkey agg_xonly;
     if (!secp256k1_musig_pubkey_get(mgr->ctx, &agg_pk, &jit_ka.cache))
-        { memset(lsp_seckey, 0, 32); return 0; }
+        { fprintf(stderr, "LSP JIT: musig_pubkey_get failed\n"); memset(lsp_seckey, 0, 32); return 0; }
     if (!secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &agg_xonly, NULL, &agg_pk))
-        { memset(lsp_seckey, 0, 32); return 0; }
+        { fprintf(stderr, "LSP JIT: xonly_from_pubkey failed\n"); memset(lsp_seckey, 0, 32); return 0; }
     if (!secp256k1_xonly_pubkey_serialize(mgr->ctx, agg_ser, &agg_xonly))
-        { memset(lsp_seckey, 0, 32); return 0; }
+        { fprintf(stderr, "LSP JIT: xonly_serialize failed\n"); memset(lsp_seckey, 0, 32); return 0; }
 
     /* TapTweak (key-path-only, no script tree) */
     unsigned char tweak[32];
@@ -216,10 +217,10 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     secp256k1_pubkey tweaked_pk;
     if (!secp256k1_musig_pubkey_xonly_tweak_add(mgr->ctx, &tweaked_pk,
                                                   &jit_ka_tweak.cache, tweak))
-        { memset(lsp_seckey, 0, 32); return 0; }
+        { fprintf(stderr, "LSP JIT: tweak_add failed\n"); memset(lsp_seckey, 0, 32); return 0; }
     secp256k1_xonly_pubkey tweaked_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(mgr->ctx, &tweaked_xonly, NULL, &tweaked_pk))
-        { memset(lsp_seckey, 0, 32); return 0; }
+        { fprintf(stderr, "LSP JIT: tweaked xonly failed\n"); memset(lsp_seckey, 0, 32); return 0; }
 
     /* Build correct P2TR funding SPK from tweaked key */
     unsigned char funding_spk[34];
