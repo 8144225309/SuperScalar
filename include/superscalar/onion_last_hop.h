@@ -28,6 +28,10 @@ typedef struct {
     int has_payment_data;
     uint64_t short_channel_id;   /* type 6: relay hop outgoing SCID */
     int has_scid;
+    /* Trampoline routing (type 0x0c) */
+    unsigned char trampoline_payload[256];
+    size_t        trampoline_payload_len;
+    int           has_trampoline;
 } onion_hop_payload_t;
 
 /*

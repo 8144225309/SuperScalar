@@ -51,6 +51,7 @@ typedef struct {
     /* Unix socket state */
     int  listen_fd;
     char socket_path[256];
+    unsigned char          our_pubkey[33]; /* node pubkey for BOLT #12 */
 } admin_rpc_t;
 
 /*

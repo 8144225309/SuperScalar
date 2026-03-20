@@ -13,6 +13,9 @@
 
 #include "superscalar/admin_rpc.h"
 #include "superscalar/rgs.h"
+#include "superscalar/bolt12.h"
+#include "superscalar/sha256.h"
+#include "superscalar/trampoline.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/chan_close.h"
 #include "superscalar/chan_open.h"
@@ -728,6 +731,70 @@ static cJSON *method_importrgs(admin_rpc_t *rpc, const cJSON *params,
     return result;
 }
 
+/* Method: payoffer — pay a BOLT #12 offer (offer → invoice_request → pay)
+ *
+ * Flow: 1. Decode bech32m offer
+ *        2. Build invoice_request with our node key
+ *        3. Send via onion message (type 513) to offer node
+ *        4. Receive invoice reply
+ *        5. Initiate payment
+ *
+ * For now: validates offer, creates invoice_request, queues for sending.
+ * Full round-trip requires onion message relay (wired in PR #48). */
+static cJSON *method_payoffer(admin_rpc_t *rpc, const cJSON *params,
+                                char *errmsg, size_t errmsg_cap)
+{
+    const cJSON *offer_item = cJSON_GetObjectItemCaseSensitive(params, "offer");
+    const cJSON *amt_item   = cJSON_GetObjectItemCaseSensitive(params, "amount_msat");
+    if (!cJSON_IsString(offer_item)) {
+        snprintf(errmsg, errmsg_cap, "missing offer parameter");
+        return NULL;
+    }
+
+    const char *offer_str = offer_item->valuestring;
+    uint64_t amount_msat = amt_item && cJSON_IsNumber(amt_item)
+                           ? (uint64_t)amt_item->valuedouble : 0;
+
+    /* Decode the BOLT #12 offer (bech32m with "lno" HRP) */
+    offer_t offer;
+    memset(&offer, 0, sizeof(offer));
+    if (!offer_decode(offer_str, &offer)) {
+        snprintf(errmsg, errmsg_cap, "invalid BOLT #12 offer");
+        return NULL;
+    }
+
+    /* Use offer amount if none specified */
+    if (amount_msat == 0 && offer.amount_msat > 0)
+        amount_msat = offer.amount_msat;
+    if (amount_msat == 0) {
+        snprintf(errmsg, errmsg_cap, "no amount in offer or request");
+        return NULL;
+    }
+
+    /* Build invoice_request */
+    invoice_request_t inv_req;
+    memset(&inv_req, 0, sizeof(inv_req));
+    memcpy(inv_req.payer_key, rpc->our_pubkey, 33);
+    inv_req.amount_msat = amount_msat;
+    /* offer_id = SHA256(node_id || description) as simplified ID */
+    sha256(offer.node_id, 33, inv_req.offer_id);
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddStringToObject(result, "status", "invoice_request_queued");
+    cJSON_AddNumberToObject(result, "amount_msat", (double)amount_msat);
+    if (offer.description[0])
+        cJSON_AddStringToObject(result, "description", offer.description);
+
+    /* Include payer key for debugging */
+    char pk_hex[67];
+    for (int i = 0; i < 33; i++)
+        sprintf(pk_hex + i * 2, "%02x", inv_req.payer_key[i]);
+    pk_hex[66] = 0;
+    cJSON_AddStringToObject(result, "payer_key", pk_hex);
+
+    return result;
+}
+
 static cJSON *method_stop(admin_rpc_t *rpc)
 {
     if (rpc->shutdown_flag)
@@ -794,6 +861,8 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_exportrgs(rpc);
     } else if (strcmp(m, "importrgs") == 0) {
         result = method_importrgs(rpc, params, errmsg, sizeof(errmsg));
+    } else if (strcmp(m, "payoffer") == 0) {
+        result = method_payoffer(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
     } else {

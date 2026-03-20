@@ -6,6 +6,9 @@
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/chan_open.h"
 #include "superscalar/admin_rpc.h"
+#include "superscalar/watchtower.h"
+#include "superscalar/onion.h"
+#include "superscalar/onion_last_hop.h"
 #include "superscalar/htlc_commit.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
@@ -2922,5 +2925,108 @@ int test_dyn_tlv3_zero(void) {
     unsigned char buf[16];
     size_t len = commitment_signed_encode_channel_type_tlv(buf, sizeof(buf), 0);
     TEST_ASSERT_EQ(len, 0, "DYN_TLV3: zero bits produces no TLV");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #81 tests: trampoline wiring, BOLT #12 payoffer, watchtower PTLC
+ * ========================================================================== */
+
+/* TRP_W1: onion TLV parser recognizes type 0x0c trampoline payload */
+int test_trp_w1_tlv_parse_0x0c(void) {
+    /* Build a TLV stream with type 0x0c containing a dummy payload */
+    unsigned char tlv[32];
+    tlv[0] = 0x0c;  /* type: trampoline */
+    tlv[1] = 10;    /* length: 10 bytes */
+    memset(tlv + 2, 0xAA, 10);
+
+    /* Also include type 2 (amt) and type 4 (cltv) so the parser returns 1 */
+    unsigned char full[64];
+    size_t pos = 0;
+    /* type 2: amt_to_forward = 50000 */
+    full[pos++] = 2; full[pos++] = 8;
+    for (int i = 0; i < 7; i++) full[pos++] = 0;
+    full[pos++] = 0x50; /* 80 in decimal but let's just test non-zero */
+    /* type 4: cltv = 700000 */
+    full[pos++] = 4; full[pos++] = 4;
+    full[pos++] = 0x00; full[pos++] = 0x0A; full[pos++] = 0xB1; full[pos++] = 0xA0;
+    /* type 0x0c: trampoline */
+    full[pos++] = 0x0c; full[pos++] = 5;
+    for (int i = 0; i < 5; i++) full[pos++] = 0xBB;
+
+    onion_hop_payload_t out;
+    int r = onion_parse_tlv_payload(full, pos, &out);
+    TEST_ASSERT(r == 1, "TRP_W1: parse ok");
+    TEST_ASSERT(out.has_trampoline == 1, "TRP_W1: has_trampoline set");
+    TEST_ASSERT_EQ(out.trampoline_payload_len, 5, "TRP_W1: payload len 5");
+    TEST_ASSERT(out.trampoline_payload[0] == 0xBB, "TRP_W1: payload data");
+    return 1;
+}
+
+/* TRP_W2: onion TLV parser without 0x0c has has_trampoline=0 */
+int test_trp_w2_no_trampoline(void) {
+    unsigned char tlv[32];
+    size_t pos = 0;
+    tlv[pos++] = 2; tlv[pos++] = 8;
+    for (int i = 0; i < 8; i++) tlv[pos++] = 0x01;
+    tlv[pos++] = 4; tlv[pos++] = 4;
+    for (int i = 0; i < 4; i++) tlv[pos++] = 0x02;
+
+    onion_hop_payload_t out;
+    onion_parse_tlv_payload(tlv, pos, &out);
+    TEST_ASSERT(out.has_trampoline == 0, "TRP_W2: no trampoline");
+    return 1;
+}
+
+/* TRP_W3: onion_hop_t has trampoline fields */
+int test_trp_w3_hop_struct(void) {
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    memset(hop.trampoline_dest, 0x42, 33);
+    hop.trampoline_amt_msat = 99000;
+    hop.trampoline_cltv = 800000;
+    hop.has_trampoline = 1;
+
+    TEST_ASSERT(hop.has_trampoline == 1, "TRP_W3: has_trampoline");
+    TEST_ASSERT_EQ((long long)hop.trampoline_amt_msat, 99000LL, "TRP_W3: amt");
+    TEST_ASSERT(hop.trampoline_dest[0] == 0x42, "TRP_W3: dest byte");
+    return 1;
+}
+
+/* B12_PO1: payoffer RPC validates offer parameter */
+int test_b12_po1_payoffer_missing_offer(void) {
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+
+    char out[4096];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"payoffer\",\"params\":{}}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    TEST_ASSERT(n > 0, "B12_PO1: response produced");
+    TEST_ASSERT(strstr(out, "missing offer") != NULL, "B12_PO1: error mentions missing offer");
+    return 1;
+}
+
+/* WT_PTLC1: watchtower_entry_t has ptlc_outputs field */
+int test_wt_ptlc1_entry_fields(void) {
+    watchtower_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.ptlc_outputs = NULL;
+    entry.n_ptlc_outputs = 0;
+    /* Just verify the fields exist and compile */
+    TEST_ASSERT(entry.n_ptlc_outputs == 0, "WT_PTLC1: n_ptlc_outputs initialized");
+    return 1;
+}
+
+/* WT_PTLC2: watchtower_htlc_t can store PTLC metadata (reused struct) */
+int test_wt_ptlc2_metadata_store(void) {
+    watchtower_htlc_t wh;
+    memset(&wh, 0, sizeof(wh));
+    wh.htlc_vout = 3;
+    wh.htlc_amount = 25000;
+    wh.direction = HTLC_OFFERED;  /* reused for PTLC direction */
+    wh.cltv_expiry = 750000;
+
+    TEST_ASSERT_EQ(wh.htlc_vout, 3, "WT_PTLC2: vout");
+    TEST_ASSERT_EQ((long long)wh.htlc_amount, 25000LL, "WT_PTLC2: amount");
     return 1;
 }

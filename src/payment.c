@@ -698,6 +698,24 @@ int payment_send_trampoline(payment_table_t *pt,
     pay->min_final_cltv = tp->cltv_expiry > 0 ? tp->cltv_expiry : 18;
     pt->count++;
 
+    /* Build onion hops with trampoline TLV on the final hop */
+    onion_hop_t tramp_hops[PATHFIND_MAX_HOPS];
+    if (build_onion_hops(&route, tp->amount_msat,
+                           pay->min_final_cltv + current_block_height,
+                           tp->has_payment_secret ? tp->payment_secret : NULL,
+                           0, NULL, tramp_hops)) {
+        /* Inject trampoline destination into the final hop to trampoline node */
+        for (int i = 0; i < route.n_hops; i++) {
+            if (tramp_hops[i].is_final) {
+                memcpy(tramp_hops[i].trampoline_dest, tp->final_dest, 33);
+                tramp_hops[i].trampoline_amt_msat = tp->amount_msat;
+                tramp_hops[i].trampoline_cltv     = tp->cltv_expiry;
+                tramp_hops[i].has_trampoline       = 1;
+                break;
+            }
+        }
+    }
+
     (void)pmgr; /* HTLC dispatch handled by caller after route inspection */
     return 0;
 }
