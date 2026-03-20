@@ -1603,6 +1603,13 @@ extern int test_bip353_validate(void);
 extern int test_chantype_roundtrip(void);
 extern int test_chantype_negotiate(void);
 extern int test_ptlc_commitment_output(void);
+extern int test_ptlc_rt1_add_and_sign(void);
+extern int test_ptlc_rt2_settle(void);
+extern int test_ptlc_rt3_fail(void);
+extern int test_dyn_c1_upgrade_valid(void);
+extern int test_dyn_c2_propose_upgrade(void);
+extern int test_rgs_i1_import_roundtrip(void);
+extern int test_bip353_native_fallback(void);
 
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
@@ -3255,6 +3262,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_chantype_roundtrip);
     RUN_TEST(test_chantype_negotiate);
     RUN_TEST(test_ptlc_commitment_output);
+    RUN_TEST(test_ptlc_rt1_add_and_sign);
+    RUN_TEST(test_ptlc_rt2_settle);
+    RUN_TEST(test_ptlc_rt3_fail);
+    RUN_TEST(test_dyn_c1_upgrade_valid);
+    RUN_TEST(test_dyn_c2_propose_upgrade);
+    RUN_TEST(test_rgs_i1_import_roundtrip);
+    RUN_TEST(test_bip353_native_fallback);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);

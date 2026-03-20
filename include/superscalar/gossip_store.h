@@ -161,4 +161,9 @@ int gossip_store_enumerate_channels_since(gossip_store_t *gs,
  * Returns bytes written to out, or 0 on error. */
 size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t out_cap);
 
+/* Import an RGS (Rapid Gossip Sync) binary blob into the gossip store.
+ * Populates channels and channel_updates from the snapshot.
+ * Returns number of channels imported, or -1 on error. */
+int gossip_store_import_rgs(gossip_store_t *gs, const unsigned char *blob, size_t blob_len);
+
 #endif /* SUPERSCALAR_GOSSIP_STORE_H */

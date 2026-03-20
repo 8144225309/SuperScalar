@@ -159,4 +159,8 @@ int chan_send_announcement_sigs(peer_mgr_t *pmgr, int peer_idx,
                                  channel_t *ch,
                                  const unsigned char chain_hash[32]);
 
+/* Dynamic commitment upgrade (BOLT #2 PR #880) */
+int channel_type_upgrade_valid(uint32_t current_bits, uint32_t proposed_bits);
+int channel_type_propose_upgrade(channel_t *ch, uint32_t new_bits);
+
 #endif /* SUPERSCALAR_CHAN_OPEN_H */

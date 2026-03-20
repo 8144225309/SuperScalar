@@ -764,3 +764,24 @@ int chan_send_announcement_sigs(peer_mgr_t *pmgr, int peer_idx,
     ch->ann_sigs_sent = 1;
     return 0;
 }
+
+/* === Dynamic commitment upgrade (BOLT #2 PR #880) === */
+
+#include "superscalar/circuit_breaker.h"
+
+/* Channel type upgrade: propose new channel_type via commitment_signed TLV.
+   Returns 1 if upgrade is valid (intersection is subset of current). */
+int channel_type_upgrade_valid(uint32_t current_bits, uint32_t proposed_bits) {
+    /* The proposed type must be a superset of the current type */
+    return (proposed_bits & current_bits) == current_bits;
+}
+
+/* Initiate a channel type upgrade. Stores proposed bits; caller must
+   re-sign commitment with new type and send commitment_signed. */
+int channel_type_propose_upgrade(channel_t *ch, uint32_t new_bits) {
+    if (!ch) return 0;
+    if (!channel_type_upgrade_valid(ch->channel_type_bits, new_bits))
+        return 0;
+    ch->channel_type_bits = new_bits;
+    return 1;
+}
