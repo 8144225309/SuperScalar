@@ -1138,12 +1138,25 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             wire_send(fd, MSG_JIT_ACCEPT, accept);
             cJSON_Delete(accept);
 
-            /* Wait for basepoints exchange */
+            /* Wait for basepoints exchange — LSP needs time to fund and
+               confirm the JIT channel on-chain (up to ~10 min on signet).
+               Discard any stale messages from the demo phase. */
             wire_msg_t bp_msg;
-            if (!wire_recv(fd, &bp_msg) ||
-                bp_msg.msg_type != MSG_CHANNEL_BASEPOINTS) {
-                if (bp_msg.json) cJSON_Delete(bp_msg.json);
-                fprintf(stderr, "Client %u: expected CHANNEL_BASEPOINTS for JIT\n", my_index);
+            int got_bp = 0;
+            for (int bp_try = 0; bp_try < 720; bp_try++) {  /* up to 12 min */
+                if (!wire_recv_timeout(fd, &bp_msg, 1))
+                    continue;  /* 1s timeout, retry */
+                if (bp_msg.msg_type == MSG_CHANNEL_BASEPOINTS) {
+                    got_bp = 1;
+                    break;
+                }
+                /* Discard non-basepoint messages (stale demo HTLCs etc.) */
+                fprintf(stderr, "Client %u: JIT recv got 0x%02x, waiting for BASEPOINTS\n",
+                        my_index, bp_msg.msg_type);
+                cJSON_Delete(bp_msg.json);
+            }
+            if (!got_bp) {
+                fprintf(stderr, "Client %u: timeout waiting for JIT CHANNEL_BASEPOINTS\n", my_index);
                 break;
             }
 
