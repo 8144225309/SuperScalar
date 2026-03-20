@@ -5680,7 +5680,7 @@ int main(int argc, char *argv[]) {
            (it exits with code 2 after successful buy). */
         int lsps2_pass = 0;
         for (int t = 0; t < 30; t++) {
-            poll(NULL, 0, 1000);  /* sleep 1s */
+            sleep(1);
             /* Check if any client disconnected (exit code 2 = success) */
             for (int ci = 0; ci < n_clients; ci++) {
                 if (lsp.client_fds[ci] < 0) {
