@@ -1610,6 +1610,11 @@ extern int test_dyn_c1_upgrade_valid(void);
 extern int test_dyn_c2_propose_upgrade(void);
 extern int test_rgs_i1_import_roundtrip(void);
 extern int test_bip353_native_fallback(void);
+extern int test_dns_native_resolv(void);
+extern int test_rpc_exportrgs(void);
+extern int test_dyn_tlv1_roundtrip(void);
+extern int test_dyn_tlv2_empty(void);
+extern int test_dyn_tlv3_zero(void);
 
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
@@ -3269,6 +3274,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_dyn_c2_propose_upgrade);
     RUN_TEST(test_rgs_i1_import_roundtrip);
     RUN_TEST(test_bip353_native_fallback);
+    RUN_TEST(test_dns_native_resolv);
+    RUN_TEST(test_rpc_exportrgs);
+    RUN_TEST(test_dyn_tlv1_roundtrip);
+    RUN_TEST(test_dyn_tlv2_empty);
+    RUN_TEST(test_dyn_tlv3_zero);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);

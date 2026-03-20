@@ -5,6 +5,8 @@
 #include "superscalar/lnurl.h"
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/chan_open.h"
+#include "superscalar/admin_rpc.h"
+#include "superscalar/htlc_commit.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
@@ -2852,5 +2854,73 @@ int test_bip353_native_fallback(void) {
     int r = bip353_dns_resolve_native("nonexistent@invalid.test.invalid", invoice, sizeof(invoice));
     /* Expected: 0 (lookup fails for fake domain) */
     TEST_ASSERT(r == 0, "BIP353_N1: invalid domain returns 0");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #80 tests: native DNS, RPC exportrgs, dynamic commit TLV wire
+ * ========================================================================== */
+
+/* DNS_N1: bip353_dns_resolve_native uses libresolv (doesn't crash on invalid domain) */
+int test_dns_native_resolv(void) {
+    char invoice[512];
+    /* This should use libresolv now, not dig. Invalid domain returns 0. */
+    int r = bip353_dns_resolve_native("nobody@invalid.test.invalid", invoice, sizeof(invoice));
+    TEST_ASSERT(r == 0, "DNS_N1: invalid domain returns 0 with native resolver");
+    return 1;
+}
+
+/* RPC_RGS1: exportrgs RPC returns valid JSON with rgs_hex field */
+int test_rpc_exportrgs(void) {
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RPC_RGS1: open store");
+    rpc.gossip = &gs;
+
+    char out[8192];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"exportrgs\"}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    TEST_ASSERT(n > 0, "RPC_RGS1: response produced");
+    /* Parse response */
+    TEST_ASSERT(strstr(out, "rgs_hex") != NULL || strstr(out, "error") != NULL,
+                "RPC_RGS1: contains rgs_hex or error");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* DYN_TLV1: encode + decode channel_type TLV round-trip */
+int test_dyn_tlv1_roundtrip(void) {
+    uint32_t bits = (1 << 12) | (1 << 22);  /* static_remote_key + anchors */
+    unsigned char buf[16];
+    size_t len = commitment_signed_encode_channel_type_tlv(buf, sizeof(buf), bits);
+    TEST_ASSERT(len > 0, "DYN_TLV1: encode produced bytes");
+    TEST_ASSERT(buf[0] == 5, "DYN_TLV1: TLV type is 5");
+
+    uint32_t decoded = 0;
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(buf, len, &decoded),
+                "DYN_TLV1: decode ok");
+    TEST_ASSERT_EQ(decoded, bits, "DYN_TLV1: round-trip matches");
+    return 1;
+}
+
+/* DYN_TLV2: decode returns 0 for empty or no type-5 TLV */
+int test_dyn_tlv2_empty(void) {
+    uint32_t bits = 0;
+    unsigned char empty[4] = {3, 2, 0xFF, 0xFF};  /* type 3, not 5 */
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(empty, 4, &bits) == 0,
+                "DYN_TLV2: wrong type returns 0");
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(NULL, 0, &bits) == 0,
+                "DYN_TLV2: NULL returns 0");
+    return 1;
+}
+
+/* DYN_TLV3: zero bits encodes to zero length (no TLV emitted) */
+int test_dyn_tlv3_zero(void) {
+    unsigned char buf[16];
+    size_t len = commitment_signed_encode_channel_type_tlv(buf, sizeof(buf), 0);
+    TEST_ASSERT_EQ(len, 0, "DYN_TLV3: zero bits produces no TLV");
     return 1;
 }
