@@ -631,7 +631,16 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             n_active_htlcs++;
     }
 
-    tx_output_t *outputs = calloc(2 + n_active_htlcs, sizeof(tx_output_t));
+
+    /* Count active PTLCs (Phase 5: production wiring) */
+    size_t n_active_ptlcs = 0;
+    for (size_t i = 0; i < ch->n_ptlcs; i++) {
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE &&
+            ch->ptlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
+            n_active_ptlcs++;
+    }
+
+    tx_output_t *outputs = calloc(2 + n_active_htlcs + n_active_ptlcs, sizeof(tx_output_t));
     if (!outputs) return 0;
 
     int ret = 0;
@@ -728,6 +737,64 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
                                      &htlc_tweaked);
             outputs[out_idx].script_pubkey_len = 34;
             outputs[out_idx].amount_sats = ch->htlcs[i].amount_sats;
+            out_idx++;
+        }
+    }
+
+    /* 7b. Build PTLC outputs (mirrors HTLC pattern with payment_point as hash) */
+    if (n_active_ptlcs > 0) {
+        /* Derive HTLC keys (reused for PTLC tapscripts) */
+        secp256k1_pubkey ptlc_local_pub, ptlc_remote_pub;
+        channel_derive_pubkey(ch->ctx, &ptlc_local_pub,
+                              &ch->local_htlc_basepoint, &pcp);
+        channel_derive_pubkey(ch->ctx, &ptlc_remote_pub,
+                              &ch->remote_htlc_basepoint, &pcp);
+        secp256k1_xonly_pubkey ptlc_local_xonly, ptlc_remote_xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &ptlc_local_xonly, NULL,
+                                           &ptlc_local_pub);
+        secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &ptlc_remote_xonly, NULL,
+                                           &ptlc_remote_pub);
+
+        for (size_t i = 0; i < ch->n_ptlcs; i++) {
+            if (ch->ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
+            if (ch->ptlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
+
+            /* Serialize payment_point xonly as 32-byte "hash" for tapscript */
+            unsigned char pp_hash[32];
+            secp256k1_xonly_pubkey pp_xonly;
+            if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly, NULL,
+                                                     &ch->ptlcs[i].payment_point))
+                continue;
+            secp256k1_xonly_pubkey_serialize(ch->ctx, pp_hash, &pp_xonly);
+
+            tapscript_leaf_t success_leaf, timeout_leaf;
+            if (ch->ptlcs[i].direction == PTLC_OFFERED) {
+                tapscript_build_htlc_offered_success(&success_leaf,
+                    pp_hash, &ptlc_remote_xonly, ch->ctx);
+                tapscript_build_htlc_offered_timeout(&timeout_leaf,
+                    ch->ptlcs[i].cltv_expiry, ch->to_self_delay,
+                    &ptlc_local_xonly, ch->ctx);
+            } else {
+                tapscript_build_htlc_received_success(&success_leaf,
+                    pp_hash, ch->to_self_delay,
+                    &ptlc_local_xonly, ch->ctx);
+                tapscript_build_htlc_received_timeout(&timeout_leaf,
+                    ch->ptlcs[i].cltv_expiry, &ptlc_remote_xonly, ch->ctx);
+            }
+
+            tapscript_leaf_t ptlc_leaves[2] = { success_leaf, timeout_leaf };
+            unsigned char ptlc_merkle[32];
+            tapscript_merkle_root(ptlc_merkle, ptlc_leaves, 2);
+
+            secp256k1_xonly_pubkey ptlc_tweaked;
+            if (!tapscript_tweak_pubkey(ch->ctx, &ptlc_tweaked, NULL,
+                                         &revocation_xonly, ptlc_merkle))
+                goto commit_tx_done;
+
+            build_p2tr_script_pubkey(outputs[out_idx].script_pubkey,
+                                     &ptlc_tweaked);
+            outputs[out_idx].script_pubkey_len = 34;
+            outputs[out_idx].amount_sats = ch->ptlcs[i].amount_sats;
             out_idx++;
         }
     }
@@ -2246,5 +2313,265 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     tx_buf_free(&unsigned_tx);
     secure_zero(revocation_privkey, 32);
     secure_zero(pcp_secret, 32);
+    return 1;
+}
+
+/* PTLC resolution transactions (production wiring) */
+
+static int channel_rebuild_ptlc_leaves(const channel_t *ch, size_t ptlc_index,
+                                         uint64_t commitment_num,
+                                         tapscript_leaf_t *success_out,
+                                         tapscript_leaf_t *timeout_out,
+                                         secp256k1_xonly_pubkey *revocation_xonly_out)
+{
+    if (!ch || ptlc_index >= ch->n_ptlcs) return 0;
+    const ptlc_t *p = &ch->ptlcs[ptlc_index];
+
+    secp256k1_pubkey pcp;
+    if (!channel_get_per_commitment_point(ch, commitment_num, &pcp)) return 0;
+
+    secp256k1_pubkey rev_pub;
+    if (!channel_derive_revocation_pubkey(ch->ctx, &rev_pub,
+                                            &ch->remote_revocation_basepoint, &pcp))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, revocation_xonly_out, NULL, &rev_pub))
+        return 0;
+
+    secp256k1_pubkey local_htlc_pub, remote_htlc_pub;
+    channel_derive_pubkey(ch->ctx, &local_htlc_pub, &ch->local_htlc_basepoint, &pcp);
+    channel_derive_pubkey(ch->ctx, &remote_htlc_pub, &ch->remote_htlc_basepoint, &pcp);
+
+    secp256k1_xonly_pubkey local_xonly, remote_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_xonly, NULL, &local_htlc_pub);
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_xonly, NULL, &remote_htlc_pub);
+
+    /* Serialize payment_point xonly as 32-byte "hash" for tapscript */
+    unsigned char pp_hash[32];
+    secp256k1_xonly_pubkey pp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly, NULL,
+                                             &p->payment_point))
+        return 0;
+    secp256k1_xonly_pubkey_serialize(ch->ctx, pp_hash, &pp_xonly);
+
+    if (p->direction == PTLC_OFFERED) {
+        tapscript_build_htlc_offered_success(success_out, pp_hash, &remote_xonly, ch->ctx);
+        tapscript_build_htlc_offered_timeout(timeout_out, p->cltv_expiry,
+                                              ch->to_self_delay, &local_xonly, ch->ctx);
+    } else {
+        tapscript_build_htlc_received_success(success_out, pp_hash, ch->to_self_delay,
+                                               &local_xonly, ch->ctx);
+        tapscript_build_htlc_received_timeout(timeout_out, p->cltv_expiry,
+                                               &remote_xonly, ch->ctx);
+    }
+    return 1;
+}
+
+int channel_build_ptlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index)
+{
+    if (!ch || !signed_tx_out || !commitment_txid || ptlc_index >= ch->n_ptlcs)
+        return 0;
+    const ptlc_t *p = &ch->ptlcs[ptlc_index];
+    (void)ptlc_spk; (void)ptlc_spk_len;
+
+    tapscript_leaf_t success_leaf, timeout_leaf;
+    secp256k1_xonly_pubkey revocation_xonly;
+    if (!channel_rebuild_ptlc_leaves(ch, ptlc_index, ch->commitment_number,
+                                      &success_leaf, &timeout_leaf,
+                                      &revocation_xonly))
+        return 0;
+
+    uint32_t nsequence = (p->direction == PTLC_RECEIVED)
+                         ? ch->to_self_delay : 0xFFFFFFFDu;
+
+    /* Destination: P2TR(local_payment_basepoint) key-path-only */
+    secp256k1_xonly_pubkey dest_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
+    unsigned char dest_ser[32];
+    secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly);
+    unsigned char dest_tweak[32];
+    sha256_tagged("TapTweak", dest_ser, 32, dest_tweak);
+    secp256k1_pubkey dest_tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &dest_tweaked_full,
+                                            &dest_xonly, dest_tweak))
+        return 0;
+    secp256k1_xonly_pubkey dest_tweaked;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL, &dest_tweaked_full);
+
+    uint64_t ptlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
+    uint64_t out_amount = ptlc_amount > ptlc_fee ? ptlc_amount - ptlc_fee : 0;
+    if (out_amount < CHANNEL_DUST_LIMIT_SATS) return 0;
+
+    tx_output_t output;
+    build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
+    output.script_pubkey_len = 34;
+    output.amount_sats = out_amount;
+
+    tx_buf_t unsigned_tx;
+    unsigned char spend_txid[32];
+    if (!build_unsigned_tx_v(&unsigned_tx, spend_txid,
+                              commitment_txid, ptlc_vout,
+                              nsequence, &output, 1, 3))
+        return 0;
+
+    /* Derive signing key */
+    secp256k1_pubkey pcp;
+    if (!channel_get_per_commitment_point(ch, ch->commitment_number, &pcp)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char signing_key[32];
+    if (!channel_derive_privkey(ch->ctx, signing_key,
+                                 ch->local_htlc_basepoint_secret, &pcp)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* Compute sighash */
+    unsigned char sighash[32];
+    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                    0, ptlc_spk, ptlc_spk_len,
+                                    ptlc_amount, nsequence,
+                                    &success_leaf)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ch->ctx, &kp, signing_key)) {
+        secure_zero(signing_key, 32); tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char sig64[64];
+    if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &kp, NULL)) {
+        secure_zero(signing_key, 32); tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* Build control block */
+    int output_parity;
+    tapscript_leaf_t leaves[2] = { success_leaf, timeout_leaf };
+    unsigned char merkle[32];
+    tapscript_merkle_root(merkle, leaves, 2);
+
+    secp256k1_xonly_pubkey tweaked;
+    tapscript_tweak_pubkey(ch->ctx, &tweaked, &output_parity,
+                            &revocation_xonly, merkle);
+
+    unsigned char control_block[65];
+    size_t cb_len;
+    tapscript_build_control_block_2leaf(control_block, &cb_len,
+                                         output_parity, &revocation_xonly,
+                                         &timeout_leaf, ch->ctx);
+
+    finalize_script_path_tx(signed_tx_out,
+        unsigned_tx.data, unsigned_tx.len,
+        sig64, success_leaf.script, success_leaf.script_len,
+        control_block, cb_len);
+
+    secure_zero(signing_key, 32);
+    tx_buf_free(&unsigned_tx);
+    return 1;
+}
+
+int channel_build_ptlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index)
+{
+    if (!ch || !signed_tx_out || !commitment_txid || ptlc_index >= ch->n_ptlcs)
+        return 0;
+    const ptlc_t *p = &ch->ptlcs[ptlc_index];
+    (void)ptlc_spk; (void)ptlc_spk_len;
+
+    tapscript_leaf_t success_leaf, timeout_leaf;
+    secp256k1_xonly_pubkey revocation_xonly;
+    if (!channel_rebuild_ptlc_leaves(ch, ptlc_index, ch->commitment_number,
+                                      &success_leaf, &timeout_leaf,
+                                      &revocation_xonly))
+        return 0;
+
+    uint32_t nsequence = (p->direction == PTLC_OFFERED)
+                         ? ch->to_self_delay : 0xFFFFFFFDu;
+
+    secp256k1_xonly_pubkey dest_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
+    unsigned char dest_ser[32];
+    secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly);
+    unsigned char dest_tweak[32];
+    sha256_tagged("TapTweak", dest_ser, 32, dest_tweak);
+    secp256k1_pubkey dest_tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &dest_tweaked_full,
+                                            &dest_xonly, dest_tweak))
+        return 0;
+    secp256k1_xonly_pubkey dest_tweaked;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL, &dest_tweaked_full);
+
+    uint64_t ptlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
+    uint64_t out_amount = ptlc_amount > ptlc_fee ? ptlc_amount - ptlc_fee : 0;
+    if (out_amount < CHANNEL_DUST_LIMIT_SATS) return 0;
+
+    tx_output_t output;
+    build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
+    output.script_pubkey_len = 34;
+    output.amount_sats = out_amount;
+
+    tx_buf_t unsigned_tx;
+    unsigned char spend_txid[32];
+    if (!build_unsigned_tx_v(&unsigned_tx, spend_txid,
+                              commitment_txid, ptlc_vout,
+                              nsequence, &output, 1, 3))
+        return 0;
+
+    secp256k1_pubkey pcp;
+    if (!channel_get_per_commitment_point(ch, ch->commitment_number, &pcp)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char signing_key[32];
+    if (!channel_derive_privkey(ch->ctx, signing_key,
+                                 ch->local_htlc_basepoint_secret, &pcp)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    unsigned char sighash[32];
+    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                    0, ptlc_spk, ptlc_spk_len,
+                                    ptlc_amount, nsequence,
+                                    &timeout_leaf)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ch->ctx, &kp, signing_key)) {
+        secure_zero(signing_key, 32); tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char sig64[64];
+    if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &kp, NULL)) {
+        secure_zero(signing_key, 32); tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    int output_parity;
+    tapscript_leaf_t leaves[2] = { success_leaf, timeout_leaf };
+    unsigned char merkle[32];
+    tapscript_merkle_root(merkle, leaves, 2);
+
+    secp256k1_xonly_pubkey tweaked;
+    tapscript_tweak_pubkey(ch->ctx, &tweaked, &output_parity,
+                            &revocation_xonly, merkle);
+
+    unsigned char control_block[65];
+    size_t cb_len;
+    tapscript_build_control_block_2leaf(control_block, &cb_len,
+                                         output_parity, &revocation_xonly,
+                                         &success_leaf, ch->ctx);
+
+    finalize_script_path_tx(signed_tx_out,
+        unsigned_tx.data, unsigned_tx.len,
+        sig64, timeout_leaf.script, timeout_leaf.script_len,
+        control_block, cb_len);
+
+    secure_zero(signing_key, 32);
+    tx_buf_free(&unsigned_tx);
     return 1;
 }

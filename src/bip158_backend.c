@@ -1322,16 +1322,16 @@ int bip158_backend_connect_all(bip158_backend_t *backend)
 }
 
 /*
- * BIP 158 scan loop — Phase 3 (RPC) + Phase 4/5 (P2P filter + header sync).
+ * BIP 158 scan loop — Phase 5 complete (P2P primary, RPC fallback).
  *
  * P2P path (preferred when backend->peers[backend->current_peer].fd >= 0):
  *   1. bip158_sync_headers() fetches block hashes into the ring buffer and
  *      provides the chain tip height — no RPC needed for header data.
  *   2. getcfilters requests are batched in chunks of 1000 blocks.
- *   3. Filter hits use regtest_scan_block_txs() when rpc_ctx is available;
- *      otherwise the hit is counted tentatively (Phase 5 replaces this).
+ *   3. Filter hits download full block via P2P; on failure, fall back to
+ *      regtest_scan_block_txs() if rpc_ctx is available.
  *
- * RPC path (fallback, or when P2P is not connected):
+ * RPC path (legacy fallback, when P2P is not connected):
  *   Uses regtest_get_block_height, regtest_get_block_hash,
  *   regtest_get_block_filter, and regtest_scan_block_txs.
  *
@@ -1371,9 +1371,12 @@ int bip158_backend_scan(bip158_backend_t *backend)
             p2p_close(&backend->peers[backend->current_peer]);
     }
     if (tip < 0) {
-        if (!rt) return 0;  /* P2P tip not yet available; caller retries on next poll */
-        tip = regtest_get_block_height(rt);
-        if (tip < 0) return -1;
+        /* Phase 5: use headers_synced from ring buffer before RPC */
+        if (backend->headers_synced >= 0)
+            tip = backend->headers_synced;
+        else if (rt)
+            tip = regtest_get_block_height(rt);
+        if (tip < 0) return 0;  /* no tip yet; caller retries on next poll */
     }
 
     int start = (backend->tip_height >= 0) ? backend->tip_height + 1 : tip;
@@ -1483,10 +1486,18 @@ int bip158_backend_scan(bip158_backend_t *backend)
                 } else {
                     p2p_close(&backend->peers[backend->current_peer]);
                 }
-                if (!block_scanned)
-                    fprintf(stderr, "BIP158: block %d P2P download failed, skipping\n", bh);
+                /* Phase 5: fall back to RPC scan if P2P block download failed */
+                if (!block_scanned && rt) {
+                    char hx[65];
+                    for (int b = 0; b < 32; b++)
+                        sprintf(hx + b*2, "%02x", recv_hash[31 - b]);
+                    hx[64] = 0;
+                    regtest_scan_block_txs(rt, hx, scan_tx_callback, &sc);
+                    block_scanned = 1;
+                } else if (!block_scanned) {
+                    fprintf(stderr, "BIP158: block %d P2P download failed, no RPC fallback\n", bh);
+                }
                 if (sc.found) matched++;
-                else if (!block_scanned) matched++;  /* false positive — tentative */
                 backend->tip_height = bh;
                 if (backend->block_connected_cb)
                     backend->block_connected_cb((uint32_t)bh,
