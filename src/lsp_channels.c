@@ -15,6 +15,7 @@
 #include "superscalar/lsp_queue.h"
 #include "superscalar/readiness.h"
 #include "superscalar/notify.h"
+#include "superscalar/admin_rpc.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -3275,8 +3276,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         factory_recovery_scan(p_rec, chain_rec);
     }
 
-    /* Pre-allocate poll arrays (clients + bridge + listen + stdin) */
-    int max_pfds = (int)mgr->n_channels + 3;
+    /* Pre-allocate poll arrays (clients + bridge + listen + stdin + admin_rpc) */
+    int max_pfds = (int)mgr->n_channels + 4;
     struct pollfd *pfds = calloc(max_pfds, sizeof(struct pollfd));
     int *client_slots = calloc(mgr->n_channels, sizeof(int));
     if (!pfds || !client_slots) {
@@ -3287,7 +3288,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     while (!(*shutdown_flag)) {
         int nfds = 0;
-        int listen_slot = -1, stdin_slot = -1, bridge_slot = -1;
+        int listen_slot = -1, stdin_slot = -1, bridge_slot = -1, admin_rpc_slot = -1;
         for (size_t ci = 0; ci < mgr->n_channels; ci++)
             client_slots[ci] = -1;
 
@@ -3318,6 +3319,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             stdin_slot = nfds;
             pfds[nfds] = (struct pollfd){ .fd = STDIN_FILENO, .events = POLLIN };
             nfds++;
+        }
+
+        /* Include admin RPC listen socket */
+        {
+            admin_rpc_t *arpc = (admin_rpc_t *)mgr->admin_rpc;
+            if (arpc && arpc->listen_fd >= 0) {
+                admin_rpc_slot = nfds;
+                pfds[nfds] = (struct pollfd){ .fd = arpc->listen_fd, .events = POLLIN };
+                nfds++;
+            }
         }
 
         if (nfds == 0) {
@@ -3883,6 +3894,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 lsp_channels_handle_cli_line(mgr, lsp, line, shutdown_flag);
             } /* else fgets succeeded */
         }
+
+        /* Handle admin RPC request */
+        if (admin_rpc_slot >= 0 && (pfds[admin_rpc_slot].revents & POLLIN))
+            admin_rpc_service((admin_rpc_t *)mgr->admin_rpc);
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
