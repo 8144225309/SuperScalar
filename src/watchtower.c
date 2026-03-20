@@ -402,6 +402,7 @@ int watchtower_check(watchtower_t *wt) {
                                                            txid_hexes[j]);
     }
 
+    fprintf(stderr, "DEBUG watchtower_check: %zu entries to scan\n", wt->n_entries);
     for (size_t i = 0; i < wt->n_entries; ) {
         watchtower_entry_t *e = &wt->entries[i];
 
@@ -410,6 +411,10 @@ int watchtower_check(watchtower_t *wt) {
         /* Check if old commitment is on chain or in mempool */
         int conf = batch_confs[i];
         int in_mempool = wt->chain->is_in_mempool(wt->chain, txid_hex);
+
+        fprintf(stderr, "DEBUG wt[%zu]: type=%d ch=%u cn=%llu txid=%s conf=%d mempool=%d reg_h=%d\n",
+                i, e->type, e->channel_id, (unsigned long long)e->commit_num,
+                txid_hex, conf, in_mempool, e->registered_height);
 
         if (conf < 0 && !in_mempool) {
             i++;  /* not found, keep watching */

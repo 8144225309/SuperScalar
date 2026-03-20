@@ -4737,7 +4737,12 @@ int main(int argc, char *argv[]) {
 
         /* Watchtower check: should detect breach and broadcast penalty */
         printf("Running watchtower check...\n");
+        fflush(stdout);
         watchtower_t *wt = mgr->watchtower;
+        if (wt) {
+            fprintf(stderr, "DEBUG: watchtower has %zu entries, chain=%p\n",
+                    wt->n_entries, (void *)wt->chain);
+        }
         if (!wt) {
             fprintf(stderr, "BREACH TEST FAILED: no watchtower configured\n");
             report_add_string(&rpt, "result", "breach_test_no_watchtower");
