@@ -5634,7 +5634,9 @@ int main(int argc, char *argv[]) {
     /* === JIT Lifecycle Test === */
     if (test_jit && channels_active) {
         printf("\n=== JIT LIFECYCLE TEST ===\n");
+        printf("  Waiting 10s for clients to finish HTLC processing...\n");
         fflush(stdout);
+        sleep(10);  /* Let clients drain recv_or_handle_ptlc and return to daemon loop */
         int jit_pass = 1;
         uint64_t jit_amount = mgr->jit_funding_sats;
         if (jit_amount == 0) jit_amount = 50000;  /* default 50k sats */
