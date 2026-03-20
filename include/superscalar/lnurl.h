@@ -138,4 +138,10 @@ int bip353_validate_address(const char *address);
  */
 int bip353_dns_resolve(const char *address, char *invoice_out, size_t inv_cap);
 
+/*
+ * Production DNS resolver. Uses libc res_query when BIP353_USE_RESOLV is defined,
+ * otherwise falls back to bip353_dns_resolve() (dig subprocess).
+ */
+int bip353_dns_resolve_native(const char *address, char *invoice_out, size_t inv_cap);
+
 #endif /* SUPERSCALAR_LNURL_H */

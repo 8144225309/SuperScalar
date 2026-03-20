@@ -2575,3 +2575,150 @@ int channel_build_ptlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
     tx_buf_free(&unsigned_tx);
     return 1;
 }
+
+/* PTLC penalty tx builder (mirrors HTLC penalty pattern) */
+
+int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    uint64_t old_commitment_num, size_t ptlc_index,
+    const unsigned char *anchor_spk, size_t anchor_spk_len)
+{
+    if (!ch || !penalty_tx_out || !commitment_txid || ptlc_index >= ch->n_ptlcs)
+        return 0;
+
+    /* 1. Retrieve per_commitment_secret from received revocations */
+    unsigned char pcp_secret[32];
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+        return 0;
+
+    secp256k1_pubkey pcp;
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &pcp, pcp_secret))
+        return 0;
+
+    /* 2. Derive revocation privkey */
+    unsigned char revocation_privkey[32];
+    if (!channel_derive_revocation_privkey(ch->ctx, revocation_privkey,
+                                             ch->local_revocation_basepoint_secret,
+                                             pcp_secret,
+                                             &ch->local_revocation_basepoint, &pcp))
+        return 0;
+
+    /* 3. Rebuild PTLC taptree from remote's perspective */
+    secp256k1_pubkey remote_htlc_pub, local_htlc_pub;
+    channel_derive_pubkey(ch->ctx, &remote_htlc_pub, &ch->remote_htlc_basepoint, &pcp);
+    channel_derive_pubkey(ch->ctx, &local_htlc_pub, &ch->local_htlc_basepoint, &pcp);
+
+    secp256k1_xonly_pubkey remote_htlc_xonly, local_htlc_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL, &remote_htlc_pub);
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL, &local_htlc_pub);
+
+    const ptlc_t *p = &ch->ptlcs[ptlc_index];
+    unsigned char pp_hash[32];
+    secp256k1_xonly_pubkey pp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly, NULL, &p->payment_point))
+        return 0;
+    secp256k1_xonly_pubkey_serialize(ch->ctx, pp_hash, &pp_xonly);
+
+    tapscript_leaf_t success_leaf, timeout_leaf;
+    if (p->direction == PTLC_OFFERED) {
+        tapscript_build_htlc_received_success(&success_leaf, pp_hash,
+            ch->to_self_delay, &remote_htlc_xonly, ch->ctx);
+        tapscript_build_htlc_received_timeout(&timeout_leaf,
+            p->cltv_expiry, &local_htlc_xonly, ch->ctx);
+    } else {
+        tapscript_build_htlc_offered_success(&success_leaf, pp_hash,
+            &local_htlc_xonly, ch->ctx);
+        tapscript_build_htlc_offered_timeout(&timeout_leaf,
+            p->cltv_expiry, ch->to_self_delay, &remote_htlc_xonly, ch->ctx);
+    }
+
+    tapscript_leaf_t ptlc_leaves[2] = { success_leaf, timeout_leaf };
+    unsigned char ptlc_merkle[32];
+    tapscript_merkle_root(ptlc_merkle, ptlc_leaves, 2);
+
+    /* 4. Derive revocation pubkey and compute tap tweak */
+    secp256k1_pubkey revocation_pubkey;
+    secp256k1_ec_pubkey_create(ch->ctx, &revocation_pubkey, revocation_privkey);
+
+    secp256k1_xonly_pubkey revocation_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL, &revocation_pubkey);
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly);
+
+    unsigned char tweak_data[64];
+    memcpy(tweak_data, internal_ser, 32);
+    memcpy(tweak_data + 32, ptlc_merkle, 32);
+    unsigned char taptweak[32];
+    sha256_tagged("TapTweak", tweak_data, 64, taptweak);
+
+    secp256k1_keypair tweaked_kp;
+    if (!secp256k1_keypair_create(ch->ctx, &tweaked_kp, revocation_privkey))
+        return 0;
+    if (!secp256k1_keypair_xonly_tweak_add(ch->ctx, &tweaked_kp, taptweak))
+        return 0;
+
+    /* 5. Build output */
+    secp256k1_xonly_pubkey local_pay_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
+                                       &ch->local_payment_basepoint);
+    unsigned char out_ser[32];
+    secp256k1_xonly_pubkey_serialize(ch->ctx, out_ser, &local_pay_xonly);
+    unsigned char out_tweak[32];
+    sha256_tagged("TapTweak", out_ser, 32, out_tweak);
+    secp256k1_pubkey out_tweaked_full;
+    secp256k1_xonly_pubkey_tweak_add(ch->ctx, &out_tweaked_full, &local_pay_xonly, out_tweak);
+    secp256k1_xonly_pubkey out_tweaked;
+    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL, &out_tweaked_full);
+
+    int has_anchor = (anchor_spk && anchor_spk_len == P2A_SPK_LEN);
+    uint64_t vsize = has_anchor ? 165 : 152;
+    uint64_t fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
+    uint64_t deduction = fee + (has_anchor ? ANCHOR_OUTPUT_AMOUNT : 0);
+    uint64_t penalty_amount = ptlc_amount > deduction ? ptlc_amount - deduction : 0;
+    if (penalty_amount < CHANNEL_DUST_LIMIT_SATS) return 0;
+
+    tx_output_t outputs[2];
+    size_t n_outputs = 1;
+    build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
+    outputs[0].script_pubkey_len = 34;
+    outputs[0].amount_sats = penalty_amount;
+    if (has_anchor) {
+        memcpy(outputs[1].script_pubkey, anchor_spk, P2A_SPK_LEN);
+        outputs[1].script_pubkey_len = P2A_SPK_LEN;
+        outputs[1].amount_sats = ANCHOR_OUTPUT_AMOUNT;
+        n_outputs = 2;
+    }
+
+    /* 6. Build unsigned tx (V2, same as HTLC penalty) */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char penalty_txid[32];
+    if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
+                            commitment_txid, ptlc_vout,
+                            0xFFFFFFFD, outputs, n_outputs)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                  0, ptlc_spk, ptlc_spk_len,
+                                  ptlc_amount, 0xFFFFFFFD)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    unsigned char sig64[64];
+    if (!secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &tweaked_kp, NULL)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    if (!finalize_signed_tx(penalty_tx_out, unsigned_tx.data, unsigned_tx.len, sig64)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    tx_buf_free(&unsigned_tx);
+    secure_zero(revocation_privkey, 32);
+    secure_zero(pcp_secret, 32);
+    return 1;
+}

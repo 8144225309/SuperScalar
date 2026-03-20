@@ -650,3 +650,48 @@ size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t ou
 
     return rgs_build(&snap, nodes, channels, out, out_cap);
 }
+
+/* === RGS client-side import (populate gossip_store from snapshot) === */
+
+#include "superscalar/rgs.h"
+
+int gossip_store_import_rgs(gossip_store_t *gs, const unsigned char *blob, size_t blob_len) {
+    if (!gs || !blob || blob_len < 17) return -1;
+
+    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
+    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    rgs_snapshot_t snap;
+    snap.node_id_count = 0;
+    snap.channel_count = 0;
+
+    if (!rgs_parse(blob, blob_len, &snap, nodes, RGS_MAX_NODE_IDS,
+                    channels, RGS_MAX_CHANNELS))
+        return -1;
+
+    int imported = 0;
+    for (uint32_t i = 0; i < snap.channel_count; i++) {
+        const rgs_channel_t *ch = &channels[i];
+        if (ch->node_id_1_idx >= snap.node_id_count ||
+            ch->node_id_2_idx >= snap.node_id_count)
+            continue;
+
+        gossip_store_upsert_channel(gs, ch->short_channel_id,
+                                  nodes[ch->node_id_1_idx].pubkey,
+                                  nodes[ch->node_id_2_idx].pubkey,
+                                  ch->funding_satoshis,
+                                  snap.last_sync_timestamp);
+
+        /* Add channel updates */
+        for (int u = 0; u < ch->update_count; u++) {
+            const rgs_channel_update_t *upd = &ch->updates[u];
+            gossip_store_upsert_channel_update(gs, ch->short_channel_id,
+                                              upd->direction,
+                                              upd->fee_base_msat,
+                                              upd->fee_proportional_millionths,
+                                              upd->cltv_expiry_delta,
+                                              upd->timestamp);
+        }
+        imported++;
+    }
+    return imported;
+}

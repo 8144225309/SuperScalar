@@ -4,6 +4,7 @@
 #include "superscalar/rgs.h"
 #include "superscalar/lnurl.h"
 #include "superscalar/ptlc_commit.h"
+#include "superscalar/chan_open.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
@@ -2681,5 +2682,175 @@ int test_ptlc_commitment_output(void) {
     tx_buf_free(&tx2);
     channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #79 tests: PTLC penalty, round-trip, dynamic commits, RGS import
+ * ========================================================================== */
+
+/* PTLC_RT1: ptlc_commit_add_and_sign adds PTLC to channel */
+int test_ptlc_rt1_add_and_sign(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx, "PTLC_RT1: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x55, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    unsigned char cid[32];
+    memset(cid, 0xAA, 32);
+
+    uint64_t ptlc_id = 0;
+    int r = ptlc_commit_add_and_sign(NULL, -1, &ch, ctx, cid,
+                                       50000, &pp, 800000, &ptlc_id);
+    TEST_ASSERT(r == 1, "PTLC_RT1: add succeeded");
+    TEST_ASSERT_EQ(ch.n_ptlcs, 1, "PTLC_RT1: 1 PTLC in channel");
+    TEST_ASSERT_EQ(ch.ptlcs[0].direction, PTLC_OFFERED, "PTLC_RT1: offered");
+    TEST_ASSERT_EQ((long long)ch.ptlcs[0].amount_sats, 50000LL, "PTLC_RT1: amount");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* PTLC_RT2: ptlc_commit_settle_and_sign transitions to SETTLED */
+int test_ptlc_rt2_settle(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x66, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t id;
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 30000, &pp, 700000, &id);
+
+    unsigned char adapted[64];
+    memset(adapted, 0xBB, 64);
+
+    int r = ptlc_commit_settle_and_sign(NULL, -1, &ch, ctx, id, adapted);
+    TEST_ASSERT(r == 1, "PTLC_RT2: settle succeeded");
+    TEST_ASSERT_EQ(ch.ptlcs[0].state, PTLC_STATE_SETTLED, "PTLC_RT2: state SETTLED");
+    TEST_ASSERT(ch.ptlcs[0].has_adapted_sig == 1, "PTLC_RT2: has_adapted_sig");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* PTLC_RT3: ptlc_commit_fail_and_sign transitions to FAILED */
+int test_ptlc_rt3_fail(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x77, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t id;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 25000, &pp, 750000, &id);
+
+    int r = ptlc_commit_fail_and_sign(NULL, -1, &ch, ctx, id);
+    TEST_ASSERT(r == 1, "PTLC_RT3: fail succeeded");
+    TEST_ASSERT_EQ(ch.ptlcs[0].state, PTLC_STATE_FAILED, "PTLC_RT3: state FAILED");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* DYN_C1: channel_type_upgrade_valid accepts superset, rejects subset */
+int test_dyn_c1_upgrade_valid(void) {
+    uint32_t base = (1 << 12);  /* static_remote_key */
+    uint32_t upgrade = (1 << 12) | (1 << 22);  /* + anchors */
+
+    TEST_ASSERT(channel_type_upgrade_valid(base, upgrade) == 1,
+                "DYN_C1: superset valid");
+    TEST_ASSERT(channel_type_upgrade_valid(upgrade, base) == 0,
+                "DYN_C1: subset invalid");
+    TEST_ASSERT(channel_type_upgrade_valid(base, base) == 1,
+                "DYN_C1: same is valid");
+    return 1;
+}
+
+/* DYN_C2: channel_type_propose_upgrade stores new bits */
+int test_dyn_c2_propose_upgrade(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.channel_type_bits = (1 << 12);
+
+    uint32_t new_bits = (1 << 12) | (1 << 22);
+    TEST_ASSERT(channel_type_propose_upgrade(&ch, new_bits) == 1,
+                "DYN_C2: upgrade accepted");
+    TEST_ASSERT_EQ(ch.channel_type_bits, new_bits, "DYN_C2: bits updated");
+
+    /* Try invalid downgrade */
+    TEST_ASSERT(channel_type_propose_upgrade(&ch, (1 << 12)) == 0,
+                "DYN_C2: downgrade rejected");
+    return 1;
+}
+
+/* RGS_I1: RGS export + import round-trip */
+int test_rgs_i1_import_roundtrip(void) {
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RGS_I1: open store");
+
+    /* Add a channel to the store */
+    unsigned char n1[33], n2[33];
+    memset(n1, 0x02, 33); n1[0] = 0x02;
+    memset(n2, 0x03, 33); n2[0] = 0x03;
+    gossip_store_upsert_channel(&gs, 0x0001000100010000ULL, n1, n2, 500000, 1700000000);
+    gossip_store_upsert_channel_update(&gs, 0x0001000100010000ULL, 0, 1000, 100, 40, 1700000000);
+
+    /* Export to RGS blob */
+    unsigned char blob[8192];
+    size_t blen = gossip_store_export_rgs(&gs, blob, sizeof(blob));
+    TEST_ASSERT(blen > 17, "RGS_I1: export produced data");
+
+    /* Import into fresh store */
+    gossip_store_t gs2;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs2), "RGS_I1: open store 2");
+
+    int imported = gossip_store_import_rgs(&gs2, blob, blen);
+    TEST_ASSERT(imported >= 1, "RGS_I1: imported at least 1 channel");
+
+    /* Verify channel exists in new store */
+    unsigned char n1_out[33], n2_out[33];
+    uint64_t cap;
+    uint32_t ts;
+    int found = gossip_store_get_channel(&gs2, 0x0001000100010000ULL,
+                                          n1_out, n2_out, &cap, &ts);
+    TEST_ASSERT(found, "RGS_I1: channel found in imported store");
+    TEST_ASSERT_EQ((long long)cap, 500000LL, "RGS_I1: capacity matches");
+
+    gossip_store_close(&gs);
+    gossip_store_close(&gs2);
+    return 1;
+}
+
+/* BIP353_N1: bip353_dns_resolve_native falls back to dig */
+int test_bip353_native_fallback(void) {
+    /* Just verify it doesn't crash; actual DNS resolution depends on network */
+    char invoice[512];
+    int r = bip353_dns_resolve_native("nonexistent@invalid.test.invalid", invoice, sizeof(invoice));
+    /* Expected: 0 (lookup fails for fake domain) */
+    TEST_ASSERT(r == 0, "BIP353_N1: invalid domain returns 0");
     return 1;
 }
