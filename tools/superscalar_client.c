@@ -1452,6 +1452,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 fprintf(stderr, "DEBUG Client %u: Round 2 entry — n_nodes=%zu, my_index=%u\n",
                         my_index, factory->n_nodes, my_index);
 
+                /* Re-init sessions: Round 2 provides ALL nonces from all
+                   participants.  Round 1 already set LSP + client nonces,
+                   so nonces_collected > n_signers without a reset. */
+                factory_sessions_init(factory);
+
                 /* Set ALL nonces (includes other clients' nonces) */
                 for (size_t ei = 0; ei < er_n_entries; ei++) {
                     secp256k1_musig_pubnonce pn;
