@@ -5675,29 +5675,16 @@ int main(int argc, char *argv[]) {
     /* === LSPS2 Wire Test === */
     if (test_lsps2 && channels_active) {
         printf("\n=== LSPS2 WIRE TEST ===\n");
-        printf("  LSPS2 handlers active (lsps0_bolt8_cb registered)\n");
-        printf("  Waiting for client --test-lsps2-buy flow (120s timeout)...\n");
+        printf("  LSPS2 handlers active — entering daemon loop for LSPS2 flow\n");
+        printf("  Client with --test-lsps2-buy will drive the test\n");
         fflush(stdout);
 
-        /* The LSPS2 test is client-driven: the client sends lsps2.get_info
-           and lsps2.buy requests. The LSP's daemon loop dispatches them to
-           lsps_handle_request(). We wait for the test client to disconnect
-           (it exits with code 2 after successful buy). */
-        int lsps2_pass = 0;
-        for (int t = 0; t < 120; t++) {
-            sleep(1);
-            /* Check if any client disconnected (exit code 2 = success) */
-            for (int ci = 0; ci < n_clients; ci++) {
-                if (lsp.client_fds[ci] < 0) {
-                    printf("  Client %d completed LSPS2 flow (disconnected)\n", ci);
-                    lsps2_pass = 1;
-                    break;
-                }
-            }
-            if (lsps2_pass) break;
-        }
-
-        printf("LSPS2 WIRE TEST: %s\n", lsps2_pass ? "PASS" : "FAIL (no client completed within 30s)");
+        /* The LSPS2 test is client-driven. The LSP must be in its daemon loop
+           to process MSG_LSPS_REQUEST messages. Force daemon_mode so the daemon
+           loop runs after this test block, which handles LSPS requests naturally.
+           The test result is checked from the client log externally. */
+        daemon_mode = 1;
+        printf("LSPS2 WIRE TEST: DEFERRED TO DAEMON LOOP\n");
         fflush(stdout);
     }
 
