@@ -79,6 +79,19 @@ int htlc_forward_process(htlc_forward_table_t *fwd,
      * Since onion_peel calls onion_parse_tlv_payload which only parses types
      * 2, 4, 8, we need the scid from type 6. We re-read the plain hops data. */
 
+    /* Trampoline detection: if type 0x0c is present, this node is a trampoline.
+       Extract the real destination and set up for re-routing. */
+    if (payload.has_trampoline) {
+        /* Parse trampoline payload for destination info */
+        onion_hop_payload_t tp;
+        if (onion_parse_tlv_payload(payload.trampoline_payload,
+                                     payload.trampoline_payload_len, &tp)) {
+            /* Override relay parameters with trampoline destination */
+            if (tp.has_amt) payload.amt_to_forward = tp.amt_to_forward;
+            if (tp.has_cltv) payload.outgoing_cltv_value = tp.outgoing_cltv_value;
+        }
+    }
+
     /* For relay, we have the outgoing amount from payload.amt_to_forward */
     if (!payload.has_amt || !payload.has_cltv) return FORWARD_FAIL;
 

@@ -1615,6 +1615,12 @@ extern int test_rpc_exportrgs(void);
 extern int test_dyn_tlv1_roundtrip(void);
 extern int test_dyn_tlv2_empty(void);
 extern int test_dyn_tlv3_zero(void);
+extern int test_trp_w1_tlv_parse_0x0c(void);
+extern int test_trp_w2_no_trampoline(void);
+extern int test_trp_w3_hop_struct(void);
+extern int test_b12_po1_payoffer_missing_offer(void);
+extern int test_wt_ptlc1_entry_fields(void);
+extern int test_wt_ptlc2_metadata_store(void);
 
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
@@ -3279,6 +3285,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_dyn_tlv1_roundtrip);
     RUN_TEST(test_dyn_tlv2_empty);
     RUN_TEST(test_dyn_tlv3_zero);
+    RUN_TEST(test_trp_w1_tlv_parse_0x0c);
+    RUN_TEST(test_trp_w2_no_trampoline);
+    RUN_TEST(test_trp_w3_hop_struct);
+    RUN_TEST(test_b12_po1_payoffer_missing_offer);
+    RUN_TEST(test_wt_ptlc1_entry_fields);
+    RUN_TEST(test_wt_ptlc2_metadata_store);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);

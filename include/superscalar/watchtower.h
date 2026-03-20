@@ -46,6 +46,10 @@ typedef struct {
     size_t n_htlc_outputs;
     size_t htlc_outputs_cap;
 
+    /* PTLC outputs on the breached commitment (for penalty sweep) */
+    watchtower_htlc_t *ptlc_outputs;   /* reuses watchtower_htlc_t layout */
+    size_t n_ptlc_outputs;
+
     /* WATCH_FACTORY_NODE fields */
     unsigned char *response_tx;   /* heap-allocated latest state tx to broadcast */
     size_t response_tx_len;

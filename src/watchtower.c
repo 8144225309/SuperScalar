@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/htlc_fee_bump.h"
 #include "superscalar/wallet_source.h"
 #include "superscalar/types.h"
@@ -628,6 +629,57 @@ int watchtower_check(watchtower_t *wt) {
             ch->n_htlcs = saved_n;
             if (saved_n > 0)
                 ch->htlcs[0] = saved_h0;
+        }
+
+        /* Sweep PTLC outputs via penalty txs (mirrors HTLC sweep above) */
+        for (size_t p = 0; p < e->n_ptlc_outputs; p++) {
+            /* Temporarily set ch->ptlcs[0] to stored PTLC metadata */
+            size_t saved_np = ch->n_ptlcs;
+            ptlc_t saved_p0 = {0};
+            if (saved_np > 0 && ch->ptlcs)
+                saved_p0 = ch->ptlcs[0];
+            if (!ch->ptlcs) {
+                ch->ptlcs = (ptlc_t *)calloc(1, sizeof(ptlc_t));
+                ch->ptlcs_cap = 1;
+            }
+            ch->n_ptlcs = 1;
+            memset(&ch->ptlcs[0], 0, sizeof(ptlc_t));
+            ch->ptlcs[0].direction = (ptlc_direction_t)e->ptlc_outputs[p].direction;
+            ch->ptlcs[0].cltv_expiry = e->ptlc_outputs[p].cltv_expiry;
+            ch->ptlcs[0].state = PTLC_STATE_ACTIVE;
+            /* Use payment_hash as serialized payment_point for tapscript */
+            secp256k1_ec_pubkey_parse(ch->ctx, &ch->ptlcs[0].payment_point,
+                                       e->ptlc_outputs[p].payment_hash, 33);
+
+            tx_buf_t ptlc_penalty;
+            tx_buf_init(&ptlc_penalty, 512);
+            if (channel_build_ptlc_penalty_tx(ch, &ptlc_penalty,
+                    e->txid, e->ptlc_outputs[p].htlc_vout,
+                    e->ptlc_outputs[p].htlc_amount,
+                    e->ptlc_outputs[p].htlc_spk, 34,
+                    e->commit_num, 0,
+                    use_anchor ? wt->anchor_spk : NULL,
+                    use_anchor ? wt->anchor_spk_len : 0)) {
+                char *ptlc_hex = (char *)malloc(ptlc_penalty.len * 2 + 1);
+                if (ptlc_hex) {
+                    hex_encode(ptlc_penalty.data, ptlc_penalty.len, ptlc_hex);
+                    char ptlc_txid[65];
+                    if (wt->chain->send_raw_tx(wt->chain, ptlc_hex, ptlc_txid)) {
+                        printf("  PTLC penalty tx (vout %u) broadcast: %s\n",
+                               e->ptlc_outputs[p].htlc_vout, ptlc_txid);
+                        penalties_broadcast++;
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, ptlc_txid,
+                                                  "ptlc_penalty", ptlc_hex, "ok");
+                    }
+                    free(ptlc_hex);
+                }
+            }
+            tx_buf_free(&ptlc_penalty);
+
+            ch->n_ptlcs = saved_np;
+            if (saved_np > 0 && ch->ptlcs)
+                ch->ptlcs[0] = saved_p0;
         }
 
         /* Remove this entry (swap with last); sync batch arrays for next iter */
