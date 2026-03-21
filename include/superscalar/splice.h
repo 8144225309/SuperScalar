@@ -177,4 +177,112 @@ int channel_apply_splice_update(channel_t *ch,
                                   uint32_t new_vout,
                                   uint64_t new_funding_amount);
 
+
+/* ---- Interactive Transaction Construction (BOLT #2 §4.9.2) ---- */
+/* Reference: CLN dual_open_control.c, LDK channel.rs, Eclair ChannelTypes.scala */
+
+#define MSG_TX_ADD_INPUT      66  /* 0x0042 */
+#define MSG_TX_ADD_OUTPUT     67  /* 0x0043 */
+#define MSG_TX_REMOVE_INPUT   68  /* 0x0044 */
+#define MSG_TX_REMOVE_OUTPUT  69  /* 0x0045 */
+#define MSG_TX_COMPLETE       70  /* 0x0046 */
+#define MSG_TX_SIGNATURES     71  /* 0x0047 */
+
+#define SPLICE_TX_MAX_SCRIPT  35
+
+/*
+ * Build tx_add_input (type 66).
+ * Simplified: uses prevtxid(32) instead of the full serialized prev tx.
+ * Wire: type(2) + channel_id(32) + serial_id(8) + prevtxid(32) +
+ *        prevtx_vout(4) + sequence(4) = 82 bytes.
+ * Returns bytes written, or 0 on error.
+ */
+size_t splice_build_tx_add_input(const unsigned char channel_id[32],
+                                  uint64_t serial_id,
+                                  const unsigned char prevtxid[32],
+                                  uint32_t prevtx_vout, uint32_t sequence,
+                                  unsigned char *buf, size_t buf_cap);
+
+/* Parse tx_add_input (type 66). Returns 1 on success. */
+int splice_parse_tx_add_input(const unsigned char *msg, size_t msg_len,
+                               unsigned char channel_id_out[32],
+                               uint64_t *serial_id_out,
+                               unsigned char prevtxid_out[32],
+                               uint32_t *prevtx_vout_out,
+                               uint32_t *sequence_out);
+
+/*
+ * Build tx_add_output (type 67).
+ * Wire: type(2) + channel_id(32) + serial_id(8) + sats(8) +
+ *        script_len(2) + script(var).
+ * Returns bytes written, or 0 on error.
+ */
+size_t splice_build_tx_add_output(const unsigned char channel_id[32],
+                                   uint64_t serial_id, uint64_t sats,
+                                   const unsigned char *script,
+                                   uint16_t script_len,
+                                   unsigned char *buf, size_t buf_cap);
+
+/* Parse tx_add_output (type 67). Returns 1 on success. */
+int splice_parse_tx_add_output(const unsigned char *msg, size_t msg_len,
+                                unsigned char channel_id_out[32],
+                                uint64_t *serial_id_out,
+                                uint64_t *sats_out,
+                                unsigned char *script_out,
+                                uint16_t *script_len_out);
+
+/*
+ * Build tx_remove_input (type 68).
+ * Wire: type(2) + channel_id(32) + serial_id(8) = 42 bytes.
+ */
+size_t splice_build_tx_remove_input(const unsigned char channel_id[32],
+                                     uint64_t serial_id,
+                                     unsigned char *buf, size_t buf_cap);
+
+/*
+ * Build tx_remove_output (type 69).
+ * Wire: type(2) + channel_id(32) + serial_id(8) = 42 bytes.
+ */
+size_t splice_build_tx_remove_output(const unsigned char channel_id[32],
+                                      uint64_t serial_id,
+                                      unsigned char *buf, size_t buf_cap);
+
+/*
+ * Parse tx_remove_input or tx_remove_output (types 68/69).
+ * Returns 1 on success.
+ */
+int splice_parse_tx_remove(const unsigned char *msg, size_t msg_len,
+                            uint16_t expected_type,
+                            unsigned char channel_id_out[32],
+                            uint64_t *serial_id_out);
+
+/*
+ * Build tx_complete (type 70).
+ * Wire: type(2) + channel_id(32) = 34 bytes.
+ */
+size_t splice_build_tx_complete(const unsigned char channel_id[32],
+                                 unsigned char *buf, size_t buf_cap);
+
+/* Parse tx_complete (type 70). Returns 1 on success. */
+int splice_parse_tx_complete(const unsigned char *msg, size_t msg_len,
+                              unsigned char channel_id_out[32]);
+
+/*
+ * Build tx_signatures (type 71).
+ * Wire: type(2) + channel_id(32) + txid(32) + wit_len(2) + witness(var).
+ * Returns bytes written, or 0 on error.
+ */
+size_t splice_build_tx_signatures(const unsigned char channel_id[32],
+                                   const unsigned char txid[32],
+                                   const unsigned char *witness,
+                                   uint16_t witness_len,
+                                   unsigned char *buf, size_t buf_cap);
+
+/* Parse tx_signatures (type 71). Returns 1 on success. */
+int splice_parse_tx_signatures(const unsigned char *msg, size_t msg_len,
+                                unsigned char channel_id_out[32],
+                                unsigned char txid_out[32],
+                                unsigned char *witness_out,
+                                uint16_t *witness_len_out);
+
 #endif /* SUPERSCALAR_SPLICE_H */
