@@ -167,6 +167,7 @@ add_library(superscalar
     src/admin_rpc.c
     src/factory_recovery.c
     src/liquidity_ad.c
+    src/scb.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -245,6 +246,7 @@ add_executable(test_superscalar
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_chain_safety.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
