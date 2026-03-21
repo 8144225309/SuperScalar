@@ -235,12 +235,10 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     tx_buf_t old_tx;
     tx_buf_init(&old_tx, 512);
     unsigned char old_txid[32];
-    /* Build the channel's OWN old commitment TX — this is what the cheater
-       would broadcast.  The watchtower is called with the LSP's channel, so
-       channel_build_commitment_tx() produces the LSP's commitment.  Using
-       _for_remote() here was wrong: it built the CLIENT's commitment TXID,
-       which never matches the LSP's broadcast. */
-    int ok = channel_build_commitment_tx(ch, &old_tx, old_txid);
+    /* Build the REMOTE's old commitment TX — this is what the remote party
+       (the potential cheater) would broadcast.  The watchtower has the
+       revocation secrets needed to punish via the penalty TX. */
+    int ok = channel_build_commitment_tx_for_remote(ch, &old_tx, old_txid);
 
     /* Restore state */
     ch->commitment_number = saved_num;
