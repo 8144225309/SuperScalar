@@ -14,6 +14,7 @@
 
 #include "superscalar/admin_rpc.h"
 #include "superscalar/bolt11.h"
+#include "superscalar/bolt12.h"
 #include "superscalar/chan_close.h"
 #include "superscalar/factory_recovery.h"
 #include "superscalar/invoice.h"
@@ -672,6 +673,53 @@ static cJSON *method_sweepfactory(admin_rpc_t *rpc, const cJSON *params,
 /* ------------------------------------------------------------------ */
 /* Method: stop                                                          */
 /* ------------------------------------------------------------------ */
+static cJSON *method_createoffer(admin_rpc_t *rpc, const cJSON *params)
+{
+    if (!rpc->ctx) return NULL;
+
+    /* Derive our compressed pubkey from the node private key */
+    secp256k1_pubkey pub;
+    if (!secp256k1_ec_pubkey_create(rpc->ctx, &pub, rpc->node_privkey)) return NULL;
+    unsigned char our_pubkey[33];
+    size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(rpc->ctx, our_pubkey, &plen, &pub,
+                                  SECP256K1_EC_COMPRESSED);
+
+    /* Parse parameters */
+    uint64_t amount_msat = 0;
+    const cJSON *amt_item = params ? cJSON_GetObjectItem(params, "amount_msat") : NULL;
+    if (amt_item && cJSON_IsNumber(amt_item))
+        amount_msat = (uint64_t)amt_item->valuedouble;
+
+    const char *desc = "SuperScalar offer";
+    const cJSON *desc_item = params ? cJSON_GetObjectItem(params, "description") : NULL;
+    if (desc_item && cJSON_IsString(desc_item))
+        desc = desc_item->valuestring;
+
+    uint64_t expiry = 0;
+    const cJSON *exp_item = params ? cJSON_GetObjectItem(params, "absolute_expiry") : NULL;
+    if (exp_item && cJSON_IsNumber(exp_item))
+        expiry = (uint64_t)exp_item->valuedouble;
+
+    /* Build offer */
+    offer_t o;
+    if (!offer_create(&o, rpc->ctx, rpc->node_privkey, our_pubkey,
+                      amount_msat, desc, expiry))
+        return NULL;
+
+    char bech32m[512];
+    if (!offer_encode(&o, bech32m, sizeof(bech32m))) return NULL;
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "offer",       bech32m);
+    cJSON_AddStringToObject(r, "description", desc);
+    cJSON_AddBoolToObject(r,   "has_amount",  o.has_amount);
+    if (o.has_amount)
+        cJSON_AddNumberToObject(r, "amount_msat", (double)amount_msat);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
 static cJSON *method_stop(admin_rpc_t *rpc)
 {
     if (rpc->shutdown_flag)
@@ -742,6 +790,8 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_sweepfactory(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "stop") == 0) {
         result = method_stop(rpc);
+    } else if (strcmp(m, "createoffer") == 0) {
+        result = method_createoffer(rpc, params);
     } else {
         size_t n = build_error(id, -32601, "Method not found", json_out, out_cap);
         cJSON_Delete(req);
