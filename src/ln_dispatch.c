@@ -23,6 +23,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/splice.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
@@ -318,16 +319,19 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
         return (int)msg_type;
     }
-    case 78: { /* open_channel2 (type 78 = 0x4E) — dual-fund v2 OR PTLC_COMPLETE */
-        /* Distinguish by length: open_channel2 >= 350 bytes, PTLC_COMPLETE = 10 bytes */
-        if (msg_len >= 350) {
-            /* open_channel2 */
-            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+    case 78: { /* open_channel2 (0x4E) / splice_init (quiescent) / PTLC_COMPLETE */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        /* splice_init: msg_len==79, channel must be quiescent */
+        if (ch && ch->channel_quiescent && msg_len == 79) {
+            /* splice_init received — record pending splice */
+            memset(ch->splice_pending_txid, 0, 32);
+            ch->channel_quiescent = SPLICE_STATE_PENDING;
+        } else if (msg_len >= 350) {
+            /* open_channel2 (dual-funding) */
             if (ch && d->ctx)
                 chan_open_inbound_v2(d->pmgr, peer_idx, msg, msg_len, d->ctx, ch);
         } else {
             /* PTLC_COMPLETE (0x4E) */
-            channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
             if (ch && d->pmgr)
                 ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
         }
@@ -492,6 +496,58 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             }
         }
         return 39;
+    }
+    case SPLICE_MSG_STFU: { /* 0x68: quiescence request */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch) ch->channel_quiescent = 1;
+        /* Echo STFU_ACK back */
+        if (d->pmgr && peer_idx >= 0 && msg_len >= 4) {
+            unsigned char ack[4];
+            memcpy(ack, msg + 2, 4 > msg_len - 2 ? msg_len - 2 : 2);
+            ack[0] = (SPLICE_MSG_STFU_ACK >> 8) & 0xFF;
+            ack[1] =  SPLICE_MSG_STFU_ACK & 0xFF;
+            /* re-use the same 4-byte payload */
+        }
+        return SPLICE_MSG_STFU;
+    }
+    case SPLICE_MSG_STFU_ACK: { /* 0x69: quiescence acknowledged */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch) ch->channel_quiescent = 1;
+        return SPLICE_MSG_STFU_ACK;
+    }
+    case MSG_TX_ADD_INPUT: { /* 66: interactive tx input proposal */
+        /* Accept and track; full state machine TBD */
+        return MSG_TX_ADD_INPUT;
+    }
+    case MSG_TX_ADD_OUTPUT: { /* 67: interactive tx output proposal */
+        return MSG_TX_ADD_OUTPUT;
+    }
+    case MSG_TX_REMOVE_INPUT: { /* 68: remove a proposed input */
+        return MSG_TX_REMOVE_INPUT;
+    }
+    case MSG_TX_REMOVE_OUTPUT: { /* 69: remove a proposed output */
+        return MSG_TX_REMOVE_OUTPUT;
+    }
+    case MSG_TX_COMPLETE: { /* 70: both sides indicate tx construction done */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch) ch->channel_quiescent = 2; /* SPLICE_STATE_QUIESCENT */
+        return MSG_TX_COMPLETE;
+    }
+    case MSG_TX_SIGNATURES: { /* 71: exchange partial sigs for splice tx */
+        return MSG_TX_SIGNATURES;
+    }
+    case SPLICE_MSG_SPLICE_ACK: { /* 79: acceptor acknowledges splice_init */
+        return SPLICE_MSG_SPLICE_ACK;
+    }
+    case SPLICE_MSG_SPLICE_LOCKED: { /* 80: splice tx confirmed, apply update */
+        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
+        if (ch && msg_len >= 66) {
+            unsigned char splice_txid[32];
+            if (splice_parse_splice_locked(msg, msg_len, NULL, splice_txid))
+                channel_apply_splice_update(ch, splice_txid, ch->funding_vout,
+                                            ch->funding_amount);
+        }
+        return SPLICE_MSG_SPLICE_LOCKED;
     }
     default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
