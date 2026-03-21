@@ -26,6 +26,7 @@
 #include "lsps.h"
 #include "gossip_store.h"
 #include "chan_close.h"
+#include "scb.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -54,6 +55,9 @@ typedef struct {
     /* Cooperative close: callback to broadcast signed closing tx */
     void (*broadcast_tx_cb)(void *ctx, const unsigned char *tx, size_t tx_len);
     void  *broadcast_tx_ctx;
+    /* PR #28: Static channel backup — path to write SCB on channel_ready.
+       NULL = disabled. Updated automatically when channels change state. */
+    const char *scb_path;
 } ln_dispatch_t;
 
 /*

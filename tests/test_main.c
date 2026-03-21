@@ -376,6 +376,23 @@ extern int test_liqad_null_ad(void);
 extern int test_liqad_node_announcement(void);
 extern int test_liqad_node_announcement_no_ad(void);
 
+/* PR #28: Chain Safety */
+extern int test_scb_entry_from_channel(void);
+extern int test_scb_save_load_roundtrip(void);
+extern int test_scb_load_bad_magic(void);
+extern int test_scb_save_load_multi(void);
+extern int test_scb_load_empty_file(void);
+extern int test_force_close_msg_error_no_wt(void);
+extern int test_force_close_msg_error_wired(void);
+extern int test_force_close_msg_error_return(void);
+extern int test_fee_anchor_guard_null(void);
+extern int test_fee_anchor_guard_low_rate(void);
+extern int test_fee_anchor_guard_normal_rate(void);
+extern int test_watchtower_init_fee_est(void);
+extern int test_watchtower_build_cpfp_no_wallet(void);
+extern int test_watchtower_add_pending(void);
+extern int test_watchtower_add_pending_full(void);
+
 /* PR #20 Phase 5: Splice Wire + BOLT #12 Full */
 extern int test_splice_wire_init_roundtrip(void);
 extern int test_splice_wire_ack(void);
@@ -1612,6 +1629,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_liqad_null_ad);
     RUN_TEST(test_liqad_node_announcement);
     RUN_TEST(test_liqad_node_announcement_no_ad);
+
+    printf("\n=== PR #28: Chain Safety ===\n");
+    RUN_TEST(test_scb_entry_from_channel);
+    RUN_TEST(test_scb_save_load_roundtrip);
+    RUN_TEST(test_scb_load_bad_magic);
+    RUN_TEST(test_scb_save_load_multi);
+    RUN_TEST(test_scb_load_empty_file);
+    RUN_TEST(test_force_close_msg_error_no_wt);
+    RUN_TEST(test_force_close_msg_error_wired);
+    RUN_TEST(test_force_close_msg_error_return);
+    RUN_TEST(test_fee_anchor_guard_null);
+    RUN_TEST(test_fee_anchor_guard_low_rate);
+    RUN_TEST(test_fee_anchor_guard_normal_rate);
+    RUN_TEST(test_watchtower_init_fee_est);
+    RUN_TEST(test_watchtower_build_cpfp_no_wallet);
+    RUN_TEST(test_watchtower_add_pending);
+    RUN_TEST(test_watchtower_add_pending_full);
 
     printf("\n=== Splice Wire Protocol ===\n");
     RUN_TEST(test_splice_wire_init_roundtrip);
