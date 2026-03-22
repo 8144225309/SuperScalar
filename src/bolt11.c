@@ -139,7 +139,7 @@ static int parse_network(const char *hrp, size_t hrp_len,
     if (hrp[0] != 'l' || hrp[1] != 'n') return 0;
 
     /* networks: bc, bs, tb, bcrt */
-    static const char *nets[] = {"bc", "bs", "tb", "bcrt", NULL};
+    static const char *nets[] = {"bc", "bs", "tb", "tbs", "tb4", "bcrt", NULL};
     int net_len = 0;
     for (int i = 0; nets[i]; i++) {
         int nl = (int)strlen(nets[i]);
