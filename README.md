@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.7 — 890 tests (848 unit + 42 regtest + 36 orchestrator), full BOLT 2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, onion routing, Dijkstra pathfinding, PTLC state machine, gossip, async factory rotation, watchtower, BIP 39 restore.
+> post-ln-phase2 — 1355 tests, 21/21 signet exhibition, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -74,7 +74,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-890 automated tests (848 unit + 42 regtest integration, including 11 adversarial/edge-case tests) plus 25 manual flag tests and 36 orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+1355 automated tests (unit + regtest integration + adversarial/edge-case) plus manual flag tests and orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer. 21/21 signet exhibition structures pass.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -103,6 +103,29 @@ python3 tools/manual_tests.py --list        # list available tests
 python3 tools/test_orchestrator.py --scenario all
 python3 tools/test_orchestrator.py --list   # list scenarios
 ```
+
+---
+
+## Fund Recovery
+
+Detect and recover funds stuck in factory leaf outputs after force-close tests or interrupted exhibitions:
+
+```bash
+# Scan for unspent exhibition outputs
+python3 tools/recover_exhibition_funds.py --network signet --scan
+
+# Sweep stuck funds back to wallet
+python3 tools/recover_exhibition_funds.py --network signet --sweep
+
+# Preview without broadcasting
+python3 tools/recover_exhibition_funds.py --network signet --sweep --dry-run
+
+# For production factory recovery (via admin RPC):
+# 1. Start LSP with --rpc-file /tmp/lsp_rpc
+# 2. Call sweepfactory: echo '{"method":"sweepfactory","params":{"factory_id":0,"dest_spk_hex":"..."}}' | nc -U /tmp/lsp_rpc
+```
+
+Exhibition keys are deterministic (LSP=0x01, clients=0x2222/3333/4444/5555), so all leaf outputs are recoverable via MuSig2 key-path spend.
 
 ---
 
