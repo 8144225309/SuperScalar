@@ -192,10 +192,15 @@ int test_onion_msg_decrypt_roundtrip(void)
     onion_msg_t msg;
     ASSERT(onion_msg_parse(wire, wire_len, &msg) == 1, "OM5: parse succeeds");
 
-    /* Decrypt at recipient using dest_sk */
+    /* Decrypt at recipient using PR #34's recv_final (matches build's TLV format) */
     unsigned char recovered[512];
-    size_t rec_len = onion_msg_decrypt_final(&msg, ctx, dest_sk,
-                                              recovered, sizeof(recovered));
+    size_t rec_len;
+    uint64_t rec_tlv_type;
+    int recv_ok = onion_msg_recv_final(ctx, dest_sk, pk2,
+                                        pkt2, pkt2_len,
+                                        recovered, sizeof(recovered),
+                                        &rec_len, &rec_tlv_type);
+    ASSERT(recv_ok, "OM5: recv_final succeeds");
     ASSERT(rec_len == orig_len, "OM5: recovered length matches");
     ASSERT(memcmp(recovered, original, orig_len) == 0, "OM5: payload round-trips");
 
