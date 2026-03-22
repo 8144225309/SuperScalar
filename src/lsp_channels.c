@@ -3220,6 +3220,7 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  reset                        Cooperative DW epoch reset (counter → 0)\n");
         printf("  close                        Cooperative close and shutdown\n");
         printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
+        printf("  pay_external <client> <bolt11> Pay external LN invoice via bridge\n");
         printf("  help                         Show this help\n");
     } else if (strncmp(line, "buy_liquidity ", 14) == 0) {
         unsigned int client;
@@ -3240,6 +3241,34 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             }
         } else {
             printf("CLI: usage: buy_liquidity <client> <amount_sats>\n");
+        }
+    } else if (strncmp(line, "pay_external ", 13) == 0) {
+        /* pay_external <from_client> <bolt11> — outbound payment via bridge */
+        unsigned int from;
+        char bolt11[2048];
+        if (sscanf(line + 13, "%u %2047s", &from, bolt11) == 2) {
+            if (from >= mgr->n_channels) {
+                printf("CLI: invalid client index (max %zu)\n",
+                       mgr->n_channels - 1);
+            } else if (mgr->bridge_fd < 0) {
+                printf("CLI: no bridge connected (need --clnbridge)\n");
+            } else {
+                printf("CLI: paying external invoice from client %u...\n", from);
+                fflush(stdout);
+                /* Send bolt11 to bridge for outbound payment */
+                uint64_t request_id = mgr->next_request_id++;
+                unsigned char dummy_hash[32] = {0};
+                cJSON *pay_msg = wire_build_bridge_send_pay(bolt11,
+                                                             dummy_hash, request_id);
+                if (wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg))
+                    printf("CLI: pay_external sent to bridge (request %llu)\n",
+                           (unsigned long long)request_id);
+                else
+                    printf("CLI: pay_external bridge send FAILED\n");
+                cJSON_Delete(pay_msg);
+            }
+        } else {
+            printf("CLI: usage: pay_external <from_client> <bolt11_invoice>\n");
         }
     } else if (len > 0) {
         printf("CLI: unknown command '%s' (type 'help')\n", line);
