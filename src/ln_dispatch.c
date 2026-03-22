@@ -658,8 +658,7 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         /* Store negotiated features if peer_mgr supports it */
         return BOLT1_MSG_INIT;
     }
-    case BOLT1_MSG_ERROR: /* error (type 17) — BOLT #1 error + force-close watchtower */
-    case MSG_ERROR: {
+    case BOLT1_MSG_ERROR: { /* error (type 17 / MSG_ERROR) — force-close + watchtower */
         /* Peer is force-closing this channel (BOLT #2 §2.3.1).
          * Register the channel for HTLC sweep monitoring via the watchtower. */
         if (d->watchtower && d->peer_channels && peer_idx >= 0) {
