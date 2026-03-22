@@ -196,6 +196,15 @@ int onion_parse_tlv_payload(const unsigned char *payload, size_t payload_len,
                 out->has_scid = 1;
             }
             break;
+        case 0x0c: /* trampoline hop payload */
+            if (length <= 256) {
+                memcpy(out->trampoline_payload, val, (size_t)length);
+                out->trampoline_payload_len = (size_t)length;
+                out->has_trampoline = 1;
+            }
+            break;
+        case 0x0e: /* nested trampoline onion (future use) */
+            break;
         default:
             /* Unknown TLV: skip (even types are required, odd are optional).
                For simplicity, skip all unknown types. */

@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <secp256k1.h>
 #include "bolt8.h"
+#include "gossip_store.h"
 #include "channel.h"
 
 #define PEER_MGR_MAX_PEERS  64
@@ -47,6 +48,7 @@ typedef struct {
     volatile int      *shutdown_flag; /* set to non-zero to stop accept loop */
     char              tor_proxy_host[256];
     int               tor_proxy_port; /* 0 = no proxy configured */
+    gossip_store_t    *gs;             /* gossip store for timestamp filter (NULL=disabled) */
 } peer_mgr_t;
 
 /*

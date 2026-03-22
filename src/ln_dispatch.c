@@ -13,6 +13,7 @@
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/onion_message.h"
+#include "superscalar/bolt1.h"
 #include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
 #include "superscalar/chan_open.h"
@@ -25,6 +26,10 @@
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/splice.h"
+#include "superscalar/stateless_invoice.h"
+#include "superscalar/circuit_breaker.h"
+#include "superscalar/peer_storage.h"
+#include "superscalar/sha256.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/select.h>
@@ -40,6 +45,7 @@
 #define MSG_REVOKE_AND_ACK        133   /* 0x0085 */
 #define MSG_CHANNEL_REESTABLISH   136   /* 0x0088 */
 #define MSG_UPDATE_FAIL_MALFORMED 135   /* 0x0087 */
+#define MSG_ANNOUNCEMENT_SIGS     259   /* 0x0103 */
 #define MSG_INVOICE_REQUEST      0x8001 /* BOLT #12 direct wire */
 #define MSG_ERROR                  17   /* 0x0011: peer force-closing */
 #define MSG_ONION_MESSAGE        0x0201 /* 513: BOLT #4 onion message */
@@ -173,12 +179,64 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             const unsigned char *channel_id   = p;      /* p[0..31] */
             const unsigned char *payment_hash = p + 48; /* p[48..79] */
             if (d->invoices) {
+                /* Locate the invoice entry for this payment_hash */
+                bolt11_invoice_entry_t *inv_entry = NULL;
+                for (int _i = 0; _i < d->invoices->count; _i++) {
+                    if (d->invoices->entries[_i].active &&
+                        memcmp(d->invoices->entries[_i].payment_hash,
+                               payment_hash, 32) == 0) {
+                        inv_entry = &d->invoices->entries[_i];
+                        break;
+                    }
+                }
+
+                /* Phase C: verify HMAC-derived payment_secret (stateless Level 1)
+                 * Only enforced for invoices created with has_stateless_secret=1. */
+                if (inv_entry && inv_entry->has_stateless_secret &&
+                    fwd_out.has_payment_secret) {
+                    if (!stateless_invoice_verify_secret(d->our_privkey,
+                                                         payment_hash,
+                                                         fwd_out.payment_secret)) {
+                        if (d->pmgr && peer_idx >= 0) {
+                            static const unsigned char bad_secret[2] = {0x40, 0x0F};
+                            htlc_commit_send_fail(d->pmgr, peer_idx,
+                                                  channel_id, htlc_id,
+                                                  bad_secret, sizeof(bad_secret));
+                        }
+                        return (int)msg_type;
+                    }
+                }
+
                 unsigned char preimage[32];
-                if (invoice_claim(d->invoices, payment_hash, amount_msat, preimage)) {
+                int claimed = 0;
+
+                /* Phase PR56 Level 2: derive preimage from stored nonce */
+                if (inv_entry && inv_entry->has_stateless_preimage &&
+                    fwd_out.has_payment_secret) {
+                    claimed = stateless_invoice_claim(d->our_privkey,
+                                                      inv_entry->stateless_nonce,
+                                                      payment_hash,
+                                                      fwd_out.payment_secret,
+                                                      preimage);
+                    if (claimed) inv_entry->settled = 1;
+                }
+
+                /* Level 1 / stored-preimage fallback */
+                if (!claimed)
+                    claimed = invoice_claim(d->invoices, payment_hash,
+                                            amount_msat, preimage);
+
+                if (claimed) {
                     if (d->pmgr && peer_idx >= 0)
                         htlc_commit_send_fulfill(d->pmgr, peer_idx,
                                                  channel_id, htlc_id, preimage);
                     invoice_settle(d->invoices, payment_hash);
+                    /* Startup/shutdown: persist the settled state so it
+                     * survives a restart (PR #72). */
+                    if (d->persist && inv_entry) {
+                        inv_entry->settled = 1;
+                        persist_save_ln_invoice((persist_t *)d->persist, inv_entry);
+                    }
                 } else {
                     /* No matching / valid invoice — send unknown_payment_hash */
                     if (d->pmgr && peer_idx >= 0) {
@@ -190,8 +248,16 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
                 }
             }
         } else if (result == FORWARD_FAIL) {
-            /* Onion decryption failed — send update_fail_malformed_htlc */
-            (void)fwd_out;
+            /* Onion decryption failed — send update_fail_malformed_htlc (BOLT #2) */
+            if (d->pmgr && peer_idx >= 0) {
+                unsigned char sha256_of_onion[32];
+                sha256(onion, ONION_PACKET_SIZE, sha256_of_onion);
+                htlc_commit_send_fail_malformed(d->pmgr, peer_idx,
+                                                p,        /* channel_id p[0..31] */
+                                                htlc_id,
+                                                sha256_of_onion,
+                                                0x8003);  /* INVALID_ONION_HMAC */
+            }
         }
         /* Phase N: copy in_channel_id into forward entry */
         if (result == FORWARD_RELAY) {
@@ -250,8 +316,14 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         /* Phase M: run channel reestablish after reconnect */
         channel_t *ch = (d->peer_channels && peer_idx >= 0)
                         ? d->peer_channels[peer_idx] : NULL;
-        if (ch && d->pmgr)
-            chan_reestablish(d->pmgr, peer_idx, d->ctx, ch);
+        if (ch && d->pmgr) {
+            int r = chan_reestablish(d->pmgr, peer_idx, d->ctx, ch);
+            if (r == 0 && d->watchtower) {
+                /* DLP detected: peer is ahead — register for sweep */
+                fprintf(stderr, "ln_dispatch: DLP peer %d — force close\n", peer_idx);
+                watchtower_set_channel(d->watchtower, (size_t)peer_idx, ch);
+            }
+        }
         return (int)msg_type;
     }
 
@@ -324,13 +396,12 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
     }
     case 78: { /* open_channel2 (0x4E) / splice_init (quiescent) / PTLC_COMPLETE */
         channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
-        /* splice_init: msg_len==79, channel must be quiescent */
         if (ch && ch->channel_quiescent && msg_len == 79) {
-            /* splice_init received — record pending splice */
+            /* splice_init: 2(type)+32(cid)+8(amount)+4(feerate)+33(funding_pubkey) = 79 */
             memset(ch->splice_pending_txid, 0, 32);
             ch->channel_quiescent = SPLICE_STATE_PENDING;
         } else if (msg_len >= 350) {
-            /* open_channel2 (dual-funding) */
+            /* open_channel2 */
             if (ch && d->ctx)
                 chan_open_inbound_v2(d->pmgr, peer_idx, msg, msg_len, d->ctx, ch);
         } else {
@@ -338,7 +409,7 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
             if (ch && d->pmgr)
                 ptlc_commit_dispatch(d->pmgr, peer_idx, ch, d->ctx, msg, msg_len);
         }
-        return 78;
+        return (int)SPLICE_MSG_SPLICE_INIT;
     }
     case 0x6D: { /* MSG_QUEUE_POLL: client requesting pending work items */
         if (!d->persist) return 0x6D;
@@ -531,63 +602,66 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         }
         return 39;
     }
-    case SPLICE_MSG_STFU: { /* 0x68: quiescence request */
+    case 0x68: { /* MSG_STFU - channel quiescence request */
         channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
         if (ch) ch->channel_quiescent = 1;
-        /* Echo STFU_ACK back */
-        if (d->pmgr && peer_idx >= 0 && msg_len >= 4) {
-            unsigned char ack[4];
-            memcpy(ack, msg + 2, 4 > msg_len - 2 ? msg_len - 2 : 2);
-            ack[0] = (SPLICE_MSG_STFU_ACK >> 8) & 0xFF;
-            ack[1] =  SPLICE_MSG_STFU_ACK & 0xFF;
-            /* re-use the same 4-byte payload */
+        return (int)SPLICE_MSG_STFU;
+    }
+    case 0x69: /* MSG_STFU_ACK */
+        return (int)SPLICE_MSG_STFU_ACK;
+    case BOLT2_STFU: { /* stfu (type 140, 0x008C) — BOLT #2 quiescence request */
+        /* Wire: type(2) + channel_id(32) = 34 bytes total */
+        if (msg_len < 2 + 32) return -1;
+        const unsigned char *channel_id = msg + 2;
+        if (d->pmgr && peer_idx >= 0) {
+            quiesce_state_t qs = QUIESCE_NONE;
+            splice_handle_stfu(d->pmgr, peer_idx, channel_id, &qs);
         }
-        return SPLICE_MSG_STFU;
+        return BOLT2_STFU;
     }
-    case SPLICE_MSG_STFU_ACK: { /* 0x69: quiescence acknowledged */
-        channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
-        if (ch) ch->channel_quiescent = 1;
-        return SPLICE_MSG_STFU_ACK;
+    case BOLT2_STFU_REPLY: { /* stfu_reply (type 141, 0x008D) — peer acknowledged quiescence */
+        /* Wire: type(2) + channel_id(32) = 34 bytes total */
+        if (msg_len < 2 + 32) return -1;
+        return BOLT2_STFU_REPLY;
     }
-    case MSG_TX_ADD_INPUT: { /* 66: interactive tx input proposal */
-        /* Accept and track; full state machine TBD */
+    case SPLICE_MSG_SPLICE_ACK: /* splice_ack: pass through */
+        return (int)SPLICE_MSG_SPLICE_ACK;
+    case MSG_TX_ADD_INPUT:
         return MSG_TX_ADD_INPUT;
-    }
-    case MSG_TX_ADD_OUTPUT: { /* 67: interactive tx output proposal */
+    case MSG_TX_ADD_OUTPUT:
         return MSG_TX_ADD_OUTPUT;
-    }
-    case MSG_TX_REMOVE_INPUT: { /* 68: remove a proposed input */
+    case MSG_TX_REMOVE_INPUT:
         return MSG_TX_REMOVE_INPUT;
-    }
-    case MSG_TX_REMOVE_OUTPUT: { /* 69: remove a proposed output */
+    case MSG_TX_REMOVE_OUTPUT:
         return MSG_TX_REMOVE_OUTPUT;
-    }
-    case MSG_TX_COMPLETE: { /* 70: both sides indicate tx construction done */
+    case MSG_TX_COMPLETE: { /* tx_complete - both sides done adding inputs/outputs */
         channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
-        if (ch) ch->channel_quiescent = 2; /* SPLICE_STATE_QUIESCENT */
+        if (ch && ch->channel_quiescent) ch->channel_quiescent = 2;
         return MSG_TX_COMPLETE;
     }
-    case MSG_TX_SIGNATURES: { /* 71: exchange partial sigs for splice tx */
+    case MSG_TX_SIGNATURES:
         return MSG_TX_SIGNATURES;
-    }
-    case SPLICE_MSG_SPLICE_ACK: { /* 79: acceptor acknowledges splice_init */
-        return SPLICE_MSG_SPLICE_ACK;
-    }
-    case SPLICE_MSG_SPLICE_LOCKED: { /* 80: splice tx confirmed, apply update */
+    case SPLICE_MSG_SPLICE_LOCKED: { /* splice_locked (80): apply new funding */
         channel_t *ch = (d->peer_channels) ? d->peer_channels[peer_idx] : NULL;
         if (ch && msg_len >= 66) {
             unsigned char splice_txid[32];
             if (splice_parse_splice_locked(msg, msg_len, NULL, splice_txid))
-                channel_apply_splice_update(ch, splice_txid, ch->funding_vout,
-                                            ch->funding_amount);
+                channel_apply_splice_update(ch, splice_txid, 0, ch->funding_amount);
         }
-        return SPLICE_MSG_SPLICE_LOCKED;
+        return (int)SPLICE_MSG_SPLICE_LOCKED;
     }
+    case BOLT1_MSG_WARNING: /* warning (type 1) - log and continue */
+        return BOLT1_MSG_WARNING;
+    case BOLT1_MSG_INIT: { /* init (type 16) - feature negotiation */
+        bolt1_init_t init_parsed;
+        bolt1_parse_init(msg, msg_len, &init_parsed);
+        /* Store negotiated features if peer_mgr supports it */
+        return BOLT1_MSG_INIT;
+    }
+    case BOLT1_MSG_ERROR: /* error (type 17) — BOLT #1 error + force-close watchtower */
     case MSG_ERROR: {
         /* Peer is force-closing this channel (BOLT #2 §2.3.1).
-         * Register the channel for HTLC sweep monitoring via the watchtower.
-         * We use a zero txid — the commitment txid is unknown until chain confirmation;
-         * watchtower's CLTV-based sweep loop handles HTLCs without requiring a specific txid. */
+         * Register the channel for HTLC sweep monitoring via the watchtower. */
         if (d->watchtower && d->peer_channels && peer_idx >= 0) {
             channel_t *fc_ch = d->peer_channels[peer_idx];
             if (fc_ch) {
@@ -598,6 +672,63 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         }
         return MSG_ERROR;
     }
+    case BOLT1_MSG_PING: { /* ping (type 18) - send pong */
+        bolt1_ping_t ping;
+        if (bolt1_parse_ping(msg, msg_len, &ping) &&
+            d->pmgr && peer_idx >= 0 && ping.num_pong_bytes <= 65531) {
+            unsigned char pong_buf[65535];
+            size_t pong_len = bolt1_build_pong(ping.num_pong_bytes,
+                                                pong_buf, sizeof(pong_buf));
+            if (pong_len > 0)
+                peer_mgr_send(d->pmgr, peer_idx, pong_buf, pong_len);
+        }
+        return BOLT1_MSG_PING;
+    }
+    case BOLT1_MSG_PONG: /* pong (type 19) - ignore */
+        return BOLT1_MSG_PONG;
+    case 256:  /* channel_announcement */
+    case 257:  /* node_announcement */
+    case 258:  /* channel_update */
+    case 265:  /* gossip_timestamp_filter */ {
+        if (d->gi) {
+            const unsigned char *payload = msg;
+            gossip_ingest_message(d->gi, payload, msg_len, (uint32_t)time(NULL));
+        }
+        return (int)msg_type;
+    }
+
+    case BOLT9_PEER_STORAGE: {   /* type 7: peer asks us to store a blob */
+        if (msg_len < 4) return -1;
+        uint16_t blen = rd16(msg + 2);
+        if (msg_len < (size_t)(4 + blen)) return -1;
+        if (d->persist && d->pmgr && peer_idx >= 0 && peer_idx < d->pmgr->count) {
+            persist_save_peer_storage((persist_t *)d->persist,
+                                       d->pmgr->peers[peer_idx].pubkey,
+                                       msg + 4, blen);
+        }
+        return (int)msg_type;
+    }
+    case BOLT9_YOUR_PEER_STORAGE: {  /* type 9: peer returns our stored blob */
+        return (int)msg_type;
+    }
+
+    case MSG_ANNOUNCEMENT_SIGS: {
+        if (msg_len < 2 + 32 + 8 + 64 + 64) return -1;
+        const unsigned char *p = msg + 2;
+        const unsigned char *channel_id = p;
+        const unsigned char *node_sig   = p + 40;
+        const unsigned char *btc_sig    = p + 104;
+        if (d->peer_channels && peer_idx >= 0 && peer_idx < PEER_MGR_MAX_PEERS) {
+            channel_t *ch = d->peer_channels[peer_idx];
+            if (ch && memcmp(ch->funding_txid, channel_id, 32) == 0) {
+                memcpy(ch->remote_node_sig,    node_sig, 64);
+                memcpy(ch->remote_bitcoin_sig, btc_sig,  64);
+                ch->ann_sigs_recv = 1;
+            }
+        }
+        return (int)msg_type;
+    }
+
     default:
         /* Unknown type — silently ignore per BOLT #1 §2 */
         return 0;
@@ -706,4 +837,77 @@ int ln_dispatch_flush_relay(ln_dispatch_t *d)
         }
     }
     return sent;
+}
+
+/* -----------------------------------------------------------------------
+ * Startup state restore — load persisted invoices into dispatch tables.
+ * Called once after d->persist and d->invoices are set, before the loop.
+ * --------------------------------------------------------------------- */
+
+/* Callback context for persist_load_ln_peer_channels */
+typedef struct {
+    ln_dispatch_t *d;
+    int count;
+} channel_restore_ctx_t;
+
+static void restore_channel_cb(const unsigned char channel_id[32],
+                                const unsigned char peer_pubkey[33],
+                                uint64_t capacity_sat,
+                                uint64_t local_balance_msat,
+                                uint64_t remote_balance_msat,
+                                int state,
+                                const char *peer_host,
+                                uint16_t peer_port,
+                                void *ctx_)
+{
+    channel_restore_ctx_t *ctx = (channel_restore_ctx_t *)ctx_;
+    ln_dispatch_t *d = ctx->d;
+    (void)state;
+
+    if (!d->peer_channels) return;
+
+    /* Find a free slot — zero funding_amount indicates unused entry */
+    for (int i = 0; i < PEER_MGR_MAX_PEERS; i++) {
+        if (!d->peer_channels[i]) continue;
+        channel_t *ch = d->peer_channels[i];
+        if (ch->funding_amount == 0) {
+            /* Restore minimal fields; full key rebuild happens on reconnect */
+            memcpy(ch->funding_txid, channel_id, 32);
+            ch->funding_amount      = capacity_sat;
+            ch->local_amount        = local_balance_msat / 1000;
+            ch->remote_amount       = remote_balance_msat / 1000;
+            ctx->count++;
+            /* Trigger reconnect if we have a host/port saved */
+            if (d->pmgr && peer_host && strlen(peer_host) > 0 && peer_port > 0)
+                peer_mgr_connect(d->pmgr, peer_host, peer_port, peer_pubkey);
+            break;
+        }
+    }
+}
+
+int ln_dispatch_load_state(ln_dispatch_t *d)
+{
+    if (!d || !d->persist) return -1;
+    int total = 0;
+
+    /* Load BOLT #11 invoices from SQLite into the in-memory invoice table */
+    if (d->invoices) {
+        int n = persist_load_ln_invoices((persist_t *)d->persist, d->invoices);
+        if (n < 0) return -1;
+        total += n;
+    }
+
+    /* Restore peer channel state from ln_peer_channels table */
+    if (d->peer_channels) {
+        channel_restore_ctx_t cctx = { d, 0 };
+        persist_load_ln_peer_channels((persist_t *)d->persist,
+                                      restore_channel_cb, &cctx);
+        total += cctx.count;
+
+    /* Load circuit breaker limits from DB */
+    if (d->cb)
+        persist_load_circuit_breaker_peers((persist_t *)d->persist, d->cb);
+    }
+
+    return total;
 }

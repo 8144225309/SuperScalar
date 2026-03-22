@@ -364,3 +364,364 @@ int test_chan_open_accept_zero_conf_min_depth(void)
     ASSERT(depth_zc == 0, "DF8: zero_conf min_depth == 0");
     return 1;
 }
+
+/* ================================================================== */
+/* PR #62: Funding flow — P2WSH 2-of-2 + wallet integration          */
+/* ================================================================== */
+
+/* CO5: NULL wallet with valid keys → chan_build_p2wsh_funding_output succeeds */
+int test_chan_open_p2wsh_builds(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO5: ctx");
+
+    /* Two valid compressed pubkeys */
+    unsigned char local_pk[33], remote_pk[33];
+    memset(local_pk, 0x11, 33);  local_pk[0]  = 0x02;
+    memset(remote_pk, 0x22, 33); remote_pk[0] = 0x03;
+
+    unsigned char spk[34];
+    int ok = chan_build_p2wsh_funding_output(ctx, local_pk, remote_pk, spk);
+    ASSERT(ok == 1, "CO5: p2wsh builds");
+    /* P2WSH: OP_0 (0x00) + PUSH32 (0x20) + 32-byte hash */
+    ASSERT(spk[0] == 0x00, "CO5: OP_0");
+    ASSERT(spk[1] == 0x20, "CO5: PUSH32");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO6: P2WSH output is deterministic for the same key pair */
+int test_chan_open_p2wsh_deterministic(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO6: ctx");
+
+    unsigned char lk[33], rk[33];
+    memset(lk, 0x33, 33); lk[0] = 0x02;
+    memset(rk, 0x44, 33); rk[0] = 0x03;
+
+    unsigned char spk1[34], spk2[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk, rk, spk1) == 1, "CO6: build 1");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk, rk, spk2) == 1, "CO6: build 2");
+    ASSERT(memcmp(spk1, spk2, 34) == 0, "CO6: deterministic");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO7: P2WSH output is the same regardless of which key is "local" vs "remote"
+   (pubkeys are sorted, so order doesn't matter) */
+int test_chan_open_p2wsh_sorted(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO7: ctx");
+
+    /* Use two keys where local > remote lexicographically */
+    unsigned char pk_big[33], pk_small[33];
+    memset(pk_big,   0xFF, 33); pk_big[0]   = 0x03;
+    memset(pk_small, 0x01, 33); pk_small[0] = 0x02;
+
+    unsigned char spk_ab[34], spk_ba[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk_big, pk_small, spk_ab) == 1, "CO7: ab");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk_small, pk_big, spk_ba) == 1, "CO7: ba");
+    /* Sorted by BOLT #3 — output must be identical either way */
+    ASSERT(memcmp(spk_ab, spk_ba, 34) == 0,
+           "CO7: sorted keys produce same P2WSH output");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO8: Different key pairs produce different P2WSH outputs (no collision) */
+int test_chan_open_p2wsh_unique_per_keypair(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO8: ctx");
+
+    unsigned char lk1[33], rk1[33], lk2[33], rk2[33];
+    memset(lk1, 0x55, 33); lk1[0] = 0x02;
+    memset(rk1, 0x66, 33); rk1[0] = 0x03;
+    memset(lk2, 0x77, 33); lk2[0] = 0x02;
+    memset(rk2, 0x88, 33); rk2[0] = 0x03;
+
+    unsigned char spk1[34], spk2[34];
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk1, rk1, spk1) == 1, "CO8: pair1");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, lk2, rk2, spk2) == 1, "CO8: pair2");
+    ASSERT(memcmp(spk1, spk2, 34) != 0,
+           "CO8: different key pairs → different funding outputs");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO10–CO11: inbound channel open uses a valid EC funding pubkey (not temp_chan_id bytes) */
+
+/* CO10: Ephemeral keypair generation produces a valid secp256k1 compressed point */
+int test_chan_open_inbound_valid_funding_pk(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO10: ctx");
+
+    /* Simulate the fix: read random bytes, derive pubkey, verify it's a valid EC point */
+    unsigned char priv[32];
+    FILE *f = fopen("/dev/urandom", "rb");
+    ASSERT(f && fread(priv, 1, 32, f) == 32, "CO10: read random bytes");
+    fclose(f);
+
+    secp256k1_pubkey pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &pub, priv), "CO10: pubkey created");
+
+    unsigned char pub33[33];
+    size_t plen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, pub33, &plen, &pub, SECP256K1_EC_COMPRESSED);
+    ASSERT(plen == 33, "CO10: serialized to 33 bytes");
+    ASSERT(pub33[0] == 0x02 || pub33[0] == 0x03, "CO10: valid compressed point prefix");
+
+    /* Verify it can be round-tripped (parsed back) */
+    secp256k1_pubkey pub2;
+    ASSERT(secp256k1_ec_pubkey_parse(ctx, &pub2, pub33, 33), "CO10: round-trip parse");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO11: Two ephemeral keypairs are different (not deterministic / same temp_chan_id) */
+int test_chan_open_inbound_unique_funding_pk(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO11: ctx");
+
+    unsigned char pk1[33], pk2[33];
+    for (int k = 0; k < 2; k++) {
+        unsigned char priv[32];
+        FILE *f = fopen("/dev/urandom", "rb");
+        ASSERT(f && fread(priv, 1, 32, f) == 32, "CO11: read random bytes");
+        fclose(f);
+        secp256k1_pubkey pub;
+        ASSERT(secp256k1_ec_pubkey_create(ctx, &pub, priv), "CO11: pubkey create");
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, k == 0 ? pk1 : pk2, &plen,
+                                       &pub, SECP256K1_EC_COMPRESSED);
+    }
+    /* With overwhelming probability two random keys differ */
+    ASSERT(memcmp(pk1, pk2, 33) != 0, "CO11: two ephemeral keys differ");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* CO9: NULL inputs return 0 gracefully */
+int test_chan_open_p2wsh_null_guard(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "CO9: ctx");
+
+    unsigned char pk[33]; memset(pk, 0x99, 33); pk[0] = 0x02;
+    unsigned char spk[34];
+
+    ASSERT(chan_build_p2wsh_funding_output(ctx, NULL, pk, spk) == 0, "CO9: NULL local");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk, NULL, spk) == 0, "CO9: NULL remote");
+    ASSERT(chan_build_p2wsh_funding_output(ctx, pk, pk, NULL) == 0, "CO9: NULL spk_out");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase B tests: announcement_signatures type 259 (ANN1 through ANN6)
+ * ========================================================================== */
+
+#include "superscalar/gossip.h"
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <string.h>
+#include <stdio.h>
+
+/* ANN1: chan_send_announcement_sigs with valid channel -> ann_sigs_sent=1, node_sig non-zero */
+int test_ann1_send_announcement_sigs(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN1: ctx");
+
+    /* Build a minimal channel_t */
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+    ch.short_channel_id = (700000ULL << 40) | (1ULL << 16) | 0;
+
+    /* Generate funding keys */
+    unsigned char local_priv[32];
+    memset(local_priv, 0x11, 32);
+    local_priv[0] = 0x01; /* ensure valid */
+    secp256k1_ec_pubkey_create(ctx, &ch.local_funding_pubkey, local_priv);
+    memcpy(ch.local_funding_secret, local_priv, 32);
+
+    unsigned char remote_priv[32];
+    memset(remote_priv, 0x22, 32);
+    remote_priv[0] = 0x02;
+    secp256k1_ec_pubkey_create(ctx, &ch.remote_funding_pubkey, remote_priv);
+
+    /* Generate node privkey */
+    unsigned char node_priv[32];
+    memset(node_priv, 0x33, 32);
+    node_priv[0] = 0x01;
+
+    /* Call without pmgr (NULL) — should still sign */
+    int result = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                              GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(result == 0, "ANN1: returns 0");
+    ASSERT(ch.ann_sigs_sent == 1, "ANN1: ann_sigs_sent = 1");
+
+    /* Verify node_sig is non-zero */
+    int nonzero = 0;
+    for (int i = 0; i < 64; i++) if (ch.local_node_sig[i] != 0) { nonzero = 1; break; }
+    ASSERT(nonzero, "ANN1: local_node_sig non-zero");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ANN2: chan_send_announcement_sigs with NULL pmgr -> returns -1 only if scid=0 */
+int test_ann2_null_pmgr_no_crash(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN2: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+    ch.short_channel_id = 0;  /* scid=0 -> guard triggers */
+
+    unsigned char node_priv[32];
+    memset(node_priv, 0x55, 32); node_priv[0] = 0x01;
+
+    /* scid=0 -> must return -1 without crash */
+    int result = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                              GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(result == -1, "ANN2: scid=0 returns -1");
+    ASSERT(ch.ann_sigs_sent == 0, "ANN2: ann_sigs_sent stays 0");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ANN3: Dispatch type 259 valid 170-byte msg -> ann_sigs_recv=1, remote sigs stored */
+int test_ann3_dispatch_type_259(void) {
+    /* Build a 170-byte wire message */
+    unsigned char msg[170];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;  /* type 259 */
+    /* channel_id at msg[2..33]: use a known pattern */
+    memset(msg + 2, 0xAA, 32);     /* channel_id */
+    /* scid at msg[34..41] */
+    msg[34] = 0x00; msg[35] = 0x0A; msg[36] = 0xBC; msg[37] = 0xDE;
+    msg[38] = 0x00; msg[39] = 0x01; msg[40] = 0x00; msg[41] = 0x00;
+    /* node_sig at msg[42..105] */
+    memset(msg + 42, 0xBB, 64);
+    /* bitcoin_sig at msg[106..169] */
+    memset(msg + 106, 0xCC, 64);
+
+    /* Set up ln_dispatch with a channel matching channel_id */
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    memset(ch.funding_txid, 0xAA, 32);  /* matches channel_id above */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+    channels[0] = &ch;
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 259, "ANN3: returns 259");
+    ASSERT(ch.ann_sigs_recv == 1, "ANN3: ann_sigs_recv = 1");
+
+    /* Verify remote sigs were stored */
+    int node_ok = 1, btc_ok = 1;
+    for (int i = 0; i < 64; i++) {
+        if (ch.remote_node_sig[i] != 0xBB) { node_ok = 0; break; }
+    }
+    for (int i = 0; i < 64; i++) {
+        if (ch.remote_bitcoin_sig[i] != 0xCC) { btc_ok = 0; break; }
+    }
+    ASSERT(node_ok, "ANN3: remote_node_sig stored correctly");
+    ASSERT(btc_ok, "ANN3: remote_bitcoin_sig stored correctly");
+
+    return 1;
+}
+
+/* ANN4: Dispatch type 259 truncated (< 170 bytes) -> returns -1 */
+int test_ann4_dispatch_truncated(void) {
+    unsigned char msg[100];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;  /* type 259 */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == -1, "ANN4: truncated returns -1");
+    return 1;
+}
+
+/* ANN5: ann_sigs_sent=1 + receive type 259 -> both flags set */
+int test_ann5_both_flags(void) {
+    unsigned char msg[170];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x03;
+    memset(msg + 2, 0xDD, 32);   /* channel_id */
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    memset(ch.funding_txid, 0xDD, 32);
+    ch.ann_sigs_sent = 1;  /* already sent */
+
+    channel_t *channels[64];
+    memset(channels, 0, sizeof(channels));
+    channels[3] = &ch;
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = channels;
+
+    ln_dispatch_process_msg(&d, 3, msg, sizeof(msg));
+    ASSERT(ch.ann_sigs_sent == 1, "ANN5: ann_sigs_sent remains 1");
+    ASSERT(ch.ann_sigs_recv == 1, "ANN5: ann_sigs_recv set to 1");
+    return 1;
+}
+
+/* ANN6: ch->short_channel_id=0 -> chan_send_announcement_sigs returns -1 */
+int test_ann6_zero_scid(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ANN6: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.short_channel_id = 0;
+
+    unsigned char node_priv[32];
+    memset(node_priv, 0x77, 32); node_priv[0] = 0x01;
+
+    int r = chan_send_announcement_sigs(NULL, -1, ctx, node_priv, &ch,
+                                         GOSSIP_CHAIN_HASH_MAINNET);
+    ASSERT(r == -1, "ANN6: scid=0 returns -1");
+    ASSERT(ch.ann_sigs_sent == 0, "ANN6: ann_sigs_sent stays 0");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

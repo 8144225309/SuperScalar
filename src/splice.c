@@ -245,33 +245,33 @@ int splice_parse_splicing_signed(const unsigned char *msg, size_t msg_len,
     return 1;
 }
 
-/* ---- Interactive Transaction Construction (BOLT #2 §4.9.2) ---- */
+/* ---- Interactive Transaction Construction (BOLT 2 ss4.9.2) ---- */
 
-static void put_u64_be(unsigned char *b, uint64_t v) {
-    for (int i = 7; i >= 0; i--) b[7-i] = (unsigned char)(v >> (i*8));
+static void put_u64_be_itx(unsigned char *b, uint64_t v) {
+    for (int i = 7; i >= 0; i--) { b[7-i] = (unsigned char)(v >> (i * 8)); }
 }
-static uint64_t get_u64_be(const unsigned char *b) {
+static uint64_t get_u64_be_itx(const unsigned char *b) {
     uint64_t v = 0;
     for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
     return v;
 }
 
-/* tx_add_input (type 66): type(2)+cid(32)+serial(8)+txid(32)+vout(4)+seq(4)=82 */
 size_t splice_build_tx_add_input(const unsigned char channel_id[32],
                                   uint64_t serial_id,
                                   const unsigned char prevtxid[32],
-                                  uint32_t prevtx_vout, uint32_t sequence,
+                                  uint32_t prevtx_vout,
+                                  uint32_t sequence,
                                   unsigned char *buf, size_t buf_cap)
 {
-    if (!channel_id || !prevtxid || !buf || buf_cap < 82) return 0;
-    size_t pos = 0;
-    put_u16_be(buf + pos, (uint16_t)MSG_TX_ADD_INPUT); pos += 2;
-    memcpy(buf + pos, channel_id, 32); pos += 32;
-    put_u64_be(buf + pos, serial_id); pos += 8;
-    memcpy(buf + pos, prevtxid, 32); pos += 32;
-    put_u32_be(buf + pos, prevtx_vout); pos += 4;
-    put_u32_be(buf + pos, sequence); pos += 4;
-    return pos;
+    if (!buf || buf_cap < 82 || !channel_id || !prevtxid) return 0;
+    size_t p = 0;
+    put_u16_be(buf + p, MSG_TX_ADD_INPUT); p += 2;
+    memcpy(buf + p, channel_id, 32);       p += 32;
+    put_u64_be_itx(buf + p, serial_id);    p += 8;
+    memcpy(buf + p, prevtxid, 32);         p += 32;
+    put_u32_be(buf + p, prevtx_vout);      p += 4;
+    put_u32_be(buf + p, sequence);         p += 4;
+    return p;
 }
 
 int splice_parse_tx_add_input(const unsigned char *msg, size_t msg_len,
@@ -283,71 +283,75 @@ int splice_parse_tx_add_input(const unsigned char *msg, size_t msg_len,
 {
     if (!msg || msg_len < 82) return 0;
     if (get_u16_be(msg) != MSG_TX_ADD_INPUT) return 0;
-    if (channel_id_out)  memcpy(channel_id_out, msg + 2, 32);
-    if (serial_id_out)   *serial_id_out   = get_u64_be(msg + 34);
-    if (prevtxid_out)    memcpy(prevtxid_out, msg + 42, 32);
-    if (prevtx_vout_out) *prevtx_vout_out = get_u32_be(msg + 74);
-    if (sequence_out)    *sequence_out    = get_u32_be(msg + 78);
+    if (channel_id_out)   memcpy(channel_id_out,  msg + 2,  32);
+    if (serial_id_out)    *serial_id_out   = get_u64_be_itx(msg + 34);
+    if (prevtxid_out)     memcpy(prevtxid_out,    msg + 42, 32);
+    if (prevtx_vout_out)  *prevtx_vout_out = get_u32_be(msg + 74);
+    if (sequence_out)     *sequence_out    = get_u32_be(msg + 78);
     return 1;
 }
 
-/* tx_add_output (type 67): type(2)+cid(32)+serial(8)+sats(8)+slen(2)+script(var) */
 size_t splice_build_tx_add_output(const unsigned char channel_id[32],
-                                   uint64_t serial_id, uint64_t sats,
-                                   const unsigned char *script, uint16_t script_len,
+                                   uint64_t serial_id,
+                                   uint64_t sats,
+                                   const unsigned char *script,
+                                   uint16_t script_len,
                                    unsigned char *buf, size_t buf_cap)
 {
-    size_t need = 2 + 32 + 8 + 8 + 2 + script_len;
-    if (!channel_id || !buf || buf_cap < need) return 0;
-    size_t pos = 0;
-    put_u16_be(buf + pos, (uint16_t)MSG_TX_ADD_OUTPUT); pos += 2;
-    memcpy(buf + pos, channel_id, 32); pos += 32;
-    put_u64_be(buf + pos, serial_id); pos += 8;
-    put_u64_be(buf + pos, sats); pos += 8;
-    put_u16_be(buf + pos, script_len); pos += 2;
-    if (script && script_len > 0) { memcpy(buf + pos, script, script_len); pos += script_len; }
-    return pos;
+    size_t needed = 52 + script_len;
+    if (!buf || buf_cap < needed || !channel_id) return 0;
+    size_t p = 0;
+    put_u16_be(buf + p, MSG_TX_ADD_OUTPUT); p += 2;
+    memcpy(buf + p, channel_id, 32);        p += 32;
+    put_u64_be_itx(buf + p, serial_id);     p += 8;
+    put_u64_be_itx(buf + p, sats);          p += 8;
+    put_u16_be(buf + p, script_len);        p += 2;
+    if (script && script_len > 0) { memcpy(buf + p, script, script_len); p += script_len; }
+    return p;
 }
 
 int splice_parse_tx_add_output(const unsigned char *msg, size_t msg_len,
                                 unsigned char channel_id_out[32],
-                                uint64_t *serial_id_out, uint64_t *sats_out,
-                                unsigned char *script_out, uint16_t *script_len_out)
+                                uint64_t *serial_id_out,
+                                uint64_t *sats_out,
+                                unsigned char *script_out,
+                                uint16_t *script_len_out)
 {
-    if (!msg || msg_len < 54) return 0;
+    if (!msg || msg_len < 52) return 0;
     if (get_u16_be(msg) != MSG_TX_ADD_OUTPUT) return 0;
-    uint16_t slen = (uint16_t)(((uint16_t)msg[50] << 8) | msg[51]);
+    uint16_t slen = ((uint16_t)msg[50] << 8) | msg[51];
     if (msg_len < (size_t)(52 + slen)) return 0;
-    if (channel_id_out) memcpy(channel_id_out, msg + 2, 32);
-    if (serial_id_out)  *serial_id_out = get_u64_be(msg + 34);
-    if (sats_out)       *sats_out      = get_u64_be(msg + 42);
-    if (script_len_out) *script_len_out = slen;
+    if (channel_id_out)  memcpy(channel_id_out, msg + 2,  32);
+    if (serial_id_out)   *serial_id_out = get_u64_be_itx(msg + 34);
+    if (sats_out)        *sats_out      = get_u64_be_itx(msg + 42);
+    if (script_len_out)  *script_len_out = slen;
     if (script_out && slen > 0) memcpy(script_out, msg + 52, slen);
     return 1;
 }
 
-/* tx_remove_input (type 68) and tx_remove_output (type 69):
-   type(2)+cid(32)+serial(8) = 42 bytes */
+static size_t build_tx_remove(uint16_t mtype, const unsigned char channel_id[32],
+                               uint64_t serial_id, unsigned char *buf, size_t buf_cap)
+{
+    if (!buf || buf_cap < 42 || !channel_id) return 0;
+    size_t p = 0;
+    put_u16_be(buf + p, mtype);       p += 2;
+    memcpy(buf + p, channel_id, 32);  p += 32;
+    put_u64_be_itx(buf + p, serial_id); p += 8;
+    return p;
+}
+
 size_t splice_build_tx_remove_input(const unsigned char channel_id[32],
                                      uint64_t serial_id,
                                      unsigned char *buf, size_t buf_cap)
 {
-    if (!channel_id || !buf || buf_cap < 42) return 0;
-    put_u16_be(buf, (uint16_t)MSG_TX_REMOVE_INPUT);
-    memcpy(buf + 2, channel_id, 32);
-    put_u64_be(buf + 34, serial_id);
-    return 42;
+    return build_tx_remove(MSG_TX_REMOVE_INPUT, channel_id, serial_id, buf, buf_cap);
 }
 
 size_t splice_build_tx_remove_output(const unsigned char channel_id[32],
                                       uint64_t serial_id,
                                       unsigned char *buf, size_t buf_cap)
 {
-    if (!channel_id || !buf || buf_cap < 42) return 0;
-    put_u16_be(buf, (uint16_t)MSG_TX_REMOVE_OUTPUT);
-    memcpy(buf + 2, channel_id, 32);
-    put_u64_be(buf + 34, serial_id);
-    return 42;
+    return build_tx_remove(MSG_TX_REMOVE_OUTPUT, channel_id, serial_id, buf, buf_cap);
 }
 
 int splice_parse_tx_remove(const unsigned char *msg, size_t msg_len,
@@ -357,17 +361,16 @@ int splice_parse_tx_remove(const unsigned char *msg, size_t msg_len,
 {
     if (!msg || msg_len < 42) return 0;
     if (get_u16_be(msg) != expected_type) return 0;
-    if (channel_id_out) memcpy(channel_id_out, msg + 2, 32);
-    if (serial_id_out)  *serial_id_out = get_u64_be(msg + 34);
+    if (channel_id_out)  memcpy(channel_id_out, msg + 2, 32);
+    if (serial_id_out)   *serial_id_out = get_u64_be_itx(msg + 34);
     return 1;
 }
 
-/* tx_complete (type 70): type(2)+cid(32) = 34 bytes */
 size_t splice_build_tx_complete(const unsigned char channel_id[32],
                                  unsigned char *buf, size_t buf_cap)
 {
-    if (!channel_id || !buf || buf_cap < 34) return 0;
-    put_u16_be(buf, (uint16_t)MSG_TX_COMPLETE);
+    if (!buf || buf_cap < 34 || !channel_id) return 0;
+    put_u16_be(buf, MSG_TX_COMPLETE);
     memcpy(buf + 2, channel_id, 32);
     return 34;
 }
@@ -381,22 +384,21 @@ int splice_parse_tx_complete(const unsigned char *msg, size_t msg_len,
     return 1;
 }
 
-/* tx_signatures (type 71): type(2)+cid(32)+txid(32)+wit_len(2)+witness(var) */
 size_t splice_build_tx_signatures(const unsigned char channel_id[32],
                                    const unsigned char txid[32],
                                    const unsigned char *witness,
                                    uint16_t witness_len,
                                    unsigned char *buf, size_t buf_cap)
 {
-    size_t need = 2 + 32 + 32 + 2 + witness_len;
-    if (!channel_id || !txid || !buf || buf_cap < need) return 0;
-    size_t pos = 0;
-    put_u16_be(buf + pos, (uint16_t)MSG_TX_SIGNATURES); pos += 2;
-    memcpy(buf + pos, channel_id, 32); pos += 32;
-    memcpy(buf + pos, txid, 32); pos += 32;
-    put_u16_be(buf + pos, witness_len); pos += 2;
-    if (witness && witness_len > 0) { memcpy(buf + pos, witness, witness_len); pos += witness_len; }
-    return pos;
+    size_t needed = 68 + witness_len;
+    if (!buf || buf_cap < needed || !channel_id || !txid) return 0;
+    size_t p = 0;
+    put_u16_be(buf + p, MSG_TX_SIGNATURES); p += 2;
+    memcpy(buf + p, channel_id, 32);        p += 32;
+    memcpy(buf + p, txid, 32);              p += 32;
+    put_u16_be(buf + p, witness_len);       p += 2;
+    if (witness && witness_len > 0) { memcpy(buf + p, witness, witness_len); p += witness_len; }
+    return p;
 }
 
 int splice_parse_tx_signatures(const unsigned char *msg, size_t msg_len,
@@ -407,11 +409,80 @@ int splice_parse_tx_signatures(const unsigned char *msg, size_t msg_len,
 {
     if (!msg || msg_len < 68) return 0;
     if (get_u16_be(msg) != MSG_TX_SIGNATURES) return 0;
-    uint16_t wlen = (uint16_t)(((uint16_t)msg[66] << 8) | msg[67]);
+    uint16_t wlen = ((uint16_t)msg[66] << 8) | msg[67];
     if (msg_len < (size_t)(68 + wlen)) return 0;
-    if (channel_id_out)  memcpy(channel_id_out, msg + 2, 32);
-    if (txid_out)        memcpy(txid_out, msg + 34, 32);
-    if (witness_len_out) *witness_len_out = wlen;
+    if (channel_id_out)   memcpy(channel_id_out,  msg + 2,  32);
+    if (txid_out)         memcpy(txid_out,         msg + 34, 32);
+    if (witness_len_out)  *witness_len_out = wlen;
     if (witness_out && wlen > 0) memcpy(witness_out, msg + 68, wlen);
     return 1;
+}
+
+/* ---- BOLT #2 Quiescence Handshake (types 140 / 141) ---- */
+
+/*
+ * splice_send_stfu — send stfu (type 140) to initiate quiescence.
+ * Wire: type(2) + channel_id(32) = 34 bytes total.
+ * Returns 0 on success, -1 on error.
+ */
+int splice_send_stfu(peer_mgr_t *pmgr, int peer_idx,
+                     const unsigned char channel_id[32])
+{
+    if (!pmgr || !channel_id || peer_idx < 0) return -1;
+    unsigned char msg[34];
+    msg[0] = 0x00;
+    msg[1] = 0x8C;  /* type 140 = MSG_STFU */
+    memcpy(msg + 2, channel_id, 32);
+    return peer_mgr_send(pmgr, peer_idx, msg, 34) ? 0 : -1;
+}
+
+/*
+ * splice_handle_stfu — handle incoming stfu (type 140).
+ *
+ * Cross-initiation: if both sides sent stfu simultaneously (*qs_state ==
+ * QUIESCE_INITIATED), the channel becomes quiescent immediately; no reply
+ * needed because the peer will receive our stfu as its own reply.
+ *
+ * Normal case: reply with stfu_reply (type 141) and mark QUIESCE_ACTIVE.
+ *
+ * Returns 0 on success, -1 on send error in normal case.
+ */
+int splice_handle_stfu(peer_mgr_t *pmgr, int peer_idx,
+                       const unsigned char channel_id[32],
+                       quiesce_state_t *qs_state)
+{
+    if (!qs_state || !channel_id) return -1;
+
+    if (*qs_state == QUIESCE_INITIATED) {
+        /* Cross-initiation: both sent stfu; channel is now quiescent */
+        *qs_state = QUIESCE_ACTIVE;
+        return 0;
+    }
+
+    /* Send stfu_reply (type 141) back to peer.
+     * Update state first; a failed send is non-fatal for quiescence tracking. */
+    *qs_state = QUIESCE_ACTIVE;
+    if (pmgr && peer_idx >= 0) {
+        unsigned char reply[34];
+        reply[0] = 0x00;
+        reply[1] = 0x8D;  /* type 141 = MSG_STFU_REPLY */
+        memcpy(reply + 2, channel_id, 32);
+        if (!peer_mgr_send(pmgr, peer_idx, reply, 34)) return -1;
+    }
+    return 0;
+}
+
+/*
+ * splice_handle_stfu_reply — handle incoming stfu_reply (type 141).
+ * We must have been in QUIESCE_INITIATED state (i.e. we sent stfu first).
+ * Returns 0 on success, -1 if the reply was unexpected.
+ */
+int splice_handle_stfu_reply(const unsigned char channel_id[32],
+                              quiesce_state_t *qs_state)
+{
+    (void)channel_id;  /* channel_id not used here; caller already routed by it */
+    if (!qs_state) return -1;
+    if (*qs_state != QUIESCE_INITIATED) return -1;
+    *qs_state = QUIESCE_ACTIVE;
+    return 0;
 }

@@ -21,6 +21,7 @@
 #include <secp256k1.h>
 #include "channel.h"
 #include "peer_mgr.h"
+#include "wallet_source.h"
 
 /* BOLT #2 wire message types */
 #define CHAN_MSG_OPEN_CHANNEL        32
@@ -49,6 +50,8 @@ typedef struct {
     uint16_t max_accepted_htlcs;    /* default 483 */
     int      announce_channel;      /* 1 = public channel */
     int      zero_conf;             /* 1 = send minimum_depth=0 (LSPS2 / Phoenix compat) */
+    /* Wallet for UTXO selection and signing (NULL = skip tx building) */
+    wallet_source_t *wallet;
     /* Local channel keys (from channel_t) */
     unsigned char funding_pubkey[33];
     unsigned char revocation_basepoint[33];
@@ -99,6 +102,18 @@ int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
                      channel_t *ch);
 
 /*
+ * Build the P2WSH 2-of-2 multisig scriptPubKey for the funding output.
+ * Pubkeys are sorted lexicographically (BOLT #3).
+ * spk_out must be at least 34 bytes.
+ * Returns 1 on success, 0 on failure.
+ */
+int chan_build_p2wsh_funding_output(
+    secp256k1_context *ctx,
+    const unsigned char local_pk[33],
+    const unsigned char remote_pk[33],
+    unsigned char spk_out[34]);
+
+/*
  * Build a raw open_channel message payload.
  * Fills buf (caller supplies; at least 300 bytes).
  * Returns number of bytes written, or 0 on error.
@@ -127,5 +142,25 @@ int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
                           const unsigned char *msg, size_t msg_len,
                           secp256k1_context *ctx,
                           channel_t *ch_out);
+
+/*
+ * Send announcement_signatures (type 259) to peer.
+ * Builds the channel_announcement hash, signs with node_privkey and
+ * ch->local_funding_secret, then sends the 170-byte wire message.
+ *
+ * Guards: ch->short_channel_id == 0 returns -1.
+ * Sets ch->ann_sigs_sent = 1 on success.
+ * chain_hash: 32-byte chain hash (use GOSSIP_CHAIN_HASH_MAINNET).
+ * Returns 0 on success, -1 on error.
+ */
+int chan_send_announcement_sigs(peer_mgr_t *pmgr, int peer_idx,
+                                 secp256k1_context *ctx,
+                                 const unsigned char node_privkey[32],
+                                 channel_t *ch,
+                                 const unsigned char chain_hash[32]);
+
+/* Dynamic commitment upgrade (BOLT #2 PR #880) */
+int channel_type_upgrade_valid(uint32_t current_bits, uint32_t proposed_bits);
+int channel_type_propose_upgrade(channel_t *ch, uint32_t new_bits);
 
 #endif /* SUPERSCALAR_CHAN_OPEN_H */

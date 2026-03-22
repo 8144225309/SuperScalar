@@ -27,6 +27,8 @@
 #include "gossip_store.h"
 #include "chan_close.h"
 #include "scb.h"
+#include "gossip_ingest.h"
+#include "circuit_breaker.h"
 
 /*
  * Aggregate context for the LN dispatch loop.
@@ -51,6 +53,7 @@ typedef struct {
     /* Phase M: per-peer channel state (indexed by peer_idx, may be NULL) */
     channel_t             **peer_channels;
     gossip_store_t        *gs;            /* gossip store for query responses; NULL=disabled */
+    gossip_ingest_t       *gi;            /* gossip ingest pipeline; NULL = passthrough gs only */
     struct persist_t      *persist;       /* factory work queue; NULL=disabled */
     /* Cooperative close: callback to broadcast signed closing tx */
     void (*broadcast_tx_cb)(void *ctx, const unsigned char *tx, size_t tx_len);
@@ -58,6 +61,7 @@ typedef struct {
     /* PR #28: Static channel backup — path to write SCB on channel_ready.
        NULL = disabled. Updated automatically when channels change state. */
     const char *scb_path;
+    circuit_breaker_t     *cb;           /* per-peer HTLC limits; NULL=disabled */
 } ln_dispatch_t;
 
 /*
@@ -65,6 +69,15 @@ typedef struct {
  * Looks up next peer by next_hop_scid via peer_mgr_find_by_scid().
  * Returns number of HTLCs successfully sent.
  */
+
+/*
+ * Load persisted state (invoices, peer channels) into dispatch tables.
+ * Call once after setting d->persist and d->invoices, before ln_dispatch_run().
+ * Restores invoices from SQLite via persist_load_ln_invoices().
+ * Returns total number of items loaded, or -1 on error (NULL d or persist).
+ */
+int ln_dispatch_load_state(ln_dispatch_t *d);
+
 int ln_dispatch_flush_relay(ln_dispatch_t *d);
 
 /*
