@@ -5,6 +5,7 @@
  */
 
 #include "superscalar/onion_msg.h"
+#include "superscalar/onion_message.h"  /* ONION_MSG_TLV_* defines */
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
