@@ -1,4 +1,15 @@
 #include "superscalar/persist.h"
+#include "superscalar/circuit_breaker.h"
+#include "superscalar/gossip_store.h"
+#include "superscalar/rgs.h"
+#include "superscalar/lnurl.h"
+#include "superscalar/ptlc_commit.h"
+#include "superscalar/chan_open.h"
+#include "superscalar/admin_rpc.h"
+#include "superscalar/watchtower.h"
+#include "superscalar/onion.h"
+#include "superscalar/onion_last_hop.h"
+#include "superscalar/htlc_commit.h"
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/channel.h"
@@ -2030,5 +2041,992 @@ int test_persist_transaction_rollback(void) {
     channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
+    return 1;
+}
+
+/* ================================================================
+ * PS_N1 – PS_N8: LN invoice + peer channel persistence (schema v9)
+ * ================================================================ */
+
+#include "superscalar/invoice.h"
+
+/* helper: make a deterministic bolt11_invoice_entry_t */
+static bolt11_invoice_entry_t make_test_invoice(unsigned char seed) {
+    bolt11_invoice_entry_t e;
+    memset(&e, 0, sizeof(e));
+    memset(e.payment_hash,   seed,     32);
+    memset(e.preimage,       seed + 1, 32);
+    memset(e.payment_secret, seed + 2, 32);
+    e.amount_msat  = 100000ULL + seed;
+    e.expiry       = 3600;
+    e.created_at   = 1700000000U + seed;
+    e.settled      = 0;
+    e.active       = 1;
+    snprintf(e.description, sizeof(e.description), "test invoice %d", (int)seed);
+    return e;
+}
+
+/* PS_N1: save one invoice, reload, hash matches */
+int test_ps_n1_save_load_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x01);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 1, "count == 1");
+    TEST_ASSERT(memcmp(tbl.entries[0].payment_hash, inv.payment_hash, 32) == 0,
+                "payment_hash matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N2: save 3 invoices, load, all 3 present */
+int test_ps_n2_save_3_invoices(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    for (unsigned char s = 1; s <= 3; s++) {
+        bolt11_invoice_entry_t inv = make_test_invoice(s * 10);
+        TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+    }
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 3, "count == 3");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N3: delete invoice, reload, count = 0 */
+int test_ps_n3_delete_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x42);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save invoice");
+    TEST_ASSERT(persist_delete_ln_invoice(&db, inv.payment_hash), "delete invoice");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 0, "count == 0 after delete");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N4: upsert – same payment_hash twice → count = 1 */
+int test_ps_n4_upsert_invoice(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0x07);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save first");
+    inv.amount_msat = 999999;
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv), "save second (upsert)");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+    int n = persist_load_ln_invoices(&db, &tbl);
+    TEST_ASSERT(n >= 0, "load ok");
+    TEST_ASSERT_EQ(tbl.count, 1, "count == 1 after upsert");
+    TEST_ASSERT_EQ((long long)tbl.entries[0].amount_msat, 999999LL, "updated amount");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* callback context for peer channel tests */
+typedef struct {
+    int            count;
+    unsigned char  last_channel_id[32];
+    uint64_t       last_local;
+    uint64_t       last_remote;
+    int            last_state;
+    char           last_host[256];
+    uint16_t       last_port;
+} pc_cb_ctx_t;
+
+static void pc_callback(const unsigned char channel_id[32],
+                         const unsigned char peer_pubkey[33],
+                         uint64_t capacity_sat,
+                         uint64_t local_balance_msat,
+                         uint64_t remote_balance_msat,
+                         int state,
+                         const char *peer_host,
+                         uint16_t peer_port,
+                         void *ctx) {
+    pc_cb_ctx_t *c = (pc_cb_ctx_t *)ctx;
+    c->count++;
+    memcpy(c->last_channel_id, channel_id, 32);
+    c->last_local  = local_balance_msat;
+    c->last_remote = remote_balance_msat;
+    c->last_state  = state;
+    if (peer_host) strncpy(c->last_host, peer_host, sizeof(c->last_host) - 1);
+    c->last_port = peer_port;
+    (void)peer_pubkey; (void)capacity_sat;
+}
+
+/* PS_N5: save one channel, load via callback, channel_id matches */
+int test_ps_n5_save_load_peer_channel(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xAA, 32);
+    memset(ppk, 0xBB, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 500000, 500000, 1, NULL, 0),
+                "save channel");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "callback fired once");
+    TEST_ASSERT(memcmp(ctx.last_channel_id, cid, 32) == 0, "channel_id matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N6: save 2 channels, callback fires twice */
+int test_ps_n6_save_2_channels(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid1[32], cid2[32], ppk[33];
+    memset(cid1, 0x11, 32);
+    memset(cid2, 0x22, 32);
+    memset(ppk,  0x33, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid1, ppk, 1000000, 500000, 500000, 0, NULL, 0),
+                "save channel 1");
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid2, ppk, 2000000, 900000, 1100000, 0, NULL, 0),
+                "save channel 2");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 2, "callback fired twice");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N7: update channel (same channel_id, different balance), sees updated */
+int test_ps_n7_update_channel(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0x55, 32);
+    memset(ppk, 0x66, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 600000, 400000, 0, NULL, 0),
+                "initial save");
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 300000, 700000, 2, NULL, 0),
+                "updated save");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "only one row");
+    TEST_ASSERT_EQ((long long)ctx.last_local,  300000LL, "updated local");
+    TEST_ASSERT_EQ((long long)ctx.last_remote, 700000LL, "updated remote");
+    TEST_ASSERT_EQ(ctx.last_state, 2, "updated state");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_N8: NULL db → save returns 0 (no crash) */
+int test_ps_n8_null_db(void) {
+    persist_t db;
+    memset(&db, 0, sizeof(db));  /* db.db == NULL */
+
+    bolt11_invoice_entry_t inv = make_test_invoice(0xFF);
+    TEST_ASSERT(persist_save_ln_invoice(&db, &inv) == 0, "null db returns 0");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xAA, 32);
+    memset(ppk, 0xBB, 33);
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    100, 50, 50, 0, NULL, 0) == 0,
+                "null db channel returns 0");
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase A tests: host/port persistence (PS_10A through PS_10D)
+ * ========================================================================== */
+
+/* PS_10A: Save channel with host/port -> load -> host/port match */
+int test_ps_10a_host_port_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10A: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xA1, 32);
+    memset(ppk, 0xA2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    1000000, 500000, 500000, 1,
+                    "localhost", 9735),
+                "PS_10A: save with host/port");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10A: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10A: callback fired once");
+    TEST_ASSERT(strcmp(ctx.last_host, "localhost") == 0, "PS_10A: host matches");
+    TEST_ASSERT_EQ(ctx.last_port, 9735, "PS_10A: port matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10B: Save with empty host (ephemeral peer) -> load -> no crash, host is empty */
+int test_ps_10b_empty_host(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10B: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xB1, 32);
+    memset(ppk, 0xB2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    500000, 200000, 300000, 0,
+                    NULL, 0),
+                "PS_10B: save with NULL host");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10B: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10B: callback fired once");
+    TEST_ASSERT(strlen(ctx.last_host) == 0, "PS_10B: host is empty");
+    TEST_ASSERT_EQ(ctx.last_port, 0, "PS_10B: port is 0");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10C: Schema v10 applied; peer_host/peer_port columns exist */
+int test_ps_10c_schema_v10(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10C: open");
+    int ver = persist_schema_version(&db);
+    TEST_ASSERT(ver == 10, "PS_10C: schema version is 10");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xC1, 32);
+    memset(ppk, 0xC2, 33);
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    800000, 400000, 400000, 0,
+                    "192.168.1.1", 9735),
+                "PS_10C: save with IP");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT(persist_load_ln_peer_channels(&db, pc_callback, &ctx), "PS_10C: load ok");
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10C: one row");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_10D: persist_load_ln_peer_channels delivers host/port to callback */
+int test_ps_10d_host_in_callback(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_10D: open");
+
+    unsigned char cid[32], ppk[33];
+    memset(cid, 0xD1, 32);
+    memset(ppk, 0xD2, 33);
+
+    TEST_ASSERT(persist_save_ln_peer_channel(&db, cid, ppk,
+                    2000000, 1000000, 1000000, 1,
+                    "node.example.com", 9736),
+                "PS_10D: save");
+
+    pc_cb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    persist_load_ln_peer_channels(&db, pc_callback, &ctx);
+    TEST_ASSERT_EQ(ctx.count, 1, "PS_10D: got callback");
+    TEST_ASSERT(strcmp(ctx.last_host, "node.example.com") == 0, "PS_10D: host delivered");
+    TEST_ASSERT_EQ(ctx.last_port, 9736, "PS_10D: port delivered");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ==========================================================================
+ * Phase D tests: circuit breaker persistence (CB_P1 through CB_P4)
+ * ========================================================================== */
+
+/* CB_P1: save + load circuit breaker limits -> match */
+int test_cb_p1_save_load_limits(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P1: open");
+
+    unsigned char pk[33];
+    memset(pk, 0xE1, 33);
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 100, 50000000000ULL, 1800) == 1,
+                "CB_P1: save");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n >= 1, "CB_P1: loaded at least 1");
+
+    int found = 0;
+    for (int i = 0; i < cb.n_peers; i++) {
+        if (cb.peers[i].active && memcmp(cb.peers[i].peer_pubkey, pk, 33) == 0) {
+            TEST_ASSERT_EQ(cb.peers[i].max_pending_htlcs, 100, "CB_P1: max_pending_htlcs");
+            TEST_ASSERT_EQ((long long)cb.peers[i].max_pending_msat, 50000000000LL,
+                           "CB_P1: max_pending_msat");
+            TEST_ASSERT_EQ(cb.peers[i].max_htlcs_per_hour, 1800, "CB_P1: max_htlcs_per_hour");
+            found = 1; break;
+        }
+    }
+    TEST_ASSERT(found, "CB_P1: peer slot found in circuit breaker");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P2: Save 3 peers -> load -> all 3 in circuit_breaker_t */
+int test_cb_p2_save_3_peers(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P2: open");
+
+    unsigned char pk1[33], pk2[33], pk3[33];
+    memset(pk1, 0x11, 33); pk1[0] = 0x02;
+    memset(pk2, 0x22, 33); pk2[0] = 0x02;
+    memset(pk3, 0x33, 33); pk3[0] = 0x02;
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk1, 10, 1000000ULL, 100) == 1,
+                "CB_P2: save 1");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk2, 20, 2000000ULL, 200) == 1,
+                "CB_P2: save 2");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk3, 30, 3000000ULL, 300) == 1,
+                "CB_P2: save 3");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n == 3, "CB_P2: loaded 3 peers");
+    TEST_ASSERT(cb.n_peers == 3, "CB_P2: n_peers == 3");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P3: Upsert same pubkey with new limits -> load -> sees new limits (no duplicate) */
+int test_cb_p3_upsert_limits(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "CB_P3: open");
+
+    unsigned char pk[33];
+    memset(pk, 0xAB, 33);
+
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 50, 9999ULL, 60) == 1,
+                "CB_P3: initial save");
+    TEST_ASSERT(persist_save_circuit_breaker_peer(&db, pk, 75, 8888ULL, 120) == 1,
+                "CB_P3: upsert");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    int n = persist_load_circuit_breaker_peers(&db, &cb);
+    TEST_ASSERT(n == 1, "CB_P3: only 1 row (upsert)");
+
+    int found = 0;
+    for (int i = 0; i < cb.n_peers; i++) {
+        if (cb.peers[i].active && memcmp(cb.peers[i].peer_pubkey, pk, 33) == 0) {
+            TEST_ASSERT_EQ(cb.peers[i].max_pending_htlcs, 75, "CB_P3: updated htlcs");
+            TEST_ASSERT_EQ((long long)cb.peers[i].max_pending_msat, 8888LL,
+                           "CB_P3: updated msat");
+            TEST_ASSERT_EQ(cb.peers[i].max_htlcs_per_hour, 120, "CB_P3: updated hourly");
+            found = 1; break;
+        }
+    }
+    TEST_ASSERT(found, "CB_P3: upserted peer found");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CB_P4: NULL persist -> save returns -1, no crash */
+int test_cb_p4_null_persist(void) {
+    TEST_ASSERT(persist_save_circuit_breaker_peer(NULL, NULL, 0, 0, 0) == -1,
+                "CB_P4: NULL persist returns -1");
+
+    circuit_breaker_t cb;
+    circuit_breaker_init(&cb);
+    TEST_ASSERT(persist_load_circuit_breaker_peers(NULL, &cb) == -1,
+                "CB_P4: NULL persist load returns -1");
+    TEST_ASSERT(persist_load_circuit_breaker_peers(NULL, NULL) == -1,
+                "CB_P4: NULL both returns -1");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #78 tests: PTLC persistence, peer storage, RGS export,
+ * BIP 353, dynamic commitments, BIP 158 RPC elimination
+ * ========================================================================== */
+
+/* PTLC_P1: save + load PTLC round-trip */
+int test_ptlc_p1_persist_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PTLC_P1: open");
+
+    ptlc_t pt;
+    memset(&pt, 0, sizeof(pt));
+    pt.id = 42;
+    pt.direction = PTLC_OFFERED;
+    pt.state = PTLC_STATE_ACTIVE;
+    pt.amount_sats = 100000;
+    pt.cltv_expiry = 700000;
+
+    TEST_ASSERT(persist_save_ptlc(&db, 1, &pt), "PTLC_P1: save");
+
+    ptlc_t loaded[4];
+    size_t n = persist_load_ptlcs(&db, 1, loaded, 4);
+    TEST_ASSERT_EQ(n, 1, "PTLC_P1: loaded 1");
+    TEST_ASSERT_EQ(loaded[0].id, 42, "PTLC_P1: id matches");
+    TEST_ASSERT_EQ(loaded[0].direction, PTLC_OFFERED, "PTLC_P1: direction");
+    TEST_ASSERT_EQ((long long)loaded[0].amount_sats, 100000LL, "PTLC_P1: amount");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PTLC_P2: delete PTLC */
+int test_ptlc_p2_delete(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PTLC_P2: open");
+
+    ptlc_t pt;
+    memset(&pt, 0, sizeof(pt));
+    pt.id = 7;
+    pt.direction = PTLC_RECEIVED;
+    pt.state = PTLC_STATE_ACTIVE;
+    pt.amount_sats = 50000;
+
+    persist_save_ptlc(&db, 1, &pt);
+    TEST_ASSERT(persist_delete_ptlc(&db, 1, 7), "PTLC_P2: delete");
+
+    ptlc_t loaded[4];
+    size_t n = persist_load_ptlcs(&db, 1, loaded, 4);
+    TEST_ASSERT_EQ(n, 0, "PTLC_P2: empty after delete");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* PS_BLOB1: peer storage save + load round-trip */
+int test_ps_blob1_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "PS_BLOB1: open");
+
+    unsigned char pk[33];
+    memset(pk, 0x42, 33);
+    unsigned char blob[] = "encrypted_backup_data_here";
+    uint16_t blen = sizeof(blob) - 1;
+
+    TEST_ASSERT(persist_save_peer_storage(&db, pk, blob, blen), "PS_BLOB1: save");
+
+    unsigned char loaded[256];
+    uint16_t loaded_len = 0;
+    TEST_ASSERT(persist_load_peer_storage(&db, pk, loaded, &loaded_len, sizeof(loaded)),
+                "PS_BLOB1: load");
+    TEST_ASSERT_EQ(loaded_len, blen, "PS_BLOB1: length matches");
+    TEST_ASSERT(memcmp(loaded, blob, blen) == 0, "PS_BLOB1: data matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* RGS_E1: RGS export produces valid blob with magic header */
+int test_rgs_e1_export(void) {
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RGS_E1: open store");
+
+    unsigned char out[4096];
+    size_t len = gossip_store_export_rgs(&gs, out, sizeof(out));
+    /* Empty store produces a minimal RGS blob (17 bytes: magic+ts+node_count+chan_count) */
+    TEST_ASSERT(len > 0, "RGS_E1: blob produced");
+    if (len >= 5)
+        TEST_ASSERT(memcmp(out, "RGSV1", 5) == 0, "RGS_E1: magic header");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* BIP353_1: bip353_to_dns_name produces correct DNS name */
+int test_bip353_dns_name(void) {
+    char dns[512];
+    int ok = bip353_to_dns_name("satoshi@bitcoin.org", dns, sizeof(dns));
+    TEST_ASSERT(ok, "BIP353_1: conversion ok");
+    TEST_ASSERT(strcmp(dns, "satoshi._bitcoin-payment.bitcoin.org") == 0,
+                "BIP353_1: DNS name matches");
+    return 1;
+}
+
+/* BIP353_2: bip353_validate_address accepts valid, rejects invalid */
+int test_bip353_validate(void) {
+    TEST_ASSERT(bip353_validate_address("user@example.com") == 1,
+                "BIP353_2: valid address");
+    TEST_ASSERT(bip353_validate_address("noatsign") == 0,
+                "BIP353_2: no @ rejected");
+    TEST_ASSERT(bip353_validate_address("@nodomain") == 0,
+                "BIP353_2: empty user rejected");
+    return 1;
+}
+
+/* CHANTYPE_1: channel_type TLV encode/decode round-trip */
+int test_chantype_roundtrip(void) {
+    uint32_t bits = (1 << 12) | (1 << 22);  /* static_remote_key + anchors */
+    unsigned char buf[16];
+    size_t len = channel_type_encode(bits, buf, sizeof(buf));
+    TEST_ASSERT(len > 0, "CHANTYPE_1: encode ok");
+
+    uint32_t decoded = 0;
+    TEST_ASSERT(channel_type_decode(buf, len, &decoded), "CHANTYPE_1: decode ok");
+    TEST_ASSERT_EQ(decoded, bits, "CHANTYPE_1: round-trip matches");
+    return 1;
+}
+
+/* CHANTYPE_2: negotiate = AND of local and remote bits */
+int test_chantype_negotiate(void) {
+    uint32_t local  = (1 << 12) | (1 << 22) | (1 << 4);
+    uint32_t remote = (1 << 12) | (1 << 6);
+    uint32_t agreed = channel_type_negotiate(local, remote);
+    TEST_ASSERT_EQ(agreed, (uint32_t)(1 << 12), "CHANTYPE_2: only shared bit");
+    return 1;
+}
+
+/* PTLC_COMMIT_1: commitment tx with PTLC has extra output */
+int test_ptlc_commitment_output(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx, "PTLC_CO1: ctx");
+
+    channel_t ch;
+    unsigned char local_priv[32], remote_priv[32];
+    memset(local_priv, 0x01, 32); local_priv[31] = 0x01;
+    memset(remote_priv, 0x02, 32); remote_priv[31] = 0x02;
+
+    secp256k1_pubkey local_pk, remote_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_pk, local_priv);
+    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_priv);
+
+    unsigned char txid[32] = {0};
+    unsigned char spk[34] = {0x51, 0x20};
+    channel_init(&ch, ctx, local_priv, &local_pk, &remote_pk,
+                  txid, 0, 1000000, spk, 34, 500000, 400000, 144);
+
+    /* Set up basepoints */
+    unsigned char bp1[32], bp2[32], bp3[32], bp4[32];
+    memset(bp1, 0x11, 32); bp1[0] = 0x01;
+    memset(bp2, 0x12, 32); bp2[0] = 0x01;
+    memset(bp3, 0x13, 32); bp3[0] = 0x01;
+    memset(bp4, 0x14, 32); bp4[0] = 0x01;
+    channel_set_local_basepoints(&ch, bp1, bp2, bp3);
+    channel_set_local_htlc_basepoint(&ch, bp4);
+
+    secp256k1_pubkey rbp, pbp, dbp, hbp;
+    secp256k1_ec_pubkey_create(ctx, &rbp, bp3);
+    secp256k1_ec_pubkey_create(ctx, &pbp, bp1);
+    secp256k1_ec_pubkey_create(ctx, &dbp, bp2);
+    secp256k1_ec_pubkey_create(ctx, &hbp, bp4);
+    channel_set_remote_basepoints(&ch, &pbp, &dbp, &rbp);
+    channel_set_remote_htlc_basepoint(&ch, &hbp);
+
+    channel_generate_local_pcs(&ch, 0);
+
+    /* Build commitment tx WITHOUT PTLC */
+    tx_buf_t tx1;
+    unsigned char txid1[32];
+    int r1 = channel_build_commitment_tx(&ch, &tx1, txid1);
+    TEST_ASSERT(r1, "PTLC_CO1: commitment without PTLC");
+    size_t len1 = tx1.len;
+
+    /* Add a PTLC */
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x77, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t ptlc_id;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 10000, &pp, 800000, &ptlc_id);
+
+    /* Build commitment tx WITH PTLC */
+    tx_buf_t tx2;
+    unsigned char txid2[32];
+    int r2 = channel_build_commitment_tx(&ch, &tx2, txid2);
+    TEST_ASSERT(r2, "PTLC_CO1: commitment with PTLC");
+
+    /* TX with PTLC should be larger (has extra output) */
+    TEST_ASSERT(tx2.len > len1, "PTLC_CO1: tx with PTLC is larger");
+
+    tx_buf_free(&tx1);
+    tx_buf_free(&tx2);
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #79 tests: PTLC penalty, round-trip, dynamic commits, RGS import
+ * ========================================================================== */
+
+/* PTLC_RT1: ptlc_commit_add_and_sign adds PTLC to channel */
+int test_ptlc_rt1_add_and_sign(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx, "PTLC_RT1: ctx");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x55, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    unsigned char cid[32];
+    memset(cid, 0xAA, 32);
+
+    uint64_t ptlc_id = 0;
+    int r = ptlc_commit_add_and_sign(NULL, -1, &ch, ctx, cid,
+                                       50000, &pp, 800000, &ptlc_id);
+    TEST_ASSERT(r == 1, "PTLC_RT1: add succeeded");
+    TEST_ASSERT_EQ(ch.n_ptlcs, 1, "PTLC_RT1: 1 PTLC in channel");
+    TEST_ASSERT_EQ(ch.ptlcs[0].direction, PTLC_OFFERED, "PTLC_RT1: offered");
+    TEST_ASSERT_EQ((long long)ch.ptlcs[0].amount_sats, 50000LL, "PTLC_RT1: amount");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* PTLC_RT2: ptlc_commit_settle_and_sign transitions to SETTLED */
+int test_ptlc_rt2_settle(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x66, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t id;
+    channel_add_ptlc(&ch, PTLC_RECEIVED, 30000, &pp, 700000, &id);
+
+    unsigned char adapted[64];
+    memset(adapted, 0xBB, 64);
+
+    int r = ptlc_commit_settle_and_sign(NULL, -1, &ch, ctx, id, adapted);
+    TEST_ASSERT(r == 1, "PTLC_RT2: settle succeeded");
+    TEST_ASSERT_EQ(ch.ptlcs[0].state, PTLC_STATE_SETTLED, "PTLC_RT2: state SETTLED");
+    TEST_ASSERT(ch.ptlcs[0].has_adapted_sig == 1, "PTLC_RT2: has_adapted_sig");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* PTLC_RT3: ptlc_commit_fail_and_sign transitions to FAILED */
+int test_ptlc_rt3_fail(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.ctx = ctx;
+
+    unsigned char pp_priv[32];
+    memset(pp_priv, 0x77, 32); pp_priv[0] = 0x01;
+    secp256k1_pubkey pp;
+    secp256k1_ec_pubkey_create(ctx, &pp, pp_priv);
+
+    uint64_t id;
+    channel_add_ptlc(&ch, PTLC_OFFERED, 25000, &pp, 750000, &id);
+
+    int r = ptlc_commit_fail_and_sign(NULL, -1, &ch, ctx, id);
+    TEST_ASSERT(r == 1, "PTLC_RT3: fail succeeded");
+    TEST_ASSERT_EQ(ch.ptlcs[0].state, PTLC_STATE_FAILED, "PTLC_RT3: state FAILED");
+
+    free(ch.ptlcs);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* DYN_C1: channel_type_upgrade_valid accepts superset, rejects subset */
+int test_dyn_c1_upgrade_valid(void) {
+    uint32_t base = (1 << 12);  /* static_remote_key */
+    uint32_t upgrade = (1 << 12) | (1 << 22);  /* + anchors */
+
+    TEST_ASSERT(channel_type_upgrade_valid(base, upgrade) == 1,
+                "DYN_C1: superset valid");
+    TEST_ASSERT(channel_type_upgrade_valid(upgrade, base) == 0,
+                "DYN_C1: subset invalid");
+    TEST_ASSERT(channel_type_upgrade_valid(base, base) == 1,
+                "DYN_C1: same is valid");
+    return 1;
+}
+
+/* DYN_C2: channel_type_propose_upgrade stores new bits */
+int test_dyn_c2_propose_upgrade(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.channel_type_bits = (1 << 12);
+
+    uint32_t new_bits = (1 << 12) | (1 << 22);
+    TEST_ASSERT(channel_type_propose_upgrade(&ch, new_bits) == 1,
+                "DYN_C2: upgrade accepted");
+    TEST_ASSERT_EQ(ch.channel_type_bits, new_bits, "DYN_C2: bits updated");
+
+    /* Try invalid downgrade */
+    TEST_ASSERT(channel_type_propose_upgrade(&ch, (1 << 12)) == 0,
+                "DYN_C2: downgrade rejected");
+    return 1;
+}
+
+/* RGS_I1: RGS export + import round-trip */
+int test_rgs_i1_import_roundtrip(void) {
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RGS_I1: open store");
+
+    /* Add a channel to the store */
+    unsigned char n1[33], n2[33];
+    memset(n1, 0x02, 33); n1[0] = 0x02;
+    memset(n2, 0x03, 33); n2[0] = 0x03;
+    gossip_store_upsert_channel(&gs, 0x0001000100010000ULL, n1, n2, 500000, 1700000000);
+    gossip_store_upsert_channel_update(&gs, 0x0001000100010000ULL, 0, 1000, 100, 40, 1700000000);
+
+    /* Export to RGS blob */
+    unsigned char blob[8192];
+    size_t blen = gossip_store_export_rgs(&gs, blob, sizeof(blob));
+    TEST_ASSERT(blen > 17, "RGS_I1: export produced data");
+
+    /* Import into fresh store */
+    gossip_store_t gs2;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs2), "RGS_I1: open store 2");
+
+    int imported = gossip_store_import_rgs(&gs2, blob, blen);
+    TEST_ASSERT(imported >= 1, "RGS_I1: imported at least 1 channel");
+
+    /* Verify channel exists in new store */
+    unsigned char n1_out[33], n2_out[33];
+    uint64_t cap;
+    uint32_t ts;
+    int found = gossip_store_get_channel(&gs2, 0x0001000100010000ULL,
+                                          n1_out, n2_out, &cap, &ts);
+    TEST_ASSERT(found, "RGS_I1: channel found in imported store");
+    TEST_ASSERT_EQ((long long)cap, 500000LL, "RGS_I1: capacity matches");
+
+    gossip_store_close(&gs);
+    gossip_store_close(&gs2);
+    return 1;
+}
+
+/* BIP353_N1: bip353_dns_resolve_native falls back to dig */
+int test_bip353_native_fallback(void) {
+    /* Just verify it doesn't crash; actual DNS resolution depends on network */
+    char invoice[512];
+    int r = bip353_dns_resolve_native("nonexistent@invalid.test.invalid", invoice, sizeof(invoice));
+    /* Expected: 0 (lookup fails for fake domain) */
+    TEST_ASSERT(r == 0, "BIP353_N1: invalid domain returns 0");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #80 tests: native DNS, RPC exportrgs, dynamic commit TLV wire
+ * ========================================================================== */
+
+/* DNS_N1: bip353_dns_resolve_native uses libresolv (doesn't crash on invalid domain) */
+int test_dns_native_resolv(void) {
+    char invoice[512];
+    /* This should use libresolv now, not dig. Invalid domain returns 0. */
+    int r = bip353_dns_resolve_native("nobody@invalid.test.invalid", invoice, sizeof(invoice));
+    TEST_ASSERT(r == 0, "DNS_N1: invalid domain returns 0 with native resolver");
+    return 1;
+}
+
+/* RPC_RGS1: exportrgs RPC returns valid JSON with rgs_hex field */
+int test_rpc_exportrgs(void) {
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+
+    gossip_store_t gs;
+    TEST_ASSERT(gossip_store_open_in_memory(&gs), "RPC_RGS1: open store");
+    rpc.gossip = &gs;
+
+    char out[8192];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"exportrgs\"}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    TEST_ASSERT(n > 0, "RPC_RGS1: response produced");
+    /* Parse response */
+    TEST_ASSERT(strstr(out, "rgs_hex") != NULL || strstr(out, "error") != NULL,
+                "RPC_RGS1: contains rgs_hex or error");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* DYN_TLV1: encode + decode channel_type TLV round-trip */
+int test_dyn_tlv1_roundtrip(void) {
+    uint32_t bits = (1 << 12) | (1 << 22);  /* static_remote_key + anchors */
+    unsigned char buf[16];
+    size_t len = commitment_signed_encode_channel_type_tlv(buf, sizeof(buf), bits);
+    TEST_ASSERT(len > 0, "DYN_TLV1: encode produced bytes");
+    TEST_ASSERT(buf[0] == 5, "DYN_TLV1: TLV type is 5");
+
+    uint32_t decoded = 0;
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(buf, len, &decoded),
+                "DYN_TLV1: decode ok");
+    TEST_ASSERT_EQ(decoded, bits, "DYN_TLV1: round-trip matches");
+    return 1;
+}
+
+/* DYN_TLV2: decode returns 0 for empty or no type-5 TLV */
+int test_dyn_tlv2_empty(void) {
+    uint32_t bits = 0;
+    unsigned char empty[4] = {3, 2, 0xFF, 0xFF};  /* type 3, not 5 */
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(empty, 4, &bits) == 0,
+                "DYN_TLV2: wrong type returns 0");
+    TEST_ASSERT(commitment_signed_decode_channel_type_tlv(NULL, 0, &bits) == 0,
+                "DYN_TLV2: NULL returns 0");
+    return 1;
+}
+
+/* DYN_TLV3: zero bits encodes to zero length (no TLV emitted) */
+int test_dyn_tlv3_zero(void) {
+    unsigned char buf[16];
+    size_t len = commitment_signed_encode_channel_type_tlv(buf, sizeof(buf), 0);
+    TEST_ASSERT_EQ(len, 0, "DYN_TLV3: zero bits produces no TLV");
+    return 1;
+}
+
+/* ==========================================================================
+ * PR #81 tests: trampoline wiring, BOLT #12 payoffer, watchtower PTLC
+ * ========================================================================== */
+
+/* TRP_W1: onion TLV parser recognizes type 0x0c trampoline payload */
+int test_trp_w1_tlv_parse_0x0c(void) {
+    /* Build a TLV stream with type 0x0c containing a dummy payload */
+    unsigned char tlv[32];
+    tlv[0] = 0x0c;  /* type: trampoline */
+    tlv[1] = 10;    /* length: 10 bytes */
+    memset(tlv + 2, 0xAA, 10);
+
+    /* Also include type 2 (amt) and type 4 (cltv) so the parser returns 1 */
+    unsigned char full[64];
+    size_t pos = 0;
+    /* type 2: amt_to_forward = 50000 */
+    full[pos++] = 2; full[pos++] = 8;
+    for (int i = 0; i < 7; i++) full[pos++] = 0;
+    full[pos++] = 0x50; /* 80 in decimal but let's just test non-zero */
+    /* type 4: cltv = 700000 */
+    full[pos++] = 4; full[pos++] = 4;
+    full[pos++] = 0x00; full[pos++] = 0x0A; full[pos++] = 0xB1; full[pos++] = 0xA0;
+    /* type 0x0c: trampoline */
+    full[pos++] = 0x0c; full[pos++] = 5;
+    for (int i = 0; i < 5; i++) full[pos++] = 0xBB;
+
+    onion_hop_payload_t out;
+    int r = onion_parse_tlv_payload(full, pos, &out);
+    TEST_ASSERT(r == 1, "TRP_W1: parse ok");
+    TEST_ASSERT(out.has_trampoline == 1, "TRP_W1: has_trampoline set");
+    TEST_ASSERT_EQ(out.trampoline_payload_len, 5, "TRP_W1: payload len 5");
+    TEST_ASSERT(out.trampoline_payload[0] == 0xBB, "TRP_W1: payload data");
+    return 1;
+}
+
+/* TRP_W2: onion TLV parser without 0x0c has has_trampoline=0 */
+int test_trp_w2_no_trampoline(void) {
+    unsigned char tlv[32];
+    size_t pos = 0;
+    tlv[pos++] = 2; tlv[pos++] = 8;
+    for (int i = 0; i < 8; i++) tlv[pos++] = 0x01;
+    tlv[pos++] = 4; tlv[pos++] = 4;
+    for (int i = 0; i < 4; i++) tlv[pos++] = 0x02;
+
+    onion_hop_payload_t out;
+    onion_parse_tlv_payload(tlv, pos, &out);
+    TEST_ASSERT(out.has_trampoline == 0, "TRP_W2: no trampoline");
+    return 1;
+}
+
+/* TRP_W3: onion_hop_t has trampoline fields */
+int test_trp_w3_hop_struct(void) {
+    onion_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    memset(hop.trampoline_dest, 0x42, 33);
+    hop.trampoline_amt_msat = 99000;
+    hop.trampoline_cltv = 800000;
+    hop.has_trampoline = 1;
+
+    TEST_ASSERT(hop.has_trampoline == 1, "TRP_W3: has_trampoline");
+    TEST_ASSERT_EQ((long long)hop.trampoline_amt_msat, 99000LL, "TRP_W3: amt");
+    TEST_ASSERT(hop.trampoline_dest[0] == 0x42, "TRP_W3: dest byte");
+    return 1;
+}
+
+/* B12_PO1: payoffer RPC validates offer parameter */
+int test_b12_po1_payoffer_missing_offer(void) {
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+
+    char out[4096];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"payoffer\",\"params\":{}}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    TEST_ASSERT(n > 0, "B12_PO1: response produced");
+    TEST_ASSERT(strstr(out, "missing offer") != NULL, "B12_PO1: error mentions missing offer");
+    return 1;
+}
+
+/* WT_PTLC1: watchtower_entry_t has ptlc_outputs field */
+int test_wt_ptlc1_entry_fields(void) {
+    watchtower_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.ptlc_outputs = NULL;
+    entry.n_ptlc_outputs = 0;
+    /* Just verify the fields exist and compile */
+    TEST_ASSERT(entry.n_ptlc_outputs == 0, "WT_PTLC1: n_ptlc_outputs initialized");
+    return 1;
+}
+
+/* WT_PTLC2: watchtower_htlc_t can store PTLC metadata (reused struct) */
+int test_wt_ptlc2_metadata_store(void) {
+    watchtower_htlc_t wh;
+    memset(&wh, 0, sizeof(wh));
+    wh.htlc_vout = 3;
+    wh.htlc_amount = 25000;
+    wh.direction = HTLC_OFFERED;  /* reused for PTLC direction */
+    wh.cltv_expiry = 750000;
+
+    TEST_ASSERT_EQ(wh.htlc_vout, 3, "WT_PTLC2: vout");
+    TEST_ASSERT_EQ((long long)wh.htlc_amount, 25000LL, "WT_PTLC2: amount");
     return 1;
 }

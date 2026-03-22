@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <secp256k1.h>
 
 /* -----------------------------------------------------------------------
  * Real bech32m codec for offers (lno1...)
@@ -69,6 +70,38 @@ int offer_decode(const char *bech32m, offer_t *o_out)
     if (desc_len >= BOLT12_OFFER_MAX_DESC) desc_len = BOLT12_OFFER_MAX_DESC - 1;
     memcpy(o_out->description, tmp + pos, desc_len);
     o_out->description[desc_len] = '\0';
+    return 1;
+}
+
+int offer_create(offer_t *o_out,
+                 secp256k1_context *ctx,
+                 const unsigned char our_seckey32[32],
+                 const unsigned char our_pubkey33[33],
+                 uint64_t amount_msat,
+                 const char *description,
+                 uint64_t absolute_expiry)
+{
+    if (!o_out || !our_seckey32 || !our_pubkey33) return 0;
+    (void)ctx; /* reserved for future blinded path generation */
+
+    memset(o_out, 0, sizeof(*o_out));
+    memcpy(o_out->node_id,     our_pubkey33,  33);
+    memcpy(o_out->signing_key, our_seckey32,  32);
+
+    if (amount_msat > 0) {
+        o_out->amount_msat = amount_msat;
+        o_out->has_amount  = 1;
+    }
+    if (description) {
+        size_t dl = strlen(description);
+        if (dl >= BOLT12_OFFER_MAX_DESC) dl = BOLT12_OFFER_MAX_DESC - 1;
+        memcpy(o_out->description, description, dl);
+        o_out->description[dl] = '\0';
+    }
+    if (absolute_expiry > 0) {
+        o_out->absolute_expiry = absolute_expiry;
+        o_out->has_expiry      = 1;
+    }
     return 1;
 }
 

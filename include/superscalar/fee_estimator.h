@@ -129,4 +129,40 @@ void fee_estimator_api_init(fee_estimator_api_t *fe,
                              ss_http_get_fn http_get,
                              void *http_ctx);
 
+/* -----------------------------------------------------------------------
+ * fee_est_t — lightweight fallback-aware fee estimate cache.
+ *
+ * Wraps a pluggable fee_estimator_t with a manual fallback and a simple
+ * 60-second freshness check. Useful when bitcoind is temporarily
+ * unavailable.
+ *
+ * Units: sat/kvB throughout.
+ * --------------------------------------------------------------------- */
+
+typedef struct {
+    fee_estimator_t *backend;          /* underlying estimator; may be NULL */
+    uint32_t         fallback_rate_sat_kvb;  /* manual fallback (default 1000) */
+    uint32_t         cached_rate_sat_kvb;    /* last successful fetch from backend */
+    uint64_t         last_update_ts;         /* Unix time of last successful fetch */
+} fee_est_t;
+
+/* Initialise with default fallback 1000 sat/kvB and no cached value. */
+void fee_est_init(fee_est_t *fe, fee_estimator_t *backend);
+
+/* Set a manual feerate fallback (sat/kvB).
+ * Used when bitcoind is unavailable.  Default is 1000 sat/kvB. */
+void fee_est_set_fallback(fee_est_t *fe, uint32_t feerate_sat_kvb);
+
+/* Get current feerate estimate (sat/kvB).
+ * If last_update_ts was set within the last 60 seconds the cached value is
+ * returned; otherwise the fallback is returned. */
+uint32_t fee_est_get_feerate(fee_est_t *fe);
+
+/* Store a freshly fetched rate and stamp last_update_ts = now. */
+void fee_est_set_cached(fee_est_t *fe, uint32_t feerate_sat_kvb);
+
+/* Force the cache stale so the next call to fee_est_get_feerate() returns
+ * the fallback instead of the cached value. */
+void fee_est_invalidate(fee_est_t *fe);
+
 #endif /* SUPERSCALAR_FEE_ESTIMATOR_H */

@@ -177,4 +177,11 @@ int htlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
                           const unsigned char channel_id[32],
                           const unsigned char *msg, size_t msg_len);
 
+/* Dynamic commitment upgrade TLV for commitment_signed extension */
+size_t commitment_signed_encode_channel_type_tlv(
+    unsigned char *buf, size_t buf_cap, uint32_t channel_type_bits);
+int commitment_signed_decode_channel_type_tlv(
+    const unsigned char *tlv_data, size_t tlv_len,
+    uint32_t *channel_type_bits_out);
+
 #endif /* SUPERSCALAR_HTLC_COMMIT_H */

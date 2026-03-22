@@ -27,6 +27,9 @@ typedef struct {
     char          description[256];
     int           settled;           /* 1 = already claimed */
     int           active;            /* 1 = slot in use */
+    int           has_stateless_secret;   /* 1 = payment_secret is HMAC-derived */
+    int           has_stateless_preimage; /* 1 = preimage is nonce-derived (Level 2) */
+    unsigned char stateless_nonce[32];    /* Level 2 nonce embedded in invoice metadata */
 } bolt11_invoice_entry_t;
 
 typedef struct {
