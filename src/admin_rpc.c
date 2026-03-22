@@ -13,6 +13,7 @@
  */
 
 #include "superscalar/admin_rpc.h"
+#include "superscalar/wire.h"
 #include "superscalar/rgs.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/sha256.h"
@@ -357,6 +358,53 @@ static cJSON *method_pay(admin_rpc_t *rpc, const cJSON *params,
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "payment_hash", hex);
     cJSON_AddStringToObject(r, "status", "pending");
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* Method: pay_bridge — outbound payment via CLN bridge (no routing stack) */
+/* ------------------------------------------------------------------ */
+static cJSON *method_pay_bridge(admin_rpc_t *rpc, const cJSON *params,
+                                 char *errmsg, size_t errcap)
+{
+    if (!rpc->channel_mgr) {
+        snprintf(errmsg, errcap, "no channel manager");
+        return NULL;
+    }
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)rpc->channel_mgr;
+    if (mgr->bridge_fd < 0) {
+        snprintf(errmsg, errcap, "bridge not connected");
+        return NULL;
+    }
+    const char *bolt11_str = NULL;
+    if (cJSON_IsObject(params)) {
+        cJSON *b = cJSON_GetObjectItemCaseSensitive(params, "bolt11");
+        if (cJSON_IsString(b)) bolt11_str = b->valuestring;
+    }
+    if (!bolt11_str) {
+        snprintf(errmsg, errcap, "missing bolt11 parameter");
+        return NULL;
+    }
+
+    /* Send bolt11 directly to bridge — bridge handles routing via CLN */
+    uint64_t request_id = mgr->next_request_id++;
+    unsigned char dummy_hash[32] = {0};
+    cJSON *pay_msg = wire_build_bridge_send_pay(bolt11_str, dummy_hash, request_id);
+    if (!pay_msg) {
+        snprintf(errmsg, errcap, "failed to build bridge pay message");
+        return NULL;
+    }
+    int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg);
+    cJSON_Delete(pay_msg);
+    if (!ok) {
+        snprintf(errmsg, errcap, "bridge send failed");
+        return NULL;
+    }
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "request_id", (double)request_id);
+    cJSON_AddStringToObject(r, "status", "sent_to_bridge");
+    cJSON_AddStringToObject(r, "bolt11", bolt11_str);
     return r;
 }
 
@@ -1024,6 +1072,8 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_createinvoice(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "pay") == 0) {
         result = method_pay(rpc, params, errmsg, sizeof(errmsg));
+    } else if (strcmp(m, "pay_bridge") == 0) {
+        result = method_pay_bridge(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "keysend") == 0) {
         result = method_keysend(rpc, params, errmsg, sizeof(errmsg));
     } else if (strcmp(m, "openchannel") == 0) {
