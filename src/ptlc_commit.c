@@ -140,3 +140,134 @@ int ptlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
         return -1;
     }
 }
+
+/* === PTLC commitment round-trip message senders === */
+
+static void wr16(unsigned char *b, uint16_t v) {
+    b[0] = (unsigned char)(v >> 8);
+    b[1] = (unsigned char)(v);
+}
+
+static void wr64(unsigned char *b, uint64_t v) {
+    for (int i = 7; i >= 0; i--) { b[i] = (unsigned char)(v & 0xFF); v >>= 8; }
+}
+
+/* Send PTLC add (custom type 0x4B):
+   type(2) + channel_id(32) + ptlc_id(8) + amount(8) + payment_point(33) + cltv(4) */
+int ptlc_commit_send_add(peer_mgr_t *mgr, int peer_idx,
+                           const unsigned char channel_id[32],
+                           uint64_t ptlc_id, uint64_t amount_sats,
+                           const unsigned char payment_point33[33],
+                           uint32_t cltv_expiry)
+{
+    if (!mgr || !channel_id) return 0;
+    unsigned char msg[2 + 32 + 8 + 8 + 33 + 4];
+    wr16(msg, 0x4B);
+    memcpy(msg + 2, channel_id, 32);
+    wr64(msg + 34, ptlc_id);
+    wr64(msg + 42, amount_sats);
+    memcpy(msg + 50, payment_point33, 33);
+    msg[83] = (unsigned char)(cltv_expiry >> 24);
+    msg[84] = (unsigned char)(cltv_expiry >> 16);
+    msg[85] = (unsigned char)(cltv_expiry >> 8);
+    msg[86] = (unsigned char)(cltv_expiry);
+    return peer_mgr_send(mgr, peer_idx, msg, sizeof(msg));
+}
+
+/* Send PTLC_PRESIG (type 0x4C): type(2) + ptlc_id(8) + pre_sig(64) = 74 */
+int ptlc_commit_send_presig(peer_mgr_t *mgr, int peer_idx,
+                              uint64_t ptlc_id,
+                              const unsigned char pre_sig[64])
+{
+    if (!mgr || !pre_sig) return 0;
+    unsigned char msg[74];
+    wr16(msg, 0x4C);
+    wr64(msg + 2, ptlc_id);
+    memcpy(msg + 10, pre_sig, 64);
+    return peer_mgr_send(mgr, peer_idx, msg, sizeof(msg));
+}
+
+/* Send PTLC_ADAPTED_SIG (type 0x4D): type(2) + ptlc_id(8) + adapted_sig(64) = 74 */
+int ptlc_commit_send_adapted_sig(peer_mgr_t *mgr, int peer_idx,
+                                   uint64_t ptlc_id,
+                                   const unsigned char adapted_sig[64])
+{
+    if (!mgr || !adapted_sig) return 0;
+    unsigned char msg[74];
+    wr16(msg, 0x4D);
+    wr64(msg + 2, ptlc_id);
+    memcpy(msg + 10, adapted_sig, 64);
+    return peer_mgr_send(mgr, peer_idx, msg, sizeof(msg));
+}
+
+/* Send PTLC_COMPLETE (type 0x4E): type(2) + ptlc_id(8) = 10 */
+int ptlc_commit_send_complete(peer_mgr_t *mgr, int peer_idx,
+                                uint64_t ptlc_id)
+{
+    if (!mgr) return 0;
+    unsigned char msg[10];
+    wr16(msg, 0x4E);
+    wr64(msg + 2, ptlc_id);
+    return peer_mgr_send(mgr, peer_idx, msg, sizeof(msg));
+}
+
+/* Full PTLC add + commitment round-trip:
+   1. Add PTLC to channel
+   2. Send PTLC add message
+   3. Trigger commitment_signed (caller handles) */
+int ptlc_commit_add_and_sign(peer_mgr_t *mgr, int peer_idx,
+                               channel_t *ch, secp256k1_context *ctx,
+                               const unsigned char channel_id[32],
+                               uint64_t amount_sats,
+                               const secp256k1_pubkey *payment_point,
+                               uint32_t cltv_expiry,
+                               uint64_t *ptlc_id_out)
+{
+    if (!ch || !payment_point || !channel_id) return 0;
+    (void)ctx;
+
+    uint64_t id;
+    if (!channel_add_ptlc(ch, PTLC_OFFERED, amount_sats, payment_point,
+                            cltv_expiry, &id))
+        return 0;
+    if (ptlc_id_out) *ptlc_id_out = id;
+
+    /* Serialize payment_point for wire */
+    if (mgr) {
+        unsigned char pp33[33];
+        size_t plen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, pp33, &plen, payment_point,
+                                       SECP256K1_EC_COMPRESSED);
+        ptlc_commit_send_add(mgr, peer_idx, channel_id, id, amount_sats,
+                              pp33, cltv_expiry);
+    }
+    return 1;
+}
+
+/* Settle a PTLC with adapted signature + send PTLC_ADAPTED_SIG */
+int ptlc_commit_settle_and_sign(peer_mgr_t *mgr, int peer_idx,
+                                  channel_t *ch, secp256k1_context *ctx,
+                                  uint64_t ptlc_id,
+                                  const unsigned char adapted_sig64[64])
+{
+    (void)ctx;
+    if (!ch || !adapted_sig64) return 0;
+    if (!channel_settle_ptlc(ch, ptlc_id, adapted_sig64)) return 0;
+    if (mgr)
+        ptlc_commit_send_adapted_sig(mgr, peer_idx, ptlc_id, adapted_sig64);
+    return 1;
+}
+
+/* Fail a PTLC */
+int ptlc_commit_fail_and_sign(peer_mgr_t *mgr, int peer_idx,
+                                channel_t *ch, secp256k1_context *ctx,
+                                uint64_t ptlc_id)
+{
+    (void)ctx;
+    if (!ch) return 0;
+    if (!channel_fail_ptlc(ch, ptlc_id)) return 0;
+    /* Send PTLC_COMPLETE as acknowledgment of failure */
+    if (mgr)
+        ptlc_commit_send_complete(mgr, peer_idx, ptlc_id);
+    return 1;
+}

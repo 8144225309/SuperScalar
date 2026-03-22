@@ -777,3 +777,101 @@ int test_multi_peer_round_robin(void)
     bip158_backend_free(&b);
     return 1;
 }
+
+/* ================================================================== */
+/* PR #64: Mempool cache — cb_is_in_mempool tests                    */
+/* ================================================================== */
+
+/* MP1: is_in_mempool returns false when cache is empty */
+int test_mempool_cache_empty_returns_false(void)
+{
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "regtest"), "init");
+    ASSERT(b.mempool_cache_count == 0, "MP1: cache empty on init");
+
+    /* A valid 64-char hex txid */
+    int r = (int)b.base.is_in_mempool(&b.base,
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    ASSERT(r == 0, "MP1: empty cache → not in mempool");
+
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* MP2: after populating the cache, is_in_mempool finds the entry */
+int test_mempool_cache_hit(void)
+{
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "regtest"), "init");
+
+    /* Store a known txid (internal byte order: all 0x01) */
+    memset(b.mempool_cache[0], 0x01, 32);
+    b.mempool_cache_count = 1;
+    b.mempool_cache_head  = 1;
+
+    /* Display-order hex: bytes in reverse, so byte[31..0] = all 0x01 */
+    int hit = (int)b.base.is_in_mempool(&b.base,
+        "0101010101010101010101010101010101010101010101010101010101010101");
+    ASSERT(hit == 1, "MP2: known txid found in cache");
+
+    /* A different txid is not found */
+    int miss = (int)b.base.is_in_mempool(&b.base,
+        "0202020202020202020202020202020202020202020202020202020202020202");
+    ASSERT(miss == 0, "MP2: unknown txid not found in cache");
+
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* MP3: ring wraps after BIP158_MEMPOOL_CACHE_SIZE entries */
+int test_mempool_cache_ring_wraps(void)
+{
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "regtest"), "init");
+
+    /* Fill cache with entries 0x01, 0x02, ..., 0x40 */
+    for (int i = 0; i < BIP158_MEMPOOL_CACHE_SIZE; i++) {
+        memset(b.mempool_cache[i], (unsigned char)(i + 1), 32);
+    }
+    b.mempool_cache_count = BIP158_MEMPOOL_CACHE_SIZE;
+    b.mempool_cache_head  = BIP158_MEMPOOL_CACHE_SIZE;
+
+    /* Count does not exceed capacity */
+    ASSERT(b.mempool_cache_count <= BIP158_MEMPOOL_CACHE_SIZE,
+           "MP3: count capped at capacity");
+
+    /* First entry (0x01...01) should still be found */
+    int hit = (int)b.base.is_in_mempool(&b.base,
+        "0101010101010101010101010101010101010101010101010101010101010101");
+    ASSERT(hit == 1, "MP3: first entry still found at capacity");
+
+    bip158_backend_free(&b);
+    return 1;
+}
+
+/* MP4: is_in_mempool returns false for unknown txid amid known entries */
+int test_mempool_cache_miss_with_entries(void)
+{
+    bip158_backend_t b;
+    ASSERT(bip158_backend_init(&b, "regtest"), "init");
+
+    /* Store 3 known txids */
+    memset(b.mempool_cache[0], 0xAA, 32);
+    memset(b.mempool_cache[1], 0xBB, 32);
+    memset(b.mempool_cache[2], 0xCC, 32);
+    b.mempool_cache_count = 3;
+    b.mempool_cache_head  = 3;
+
+    /* An unrelated txid is not found */
+    int r = (int)b.base.is_in_mempool(&b.base,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    ASSERT(r == 0, "MP4: unrelated txid not found");
+
+    /* Known txid (0xBB...BB) should be found */
+    int hit = (int)b.base.is_in_mempool(&b.base,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    ASSERT(hit == 1, "MP4: known txid found");
+
+    bip158_backend_free(&b);
+    return 1;
+}

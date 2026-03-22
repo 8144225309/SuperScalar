@@ -358,3 +358,46 @@ int test_ss_config_default(void)
 
     return 1;
 }
+
+
+/* -----------------------------------------------------------------------
+ * PR #75: FE1, FE2, FE3 — fee_est_t fallback / cache / invalidate tests
+ * --------------------------------------------------------------------- */
+
+/* FE1: fee_est_set_fallback -> fee_est_get_feerate returns fallback */
+int test_fee_est_fallback(void)
+{
+    fee_est_t fe;
+    fee_est_init(&fe, NULL);
+    fee_est_set_fallback(&fe, 2000);
+    uint32_t rate = fee_est_get_feerate(&fe);
+    ASSERT(rate == 2000, "FE1: get_feerate returns fallback 2000");
+    return 1;
+}
+
+/* FE2: set fallback=1000, set cached=5000 with fresh timestamp -> get returns 5000 */
+int test_fee_est_cached_fresh(void)
+{
+    fee_est_t fe;
+    fee_est_init(&fe, NULL);
+    fee_est_set_fallback(&fe, 1000);
+    fee_est_set_cached(&fe, 5000);   /* stamps last_update_ts = now */
+    uint32_t rate = fee_est_get_feerate(&fe);
+    ASSERT(rate == 5000, "FE2: fresh cached value returned (5000)");
+    return 1;
+}
+
+/* FE3: cached=5000 but stale (last_update=1) -> invalidate -> get returns fallback */
+int test_fee_est_stale_returns_fallback(void)
+{
+    fee_est_t fe;
+    fee_est_init(&fe, NULL);
+    fee_est_set_fallback(&fe, 1000);
+    /* Manually plant a stale cached value */
+    fe.cached_rate_sat_kvb = 5000;
+    fe.last_update_ts      = 1;     /* epoch 1970 — definitely stale */
+    fee_est_invalidate(&fe);        /* forces last_update_ts = 0 */
+    uint32_t rate = fee_est_get_feerate(&fe);
+    ASSERT(rate == 1000, "FE3: invalidated cache returns fallback 1000");
+    return 1;
+}

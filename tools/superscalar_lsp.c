@@ -927,6 +927,7 @@ int main(int argc, char *argv[]) {
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
     const char *rpc_file_arg = NULL;
+    const char *scb_path_arg = NULL;
     const char *tor_proxy_arg = NULL;
     const char *tor_control_arg = NULL;
     const char *tor_password = NULL;
@@ -1140,6 +1141,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--rpc-file") == 0 && i + 1 < argc)
             rpc_file_arg = argv[++i];
+        else if (strcmp(argv[i], "--scb-path") == 0 && i + 1 < argc)
+            scb_path_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-proxy") == 0 && i + 1 < argc)
             tor_proxy_arg = argv[++i];
         else if (strcmp(argv[i], "--tor-control") == 0 && i + 1 < argc)
@@ -2219,14 +2222,17 @@ int main(int argc, char *argv[]) {
             }
 
             /* Watchtower: init and wire into dispatch */
-            watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, NULL, g_db);
+            watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, fee_est, g_db);
             if (g_bip158.base.get_block_height)
                 watchtower_set_chain_backend(&g_watchtower, &g_bip158.base);
+            if (g_hd_wallet)
+                watchtower_set_wallet(&g_watchtower, &g_hd_wallet->base);
             for (size_t _wi = 0; _wi < g_channel_mgr->n_channels; _wi++)
                 watchtower_set_channel(&g_watchtower, _wi,
                                        &g_channel_mgr->entries[_wi].channel);
             g_watchtower_ready = 1;
             g_ln_dispatch.watchtower  = &g_watchtower;
+            g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
     g_ln_dispatch.jit_open_cb = on_jit_open;
     g_ln_dispatch.jit_cb_ctx  = NULL;
@@ -4739,10 +4745,6 @@ int main(int argc, char *argv[]) {
         printf("Running watchtower check...\n");
         fflush(stdout);
         watchtower_t *wt = mgr->watchtower;
-        if (wt) {
-            fprintf(stderr, "DEBUG: watchtower has %zu entries, chain=%p\n",
-                    wt->n_entries, (void *)wt->chain);
-        }
         if (!wt) {
             fprintf(stderr, "BREACH TEST FAILED: no watchtower configured\n");
             report_add_string(&rpt, "result", "breach_test_no_watchtower");

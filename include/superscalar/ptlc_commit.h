@@ -24,4 +24,40 @@ int ptlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
                           secp256k1_context *ctx,
                           const unsigned char *msg, size_t msg_len);
 
+/* PTLC commitment round-trip message senders */
+
+int ptlc_commit_send_add(peer_mgr_t *mgr, int peer_idx,
+                           const unsigned char channel_id[32],
+                           uint64_t ptlc_id, uint64_t amount_sats,
+                           const unsigned char payment_point33[33],
+                           uint32_t cltv_expiry);
+
+int ptlc_commit_send_presig(peer_mgr_t *mgr, int peer_idx,
+                              uint64_t ptlc_id,
+                              const unsigned char pre_sig[64]);
+
+int ptlc_commit_send_adapted_sig(peer_mgr_t *mgr, int peer_idx,
+                                   uint64_t ptlc_id,
+                                   const unsigned char adapted_sig[64]);
+
+int ptlc_commit_send_complete(peer_mgr_t *mgr, int peer_idx,
+                                uint64_t ptlc_id);
+
+int ptlc_commit_add_and_sign(peer_mgr_t *mgr, int peer_idx,
+                               channel_t *ch, secp256k1_context *ctx,
+                               const unsigned char channel_id[32],
+                               uint64_t amount_sats,
+                               const secp256k1_pubkey *payment_point,
+                               uint32_t cltv_expiry,
+                               uint64_t *ptlc_id_out);
+
+int ptlc_commit_settle_and_sign(peer_mgr_t *mgr, int peer_idx,
+                                  channel_t *ch, secp256k1_context *ctx,
+                                  uint64_t ptlc_id,
+                                  const unsigned char adapted_sig64[64]);
+
+int ptlc_commit_fail_and_sign(peer_mgr_t *mgr, int peer_idx,
+                                channel_t *ch, secp256k1_context *ctx,
+                                uint64_t ptlc_id);
+
 #endif /* SUPERSCALAR_PTLC_COMMIT_H */

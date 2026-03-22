@@ -162,16 +162,39 @@ add_library(superscalar
     src/probe.c
     src/peer_storage.c
     src/payment.c
+    src/rgs.c
+    src/onion_msg.c
+    src/mission_control.c
+    src/route_policy.c
+    src/fwd_history.c
+    src/htlc_accept.c
+    src/gossip_ingest.c
+    src/pathfind_exclude.c
+    src/stateless_invoice.c
+    src/onion_msg_relay.c
+    src/htlc_fee_bump.c
+    src/bolt4_failure.c
+    src/payment_uri.c
+    src/trampoline.c
+    src/hold_invoice.c
+    src/lnurl.c
+    src/liquidity_ad.c
+    src/bolt1.c
+    src/circuit_breaker.c
     src/ln_dispatch.c
     src/invoice.c
     src/admin_rpc.c
     src/factory_recovery.c
+    src/scb.c
+    src/onion_message.c
+    src/scb_recovery.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar PRIVATE ${cjson_SOURCE_DIR})
 target_include_directories(superscalar PUBLIC ${SQLite3_INCLUDE_DIRS})
-target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto OpenSSL::SSL)
+target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3 OpenSSL::Crypto OpenSSL::SSL resolv)
+target_compile_definitions(superscalar PUBLIC BIP353_USE_RESOLV)
 target_link_libraries(superscalar PRIVATE project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar PRIVATE project_sanitizers)
@@ -238,10 +261,34 @@ add_executable(test_superscalar
     tests/test_spec_vectors.c
     tests/test_payment.c
     tests/test_splice_wire.c
+    tests/test_circuit_breaker.c
+    tests/test_rgs.c
+    tests/test_onion_msg.c
+    tests/test_mission_control.c
+    tests/test_route_policy.c
+    tests/test_fwd_history.c
+    tests/test_htlc_accept.c
+    tests/test_gossip_ingest.c
+    tests/test_pathfind_exclude.c
+    tests/test_stateless_invoice.c
+    tests/test_onion_msg_relay.c
+    tests/test_htlc_fee_bump.c
+    tests/test_bolt4_failure.c
+    tests/test_payment_uri.c
+    tests/test_trampoline.c
+    tests/test_hold_invoice.c
+    tests/test_lnurl.c
+    tests/test_splice_interactive.c
+    tests/test_liquidity_ad.c
+    tests/test_bolt1.c
     tests/test_bolt12_full.c
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_chain_safety.c
+    tests/test_onion_message.c
+    tests/test_scb_recovery.c
+    tests/test_bolt9_features.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

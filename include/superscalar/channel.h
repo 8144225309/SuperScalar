@@ -151,6 +151,18 @@ typedef struct {
        Both sides must use the same root in musig_session_finalize_nonces. */
     unsigned char chan_merkle_root[32];
     int has_chan_merkle_root;
+
+    /* Dynamic commitment: negotiated channel type (BOLT #2 PR #880) */
+    uint32_t      channel_type_bits;         /* feature bits from channel_type TLV */
+
+    /* announcement_signatures (BOLT #7 type 259) */
+    uint64_t      short_channel_id;          /* block<<40 | tx_idx<<16 | vout */
+    unsigned char local_node_sig[64];        /* our Schnorr sig over channel_announcement */
+    unsigned char local_bitcoin_sig[64];     /* our bitcoin key sig over channel_announcement */
+    unsigned char remote_node_sig[64];       /* peer's node key sig */
+    unsigned char remote_bitcoin_sig[64];    /* peer's bitcoin key sig */
+    int           ann_sigs_sent;             /* 1 = we sent announcement_signatures */
+    int           ann_sigs_recv;             /* 1 = peer sent us announcement_signatures */
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
@@ -397,6 +409,24 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     const unsigned char *commitment_txid, uint32_t htlc_vout,
     uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
     uint64_t old_commitment_num, size_t htlc_index,
+    const unsigned char *anchor_spk, size_t anchor_spk_len);
+
+/* --- PTLC resolution transactions (Phase 5: production wiring) --- */
+
+int channel_build_ptlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index);
+
+int channel_build_ptlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    size_t ptlc_index);
+
+int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
+    const unsigned char *commitment_txid, uint32_t ptlc_vout,
+    uint64_t ptlc_amount, const unsigned char *ptlc_spk, size_t ptlc_spk_len,
+    uint64_t old_commitment_num, size_t ptlc_index,
     const unsigned char *anchor_spk, size_t anchor_spk_len);
 
 #endif /* SUPERSCALAR_CHANNEL_H */

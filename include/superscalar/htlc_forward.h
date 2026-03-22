@@ -48,6 +48,8 @@ typedef struct {
     /* Phase N: relay pump fields */
     unsigned char next_onion[ONION_PACKET_SIZE]; /* peeled onion for next hop */
     unsigned char in_channel_id[32];    /* BOLT #2 channel_id of inbound HTLC */
+    unsigned char payment_secret[32];   /* final-hop payment_secret from onion TLV type 8 */
+    int           has_payment_secret;    /* 1 if payment_secret was extracted */
 } htlc_forward_entry_t;
 /* NOTE: htlc_forward_table_t is ~390 KB due to next_onion[]. Declare as
  * global or heap-allocated, NOT on the stack. */
