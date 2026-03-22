@@ -2,6 +2,70 @@
 
 All notable changes to SuperScalar are documented here.
 
+## Unreleased (post-ln-phase2) — 2026-03-22
+
+LN phase 2 integration: 7 PRs (#28–#34) merged via omnibus PR #35. 21/21 signet exhibition passing with 10 bug fixes. 1355 unit tests.
+
+### Added
+
+- **LN phase 2 features (PRs #28–#34, merged via #35, +22,000 lines)**:
+  - **BOLT #1 peer protocol** (`bolt1.c`): init/error/warning/ping/pong (types 16–19), feature bit negotiation, mandatory feature check
+  - **Circuit breaker** (`circuit_breaker.c`): per-peer HTLC rate limits, token bucket, ban escalation callback
+  - **Splicing** (`splice.c`): BOLT #2 interactive tx construction, STFU quiescence (types 140/141 + legacy 0x68/0x69), splice_init/ack/locked
+  - **Liquidity advertisements** (`liquidity_ad.c`): option_will_fund (BOLT #878), node_announcement TLV, compact_lease, real pubkey derivation
+  - **Static channel backup** (`scb.c`): SCB format, save/load, disaster recovery
+  - **Onion messages** (`onion_message.c`, `onion_msg.c`): type 513, final-hop decryption, TLV routing, multi-hop relay
+  - **Trampoline routing** (`trampoline.c`): BOLT #4 trampoline header parse/unwrap
+  - **Rapid Gossip Sync** (`rgs.c`): compact gossip import/export, admin RPC
+  - **LNURL + BIP 353** (`lnurl.c`): Lightning Address, pay/withdraw, DNS resolution
+  - **Hold invoices** (`hold_invoice.c`): async HTLC delivery, settlement control
+  - **Mission control** (`mission_control.c`): payment failure scoring, channel exclusion
+  - **Route policy** (`route_policy.c`): HTLC forwarding policy enforcement
+  - **Stateless invoices** (`stateless_invoice.c`): HMAC-derived payment secrets
+  - **Gossip ingestion** (`gossip_ingest.c`): verify and store incoming BOLT #7 messages
+  - **HTLC fee bumping** (`htlc_fee_bump.c`): deadline-aware sweep fee estimation
+  - **BOLT #4 failure parser** (`bolt4_failure.c`): onion failure message decoding
+  - **Peer storage** (BOLT #9 types 7/9): store/retrieve peer blobs
+  - **Announcement signatures** (type 259): channel announcement flow
+  - **Dynamic commitments**: channel_type TLV negotiation (BOLT #2 PR #880)
+  - **PTLC penalty**: watchtower PTLC sweep on breach
+  - **Admin RPC methods**: `exportrgs`, `importrgs`, `payoffer`, `listfactories`, `recoverfactory`, `sweepfactory`, `createoffer`
+
+- **Exhibition tests S17–S21 (new protocol demonstrations)**:
+  - **S17** (`--test-jit`): JIT channel lifecycle with non-blocking state machine
+  - **S18** (`--test-realloc`): Leaf realloc with corrected sats/msat units
+  - **S19** (`--test-lsps2`): LSPS2 buy flow through daemon loop
+  - **S20** (3-factory ladder): concurrent factory lifecycle
+  - **S21** (`--test-bolt12`): BOLT #12 offer codec + signature round-trip
+
+- **Exhibition tests S22–S26 (planned)**:
+  - **S22** (`--test-buy-liquidity`): L-stock inbound capacity purchase
+  - **S23** (`--test-bip39`): BIP39 mnemonic generate/validate/seed round-trip
+  - **S24** (`--test-large-factory`): 8+ client factory with deeper DW tree
+  - **S25** (`pay_external` CLI): outbound payment via bridge
+  - **S26**: standalone watchtower deployment
+
+- **Fund recovery tool** (`tools/recover_exhibition_funds.py`): scan blockchain for stuck exhibition outputs and sweep them back to wallet
+
+### Fixed
+
+- **Leaf realloc msat/sats units** (`lsp_channels.c`): channel balance update used millisatoshis instead of satoshis after leaf realloc
+- **Epoch reset nonce double-counting** (`superscalar_client.c`): Round 2 added nonces on top of Round 1 (7 vs 5); fix: `factory_sessions_init()` before Round 2
+- **CLN plugin subprocess** (`cln_plugin.py`): `LIGHTNING_CLI` config with embedded args passed as single executable path; fix: `.split()`
+- **Inbox message drops** (`superscalar_client.c`): daemon loop inbox discarded all non-COMMITMENT_SIGNED messages; fix: re-dispatch through main switch via `goto`
+- **JIT blocking handler** (`superscalar_client.c`): synchronous `wire_recv` blocked for 10+ min on signet; fix: non-blocking state machine (WAITING_BASEPOINTS → WAITING_NONCES → WAITING_READY → COMPLETE)
+- **LSP stale messages before JIT_ACCEPT** (`jit_channel.c`): `wire_recv` got stale MSG_REGISTER_INVOICE; fix: drain loop with 1s timeout
+- **Watchtower breach detection** (`watchtower.c`): TXIDs mismatched because breach test broadcast LSP's commitment but watchtower watched for client's; fix: breach test uses `channel_build_commitment_tx_for_remote`
+- **Duplicate case value** (`ln_dispatch.c`): `BOLT1_MSG_ERROR` and `MSG_ERROR` both type 17
+- **LSPS2 test timing** (`superscalar_lsp.c`): sleep-poll loop didn't process client messages; fix: force daemon_mode for message dispatch
+- **cppcheck warnings**: duplicate expression in lnurl.c, uninitialized vars in test_chan_open.c
+
+### Architecture improvements
+
+- **Non-blocking JIT state machine**: industry-standard message-driven dispatch matching CLN/LND/LDK/Eclair pattern
+- **Inbox re-dispatch**: all message types properly handled regardless of arrival order
+- **Onion message API unification**: PR #29 and PR #34 onion implementations reconciled (build/encode 2-step API, BOLT #12 TLV types 64/66/68)
+
 ## 0.1.7 — 2026-03-19
 
 890/890 unit tests pass. Full BOLT Lightning wire protocol stack integrated on top of the SuperScalar factory layer.
