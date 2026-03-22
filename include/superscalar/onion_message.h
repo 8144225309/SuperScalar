@@ -70,11 +70,7 @@ int onion_msg_parse(const unsigned char *buf, size_t len, onion_msg_t *msg_out);
  * out/out_cap: output buffer (needs at least 2+33+2+payload_len bytes).
  * Returns bytes written to out, or 0 on error.
  */
-size_t onion_msg_build(secp256k1_context *ctx,
-                       const unsigned char dest_pubkey33[33],
-                       const unsigned char *payload, size_t payload_len,
-                       const unsigned char session_key[32],
-                       unsigned char *out, size_t out_cap);
+/* onion_msg_build is declared in onion_msg.h (PR #34 evolved version) */
 
 /*
  * Decrypt the final-hop payload of a received onion message.

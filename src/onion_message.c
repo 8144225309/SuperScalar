@@ -36,48 +36,8 @@ int onion_msg_parse(const unsigned char *buf, size_t len, onion_msg_t *msg_out)
     return 1;
 }
 
-size_t onion_msg_build(secp256k1_context *ctx,
-                       const unsigned char dest_pubkey33[33],
-                       const unsigned char *payload, size_t payload_len,
-                       const unsigned char session_key[32],
-                       unsigned char *out, size_t out_cap)
-{
-    if (!ctx || !dest_pubkey33 || !payload || !out) return 0;
-    if (payload_len == 0 || payload_len > ONION_MSG_MAX_PAYLOAD) return 0;
-
-    /* blinding_point = session_key * G */
-    secp256k1_pubkey ephemeral;
-    if (!secp256k1_ec_pubkey_create(ctx, &ephemeral, session_key)) return 0;
-    unsigned char blinding_point[33];
-    size_t bp_len = 33;
-    secp256k1_ec_pubkey_serialize(ctx, blinding_point, &bp_len,
-                                  &ephemeral, SECP256K1_EC_COMPRESSED);
-
-    /* shared_secret = SHA256(session_key * dest_pubkey) */
-    unsigned char ss[32];
-    if (!onion_ecdh_shared_secret(ctx, session_key, dest_pubkey33, ss)) return 0;
-
-    /* rho = HMAC-SHA256("rho", ss) */
-    unsigned char rho[32];
-    onion_generate_rho(ss, rho);
-
-    /* Encrypt: ciphertext = payload XOR ChaCha20(rho) */
-    unsigned char ciphertext[ONION_MSG_MAX_PAYLOAD];
-    if (!onion_xor_stream(payload, payload_len, rho, ciphertext)) return 0;
-
-    /* Wire: type(2) + blinding_point(33) + onion_len(2 BE) + ciphertext */
-    uint16_t onion_len = (uint16_t)payload_len;
-    size_t total = 2 + 33 + 2 + onion_len;
-    if (total > out_cap) return 0;
-
-    out[0] = ONION_MSG_TYPE_HIGH;
-    out[1] = ONION_MSG_TYPE_LOW;
-    memcpy(out + 2, blinding_point, 33);
-    out[35] = (unsigned char)(onion_len >> 8);
-    out[36] = (unsigned char)(onion_len);
-    memcpy(out + 37, ciphertext, onion_len);
-    return total;
-}
+/* onion_msg_build removed — superseded by the evolved version in onion_msg.c
+   (PR #34) which uses the canonical parameter order matching BOLT #4. */
 
 size_t onion_msg_decrypt_final(const onion_msg_t *msg,
                                 secp256k1_context *ctx,
