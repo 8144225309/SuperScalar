@@ -1426,6 +1426,54 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
+    /* --- BIP39 Test (early exit) --- */
+    if (test_bip39) {
+        printf("\n=== BIP39 MNEMONIC TEST ===\n");
+        fflush(stdout);
+        int bip39_pass = 1;
+
+        char mnemonic[512];
+        if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
+            printf("  bip39_generate FAILED\n");
+            bip39_pass = 0;
+        } else {
+            printf("  Generated: %s\n", mnemonic);
+            if (!bip39_validate(mnemonic)) {
+                printf("  bip39_validate FAILED\n");
+                bip39_pass = 0;
+            } else {
+                printf("  Validation: OK\n");
+            }
+
+            unsigned char seed[64];
+            if (!bip39_mnemonic_to_seed(mnemonic, "", seed)) {
+                printf("  bip39_mnemonic_to_seed FAILED\n");
+                bip39_pass = 0;
+            } else {
+                int all_zero = 1;
+                for (int i = 0; i < 64; i++) if (seed[i]) { all_zero = 0; break; }
+                if (all_zero) {
+                    printf("  Seed is all zeros — FAILED\n");
+                    bip39_pass = 0;
+                } else {
+                    printf("  Seed derivation: OK (64 bytes, non-zero)\n");
+                }
+
+                unsigned char seed2[64];
+                bip39_mnemonic_to_seed(mnemonic, "", seed2);
+                if (memcmp(seed, seed2, 64) != 0) {
+                    printf("  Determinism check FAILED\n");
+                    bip39_pass = 0;
+                } else {
+                    printf("  Determinism: OK (same mnemonic → same seed)\n");
+                }
+            }
+        }
+
+        printf("BIP39 MNEMONIC TEST: %s\n", bip39_pass ? "PASS" : "FAIL");
+        return bip39_pass ? 0 : 1;
+    }
+
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
     if (strcmp(network, "mainnet") == 0 && !accept_risk) {
         fprintf(stderr,
@@ -5864,63 +5912,7 @@ int main(int argc, char *argv[]) {
         fflush(stdout);
     }
 
-    /* === BIP39 Mnemonic Test (generate + validate round-trip) === */
-    if (test_bip39) {
-        printf("\n=== BIP39 MNEMONIC TEST ===\n");
-        fflush(stdout);
-        int bip39_pass = 1;
-
-        /* Generate a 24-word mnemonic */
-        char mnemonic[512];
-        if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
-            printf("  bip39_generate FAILED\n");
-            bip39_pass = 0;
-        } else {
-            printf("  Generated: %s\n", mnemonic);
-
-            /* Validate it */
-            if (!bip39_validate(mnemonic)) {
-                printf("  bip39_validate FAILED\n");
-                bip39_pass = 0;
-            } else {
-                printf("  Validation: OK\n");
-            }
-
-            /* Derive seed and verify it's non-zero */
-            unsigned char seed[64];
-            if (!bip39_mnemonic_to_seed(mnemonic, "", seed)) {
-                printf("  bip39_mnemonic_to_seed FAILED\n");
-                bip39_pass = 0;
-            } else {
-                int all_zero = 1;
-                for (int i = 0; i < 64; i++) if (seed[i]) { all_zero = 0; break; }
-                if (all_zero) {
-                    printf("  Seed is all zeros — FAILED\n");
-                    bip39_pass = 0;
-                } else {
-                    printf("  Seed derivation: OK (64 bytes, non-zero)\n");
-                }
-
-                /* Derive a second time with same mnemonic — must match */
-                unsigned char seed2[64];
-                bip39_mnemonic_to_seed(mnemonic, "", seed2);
-                if (memcmp(seed, seed2, 64) != 0) {
-                    printf("  Determinism check FAILED\n");
-                    bip39_pass = 0;
-                } else {
-                    printf("  Determinism: OK (same mnemonic → same seed)\n");
-                }
-            }
-        }
-
-        printf("BIP39 MNEMONIC TEST: %s\n", bip39_pass ? "PASS" : "FAIL");
-        fflush(stdout);
-        /* Early exit — BIP39 test doesn't need a factory */
-        if (!demo_mode) {
-            secp256k1_context_destroy(ctx);
-            return bip39_pass ? 0 : 1;
-        }
-    }
+    /* BIP39 test moved to early-exit section (before factory creation) */
 
     /* === Large Factory Test (>4 clients) === */
     if (test_large_factory && channels_active) {
