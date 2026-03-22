@@ -292,6 +292,9 @@ static void usage(const char *prog) {
         "  --test-jit          After demo: create JIT channels for all clients\n"
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
+        "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
+        "  --test-bip39        BIP39 mnemonic generate + validate round-trip (early exit)\n"
+        "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
@@ -946,6 +949,9 @@ int main(int argc, char *argv[]) {
     int test_jit = 0;
     int test_lsps2 = 0;
     int test_bolt12 = 0;
+    int test_buy_liquidity = 0;
+    int test_bip39 = 0;
+    int test_large_factory = 0;
     int dynamic_fees = 0;
     const char *fee_estimator_arg = NULL; /* --fee-estimator MODE */
     int heartbeat_interval = 0;  /* 0 = disabled; seconds between daemon status lines */
@@ -1045,6 +1051,12 @@ int main(int argc, char *argv[]) {
             test_lsps2 = 1;
         else if (strcmp(argv[i], "--test-bolt12") == 0)
             test_bolt12 = 1;
+        else if (strcmp(argv[i], "--test-buy-liquidity") == 0)
+            test_buy_liquidity = 1;
+        else if (strcmp(argv[i], "--test-bip39") == 0)
+            test_bip39 = 1;
+        else if (strcmp(argv[i], "--test-large-factory") == 0)
+            test_large_factory = 1;
         else if (strcmp(argv[i], "--active-blocks") == 0 && i + 1 < argc)
             active_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--dying-blocks") == 0 && i + 1 < argc)
@@ -2707,7 +2719,8 @@ int main(int argc, char *argv[]) {
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || force_close || test_burn ||
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
-        test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12) {
+        test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
+        test_buy_liquidity || test_large_factory) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
@@ -5802,6 +5815,152 @@ int main(int argc, char *argv[]) {
         }
 
         printf("BOLT12 OFFER TEST: %s\n", b12_pass ? "PASS" : "FAIL");
+        fflush(stdout);
+    }
+
+    /* === Buy Liquidity Test (L-stock → client inbound capacity) === */
+    if (test_buy_liquidity && channels_active) {
+        printf("\n=== BUY LIQUIDITY TEST ===\n");
+        fflush(stdout);
+        int buy_pass = 1;
+
+        if (leaf_arity != 2) {
+            printf("  SKIP: --test-buy-liquidity requires --leaf-arity 2\n");
+            printf("BUY LIQUIDITY TEST: SKIP\n");
+        } else {
+            /* Buy 1000 sats of inbound liquidity for client 0 from L-stock */
+            uint64_t buy_amount = 1000;
+            printf("  Buying %llu sats inbound for client 0 from L-stock...\n",
+                   (unsigned long long)buy_amount);
+            fflush(stdout);
+
+            /* Record pre-buy state */
+            size_t leaf_node_idx = lsp.factory.leaf_node_indices[0];
+            uint64_t pre_lstock = lsp.factory.nodes[leaf_node_idx].outputs[2].amount_sats;
+            uint64_t pre_client = lsp.factory.nodes[leaf_node_idx].outputs[0].amount_sats;
+
+            if (!lsp_channels_buy_liquidity(mgr, &lsp, 0, buy_amount)) {
+                printf("  buy_liquidity FAILED\n");
+                buy_pass = 0;
+            } else {
+                /* Verify L-stock decreased and client output increased */
+                uint64_t post_lstock = lsp.factory.nodes[leaf_node_idx].outputs[2].amount_sats;
+                uint64_t post_client = lsp.factory.nodes[leaf_node_idx].outputs[0].amount_sats;
+
+                printf("  L-stock: %llu → %llu (-%llu)\n",
+                       (unsigned long long)pre_lstock, (unsigned long long)post_lstock,
+                       (unsigned long long)(pre_lstock - post_lstock));
+                printf("  Client 0 output: %llu → %llu (+%llu)\n",
+                       (unsigned long long)pre_client, (unsigned long long)post_client,
+                       (unsigned long long)(post_client - pre_client));
+
+                if (post_lstock >= pre_lstock || post_client <= pre_client) {
+                    printf("  Balance check FAILED\n");
+                    buy_pass = 0;
+                }
+            }
+            printf("BUY LIQUIDITY TEST: %s\n", buy_pass ? "PASS" : "FAIL");
+        }
+        fflush(stdout);
+    }
+
+    /* === BIP39 Mnemonic Test (generate + validate round-trip) === */
+    if (test_bip39) {
+        printf("\n=== BIP39 MNEMONIC TEST ===\n");
+        fflush(stdout);
+        int bip39_pass = 1;
+
+        /* Generate a 24-word mnemonic */
+        char mnemonic[512];
+        if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
+            printf("  bip39_generate FAILED\n");
+            bip39_pass = 0;
+        } else {
+            printf("  Generated: %s\n", mnemonic);
+
+            /* Validate it */
+            if (!bip39_validate(mnemonic)) {
+                printf("  bip39_validate FAILED\n");
+                bip39_pass = 0;
+            } else {
+                printf("  Validation: OK\n");
+            }
+
+            /* Derive seed and verify it's non-zero */
+            unsigned char seed[64];
+            if (!bip39_mnemonic_to_seed(mnemonic, "", seed)) {
+                printf("  bip39_mnemonic_to_seed FAILED\n");
+                bip39_pass = 0;
+            } else {
+                int all_zero = 1;
+                for (int i = 0; i < 64; i++) if (seed[i]) { all_zero = 0; break; }
+                if (all_zero) {
+                    printf("  Seed is all zeros — FAILED\n");
+                    bip39_pass = 0;
+                } else {
+                    printf("  Seed derivation: OK (64 bytes, non-zero)\n");
+                }
+
+                /* Derive a second time with same mnemonic — must match */
+                unsigned char seed2[64];
+                bip39_mnemonic_to_seed(mnemonic, "", seed2);
+                if (memcmp(seed, seed2, 64) != 0) {
+                    printf("  Determinism check FAILED\n");
+                    bip39_pass = 0;
+                } else {
+                    printf("  Determinism: OK (same mnemonic → same seed)\n");
+                }
+            }
+        }
+
+        printf("BIP39 MNEMONIC TEST: %s\n", bip39_pass ? "PASS" : "FAIL");
+        fflush(stdout);
+        /* Early exit — BIP39 test doesn't need a factory */
+        if (!demo_mode) {
+            secp256k1_context_destroy(ctx);
+            return bip39_pass ? 0 : 1;
+        }
+    }
+
+    /* === Large Factory Test (>4 clients) === */
+    if (test_large_factory && channels_active) {
+        printf("\n=== LARGE FACTORY TEST ===\n");
+        printf("  Factory created with %d clients (%d channels)\n",
+               n_clients, n_clients);
+        printf("  DW tree nodes: %zu\n", lsp.factory.n_nodes);
+        printf("  Leaf arity: %d\n", lsp.factory.leaf_arity);
+        fflush(stdout);
+        int large_pass = 1;
+
+        /* Verify we have more than 4 clients */
+        if (n_clients <= 4) {
+            printf("  SKIP: --test-large-factory requires --clients > 4\n");
+            printf("LARGE FACTORY TEST: SKIP\n");
+        } else {
+            /* Verify all channels are active */
+            int active = 0;
+            for (int ci = 0; ci < n_clients; ci++) {
+                if (mgr->entries[ci].channel.funding_amount > 0)
+                    active++;
+            }
+            printf("  Active channels: %d/%d\n", active, n_clients);
+            if (active != n_clients) {
+                printf("  Not all channels active — FAILED\n");
+                large_pass = 0;
+            }
+
+            /* Verify DW tree is deeper than 4-client tree */
+            if (lsp.factory.n_nodes <= 6) {
+                printf("  Tree should have >6 nodes for >4 clients, got %zu\n",
+                       lsp.factory.n_nodes);
+                large_pass = 0;
+            } else {
+                printf("  Tree depth verified: %zu nodes (>6)\n",
+                       lsp.factory.n_nodes);
+            }
+
+            printf("LARGE FACTORY TEST: %s\n", large_pass ? "PASS" : "FAIL");
+        }
         fflush(stdout);
     }
 
