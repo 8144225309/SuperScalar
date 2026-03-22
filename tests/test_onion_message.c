@@ -133,15 +133,21 @@ int test_onion_msg_build_and_parse(void)
     const unsigned char payload[] = "hello onion world";
     unsigned char out[512];
     unsigned char path_key[33];
-    size_t out_len = onion_msg_build(ctx, session_key, dest_pk,
+    unsigned char pkt[512];
+    size_t pkt_len = onion_msg_build(ctx, session_key, dest_pk,
                                      payload, sizeof(payload) - 1,
-                                     1, path_key, out, sizeof(out));
-    ASSERT(out_len > 37, "OM4: build returns > 37 bytes");
+                                     ONION_MSG_TLV_INVOICE_REQUEST,
+                                     path_key, pkt, sizeof(pkt));
+    ASSERT(pkt_len > 0, "OM4: build returns packet");
+
+    /* Encode into wire frame (adds type 513 prefix) */
+    size_t out_len = onion_msg_encode(path_key, pkt, pkt_len, out, sizeof(out));
+    ASSERT(out_len > 37, "OM4: encode returns > 37 bytes");
 
     /* Verify type */
     ASSERT(out[0] == 0x02 && out[1] == 0x01, "OM4: type 513 prefix");
 
-    /* Parse the built message */
+    /* Parse the wire-framed message */
     onion_msg_t msg;
     ASSERT(onion_msg_parse(out, out_len, &msg) == 1, "OM4: parse built msg");
 
@@ -171,14 +177,18 @@ int test_onion_msg_decrypt_roundtrip(void)
     const char *original = "invoice_request_bytes";
     size_t orig_len = strlen(original);
 
-    unsigned char wire[512];
-    unsigned char pk2[33];
-    size_t wire_len = onion_msg_build(ctx, session_key, dest_pk,
+    unsigned char pkt2[512], pk2[33];
+    size_t pkt2_len = onion_msg_build(ctx, session_key, dest_pk,
                                       (const unsigned char *)original, orig_len,
-                                      1, pk2, wire, sizeof(wire));
-    ASSERT(wire_len > 0, "OM5: build succeeds");
+                                      ONION_MSG_TLV_INVOICE_REQUEST,
+                                      pk2, pkt2, sizeof(pkt2));
+    ASSERT(pkt2_len > 0, "OM5: build succeeds");
 
-    /* Parse */
+    /* Encode to wire frame then parse */
+    unsigned char wire[512];
+    size_t wire_len = onion_msg_encode(pk2, pkt2, pkt2_len, wire, sizeof(wire));
+    ASSERT(wire_len > 0, "OM5: encode succeeds");
+
     onion_msg_t msg;
     ASSERT(onion_msg_parse(wire, wire_len, &msg) == 1, "OM5: parse succeeds");
 
