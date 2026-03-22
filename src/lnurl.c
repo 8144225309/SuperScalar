@@ -253,7 +253,7 @@ static int json_extract_str(const char *json, const char *key,
     if (!kp) return 0;
     kp += strlen(search);
     /* skip whitespace and colon */
-    while (*kp == ' ' || *kp == '\t' || *kp == ':' || *kp == ' ') kp++;
+    while (*kp == ' ' || *kp == '\t' || *kp == ':') kp++;
     if (*kp != '"') return 0;
     kp++; /* skip opening quote */
     size_t i = 0;
