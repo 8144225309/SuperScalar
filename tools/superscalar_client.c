@@ -1479,10 +1479,6 @@ handle_message:
                     break;
                 }
 
-                /* DEBUG: Round 2 entry state */
-                fprintf(stderr, "DEBUG Client %u: Round 2 entry — n_nodes=%zu, my_index=%u\n",
-                        my_index, factory->n_nodes, my_index);
-
                 /* Re-init sessions: Round 2 provides ALL nonces from all
                    participants.  Round 1 already set LSP + client nonces,
                    so nonces_collected > n_signers without a reset. */
@@ -1511,26 +1507,10 @@ handle_message:
 
                 wire_bundle_entry_t my_psig_entries[FACTORY_MAX_NODES];
                 size_t n_my_psigs = 0;
-                int debug_dumped_first_miss = 0; /* one-shot flag */
 
                 for (size_t n = 0; n < factory->n_nodes; n++) {
                     int slot = factory_find_signer_slot(factory, n, my_index);
-                    fprintf(stderr, "DEBUG Client %u: Round 2 node %zu — slot=%d\n",
-                            my_index, n, slot);
-                    if (slot < 0) {
-                        if (!debug_dumped_first_miss) {
-                            debug_dumped_first_miss = 1;
-                            const factory_node_t *dbg_node = &factory->nodes[n];
-                            fprintf(stderr, "DEBUG Client %u: FIRST MISS node %zu — "
-                                    "n_signers=%zu, signer_indices=[",
-                                    my_index, n, dbg_node->n_signers);
-                            for (size_t di = 0; di < dbg_node->n_signers; di++)
-                                fprintf(stderr, "%s%u", di ? "," : "",
-                                        dbg_node->signer_indices[di]);
-                            fprintf(stderr, "]\n");
-                        }
-                        continue;
-                    }
+                    if (slot < 0) continue;
 
                     /* Finalize this node (all nonces now set) */
                     if (!factory_session_finalize_node(factory, n)) {
