@@ -34,10 +34,13 @@
 #define ONION_MSG_TYPE                  513    /* 0x0201 — BOLT #12 */
 #define ONION_MSG_APP_MAX               1024   /* max application payload bytes */
 
-/* Well-known TLV type tags for onion message application payloads */
-#define ONION_MSG_TLV_INVOICE_REQUEST   1      /* invoice_request (payer → offerer) */
-#define ONION_MSG_TLV_INVOICE           2      /* invoice (offerer → payer) */
-#define ONION_MSG_TLV_INVOICE_ERROR     3      /* invoice_error (payer → offerer) */
+/* Application TLV type tags for onion_msg_build app_tlv_type parameter.
+   These match the BOLT #12 final-hop TLV types from onion_message.h. */
+#ifndef ONION_MSG_TLV_INVOICE_REQUEST
+#define ONION_MSG_TLV_INVOICE_REQUEST  64     /* invoice_request (BOLT #12) */
+#define ONION_MSG_TLV_INVOICE          66     /* invoice (BOLT #12) */
+#define ONION_MSG_TLV_INVOICE_ERROR    68     /* invoice_error (BOLT #12) */
+#endif
 
 /*
  * Encode an onion message wire frame:
