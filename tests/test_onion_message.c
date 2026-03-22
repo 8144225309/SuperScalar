@@ -16,6 +16,7 @@
  */
 
 #include "superscalar/onion_message.h"
+#include "superscalar/onion_msg.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/admin_rpc.h"
@@ -131,8 +132,10 @@ int test_onion_msg_build_and_parse(void)
 
     const unsigned char payload[] = "hello onion world";
     unsigned char out[512];
-    size_t out_len = onion_msg_build(ctx, dest_pk, payload, sizeof(payload) - 1,
-                                     session_key, out, sizeof(out));
+    unsigned char path_key[33];
+    size_t out_len = onion_msg_build(ctx, session_key, dest_pk,
+                                     payload, sizeof(payload) - 1,
+                                     1, path_key, out, sizeof(out));
     ASSERT(out_len > 37, "OM4: build returns > 37 bytes");
 
     /* Verify type */
@@ -169,9 +172,10 @@ int test_onion_msg_decrypt_roundtrip(void)
     size_t orig_len = strlen(original);
 
     unsigned char wire[512];
-    size_t wire_len = onion_msg_build(ctx, dest_pk,
+    unsigned char pk2[33];
+    size_t wire_len = onion_msg_build(ctx, session_key, dest_pk,
                                       (const unsigned char *)original, orig_len,
-                                      session_key, wire, sizeof(wire));
+                                      1, pk2, wire, sizeof(wire));
     ASSERT(wire_len > 0, "OM5: build succeeds");
 
     /* Parse */
