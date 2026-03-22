@@ -498,7 +498,7 @@ int test_chan_open_inbound_unique_funding_pk(void)
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     ASSERT(ctx, "CO11: ctx");
 
-    unsigned char pk1[33], pk2[33];
+    unsigned char pk1[33] = {0}, pk2[33] = {0};
     for (int k = 0; k < 2; k++) {
         unsigned char priv[32];
         FILE *f = fopen("/dev/urandom", "rb");

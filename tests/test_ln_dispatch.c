@@ -1732,7 +1732,8 @@ int test_ln_dispatch_uf1_feerate_updated(void)
 
     int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
     ASSERT(r == 134, "UF1: returns 134");
-    ASSERT(ch.fee_rate_sat_per_kvb == 2500, "UF1: feerate updated to 2500");
+    /* feerate_per_kw * 4 = sat/kvb (BOLT #2: kw = kvb/4) */
+    ASSERT(ch.fee_rate_sat_per_kvb == 10000, "UF1: feerate 2500 kw = 10000 kvb");
     return 1;
 }
 
