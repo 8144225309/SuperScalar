@@ -1388,3 +1388,386 @@ int test_ln_dispatch_close_broadcast(void)
     ASSERT(ch.close_state == 5, "CB1: close_state == 5 after fee agreement");
     return 1;
 }
+
+
+/* ================================================================== */
+/* GD1 — type 256 with gi set → gi.n_channel_ann incremented         */
+/* ================================================================== */
+int test_ln_dispatch_gossip_type256_gi(void)
+{
+    gossip_store_t gs;
+    gossip_store_open_in_memory(&gs);
+
+    gossip_ingest_t gi;
+    gossip_ingest_init(&gi, NULL, &gs); /* NULL ctx = no sig verify */
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gi = &gi;
+
+    /* Minimal type-256 message (just 2-byte type, no content) */
+    unsigned char msg[2];
+    msg[0] = 0x01; msg[1] = 0x00; /* type 256 */
+    ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+
+    /* With malformed payload, the ingest may reject but shouldn't crash */
+    /* We just verify no crash and function returns 256 */
+    unsigned char msg2[130];
+    memset(msg2, 0, sizeof(msg2));
+    msg2[0] = 0x01; msg2[1] = 0x00;
+    int r = ln_dispatch_process_msg(&d, 0, msg2, sizeof(msg2));
+    ASSERT(r == 256, "GD1: type 256 returns 256");
+
+    gossip_store_close(&gs);
+    return 1;
+}
+
+/* ================================================================== */
+/* GD2 — type 257 dispatches to gi                                    */
+/* ================================================================== */
+int test_ln_dispatch_gossip_type257_gi(void)
+{
+    gossip_ingest_t gi;
+    gossip_ingest_init(&gi, NULL, NULL);
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gi = &gi;
+
+    unsigned char msg[64]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x01; /* type 257 */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 257, "GD2: type 257 returns 257");
+    return 1;
+}
+
+/* ================================================================== */
+/* GD3 — type 258 dispatches to gi                                    */
+/* ================================================================== */
+int test_ln_dispatch_gossip_type258_gi(void)
+{
+    gossip_ingest_t gi;
+    gossip_ingest_init(&gi, NULL, NULL);
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gi = &gi;
+
+    unsigned char msg[64]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x02; /* type 258 */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 258, "GD3: type 258 returns 258");
+    return 1;
+}
+
+/* ================================================================== */
+/* GD4 — gi == NULL + type 256 → no crash, returns 256               */
+/* ================================================================== */
+int test_ln_dispatch_gossip_gi_null_no_crash(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.gi = NULL;
+
+    unsigned char msg[4]; memset(msg, 0, sizeof(msg));
+    msg[0] = 0x01; msg[1] = 0x00; /* type 256 */
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 256, "GD4: type 256 returns 256 with NULL gi");
+    return 1;
+}
+
+/* ================================================================== */
+
+/* FF1 -- FORWARD_FAIL with valid pmgr sends fail_malformed, no crash */
+int test_ln_dispatch_forward_fail_sends_malformed(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    memset(&mpp, 0, sizeof(mpp));
+    unsigned char node_priv[32];
+    memset(node_priv, 0x11, 32);
+    peer_mgr_t pmgr;
+    memset(&pmgr, 0, sizeof(pmgr));
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.fwd = &fwd; d.mpp = &mpp;
+    memcpy(d.our_privkey, node_priv, 32);
+    d.ctx = ctx; d.pmgr = &pmgr;
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = calloc(1, msg_len);
+    msg[0] = 0x00; msg[1] = 0x80;
+    msg[2+32+8+6] = 0x27; msg[2+32+8+7] = 0x10;
+    int r = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    secp256k1_context_destroy(ctx);
+    ASSERT(r == 128, "FF1: FORWARD_FAIL path returns 128");
+    return 1;
+}
+
+/* FF2 -- FORWARD_FAIL with NULL pmgr no crash */
+int test_ln_dispatch_forward_fail_null_pmgr(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                       SECP256K1_CONTEXT_VERIFY);
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    memset(&mpp, 0, sizeof(mpp));
+    unsigned char node_priv[32];
+    memset(node_priv, 0x22, 32);
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.fwd = &fwd; d.mpp = &mpp;
+    memcpy(d.our_privkey, node_priv, 32);
+    d.ctx = ctx; d.pmgr = NULL;
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = calloc(1, msg_len);
+    msg[0] = 0x00; msg[1] = 0x80;
+    msg[2+32+8+7] = 0x01;
+    int r = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    secp256k1_context_destroy(ctx);
+    ASSERT(r == 128, "FF2: NULL pmgr FORWARD_FAIL returns 128 without crash");
+    return 1;
+}
+
+
+/* ================================================================== */
+/* PR #72: Startup/shutdown flow -- ln_dispatch_load_state() tests    */
+/* ================================================================== */
+
+#include "superscalar/persist.h"
+
+/* Helper: build a deterministic invoice entry (mirrors test_persist.c) */
+static bolt11_invoice_entry_t boot_make_invoice(unsigned char seed)
+{
+    bolt11_invoice_entry_t e;
+    memset(&e, 0, sizeof(e));
+    memset(e.payment_hash,   seed,     32);
+    memset(e.preimage,       seed + 1, 32);
+    memset(e.payment_secret, seed + 2, 32);
+    e.amount_msat = 100000ULL + seed;
+    e.expiry      = 3600;
+    e.created_at  = 1700000000U + seed;
+    e.settled     = 0;
+    e.active      = 1;
+    snprintf(e.description, sizeof(e.description), "boot invoice %d", (int)seed);
+    return e;
+}
+
+/* BOOT1: NULL persist -> ln_dispatch_load_state returns -1, no crash */
+int test_ln_dispatch_boot1_null_persist(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    /* d.persist == NULL */
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r == -1, "BOOT1: NULL persist returns -1");
+    return 1;
+}
+
+/* BOOT2: save 1 invoice to in-memory DB, fresh invoice_table -> 1 restored */
+int test_ln_dispatch_boot2_load_one_invoice(void)
+{
+    persist_t db;
+    ASSERT(persist_open(&db, NULL), "BOOT2: persist_open");
+
+    bolt11_invoice_entry_t inv = boot_make_invoice(0xA1);
+    ASSERT(persist_save_ln_invoice(&db, &inv), "BOOT2: save invoice");
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist  = (struct persist_t *)&db;
+    d.invoices = &tbl;
+
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r == 1, "BOOT2: load_state returns 1");
+    ASSERT(tbl.count == 1, "BOOT2: invoice_table has 1 entry");
+    ASSERT(memcmp(tbl.entries[0].payment_hash, inv.payment_hash, 32) == 0,
+           "BOOT2: payment_hash matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* BOOT3: save 3 invoices, load -> all 3 restored */
+int test_ln_dispatch_boot3_load_three_invoices(void)
+{
+    persist_t db;
+    ASSERT(persist_open(&db, NULL), "BOOT3: persist_open");
+
+    for (unsigned char s = 1; s <= 3; s++) {
+        bolt11_invoice_entry_t inv = boot_make_invoice(s * 0x10);
+        ASSERT(persist_save_ln_invoice(&db, &inv), "BOOT3: save invoice");
+    }
+
+    bolt11_invoice_table_t tbl;
+    memset(&tbl, 0, sizeof(tbl));
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist  = (struct persist_t *)&db;
+    d.invoices = &tbl;
+
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r == 3, "BOOT3: load_state returns 3");
+    ASSERT(tbl.count == 3, "BOOT3: invoice_table has 3 entries");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* BOOT4: persist set but invoices = NULL -> returns 0 (no crash) */
+int test_ln_dispatch_boot4_null_invoices(void)
+{
+    persist_t db;
+    ASSERT(persist_open(&db, NULL), "BOOT4: persist_open");
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist  = (struct persist_t *)&db;
+    d.invoices = NULL;  /* no invoice table */
+
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r >= 0, "BOOT4: NULL invoices returns >= 0, no crash");
+
+    persist_close(&db);
+    return 1;
+}
+
+
+/* ================================================================== */
+/* PR #73: BOOT5 -- save a channel via persist, load_state restores it */
+/* ================================================================== */
+int test_ln_dispatch_boot5_channel_restore(void)
+{
+    persist_t db;
+    ASSERT(persist_open(&db, NULL), "BOOT5: persist_open");
+
+    unsigned char channel_id[32];
+    unsigned char peer_pk[33];
+    memset(channel_id, 0xAB, sizeof(channel_id));
+    memset(peer_pk,    0xCD, sizeof(peer_pk));
+    uint64_t cap_sat   = 500000;
+    uint64_t local_ms  = 300000000;
+    uint64_t remote_ms = 200000000;
+    ASSERT(persist_save_ln_peer_channel(&db, channel_id, peer_pk,
+                                         cap_sat, local_ms, remote_ms, 0, NULL, 0),
+           "BOOT5: persist_save_ln_peer_channel");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    channel_t *channels[PEER_MGR_MAX_PEERS];
+    memset(channels, 0, sizeof(channels));
+    channels[0] = &ch;
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist       = (struct persist_t *)&db;
+    d.peer_channels = channels;
+
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r >= 1, "BOOT5: load_state returns >= 1");
+    ASSERT(ch.funding_amount == cap_sat,
+           "BOOT5: funding_amount restored");
+    ASSERT(ch.local_amount  == local_ms  / 1000,
+           "BOOT5: local_amount restored");
+    ASSERT(ch.remote_amount == remote_ms / 1000,
+           "BOOT5: remote_amount restored");
+    ASSERT(memcmp(ch.funding_txid, channel_id, 32) == 0,
+           "BOOT5: funding_txid matches channel_id");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ================================================================== */
+/* PR #73: BOOT6 -- NULL peer_channels -> no crash, returns >= 0      */
+/* ================================================================== */
+int test_ln_dispatch_boot6_null_channels_no_crash(void)
+{
+    persist_t db;
+    ASSERT(persist_open(&db, NULL), "BOOT6: persist_open");
+
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.persist       = (struct persist_t *)&db;
+    d.peer_channels = NULL;
+    d.invoices      = NULL;
+
+    int r = ln_dispatch_load_state(&d);
+    ASSERT(r >= 0, "BOOT6: NULL peer_channels returns >= 0, no crash");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ================================================================== */
+/* PR #74: UF1 -- update_fee sets ch->fee_rate_sat_per_kvb            */
+/* ================================================================== */
+int test_ln_dispatch_uf1_feerate_updated(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    channel_t *channels[PEER_MGR_MAX_PEERS];
+    memset(channels, 0, sizeof(channels));
+    channels[0] = &ch;
+    d.peer_channels = channels;
+
+    /* update_fee: type(2=134) + channel_id(32) + feerate_per_kw(4) = 38 bytes */
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 134;
+    /* feerate_per_kw = 2500 big-endian: 0x000009C4 */
+    msg[34] = 0x00; msg[35] = 0x00; msg[36] = 0x09; msg[37] = 0xC4;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 134, "UF1: returns 134");
+    ASSERT(ch.fee_rate_sat_per_kvb == 2500, "UF1: feerate updated to 2500");
+    return 1;
+}
+
+/* ================================================================== */
+/* PR #74: UF2 -- truncated update_fee (< 38 bytes) -> returns -1    */
+/* ================================================================== */
+int test_ln_dispatch_uf2_truncated_update_fee(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+
+    unsigned char msg[37];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 134;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == -1, "UF2: truncated update_fee returns -1");
+    return 1;
+}
+
+/* ================================================================== */
+/* PR #74: UF3 -- NULL peer_channels -> no crash, returns 134         */
+/* ================================================================== */
+int test_ln_dispatch_uf3_null_channels(void)
+{
+    ln_dispatch_t d;
+    memset(&d, 0, sizeof(d));
+    d.peer_channels = NULL;
+
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = 0; msg[1] = 134;
+    msg[34] = 0; msg[35] = 0; msg[36] = 0x03; msg[37] = 0xE8;
+
+    int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
+    ASSERT(r == 134, "UF3: NULL peer_channels returns 134, no crash");
+    return 1;
+}

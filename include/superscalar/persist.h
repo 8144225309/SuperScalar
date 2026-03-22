@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 8
+#define PERSIST_SCHEMA_VERSION 10
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -571,5 +571,102 @@ int persist_load_htlc_inbound_pending(persist_t *p, htlc_inbound_table_t *tbl);
 int persist_update_htlc_inbound(persist_t *p, uint64_t htlc_id,
                                  htlc_inbound_state_t state,
                                  const unsigned char preimage[32]);
+
+
+/* --- LN node invoice table (schema v9) --- */
+
+#include "superscalar/invoice.h"
+
+/*
+ * Save (upsert) a BOLT #11 invoice entry to the ln_invoices table.
+ * Uses INSERT OR REPLACE keyed on payment_hash.
+ * Returns 1 on success, 0 on error.
+ */
+int persist_save_ln_invoice(persist_t *p, const bolt11_invoice_entry_t *e);
+
+/*
+ * Load all entries from ln_invoices into the caller-supplied table.
+ * Fills tbl->entries[] and sets tbl->count.
+ * Returns number of invoices loaded, or -1 on error.
+ */
+int persist_load_ln_invoices(persist_t *p, bolt11_invoice_table_t *tbl);
+
+/*
+ * Delete a single invoice from ln_invoices by payment_hash.
+ * Returns 1 on success, 0 on error or not found.
+ */
+int persist_delete_ln_invoice(persist_t *p, const unsigned char payment_hash[32]);
+
+/* --- LN peer channel table (schema v9) --- */
+
+/*
+ * Save (upsert) a peer channel row.  channel_id is a 32-byte ID (e.g.
+ * funding txid or random). state is implementation-defined integer.
+ * our_funding_pubkey / their_funding_pubkey are 33-byte compressed keys
+ * (may be NULL to store as empty blob).
+ * Returns 1 on success, 0 on error.
+ */
+int persist_save_ln_peer_channel(persist_t *p,
+                                  const unsigned char channel_id[32],
+                                  const unsigned char peer_pubkey[33],
+                                  uint64_t capacity_sat,
+                                  uint64_t local_balance_msat,
+                                  uint64_t remote_balance_msat,
+                                  int state,
+                                  const char *peer_host,
+                                  uint16_t peer_port);
+
+/*
+ * Enumerate all rows in ln_peer_channels, calling cb() once per row.
+ * cb receives channel_id, peer_pubkey, balances, state, host, port, and caller ctx.
+ * Returns 1 on success, 0 on error.
+ */
+int persist_load_ln_peer_channels(persist_t *p,
+                                   void (*cb)(const unsigned char channel_id[32],
+                                              const unsigned char peer_pubkey[33],
+                                              uint64_t capacity_sat,
+                                              uint64_t local_balance_msat,
+                                              uint64_t remote_balance_msat,
+                                              int state,
+                                              const char *peer_host,
+                                              uint16_t peer_port,
+                                              void *ctx),
+                                   void *ctx);
+
+/* --- Circuit breaker persistence (schema v10) --- */
+
+#include "superscalar/circuit_breaker.h"
+
+/*
+ * Save (upsert) per-peer circuit breaker limits.
+ * Keyed on peer_pubkey (33 bytes). Returns 1 on success, 0 on error.
+ */
+int persist_save_circuit_breaker_peer(persist_t *p,
+                                       const unsigned char peer_pubkey[33],
+                                       uint16_t max_pending_htlcs,
+                                       uint64_t max_pending_msat,
+                                       uint32_t max_htlcs_per_hour);
+
+/*
+ * Load all saved circuit breaker peers into cb.
+ * Calls circuit_breaker_set_peer_limits() for each row.
+ * Returns number loaded, or -1 on error.
+ */
+int persist_load_circuit_breaker_peers(persist_t *p, circuit_breaker_t *cb);
+
+/* --- PTLC persistence (schema v10) --- */
+
+int persist_save_ptlc(persist_t *p, uint32_t channel_id, const ptlc_t *ptlc);
+size_t persist_load_ptlcs(persist_t *p, uint32_t channel_id,
+                            ptlc_t *ptlcs_out, size_t max_ptlcs);
+int persist_delete_ptlc(persist_t *p, uint32_t channel_id, uint64_t ptlc_id);
+
+/* --- Peer storage persistence (schema v10) --- */
+
+int persist_save_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
+                                const unsigned char *blob, uint16_t blob_len);
+int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
+                                unsigned char *blob_out, uint16_t *blob_len_out,
+                                size_t blob_cap);
 
 #endif /* SUPERSCALAR_PERSIST_H */

@@ -5,6 +5,7 @@
  */
 
 #include "superscalar/liquidity_ad.h"
+#include <secp256k1.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -110,6 +111,7 @@ uint64_t liquidity_ad_fee(const liquidity_ad_t *ad,
 
 size_t liquidity_ad_build_node_announcement(
     unsigned char *out, size_t out_cap,
+    secp256k1_context *ctx,
     const unsigned char node_priv32[32],
     uint32_t timestamp,
     const unsigned char rgb[3],
@@ -125,7 +127,7 @@ size_t liquidity_ad_build_node_announcement(
      * We build a minimal node_announcement without addresses (addrlen=0)
      * and append the will_fund TLV.
      */
-    if (!out || !node_priv32) return 0;
+    if (!out || !node_priv32 || !ctx) return 0;
 
     /* Minimal fixed size: 2+64+2+0+4+33+3+32+2+0 = 142 bytes, plus TLV=22 */
     size_t base = 2 + 64 + 2 + 4 + 33 + 3 + 32 + 2;
@@ -150,9 +152,14 @@ size_t liquidity_ad_build_node_announcement(
     out[off++] = (unsigned char)(timestamp >>  8);
     out[off++] = (unsigned char)(timestamp);
 
-    /* node_id: 33-byte placeholder (derived from priv in production) */
-    memcpy(out + off, node_priv32, 32);  /* simplified: use priv as pub placeholder */
-    out[off + 32] = 0x02;  /* prefix byte */
+    /* node_id: 33-byte compressed pubkey derived from private key (BOLT #7) */
+    {
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, node_priv32)) return 0;
+        size_t pub_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, out + off, &pub_len, &pub,
+                                      SECP256K1_EC_COMPRESSED);
+    }
     off += 33;
 
     /* rgb_color: 3 bytes */

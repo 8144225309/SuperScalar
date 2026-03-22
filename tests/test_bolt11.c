@@ -166,3 +166,161 @@ int test_bolt11_invalid_rejected(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+
+/* ================================================================== */
+/* M1 — metadata round-trip encode/decode                             */
+/* ================================================================== */
+int test_bolt11_metadata_roundtrip(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char node_priv[32]; memset(node_priv, 0x42, 32);
+
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    strcpy(inv.network, "bcrt");
+    inv.amount_msat = 1000000;
+    inv.has_amount  = 1;
+    inv.timestamp   = 1700000000;
+    memset(inv.payment_hash,   0xAA, 32);
+    memset(inv.payment_secret, 0xBB, 32);
+    inv.has_payment_secret = 1;
+    strcpy(inv.description, "metadata test");
+
+    /* Set metadata */
+    inv.metadata[0] = 0x01; inv.metadata[1] = 0x02;
+    inv.metadata[2] = 0x03; inv.metadata[3] = 0x04;
+    inv.metadata_len = 4;
+    inv.has_metadata = 1;
+
+    char encoded[2048];
+    ASSERT(bolt11_encode(&inv, node_priv, ctx, encoded, sizeof(encoded)),
+           "M1: encode");
+
+    bolt11_invoice_t dec;
+    ASSERT(bolt11_decode(ctx, encoded, &dec), "M1: decode");
+    ASSERT(dec.has_metadata,           "M1: has_metadata=1");
+    ASSERT(dec.metadata_len == 4,      "M1: metadata_len=4");
+    ASSERT(dec.metadata[0] == 0x01,    "M1: metadata[0]");
+    ASSERT(dec.metadata[3] == 0x04,    "M1: metadata[3]");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* M2 — no metadata: has_metadata=0, no crash                        */
+/* ================================================================== */
+int test_bolt11_no_metadata(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char node_priv[32]; memset(node_priv, 0x55, 32);
+
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    strcpy(inv.network, "bcrt");
+    inv.amount_msat = 500; inv.has_amount = 1;
+    inv.timestamp = 1700000001;
+    memset(inv.payment_hash,   0xCC, 32);
+    memset(inv.payment_secret, 0xDD, 32);
+    inv.has_payment_secret = 1;
+    inv.has_metadata = 0; /* no metadata */
+    strcpy(inv.description, "no meta");
+
+    char encoded[2048];
+    ASSERT(bolt11_encode(&inv, node_priv, ctx, encoded, sizeof(encoded)),
+           "M2: encode");
+
+    bolt11_invoice_t dec;
+    ASSERT(bolt11_decode(ctx, encoded, &dec), "M2: decode");
+    ASSERT(!dec.has_metadata, "M2: has_metadata=0");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* M3 — metadata_len truncated to 64 on decode                       */
+/* ================================================================== */
+int test_bolt11_metadata_truncated(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char node_priv[32]; memset(node_priv, 0x66, 32);
+
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    strcpy(inv.network, "bcrt");
+    inv.amount_msat = 1000; inv.has_amount = 1;
+    inv.timestamp = 1700000002;
+    memset(inv.payment_hash,   0xEE, 32);
+    memset(inv.payment_secret, 0xFF, 32);
+    inv.has_payment_secret = 1;
+    /* 64 bytes metadata (max) */
+    memset(inv.metadata, 0x11, 64);
+    inv.metadata_len = 64;
+    inv.has_metadata = 1;
+    strcpy(inv.description, "max meta");
+
+    char encoded[4096];
+    ASSERT(bolt11_encode(&inv, node_priv, ctx, encoded, sizeof(encoded)),
+           "M3: encode");
+
+    bolt11_invoice_t dec;
+    ASSERT(bolt11_decode(ctx, encoded, &dec), "M3: decode");
+    ASSERT(dec.has_metadata,      "M3: has_metadata");
+    ASSERT(dec.metadata_len <= 64, "M3: truncated to 64");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ================================================================== */
+/* M4 — full round-trip with all fields including metadata            */
+/* ================================================================== */
+int test_bolt11_full_roundtrip_with_metadata(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    unsigned char node_priv[32]; memset(node_priv, 0x77, 32);
+
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    strcpy(inv.network, "bc");
+    inv.amount_msat = 2000000; inv.has_amount = 1;
+    inv.timestamp = 1700000003;
+    memset(inv.payment_hash,   0x12, 32);
+    memset(inv.payment_secret, 0x34, 32);
+    inv.has_payment_secret = 1;
+    strcpy(inv.description, "full roundtrip");
+    inv.expiry = 7200;
+    inv.min_final_cltv_expiry = 40;
+    /* metadata */
+    inv.metadata[0] = 0xDE; inv.metadata[1] = 0xAD;
+    inv.metadata[2] = 0xBE; inv.metadata[3] = 0xEF;
+    inv.metadata_len = 4; inv.has_metadata = 1;
+
+    char encoded[4096];
+    ASSERT(bolt11_encode(&inv, node_priv, ctx, encoded, sizeof(encoded)),
+           "M4: encode");
+
+    bolt11_invoice_t dec;
+    ASSERT(bolt11_decode(ctx, encoded, &dec), "M4: decode");
+    ASSERT(dec.amount_msat == 2000000,       "M4: amount");
+    ASSERT(dec.has_payment_secret,           "M4: has_payment_secret");
+    ASSERT(dec.has_metadata,                 "M4: has_metadata");
+    ASSERT(dec.metadata[0] == 0xDE,          "M4: metadata[0]");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

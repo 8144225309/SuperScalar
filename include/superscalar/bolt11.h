@@ -56,6 +56,10 @@ typedef struct {
     int      has_amount;
     int      has_description_hash;  /* 1 if description_hash used, 0 if description text */
     int      min_final_cltv_expiry; /* tagged field c; default 18 */
+    /* Tagged field 27: payment_metadata (used for Level-2 stateless nonce) */
+    unsigned char metadata[64];
+    size_t        metadata_len;
+    int           has_metadata;
 } bolt11_invoice_t;
 
 /*

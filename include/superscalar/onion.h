@@ -35,6 +35,11 @@ typedef struct {
     unsigned char amp_set_id[32];     /* identifies the AMP set */
     uint8_t       amp_child_index;    /* shard index 0..N-1 */
     int           has_amp;
+    /* Trampoline routing */
+    unsigned char trampoline_dest[33];
+    uint64_t      trampoline_amt_msat;
+    uint32_t      trampoline_cltv;
+    int           has_trampoline;
 } onion_hop_t;
 
 /*

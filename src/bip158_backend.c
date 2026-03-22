@@ -584,8 +584,22 @@ static int cb_get_confirmations(chain_backend_t *self, const char *txid_hex)
 
 static bool cb_is_in_mempool(chain_backend_t *self, const char *txid_hex)
 {
-    /* TODO: query peer mempool via BIP 157 connection */
-    (void)self; (void)txid_hex;
+    bip158_backend_t *b = (bip158_backend_t *)self;
+    if (!txid_hex || strlen(txid_hex) != 64) return false;
+
+    /* Parse display-order hex → internal bytes (reversed) */
+    unsigned char txid[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned int byte;
+        if (sscanf(txid_hex + (31 - i) * 2, "%02x", &byte) != 1) return false;
+        txid[i] = (unsigned char)byte;
+    }
+
+    int count = b->mempool_cache_count < BIP158_MEMPOOL_CACHE_SIZE
+                ? b->mempool_cache_count : BIP158_MEMPOOL_CACHE_SIZE;
+    for (int i = 0; i < count; i++) {
+        if (memcmp(b->mempool_cache[i], txid, 32) == 0) return true;
+    }
     return false;
 }
 
@@ -860,7 +874,7 @@ void bip158_backend_set_mempool_cb(bip158_backend_t *backend,
 
 int bip158_backend_poll_mempool(bip158_backend_t *backend)
 {
-    if (!backend || backend->peers[backend->current_peer].fd < 0 || !backend->mempool_cb) return 0;
+    if (!backend || backend->peers[backend->current_peer].fd < 0) return 0;
 
     /* Subscribe to mempool (BIP 35) on first call */
     if (!backend->mempool_subscribed) {
@@ -872,16 +886,26 @@ int bip158_backend_poll_mempool(bip158_backend_t *backend)
     uint8_t txids[256][32];
     int n = p2p_poll_inv(&backend->peers[backend->current_peer], txids, 256, 100);
 
-    /* Convert each txid to display-order hex and fire the callback */
+    /* Convert each txid to display-order hex, fire callback, cache raw bytes */
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < n; i++) {
-        char hex[65];
-        for (int b = 0; b < 32; b++) {
-            hex[(31 - b) * 2]     = hx[(txids[i][b] >> 4) & 0xf];
-            hex[(31 - b) * 2 + 1] = hx[txids[i][b] & 0xf];
+        /* Store raw bytes in the ring buffer */
+        int slot = backend->mempool_cache_head % BIP158_MEMPOOL_CACHE_SIZE;
+        memcpy(backend->mempool_cache[slot], txids[i], 32);
+        backend->mempool_cache_head++;
+        if (backend->mempool_cache_count < BIP158_MEMPOOL_CACHE_SIZE)
+            backend->mempool_cache_count++;
+
+        /* Fire callback with display-order hex */
+        if (backend->mempool_cb) {
+            char hex[65];
+            for (int b = 0; b < 32; b++) {
+                hex[(31 - b) * 2]     = hx[(txids[i][b] >> 4) & 0xf];
+                hex[(31 - b) * 2 + 1] = hx[txids[i][b] & 0xf];
+            }
+            hex[64] = '\0';
+            backend->mempool_cb(hex, backend->mempool_ctx);
         }
-        hex[64] = '\0';
-        backend->mempool_cb(hex, backend->mempool_ctx);
     }
     return n;
 }
@@ -1298,18 +1322,18 @@ int bip158_backend_connect_all(bip158_backend_t *backend)
 }
 
 /*
- * BIP 158 scan loop — Phase 3 (RPC) + Phase 4/5 (P2P filter + header sync).
+ * BIP 158 scan loop — Phase 5 complete (P2P primary, RPC fallback).
  *
  * P2P path (preferred when backend->peers[backend->current_peer].fd >= 0):
  *   1. bip158_sync_headers() fetches block hashes into the ring buffer and
  *      provides the chain tip height — no RPC needed for header data.
  *   2. getcfilters requests are batched in chunks of 1000 blocks.
- *   3. Filter hits use regtest_scan_block_txs() when rpc_ctx is available;
- *      otherwise the hit is counted tentatively (Phase 5 replaces this).
+ *   3. Filter hits download full block via P2P; on failure, fall back to
+ *      regtest_scan_block_txs() if rpc_ctx is available.
  *
- * RPC path (fallback, or when P2P is not connected):
- *   Uses regtest_get_block_height, regtest_get_block_hash,
- *   regtest_get_block_filter, and regtest_scan_block_txs.
+ * Fallback path (P2P down, ring buffer + RPC last resort):
+ *   Uses ring-buffer block hashes when available, then regtest_get_block_hash,
+ *   regtest_get_block_filter, and regtest_scan_block_txs as last resort.
  *
  * Returns number of matched blocks, or -1 on hard error.
  */
@@ -1347,9 +1371,12 @@ int bip158_backend_scan(bip158_backend_t *backend)
             p2p_close(&backend->peers[backend->current_peer]);
     }
     if (tip < 0) {
-        if (!rt) return 0;  /* P2P tip not yet available; caller retries on next poll */
-        tip = regtest_get_block_height(rt);
-        if (tip < 0) return -1;
+        /* Phase 5: use headers_synced from ring buffer before RPC */
+        if (backend->headers_synced >= 0)
+            tip = backend->headers_synced;
+        else if (rt)
+            tip = regtest_get_block_height(rt);
+        if (tip < 0) return 0;  /* no tip yet; caller retries on next poll */
     }
 
     int start = (backend->tip_height >= 0) ? backend->tip_height + 1 : tip;
@@ -1459,10 +1486,18 @@ int bip158_backend_scan(bip158_backend_t *backend)
                 } else {
                     p2p_close(&backend->peers[backend->current_peer]);
                 }
-                if (!block_scanned)
-                    fprintf(stderr, "BIP158: block %d P2P download failed, skipping\n", bh);
+                /* Phase 5: fall back to RPC scan if P2P block download failed */
+                if (!block_scanned && rt) {
+                    char hx[65];
+                    for (int b = 0; b < 32; b++)
+                        sprintf(hx + b*2, "%02x", recv_hash[31 - b]);
+                    hx[64] = 0;
+                    regtest_scan_block_txs(rt, hx, scan_tx_callback, &sc);
+                    block_scanned = 1;
+                } else if (!block_scanned) {
+                    fprintf(stderr, "BIP158: block %d P2P download failed, no RPC fallback\n", bh);
+                }
                 if (sc.found) matched++;
-                else if (!block_scanned) matched++;  /* false positive — tentative */
                 backend->tip_height = bh;
                 if (backend->block_connected_cb)
                     backend->block_connected_cb((uint32_t)bh,
@@ -1472,14 +1507,37 @@ int bip158_backend_scan(bip158_backend_t *backend)
             if (!batch_ok) break;
             h = batch_end + 1;
         }
-    } else if (backend->peers[backend->current_peer].fd < 0 && rt) {
-        /* === RPC path (no P2P connection) === */
+    } else if (backend->peers[backend->current_peer].fd < 0) {
+        /* === Fallback path: ring-buffer hashes + P2P reconnect + RPC last resort === */
+        /* Phase 5: when P2P is down but we have header data in the ring buffer,
+           attempt to reconnect and use P2P for filters + blocks.
+           Only fall back to RPC if both P2P and ring buffer are unavailable. */
+        if (backend->n_peers > 0)
+            bip158_backend_reconnect(backend);
+
+        /* If reconnect succeeded, re-enter P2P path on next scan call */
+        if (backend->peers[backend->current_peer].fd >= 0)
+            return 0;  /* will use P2P path on next poll */
+
+        /* True fallback: RPC path for environments without P2P peers */
+        if (!rt) return 0;  /* no RPC either; caller retries later */
         for (int h = start; h <= tip; h++) {
             char          hash_hex[65];
             size_t        filter_len = 0;
             unsigned char key[16];
 
-            if (!regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex))) {
+            /* Use ring buffer hash if available, else RPC */
+            int have_hash = 0;
+            if (backend->headers_synced >= h && h >= 0) {
+                const uint8_t *bh = backend->header_hashes[h % BIP158_HEADER_WINDOW];
+                for (int b = 0; b < 32; b++)
+                    sprintf(hash_hex + b*2, "%02x", bh[31 - b]);
+                hash_hex[64] = 0;
+                have_hash = 1;
+            } else {
+                have_hash = regtest_get_block_hash(rt, h, hash_hex, sizeof(hash_hex));
+            }
+            if (!have_hash) {
                 backend->tip_height = h;
                 if (backend->block_connected_cb)
                     backend->block_connected_cb((uint32_t)h,
@@ -1512,6 +1570,7 @@ int bip158_backend_scan(bip158_backend_t *backend)
                                              backend->block_connected_ctx);
         }
     }
+
 
     free(filter_buf);
 #undef FILTER_BUF_MAX

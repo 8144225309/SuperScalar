@@ -7,6 +7,7 @@
 #include "superscalar/gossip_store.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 
 /* Helper: encode 33-byte pubkey as 66-char hex string (+ NUL) */
@@ -447,4 +448,250 @@ int gossip_store_get_channels_in_range(gossip_store_t *gs,
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+/* ---- Channel enumeration for pathfinding ---- */
+
+int gossip_store_enumerate_channels(gossip_store_t *gs,
+                                     gossip_store_full_channel_cb_t cb,
+                                     void *ctx)
+{
+    if (!gs || !gs->db || !cb) return -1;
+
+    sqlite3_stmt *stmt;
+    /*
+     * Join channels with their channel_updates to emit one directed edge per
+     * (scid, direction) row.  We use capacity_sat * 1000 as a conservative
+     * htlc_max_msat because the gossip_channel_updates table does not store
+     * the htlc_maximum_msat field (it is optional in BOLT #7 and was not
+     * added to the schema).  htlc_min_msat is set to 1 msat (permissive).
+     */
+    const char *sql =
+        "SELECT c.scid, c.node1_hex, c.node2_hex, c.capacity_sat, "
+        "       u.direction, u.fee_base_msat, u.fee_ppm, u.cltv_delta "
+        "FROM gossip_channels c "
+        "JOIN gossip_channel_updates u ON c.scid = u.scid "
+        "WHERE c.pruned_at = 0;";
+
+    int rc = sqlite3_prepare_v2(gs->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t scid        = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *n1_hex   = (const char *)sqlite3_column_text(stmt, 1);
+        const char *n2_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        uint64_t cap_sat     = (uint64_t)sqlite3_column_int64(stmt, 3);
+        int direction        = sqlite3_column_int(stmt, 4);
+        uint32_t fee_base    = (uint32_t)sqlite3_column_int64(stmt, 5);
+        uint32_t fee_ppm     = (uint32_t)sqlite3_column_int64(stmt, 6);
+        uint16_t cltv        = (uint16_t)sqlite3_column_int(stmt, 7);
+
+        if (!n1_hex || !n2_hex) continue;
+
+        unsigned char pk1[33], pk2[33];
+        if (!hex_to_pubkey(n1_hex, pk1)) continue;
+        if (!hex_to_pubkey(n2_hex, pk2)) continue;
+
+        /* direction 0: node1 is src; direction 1: node2 is src */
+        const unsigned char *src = (direction == 0) ? pk1 : pk2;
+        const unsigned char *dst = (direction == 0) ? pk2 : pk1;
+
+        uint64_t htlc_max = cap_sat * 1000ULL; /* conservative upper bound */
+
+        cb(scid, src, dst, fee_base, fee_ppm, cltv,
+           1ULL /* htlc_min_msat */, htlc_max, cap_sat, ctx);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* ---- Incremental channel enumeration (since a given timestamp) ---- */
+
+int gossip_store_enumerate_channels_since(gossip_store_t *gs,
+                                           uint32_t since_ts,
+                                           gossip_store_full_channel_cb_t cb,
+                                           void *ctx)
+{
+    if (!gs || !gs->db || !cb) return -1;
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT c.scid, c.node1_hex, c.node2_hex, c.capacity_sat, "
+        "       u.direction, u.fee_base_msat, u.fee_ppm, u.cltv_delta "
+        "FROM gossip_channels c "
+        "JOIN gossip_channel_updates u ON c.scid = u.scid "
+        "WHERE c.pruned_at = 0 AND u.timestamp > ?;";
+
+    int rc = sqlite3_prepare_v2(gs->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)since_ts);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t scid        = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *n1_hex   = (const char *)sqlite3_column_text(stmt, 1);
+        const char *n2_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        uint64_t cap_sat     = (uint64_t)sqlite3_column_int64(stmt, 3);
+        int direction        = sqlite3_column_int(stmt, 4);
+        uint32_t fee_base    = (uint32_t)sqlite3_column_int64(stmt, 5);
+        uint32_t fee_ppm     = (uint32_t)sqlite3_column_int64(stmt, 6);
+        uint16_t cltv        = (uint16_t)sqlite3_column_int(stmt, 7);
+
+        if (!n1_hex || !n2_hex) continue;
+
+        unsigned char pk1[33], pk2[33];
+        if (!hex_to_pubkey(n1_hex, pk1)) continue;
+        if (!hex_to_pubkey(n2_hex, pk2)) continue;
+
+        const unsigned char *src = (direction == 0) ? pk1 : pk2;
+        const unsigned char *dst = (direction == 0) ? pk2 : pk1;
+
+        uint64_t htlc_max = cap_sat * 1000ULL;
+
+        cb(scid, src, dst, fee_base, fee_ppm, cltv,
+           1ULL /* htlc_min_msat */, htlc_max, cap_sat, ctx);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* === RGS snapshot export (wire gossip_store → rgs_snapshot_t) === */
+
+#include "superscalar/rgs.h"
+
+size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t out_cap) {
+    if (!gs || !gs->db || !out) return 0;
+
+    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
+    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    uint32_t n_nodes = 0, n_channels = 0;
+
+    /* Collect unique node IDs from channels */
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(gs->db,
+            "SELECT node1_hex, node2_hex, scid, capacity_sat "
+            "FROM gossip_channels LIMIT ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, RGS_MAX_CHANNELS);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW && n_channels < RGS_MAX_CHANNELS) {
+        /* node IDs are hex strings; decode to 33-byte pubkeys */
+        const char *n1_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *n2_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (!n1_hex || !n2_hex || strlen(n1_hex) < 66 || strlen(n2_hex) < 66)
+            continue;
+        unsigned char n1_raw[33], n2_raw[33];
+        for (int b = 0; b < 33; b++) {
+            unsigned int v;
+            sscanf(n1_hex + b*2, "%02x", &v); n1_raw[b] = (unsigned char)v;
+            sscanf(n2_hex + b*2, "%02x", &v); n2_raw[b] = (unsigned char)v;
+        }
+        const unsigned char *n1 = n1_raw;
+        const unsigned char *n2 = n2_raw;
+
+        /* Find or add node IDs */
+        uint32_t idx1 = n_nodes, idx2 = n_nodes;
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            if (memcmp(nodes[i].pubkey, n1, 33) == 0) { idx1 = i; break; }
+        }
+        if (idx1 == n_nodes && n_nodes < RGS_MAX_NODE_IDS) {
+            memcpy(nodes[n_nodes].pubkey, n1, 33);
+            idx1 = n_nodes++;
+        }
+        for (uint32_t i = 0; i < n_nodes; i++) {
+            if (memcmp(nodes[i].pubkey, n2, 33) == 0) { idx2 = i; break; }
+        }
+        if (idx2 == n_nodes && n_nodes < RGS_MAX_NODE_IDS) {
+            memcpy(nodes[n_nodes].pubkey, n2, 33);
+            idx2 = n_nodes++;
+        }
+
+        rgs_channel_t *ch = &channels[n_channels];
+        memset(ch, 0, sizeof(*ch));
+        ch->short_channel_id = (uint64_t)sqlite3_column_int64(stmt, 2);
+        ch->node_id_1_idx = idx1;
+        ch->node_id_2_idx = idx2;
+        ch->funding_satoshis = (uint64_t)sqlite3_column_int64(stmt, 3);
+        ch->update_count = 0;
+        n_channels++;
+    }
+    sqlite3_finalize(stmt);
+
+    /* Load channel updates */
+    for (uint32_t i = 0; i < n_channels; i++) {
+        for (int dir = 0; dir <= 1; dir++) {
+            uint32_t fee_base = 0, fee_ppm = 0;
+            uint16_t cltv = 0;
+            uint32_t ts = 0;
+            if (gossip_store_get_channel_update(gs, channels[i].short_channel_id,
+                                                  dir, &fee_base, &fee_ppm, &cltv, &ts)) {
+                int ui = channels[i].update_count;
+                if (ui < RGS_MAX_UPDATES_PER_CHAN) {
+                    channels[i].updates[ui].direction = dir;
+                    channels[i].updates[ui].fee_base_msat = fee_base;
+                    channels[i].updates[ui].fee_proportional_millionths = fee_ppm;
+                    channels[i].updates[ui].cltv_expiry_delta = cltv;
+                    channels[i].updates[ui].timestamp = ts;
+                    channels[i].update_count++;
+                }
+            }
+        }
+    }
+
+    rgs_snapshot_t snap;
+    snap.last_sync_timestamp = (uint32_t)time(NULL);
+    snap.node_id_count = n_nodes;
+    snap.channel_count = n_channels;
+
+    return rgs_build(&snap, nodes, channels, out, out_cap);
+}
+
+/* === RGS client-side import (populate gossip_store from snapshot) === */
+
+#include "superscalar/rgs.h"
+
+int gossip_store_import_rgs(gossip_store_t *gs, const unsigned char *blob, size_t blob_len) {
+    if (!gs || !blob || blob_len < 17) return -1;
+
+    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
+    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    rgs_snapshot_t snap;
+    snap.node_id_count = 0;
+    snap.channel_count = 0;
+
+    if (!rgs_parse(blob, blob_len, &snap, nodes, RGS_MAX_NODE_IDS,
+                    channels, RGS_MAX_CHANNELS))
+        return -1;
+
+    int imported = 0;
+    for (uint32_t i = 0; i < snap.channel_count; i++) {
+        const rgs_channel_t *ch = &channels[i];
+        if (ch->node_id_1_idx >= snap.node_id_count ||
+            ch->node_id_2_idx >= snap.node_id_count)
+            continue;
+
+        gossip_store_upsert_channel(gs, ch->short_channel_id,
+                                  nodes[ch->node_id_1_idx].pubkey,
+                                  nodes[ch->node_id_2_idx].pubkey,
+                                  ch->funding_satoshis,
+                                  snap.last_sync_timestamp);
+
+        /* Add channel updates */
+        for (int u = 0; u < ch->update_count; u++) {
+            const rgs_channel_update_t *upd = &ch->updates[u];
+            gossip_store_upsert_channel_update(gs, ch->short_channel_id,
+                                              upd->direction,
+                                              upd->fee_base_msat,
+                                              upd->fee_proportional_millionths,
+                                              upd->cltv_expiry_delta,
+                                              upd->timestamp);
+        }
+        imported++;
+    }
+    return imported;
 }
