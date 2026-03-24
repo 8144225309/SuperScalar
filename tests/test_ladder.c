@@ -2451,15 +2451,15 @@ int test_rotation_retry_success_resets(void) {
 int test_rotation_retry_defaults(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    /* rot_max_retries = 0 → default 3, rot_retry_base_delay = 0 → default 10 */
+    /* rot_max_retries = 0 → default 3, rot_retry_base_delay = 0 → default 2 */
 
     mgr.rot_attempted_mask |= (1u << 1);
     lsp_rotation_record_failure(&mgr, 1, 200);
 
-    /* Default delay: 10 * 2^1 = 20 blocks */
-    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 215), 0,
+    /* Default delay: 2 * 2^1 = 4 blocks */
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 203), 0,
                    "default delay not elapsed");
-    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 220), 1,
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&mgr, 1, 204), 1,
                    "default delay elapsed");
 
     /* Exhaust at default max 3 */
