@@ -1664,8 +1664,8 @@ int test_dw_cross_layer_delay_ordering(void) {
     }
 
     /* Verify odometer behavior: layer n_layers-1 is innermost (fastest).
-       After 1 advance from reset, layer 2 goes to state 1, others stay at 0. */
-    dw_counter_reset(&ctr);
+       After 1 advance from init, layer 2 goes to state 1, others stay at 0. */
+    dw_counter_init(&ctr, 3, 1, 4);
     dw_counter_advance(&ctr);
 
     TEST_ASSERT_EQ(ctr.layers[0].current_state, 0, "layer 0 (outermost) at 0");

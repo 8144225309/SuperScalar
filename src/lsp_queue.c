@@ -173,7 +173,6 @@ int queue_has_pending(persist_t *p, uint32_t client_idx) {
 const char *queue_request_type_name(int request_type) {
     switch (request_type) {
         case QUEUE_REQ_ROTATION:     return "rotation";
-        case QUEUE_REQ_EPOCH_RESET:  return "epoch_reset";
         case QUEUE_REQ_LEAF_ADVANCE: return "leaf_advance";
         case QUEUE_REQ_DW_PRESIGN:   return "dw_presign";
         case QUEUE_REQ_CLOSE:        return "close";

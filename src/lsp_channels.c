@@ -1107,301 +1107,6 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
-/* --- Distributed Epoch Reset (2-round MuSig2 ceremony) --- */
-
-/* Orchestrate a distributed epoch reset: rebuild all unsigned txs with DW
-   counter at 0, then collect partial signatures from ALL clients via a
-   2-round PROPOSE/PSIG exchange. Requires all clients to be online.
-   Returns 1 on success, 0 on failure. */
-static int lsp_epoch_reset_distributed(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    factory_t *f = &lsp->factory;
-    size_t nc = lsp->n_clients;
-
-    /* Step 1: Pre-check — all clients must be online for N-of-N signing */
-    for (size_t c = 0; c < nc; c++) {
-        if (lsp->client_fds[c] < 0) {
-            fprintf(stderr, "LSP: epoch reset aborted — client %zu offline\n", c);
-            return 0;
-        }
-    }
-
-    printf("LSP: starting distributed epoch reset (%zu clients, %zu nodes)\n",
-           nc, f->n_nodes);
-
-    /* Step 2: Reset DW counter + rebuild all unsigned txs */
-    if (!factory_reset_epoch_unsigned(f)) {
-        fprintf(stderr, "LSP: factory_reset_epoch_unsigned failed\n");
-        return 0;
-    }
-
-    /* Step 3: Init signing sessions for all nodes */
-    if (!factory_sessions_init(f)) {
-        fprintf(stderr, "LSP: factory_sessions_init failed\n");
-        return 0;
-    }
-
-    /* Step 4: Generate LSP nonces (participant 0) for all nodes */
-    unsigned char lsp_seckey[32];
-    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
-        return 0;
-
-    secp256k1_musig_secnonce lsp_secnonces[FACTORY_MAX_NODES];
-    memset(lsp_secnonces, 0, sizeof(lsp_secnonces));
-
-    /* Build LSP nonce bundle + accumulate all nonces for Round 2 */
-    wire_bundle_entry_t all_nonces[FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS];
-    size_t n_all_nonces = 0;
-
-    wire_bundle_entry_t lsp_nonce_entries[FACTORY_MAX_NODES];
-    size_t n_lsp_nonces = 0;
-
-    for (size_t n = 0; n < f->n_nodes; n++) {
-        int slot = factory_find_signer_slot(f, n, 0);
-        if (slot < 0) continue;
-
-        secp256k1_musig_pubnonce pubnonce;
-        if (!musig_generate_nonce(lsp->ctx, &lsp_secnonces[n], &pubnonce,
-                                   lsp_seckey, &lsp->lsp_pubkey,
-                                   &f->nodes[n].keyagg.cache)) {
-            memset(lsp_seckey, 0, 32);
-            fprintf(stderr, "LSP: nonce gen failed for node %zu\n", n);
-            return 0;
-        }
-
-        if (!factory_session_set_nonce(f, n, (size_t)slot, &pubnonce)) {
-            memset(lsp_seckey, 0, 32);
-            return 0;
-        }
-
-        /* Add to LSP nonce bundle (for Round 1) */
-        lsp_nonce_entries[n_lsp_nonces].node_idx = (uint32_t)n;
-        lsp_nonce_entries[n_lsp_nonces].signer_slot = (uint32_t)slot;
-        musig_pubnonce_serialize(lsp->ctx,
-                                  lsp_nonce_entries[n_lsp_nonces].data, &pubnonce);
-        lsp_nonce_entries[n_lsp_nonces].data_len = 66;
-        n_lsp_nonces++;
-
-        /* Also accumulate for all_nonces (Round 2) */
-        all_nonces[n_all_nonces] = lsp_nonce_entries[n_lsp_nonces - 1];
-        n_all_nonces++;
-    }
-
-    /* Step 5: ROUND 1 — send LSP nonces, collect each client's nonces */
-    for (size_t c = 0; c < nc; c++) {
-        cJSON *propose = wire_build_epoch_reset_propose(1, lsp_nonce_entries,
-                                                          n_lsp_nonces);
-        if (!wire_send(lsp->client_fds[c], MSG_EPOCH_RESET_PROPOSE, propose)) {
-            cJSON_Delete(propose);
-            memset(lsp_seckey, 0, 32);
-            fprintf(stderr, "LSP: failed to send Round 1 PROPOSE to client %zu\n", c);
-            return 0;
-        }
-        cJSON_Delete(propose);
-
-        /* Wait for EPOCH_RESET_PSIG with client's nonces.
-           Retry loop: discard stale CS/RAA from prior payment updates. */
-        wire_msg_t resp;
-        int got_r1 = 0;
-        for (int retry = 0; retry < 10; retry++) {
-            memset(&resp, 0, sizeof(resp));
-            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp, 30))
-                break;
-            if (resp.msg_type == MSG_EPOCH_RESET_PSIG) { got_r1 = 1; break; }
-            fprintf(stderr, "LSP: epoch reset R1: discarding stale msg 0x%02x "
-                    "from client %zu\n", resp.msg_type, c);
-            if (resp.json) { cJSON_Delete(resp.json); resp.json = NULL; }
-        }
-        if (!got_r1) {
-            fprintf(stderr, "LSP: epoch reset R1: no PSIG from client %zu "
-                    "(last msg 0x%02x)\n", c, resp.msg_type);
-            if (resp.json) cJSON_Delete(resp.json);
-            memset(lsp_seckey, 0, 32);
-            return 0;
-        }
-
-        /* Parse client nonces */
-        wire_bundle_entry_t client_nonces[FACTORY_MAX_NODES];
-        size_t n_client_nonces = 0;
-        wire_bundle_entry_t client_psigs_dummy[1];
-        size_t n_dummy = 0;
-        if (!wire_parse_epoch_reset_psig(resp.json,
-                                           client_nonces, FACTORY_MAX_NODES,
-                                           &n_client_nonces,
-                                           client_psigs_dummy, 1, &n_dummy)) {
-            fprintf(stderr, "LSP: failed to parse Round 1 PSIG from client %zu\n", c);
-            cJSON_Delete(resp.json);
-            memset(lsp_seckey, 0, 32);
-            return 0;
-        }
-        cJSON_Delete(resp.json);
-
-        /* Set client nonces on factory + accumulate for all_nonces */
-        for (size_t i = 0; i < n_client_nonces; i++) {
-            secp256k1_musig_pubnonce pn;
-            if (!musig_pubnonce_parse(lsp->ctx, &pn, client_nonces[i].data)) {
-                fprintf(stderr, "LSP: bad pubnonce from client %zu node %u\n",
-                        c, client_nonces[i].node_idx);
-                memset(lsp_seckey, 0, 32);
-                return 0;
-            }
-            if (!factory_session_set_nonce(f, client_nonces[i].node_idx,
-                                             client_nonces[i].signer_slot, &pn)) {
-                memset(lsp_seckey, 0, 32);
-                return 0;
-            }
-
-            /* Accumulate for Round 2 */
-            if (n_all_nonces < FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS) {
-                all_nonces[n_all_nonces] = client_nonces[i];
-                n_all_nonces++;
-            }
-        }
-
-        printf("LSP: Round 1 complete for client %zu (%zu nonces)\n",
-               c, n_client_nonces);
-    }
-
-    /* Step 6: All nonces collected — finalize sessions */
-    if (!factory_sessions_finalize(f)) {
-        fprintf(stderr, "LSP: factory_sessions_finalize failed\n");
-        memset(lsp_seckey, 0, 32);
-        return 0;
-    }
-
-    /* Step 7: LSP creates partial sigs for all its nodes */
-    secp256k1_keypair lsp_kp;
-    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
-        memset(lsp_seckey, 0, 32);
-        return 0;
-    }
-    memset(lsp_seckey, 0, 32);
-
-    for (size_t n = 0; n < f->n_nodes; n++) {
-        int slot = factory_find_signer_slot(f, n, 0);
-        if (slot < 0) continue;
-
-        secp256k1_musig_partial_sig psig;
-        if (!musig_create_partial_sig(lsp->ctx, &psig, &lsp_secnonces[n],
-                                        &lsp_kp, &f->nodes[n].signing_session)) {
-            fprintf(stderr, "LSP: partial sig failed for node %zu\n", n);
-            return 0;
-        }
-
-        if (!factory_session_set_partial_sig(f, n, (size_t)slot, &psig))
-            return 0;
-
-        /* Track signing progress */
-        if (mgr->persist)
-            persist_save_signing_progress((persist_t *)mgr->persist, 0,
-                                           (uint32_t)n, (uint32_t)slot, 1, 1);
-    }
-
-    /* Step 8-9: ROUND 2 — send ALL nonces, collect each client's psigs */
-    for (size_t c = 0; c < nc; c++) {
-        cJSON *propose2 = wire_build_epoch_reset_propose(2, all_nonces,
-                                                           n_all_nonces);
-        if (!wire_send(lsp->client_fds[c], MSG_EPOCH_RESET_PROPOSE, propose2)) {
-            cJSON_Delete(propose2);
-            fprintf(stderr, "LSP: failed to send Round 2 PROPOSE to client %zu\n", c);
-            return 0;
-        }
-        cJSON_Delete(propose2);
-
-        /* Wait for EPOCH_RESET_PSIG with client's partial sigs.
-           Retry loop: discard stale messages. */
-        wire_msg_t resp2;
-        int got_r2 = 0;
-        for (int retry = 0; retry < 10; retry++) {
-            memset(&resp2, 0, sizeof(resp2));
-            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp2, 30))
-                break;
-            if (resp2.msg_type == MSG_EPOCH_RESET_PSIG) { got_r2 = 1; break; }
-            fprintf(stderr, "LSP: epoch reset R2: discarding stale msg 0x%02x "
-                    "from client %zu\n", resp2.msg_type, c);
-            if (resp2.json) { cJSON_Delete(resp2.json); resp2.json = NULL; }
-        }
-        if (!got_r2) {
-            fprintf(stderr, "LSP: epoch reset R2: no PSIG from client %zu "
-                    "(last msg 0x%02x)\n", c, resp2.msg_type);
-            if (resp2.json) cJSON_Delete(resp2.json);
-            return 0;
-        }
-
-        /* Parse client's partial sigs */
-        wire_bundle_entry_t nonces_dummy[1];
-        size_t n_nonces_dummy = 0;
-        wire_bundle_entry_t client_psigs[FACTORY_MAX_NODES];
-        size_t n_client_psigs = 0;
-        if (!wire_parse_epoch_reset_psig(resp2.json,
-                                           nonces_dummy, 1, &n_nonces_dummy,
-                                           client_psigs, FACTORY_MAX_NODES,
-                                           &n_client_psigs)) {
-            fprintf(stderr, "LSP: failed to parse Round 2 PSIG from client %zu\n", c);
-            cJSON_Delete(resp2.json);
-            return 0;
-        }
-        cJSON_Delete(resp2.json);
-
-        /* Set client's partial sigs on factory */
-        for (size_t i = 0; i < n_client_psigs; i++) {
-            secp256k1_musig_partial_sig ps;
-            if (!musig_partial_sig_parse(lsp->ctx, &ps, client_psigs[i].data)) {
-                fprintf(stderr, "LSP: bad psig from client %zu node %u\n",
-                        c, client_psigs[i].node_idx);
-                return 0;
-            }
-            if (!factory_session_set_partial_sig(f, client_psigs[i].node_idx,
-                                                   client_psigs[i].signer_slot,
-                                                   &ps))
-                return 0;
-
-            /* Track signing progress */
-            if (mgr->persist)
-                persist_save_signing_progress((persist_t *)mgr->persist, 0,
-                                               client_psigs[i].node_idx,
-                                               client_psigs[i].signer_slot, 1, 1);
-        }
-
-        printf("LSP: Round 2 complete for client %zu (%zu psigs)\n",
-               c, n_client_psigs);
-    }
-
-    /* Step 10: Aggregate all partial sigs into final Schnorr signatures */
-    if (!factory_sessions_complete(f)) {
-        fprintf(stderr, "LSP: factory_sessions_complete failed\n");
-        return 0;
-    }
-
-    /* Clear signing progress after successful aggregation */
-    if (mgr->persist)
-        persist_clear_signing_progress((persist_t *)mgr->persist, 0);
-
-    /* Step 11: Notify all clients */
-    cJSON *done = wire_build_epoch_reset_done();
-    for (size_t c = 0; c < nc; c++) {
-        wire_send(lsp->client_fds[c], MSG_EPOCH_RESET_DONE, done);
-    }
-    cJSON_Delete(done);
-
-    /* Step 12: Persist DW counter state */
-    if (mgr->persist) {
-        uint32_t leaf_states[8];
-        for (int i = 0; i < f->n_leaf_nodes; i++)
-            leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS];
-        for (uint32_t i = 0; i < f->counter.n_layers; i++)
-            layer_states[i] = f->counter.layers[i].config.max_states;
-        persist_save_dw_counter_with_leaves(
-            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-            f->counter.n_layers, layer_states,
-            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
-    }
-
-    printf("LSP: distributed epoch reset complete — all %zu nodes signed\n",
-           f->n_nodes);
-    return 1;
-}
-
 /* --- Per-leaf DW advance (arity-1 split-round signing) --- */
 
 /* Advance one leaf's DW counter, do split-round signing with the affected
@@ -1423,7 +1128,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     }
     if (rc == -1) {
         /* Root advanced + full rebuild needed — too complex for per-leaf flow.
-           This is rare and should trigger an epoch reset instead. */
+           This is rare and should trigger a factory rotation instead. */
         printf("LSP: leaf %d exhausted, root advanced — skipping per-leaf signing\n",
                leaf_side);
         return 1;
@@ -2215,12 +1920,6 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     case MSG_CLOSE_REQUEST:
         printf("LSP: client %zu requested close\n", client_idx);
         return 1;  /* handled by caller */
-
-    case MSG_EPOCH_RESET_PSIG:
-        /* Stale PSIG outside of active ceremony — discard. Active ceremony
-           uses recv_timeout_service_bridge() to read responses directly. */
-        printf("LSP: discarding stale EPOCH_RESET_PSIG from client %zu\n", client_idx);
-        return 1;
 
     case MSG_LEAF_ADVANCE_PSIG:
         /* Stale PSIG outside of active ceremony — discard. Active ceremony
@@ -3232,14 +2931,6 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         } else {
             printf("CLI: usage: invoice <client> <amount_msat>\n");
         }
-    } else if (strcmp(line, "reset") == 0) {
-        printf("CLI: triggering distributed epoch reset...\n");
-        fflush(stdout);
-        if (lsp_epoch_reset_distributed(mgr, lsp_ptr))
-            printf("CLI: epoch reset complete — DW counter back to 0\n");
-        else
-            printf("CLI: epoch reset FAILED\n");
-        fflush(stdout);
     } else if (strcmp(line, "help") == 0) {
         printf("Commands:\n");
         printf("  pay <from> <to> <amount>     Send payment between clients\n");
@@ -3247,7 +2938,6 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  invoice <client> <msat>      Create external invoice for LN receive\n");
         printf("  status                       Show factory/channel/bridge state\n");
         printf("  rotate                       Force factory rotation\n");
-        printf("  reset                        Cooperative DW epoch reset (counter → 0)\n");
         printf("  close                        Cooperative close and shutdown\n");
         printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
         printf("  pay_external <client> <bolt11> Pay external LN invoice via bridge\n");
@@ -3700,17 +3390,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
-            /* Check if DW counter is near exhaustion — trigger epoch reset */
+            /* Check if DW counter is near exhaustion — trigger factory rotation */
             if (!dw_counter_is_exhausted(&lsp->factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp->factory.counter);
                 uint32_t total = lsp->factory.counter.total_states;
                 if (total > 0 && epoch >= (total * 3) / 4) {
-                    printf("LSP: DW counter at %u/%u (>75%%) — epoch reset needed\n",
+                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed\n",
                            epoch, total);
-                    if (lsp_epoch_reset_distributed(mgr, lsp))
-                        printf("LSP: distributed epoch reset complete — counter back to 0\n");
-                    else
-                        fprintf(stderr, "LSP: distributed epoch reset FAILED\n");
+                    if (mgr->rot_auto_rotate) {
+                        lsp_channels_rotate_factory(mgr, lsp);
+                    }
                 }
             }
 

@@ -1292,34 +1292,6 @@ int factory_advance(factory_t *f) {
     return factory_sign_all(f);
 }
 
-int factory_reset_epoch(factory_t *f) {
-    dw_counter_reset(&f->counter);
-
-    /* Reset per-leaf layers too */
-    for (int i = 0; i < f->n_leaf_nodes; i++)
-        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
-    f->per_leaf_enabled = 0;
-
-    if (!update_l_stock_outputs(f))
-        return 0;
-    if (!build_all_unsigned_txs(f))
-        return 0;
-    return factory_sign_all(f);
-}
-
-int factory_reset_epoch_unsigned(factory_t *f) {
-    dw_counter_reset(&f->counter);
-
-    /* Reset per-leaf layers too */
-    for (int i = 0; i < f->n_leaf_nodes; i++)
-        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
-    f->per_leaf_enabled = 0;
-
-    if (!update_l_stock_outputs(f))
-        return 0;
-    return build_all_unsigned_txs(f);
-}
-
 /* Rebuild unsigned tx for a single node. */
 static int rebuild_node_tx(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;
