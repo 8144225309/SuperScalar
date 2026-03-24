@@ -4703,14 +4703,20 @@ int main(int argc, char *argv[]) {
             tx_buf_t old_commit_tx;
             tx_buf_init(&old_commit_tx, 512);
             unsigned char old_txid[32];
-            /* Build the CLIENT's old commitment (from LSP's perspective).
-               The watchtower watches for the remote's commitment via
-               channel_build_commitment_tx_for_remote(lsp_ch), which builds
-               the client's commitment. The breach test simulates the CLIENT
-               cheating by broadcasting their old commitment. The LSP's
-               watchtower detects it and broadcasts a penalty TX using the
-               client's revocation secret. */
-            int built = channel_build_commitment_tx_for_remote(chX, &old_commit_tx, old_txid);
+            int built;
+            if (breach_test == 2) {
+                /* --cheat-daemon: simulate LSP cheating by broadcasting the
+                   LSP's own old commitment TX.  Client watchtowers watch for
+                   this via channel_build_commitment_tx_for_remote(client_ch),
+                   which produces the same txid as our local commitment. */
+                built = channel_build_commitment_tx(chX, &old_commit_tx, old_txid);
+            } else {
+                /* --test-breach: simulate CLIENT cheating by broadcasting the
+                   client's old commitment TX.  The LSP's own watchtower
+                   watches for this via channel_build_commitment_tx_for_remote
+                   (lsp_ch) and broadcasts a penalty TX. */
+                built = channel_build_commitment_tx_for_remote(chX, &old_commit_tx, old_txid);
+            }
 
             /* Restore current state */
             chX->commitment_number = saved_num;
