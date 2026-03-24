@@ -58,7 +58,7 @@ int test_queue_urgency_ordering(void) {
                            QUEUE_URGENCY_LOW, 0, NULL), "push low");
     TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_CRITICAL, 0, NULL), "push critical");
-    TEST_ASSERT(queue_push(&db, 0, 3, QUEUE_REQ_EPOCH_RESET,
+    TEST_ASSERT(queue_push(&db, 0, 3, QUEUE_REQ_LEAF_ADVANCE,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push normal");
     TEST_ASSERT(queue_push(&db, 0, 4, QUEUE_REQ_LEAF_ADVANCE,
                            QUEUE_URGENCY_HIGH, 0, NULL), "push high");
@@ -107,8 +107,8 @@ int test_queue_different_types(void) {
 
     TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push rotation");
-    TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_EPOCH_RESET,
-                           QUEUE_URGENCY_NORMAL, 0, NULL), "push epoch_reset");
+    TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_LEAF_ADVANCE,
+                           QUEUE_URGENCY_NORMAL, 0, NULL), "push leaf_advance");
     TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_DW_PRESIGN,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push dw_presign");
 
@@ -153,7 +153,7 @@ int test_queue_expire(void) {
     TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_NORMAL, now - 100, NULL),
                 "push expired");
-    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_EPOCH_RESET,
+    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_LEAF_ADVANCE,
                            QUEUE_URGENCY_NORMAL, now + 3600, NULL),
                 "push not expired");
     /* Push one with no expiry (expires_at=0) */
@@ -191,7 +191,7 @@ int test_queue_delete_single(void) {
 
     TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push 1");
-    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_EPOCH_RESET,
+    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_LEAF_ADVANCE,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push 2");
 
     queue_entry_t entries[QUEUE_MAX_PENDING];
@@ -213,7 +213,7 @@ int test_queue_delete_all(void) {
 
     TEST_ASSERT(queue_push(&db, 0, 1, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push 1");
-    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_EPOCH_RESET,
+    TEST_ASSERT(queue_push(&db, 0, 2, QUEUE_REQ_LEAF_ADVANCE,
                            QUEUE_URGENCY_HIGH, 0, NULL), "push 2");
     TEST_ASSERT(queue_push(&db, 1, 1, QUEUE_REQ_ROTATION,
                            QUEUE_URGENCY_NORMAL, 0, NULL), "push other client");
@@ -248,8 +248,6 @@ int test_queue_has_pending(void) {
 int test_queue_request_type_name(void) {
     TEST_ASSERT(strcmp(queue_request_type_name(QUEUE_REQ_ROTATION), "rotation") == 0,
                 "rotation name");
-    TEST_ASSERT(strcmp(queue_request_type_name(QUEUE_REQ_EPOCH_RESET), "epoch_reset") == 0,
-                "epoch_reset name");
     TEST_ASSERT(strcmp(queue_request_type_name(QUEUE_REQ_LEAF_ADVANCE), "leaf_advance") == 0,
                 "leaf_advance name");
     TEST_ASSERT(strcmp(queue_request_type_name(QUEUE_REQ_DW_PRESIGN), "dw_presign") == 0,

@@ -91,7 +91,7 @@ int test_notify_multiple_sends(void) {
     n.backend_data = &tb;
 
     notify_send(&n, 0, NOTIFY_QUEUE_ITEM, QUEUE_URGENCY_LOW, NULL);
-    notify_send(&n, 1, NOTIFY_EPOCH_RESET, QUEUE_URGENCY_NORMAL, NULL);
+    notify_send(&n, 1, NOTIFY_ROTATION_NEEDED, QUEUE_URGENCY_NORMAL, NULL);
     notify_send(&n, 2, NOTIFY_FACTORY_EXPIRING, QUEUE_URGENCY_CRITICAL, "{}");
 
     TEST_ASSERT_EQ(tb.call_count, 3, "called 3 times");
@@ -139,8 +139,6 @@ int test_notify_null_safety(void) {
 int test_notify_event_names(void) {
     TEST_ASSERT(strcmp(notify_event_name(NOTIFY_ROTATION_NEEDED), "rotation_needed") == 0,
                 "rotation_needed");
-    TEST_ASSERT(strcmp(notify_event_name(NOTIFY_EPOCH_RESET), "epoch_reset") == 0,
-                "epoch_reset");
     TEST_ASSERT(strcmp(notify_event_name(NOTIFY_FACTORY_EXPIRING), "factory_expiring") == 0,
                 "factory_expiring");
     TEST_ASSERT(strcmp(notify_event_name(NOTIFY_PAYMENT_RECEIVED), "payment_received") == 0,
