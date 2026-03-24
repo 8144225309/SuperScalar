@@ -1198,12 +1198,22 @@ static int lsp_epoch_reset_distributed(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         cJSON_Delete(propose);
 
-        /* Wait for EPOCH_RESET_PSIG with client's nonces */
+        /* Wait for EPOCH_RESET_PSIG with client's nonces.
+           Retry loop: discard stale CS/RAA from prior payment updates. */
         wire_msg_t resp;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp, 30) ||
-            resp.msg_type != MSG_EPOCH_RESET_PSIG) {
-            fprintf(stderr, "LSP: expected EPOCH_RESET_PSIG (nonces) from client %zu, "
-                    "got 0x%02x\n", c, resp.msg_type);
+        int got_r1 = 0;
+        for (int retry = 0; retry < 10; retry++) {
+            memset(&resp, 0, sizeof(resp));
+            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp, 30))
+                break;
+            if (resp.msg_type == MSG_EPOCH_RESET_PSIG) { got_r1 = 1; break; }
+            fprintf(stderr, "LSP: epoch reset R1: discarding stale msg 0x%02x "
+                    "from client %zu\n", resp.msg_type, c);
+            if (resp.json) { cJSON_Delete(resp.json); resp.json = NULL; }
+        }
+        if (!got_r1) {
+            fprintf(stderr, "LSP: epoch reset R1: no PSIG from client %zu "
+                    "(last msg 0x%02x)\n", c, resp.msg_type);
             if (resp.json) cJSON_Delete(resp.json);
             memset(lsp_seckey, 0, 32);
             return 0;
@@ -1297,12 +1307,22 @@ static int lsp_epoch_reset_distributed(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         cJSON_Delete(propose2);
 
-        /* Wait for EPOCH_RESET_PSIG with client's partial sigs */
+        /* Wait for EPOCH_RESET_PSIG with client's partial sigs.
+           Retry loop: discard stale messages. */
         wire_msg_t resp2;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp2, 30) ||
-            resp2.msg_type != MSG_EPOCH_RESET_PSIG) {
-            fprintf(stderr, "LSP: expected EPOCH_RESET_PSIG (psigs) from client %zu, "
-                    "got 0x%02x\n", c, resp2.msg_type);
+        int got_r2 = 0;
+        for (int retry = 0; retry < 10; retry++) {
+            memset(&resp2, 0, sizeof(resp2));
+            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &resp2, 30))
+                break;
+            if (resp2.msg_type == MSG_EPOCH_RESET_PSIG) { got_r2 = 1; break; }
+            fprintf(stderr, "LSP: epoch reset R2: discarding stale msg 0x%02x "
+                    "from client %zu\n", resp2.msg_type, c);
+            if (resp2.json) { cJSON_Delete(resp2.json); resp2.json = NULL; }
+        }
+        if (!got_r2) {
+            fprintf(stderr, "LSP: epoch reset R2: no PSIG from client %zu "
+                    "(last msg 0x%02x)\n", c, resp2.msg_type);
             if (resp2.json) cJSON_Delete(resp2.json);
             return 0;
         }
@@ -2889,22 +2909,32 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
 
     /* Outputs 1..N: each client gets their remote_amount.
        When close_spk override is active, all outputs use it (rotation/recycling).
-       Otherwise, each client output uses their per-client close address. */
+       Otherwise, each client output uses their per-client close address.
+       Skip dust outputs (< 546 sats) — fold them back into the LSP output. */
+    size_t n_outs = 1;  /* output 0 = LSP */
+    uint64_t dust_reclaimed = 0;
     for (size_t c = 0; c < mgr->n_channels; c++) {
-        outputs[c + 1].amount_sats = mgr->entries[c].channel.remote_amount;
-        if (!close_spk && mgr->entries[c].close_spk_len > 0) {
-            memcpy(outputs[c + 1].script_pubkey, mgr->entries[c].close_spk,
-                   mgr->entries[c].close_spk_len);
-            outputs[c + 1].script_pubkey_len = mgr->entries[c].close_spk_len;
-        } else {
-            memcpy(outputs[c + 1].script_pubkey, spk, spk_len);
-            outputs[c + 1].script_pubkey_len = spk_len;
+        uint64_t amt = mgr->entries[c].channel.remote_amount;
+        if (amt < 546) {
+            dust_reclaimed += amt;
+            continue;
         }
+        outputs[n_outs].amount_sats = amt;
+        if (!close_spk && mgr->entries[c].close_spk_len > 0) {
+            memcpy(outputs[n_outs].script_pubkey, mgr->entries[c].close_spk,
+                   mgr->entries[c].close_spk_len);
+            outputs[n_outs].script_pubkey_len = mgr->entries[c].close_spk_len;
+        } else {
+            memcpy(outputs[n_outs].script_pubkey, spk, spk_len);
+            outputs[n_outs].script_pubkey_len = spk_len;
+        }
+        n_outs++;
     }
+    outputs[0].amount_sats += dust_reclaimed;
 
     /* Invariant: sum of outputs + close_fee == funding_amount */
     uint64_t sum = close_fee;
-    for (size_t i = 0; i < mgr->n_channels + 1; i++)
+    for (size_t i = 0; i < n_outs; i++)
         sum += outputs[i].amount_sats;
     if (sum != factory->funding_amount_sats) {
         fprintf(stderr, "lsp_channels_build_close_outputs: balance invariant failed "
@@ -2913,7 +2943,7 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
         return 0;
     }
 
-    return mgr->n_channels + 1;
+    return n_outs;
 }
 
 int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory) {
@@ -3911,17 +3941,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Handle stdin CLI commands */
         if (stdin_slot >= 0 && (pfds[stdin_slot].revents & POLLIN)) {
             char line[256];
-            if (!fgets(line, sizeof(line), stdin)) {
+            /* Use read() instead of fgets() — fgets permanently marks
+               stdio EOF on FIFOs even when new writers connect later. */
+            ssize_t nr = read(STDIN_FILENO, line, sizeof(line) - 1);
+            if (nr <= 0) {
                 /* EOF or error — disable CLI to prevent spin loop */
                 mgr->cli_enabled = 0;
             } else {
+                line[nr] = '\0';
                 /* Strip trailing newline */
                 size_t len = strlen(line);
                 while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                     line[--len] = '\0';
 
                 lsp_channels_handle_cli_line(mgr, lsp, line, shutdown_flag);
-            } /* else fgets succeeded */
+            }
         }
 
         /* Handle admin RPC request */
