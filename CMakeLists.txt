@@ -301,7 +301,7 @@ add_test(NAME unit_tests COMMAND test_superscalar --unit)
 add_test(NAME regtest_tests COMMAND test_superscalar --regtest)
 
 # --- Executables ---
-add_executable(superscalar_lsp tools/superscalar_lsp.c)
+add_executable(superscalar_lsp tools/superscalar_lsp.c tools/superscalar_lsp_tests.c)
 target_include_directories(superscalar_lsp PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar_lsp PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_lsp PRIVATE superscalar project_warnings)
