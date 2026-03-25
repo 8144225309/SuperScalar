@@ -441,6 +441,8 @@ extern int test_admin_rpc_openchannel_peer_not_connected(void);
 extern int test_admin_rpc_openchannel_zero_amount(void);
 extern int test_admin_rpc_closechannel_spk_not_error(void);
 extern int test_admin_rpc_closechannel_spk_nonzero(void);
+extern int test_admin_rpc_getbalance(void);
+extern int test_admin_rpc_listfunds(void);
 extern int test_admin_rpc_listfactories_no_persist(void);
 extern int test_admin_rpc_recoverfactory_no_persist(void);
 extern int test_admin_rpc_sweepfactory_no_persist(void);
@@ -2166,6 +2168,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_openchannel_zero_amount);
     RUN_TEST(test_admin_rpc_closechannel_spk_not_error);
     RUN_TEST(test_admin_rpc_closechannel_spk_nonzero);
+    RUN_TEST(test_admin_rpc_getbalance);
+    RUN_TEST(test_admin_rpc_listfunds);
     RUN_TEST(test_admin_rpc_listfactories_no_persist);
     RUN_TEST(test_admin_rpc_recoverfactory_no_persist);
     RUN_TEST(test_admin_rpc_sweepfactory_no_persist);

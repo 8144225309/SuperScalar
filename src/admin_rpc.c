@@ -1030,6 +1030,64 @@ static cJSON *method_stop(admin_rpc_t *rpc)
 }
 
 /* ------------------------------------------------------------------ */
+/* Method: getbalance                                                    */
+/* ------------------------------------------------------------------ */
+static cJSON *method_getbalance(admin_rpc_t *rpc)
+{
+    cJSON *r = cJSON_CreateObject();
+    uint64_t total_local = 0, total_remote = 0;
+    size_t n_active = 0;
+
+    if (rpc->channel_mgr) {
+        for (size_t i = 0; i < rpc->channel_mgr->n_channels; i++) {
+            lsp_channel_entry_t *e = &rpc->channel_mgr->entries[i];
+            channel_t *ch = &e->channel;
+            total_local  += ch->local_amount;
+            total_remote += ch->remote_amount;
+            if (e->ready) n_active++;
+        }
+    }
+
+    cJSON_AddNumberToObject(r, "local_balance_msat",  (double)total_local);
+    cJSON_AddNumberToObject(r, "remote_balance_msat", (double)total_remote);
+    cJSON_AddNumberToObject(r, "total_balance_msat",  (double)(total_local + total_remote));
+    cJSON_AddNumberToObject(r, "local_balance_sats",  (double)(total_local / 1000));
+    cJSON_AddNumberToObject(r, "remote_balance_sats", (double)(total_remote / 1000));
+    cJSON_AddNumberToObject(r, "n_channels",          (double)(rpc->channel_mgr ?
+                                                        rpc->channel_mgr->n_channels : 0));
+    cJSON_AddNumberToObject(r, "n_active",            (double)n_active);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* Method: listfunds                                                     */
+/* ------------------------------------------------------------------ */
+static cJSON *method_listfunds(admin_rpc_t *rpc)
+{
+    cJSON *r = cJSON_CreateObject();
+
+    /* Channel funds */
+    cJSON *channels = cJSON_AddArrayToObject(r, "channels");
+    uint64_t total_channel_sats = 0;
+    if (rpc->channel_mgr) {
+        for (size_t i = 0; i < rpc->channel_mgr->n_channels; i++) {
+            lsp_channel_entry_t *e = &rpc->channel_mgr->entries[i];
+            channel_t *ch = &e->channel;
+            cJSON *ce = cJSON_CreateObject();
+            cJSON_AddNumberToObject(ce, "channel_id", (double)e->channel_id);
+            cJSON_AddNumberToObject(ce, "our_amount_msat", (double)ch->local_amount);
+            cJSON_AddNumberToObject(ce, "their_amount_msat", (double)ch->remote_amount);
+            cJSON_AddStringToObject(ce, "state", e->ready ? "active" : "pending");
+            cJSON_AddItemToArray(channels, ce);
+            total_channel_sats += ch->local_amount / 1000;
+        }
+    }
+
+    cJSON_AddNumberToObject(r, "total_channel_sats", (double)total_channel_sats);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main dispatch                                                         */
 /* ------------------------------------------------------------------ */
 size_t admin_rpc_handle_request(admin_rpc_t *rpc,
@@ -1100,6 +1158,10 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_stop(rpc);
     } else if (strcmp(m, "createoffer") == 0) {
         result = method_createoffer(rpc, params);
+    } else if (strcmp(m, "getbalance") == 0) {
+        result = method_getbalance(rpc);
+    } else if (strcmp(m, "listfunds") == 0) {
+        result = method_listfunds(rpc);
     } else {
         size_t n = build_error(id, -32601, "Method not found", json_out, out_cap);
         cJSON_Delete(req);
