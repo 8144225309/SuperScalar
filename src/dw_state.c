@@ -70,9 +70,3 @@ bool dw_counter_is_exhausted(const dw_counter_t *ctr) {
 uint32_t dw_counter_epoch(const dw_counter_t *ctr) {
     return ctr->current_epoch;
 }
-
-void dw_counter_reset(dw_counter_t *ctr) {
-    for (uint32_t i = 0; i < ctr->n_layers; i++)
-        ctr->layers[i].current_state = 0;
-    ctr->current_epoch = 0;
-}

@@ -8,7 +8,6 @@
 
 /* --- Request types --- */
 #define QUEUE_REQ_ROTATION      1  /* participate in factory rotation */
-#define QUEUE_REQ_EPOCH_RESET   2  /* sign epoch reset */
 #define QUEUE_REQ_LEAF_ADVANCE  3  /* sign per-leaf DW advance */
 #define QUEUE_REQ_DW_PRESIGN    4  /* presign future DW states */
 #define QUEUE_REQ_CLOSE         5  /* cooperative close */

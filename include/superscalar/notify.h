@@ -6,7 +6,6 @@
 
 /* --- Notification event types --- */
 #define NOTIFY_ROTATION_NEEDED    1  /* factory rotation starting */
-#define NOTIFY_EPOCH_RESET        2  /* epoch reset ceremony needed */
 #define NOTIFY_FACTORY_EXPIRING   3  /* factory approaching CLTV timeout */
 #define NOTIFY_PAYMENT_RECEIVED   4  /* inbound payment pending */
 #define NOTIFY_QUEUE_ITEM         5  /* generic: pending work queued */

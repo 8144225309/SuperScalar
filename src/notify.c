@@ -154,7 +154,6 @@ void notify_cleanup(notify_t *n) {
 const char *notify_event_name(int event_type) {
     switch (event_type) {
         case NOTIFY_ROTATION_NEEDED:  return "rotation_needed";
-        case NOTIFY_EPOCH_RESET:      return "epoch_reset";
         case NOTIFY_FACTORY_EXPIRING: return "factory_expiring";
         case NOTIFY_PAYMENT_RECEIVED: return "payment_received";
         case NOTIFY_QUEUE_ITEM:       return "queue_item";

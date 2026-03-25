@@ -1380,15 +1380,12 @@ extern int test_jit_multiple_channels(void);
 extern int test_jit_multiple_watchtower_indices(void);
 extern int test_jit_funding_confirmation_transition(void);
 
-/* Cooperative Epoch Reset + Per-Leaf Advance */
-extern int test_dw_counter_reset(void);
-extern int test_factory_reset_epoch(void);
+/* Per-Leaf Advance */
 extern int test_factory_advance_leaf_left(void);
 extern int test_factory_advance_leaf_right(void);
 extern int test_factory_advance_leaf_independence(void);
 extern int test_factory_advance_leaf_exhaustion(void);
 extern int test_factory_advance_leaf_preserves_parent_txids(void);
-extern int test_factory_epoch_reset_after_leaf_mode(void);
 
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
@@ -1489,7 +1486,6 @@ extern int test_ceremony_below_minimum(void);
 extern int test_ceremony_state_transitions(void);
 
 /* Distributed State Advances tests */
-extern int test_distributed_epoch_reset(void);
 extern int test_arity2_leaf_advance(void);
 
 /* Production Hardening tests */
@@ -1509,10 +1505,6 @@ extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
 extern int test_close_outputs_wallet_spk(void);
 extern int test_fee_accumulation_and_settlement(void);
-
-/* Distributed Epoch Reset tests */
-extern int test_epoch_reset_propose_round_field(void);
-extern int test_distributed_epoch_reset_ceremony(void);
 
 /* Property-Based Tests (Roadmap Item #5) */
 extern int test_prop_hex_roundtrip(void);
@@ -3080,15 +3072,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_multiple_watchtower_indices);
     RUN_TEST(test_jit_funding_confirmation_transition);
 
-    printf("\n=== Cooperative Epoch Reset + Per-Leaf Advance ===\n");
-    RUN_TEST(test_dw_counter_reset);
-    RUN_TEST(test_factory_reset_epoch);
+    printf("\n=== Per-Leaf Advance ===\n");
     RUN_TEST(test_factory_advance_leaf_left);
     RUN_TEST(test_factory_advance_leaf_right);
     RUN_TEST(test_factory_advance_leaf_independence);
     RUN_TEST(test_factory_advance_leaf_exhaustion);
     RUN_TEST(test_factory_advance_leaf_preserves_parent_txids);
-    RUN_TEST(test_factory_epoch_reset_after_leaf_mode);
 
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);
@@ -3196,7 +3185,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ceremony_state_transitions);
 
     printf("\n=== Distributed State Advances ===\n");
-    RUN_TEST(test_distributed_epoch_reset);
     RUN_TEST(test_arity2_leaf_advance);
 
     printf("\n=== Production Hardening ===\n");
@@ -3216,10 +3204,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_on_close_includes_unsettled);
     RUN_TEST(test_close_outputs_wallet_spk);
     RUN_TEST(test_fee_accumulation_and_settlement);
-
-    printf("\n=== Distributed Epoch Reset ===\n");
-    RUN_TEST(test_epoch_reset_propose_round_field);
-    RUN_TEST(test_distributed_epoch_reset_ceremony);
 
     printf("\n=== Property-Based Tests ===\n");
     RUN_TEST(test_prop_hex_roundtrip);
