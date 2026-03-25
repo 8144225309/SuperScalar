@@ -60,6 +60,12 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
 
+/* List all non-closed factory IDs from the ladder_factories table.
+   Returns count written to ids_out (up to max_ids).
+   Only returns factories with state != 'closed'. */
+size_t persist_list_active_factory_ids(persist_t *p,
+                                        uint32_t *ids_out, size_t max_ids);
+
 /* Load factory metadata. Caller must have initialized f->pubkeys with
    correct keys before calling (used to rebuild the tree).
    Returns 1 on success. */

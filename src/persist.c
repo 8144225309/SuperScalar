@@ -805,6 +805,24 @@ int persist_has_factory(persist_t *p, uint32_t factory_id) {
     return found;
 }
 
+size_t persist_list_active_factory_ids(persist_t *p,
+                                        uint32_t *ids_out, size_t max_ids) {
+    if (!p || !p->db || !ids_out || max_ids == 0) return 0;
+    const char *sql =
+        "SELECT factory_id FROM ladder_factories "
+        "WHERE state != 'closed' ORDER BY factory_id ASC";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    size_t count = 0;
+    while (count < max_ids && sqlite3_step(stmt) == SQLITE_ROW) {
+        ids_out[count] = (uint32_t)sqlite3_column_int(stmt, 0);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
