@@ -790,3 +790,48 @@ int test_admin_rpc_closechannel_spk_nonzero(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+int test_admin_rpc_getbalance(void)
+{
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+    rpc.listen_fd = -1;
+
+    char out[ADMIN_RPC_RESPONSE_MAX];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getbalance\",\"params\":{}}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    ASSERT(n > 0, "AR27: got response");
+
+    cJSON *resp = cJSON_Parse(out);
+    ASSERT(resp != NULL, "AR27: valid JSON");
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    ASSERT(result != NULL, "AR27: has result");
+    ASSERT(cJSON_GetObjectItem(result, "local_balance_msat") != NULL, "AR27: has local_balance_msat");
+    ASSERT(cJSON_GetObjectItem(result, "n_channels") != NULL, "AR27: has n_channels");
+    ASSERT(cJSON_GetObjectItem(result, "local_balance_msat")->valuedouble == 0.0,
+           "AR27: zero balance with no mgr");
+    cJSON_Delete(resp);
+    return 1;
+}
+
+int test_admin_rpc_listfunds(void)
+{
+    admin_rpc_t rpc;
+    memset(&rpc, 0, sizeof(rpc));
+    rpc.listen_fd = -1;
+
+    char out[ADMIN_RPC_RESPONSE_MAX];
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"listfunds\",\"params\":{}}";
+    size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
+    ASSERT(n > 0, "AR28: got response");
+
+    cJSON *resp = cJSON_Parse(out);
+    ASSERT(resp != NULL, "AR28: valid JSON");
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    ASSERT(result != NULL, "AR28: has result");
+    cJSON *channels = cJSON_GetObjectItem(result, "channels");
+    ASSERT(channels != NULL && cJSON_IsArray(channels), "AR28: has channels array");
+    ASSERT(cJSON_GetArraySize(channels) == 0, "AR28: empty channels with no mgr");
+    cJSON_Delete(resp);
+    return 1;
+}
