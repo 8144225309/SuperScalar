@@ -3091,19 +3091,30 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* EINTR from signal — check shutdown flag */
             continue;
         }
-        if (ret == 0) {
-            /* Periodic fee refresh (every 60s) */
-            if (mgr->fee) {
-                fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
-                if (fe->update)
-                    fe->update(fe);
-            }
 
-            /* Check block height / factory lifecycle FIRST (fast: 1 RPC call).
-               watchtower_check is deferred to avoid blocking the daemon loop —
-               it makes O(n_entries * scan_depth) RPC calls and can take minutes. */
-            if (mgr->watchtower && mgr->watchtower->rt) {
-                int height = regtest_get_block_height(mgr->watchtower->rt);
+        /* ---- Periodic checks: run on every iteration, throttled to ~5s ----
+           poll() may never return 0 (timeout) if client reconnections or
+           listen-socket events keep firing.  Time-gate the height-dependent
+           checks so they still run reliably. */
+        {
+            static time_t last_periodic = 0;
+            time_t tnow = time(NULL);
+            if (last_periodic == 0) last_periodic = tnow;
+
+            if (tnow - last_periodic >= 5) {
+                last_periodic = tnow;
+
+                /* Periodic fee refresh */
+                if (mgr->fee) {
+                    fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
+                    if (fe->update)
+                        fe->update(fe);
+                }
+
+                /* Check block height / factory lifecycle (fast: 1 RPC call).
+                   watchtower_check is deferred to once per 60s (below). */
+                if (mgr->watchtower && mgr->watchtower->rt) {
+                    int height = regtest_get_block_height(mgr->watchtower->rt);
                 if (height > 0) {
                     for (size_t c = 0; c < mgr->n_channels; c++) {
                         channel_t *ch = &mgr->entries[c].channel;
@@ -3301,72 +3312,79 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             }
                                         }
                                     }
+                                }
+                            }
 
-                                    /* Retry with exponential backoff */
-                                    int retry_act = lsp_rotation_should_retry(
-                                        mgr, lf->factory_id, (uint32_t)height);
-                                    if (retry_act == 1) {
-                                        uint32_t ridx = lf->factory_id % 8;
-                                        uint32_t attempt = mgr->rot_retry_count[ridx] + 1;
-                                        uint32_t mret = mgr->rot_max_retries > 0
-                                                        ? mgr->rot_max_retries : 3;
-                                        printf("LSP: retrying rotation for factory %u "
-                                               "(attempt %u/%u)\n",
-                                               lf->factory_id, attempt, mret);
-                                        fflush(stdout);
-                                        int ok = lsp_channels_rotate_factory(mgr, lsp);
-                                        {
-                                            time_t tnow = time(NULL);
-                                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
-                                                mgr->entries[rc].last_message_time = tnow;
-                                                mgr->entries[rc].offline_detected = 0;
-                                            }
+                            /* Retry rotation with exponential backoff — runs on
+                               every poll tick while factory is DYING/EXPIRED,
+                               even without a state transition (the initial
+                               trigger above fires only on ACTIVE→DYING). */
+                            if (mgr->rot_auto_rotate &&
+                                (lf->cached_state == FACTORY_DYING ||
+                                 lf->cached_state == FACTORY_EXPIRED)) {
+                                int retry_act = lsp_rotation_should_retry(
+                                    mgr, lf->factory_id, (uint32_t)height);
+                                if (retry_act == 1) {
+                                    uint32_t ridx = lf->factory_id % 8;
+                                    uint32_t attempt = mgr->rot_retry_count[ridx] + 1;
+                                    uint32_t mret = mgr->rot_max_retries > 0
+                                                    ? mgr->rot_max_retries : 3;
+                                    printf("LSP: retrying rotation for factory %u "
+                                           "(attempt %u/%u)\n",
+                                           lf->factory_id, attempt, mret);
+                                    fflush(stdout);
+                                    int ok = lsp_channels_rotate_factory(mgr, lsp);
+                                    {
+                                        time_t tnow = time(NULL);
+                                        for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                            mgr->entries[rc].last_message_time = tnow;
+                                            mgr->entries[rc].offline_detected = 0;
                                         }
-                                        if (ok) {
-                                            printf("LSP: retry rotation complete\n");
-                                            fflush(stdout);
-                                            lsp_rotation_record_success(mgr, lf->factory_id);
-                                        } else {
-                                            lsp_rotation_record_failure(mgr, lf->factory_id,
-                                                                        (uint32_t)height);
-                                            fprintf(stderr, "LSP: retry rotation FAILED "
-                                                    "(attempt %u)\n", attempt);
-                                        }
-                                    } else if (retry_act == -1) {
-                                        /* Max retries exhausted — distribution TX fallback */
-                                        uint32_t mret = mgr->rot_max_retries > 0
-                                                        ? mgr->rot_max_retries : 3;
-                                        printf("LSP: rotation failed %u times for factory %u"
-                                               " — broadcasting distribution TX\n",
-                                               mret, lf->factory_id);
-                                        fflush(stdout);
-                                        if (lf->distribution_tx.len > 0 &&
-                                            mgr->chain_be) {
-                                            chain_backend_t *_cb =
-                                                (chain_backend_t *)mgr->chain_be;
-                                            char *dhex = malloc(
-                                                lf->distribution_tx.len * 2 + 1);
-                                            if (dhex) {
-                                                extern void hex_encode(
-                                                    const unsigned char *, size_t,
-                                                    char *);
-                                                hex_encode(lf->distribution_tx.data,
-                                                           lf->distribution_tx.len,
-                                                           dhex);
-                                                char dtxid[65];
-                                                if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                                    printf("LSP: fallback distribution "
-                                                           "TX: %s\n", dtxid);
-                                                else
-                                                    fprintf(stderr, "LSP: fallback "
-                                                            "dist TX broadcast failed\n");
-                                                free(dhex);
-                                            }
-                                        }
-                                        /* Sentinel: past max → no further action */
-                                        uint32_t ridx = lf->factory_id % 8;
-                                        mgr->rot_retry_count[ridx] = (uint8_t)(mret + 1);
                                     }
+                                    if (ok) {
+                                        printf("LSP: retry rotation complete\n");
+                                        fflush(stdout);
+                                        lsp_rotation_record_success(mgr, lf->factory_id);
+                                    } else {
+                                        lsp_rotation_record_failure(mgr, lf->factory_id,
+                                                                    (uint32_t)height);
+                                        fprintf(stderr, "LSP: retry rotation FAILED "
+                                                "(attempt %u)\n", attempt);
+                                    }
+                                } else if (retry_act == -1) {
+                                    /* Max retries exhausted — distribution TX fallback */
+                                    uint32_t mret = mgr->rot_max_retries > 0
+                                                    ? mgr->rot_max_retries : 3;
+                                    printf("LSP: rotation failed %u times for factory %u"
+                                           " — broadcasting distribution TX\n",
+                                           mret, lf->factory_id);
+                                    fflush(stdout);
+                                    if (lf->distribution_tx.len > 0 &&
+                                        mgr->chain_be) {
+                                        chain_backend_t *_cb =
+                                            (chain_backend_t *)mgr->chain_be;
+                                        char *dhex = malloc(
+                                            lf->distribution_tx.len * 2 + 1);
+                                        if (dhex) {
+                                            extern void hex_encode(
+                                                const unsigned char *, size_t,
+                                                char *);
+                                            hex_encode(lf->distribution_tx.data,
+                                                       lf->distribution_tx.len,
+                                                       dhex);
+                                            char dtxid[65];
+                                            if (_cb->send_raw_tx(_cb, dhex, dtxid))
+                                                printf("LSP: fallback distribution "
+                                                       "TX: %s\n", dtxid);
+                                            else
+                                                fprintf(stderr, "LSP: fallback "
+                                                        "dist TX broadcast failed\n");
+                                            free(dhex);
+                                        }
+                                    }
+                                    /* Sentinel: past max → no further action */
+                                    uint32_t ridx = lf->factory_id % 8;
+                                    mgr->rot_retry_count[ridx] = (uint8_t)(mret + 1);
                                 }
                             }
                         }
@@ -3549,8 +3567,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
-            continue;
-        }
+            } /* if (tnow - last_periodic >= 5) */
+        } /* periodic checks block */
+
+        if (ret == 0) continue;
 
         /* Handle new connections on listen_fd (bridge or client reconnect) */
         if (listen_slot >= 0 && (pfds[listen_slot].revents & POLLIN)) {

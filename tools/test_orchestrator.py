@@ -72,7 +72,7 @@ DEFAULT_NETWORK = "regtest"
 
 # Per-network timing constants
 TIMING = {
-    "regtest":  {"factory_timeout": 90, "breach_wait": 30, "lsp_timeout": 120,
+    "regtest":  {"factory_timeout": 90, "breach_wait": 90, "lsp_timeout": 120,
                  "coop_wait": 20, "stagger": 0.5, "lsp_bind": 3.0},
     "signet":   {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
                  "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
