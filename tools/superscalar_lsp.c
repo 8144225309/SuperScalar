@@ -1763,8 +1763,15 @@ int main(int argc, char *argv[]) {
     if (rt_ok) {
         chain_backend_regtest_init(&g_chain_be_rpc, &rt);
         chain_be = &g_chain_be_rpc;
-        wallet_source_rpc_init(&g_ws_rpc, &rt);
-        wallet_src = &g_ws_rpc.base;
+        if (g_hd_wallet) {
+            /* HD wallet available: use it for UTXO selection + signing,
+               use RPC chain backend for monitoring + broadcasting */
+            wallet_src = &g_hd_wallet->base;
+            printf("LSP: using HD wallet for factory funding (RPC for chain)\n");
+        } else {
+            wallet_source_rpc_init(&g_ws_rpc, &rt);
+            wallet_src = &g_ws_rpc.base;
+        }
     } else {
         chain_be = (chain_backend_t *)&g_bip158;
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
@@ -2518,7 +2525,33 @@ accept_new_factory:
     }
 
     char funding_txid_hex[65];
-    if (rt_ok) {
+    if (g_hd_wallet && wallet_src) {
+        /* HD wallet mode: fund via wallet_source_t interface (works with
+           both RPC chain backend and BIP158 lite client) */
+        printf("LSP: funding factory via HD wallet (%llu sats)...\n",
+               (unsigned long long)funding_sats);
+        if (!lsp_fund_spk(wallet_src, chain_be,
+                          fund_spk, sizeof(fund_spk),
+                          funding_sats, fee_rate, funding_txid_hex)) {
+            fprintf(stderr, "LSP: HD wallet factory funding failed\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        if (is_regtest) {
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        } else {
+            printf("LSP: waiting for funding tx confirmation on %s...\n", network);
+            int conf = lsp_wait_for_confirmation(chain_be, funding_txid_hex,
+                                                   confirm_timeout_secs);
+            if (conf < 1) {
+                fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+                lsp_cleanup(&lsp);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+    } else if (rt_ok) {
         double funding_btc = (double)funding_sats / 100000000.0;
         if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
             fprintf(stderr, "LSP: failed to fund factory address\n");
