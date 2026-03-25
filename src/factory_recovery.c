@@ -15,6 +15,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/musig.h"
+#include "superscalar/sha256.h"
 #include "superscalar/types.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
@@ -103,6 +104,32 @@ static int get_confs(chain_backend_t *chain, const char *txid)
 
 static void refresh_confs(chain_backend_t *chain, fr_node_t *nodes, int n)
 {
+    if (!chain) return;
+
+    /* Try batch method first (single RPC round-trip) */
+    if (chain->get_confirmations_batch) {
+        const char *txids[256];
+        int confs[256];
+        int count = 0;
+        int map[256];  /* map batch index -> node index */
+        for (int i = 0; i < n && count < 256; i++) {
+            if (nodes[i].txid[0]) {
+                txids[count] = nodes[i].txid;
+                map[count] = i;
+                count++;
+            } else {
+                nodes[i].confs = -1;
+            }
+        }
+        if (count > 0 && chain->get_confirmations_batch(chain,
+                txids, (size_t)count, confs)) {
+            for (int j = 0; j < count; j++)
+                nodes[map[j]].confs = confs[j];
+            return;
+        }
+    }
+
+    /* Fallback: individual queries */
     for (int i = 0; i < n; i++) {
         nodes[i].confs = nodes[i].txid[0]
                          ? get_confs(chain, nodes[i].txid)
@@ -577,9 +604,9 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
 
         if (!txid || !hex || !hex[0]) continue;
 
-        /* Check this state TX is confirmed */
-        int confs = chain ? chain->get_confirmations(chain, txid) : -1;
-        if (confs < 1) continue;  /* not confirmed — skip */
+        /* Skip expensive per-node confirmation check — just parse outputs
+           and attempt to spend. Unspent outputs succeed; already-spent ones
+           fail harmlessly at broadcast with "inputs-missingorspent". */
 
         /* Parse outputs from the raw TX */
 #define MAX_LEAF_OUTS 8
@@ -615,13 +642,28 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
             /*
              * Determine if this is a key-path-only LSP output:
              *   P2TR = OP_1(0x51) PUSHBYTES_32(0x20) <32-byte-xonly-key>
-             * If the 32-byte key matches the LSP x-only pubkey, we can sign.
+             * Check both untweaked AND taptweak(LSP) for L-stock outputs.
              */
             int is_lsp_key_path = 0;
             if (spk_lens[vout] == 34 &&
-                spks[vout][0] == 0x51 && spks[vout][1] == 0x20 &&
-                memcmp(spks[vout] + 2, lsp_xonly_bytes, 32) == 0) {
-                is_lsp_key_path = 1;
+                spks[vout][0] == 0x51 && spks[vout][1] == 0x20) {
+                if (memcmp(spks[vout] + 2, lsp_xonly_bytes, 32) == 0) {
+                    is_lsp_key_path = 1;
+                } else {
+                    /* Check taptweak(LSP_xonly, NULL) — L-stock key-path */
+                    unsigned char tw_data[32];
+                    sha256_tagged("TapTweak", lsp_xonly_bytes, 32, tw_data);
+                    secp256k1_pubkey tw_full;
+                    if (secp256k1_xonly_pubkey_tweak_add(ctx, &tw_full,
+                            &lsp_xonly, tw_data)) {
+                        secp256k1_xonly_pubkey tw_xo;
+                        unsigned char tw_bytes[32];
+                        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_full);
+                        secp256k1_xonly_pubkey_serialize(ctx, tw_bytes, &tw_xo);
+                        if (memcmp(spks[vout] + 2, tw_bytes, 32) == 0)
+                            is_lsp_key_path = 1;
+                    }
+                }
             }
 
             if (!is_lsp_key_path) {
@@ -632,6 +674,8 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
                  * blocks using only its own private key.
                  */
                 int handled = 0;
+                secp256k1_pubkey client_pub;
+                int have_client = 0;
                 do {
                     if (cltv_timeout == 0) break;
                     if (spk_lens[vout] != 34 ||
@@ -639,8 +683,6 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
                         break;
 
                     /* Find client pubkey: channels.slot → factory_participants.slot+1 */
-                    secp256k1_pubkey client_pub;
-                    int have_client = 0;
                     {
                         sqlite3_stmt *cst;
                         if (sqlite3_prepare_v2(p->db,
@@ -896,10 +938,17 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
                 continue;
             }
 
-            /* Schnorr sign */
+            /* Schnorr sign — use tweaked keypair if output is tap-tweaked */
             unsigned char sig64[64];
             unsigned char aux[32] = {0};
-            if (!secp256k1_schnorrsig_sign32(ctx, sig64, sighash, &lsp_kp, aux)) {
+            secp256k1_keypair sign_kp = lsp_kp;
+            if (memcmp(spks[vout] + 2, lsp_xonly_bytes, 32) != 0) {
+                /* Output key != plain LSP key — apply taptweak to keypair */
+                unsigned char tw_data[32];
+                sha256_tagged("TapTweak", lsp_xonly_bytes, 32, tw_data);
+                secp256k1_keypair_xonly_tweak_add(ctx, &sign_kp, tw_data);
+            }
+            if (!secp256k1_schnorrsig_sign32(ctx, sig64, sighash, &sign_kp, aux)) {
                 tx_buf_free(&unsigned_tx);
                 cJSON_AddStringToObject(entry, "status", "sign_failed");
                 cJSON_AddItemToArray(results, entry);

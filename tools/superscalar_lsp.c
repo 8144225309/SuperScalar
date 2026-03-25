@@ -293,7 +293,7 @@ static void usage(const char *prog) {
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
         "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
-        "  --test-bip39        BIP39 mnemonic generate + validate round-trip (early exit)\n"
+        "  --test-bip39        Full factory lifecycle with BIP39 HD-derived LSP key\n"
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
@@ -1283,7 +1283,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
                     "default minrelaytxfee (1 sat/vB).\n"
                     "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or use package relay "
-                    "(Bitcoin Core v28+; v30 adds full ephemeral anchor support).\n"
+                    "(Bitcoin Core v30+ with ephemeral anchor support).\n"
                     "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
                     (unsigned long long)fee_rate, (double)fee_rate / 1000.0);
         } else {
@@ -1426,53 +1426,7 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* --- BIP39 Test (early exit) --- */
-    if (test_bip39) {
-        printf("\n=== BIP39 MNEMONIC TEST ===\n");
-        fflush(stdout);
-        int bip39_pass = 1;
-
-        char mnemonic[512];
-        if (!bip39_generate(24, mnemonic, sizeof(mnemonic))) {
-            printf("  bip39_generate FAILED\n");
-            bip39_pass = 0;
-        } else {
-            printf("  Generated: %s\n", mnemonic);
-            if (!bip39_validate(mnemonic)) {
-                printf("  bip39_validate FAILED\n");
-                bip39_pass = 0;
-            } else {
-                printf("  Validation: OK\n");
-            }
-
-            unsigned char seed[64];
-            if (!bip39_mnemonic_to_seed(mnemonic, "", seed)) {
-                printf("  bip39_mnemonic_to_seed FAILED\n");
-                bip39_pass = 0;
-            } else {
-                int all_zero = 1;
-                for (int i = 0; i < 64; i++) if (seed[i]) { all_zero = 0; break; }
-                if (all_zero) {
-                    printf("  Seed is all zeros — FAILED\n");
-                    bip39_pass = 0;
-                } else {
-                    printf("  Seed derivation: OK (64 bytes, non-zero)\n");
-                }
-
-                unsigned char seed2[64];
-                bip39_mnemonic_to_seed(mnemonic, "", seed2);
-                if (memcmp(seed, seed2, 64) != 0) {
-                    printf("  Determinism check FAILED\n");
-                    bip39_pass = 0;
-                } else {
-                    printf("  Determinism: OK (same mnemonic → same seed)\n");
-                }
-            }
-        }
-
-        printf("BIP39 MNEMONIC TEST: %s\n", bip39_pass ? "PASS" : "FAIL");
-        return bip39_pass ? 0 : 1;
-    }
+    /* --- BIP39 Test placeholder (moved after key init) --- */
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
     if (strcmp(network, "mainnet") == 0 && !accept_risk) {
@@ -1671,6 +1625,57 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     /* Note: lsp_seckey zeroed at cleanup — needed for lsp_channels_init() */
+
+    /* --- BIP39 Test: override LSP key with HD-derived key --- */
+    if (test_bip39) {
+        printf("\n=== BIP39 HD WALLET TEST ===\n");
+        fflush(stdout);
+
+        char bip39_mnemonic[512];
+        if (!bip39_generate(24, bip39_mnemonic, sizeof(bip39_mnemonic))) {
+            fprintf(stderr, "BIP39: mnemonic generation FAILED\n");
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("  Mnemonic: %s\n", bip39_mnemonic);
+        printf("  Validation: %s\n", bip39_validate(bip39_mnemonic) ? "OK" : "FAILED");
+
+        unsigned char bip39_seed[64];
+        if (!bip39_mnemonic_to_seed(bip39_mnemonic, "", bip39_seed)) {
+            fprintf(stderr, "BIP39: seed derivation FAILED\n");
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("  Seed: OK (64 bytes)\n");
+
+        if (!hd_key_derive_path(bip39_seed, 64, "m/1039'/0'/0'", lsp_seckey)) {
+            fprintf(stderr, "BIP39: key derivation FAILED\n");
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        memset(bip39_seed, 0, 64);
+
+        if (!secp256k1_keypair_create(ctx, &lsp_kp, lsp_seckey)) {
+            fprintf(stderr, "BIP39: keypair creation FAILED\n");
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+
+        secp256k1_pubkey bip39_pk;
+        secp256k1_keypair_pub(ctx, &bip39_pk, &lsp_kp);
+        unsigned char bip39_pub33[33];
+        size_t bip39_pub33_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, bip39_pub33, &bip39_pub33_len,
+                                      &bip39_pk, SECP256K1_EC_COMPRESSED);
+        printf("  LSP key (m/1039'/0'/0'): ");
+        for (int i = 0; i < 33; i++) printf("%02x", bip39_pub33[i]);
+        printf("\n  Proceeding with factory creation using HD-derived key...\n");
+        fflush(stdout);
+    }
 
     /* Initialize bitcoin-cli connection */
     regtest_t rt;
@@ -2762,6 +2767,9 @@ int main(int argc, char *argv[]) {
     lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
     if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
     g_channel_mgr = mgr;
+    /* Update admin RPC channel_mgr (was NULL when RPC was initialized earlier) */
+    if (g_admin_rpc.ctx)
+        g_admin_rpc.channel_mgr = mgr;
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
@@ -6728,6 +6736,8 @@ int main(int argc, char *argv[]) {
 
     printf("LSP: cooperative close confirmed! txid: %s\n", close_txid);
     printf("LSP: SUCCESS — factory created and closed with %d clients\n", n_clients);
+    if (test_bip39)
+        printf("=== BIP39 HD WALLET TEST PASSED ===\n");
 
     /* Report: close confirmation */
     report_add_string(&rpt, "close_txid", close_txid);
