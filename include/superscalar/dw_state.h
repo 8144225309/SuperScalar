@@ -50,7 +50,4 @@ bool     dw_counter_advance(dw_counter_t *ctr);
 bool     dw_counter_is_exhausted(const dw_counter_t *ctr);
 uint32_t dw_counter_epoch(const dw_counter_t *ctr);
 
-/* Reset all layers and epoch to 0, reclaiming all N^2 states. */
-void     dw_counter_reset(dw_counter_t *ctr);
-
 #endif /* SUPERSCALAR_DW_STATE_H */

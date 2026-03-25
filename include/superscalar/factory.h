@@ -232,24 +232,15 @@ int factory_sign_all(factory_t *f);
 int factory_verify_all(factory_t *f);
 int factory_advance(factory_t *f);
 
-/* Reset DW counter to epoch 0, rebuild all unsigned txs, re-sign.
-   Reclaims all N^2 states. Requires all signers to participate. */
-int factory_reset_epoch(factory_t *f);
-
-/* Reset DW counter to epoch 0, rebuild all unsigned txs, but do NOT sign.
-   Use for distributed signing: call this, then use factory_sessions_*()
-   to exchange nonces and partial sigs with participants. */
-int factory_reset_epoch_unsigned(factory_t *f);
-
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
    Rebuilds + re-signs only the affected state node.
-   Returns 0 if fully exhausted (need cooperative epoch reset). */
+   Returns 0 if fully exhausted (need factory rotation). */
 int factory_advance_leaf(factory_t *f, int leaf_side);
 
 /* Advance leaf DW counter + rebuild unsigned tx, but do NOT sign.
    Use for split-round signing: call this, then use factory_session_*_node()
    to exchange nonces and partial sigs with the counterparty.
-   Returns 0 if fully exhausted (need cooperative epoch reset).
+   Returns 0 if fully exhausted (need factory rotation).
    Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
 
@@ -381,7 +372,7 @@ int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx);
 
 /* Advance leaf DW counter. If leaf exhausted, advance root layer and
    rebuild+resign only the affected path. Returns leaf_node_idx on success,
-   -1 on error, -2 if fully exhausted (need epoch reset). */
+   -1 on error, -2 if fully exhausted (need factory rotation). */
 int factory_advance_and_rebuild_path(factory_t *f, int leaf_side);
 
 /* --- Tree navigation helpers --- */
