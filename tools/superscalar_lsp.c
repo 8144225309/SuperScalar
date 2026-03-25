@@ -2159,6 +2159,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* === Phase 1: Accept clients === */
+    uint32_t factory_generation = 0;  /* increments each factory lifecycle */
+
+accept_new_factory:
     printf("LSP: listening on port %d, waiting for %d clients...\n", port, n_clients);
     fflush(stdout);
 
@@ -3276,13 +3279,31 @@ int main(int argc, char *argv[]) {
     report_add_string(&rpt, "result", "success");
     report_close(&rpt);
 
+    /* Clean up this factory's resources */
     jit_channels_cleanup(mgr);
     free(mgr);
+    mgr = NULL;
+    lsp_cleanup(&lsp);
+
+    /* Persistent daemon: loop back for a new factory instead of exiting.
+       Mark this factory as closed in DB (cooperative close already on chain).
+       Only loop if --daemon was specified and no SIGTERM received. */
+    if (daemon_mode && !g_shutdown) {
+        if (use_db) {
+            persist_save_ladder_factory(&db, factory_generation, "closed",
+                                         1, 1, 0, 0, 0, 0, 0);
+        }
+        factory_generation++;
+        printf("\nLSP: factory %u closed, ready for new clients...\n\n",
+               factory_generation - 1);
+        fflush(stdout);
+        goto accept_new_factory;
+    }
+
     if (use_db)
         persist_close(&db);
     if (tor_control_fd >= 0)
         close(tor_control_fd);
-    lsp_cleanup(&lsp);
     memset(lsp_seckey, 0, 32);
     secp256k1_context_destroy(ctx);
     return 0;
