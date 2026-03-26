@@ -488,6 +488,45 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 }
 
+/* Receive an expected message type, draining stray benign messages.
+   Loops with a wall-clock timeout, dispatching REGISTER_INVOICE,
+   CLOSE_REQUEST, LSPS_REQUEST, and QUEUE_POLL to their handlers
+   instead of failing the ceremony.  Pattern from lsp_rotation.c:168-184. */
+static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int client_fd, wire_msg_t *msg,
+                                      uint8_t expected_type,
+                                      int timeout_sec, size_t client_idx) {
+    struct timeval t_start, t_now;
+    gettimeofday(&t_start, NULL);
+    while (1) {
+        gettimeofday(&t_now, NULL);
+        int elapsed = (int)(t_now.tv_sec - t_start.tv_sec);
+        int remain = timeout_sec - elapsed;
+        if (remain <= 0) return 0;
+        memset(msg, 0, sizeof(*msg));
+        if (!recv_timeout_service_bridge(mgr, lsp, client_fd, msg, remain))
+            return 0;
+        if (msg->msg_type == expected_type)
+            return 1;
+        if (msg->msg_type == MSG_ERROR)
+            return 0;
+        /* Benign stray: dispatch and retry */
+        if (msg->msg_type == MSG_REGISTER_INVOICE ||
+            msg->msg_type == MSG_CLOSE_REQUEST ||
+            msg->msg_type == MSG_LSPS_REQUEST ||
+            msg->msg_type == MSG_QUEUE_POLL ||
+            msg->msg_type == MSG_QUEUE_DONE) {
+            lsp_channels_handle_msg(mgr, lsp, client_idx, msg);
+            if (msg->json) { cJSON_Delete(msg->json); msg->json = NULL; }
+            continue;
+        }
+        /* Unknown stray — log and retry */
+        fprintf(stderr, "LSP: ceremony: discarding stray msg 0x%02x from client %zu\n",
+                msg->msg_type, client_idx);
+        if (msg->json) { cJSON_Delete(msg->json); msg->json = NULL; }
+    }
+}
+
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
     if (!mgr) return;
     if (mgr->entries) {
@@ -758,8 +797,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from sender */
     {
         wire_msg_t ack_msg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[sender_idx], &ack_msg, 30) ||
-            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+        if (!recv_expected_drain_stray(mgr, lsp, lsp->client_fds[sender_idx],
+                                        &ack_msg, MSG_REVOKE_AND_ACK, 30, sender_idx)) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from sender %zu\n", sender_idx);
             free(old_sender_htlcs);
@@ -1024,8 +1063,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK from dest */
     {
         wire_msg_t ack_msg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[dest_idx], &ack_msg, 30) ||
-            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+        if (!recv_expected_drain_stray(mgr, lsp, lsp->client_fds[dest_idx],
+                                        &ack_msg, MSG_REVOKE_AND_ACK, 30, dest_idx)) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from dest %zu\n", dest_idx);
             free(old_dest_htlcs);
@@ -1683,8 +1722,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Wait for REVOKE_AND_ACK */
     {
         wire_msg_t ack_msg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[client_idx], &ack_msg, 30) ||
-            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+        if (!recv_expected_drain_stray(mgr, lsp, lsp->client_fds[client_idx],
+                                        &ack_msg, MSG_REVOKE_AND_ACK, 30, client_idx)) {
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             free(old_ch_htlcs);
             return 0;
@@ -2207,9 +2246,9 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             /* Wait for REVOKE_AND_ACK from dest */
             {
                 wire_msg_t ack_msg;
-                if (!recv_timeout_service_bridge(mgr, lsp,
-                        lsp->client_fds[reconnected_idx], &ack_msg, 30) ||
-                    ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+                if (!recv_expected_drain_stray(mgr, lsp,
+                        lsp->client_fds[reconnected_idx], &ack_msg,
+                        MSG_REVOKE_AND_ACK, 30, reconnected_idx)) {
                     if (ack_msg.json) cJSON_Delete(ack_msg.json);
                     fprintf(stderr, "LSP: replay REVOKE_AND_ACK timeout for client %zu\n",
                             reconnected_idx);
@@ -2522,7 +2561,12 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     } else {
                         if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
                         fprintf(stderr, "LSP reconnect: RAA timeout after CS retransmit "
-                                "(client %zu)\n", c);
+                                "(client %zu) — clearing stale pending_cs\n", c);
+                        /* Clear pending_cs to prevent infinite retransmit on
+                           every future reconnect.  The client already processed
+                           the CS on the first attempt. */
+                        persist_save_pending_cs(pcs_db,
+                            mgr->entries[c].channel_id, 0);
                     }
                 }
                 cJSON_Delete(pcs_cs);
