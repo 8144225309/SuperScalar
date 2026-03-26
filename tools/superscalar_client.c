@@ -658,10 +658,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                my_index, factory->active_blocks, factory->dying_blocks);
     }
 
-    /* Rate-limit periodic watchtower checks: each select() timeout is 2s;
-       only run check every 15 timeouts (~30s) to avoid blocking message I/O
-       with slow RPC calls. */
-    int wt_check_counter = 0;
+    /* Watchtower check runs on a time-gated basis (every ~10s) inside the
+       select() loop below, regardless of whether select() timed out or
+       returned socket activity.  See the static last_wt variable there. */
 
     /* --test-lsps2: send lsps2.get_info immediately on factory entry */
     if (cbd && cbd->test_lsps2 && !cbd->test_lsps2_done) {
@@ -708,14 +707,21 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) continue;  /* EINTR */
-        if (ret == 0) {
-            /* Periodic watchtower check — throttled to once every ~30s */
-            if (cbd && cbd->wt && ++wt_check_counter >= 15) {
-                wt_check_counter = 0;
+
+        /* Periodic watchtower check — runs every ~10s regardless of select()
+           result.  Previous code only ran on timeout (ret==0), so active
+           sockets could starve the watchtower indefinitely. */
+        {
+            static time_t last_wt = 0;
+            time_t tnow = time(NULL);
+            if (last_wt == 0) last_wt = tnow;
+            if (cbd && cbd->wt && (tnow - last_wt) >= 10) {
+                last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
-            continue;
         }
+
+        if (ret == 0) continue;  /* no socket data — loop back */
 
         if (!wire_recv(fd, &msg)) {
             fprintf(stderr, "Client %u: daemon recv failed (disconnected)\n", my_index);
