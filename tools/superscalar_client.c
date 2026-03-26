@@ -509,7 +509,7 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                                          const secp256k1_keypair *keypair,
                                          uint32_t my_index) {
     wire_msg_t rev_msg;
-    if (!recv_or_handle_ptlc(fd, &rev_msg, 2, MSG_LSP_REVOKE_AND_ACK,
+    if (!recv_or_handle_ptlc(fd, &rev_msg, 15, MSG_LSP_REVOKE_AND_ACK,
                               ctx, keypair, my_index, cbd ? &cbd->inbox : NULL))
         return;
     if (rev_msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
