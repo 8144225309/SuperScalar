@@ -797,7 +797,24 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60) || msg.msg_type != MSG_CLOSE_PSIG) {
+                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60)) {
+                    close_psig_cer.clients[c] = CLIENT_ERROR;
+                    continue;
+                }
+                /* Drain stray benign messages before CLOSE_PSIG */
+                if (msg.msg_type == MSG_LSPS_REQUEST) {
+                    lsps_ctx_t lsps_ctx = { .mgr = NULL, .lsp = lsp, .client_idx = c };
+                    lsps_handle_request(&lsps_ctx, lsp->client_fds[c], msg.json);
+                    cJSON_Delete(msg.json);
+                    ready[c] = 1;  /* retry this client */
+                    continue;
+                }
+                if (msg.msg_type == MSG_REGISTER_INVOICE) {
+                    cJSON_Delete(msg.json);
+                    ready[c] = 1;  /* retry this client */
+                    continue;
+                }
+                if (msg.msg_type != MSG_CLOSE_PSIG) {
                     if (msg.json && !check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected CLOSE_PSIG from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
