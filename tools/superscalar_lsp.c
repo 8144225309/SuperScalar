@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <poll.h>
 #ifdef __linux__
 #include <execinfo.h>
 #endif
@@ -396,6 +397,61 @@ static int advance_chain(regtest_t *rt, int n, const char *mine_addr,
     fprintf(stderr, "advance_chain: timed out waiting for %d blocks "
             "(height %d / %d)\n", n, regtest_get_block_height(rt), target_h);
     return 0;
+}
+
+/* Non-blocking confirmation wait: poll for TX confirmation while servicing
+   the LSP's listen socket for client reconnections.  This prevents clients
+   from disconnecting during long confirmation waits on signet/testnet.
+   Returns 1 on confirmed, 0 on timeout. */
+static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
+                                            int timeout_secs, lsp_t *lsp,
+                                            lsp_channel_mgr_t *mgr) {
+    if (!rt || !txid_hex) return 0;
+    time_t t_start = time(NULL);
+
+    while (1) {
+        time_t tnow = time(NULL);
+        int elapsed = (int)(tnow - t_start);
+        if (elapsed >= timeout_secs) return 0;
+
+        /* Check confirmation */
+        int conf = regtest_get_confirmations(rt, txid_hex);
+        if (conf >= 1) return 1;
+
+        /* Log progress */
+        int height = regtest_get_block_height(rt);
+        if (elapsed > 0 && (elapsed % 15) == 0)
+            printf("  waiting for confirmation of %.16s... (height=%d, %ds / %ds)\n",
+                   txid_hex, height, elapsed, timeout_secs);
+        fflush(stdout);
+
+        /* Service listen socket for client reconnections (5s poll) */
+        if (lsp && lsp->listen_fd >= 0) {
+            struct pollfd pfd = { .fd = lsp->listen_fd, .events = POLLIN };
+            int pret = poll(&pfd, 1, 5000);
+            if (pret > 0 && (pfd.revents & POLLIN)) {
+                int new_fd = wire_accept(lsp->listen_fd);
+                if (new_fd >= 0) {
+                    int hs_ok;
+                    if (lsp->use_nk)
+                        hs_ok = wire_noise_handshake_nk_responder(new_fd,
+                                    mgr ? mgr->ctx : NULL, lsp->nk_seckey);
+                    else
+                        hs_ok = wire_noise_handshake_responder(new_fd,
+                                    mgr ? mgr->ctx : NULL);
+                    if (hs_ok && mgr) {
+                        /* Let the public reconnect handler read and process
+                           the first message (MSG_RECONNECT expected) */
+                        lsp_channels_handle_reconnect(mgr, lsp, new_fd);
+                    } else {
+                        wire_close(new_fd);
+                    }
+                }
+            }
+        } else {
+            sleep(5);
+        }
+    }
 }
 
 /* Report all factory tree nodes */
@@ -2563,9 +2619,10 @@ accept_new_factory:
             regtest_mine_blocks(&rt, 1, mine_addr);
         } else {
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-            int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex,
-                                                        confirm_timeout_secs);
-            if (conf < 1) {
+            int conf = wait_for_confirmation_servicing(&rt, funding_txid_hex,
+                                                         confirm_timeout_secs,
+                                                         &lsp, NULL);
+            if (!conf) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
                 lsp_cleanup(&lsp);
                 secp256k1_context_destroy(ctx);
