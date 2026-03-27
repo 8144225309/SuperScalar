@@ -167,6 +167,12 @@ typedef struct {
 
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
+
+    /* Async ceremony dispatch (pending operation queue).
+       Replaces all blocking wire_recv_timeout calls in the daemon loop.
+       Pool + per-client linked lists managed by pending_op.c. */
+    void *pending_pool;          /* pending_op_pool_t* — avoids header dependency */
+    void *client_pending[16];    /* pending_op_t* per client head (max 16 clients) */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

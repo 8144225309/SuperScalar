@@ -431,31 +431,129 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     return 1;
 }
 
-/* Receive from client_fd with timeout, servicing bridge heartbeats while waiting.
-   Replaces wire_recv_timeout() to prevent bridge starvation during HTLC processing. */
-static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
-                                       int client_fd, wire_msg_t *msg,
-                                       int timeout_sec) {
-    (void)lsp;
-    /* Zero msg so callers can safely check msg->json on failure */
+/* Forward declarations for functions defined later in this file */
+static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int new_fd, const wire_msg_t *msg);
+static int find_client_slot_by_pubkey(const lsp_t *lsp,
+                                       const secp256k1_context *ctx,
+                                       const secp256k1_pubkey *pk);
+
+/* Accept and handle a new connection on the listen socket.
+   Handles noise handshake, then dispatches RECONNECT, HELLO, or BRIDGE_HELLO.
+   Called from both the daemon loop and recv_timeout_service_all. */
+static void accept_and_handle_connection(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    int new_fd = wire_accept(lsp->listen_fd);
+    if (new_fd < 0) return;
+
+    int hs_ok;
+    if (lsp->use_nk)
+        hs_ok = wire_noise_handshake_nk_responder(new_fd, mgr->ctx, lsp->nk_seckey);
+    else
+        hs_ok = wire_noise_handshake_responder(new_fd, mgr->ctx);
+    if (!hs_ok) {
+        wire_close(new_fd);
+        return;
+    }
+
+    wire_msg_t peek;
+    if (!wire_recv_timeout(new_fd, &peek, 30)) {
+        wire_close(new_fd);
+        return;
+    }
+
+    if (peek.msg_type == MSG_BRIDGE_HELLO) {
+        cJSON_Delete(peek.json);
+        cJSON *ack = wire_build_bridge_hello_ack();
+        wire_send(new_fd, MSG_BRIDGE_HELLO_ACK, ack);
+        cJSON_Delete(ack);
+        if (lsp->bridge_fd >= 0) wire_close(lsp->bridge_fd);
+        lsp->bridge_fd = new_fd;
+        mgr->bridge_fd = new_fd;
+        printf("LSP: bridge connected (fd=%d)\n", new_fd);
+    } else if (peek.msg_type == MSG_RECONNECT) {
+        int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
+        cJSON_Delete(peek.json);
+        if (!ret)
+            fprintf(stderr, "LSP: reconnect handshake failed\n");
+    } else if (peek.msg_type == MSG_HELLO) {
+        unsigned char pk_buf[33];
+        secp256k1_pubkey pk;
+        if (wire_json_get_hex(peek.json, "pubkey", pk_buf, 33) == 33 &&
+            secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
+            int slot = find_client_slot_by_pubkey(lsp, mgr->ctx, &pk);
+            if (slot >= 0) {
+                cJSON_Delete(peek.json);
+                uint64_t cn = mgr->entries[slot].channel.commitment_number;
+                peek.json = wire_build_reconnect(mgr->ctx, &pk, cn);
+                peek.msg_type = MSG_RECONNECT;
+                int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
+                cJSON_Delete(peek.json);
+                if (!ret)
+                    fprintf(stderr, "LSP: HELLO->reconnect failed for slot %d\n", slot);
+            } else {
+                cJSON_Delete(peek.json);
+                wire_close(new_fd);
+            }
+        } else {
+            cJSON_Delete(peek.json);
+            wire_close(new_fd);
+        }
+    } else {
+        fprintf(stderr, "LSP: unexpected msg 0x%02x from new connection\n",
+                peek.msg_type);
+        cJSON_Delete(peek.json);
+        wire_close(new_fd);
+    }
+}
+
+/* Full-service recv: wait for a message from client_fd while keeping the
+   entire server alive — accept reconnections on listen_fd, service bridge
+   messages, and handle admin RPC requests.  No message is ever lost because
+   other client FDs stay in the kernel buffer until the daemon loop resumes.
+   This replaces the old recv_timeout_service_bridge which only polled 2 fds. */
+static int recv_timeout_service_all(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                     int client_fd, wire_msg_t *msg,
+                                     int timeout_sec) {
     memset(msg, 0, sizeof(*msg));
-    static int servicing = 0;   /* recursion guard (single-threaded) */
+    static int servicing = 0;   /* recursion guard */
     struct timeval start, now;
     gettimeofday(&start, NULL);
 
     while (1) {
-        struct pollfd pfds[2];
+        /* Build poll set: target client + all service fds */
+        struct pollfd pfds[4];
         int nfds = 0;
+        int client_slot, bridge_slot = -1, listen_slot = -1, admin_slot = -1;
 
         pfds[nfds].fd = client_fd;
         pfds[nfds].events = POLLIN;
-        int client_slot = nfds++;
+        client_slot = nfds++;
 
-        int bridge_slot = -1;
         if (mgr->bridge_fd >= 0 && !servicing) {
+            bridge_slot = nfds;
             pfds[nfds].fd = mgr->bridge_fd;
             pfds[nfds].events = POLLIN;
-            bridge_slot = nfds++;
+            nfds++;
+        }
+
+        /* Only service listen + admin during daemon operation (channels exist).
+           During early ceremonies (factory creation, basepoint exchange) the
+           channel manager is not yet ready for reconnections. */
+        if (lsp && lsp->listen_fd >= 0 && !servicing && mgr->n_channels > 0) {
+            listen_slot = nfds;
+            pfds[nfds].fd = lsp->listen_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        if (mgr->admin_rpc && !servicing && mgr->n_channels > 0) {
+            admin_rpc_t *arpc = (admin_rpc_t *)mgr->admin_rpc;
+            if (arpc->listen_fd >= 0) {
+                admin_slot = nfds;
+                pfds[nfds].fd = arpc->listen_fd;
+                pfds[nfds].events = POLLIN;
+                nfds++;
+            }
         }
 
         gettimeofday(&now, NULL);
@@ -463,14 +561,18 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         int remaining = timeout_sec - elapsed;
         if (remaining <= 0) return 0;
 
-        int ret = poll(pfds, (nfds_t)nfds, remaining * 1000);
-        if (ret <= 0) return 0;
+        /* Cap poll timeout to 5s so we can do periodic checks */
+        int poll_ms = remaining * 1000;
+        if (poll_ms > 5000) poll_ms = 5000;
 
-        /* Service bridge if ready */
+        int ret = poll(pfds, (nfds_t)nfds, poll_ms);
+        if (ret < 0) continue;  /* EINTR */
+
+        /* Service bridge */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
             wire_msg_t bmsg;
             if (!wire_recv(mgr->bridge_fd, &bmsg)) {
-                fprintf(stderr, "LSP: bridge disconnected during client wait\n");
+                fprintf(stderr, "LSP: bridge disconnected during ceremony\n");
                 mgr->bridge_fd = -1;
             } else {
                 servicing = 1;
@@ -478,14 +580,35 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 servicing = 0;
                 cJSON_Delete(bmsg.json);
             }
-            if (!(pfds[client_slot].revents & POLLIN))
-                continue;
         }
 
-        /* Client fd ready — read message */
+        /* Accept reconnections */
+        if (listen_slot >= 0 && (pfds[listen_slot].revents & POLLIN)) {
+            servicing = 1;
+            accept_and_handle_connection(mgr, lsp);
+            servicing = 0;
+        }
+
+        /* Service admin RPC */
+        if (admin_slot >= 0 && (pfds[admin_slot].revents & POLLIN)) {
+            servicing = 1;
+            admin_rpc_service((admin_rpc_t *)mgr->admin_rpc);
+            servicing = 0;
+        }
+
+        /* Target client ready — read and return */
         if (pfds[client_slot].revents & POLLIN)
             return wire_recv(client_fd, msg);
+
+        /* ret == 0 means timeout on this poll cycle — loop and check deadline */
     }
+}
+
+/* Backward-compatible wrapper — all existing callers use this name */
+static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       int client_fd, wire_msg_t *msg,
+                                       int timeout_sec) {
+    return recv_timeout_service_all(mgr, lsp, client_fd, msg, timeout_sec);
 }
 
 /* Receive an expected message type, draining stray benign messages.
@@ -3618,77 +3741,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Handle new connections on listen_fd (bridge or client reconnect) */
         if (listen_slot >= 0 && (pfds[listen_slot].revents & POLLIN)) {
-            int new_fd = wire_accept(lsp->listen_fd);
-            if (new_fd >= 0) {
-                /* Noise handshake (NK if LSP has static key set) */
-                int reconn_hs;
-                if (lsp->use_nk)
-                    reconn_hs = wire_noise_handshake_nk_responder(new_fd, mgr->ctx, lsp->nk_seckey);
-                else
-                    reconn_hs = wire_noise_handshake_responder(new_fd, mgr->ctx);
-                if (!reconn_hs) {
-                    wire_close(new_fd);
-                } else {
-                    /* Peek at first message to distinguish bridge vs client */
-                    wire_msg_t peek;
-                    if (wire_recv_timeout(new_fd, &peek, 30)) {
-                        if (peek.msg_type == MSG_BRIDGE_HELLO) {
-                            /* Bridge connection */
-                            cJSON_Delete(peek.json);
-                            cJSON *ack = wire_build_bridge_hello_ack();
-                            wire_send(new_fd, MSG_BRIDGE_HELLO_ACK, ack);
-                            cJSON_Delete(ack);
-                            if (lsp->bridge_fd >= 0)
-                                wire_close(lsp->bridge_fd);
-                            lsp->bridge_fd = new_fd;
-                            mgr->bridge_fd = new_fd;
-                            printf("LSP: bridge connected in daemon loop (fd=%d)\n", new_fd);
-                        } else if (peek.msg_type == MSG_RECONNECT) {
-                            /* Client reconnect — use pre-read message */
-                            int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
-                            cJSON_Delete(peek.json);
-                            if (!ret) {
-                                fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
-                            }
-                        } else if (peek.msg_type == MSG_HELLO) {
-                            /* Client reconnecting without state — check if known pubkey */
-                            unsigned char pk_buf[33];
-                            secp256k1_pubkey pk;
-                            if (wire_json_get_hex(peek.json, "pubkey", pk_buf, 33) == 33 &&
-                                secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                                int slot = find_client_slot_by_pubkey(lsp, mgr->ctx, &pk);
-                                if (slot >= 0) {
-                                    fprintf(stderr, "LSP daemon: MSG_HELLO from known client %d "
-                                            "(lost state?), attempting reconnect\n", slot);
-                                    cJSON_Delete(peek.json);
-                                    uint64_t cn = mgr->entries[slot].channel.commitment_number;
-                                    peek.json = wire_build_reconnect(mgr->ctx, &pk, cn);
-                                    peek.msg_type = MSG_RECONNECT;
-                                    int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
-                                    cJSON_Delete(peek.json);
-                                    if (!ret) {
-                                        fprintf(stderr, "LSP daemon: HELLO->reconnect failed for "
-                                                "slot %d (state mismatch — client needs --db)\n", slot);
-                                    }
-                                } else {
-                                    cJSON_Delete(peek.json);
-                                    wire_close(new_fd);
-                                }
-                            } else {
-                                cJSON_Delete(peek.json);
-                                wire_close(new_fd);
-                            }
-                        } else {
-                            fprintf(stderr, "LSP daemon: unexpected msg 0x%02x from new connection\n",
-                                    peek.msg_type);
-                            cJSON_Delete(peek.json);
-                            wire_close(new_fd);
-                        }
-                    } else {
-                        wire_close(new_fd);
-                    }
-                }
-            }
+            accept_and_handle_connection(mgr, lsp);
         }
 
         /* Handle stdin CLI commands */
