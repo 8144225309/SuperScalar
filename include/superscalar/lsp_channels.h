@@ -167,6 +167,18 @@ typedef struct {
 
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
+
+    /* Deferred reconnection queue: connections accepted during ceremonies
+       are queued here and processed when the daemon loop resumes.
+       Prevents reentrancy while keeping the listen socket responsive. */
+    #define PENDING_RECONNECT_MAX 8
+    struct {
+        int fd;
+        uint8_t msg_type;     /* MSG_RECONNECT, MSG_BRIDGE_HELLO, MSG_HELLO */
+        void *json;           /* cJSON* — owned by queue entry, freed on drain */
+        int valid;
+    } pending_reconnects[8];
+    size_t n_pending_reconnects;
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
