@@ -2,6 +2,31 @@
 
 All notable changes to SuperScalar are documented here.
 
+## Unreleased — 2026-03-27
+
+Production hardening: persistent daemon mode, HD wallet funding, deferred ceremony reconnections, 8 bug fixes. 36/36 orchestrator scenarios, 1351 unit tests.
+
+### Added
+
+- **Persistent daemon mode** (`superscalar_lsp.c`, `persist.c`): LSP loops after cooperative close, reloading factory state from DB — enables long-running production deployments (PR #36)
+- **HD wallet wired to factory funding** (`superscalar_lsp.c`): BIP 32/39 derived keys used for factory self-funding path instead of hardcoded regtest keys (PR #37)
+- **Admin RPC: `getbalance` and `listfunds`** (`admin_rpc.c`): query on-chain wallet balance and list unspent outputs via JSON-RPC Unix socket (PR #38)
+- **Admin RPC: `pay_bridge`** (`admin_rpc.c`): outbound payment routing through CLN bridge (PR #39)
+
+### Fixed
+
+- **Deferred ceremony reconnections** (`lsp_channels.c`, PR #48): listen socket now polled during blocking ceremony waits; new connections are accepted, noise-handshaked, and queued — drained when daemon loop resumes. Prevents "connection refused" without reentrancy risk
+- **Non-blocking confirmation wait** (`superscalar_lsp.c`): confirmation polling services client reconnections instead of blocking the event loop
+- **Ceremony message handling robustness** (`lsp.c`, `lsp_channels.c`): 4 fixes — boundary checks on recv, partial-message handling, timeout propagation, error recovery
+- **Cooperative close dust filter** (`superscalar_lsp.c`): outputs below dust limit excluded from close TX; `sweepfactory` RPC recovery path hardened
+- **Breach detection and lifecycle monitoring** (`superscalar_lsp.c`, `lsp_rotation.c`): rotation retry on transient failure; lifecycle state transitions validated
+- **Client watchtower scan starvation** (`superscalar_client.c`): active socket traffic could starve periodic watchtower block scans; fix: dedicated scan window between message polls
+- **BOLT #11 HRP for signet/testnet4** (`bolt11.c`): added `tbs` (signet) and `tb4` (testnet4) prefixes to invoice decoder
+
+### Refactoring
+
+- **Test extraction** (`tests/`): monolithic test blocks extracted into dedicated include files for maintainability
+
 ## Unreleased (post-ln-phase2) — 2026-03-22
 
 LN phase 2 integration: 7 PRs (#28–#34) merged via omnibus PR #35. 21/21 signet exhibition passing with 10 bug fixes. 1355 unit tests.
