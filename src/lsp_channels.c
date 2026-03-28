@@ -3371,6 +3371,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             time_t tnow = time(NULL);
             if (last_periodic == 0) last_periodic = tnow;
 
+            /* Send keepalive pings every 30s to prevent client recv timeout */
+            {
+                static time_t last_daemon_ping = 0;
+                if (!last_daemon_ping) last_daemon_ping = tnow;
+                if (tnow - last_daemon_ping >= 30) {
+                    cJSON *ping = cJSON_CreateObject();
+                    for (size_t pi = 0; pi < mgr->n_channels; pi++) {
+                        if (lsp->client_fds[pi] >= 0)
+                            wire_send(lsp->client_fds[pi], MSG_PING, ping);
+                    }
+                    cJSON_Delete(ping);
+                    last_daemon_ping = tnow;
+                }
+            }
+
             if (tnow - last_periodic >= 5) {
                 last_periodic = tnow;
 
