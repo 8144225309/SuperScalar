@@ -164,6 +164,11 @@ int wire_recv(int fd, wire_msg_t *msg);
    restores WIRE_DEFAULT_TIMEOUT_SEC after. Use timeout_sec=0 for infinite wait. */
 int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec);
 
+/* Recv, transparently handling MSG_PING/MSG_PONG keepalives.
+   Loops until a non-keepalive message is received or the recv fails.
+   Use in ceremony code where stale PONG messages may arrive. */
+int wire_recv_skip_ping(int fd, wire_msg_t *msg);
+
 /* --- Crypto JSON helpers --- */
 
 /* Encode binary as hex string and add to JSON object */

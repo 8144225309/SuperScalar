@@ -483,6 +483,26 @@ int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec) {
     return ok;
 }
 
+int wire_recv_skip_ping(int fd, wire_msg_t *msg) {
+    while (1) {
+        if (!wire_recv(fd, msg)) return 0;
+        if (msg->msg_type == MSG_PING) {
+            cJSON *pong = cJSON_CreateObject();
+            wire_send(fd, MSG_PONG, pong);
+            cJSON_Delete(pong);
+            if (msg->json) cJSON_Delete(msg->json);
+            memset(msg, 0, sizeof(*msg));
+            continue;
+        }
+        if (msg->msg_type == MSG_PONG) {
+            if (msg->json) cJSON_Delete(msg->json);
+            memset(msg, 0, sizeof(*msg));
+            continue;
+        }
+        return 1;
+    }
+}
+
 /* --- Crypto JSON helpers --- */
 
 void wire_json_add_hex(cJSON *obj, const char *key,
