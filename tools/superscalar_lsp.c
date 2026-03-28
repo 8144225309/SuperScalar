@@ -425,31 +425,76 @@ static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
                    txid_hex, height, elapsed, timeout_secs);
         fflush(stdout);
 
-        /* Service listen socket for client reconnections (5s poll) */
-        if (lsp && lsp->listen_fd >= 0) {
-            struct pollfd pfd = { .fd = lsp->listen_fd, .events = POLLIN };
-            int pret = poll(&pfd, 1, 5000);
-            if (pret > 0 && (pfd.revents & POLLIN)) {
-                int new_fd = wire_accept(lsp->listen_fd);
-                if (new_fd >= 0) {
-                    int hs_ok;
-                    if (lsp->use_nk)
-                        hs_ok = wire_noise_handshake_nk_responder(new_fd,
-                                    mgr ? mgr->ctx : NULL, lsp->nk_seckey);
-                    else
-                        hs_ok = wire_noise_handshake_responder(new_fd,
-                                    mgr ? mgr->ctx : NULL);
-                    if (hs_ok && mgr) {
-                        /* Let the public reconnect handler read and process
-                           the first message (MSG_RECONNECT expected) */
-                        lsp_channels_handle_reconnect(mgr, lsp, new_fd);
-                    } else {
-                        wire_close(new_fd);
+        /* Send keepalive ping to all clients every 30 seconds */
+        {
+            static time_t last_ping = 0;
+            if (!last_ping) last_ping = time(NULL);
+            if (tnow - last_ping >= 30 && lsp) {
+                cJSON *ping = cJSON_CreateObject();
+                for (size_t i = 0; i < lsp->n_clients; i++) {
+                    if (lsp->client_fds[i] >= 0)
+                        wire_send(lsp->client_fds[i], MSG_PING, ping);
+                }
+                cJSON_Delete(ping);
+                last_ping = tnow;
+            }
+        }
+
+        /* Poll listen socket + client fds (5s timeout) */
+        {
+            struct pollfd pfds[16];
+            int nfds = 0;
+            int listen_idx = -1;
+            if (lsp && lsp->listen_fd >= 0 && nfds < 16) {
+                listen_idx = nfds;
+                pfds[nfds].fd = lsp->listen_fd;
+                pfds[nfds].events = POLLIN;
+                nfds++;
+            }
+            /* Also poll client fds to respond to pings */
+            if (lsp) {
+                for (size_t i = 0; i < lsp->n_clients && nfds < 16; i++) {
+                    if (lsp->client_fds[i] >= 0) {
+                        pfds[nfds].fd = lsp->client_fds[i];
+                        pfds[nfds].events = POLLIN;
+                        nfds++;
                     }
                 }
             }
-        } else {
-            sleep(5);
+            int pret = nfds > 0 ? poll(pfds, (nfds_t)nfds, 5000) : 0;
+            if (!pret) { if (!nfds) sleep(5); }
+            if (pret > 0) {
+                for (int fi = 0; fi < nfds; fi++) {
+                    if (!(pfds[fi].revents & POLLIN)) continue;
+                    if (fi == listen_idx) {
+                        int new_fd = wire_accept(lsp->listen_fd);
+                        if (new_fd >= 0) {
+                            int hs_ok;
+                            if (lsp->use_nk)
+                                hs_ok = wire_noise_handshake_nk_responder(new_fd,
+                                            mgr ? mgr->ctx : NULL, lsp->nk_seckey);
+                            else
+                                hs_ok = wire_noise_handshake_responder(new_fd,
+                                            mgr ? mgr->ctx : NULL);
+                            if (hs_ok && mgr)
+                                lsp_channels_handle_reconnect(mgr, lsp, new_fd);
+                            else
+                                wire_close(new_fd);
+                        }
+                    } else {
+                        /* Client socket ready — handle ping/pong */
+                        wire_msg_t cmsg;
+                        if (wire_recv(pfds[fi].fd, &cmsg)) {
+                            if (cmsg.msg_type == MSG_PING) {
+                                cJSON *pong = cJSON_CreateObject();
+                                wire_send(pfds[fi].fd, MSG_PONG, pong);
+                                cJSON_Delete(pong);
+                            }
+                            if (cmsg.json) cJSON_Delete(cmsg.json);
+                        }
+                    }
+                }
+            }
         }
     }
 }
