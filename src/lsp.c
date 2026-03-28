@@ -361,7 +361,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_NONCE_BUNDLE) {
+                if (!wire_recv_skip_ping(lsp->client_fds[c], &msg) || msg.msg_type != MSG_NONCE_BUNDLE) {
                     if (msg.json && !check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected NONCE_BUNDLE from client %zu, got 0x%02x\n",
                                 c, msg.msg_type);
@@ -491,7 +491,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv(lsp->client_fds[c], &msg) || msg.msg_type != MSG_PSIG_BUNDLE) {
+                if (!wire_recv_skip_ping(lsp->client_fds[c], &msg) || msg.msg_type != MSG_PSIG_BUNDLE) {
                     if (msg.json && !check_client_error(&msg, c))
                         fprintf(stderr, "LSP: expected PSIG_BUNDLE from client %zu\n", c);
                     if (msg.json) cJSON_Delete(msg.json);
@@ -685,7 +685,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60)) {
+                if (!wire_recv_skip_ping(lsp->client_fds[c], &msg)) {
                     fprintf(stderr, "LSP: timeout/disconnect waiting for CLOSE_NONCE from client %zu\n", c);
                     close_nonce_cer.clients[c] = CLIENT_ERROR;
                     continue;
@@ -797,7 +797,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                 if (!ready[c]) continue;
 
                 wire_msg_t msg;
-                if (!wire_recv_timeout(lsp->client_fds[c], &msg, 60)) {
+                if (!wire_recv_skip_ping(lsp->client_fds[c], &msg)) {
                     close_psig_cer.clients[c] = CLIENT_ERROR;
                     continue;
                 }
