@@ -347,6 +347,30 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
             return NULL;
         }
     }
+    /* Register in the bridge invoice table so lsp_channels_lookup_invoice
+       finds the hash when the HTLC arrives via bridge.  Without this,
+       bridge HTLCs for admin-RPC-created invoices fail with "unknown hash". */
+    if (rpc->channel_mgr) {
+        /* Find the invoice we just created in the BOLT11 table */
+        for (int i = 0; i < INVOICE_TABLE_MAX; i++) {
+            bolt11_invoice_entry_t *e = &rpc->invoices->entries[i];
+            if (!e->active || e->settled) continue;
+            /* Match by amount + description (most recent entry) */
+            if (e->amount_msat == amount_msat) {
+                /* dest_client=0 is the default target for bridge payments */
+                lsp_channels_register_invoice(rpc->channel_mgr,
+                    e->payment_hash, e->preimage, 0, amount_msat);
+                char hash_hex[65];
+                extern void hex_encode(const unsigned char *, size_t, char *);
+                hex_encode(e->payment_hash, 32, hash_hex);
+                hash_hex[64] = '\0';
+                printf("LSP: registered bridge invoice %s (client 0, %llu msat)\n",
+                       hash_hex, (unsigned long long)amount_msat);
+                break;
+            }
+        }
+    }
+
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "bolt11", bech32);
     cJSON_AddNumberToObject(r, "amount_msat", (double)amount_msat);
