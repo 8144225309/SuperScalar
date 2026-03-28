@@ -47,6 +47,7 @@ typedef struct {
     uint32_t               *block_height;       /* current chain tip; may be NULL */
     wallet_source_t        *wallet;             /* on-chain wallet; NULL = no channel open */
     volatile int           *shutdown_flag;
+    void                   *lsp;               /* lsp_t* for client fd access */
 
     /* Unix socket state */
     int  listen_fd;

@@ -1076,6 +1076,28 @@ handle_message:
             cJSON_Delete(msg.json);
             break;
 
+        case MSG_DELIVER_PREIMAGE: {
+            /* LSP delivers preimage for an admin-created invoice.
+               Store it so we can fulfill the HTLC when it arrives. */
+            unsigned char dp_hash[32], dp_preimage[32];
+            if (msg.json &&
+                wire_json_get_hex(msg.json, "payment_hash", dp_hash, 32) == 32 &&
+                wire_json_get_hex(msg.json, "preimage", dp_preimage, 32) == 32) {
+                if (cbd && cbd->n_invoices < MAX_CLIENT_INVOICES) {
+                    client_invoice_t *inv = &cbd->invoices[cbd->n_invoices];
+                    memcpy(inv->payment_hash, dp_hash, 32);
+                    memcpy(inv->preimage, dp_preimage, 32);
+                    cJSON *amt = cJSON_GetObjectItem(msg.json, "amount_msat");
+                    inv->amount_msat = amt ? (uint64_t)amt->valuedouble : 0;
+                    inv->active = 1;
+                    cbd->n_invoices++;
+                    printf("Client %u: stored preimage for admin invoice\n", my_index);
+                }
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         case MSG_JIT_OFFER: {
             /* LSP offers a JIT channel — non-blocking state machine */
             size_t jit_cidx;

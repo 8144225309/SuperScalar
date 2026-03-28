@@ -10,6 +10,7 @@
 
 /* --- Message types --- */
 #define MSG_HELLO              0x01
+#define MSG_DELIVER_PREIMAGE   0x72  /* LSP → Client: preimage for admin-created invoice */
 #define MSG_PING               0x70  /* Keepalive: either side sends */
 #define MSG_PONG               0x71  /* Keepalive response */
 #define MSG_HELLO_ACK          0x02
