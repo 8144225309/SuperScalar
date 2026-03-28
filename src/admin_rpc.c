@@ -347,27 +347,52 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
             return NULL;
         }
     }
-    /* Register in the bridge invoice table so lsp_channels_lookup_invoice
-       finds the hash when the HTLC arrives via bridge.  Without this,
-       bridge HTLCs for admin-RPC-created invoices fail with "unknown hash". */
+    /* Register in bridge invoice table, deliver preimage to client, notify bridge.
+       1. Register hash so LSP can look up the HTLC when it arrives
+       2. Send preimage to client so it can fulfill
+       3. Notify bridge so CLN plugin knows about the invoice */
     if (rpc->channel_mgr) {
-        /* Find the invoice we just created in the BOLT11 table */
-        for (int i = 0; i < INVOICE_TABLE_MAX; i++) {
+        bolt11_invoice_entry_t *found = NULL;
+        for (int i = INVOICE_TABLE_MAX - 1; i >= 0; i--) {
             bolt11_invoice_entry_t *e = &rpc->invoices->entries[i];
-            if (!e->active || e->settled) continue;
-            /* Match by amount + description (most recent entry) */
-            if (e->amount_msat == amount_msat) {
-                /* dest_client=0 is the default target for bridge payments */
-                lsp_channels_register_invoice(rpc->channel_mgr,
-                    e->payment_hash, e->preimage, 0, amount_msat);
-                char hash_hex[65];
-                extern void hex_encode(const unsigned char *, size_t, char *);
-                hex_encode(e->payment_hash, 32, hash_hex);
-                hash_hex[64] = '\0';
-                printf("LSP: registered bridge invoice %s (client 0, %llu msat)\n",
-                       hash_hex, (unsigned long long)amount_msat);
-                break;
+            if (e->active && !e->settled && e->amount_msat == amount_msat) {
+                found = e; break;
             }
+        }
+        if (found) {
+            lsp_channel_mgr_t *mgr = rpc->channel_mgr;
+            typedef struct lsp lsp_t;
+            lsp_t *lsp = (lsp_t *)rpc->lsp;
+            extern void hex_encode(const unsigned char *, size_t, char *);
+            char hash_hex[65];
+            hex_encode(found->payment_hash, 32, hash_hex);
+            hash_hex[64] = '\0';
+            /* 1. Register in bridge invoice table */
+            lsp_channels_register_invoice(mgr,
+                found->payment_hash, found->preimage, 0, amount_msat);
+
+            /* 2. Deliver preimage to client 0 via MSG_DELIVER_PREIMAGE */
+            if (lsp && lsp->client_fds[0] >= 0) {
+                cJSON *dp = cJSON_CreateObject();
+                wire_json_add_hex(dp, "payment_hash", found->payment_hash, 32);
+                wire_json_add_hex(dp, "preimage", found->preimage, 32);
+                cJSON_AddNumberToObject(dp, "amount_msat", (double)amount_msat);
+                wire_send(lsp->client_fds[0], MSG_DELIVER_PREIMAGE, dp);
+                cJSON_Delete(dp);
+                printf("LSP: delivered preimage to client 0 for %s\n", hash_hex);
+            }
+
+            /* 3. Notify bridge so CLN plugin creates matching CLN invoice */
+            if (mgr->bridge_fd >= 0) {
+                cJSON *reg = wire_build_bridge_register(
+                    found->payment_hash, found->preimage, amount_msat, 0);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
+                cJSON_Delete(reg);
+                printf("LSP: sent BRIDGE_REGISTER for %s\n", hash_hex);
+            }
+
+            printf("LSP: registered bridge invoice %s (client 0, %llu msat)\n",
+                   hash_hex, (unsigned long long)amount_msat);
         }
     }
 

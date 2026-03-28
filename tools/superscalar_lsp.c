@@ -2225,6 +2225,7 @@ int main(int argc, char *argv[]) {
                 g_admin_rpc.ctx           = ctx;
                 memcpy(g_admin_rpc.node_privkey, lsp_seckey, 32);
                 g_admin_rpc.channel_mgr   = mgr;
+                g_admin_rpc.lsp           = &lsp;
                 g_admin_rpc.payments      = &g_payments;
                 g_admin_rpc.invoices      = &g_invoice_tbl;
                 g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
@@ -2906,8 +2907,10 @@ accept_new_factory:
     if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
     g_channel_mgr = mgr;
     /* Update admin RPC channel_mgr (was NULL when RPC was initialized earlier) */
-    if (g_admin_rpc.ctx)
+    if (g_admin_rpc.ctx) {
         g_admin_rpc.channel_mgr = mgr;
+        g_admin_rpc.lsp = &lsp;
+    }
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
