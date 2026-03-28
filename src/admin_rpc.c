@@ -13,6 +13,7 @@
  */
 
 #include "superscalar/admin_rpc.h"
+#include "superscalar/lsp.h"
 #include "superscalar/wire.h"
 #include "superscalar/rgs.h"
 #include "superscalar/bolt12.h"
@@ -361,7 +362,6 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
         }
         if (found) {
             lsp_channel_mgr_t *mgr = rpc->channel_mgr;
-            typedef struct lsp lsp_t;
             lsp_t *lsp = (lsp_t *)rpc->lsp;
             extern void hex_encode(const unsigned char *, size_t, char *);
             char hash_hex[65];
