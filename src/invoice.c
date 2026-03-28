@@ -128,6 +128,58 @@ int invoice_create(bolt11_invoice_table_t *tbl,
     return 1;
 }
 
+int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
+                              secp256k1_context *ctx,
+                              const unsigned char node_privkey[32],
+                              const char *network,
+                              uint64_t amount_msat,
+                              const char *description,
+                              uint32_t expiry_secs,
+                              const unsigned char *hint_pubkey,
+                              uint64_t hint_scid,
+                              uint32_t hint_fee_base,
+                              uint32_t hint_fee_ppm,
+                              uint16_t hint_cltv_delta,
+                              char *bech32_out, size_t out_cap)
+{
+    /* Create the base invoice first (without hint) into a temp buffer */
+    char tmp[512];
+    if (!invoice_create(tbl, ctx, node_privkey, network, amount_msat,
+                        description, expiry_secs, tmp, sizeof(tmp)))
+        return 0;
+
+    /* If no hint requested, just copy and return */
+    if (!hint_pubkey) {
+        strncpy(bech32_out, tmp, out_cap - 1);
+        bech32_out[out_cap - 1] = '\0';
+        return 1;
+    }
+
+    /* Decode, add hint, re-encode */
+    bolt11_invoice_t inv;
+    if (!bolt11_decode(tmp, &inv, ctx)) {
+        return 0;
+    }
+
+    /* Add the route hint */
+    if (inv.n_hints < BOLT11_MAX_ROUTE_HINTS) {
+        bolt11_route_hint_t *h = &inv.hints[inv.n_hints];
+        memset(h, 0, sizeof(*h));
+        memcpy(h->hops[0].pubkey, hint_pubkey, 33);
+        h->hops[0].short_channel_id = hint_scid;
+        h->hops[0].fee_base_msat = hint_fee_base;
+        h->hops[0].fee_ppm = hint_fee_ppm;
+        h->hops[0].cltv_expiry_delta = hint_cltv_delta;
+        h->n_hops = 1;
+        inv.n_hints++;
+    }
+
+    if (!bolt11_encode(&inv, node_privkey, ctx, bech32_out, out_cap)) {
+        return 0;
+    }
+    return 1;
+}
+
 int invoice_claim(bolt11_invoice_table_t *tbl,
                   const unsigned char payment_hash[32],
                   uint64_t amount_msat,

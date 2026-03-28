@@ -304,11 +304,48 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
         snprintf(errmsg, errcap, "node privkey not configured");
         return NULL;
     }
-    if (!invoice_create(rpc->invoices, rpc->ctx, rpc->node_privkey,
-                        "signet", amount_msat, desc, expiry,
-                        bech32, sizeof(bech32))) {
-        snprintf(errmsg, errcap, "invoice_create failed");
-        return NULL;
+    /* Optional route hint for bridge/private channel routing */
+    unsigned char hint_pk[33];
+    int has_hint = 0;
+    uint64_t hint_scid = 0;
+    uint32_t hint_fee_base = 0, hint_fee_ppm = 0;
+    uint16_t hint_cltv = 40;
+    if (cJSON_IsObject(params)) {
+        cJSON *rh = cJSON_GetObjectItemCaseSensitive(params, "route_hint_pubkey");
+        cJSON *rs = cJSON_GetObjectItemCaseSensitive(params, "route_hint_scid");
+        if (cJSON_IsString(rh) && cJSON_IsNumber(rs)) {
+            extern int hex_decode(const char *, unsigned char *, size_t);
+            if (hex_decode(rh->valuestring, hint_pk, 33) == 33) {
+                has_hint = 1;
+                hint_scid = (uint64_t)rs->valuedouble;
+                cJSON *fb = cJSON_GetObjectItemCaseSensitive(params, "route_hint_fee_base");
+                if (cJSON_IsNumber(fb)) hint_fee_base = (uint32_t)fb->valuedouble;
+                cJSON *fp = cJSON_GetObjectItemCaseSensitive(params, "route_hint_fee_ppm");
+                if (cJSON_IsNumber(fp)) hint_fee_ppm = (uint32_t)fp->valuedouble;
+                cJSON *cd = cJSON_GetObjectItemCaseSensitive(params, "route_hint_cltv");
+                if (cJSON_IsNumber(cd)) hint_cltv = (uint16_t)cd->valuedouble;
+            }
+        }
+    }
+
+    /* Determine network from RPC context (default signet) */
+    const char *net = "signet";
+    if (has_hint) {
+        if (!invoice_create_with_hint(rpc->invoices, rpc->ctx, rpc->node_privkey,
+                                       net, amount_msat, desc, expiry,
+                                       hint_pk, hint_scid, hint_fee_base,
+                                       hint_fee_ppm, hint_cltv,
+                                       bech32, sizeof(bech32))) {
+            snprintf(errmsg, errcap, "invoice_create_with_hint failed");
+            return NULL;
+        }
+    } else {
+        if (!invoice_create(rpc->invoices, rpc->ctx, rpc->node_privkey,
+                            net, amount_msat, desc, expiry,
+                            bech32, sizeof(bech32))) {
+            snprintf(errmsg, errcap, "invoice_create failed");
+            return NULL;
+        }
     }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "bolt11", bech32);
