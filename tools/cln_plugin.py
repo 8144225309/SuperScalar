@@ -431,18 +431,31 @@ def handle_htlc_accepted(rpc_id, params):
                     f"!= hash={payment_hash[:16]}...")
                 keysend_preimage = None
 
+    # Check if this is a forwarding HTLC (has short_channel_id in onion).
+    # If CLN-A is forwarding to an unknown next-hop, it's likely destined
+    # for the SuperScalar LSP via the bridge.  Forward it.
+    onion = params.get("onion", {})
+    is_forward = "short_channel_id" in onion
+
     log(f"htlc_accepted: hash={payment_hash[:16]}... amt={amount_msat} "
         f"cltv={cltv_expiry} ours={is_ours} keysend={keysend_preimage is not None} "
-        f"(registry={n_registered})")
+        f"forward={is_forward} (registry={n_registered})")
 
-    if not is_ours and not keysend_preimage:
-        # Not a factory payment and not keysend — let CLN handle it normally
+    if not is_ours and not keysend_preimage and not is_forward:
+        # Not a factory payment, not keysend, not a forward — let CLN handle
         send_to_cln({
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {"result": "continue"}
         })
         return
+
+    # For forwarding HTLCs, use the forward_msat and outgoing_cltv from onion
+    if is_forward and not is_ours and not keysend_preimage:
+        fwd_msat = onion.get("forward_msat", onion.get("forward_amount", amount_msat))
+        if isinstance(fwd_msat, str):
+            fwd_msat = int(fwd_msat.replace("msat", ""))
+        amount_msat = int(fwd_msat)
 
     # Register pending HTLC keyed by payment_hash (no counter desync risk)
     with lock:
