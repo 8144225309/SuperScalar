@@ -246,6 +246,11 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Run a daemon event loop handling channel messages until shutdown.
    Loops on select() with 5-second timeout checking *shutdown_flag.
    Returns 1 on clean shutdown. */
+/* Run one daemon loop iteration: accept connections, drain reconnect queue,
+ * poll clients for 1 second. Returns immediately. */
+int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      volatile int *shutdown_flag);
+
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
 

@@ -433,6 +433,115 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
 /* Receive from client_fd with timeout, servicing bridge heartbeats while waiting.
    Replaces wire_recv_timeout() to prevent bridge starvation during HTLC processing. */
+
+/* Accept a connection on the listen socket and queue it for deferred processing.
+   Callable from any wait loop (confirmation waits, ceremony waits, etc.).
+   Returns 1 if a connection was queued, 0 otherwise. */
+
+/* Forward declarations for daemon_loop_once */
+static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp, int fd, const wire_msg_t *msg);
+int lsp_accept_and_queue_connection(void *mgr_ptr, void *lsp_ptr);
+
+/* Single iteration: drain queue, poll for 1 second, return. */
+int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       volatile int *shutdown_flag)
+{
+    /* Set shutdown after one iteration */
+    volatile int one_shot = 0;
+    (void)shutdown_flag;
+
+    /* Accept any pending connections */
+    lsp_accept_and_queue_connection(mgr, lsp);
+
+    /* Drain reconnect queue - this is the code from the daemon loop top */
+    while (mgr->n_pending_reconnects > 0) {
+        mgr->n_pending_reconnects--;
+        size_t qi = mgr->n_pending_reconnects;
+        if (!mgr->pending_reconnects[qi].valid) continue;
+        int qfd = mgr->pending_reconnects[qi].fd;
+        uint8_t qtype = mgr->pending_reconnects[qi].msg_type;
+        cJSON *qjson = (cJSON *)mgr->pending_reconnects[qi].json;
+        mgr->pending_reconnects[qi].valid = 0;
+        mgr->pending_reconnects[qi].json = NULL;
+        wire_set_timeout(qfd, WIRE_DEFAULT_TIMEOUT_SEC);
+        if (qtype == MSG_RECONNECT) {
+            wire_msg_t qmsg = { .msg_type = qtype, .json = qjson };
+            handle_reconnect_with_msg(mgr, lsp, qfd, &qmsg);
+            if (qjson) cJSON_Delete(qjson);
+        } else if (qtype == MSG_HELLO) {
+            unsigned char pk_buf[33];
+            secp256k1_pubkey pk;
+            if (qjson && wire_json_get_hex(qjson, "pubkey", pk_buf, 33) == 33 &&
+                secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
+                int slot = -1;
+                for (size_t s = 0; s < lsp->n_clients; s++) {
+                    unsigned char s1[33], s2[33];
+                    size_t l1 = 33, l2 = 33;
+                    if (secp256k1_ec_pubkey_serialize(mgr->ctx, s1, &l1,
+                            &lsp->client_pubkeys[s], SECP256K1_EC_COMPRESSED) &&
+                        secp256k1_ec_pubkey_serialize(mgr->ctx, s2, &l2,
+                            &pk, SECP256K1_EC_COMPRESSED) &&
+                        memcmp(s1, s2, 33) == 0) { slot = (int)s; break; }
+                }
+                if (slot >= 0) {
+                    cJSON_Delete(qjson);
+                    uint64_t cn = mgr->entries[slot].channel.commitment_number;
+                    qjson = wire_build_reconnect(mgr->ctx, &pk, cn);
+                    wire_msg_t qmsg = { .msg_type = MSG_RECONNECT, .json = qjson };
+                    handle_reconnect_with_msg(mgr, lsp, qfd, &qmsg);
+                    cJSON_Delete(qjson);
+                } else {
+                    if (qjson) cJSON_Delete(qjson);
+                    wire_close(qfd);
+                }
+            } else {
+                if (qjson) cJSON_Delete(qjson);
+                wire_close(qfd);
+            }
+        } else {
+            if (qjson) cJSON_Delete(qjson);
+            wire_close(qfd);
+        }
+    }
+    (void)one_shot;
+    return 1;
+}
+
+int lsp_accept_and_queue_connection(void *mgr_ptr, void *lsp_ptr)
+{
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    lsp_t *lsp = (lsp_t *)lsp_ptr;
+    if (!mgr || !lsp || lsp->listen_fd < 0) return 0;
+    if (mgr->n_pending_reconnects >= PENDING_RECONNECT_MAX) return 0;
+
+    /* Non-blocking check: is there a connection waiting? */
+    struct pollfd pfd = { .fd = lsp->listen_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, 0);  /* instant poll, no wait */
+    if (ret <= 0 || !(pfd.revents & POLLIN)) return 0;
+
+    int new_fd = wire_accept(lsp->listen_fd);
+    if (new_fd < 0) return 0;
+
+    wire_set_timeout(new_fd, 5);
+    int hs_ok;
+    if (lsp->use_nk)
+        hs_ok = wire_noise_handshake_nk_responder(new_fd, mgr->ctx, lsp->nk_seckey);
+    else
+        hs_ok = wire_noise_handshake_responder(new_fd, mgr->ctx);
+
+    if (!hs_ok) { wire_close(new_fd); return 0; }
+
+    wire_msg_t peek;
+    if (!wire_recv_timeout(new_fd, &peek, 5)) { wire_close(new_fd); return 0; }
+
+    size_t qi = mgr->n_pending_reconnects++;
+    mgr->pending_reconnects[qi].fd = new_fd;
+    mgr->pending_reconnects[qi].msg_type = peek.msg_type;
+    mgr->pending_reconnects[qi].json = peek.json;
+    mgr->pending_reconnects[qi].valid = 1;
+    return 1;
+}
+
 static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        int client_fd, wire_msg_t *msg,
                                        int timeout_sec) {

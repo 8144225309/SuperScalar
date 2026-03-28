@@ -1,8 +1,13 @@
 #include "superscalar/lsp_fund.h"
+#include "superscalar/lsp.h"
+#include "superscalar/wire.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <cJSON.h>
 
 extern int  hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -13,7 +18,7 @@ extern void reverse_bytes(unsigned char *data, size_t len);
  * 1 input, n_outputs outputs. wallet->sign_input will add the witness.
  * Returns byte length written into out (always < 512 for 1-in 2-out P2TR).
  */
-static size_t build_unsigned_tx(unsigned char *out,
+static size_t lsp_fund_build_unsigned_tx(unsigned char *out,
                                  const unsigned char *txid32_internal,
                                  uint32_t vout_idx,
                                  const unsigned char *spk1, size_t spk1_len,
@@ -104,7 +109,7 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 
     /* Build unsigned TX (max ~137 bytes base) */
     unsigned char tx_raw[512];
-    size_t tx_len = build_unsigned_tx(tx_raw, in_txid_bytes, in_vout,
+    size_t tx_len = lsp_fund_build_unsigned_tx(tx_raw, in_txid_bytes, in_vout,
                                        target_spk, target_spk_len, amount_sats,
                                        n_outputs == 2 ? chg_spk : NULL,
                                        n_outputs == 2 ? chg_spk_len : 0,
@@ -148,13 +153,110 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
                                int timeout_secs)
 {
+    return lsp_wait_for_confirmation_service(chain, txid_hex, timeout_secs, NULL, NULL);
+}
+
+int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_hex,
+                                       int timeout_secs, void *mgr_ptr, void *lsp_ptr)
+{
     if (!chain || !txid_hex) return 0;
-    int waited = 0;
-    while (waited < timeout_secs) {
-        int confs = chain->get_confirmations(chain, txid_hex);
-        if (confs >= 1) return 1;
-        sleep(15);
-        waited += 15;
+
+    lsp_t *lsp = (lsp_t *)lsp_ptr;
+    (void)mgr_ptr;  /* used only as opaque arg to lsp_accept_and_queue_connection */
+
+    if (!lsp) {
+        /* No LSP context: simple sleep loop (original behaviour) */
+        int waited = 0;
+        while (waited < timeout_secs) {
+            int confs = chain->get_confirmations(chain, txid_hex);
+            if (confs >= 1) return 1;
+            sleep(15);
+            waited += 15;
+        }
+        return 0;
     }
-    return 0;
+
+    /* --- poll()-based keepalive loop --- */
+    struct timeval tv_start, tv_now;
+    gettimeofday(&tv_start, NULL);
+
+    time_t last_conf_check = 0;   /* force immediate first check */
+    time_t last_ping       = 0;
+
+    extern int lsp_accept_and_queue_connection(void *mgr, void *lsp);
+
+    for (;;) {
+        gettimeofday(&tv_now, NULL);
+        int elapsed = (int)(tv_now.tv_sec - tv_start.tv_sec);
+        if (elapsed >= timeout_secs) return 0;
+
+        /* Check confirmations every 15 s */
+        if (tv_now.tv_sec - last_conf_check >= 15) {
+            int confs = chain->get_confirmations(chain, txid_hex);
+            if (confs >= 1) return 1;
+            last_conf_check = tv_now.tv_sec;
+        }
+
+        /* Build pollfd array: listen_fd + each client fd */
+        int nfds = 0;
+        struct pollfd pfds[128];
+
+        if (lsp->listen_fd >= 0) {
+            pfds[nfds].fd     = lsp->listen_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            if (lsp->client_fds[i] >= 0) {
+                pfds[nfds].fd     = lsp->client_fds[i];
+                pfds[nfds].events = POLLIN;
+                nfds++;
+            }
+        }
+
+        int pr = poll(pfds, (nfds_t)nfds, 5000);  /* 5 s timeout */
+        if (pr > 0) {
+            int idx = 0;
+            /* listen socket readable -> accept+queue */
+            if (lsp->listen_fd >= 0) {
+                if (pfds[idx].revents & POLLIN)
+                    lsp_accept_and_queue_connection(mgr_ptr, lsp_ptr);
+                idx++;
+            }
+            /* client sockets */
+            for (size_t i = 0; i < lsp->n_clients; i++) {
+                if (lsp->client_fds[i] < 0) continue;
+                if (pfds[idx].revents & (POLLHUP | POLLERR)) {
+                    wire_close(lsp->client_fds[i]);
+                    lsp->client_fds[i] = -1;
+                    idx++;
+                    continue;
+                }
+                if (pfds[idx].revents & POLLIN) {
+                    wire_msg_t wmsg;
+                    if (wire_recv_timeout(lsp->client_fds[i], &wmsg, 1)) {
+                        if (wmsg.msg_type == MSG_PING) {
+                            cJSON *pong = cJSON_CreateObject();
+                            wire_send(lsp->client_fds[i], MSG_PONG, pong);
+                            cJSON_Delete(pong);
+                        }
+                        if (wmsg.json) cJSON_Delete(wmsg.json);
+                    }
+                }
+                idx++;
+            }
+        }
+
+        /* Send PING to all clients every 30 s */
+        gettimeofday(&tv_now, NULL);
+        if (tv_now.tv_sec - last_ping >= 30) {
+            cJSON *ping = cJSON_CreateObject();
+            for (size_t i = 0; i < lsp->n_clients; i++) {
+                if (lsp->client_fds[i] >= 0)
+                    wire_send(lsp->client_fds[i], MSG_PING, ping);
+            }
+            cJSON_Delete(ping);
+            last_ping = tv_now.tv_sec;
+        }
+    }
 }

@@ -1062,6 +1062,20 @@ handle_message:
             break;
         }
 
+        case MSG_PING: {
+            /* Keepalive ping from LSP: respond with pong */
+            cJSON *pong = cJSON_CreateObject();
+            wire_send(fd, MSG_PONG, pong);
+            cJSON_Delete(pong);
+            cJSON_Delete(msg.json);
+            break;
+        }
+
+        case MSG_PONG:
+            /* Keepalive response: discard */
+            cJSON_Delete(msg.json);
+            break;
+
         case MSG_JIT_OFFER: {
             /* LSP offers a JIT channel — non-blocking state machine */
             size_t jit_cidx;

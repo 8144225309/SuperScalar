@@ -408,7 +408,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             int confirmed = 0;
             for (int attempt = 0; attempt < 2; attempt++) {
                 if (chain_be) {
-                    if (lsp_wait_for_confirmation(chain_be, rc_txid, rot_timeout)) {
+                    if (lsp_wait_for_confirmation_service(chain_be, rc_txid, rot_timeout, mgr, lsp)) {
                         confirmed = 1; break;
                     }
                     if (chain_be->is_in_mempool(chain_be, rc_txid)) {
@@ -503,7 +503,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         int confirmed = 0;
         for (int attempt = 0; attempt < 2; attempt++) {
             if (chain_be) {
-                if (lsp_wait_for_confirmation(chain_be, fund_txid_hex, rot_timeout)) {
+                if (lsp_wait_for_confirmation_service(chain_be, fund_txid_hex, rot_timeout, mgr, lsp)) {
                     confirmed = 1; break;
                 }
                 if (chain_be->is_in_mempool(chain_be, fund_txid_hex)) {

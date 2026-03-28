@@ -2598,8 +2598,8 @@ accept_new_factory:
             regtest_mine_blocks(&rt, 1, mine_addr);
         } else {
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-            int conf = lsp_wait_for_confirmation(chain_be, funding_txid_hex,
-                                                   confirm_timeout_secs);
+            int conf = lsp_wait_for_confirmation_service(chain_be, funding_txid_hex,
+                                                   confirm_timeout_secs, NULL, &lsp);
             if (conf < 1) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
                 lsp_cleanup(&lsp);

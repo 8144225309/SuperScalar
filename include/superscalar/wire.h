@@ -10,6 +10,8 @@
 
 /* --- Message types --- */
 #define MSG_HELLO              0x01
+#define MSG_PING               0x70  /* Keepalive: either side sends */
+#define MSG_PONG               0x71  /* Keepalive response */
 #define MSG_HELLO_ACK          0x02
 #define MSG_FACTORY_PROPOSE    0x10
 #define MSG_NONCE_BUNDLE       0x11

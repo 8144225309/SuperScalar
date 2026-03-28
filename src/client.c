@@ -47,6 +47,30 @@ static void client_send_error(int fd, const char *reason) {
     cJSON_Delete(err);
 }
 
+/* Wrapper around wire_recv_timeout that transparently handles
+   MSG_PING (responds with MSG_PONG) and MSG_PONG (discards).
+   Returns 1 on a real (non-keepalive) message, 0 on failure. */
+static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
+    for (;;) {
+        if (!wire_recv_timeout(fd, msg, timeout_sec))
+            return 0;
+        if (msg->msg_type == MSG_PING) {
+            cJSON *pong = cJSON_CreateObject();
+            wire_send(fd, MSG_PONG, pong);
+            cJSON_Delete(pong);
+            if (msg->json) cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;  /* wait for next real message */
+        }
+        if (msg->msg_type == MSG_PONG) {
+            if (msg->json) cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;  /* discard pong, wait for real message */
+        }
+        return 1;  /* real message */
+    }
+}
+
 /* Initialize a client-side channel from factory leaf outputs.
    Mirrors the LSP's lsp_channels_init logic.
    remote_*_bp: remote (LSP) basepoint pubkeys received via MSG_CHANNEL_BASEPOINTS.
@@ -570,8 +594,16 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
-    if (!factory_build_tree(factory_out) || !factory_sessions_init(factory_out)) {
-        fprintf(stderr, "Client %u: rotation factory build/init failed\n", my_index);
+    if (!factory_build_tree(factory_out)) {
+        printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
+        fflush(stdout);
+        return 0;
+    }
+    printf("Client %u: rotation tree OK (%zu nodes)\n", my_index, factory_out->n_nodes);
+    fflush(stdout);
+    if (!factory_sessions_init(factory_out)) {
+        printf("Client %u: ROTATION SESSIONS_INIT FAILED\n", my_index);
+        fflush(stdout);
         return 0;
     }
 
@@ -929,7 +961,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* Receive FACTORY_PROPOSE — disable timeout since LSP may be waiting for
        on-chain funding confirmation (up to ~10 min on signet/testnet) */
-    if (!wire_recv_timeout(fd, &msg, 0) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
+    if (!wire_recv_handle_ping(fd, &msg, 0) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
         fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);

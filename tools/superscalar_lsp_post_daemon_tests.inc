@@ -1516,8 +1516,8 @@
         } else {
             printf("ROTATION: waiting for Factory 1 funding confirmation on %s...\n", network);
             fflush(stdout);
-            int conf2 = regtest_wait_for_confirmation(&rt, fund2_txid_hex,
-                                                      confirm_timeout_secs);
+            int conf2 = lsp_wait_for_confirmation_service(chain_be, fund2_txid_hex,
+                                                      confirm_timeout_secs, mgr, &lsp);
             if (conf2 < 1) {
                 fprintf(stderr, "ROTATION: Factory 1 funding not confirmed within timeout\n");
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
