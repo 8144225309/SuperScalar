@@ -157,7 +157,7 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
 
     /* Decode, add hint, re-encode */
     bolt11_invoice_t inv;
-    if (!bolt11_decode(tmp, &inv, ctx)) {
+    if (!bolt11_decode(ctx, tmp, &inv)) {
         return 0;
     }
 
