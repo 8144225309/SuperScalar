@@ -155,28 +155,55 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
         return 1;
     }
 
-    /* Decode, add hint, re-encode */
-    bolt11_invoice_t inv;
-    if (!bolt11_decode(ctx, tmp, &inv)) {
-        return 0;
-    }
+    /* Undo: decrement count since invoice_create already incremented it.
+       We'll re-encode with the hint and the count stays correct. */
+    tbl->count--;
 
-    /* Add the route hint */
-    if (inv.n_hints < BOLT11_MAX_ROUTE_HINTS) {
-        bolt11_route_hint_t *h = &inv.hints[inv.n_hints];
-        memset(h, 0, sizeof(*h));
-        memcpy(h->hops[0].pubkey, hint_pubkey, 33);
-        h->hops[0].short_channel_id = hint_scid;
-        h->hops[0].fee_base_msat = hint_fee_base;
-        h->hops[0].fee_ppm = hint_fee_ppm;
-        h->hops[0].cltv_expiry_delta = hint_cltv_delta;
-        h->n_hops = 1;
-        inv.n_hints++;
+    /* Find the entry that was just created (last active slot) */
+    bolt11_invoice_entry_t *e2 = NULL;
+    for (int i = INVOICE_TABLE_MAX - 1; i >= 0; i--) {
+        if (tbl->entries[i].active) { e2 = &tbl->entries[i]; break; }
     }
+    if (!e2) return 0;
+
+    /* Build invoice struct directly with hint included */
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    const char *pfx2 = "bcrt";
+    if (strcmp(network, "mainnet") == 0) pfx2 = "bc";
+    else if (strcmp(network, "testnet") == 0) pfx2 = "tb";
+    else if (strcmp(network, "signet") == 0) pfx2 = "tbs";
+    strncpy(inv.network, pfx2, sizeof(inv.network) - 1);
+    inv.amount_msat = amount_msat;
+    inv.has_amount = (amount_msat > 0);
+    inv.timestamp = e2->created_at;
+    inv.expiry = e2->expiry;
+    inv.min_final_cltv_expiry = 18;
+    memcpy(inv.payment_hash, e2->payment_hash, 32);
+    memcpy(inv.payment_secret, e2->payment_secret, 32);
+    inv.has_payment_secret = 1;
+    memcpy(inv.metadata, e2->stateless_nonce, 32);
+    inv.metadata_len = 32;
+    inv.has_metadata = 1;
+    if (description)
+        strncpy(inv.description, description, sizeof(inv.description) - 1);
+    inv.features = (1 << BOLT11_FEATURE_PAYMENT_SECRET);
+
+    /* Add route hint */
+    bolt11_route_hint_t *h = &inv.hints[0];
+    memcpy(h->hops[0].pubkey, hint_pubkey, 33);
+    h->hops[0].short_channel_id = hint_scid;
+    h->hops[0].fee_base_msat = hint_fee_base;
+    h->hops[0].fee_ppm = hint_fee_ppm;
+    h->hops[0].cltv_expiry_delta = hint_cltv_delta;
+    h->n_hops = 1;
+    inv.n_hints = 1;
 
     if (!bolt11_encode(&inv, node_privkey, ctx, bech32_out, out_cap)) {
+        e2->active = 0;
         return 0;
     }
+    tbl->count++;
     return 1;
 }
 
