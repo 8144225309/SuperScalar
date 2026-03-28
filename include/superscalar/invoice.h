@@ -67,6 +67,23 @@ int invoice_create(bolt11_invoice_table_t *tbl,
                    uint32_t expiry_secs,
                    char *bech32_out, size_t out_cap);
 
+/* Same as invoice_create but with an optional route hint for private channels.
+   hint_pubkey: 33-byte compressed pubkey of the hop (e.g. CLN bridge node).
+   hint_scid: short_channel_id as uint64.  Pass hint_pubkey=NULL to skip. */
+int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
+                              secp256k1_context *ctx,
+                              const unsigned char node_privkey[32],
+                              const char *network,
+                              uint64_t amount_msat,
+                              const char *description,
+                              uint32_t expiry_secs,
+                              const unsigned char *hint_pubkey,
+                              uint64_t hint_scid,
+                              uint32_t hint_fee_base,
+                              uint32_t hint_fee_ppm,
+                              uint16_t hint_cltv_delta,
+                              char *bech32_out, size_t out_cap);
+
 /*
  * Redeem a pending invoice when the final HTLC arrives.
  *
