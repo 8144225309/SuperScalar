@@ -33,4 +33,12 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
                                int timeout_secs);
 
+/*
+ * Same as lsp_wait_for_confirmation but services the listen socket during the
+ * wait so clients can reconnect.  Pass mgr=NULL/lsp=NULL to fall back to the
+ * plain sleep-only version.
+ */
+int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_hex,
+                                       int timeout_secs, void *mgr, void *lsp);
+
 #endif /* SUPERSCALAR_LSP_FUND_H */

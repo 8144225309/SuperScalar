@@ -63,6 +63,8 @@ const char *wire_msg_type_name(uint8_t type) {
     switch (type) {
     case 0x01: return "HELLO";
     case 0x02: return "HELLO_ACK";
+    case 0x70: return "PING";
+    case 0x71: return "PONG";
     case 0x10: return "FACTORY_PROPOSE";
     case 0x11: return "NONCE_BUNDLE";
     case 0x12: return "ALL_NONCES";
