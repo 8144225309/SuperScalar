@@ -336,15 +336,7 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 16: { /* n: payee pubkey (53 5-bit groups = 33 bytes) */
-            if (fdata5_len == 53) {
-                unsigned char tmp[33];
-                if (fivebit_to_bytes(fdata5, 53, tmp, 33) == 33)
-                    memcpy(out->payee_pubkey, tmp, 33);
-            }
-            break;
-        }
-        case 18: { /* s: payment_secret (52 5-bit groups = 32 bytes) */
+        case 16: { /* s: payment_secret (52 5-bit groups = 32 bytes) */
             if (fdata5_len == 52) {
                 unsigned char tmp[32];
                 if (fivebit_to_bytes(fdata5, 52, tmp, 32) == 32) {
@@ -352,6 +344,17 @@ int bolt11_decode(secp256k1_context *ctx,
                     out->has_payment_secret = 1;
                 }
             }
+            break;
+        }
+        case 19: { /* n: payee pubkey (53 5-bit groups = 33 bytes) */
+            if (fdata5_len == 53) {
+                unsigned char tmp[33];
+                if (fivebit_to_bytes(fdata5, 53, tmp, 33) == 33)
+                    memcpy(out->payee_pubkey, tmp, 33);
+            }
+            break;
+        }
+        case 18: { /* reserved / unknown tag 18 */
             break;
         }
         case 27: { /* m: payment_metadata */
@@ -499,11 +502,11 @@ int bolt11_encode(const bolt11_invoice_t *inv,
         WRITE_FIELD(1, f, 52);
     }
 
-    /* s: payment_secret */
+    /* s: payment_secret (tag 16 = bech32 's') */
     if (inv->has_payment_secret) {
         uint8_t f[52];
         bytes_to_5bit(inv->payment_secret, 32, f, 52);
-        WRITE_FIELD(18, f, 52);
+        WRITE_FIELD(16, f, 52);
     }
 
     /* m: payment_metadata (type 27) */
@@ -553,11 +556,11 @@ int bolt11_encode(const bolt11_invoice_t *inv,
         WRITE_FIELD(6, f, f_len);
     }
 
-    /* n: payee pubkey */
+    /* n: payee pubkey (tag 19 = bech32 'n') */
     if (inv->payee_pubkey[0] != 0) {
         uint8_t f[54];
         size_t f_len = bytes_to_5bit(inv->payee_pubkey, 33, f, sizeof(f));
-        WRITE_FIELD(16, f, f_len);
+        WRITE_FIELD(19, f, f_len);
     }
 
     /* r: route hints */
