@@ -30,12 +30,14 @@ import glob
 def bitcoin_cli(network, *args, wallet=None):
     """Run bitcoin-cli with network and optional wallet."""
     cmd = ["bitcoin-cli"]
+    rpcuser = os.environ.get("SS_RPCUSER", "rpcuser")
+    rpcpass = os.environ.get("SS_RPCPASS", "rpcpass")
     if network == "signet":
-        cmd += ["-signet", "-rpcuser=signetrpc", "-rpcpassword=signetrpcpass123"]
+        cmd += ["-signet", f"-rpcuser={rpcuser}", f"-rpcpassword={rpcpass}"]
     elif network == "testnet4":
-        cmd += ["-testnet4", "-rpcuser=testnet4rpc", "-rpcpassword=testnet4rpcpass123"]
+        cmd += ["-testnet4", f"-rpcuser={rpcuser}", f"-rpcpassword={rpcpass}"]
     elif network == "regtest":
-        cmd += ["-regtest", "-rpcuser=rpcuser", "-rpcpassword=rpcpass"]
+        cmd += ["-regtest", f"-rpcuser={rpcuser}", f"-rpcpassword={rpcpass}"]
     if wallet:
         cmd += [f"-rpcwallet={wallet}"]
     cmd += list(args)
@@ -156,7 +158,7 @@ def main():
     )
     parser.add_argument("--network", default="signet",
                         choices=["signet", "testnet4", "regtest"])
-    parser.add_argument("--exhibit-dir", default="/root/ss_signet_exhibit",
+    parser.add_argument("--exhibit-dir", default="./ss_exhibit",
                         help="Path to exhibition directory")
     parser.add_argument("--scan", action="store_true",
                         help="Scan for unspent exhibition outputs")
