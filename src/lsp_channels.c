@@ -3468,7 +3468,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         if (ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
                                             memcmp(ch->htlcs[h].payment_hash,
                                                    orig->payment_hash, 32) == 0) {
-                                            channel_fail_htlc(ch, ch->htlcs[h].htlc_id);
+                                            channel_fail_htlc(ch, ch->htlcs[h].id);
                                             break;
                                         }
                                     }
