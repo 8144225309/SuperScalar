@@ -7,18 +7,32 @@ Wants=network-online.target
 Type=simple
 User=superscalar
 Group=superscalar
+EnvironmentFile=-/etc/superscalar/env
 ExecStart=/usr/local/bin/superscalar_lsp \
-    --network signet --daemon --cli \
+    --network ${SS_NETWORK:-signet} --daemon --cli \
     --db /var/lib/superscalar/lsp.db \
-    --port 9735 --clients 4 --amount 100000 \
-    --active-blocks 4320 --dying-blocks 432 \
+    --rpc-file /run/superscalar/admin.sock \
+    --port ${SS_PORT:-9735} --clients ${SS_CLIENTS:-4} --amount ${SS_AMOUNT:-100000} \
+    --active-blocks ${SS_ACTIVE_BLOCKS:-4320} --dying-blocks ${SS_DYING_BLOCKS:-432} \
     --dynamic-fees --auto-rebalance \
+    --keyfile /var/lib/superscalar/lsp.key \
+    --passphrase-file /var/lib/superscalar/passphrase \
+    --rpcuser ${SS_RPCUSER:-rpcuser} --rpcpassword ${SS_RPCPASSWORD:-rpcpass} \
     --cli-path /usr/local/bin/bitcoin-cli
 Restart=on-failure
 RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
 LimitNOFILE=65536
+RuntimeDirectory=superscalar
 StandardOutput=append:/var/log/superscalar/lsp.log
 StandardError=append:/var/log/superscalar/lsp.log
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/superscalar /var/log/superscalar /run/superscalar
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
