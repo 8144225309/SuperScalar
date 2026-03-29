@@ -462,3 +462,48 @@ int wallet_source_hd_get_address(const wallet_source_hd_t *ws, uint32_t index,
                                char *out, size_t out_cap);
     return bech32m_encode(hrp, spk + 2, 32, 1, addr_out, addr_cap);
 }
+
+uint64_t wallet_source_hd_get_balance(const wallet_source_hd_t *ws)
+{
+    if (!ws || !ws->db) return 0;
+    /* Sum all unspent, unreserved UTXOs from persist layer */
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < ws->next_index + ws->lookahead; i++) {
+        char txid[65];
+        uint32_t vout;
+        uint64_t amount;
+        if (persist_get_hd_utxo(ws->db, i, txid, &vout, &amount) && amount > 0)
+            total += amount;
+    }
+    return total;
+}
+
+uint32_t wallet_source_hd_extend_gap(wallet_source_hd_t *ws)
+{
+    if (!ws) return 0;
+
+    /* Extend if next_index is within 20 addresses of the cache boundary */
+    uint32_t threshold = ws->n_spks > 20 ? ws->n_spks - 20 : 0;
+    if (ws->next_index < threshold) return ws->n_spks;
+
+    /* Derive and register the next batch */
+    uint32_t new_cap = ws->next_index + ws->lookahead;
+    if (new_cap <= ws->n_spks) return ws->n_spks;
+
+    /* Reallocate SPK array */
+    unsigned char (*new_spks)[34] = realloc(ws->spks, new_cap * 34);
+    if (!new_spks) return ws->n_spks;
+    ws->spks = new_spks;
+
+    for (uint32_t i = ws->n_spks; i < new_cap; i++) {
+        if (!wallet_source_hd_derive(ws, i, ws->spks[i], NULL))
+            break;
+        /* Register new address with BIP 158 scanner */
+        if (ws->bip158) {
+            chain_backend_t *cb = &ws->bip158->base;
+            cb->register_script(cb, ws->spks[i], 34);
+        }
+        ws->n_spks = i + 1;
+    }
+    return ws->n_spks;
+}

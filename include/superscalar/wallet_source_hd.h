@@ -77,4 +77,16 @@ int wallet_source_hd_derive(const wallet_source_hd_t *ws, uint32_t index,
 int wallet_source_hd_get_address(const wallet_source_hd_t *ws, uint32_t index,
                                    char *addr_out, size_t addr_cap);
 
+/*
+ * Get total confirmed balance across all HD wallet UTXOs.
+ * Queries persist layer for unspent, unreserved UTXOs.
+ */
+uint64_t wallet_source_hd_get_balance(const wallet_source_hd_t *ws);
+
+/*
+ * Extend the pre-derived address cache if next_index is approaching the limit.
+ * Called periodically to maintain gap limit coverage. Returns new n_spks.
+ */
+uint32_t wallet_source_hd_extend_gap(wallet_source_hd_t *ws);
+
 #endif /* SUPERSCALAR_WALLET_SOURCE_HD_H */

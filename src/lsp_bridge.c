@@ -250,11 +250,22 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Wait for REVOKE_AND_ACK from dest */
         {
             wire_msg_t ack_msg;
-            if (!wire_recv(lsp->client_fds[dest_idx], &ack_msg) ||
+            if (!wire_recv_skip_ping(lsp->client_fds[dest_idx], &ack_msg) ||
                 ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+                /* Client disconnected or sent unexpected message.
+                   Rollback: fail the HTLC we just added so the channel
+                   state is consistent and bridge can retry later. */
+                fprintf(stderr, "LSP: bridge HTLC rollback — client %zu disconnected during commit\n",
+                        dest_idx);
+                channel_fail_htlc(dest_ch, dest_htlc_id);
+                /* Notify bridge of failure */
+                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                    "client_disconnected", htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
                 if (ack_msg.json) cJSON_Delete(ack_msg.json);
                 free(old_dest_htlcs);
-                return 0;
+                return 1;  /* handled (not a fatal error) */
             }
             uint32_t ack_chan_id;
             unsigned char rev_secret[32], next_point[33];
