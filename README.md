@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> post-ln-phase2 — 1355 tests, 21/21 signet exhibition, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
+> v0.1.8 — 1351 unit tests, 36/36 orchestrator, 26/26 signet exhibition, end-to-end CLN bridge payments, MSG_PING/MSG_PONG keepalive, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -27,7 +27,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 848 unit + 42 regtest + 36 orchestrator + 25 manual flag tests, CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 1351 unit + 36 orchestrator + 26 signet exhibition tests, CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
