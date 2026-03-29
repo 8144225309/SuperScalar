@@ -3008,6 +3008,21 @@ int persist_mark_hd_utxo_spent(persist_t *p, const char *txid, uint32_t vout)
     return ok;
 }
 
+uint64_t persist_sum_hd_utxos(persist_t *p)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT COALESCE(SUM(amount_sats), 0) FROM hd_utxos "
+                      "WHERE spent = 0 AND reserved = 0";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    uint64_t total = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        total = (uint64_t)sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return total;
+}
+
 int persist_get_hd_utxo(persist_t *p,
                           uint64_t min_sats,
                           char txid_out[65],
