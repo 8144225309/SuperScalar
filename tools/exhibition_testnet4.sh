@@ -22,8 +22,8 @@ INSPECTOR="$SCRIPT_DIR/inspect_factory.py"
 
 # Testnet4 RPC defaults (override via environment)
 NETWORK="${SS_NETWORK:-testnet4}"
-RPCUSER="${SS_RPCUSER:-testnet4rpc}"
-RPCPASS="${SS_RPCPASS:-testnet4rpcpass123}"
+RPCUSER="${SS_RPCUSER:-rpcuser}"
+RPCPASS="${SS_RPCPASS:-rpcpass}"
 RPCPORT="${SS_RPCPORT:-48332}"
 
 # Testnet4 CLN dirs (override via environment)
