@@ -440,19 +440,25 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
 int wallet_source_hd_get_address(const wallet_source_hd_t *ws, uint32_t index,
                                    char *addr_out, size_t addr_cap)
 {
-    /* For now, return hex of the P2TR SPK — callers can convert to bech32m */
-    if (!ws || !addr_out || addr_cap < 69) return 0;
+    if (!ws || !addr_out || addr_cap < 64) return 0;
     unsigned char spk[34];
     if (index < ws->n_spks)
         memcpy(spk, ws->spks[index], 34);
     else if (!wallet_source_hd_derive(ws, index, spk, NULL))
         return 0;
 
-    static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < 34; i++) {
-        addr_out[i * 2]     = hx[(spk[i] >> 4) & 0xf];
-        addr_out[i * 2 + 1] = hx[ spk[i]       & 0xf];
-    }
-    addr_out[68] = '\0';
-    return 1;
+    /* P2TR SPK is: OP_1 (0x51) + PUSH32 (0x20) + 32-byte x-only pubkey.
+       bech32m encodes the 32-byte witness program with version 1. */
+    if (spk[0] != 0x51 || spk[1] != 0x20) return 0;
+
+    /* Determine HRP from network */
+    const char *hrp = "bc";  /* mainnet default */
+    if (ws->coin_type == 1) hrp = "tb";  /* testnet/signet */
+
+    extern int bech32m_encode(const char *hrp,
+                               const unsigned char *witness_program,
+                               size_t witness_len,
+                               int witness_version,
+                               char *out, size_t out_cap);
+    return bech32m_encode(hrp, spk + 2, 32, 1, addr_out, addr_cap);
 }

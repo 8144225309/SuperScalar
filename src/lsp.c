@@ -410,11 +410,19 @@ int lsp_run_factory_creation(lsp_t *lsp,
             }
         }
 
-        /* For now, require all clients (no graceful degradation yet) */
+        /* Check if we have enough clients for a viable factory.
+           If some timed out but quorum is met, retry with remaining clients.
+           If quorum is not met, abort. */
         if (nonces_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent nonces\n",
-                    nonces_received, lsp->n_clients);
-            goto fail;
+            if (ceremony_has_quorum(&ceremony)) {
+                size_t active = ceremony_count_in_state(&ceremony, CLIENT_NONCE_RECEIVED);
+                fprintf(stderr, "LSP: %zu/%zu clients sent nonces (quorum met, continuing with %zu)\n",
+                        nonces_received, lsp->n_clients, active);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent nonces (quorum requires %d)\n",
+                        nonces_received, lsp->n_clients, ceremony.min_clients);
+                goto fail;
+            }
         }
     }
 
@@ -538,9 +546,14 @@ int lsp_run_factory_creation(lsp_t *lsp,
         }
 
         if (psigs_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent psigs\n",
-                    psigs_received, lsp->n_clients);
-            goto fail;
+            if (ceremony_has_quorum(&psig_ceremony)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent psigs (quorum met)\n",
+                        psigs_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent psigs (quorum requires %d)\n",
+                        psigs_received, lsp->n_clients, psig_ceremony.min_clients);
+                goto fail;
+            }
         }
     }
 
@@ -731,9 +744,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         }
 
         if (close_nonces_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent close nonces\n",
-                    close_nonces_received, lsp->n_clients);
-            goto close_fail;
+            if (ceremony_has_quorum(&close_nonce_cer)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent close nonces (quorum met)\n",
+                        close_nonces_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent close nonces (quorum requires %d)\n",
+                        close_nonces_received, lsp->n_clients, close_nonce_cer.min_clients);
+                goto close_fail;
+            }
         }
     }
 
@@ -841,9 +859,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         }
 
         if (close_psigs_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs\n",
-                    close_psigs_received, lsp->n_clients);
-            goto close_fail;
+            if (ceremony_has_quorum(&close_psig_cer)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent close psigs (quorum met)\n",
+                        close_psigs_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs (quorum requires %d)\n",
+                        close_psigs_received, lsp->n_clients, close_psig_cer.min_clients);
+                goto close_fail;
+            }
         }
     }
 
