@@ -466,16 +466,10 @@ int wallet_source_hd_get_address(const wallet_source_hd_t *ws, uint32_t index,
 uint64_t wallet_source_hd_get_balance(const wallet_source_hd_t *ws)
 {
     if (!ws || !ws->db) return 0;
-    /* Sum all unspent, unreserved UTXOs from persist layer */
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < ws->next_index + ws->lookahead; i++) {
-        char txid[65];
-        uint32_t vout;
-        uint64_t amount;
-        if (persist_get_hd_utxo(ws->db, i, txid, &vout, &amount) && amount > 0)
-            total += amount;
-    }
-    return total;
+    /* Use persist_get_hd_balance which sums all unspent UTXOs.
+       If not available, do iterative coin selection as fallback. */
+    extern uint64_t persist_sum_hd_utxos(persist_t *p);
+    return persist_sum_hd_utxos(ws->db);
 }
 
 uint32_t wallet_source_hd_extend_gap(wallet_source_hd_t *ws)
