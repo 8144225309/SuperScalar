@@ -47,7 +47,7 @@ The following are out of scope:
 
 ## Current Security Status
 
-SuperScalar is pre-1.0 software. It has a `--i-accept-the-risk` guard for mainnet operation. An internal security audit identified 4 gaps (3 critical, 1 serious); all 4 have been fixed. See [docs/mainnet-audit.md](docs/mainnet-audit.md) for details.
+SuperScalar is pre-1.0 software. It has not been externally audited. Use on signet/testnet for testing only. Mainnet use is not recommended until a formal security audit is completed.
 
 No external security audit has been performed yet. Use on mainnet at your own risk.
 

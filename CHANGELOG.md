@@ -2,34 +2,81 @@
 
 All notable changes to SuperScalar are documented here.
 
-## Unreleased — 2026-03-27
+## 0.1.8 — 2026-03-28
 
-Production hardening: persistent daemon mode, HD wallet funding, deferred ceremony reconnections, 8 bug fixes. 36/36 orchestrator scenarios, 1351 unit tests.
+Production hardening + LN phase 2 integration. MSG_PING/MSG_PONG keepalive, end-to-end bridge payments, factory rotation on signet, 12 bug fixes. 26/26 signet exhibition structures passing. 36/36 orchestrator scenarios. 1351 unit tests.
 
 ### Added
 
+- **MSG_PING/MSG_PONG keepalive** (`wire.h`, `lsp_fund.c`, `lsp_channels.c`): poll-based confirmation waits send periodic pings to all clients every 30s; daemon loop sends keepalive pings; `wire_recv_skip_ping()` transparently handles stale pongs during ceremonies. Replaces sleep-based waits that caused client disconnections on signet.
+- **End-to-end bridge payments** (`admin_rpc.c`, `cln_plugin.py`, `lsp_bridge.c`): admin RPC `createinvoice` with route hints, MSG_DELIVER_PREIMAGE to client, MSG_BRIDGE_REGISTER to CLN plugin, HTLC intercept for forwarding — full CLN-B → CLN-A → plugin → bridge → LSP → client → fulfill pipeline proven on signet (S14)
+- **BOLT #11 route hints** (`invoice.c`): `invoice_create_with_hint()` embeds route hint (tag `r`) for bridge channel routing
 - **Persistent daemon mode** (`superscalar_lsp.c`, `persist.c`): LSP loops after cooperative close, reloading factory state from DB — enables long-running production deployments (PR #36)
 - **HD wallet wired to factory funding** (`superscalar_lsp.c`): BIP 32/39 derived keys used for factory self-funding path instead of hardcoded regtest keys (PR #37)
-- **Admin RPC: `getbalance` and `listfunds`** (`admin_rpc.c`): query on-chain wallet balance and list unspent outputs via JSON-RPC Unix socket (PR #38)
-- **Admin RPC: `pay_bridge`** (`admin_rpc.c`): outbound payment routing through CLN bridge (PR #39)
+- **Admin RPC: `getbalance`, `listfunds`, `pay_bridge`, `createinvoice`** (`admin_rpc.c`): query wallet, list UTXOs, outbound payment via bridge, invoice creation with route hints (PRs #38–#39)
+- **LN phase 2 features (PRs #28–#34, merged via #35, +22,000 lines)**:
+  - **BOLT #1 peer protocol** (`bolt1.c`): init/error/warning/ping/pong (types 16–19), feature bit negotiation, mandatory feature check
+  - **Circuit breaker** (`circuit_breaker.c`): per-peer HTLC rate limits, token bucket, ban escalation callback
+  - **Splicing** (`splice.c`): BOLT #2 interactive tx construction, STFU quiescence (types 140/141 + legacy 0x68/0x69), splice_init/ack/locked
+  - **Liquidity advertisements** (`liquidity_ad.c`): option_will_fund (BOLT #878), node_announcement TLV, compact_lease, real pubkey derivation
+  - **Static channel backup** (`scb.c`): SCB format, save/load, disaster recovery
+  - **Onion messages** (`onion_message.c`, `onion_msg.c`): type 513, final-hop decryption, TLV routing, multi-hop relay
+  - **Trampoline routing** (`trampoline.c`): BOLT #4 trampoline header parse/unwrap
+  - **Rapid Gossip Sync** (`rgs.c`): compact gossip import/export, admin RPC
+  - **LNURL + BIP 353** (`lnurl.c`): Lightning Address, pay/withdraw, DNS resolution
+  - **Hold invoices** (`hold_invoice.c`): async HTLC delivery, settlement control
+  - **Mission control** (`mission_control.c`): payment failure scoring, channel exclusion
+  - **Route policy** (`route_policy.c`): HTLC forwarding policy enforcement
+  - **Stateless invoices** (`stateless_invoice.c`): HMAC-derived payment secrets
+  - **Gossip ingestion** (`gossip_ingest.c`): verify and store incoming BOLT #7 messages
+  - **HTLC fee bumping** (`htlc_fee_bump.c`): deadline-aware sweep fee estimation
+  - **BOLT #4 failure parser** (`bolt4_failure.c`): onion failure message decoding
+  - **Peer storage** (BOLT #9 types 7/9): store/retrieve peer blobs
+  - **Announcement signatures** (type 259): channel announcement flow
+  - **Dynamic commitments**: channel_type TLV negotiation (BOLT #2 PR #880)
+  - **PTLC penalty**: watchtower PTLC sweep on breach
+  - **Admin RPC methods**: `exportrgs`, `importrgs`, `payoffer`, `listfactories`, `recoverfactory`, `sweepfactory`, `createoffer`
+- **Exhibition tests S17–S26**:
+  - **S17** (`--test-jit`): JIT channel lifecycle with non-blocking state machine
+  - **S18** (`--test-realloc`): Leaf realloc with corrected sats/msat units
+  - **S19** (`--test-lsps2`): LSPS2 buy flow through daemon loop
+  - **S20** (3-factory ladder): concurrent factory lifecycle
+  - **S21** (`--test-bolt12`): BOLT #12 offer codec + signature round-trip
+  - **S22** (`--test-buy-liquidity`): L-stock inbound capacity purchase
+  - **S23** (`--test-bip39`): BIP39 mnemonic generate/validate/seed round-trip
+  - **S24** (`--test-large-factory`): 8+ client factory with deeper DW tree
+  - **S25** (`pay_external` CLI): outbound payment via bridge
+  - **S26**: standalone watchtower deployment
+- **Fund recovery tool** (`tools/recover_exhibition_funds.py`): scan blockchain for stuck exhibition outputs and sweep them back to wallet
 
 ### Fixed
 
-- **Deferred ceremony reconnections** (`lsp_channels.c`, PR #48): listen socket now polled during blocking ceremony waits; new connections are accepted, noise-handshaked, and queued — drained when daemon loop resumes. Prevents "connection refused" without reentrancy risk
+- **BOLT #11 tag numbers** (`bolt11.c`): payment_secret was encoded as tag 18 (wrong); corrected to tag 16 (`s` = bech32 value 16). Payee pubkey corrected from tag 16 to tag 19 (`n` = bech32 value 19). Fixed "Missing required payment secret" when CLN paid SuperScalar invoices.
+- **CLN plugin HTLC intercept** (`cln_plugin.py`): plugin now forwards all HTLCs with `short_channel_id` in onion (forwarding HTLCs) to bridge, not just registered invoices and keysend
+- **Bridge invoice table registration** (`admin_rpc.c`): admin RPC `createinvoice` now registers invoices in both BOLT11 table and bridge htlc_inbound table; previously bridge HTLCs failed with "unknown hash"
+- **Deferred ceremony reconnections** (`lsp_channels.c`, PR #48): listen socket now polled during blocking ceremony waits; new connections accepted, noise-handshaked, and queued — drained when daemon loop resumes
 - **Non-blocking confirmation wait** (`superscalar_lsp.c`): confirmation polling services client reconnections instead of blocking the event loop
-- **Ceremony message handling robustness** (`lsp.c`, `lsp_channels.c`): 4 fixes — boundary checks on recv, partial-message handling, timeout propagation, error recovery
+- **Ceremony message handling robustness** (`lsp.c`, `lsp_channels.c`): boundary checks on recv, partial-message handling, timeout propagation, error recovery
 - **Cooperative close dust filter** (`superscalar_lsp.c`): outputs below dust limit excluded from close TX; `sweepfactory` RPC recovery path hardened
 - **Breach detection and lifecycle monitoring** (`superscalar_lsp.c`, `lsp_rotation.c`): rotation retry on transient failure; lifecycle state transitions validated
 - **Client watchtower scan starvation** (`superscalar_client.c`): active socket traffic could starve periodic watchtower block scans; fix: dedicated scan window between message polls
 - **BOLT #11 HRP for signet/testnet4** (`bolt11.c`): added `tbs` (signet) and `tb4` (testnet4) prefixes to invoice decoder
+- **Leaf realloc msat/sats units** (`lsp_channels.c`): channel balance update used millisatoshis instead of satoshis after leaf realloc
+- **Epoch reset nonce double-counting** (`superscalar_client.c`): Round 2 added nonces on top of Round 1; fix: `factory_sessions_init()` before Round 2
+- **CLN plugin subprocess** (`cln_plugin.py`): `LIGHTNING_CLI` config with embedded args; fix: `.split()`
+- **Inbox message drops** (`superscalar_client.c`): daemon loop inbox discarded all non-COMMITMENT_SIGNED messages; fix: re-dispatch through main switch
+- **JIT blocking handler** (`superscalar_client.c`): synchronous `wire_recv` blocked for 10+ min on signet; fix: non-blocking state machine
+- **LSP stale messages before JIT_ACCEPT** (`jit_channel.c`): `wire_recv` got stale MSG_REGISTER_INVOICE; fix: drain loop
+- **Watchtower breach detection** (`watchtower.c`): TXIDs mismatched; fix: breach test uses `channel_build_commitment_tx_for_remote`
+- **LSPS2 test timing** (`superscalar_lsp.c`): sleep-poll loop didn't process client messages; fix: force daemon_mode
 
-### Refactoring
+### Architecture improvements
 
-- **Test extraction** (`tests/`): monolithic test blocks extracted into dedicated include files for maintainability
-
-## Unreleased (post-ln-phase2) — 2026-03-22
-
-LN phase 2 integration: 7 PRs (#28–#34) merged via omnibus PR #35. 21/21 signet exhibition passing with 10 bug fixes. 1355 unit tests.
+- **Poll-based keepalive**: all blocking waits replaced with `poll()` + periodic MSG_PING — clients never see >30s silence during confirmation waits, ceremonies, or daemon idle
+- **Non-blocking JIT state machine**: industry-standard message-driven dispatch matching CLN/LND/LDK/Eclair pattern
+- **Inbox re-dispatch**: all message types properly handled regardless of arrival order
+- **Onion message API unification**: PR #29 and PR #34 onion implementations reconciled
+- **Test extraction**: monolithic test blocks extracted into dedicated include files
 
 ### Added
 
