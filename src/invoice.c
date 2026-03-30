@@ -95,6 +95,7 @@ int invoice_create(bolt11_invoice_table_t *tbl,
     if (strcmp(network, "mainnet") == 0) pfx = "bc";
     else if (strcmp(network, "testnet") == 0) pfx = "tb";
     else if (strcmp(network, "signet") == 0)  pfx = "tbs";
+    else if (strcmp(network, "testnet4") == 0) pfx = "tb";
     strncpy(inv.network, pfx, sizeof(inv.network) - 1);
 
     inv.amount_msat = amount_msat;
