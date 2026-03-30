@@ -329,12 +329,8 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
         }
     }
 
-    /* Determine network from params or RPC context */
-    const char *net = "signet";
-    if (cJSON_IsObject(params)) {
-        cJSON *n = cJSON_GetObjectItemCaseSensitive(params, "network");
-        if (cJSON_IsString(n)) net = n->valuestring;
-    }
+    /* Use the LSP's configured network for BOLT11 encoding */
+    const char *net = rpc->network[0] ? rpc->network : "signet";
     if (has_hint) {
         if (!invoice_create_with_hint(rpc->invoices, rpc->ctx, rpc->node_privkey,
                                        net, amount_msat, desc, expiry,
