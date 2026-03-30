@@ -535,17 +535,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     reverse_bytes(fund_txid, 32);
 
     uint64_t fund_amount = 0;
-    unsigned char actual_spk[256];
-    size_t actual_spk_len = 0;
     uint32_t fund_vout = 0;
-    for (uint32_t v = 0; v < 4; v++) {
-        regtest_get_tx_output(rt, fund_txid_hex, v,
-                              &fund_amount, actual_spk, &actual_spk_len);
-        if (actual_spk_len == mgr->rot_fund_spk_len &&
-            memcmp(actual_spk, mgr->rot_fund_spk, mgr->rot_fund_spk_len) == 0) {
-            fund_vout = v;
-            break;
+    if (rt) {
+        /* Regtest: query bitcoin-cli for the exact output */
+        unsigned char actual_spk[256];
+        size_t actual_spk_len = 0;
+        for (uint32_t v = 0; v < 4; v++) {
+            regtest_get_tx_output(rt, fund_txid_hex, v,
+                                  &fund_amount, actual_spk, &actual_spk_len);
+            if (actual_spk_len == mgr->rot_fund_spk_len &&
+                memcmp(actual_spk, mgr->rot_fund_spk, mgr->rot_fund_spk_len) == 0) {
+                fund_vout = v;
+                break;
+            }
         }
+    } else {
+        /* Light-client: lsp_fund_spk always puts target at vout=0 */
+        fund_vout = 0;
+        fund_amount = mgr->rot_funding_sats;
     }
     if (fund_amount == 0) {
         fprintf(stderr, "LSP rotate: could not find funding output\n");

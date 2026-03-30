@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -410,11 +411,91 @@ int lsp_run_factory_creation(lsp_t *lsp,
             }
         }
 
-        /* For now, require all clients (no graceful degradation yet) */
+        /* If some clients failed, try to recover them before giving up.
+           Accept reconnections, re-send FACTORY_PROPOSE, wait for nonces. */
         if (nonces_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent nonces\n",
-                    nonces_received, lsp->n_clients);
-            goto fail;
+            size_t timed_out = ceremony_count_in_state(&ceremony, CLIENT_TIMED_OUT);
+            size_t errored = ceremony_count_in_state(&ceremony, CLIENT_ERROR);
+            fprintf(stderr, "LSP: %zu/%zu nonces received (%zu timed out, %zu error)\n",
+                    nonces_received, lsp->n_clients, timed_out, errored);
+
+            /* Attempt reconnection recovery for timed-out clients (1 retry) */
+            if (timed_out > 0) {
+                fprintf(stderr, "LSP: waiting for %zu timed-out clients to reconnect...\n", timed_out);
+                /* Drain reconnect queue and accept new connections */
+                extern int lsp_accept_and_queue_connection(void *mgr, void *lsp);
+                extern void lsp_channels_run_daemon_loop_once(void *mgr, void *lsp, volatile int *);
+                volatile int tmp = 0;
+                for (int wait = 0; wait < 30; wait++) {
+                    lsp_channels_run_daemon_loop_once(NULL, lsp, &tmp);
+                    int all_back = 1;
+                    for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+                        if (ceremony.clients[ci] == CLIENT_TIMED_OUT &&
+                            lsp->client_fds[ci] < 0)
+                            all_back = 0;
+                    }
+                    if (all_back) break;
+                    sleep(1);
+                }
+
+                /* Re-send FACTORY_PROPOSE to reconnected clients and collect nonces */
+                for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+                    if (ceremony.clients[ci] != CLIENT_TIMED_OUT) continue;
+                    if (lsp->client_fds[ci] < 0) continue;  /* still offline */
+
+                    fprintf(stderr, "LSP: re-sending FACTORY_PROPOSE to reconnected client %zu\n", ci);
+                    cJSON *re_propose = wire_build_factory_propose(f);
+                    if (!wire_send(lsp->client_fds[ci], MSG_FACTORY_PROPOSE, re_propose)) {
+                        cJSON_Delete(re_propose);
+                        continue;
+                    }
+                    cJSON_Delete(re_propose);
+
+                    /* Wait for nonce with short timeout */
+                    wire_msg_t retry_msg;
+                    if (wire_recv_skip_ping(lsp->client_fds[ci], &retry_msg) &&
+                        retry_msg.msg_type == MSG_NONCE_BUNDLE) {
+                        /* Process nonce bundle (same logic as above) */
+                        cJSON *re_entries = cJSON_GetObjectItem(retry_msg.json, "entries");
+                        if (re_entries && cJSON_IsArray(re_entries)) {
+                            int n = cJSON_GetArraySize(re_entries);
+                            for (int ei = 0; ei < n; ei++) {
+                                cJSON *ent = cJSON_GetArrayItem(re_entries, ei);
+                                if (!ent) continue;
+                                uint32_t node_idx = (uint32_t)cJSON_GetNumberValue(
+                                    cJSON_GetObjectItem(ent, "node_idx"));
+                                uint32_t slot = (uint32_t)cJSON_GetNumberValue(
+                                    cJSON_GetObjectItem(ent, "signer_slot"));
+                                unsigned char nonce_data[66];
+                                if (wire_json_get_hex(ent, "data", nonce_data, 66) == 66 &&
+                                    all_nonce_count < total_slots) {
+                                    all_nonce_entries[all_nonce_count].node_idx = node_idx;
+                                    all_nonce_entries[all_nonce_count].signer_slot = slot;
+                                    memcpy(all_nonce_entries[all_nonce_count].data, nonce_data, 66);
+                                    all_nonce_entries[all_nonce_count].data_len = 66;
+                                    all_nonce_count++;
+                                }
+                            }
+                            ceremony.clients[ci] = CLIENT_NONCE_RECEIVED;
+                            nonces_received++;
+                            fprintf(stderr, "LSP: client %zu reconnected and sent nonces\n", ci);
+                        }
+                    }
+                    if (retry_msg.json) cJSON_Delete(retry_msg.json);
+                }
+            }
+
+            /* Final quorum check after recovery attempt */
+            if (nonces_received < lsp->n_clients) {
+                if (ceremony_has_quorum(&ceremony)) {
+                    fprintf(stderr, "LSP: %zu/%zu nonces after recovery (quorum met)\n",
+                            nonces_received, lsp->n_clients);
+                } else {
+                    fprintf(stderr, "LSP: only %zu/%zu nonces after recovery (quorum requires %d)\n",
+                            nonces_received, lsp->n_clients, ceremony.min_clients);
+                    goto fail;
+                }
+            }
         }
     }
 
@@ -538,9 +619,14 @@ int lsp_run_factory_creation(lsp_t *lsp,
         }
 
         if (psigs_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent psigs\n",
-                    psigs_received, lsp->n_clients);
-            goto fail;
+            if (ceremony_has_quorum(&psig_ceremony)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent psigs (quorum met)\n",
+                        psigs_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent psigs (quorum requires %d)\n",
+                        psigs_received, lsp->n_clients, psig_ceremony.min_clients);
+                goto fail;
+            }
         }
     }
 
@@ -731,9 +817,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         }
 
         if (close_nonces_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent close nonces\n",
-                    close_nonces_received, lsp->n_clients);
-            goto close_fail;
+            if (ceremony_has_quorum(&close_nonce_cer)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent close nonces (quorum met)\n",
+                        close_nonces_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent close nonces (quorum requires %d)\n",
+                        close_nonces_received, lsp->n_clients, close_nonce_cer.min_clients);
+                goto close_fail;
+            }
         }
     }
 
@@ -841,9 +932,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         }
 
         if (close_psigs_received < lsp->n_clients) {
-            fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs\n",
-                    close_psigs_received, lsp->n_clients);
-            goto close_fail;
+            if (ceremony_has_quorum(&close_psig_cer)) {
+                fprintf(stderr, "LSP: %zu/%zu clients sent close psigs (quorum met)\n",
+                        close_psigs_received, lsp->n_clients);
+            } else {
+                fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs (quorum requires %d)\n",
+                        close_psigs_received, lsp->n_clients, close_psig_cer.min_clients);
+                goto close_fail;
+            }
         }
     }
 

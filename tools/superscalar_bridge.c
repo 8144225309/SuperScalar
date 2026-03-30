@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <getopt.h>
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -74,10 +75,11 @@ int main(int argc, char *argv[]) {
     bridge_init(&br);
 
     /* NK authentication: pin LSP static pubkey if provided */
+    unsigned char pk_buf[33] = {0};
+    int lsp_pubkey_set = 0;
     if (lsp_pubkey_hex) {
         secp256k1_context *ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_VERIFY);
-        unsigned char pk_buf[33];
         if (hex_decode(lsp_pubkey_hex, pk_buf, 33) != 33) {
             fprintf(stderr, "Error: --lsp-pubkey must be 33-byte compressed pubkey hex\n");
             secp256k1_context_destroy(ctx);
@@ -91,23 +93,61 @@ int main(int argc, char *argv[]) {
         }
         bridge_set_lsp_pubkey(&br, &lsp_pk);
         printf("Bridge: NK authentication enabled (pinned LSP pubkey)\n");
+        lsp_pubkey_set = 1;
         secp256k1_context_destroy(ctx);
     }
 
-    if (!bridge_connect_lsp(&br, lsp_host, lsp_port)) {
-        fprintf(stderr, "Failed to connect to LSP\n");
-        return 1;
+    /* Supervisor loop: restart bridge on failure with escalating backoff.
+       Max 5 restarts before giving up. Backoff: 5s, 10s, 20s, 40s, 60s. */
+    int restart_count = 0;
+    int max_restarts = 5;
+    int backoff_sec = 5;
+
+    while (restart_count <= max_restarts) {
+        if (restart_count > 0) {
+            fprintf(stderr, "Bridge: restarting (attempt %d/%d, backoff %ds)...\n",
+                    restart_count, max_restarts, backoff_sec);
+            sleep(backoff_sec);
+            backoff_sec = backoff_sec * 2 > 60 ? 60 : backoff_sec * 2;
+            bridge_cleanup(&br);
+            bridge_init(&br);
+            if (lsp_pubkey_set) {
+                secp256k1_context *rctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+                secp256k1_pubkey rpk;
+                if (rctx && secp256k1_ec_pubkey_parse(rctx, &rpk, pk_buf, 33))
+                    bridge_set_lsp_pubkey(&br, &rpk);
+                if (rctx) secp256k1_context_destroy(rctx);
+            }
+        }
+
+        if (!bridge_connect_lsp(&br, lsp_host, lsp_port)) {
+            fprintf(stderr, "Bridge: failed to connect to LSP\n");
+            restart_count++;
+            continue;
+        }
+
+        if (!bridge_listen_plugin(&br, plugin_port)) {
+            fprintf(stderr, "Bridge: failed to listen for plugin\n");
+            restart_count++;
+            continue;
+        }
+
+        printf("Bridge running, waiting for plugin connection...\n");
+
+        int rc = bridge_run(&br);
+        if (rc) {
+            /* Clean exit requested */
+            bridge_cleanup(&br);
+            return 0;
+        }
+
+        /* bridge_run returned failure — restart */
+        fprintf(stderr, "Bridge: bridge_run exited, will restart\n");
+        restart_count++;
+        /* Reset backoff on successful runs that lasted >60s */
     }
 
-    if (!bridge_listen_plugin(&br, plugin_port)) {
-        fprintf(stderr, "Failed to listen for plugin\n");
-        bridge_cleanup(&br);
-        return 1;
-    }
-
-    printf("Bridge running, waiting for plugin connection...\n");
-
-    int rc = bridge_run(&br);
+    fprintf(stderr, "Bridge: max restarts (%d) exhausted, exiting\n", max_restarts);
     bridge_cleanup(&br);
-    return rc ? 0 : 1;
+    return 1;
 }

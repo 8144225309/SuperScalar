@@ -2,6 +2,34 @@
 
 All notable changes to SuperScalar are documented here.
 
+## Unreleased
+
+Production hardening and BIP 158 deposit detection (PR #49). 36/36 orchestrator, 1351 unit tests.
+
+### Added
+
+- **Ceremony reconnect retry** (`lsp.c`): on nonce timeout, waits up to 30s for clients to reconnect, re-sends FACTORY_PROPOSE, and collects nonces. Falls back to quorum check only after recovery fails.
+- **Ceremony quorum support** (`lsp.c`): wired `ceremony_has_quorum()` (previously dead code) into all 4 ceremony phases — factory creation nonces/psigs and cooperative close nonces/psigs. Partial client failures no longer abort if quorum is met.
+- **Factory creation retry** (`superscalar_lsp.c`): initial ceremony retries up to 3 times with 5s backoff
+- **Bridge supervisor** (`superscalar_bridge.c`): outer restart loop with escalating backoff (5s→60s, max 5 restarts), re-initializes NK auth on each attempt
+- **Bridge HTLC timeout monitoring** (`lsp_channels.c`): daemon loop checks bridge HTLC origins against block height, fails back 10 blocks before CLTV expiry to avoid on-chain resolution
+- **BIP 158 deposit detection** (`lsp_channels.c`, `wallet_source_hd.c`): daemon loop polls HD wallet balance every 30s, logs deposit events with delta
+- **`getdepositaddress` admin RPC** (`admin_rpc.c`): returns bech32m P2TR deposit address from HD wallet
+- **`persist_sum_hd_utxos()`** (`persist.c`): SQL SUM query for total unspent HD wallet balance
+- **Dynamic gap limit** (`wallet_source_hd.c`): `wallet_source_hd_extend_gap()` reallocs SPK cache and registers new addresses with BIP 158 as next_index approaches boundary
+- **Watchtower systemd unit** (`tools/deploy/superscalar-watchtower.service`): new unit file for standalone watchtower deployment
+
+### Fixed
+
+- **Bridge HTLC rollback** (`lsp_bridge.c`): on client disconnect during COMMITMENT_SIGNED exchange, rollback via `channel_fail_htlc()` and send `BRIDGE_FAIL_HTLC`. Previously left channel in half-committed state.
+- **Light-client rotation** (`lsp_rotation.c`): use vout=0 and known amount in light-client mode instead of calling `regtest_get_tx_output(NULL)` which would crash
+- **Bech32m deposit address** (`wallet_source_hd.c`): `wallet_source_hd_get_address()` now returns proper bech32m P2TR address instead of hex SPK
+
+### Operator tooling
+
+- **LSP systemd unit** updated: admin RPC socket, keyfile auth, env file, security hardening (NoNewPrivileges, ProtectSystem, PrivateTmp)
+- **`.env.example`** updated: comprehensive config with `SS_` prefix variables for all components
+
 ## 0.1.8 — 2026-03-28
 
 Production hardening + LN phase 2 integration. MSG_PING/MSG_PONG keepalive, end-to-end bridge payments, factory rotation on signet, 12 bug fixes. 26/26 signet exhibition structures passing. 36/36 orchestrator scenarios. 1351 unit tests.
