@@ -2785,15 +2785,30 @@ accept_new_factory:
     }
 
     printf("LSP: starting factory creation ceremony...\n");
-    if (!lsp_run_factory_creation(&lsp,
-                                   funding_txid, funding_vout,
-                                   funding_amount,
-                                   fund_spk, 34,
-                                   step_blocks, 4, cltv_timeout)) {
-        fprintf(stderr, "LSP: factory creation failed\n");
-        lsp_cleanup(&lsp);
-        secp256k1_context_destroy(ctx);
-        return 1;
+    {
+        int creation_ok = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                printf("LSP: factory creation retry %d/3...\n", attempt + 1);
+                /* Brief pause for clients to stabilize */
+                sleep(5);
+            }
+            if (lsp_run_factory_creation(&lsp,
+                                          funding_txid, funding_vout,
+                                          funding_amount,
+                                          fund_spk, 34,
+                                          step_blocks, 4, cltv_timeout)) {
+                creation_ok = 1;
+                break;
+            }
+            fprintf(stderr, "LSP: factory creation attempt %d failed\n", attempt + 1);
+        }
+        if (!creation_ok) {
+            fprintf(stderr, "LSP: factory creation failed after 3 attempts\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
 

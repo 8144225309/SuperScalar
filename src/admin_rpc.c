@@ -1248,6 +1248,23 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_getbalance(rpc);
     } else if (strcmp(m, "listfunds") == 0) {
         result = method_listfunds(rpc);
+    } else if (strcmp(m, "getdepositaddress") == 0) {
+        /* Return a bech32m P2TR deposit address from the HD wallet */
+        if (rpc->wallet) {
+            char addr[128] = {0};
+            extern int wallet_source_hd_get_address(const void *, uint32_t, char *, size_t);
+            /* Use index 0 for the primary deposit address */
+            if (wallet_source_hd_get_address(rpc->wallet, 0, addr, sizeof(addr))) {
+                result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "address", addr);
+                cJSON_AddStringToObject(result, "type", "p2tr");
+                cJSON_AddNumberToObject(result, "index", 0);
+            } else {
+                snprintf(errmsg, sizeof(errmsg), "HD wallet address derivation failed");
+            }
+        } else {
+            snprintf(errmsg, sizeof(errmsg), "HD wallet not available (using RPC wallet?)");
+        }
     } else {
         size_t n = build_error(id, -32601, "Method not found", json_out, out_cap);
         cJSON_Delete(req);

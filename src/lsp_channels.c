@@ -3389,6 +3389,27 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (tnow - last_periodic >= 5) {
                 last_periodic = tnow;
 
+                /* Check HD wallet balance for incoming deposits (every 30s) */
+                {
+                    static time_t last_deposit_check = 0;
+                    if (!last_deposit_check) last_deposit_check = tnow;
+                    if (tnow - last_deposit_check >= 30 && mgr->wallet_src) {
+                        extern uint64_t wallet_source_hd_get_balance(const void *);
+                        extern uint32_t wallet_source_hd_extend_gap(void *);
+                        uint64_t bal = wallet_source_hd_get_balance(mgr->wallet_src);
+                        if (bal != mgr->available_balance_sats) {
+                            if (bal > mgr->available_balance_sats)
+                                printf("LSP: deposit detected — wallet balance: %llu sats (+%llu)\n",
+                                       (unsigned long long)bal,
+                                       (unsigned long long)(bal - mgr->available_balance_sats));
+                            mgr->available_balance_sats = bal;
+                        }
+                        /* Extend gap limit if needed */
+                        wallet_source_hd_extend_gap(mgr->wallet_src);
+                        last_deposit_check = tnow;
+                    }
+                }
+
                 /* Periodic fee refresh */
                 if (mgr->fee) {
                     fee_estimator_t *fe = (fee_estimator_t *)mgr->fee;
@@ -3421,6 +3442,42 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             }
                         }
                     }
+
+                    /* Bridge HTLC timeout check: fail back bridge HTLCs approaching
+                       their CLTV deadline to avoid on-chain resolution.
+                       Safety margin: fail 10 blocks before expiry. */
+                    if (mgr->htlc_origins && mgr->bridge_fd >= 0) {
+                        for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
+                            htlc_origin_t *orig = &mgr->htlc_origins[oi];
+                            if (!orig->active || orig->cltv_expiry == 0) continue;
+                            if ((uint32_t)height + 10 >= orig->cltv_expiry) {
+                                fprintf(stderr, "LSP: bridge HTLC timeout — failing back "
+                                        "htlc_id=%llu (height=%d, cltv=%u)\n",
+                                        (unsigned long long)orig->bridge_htlc_id,
+                                        height, orig->cltv_expiry);
+                                unsigned char zero_hash[32] = {0};
+                                cJSON *fail = wire_build_bridge_fail_htlc(
+                                    zero_hash, "cltv_expiry_too_soon",
+                                    orig->bridge_htlc_id);
+                                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                                cJSON_Delete(fail);
+                                /* Also fail the channel-side HTLC if still active */
+                                for (size_t c = 0; c < mgr->n_channels; c++) {
+                                    channel_t *ch = &mgr->entries[c].channel;
+                                    for (size_t h = 0; h < ch->n_htlcs; h++) {
+                                        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                                            memcmp(ch->htlcs[h].payment_hash,
+                                                   orig->payment_hash, 32) == 0) {
+                                            channel_fail_htlc(ch, ch->htlcs[h].id);
+                                            break;
+                                        }
+                                    }
+                                }
+                                orig->active = 0;
+                            }
+                        }
+                    }
+
                     /* Profit settlement check */
                     if (mgr->economic_mode == ECON_PROFIT_SHARED &&
                         mgr->accumulated_fees_sats > 0 &&

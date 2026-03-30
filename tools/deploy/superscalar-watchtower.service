@@ -1,0 +1,26 @@
+[Unit]
+Description=SuperScalar Watchtower
+After=network-online.target bitcoind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=superscalar
+Group=superscalar
+EnvironmentFile=-/etc/superscalar/env
+ExecStart=/usr/local/bin/superscalar_watchtower \
+    --network ${SS_NETWORK:-signet} \
+    --db /var/lib/superscalar/watchtower.db \
+    --rpcuser ${SS_RPCUSER:-rpcuser} --rpcpassword ${SS_RPCPASSWORD:-rpcpass}
+Restart=on-failure
+RestartSec=30
+LimitNOFILE=65536
+StandardOutput=append:/var/log/superscalar/watchtower.log
+StandardError=append:/var/log/superscalar/watchtower.log
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/superscalar /var/log/superscalar
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
