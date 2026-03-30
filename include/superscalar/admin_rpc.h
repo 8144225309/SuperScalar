@@ -48,6 +48,7 @@ typedef struct {
     wallet_source_t        *wallet;             /* on-chain wallet; NULL = no channel open */
     volatile int           *shutdown_flag;
     void                   *lsp;               /* lsp_t* for client fd access */
+    char                    network[16];       /* "signet", "testnet4", "regtest", "mainnet" */
 
     /* Unix socket state */
     int  listen_fd;

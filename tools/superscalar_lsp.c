@@ -2226,6 +2226,7 @@ int main(int argc, char *argv[]) {
                 memcpy(g_admin_rpc.node_privkey, lsp_seckey, 32);
                 g_admin_rpc.channel_mgr   = mgr;
                 g_admin_rpc.lsp           = &lsp;
+                strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
                 g_admin_rpc.payments      = &g_payments;
                 g_admin_rpc.invoices      = &g_invoice_tbl;
                 g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
@@ -2925,6 +2926,7 @@ accept_new_factory:
     if (g_admin_rpc.ctx) {
         g_admin_rpc.channel_mgr = mgr;
         g_admin_rpc.lsp = &lsp;
+        strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
     }
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
