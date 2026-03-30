@@ -174,6 +174,7 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
     if (strcmp(network, "mainnet") == 0) pfx2 = "bc";
     else if (strcmp(network, "testnet") == 0) pfx2 = "tb";
     else if (strcmp(network, "signet") == 0) pfx2 = "tbs";
+    else if (strcmp(network, "testnet4") == 0) pfx2 = "tb";
     strncpy(inv.network, pfx2, sizeof(inv.network) - 1);
     inv.amount_msat = amount_msat;
     inv.has_amount = (amount_msat > 0);
