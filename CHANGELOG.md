@@ -78,6 +78,7 @@ Production hardening + LN phase 2 integration. MSG_PING/MSG_PONG keepalive, end-
 - **Fund recovery tool** (`tools/recover_exhibition_funds.py`): scan blockchain for stuck exhibition outputs and sweep them back to wallet
 ### Fixed
 
+- **TX confirmation via getrawtransaction** (`regtest.c`): added `getrawtransaction` probe between `gettransaction` (wallet-only) and block-scanning fallback. Fixes "Invalid or non-wallet transaction id" for manually-built TXs (HD wallet funding path). Matches CLN/LND/LDK industry standard — treat bitcoind as chain source, not wallet.
 - **Admin RPC network-aware invoice encoding** (`admin_rpc.c`): `createinvoice` reads `rpc->network` from the LSP's `--network` CLI flag instead of hardcoding "signet". Invoices now encode the correct BOLT #11 prefix on any network.
 - **Testnet4 BOLT #11 prefix** (`invoice.c`): added `testnet4 → tb` mapping in both `invoice_create` and `invoice_create_with_hint` (was falling through to `bcrt` regtest prefix)
 - **BOLT #11 tag numbers** (`bolt11.c`): payment_secret was encoded as tag 18 (wrong); corrected to tag 16 (`s` = bech32 value 16). Payee pubkey corrected from tag 16 to tag 19 (`n` = bech32 value 19). Fixed "Missing required payment secret" when CLN paid SuperScalar invoices.
