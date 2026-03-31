@@ -871,6 +871,29 @@ int regtest_get_confirmations(regtest_t *rt, const char *txid) {
         }
     }
 
+    /* Try getrawtransaction (works for any TX with -txindex=1, or if in
+       mempool even without txindex).  This is the industry standard approach
+       used by CLN, LND, and LDK — treats bitcoind as a chain source, not
+       a wallet.  Fixes the gap where manually-built TXs (HD wallet path)
+       are invisible to gettransaction. */
+    snprintf(params, sizeof(params), "\"%s\" true", txid);
+    result = regtest_exec(rt, "getrawtransaction", params);
+    if (result) {
+        cJSON *json = cJSON_Parse(result);
+        free(result);
+        if (json) {
+            cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
+            if (conf && cJSON_IsNumber(conf)) {
+                int val = conf->valueint;
+                cJSON_Delete(json);
+                return val;
+            }
+            /* No confirmations field = in mempool, not yet confirmed */
+            cJSON_Delete(json);
+            return 0;
+        }
+    }
+
     /* Fallback: scan recent blocks with getrawtransaction + blockhash */
     result = regtest_exec(rt, "getblockcount", "");
     if (!result) return -1;
@@ -940,6 +963,29 @@ int regtest_get_confirmations_batch(regtest_t *rt,
             n_remaining--;
         }
         cJSON_Delete(json);
+    }
+
+    if (n_remaining == 0) return 1;
+
+    /* Step 1b: getrawtransaction for remaining txids (works with -txindex=1
+       or for mempool TXs).  Same approach as CLN/LND/LDK. */
+    for (size_t i = 0; i < n_txids; i++) {
+        if (confs_out[i] >= 0) continue;  /* already found */
+        char params[256];
+        snprintf(params, sizeof(params), "\"%s\" true", txids_hex[i]);
+        char *result = regtest_exec(rt, "getrawtransaction", params);
+        if (!result) continue;
+        cJSON *json = cJSON_Parse(result);
+        free(result);
+        if (!json) continue;
+        cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
+        if (conf && cJSON_IsNumber(conf)) {
+            confs_out[i] = conf->valueint;
+        } else {
+            confs_out[i] = 0;  /* in mempool */
+        }
+        cJSON_Delete(json);
+        n_remaining--;
     }
 
     if (n_remaining == 0) return 1;
