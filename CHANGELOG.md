@@ -76,9 +76,12 @@ Production hardening + LN phase 2 integration. MSG_PING/MSG_PONG keepalive, end-
   - **S25** (`pay_external` CLI): outbound payment via bridge
   - **S26**: standalone watchtower deployment
 - **Fund recovery tool** (`tools/recover_exhibition_funds.py`): scan blockchain for stuck exhibition outputs and sweep them back to wallet
+- **Testnet4 validation**: S1 (cooperative close), S2 (force close), S7 (breach+penalty), S12 (rotation), S14 (bridge routing) — all passing on testnet4
 
 ### Fixed
 
+- **Admin RPC network-aware invoice encoding** (`admin_rpc.c`): `createinvoice` reads `rpc->network` from the LSP's `--network` CLI flag instead of hardcoding "signet". Invoices now encode the correct BOLT #11 prefix on any network.
+- **Testnet4 BOLT #11 prefix** (`invoice.c`): added `testnet4 → tb` mapping in both `invoice_create` and `invoice_create_with_hint` (was falling through to `bcrt` regtest prefix)
 - **BOLT #11 tag numbers** (`bolt11.c`): payment_secret was encoded as tag 18 (wrong); corrected to tag 16 (`s` = bech32 value 16). Payee pubkey corrected from tag 16 to tag 19 (`n` = bech32 value 19). Fixed "Missing required payment secret" when CLN paid SuperScalar invoices.
 - **CLN plugin HTLC intercept** (`cln_plugin.py`): plugin now forwards all HTLCs with `short_channel_id` in onion (forwarding HTLCs) to bridge, not just registered invoices and keysend
 - **Bridge invoice table registration** (`admin_rpc.c`): admin RPC `createinvoice` now registers invoices in both BOLT11 table and bridge htlc_inbound table; previously bridge HTLCs failed with "unknown hash"
