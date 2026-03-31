@@ -76,8 +76,6 @@ Production hardening + LN phase 2 integration. MSG_PING/MSG_PONG keepalive, end-
   - **S25** (`pay_external` CLI): outbound payment via bridge
   - **S26**: standalone watchtower deployment
 - **Fund recovery tool** (`tools/recover_exhibition_funds.py`): scan blockchain for stuck exhibition outputs and sweep them back to wallet
-- **Testnet4 validation**: S1 (cooperative close), S2 (force close), S7 (breach+penalty), S12 (rotation), S14 (bridge routing) — all passing on testnet4
-
 ### Fixed
 
 - **Admin RPC network-aware invoice encoding** (`admin_rpc.c`): `createinvoice` reads `rpc->network` from the LSP's `--network` CLI flag instead of hardcoding "signet". Invoices now encode the correct BOLT #11 prefix on any network.
