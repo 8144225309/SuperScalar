@@ -1,5 +1,6 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp_channels_internal.h"
+#include "superscalar/ceremony.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/factory_recovery.h"
 #include "superscalar/jit_channel.h"
@@ -703,11 +704,11 @@ void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
 int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
+    /* Phase 1: batch-send basepoints to ALL clients */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
         channel_t *ch = &entry->channel;
 
-        /* Compute LSP's first_per_commitment_point (cn=0) and second (cn=1) */
         secp256k1_pubkey lsp_first_pcp, lsp_second_pcp;
         if (!channel_get_per_commitment_point(ch, 0, &lsp_first_pcp) ||
             !channel_get_per_commitment_point(ch, 1, &lsp_second_pcp)) {
@@ -715,7 +716,6 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             return 0;
         }
 
-        /* Send LSP's basepoints to client */
         cJSON *bp_msg = wire_build_channel_basepoints(
             entry->channel_id, mgr->ctx,
             &ch->local_payment_basepoint,
@@ -729,38 +729,63 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             return 0;
         }
         cJSON_Delete(bp_msg);
-
-        /* Receive client's basepoints */
-        wire_msg_t bp_resp;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &bp_resp, 30) ||
-            bp_resp.msg_type != MSG_CHANNEL_BASEPOINTS) {
-            fprintf(stderr, "LSP: expected CHANNEL_BASEPOINTS from client %zu, got 0x%02x\n",
-                    c, bp_resp.msg_type);
-            if (bp_resp.json) cJSON_Delete(bp_resp.json);
-            return 0;
-        }
-
-        uint32_t resp_ch_id;
-        secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc, rfirst_pcp, rsecond_pcp;
-        if (!wire_parse_channel_basepoints(bp_resp.json, &resp_ch_id, mgr->ctx,
-                                             &rpay, &rdelay, &rrevoc, &rhtlc,
-                                             &rfirst_pcp, &rsecond_pcp)) {
-            fprintf(stderr, "LSP: failed to parse client %zu basepoints\n", c);
-            cJSON_Delete(bp_resp.json);
-            return 0;
-        }
-        cJSON_Delete(bp_resp.json);
-
-        /* Set remote basepoints from wire */
-        channel_set_remote_basepoints(ch, &rpay, &rdelay, &rrevoc);
-        channel_set_remote_htlc_basepoint(ch, &rhtlc);
-
-        /* Store remote's first and second per-commitment points */
-        channel_set_remote_pcp(ch, 0, &rfirst_pcp);
-        channel_set_remote_pcp(ch, 1, &rsecond_pcp);
-
-        printf("LSP: basepoint exchange complete for channel %zu\n", c);
     }
+
+    /* Phase 2: parallel-collect basepoint replies from all clients */
+    int *bp_fds = (int *)calloc(mgr->n_channels, sizeof(int));
+    int *bp_ready = (int *)calloc(mgr->n_channels, sizeof(int));
+    if (!bp_fds || !bp_ready) { free(bp_fds); free(bp_ready); return 0; }
+
+    for (size_t c = 0; c < mgr->n_channels; c++)
+        bp_fds[c] = lsp->client_fds[c];
+
+    size_t bp_received = 0;
+    while (bp_received < mgr->n_channels) {
+        int n_ready = ceremony_select_all(bp_fds, mgr->n_channels, 30, bp_ready);
+        if (n_ready <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for basepoint replies (%zu/%zu received)\n",
+                    bp_received, mgr->n_channels);
+            free(bp_fds); free(bp_ready);
+            return 0;
+        }
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            if (!bp_ready[c]) continue;
+
+            wire_msg_t bp_resp;
+            if (!wire_recv_skip_ping(lsp->client_fds[c], &bp_resp) ||
+                bp_resp.msg_type != MSG_CHANNEL_BASEPOINTS) {
+                fprintf(stderr, "LSP: expected CHANNEL_BASEPOINTS from client %zu, got 0x%02x\n",
+                        c, bp_resp.msg_type);
+                if (bp_resp.json) cJSON_Delete(bp_resp.json);
+                free(bp_fds); free(bp_ready);
+                return 0;
+            }
+
+            uint32_t resp_ch_id;
+            secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc, rfirst_pcp, rsecond_pcp;
+            if (!wire_parse_channel_basepoints(bp_resp.json, &resp_ch_id, mgr->ctx,
+                                                 &rpay, &rdelay, &rrevoc, &rhtlc,
+                                                 &rfirst_pcp, &rsecond_pcp)) {
+                fprintf(stderr, "LSP: failed to parse client %zu basepoints\n", c);
+                cJSON_Delete(bp_resp.json);
+                free(bp_fds); free(bp_ready);
+                return 0;
+            }
+            cJSON_Delete(bp_resp.json);
+
+            channel_t *ch = &mgr->entries[c].channel;
+            channel_set_remote_basepoints(ch, &rpay, &rdelay, &rrevoc);
+            channel_set_remote_htlc_basepoint(ch, &rhtlc);
+            channel_set_remote_pcp(ch, 0, &rfirst_pcp);
+            channel_set_remote_pcp(ch, 1, &rsecond_pcp);
+
+            bp_fds[c] = -1;  /* mark as received */
+            bp_received++;
+            printf("LSP: basepoint exchange complete for channel %zu\n", c);
+        }
+    }
+    free(bp_fds);
+    free(bp_ready);
 
     return 1;
 }
@@ -768,6 +793,7 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
+    /* Phase 1: batch-send CHANNEL_READY + SCID + nonces to ALL clients */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
 
@@ -785,8 +811,6 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
         /* 4B: Send SCID assignment for route hints */
         {
-            /* Derive SCID from factory epoch + leaf position + output index.
-               client_idx is c+1 (0=LSP). leaf_index for SCID = leaf position. */
             int leaf_pos = -1;
             for (int li = 0; li < lsp->factory.n_leaf_nodes; li++) {
                 size_t ni = lsp->factory.leaf_node_indices[li];
@@ -799,7 +823,7 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                 }
                 if (leaf_pos >= 0) break;
             }
-            if (leaf_pos < 0) leaf_pos = (int)c; /* fallback */
+            if (leaf_pos < 0) leaf_pos = (int)c;
             uint64_t scid = factory_derive_scid(&lsp->factory, leaf_pos, 0);
             cJSON *scid_msg = wire_build_scid_assign(
                 entry->channel_id, scid,
@@ -835,14 +859,35 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             cJSON_Delete(nonce_msg);
             free(pubnonces_ser);
         }
+    }
 
-        /* Wait for client's nonces */
-        {
+    /* Phase 2: parallel-collect nonce replies from all clients */
+    int *nonce_fds = (int *)calloc(mgr->n_channels, sizeof(int));
+    int *nonce_ready = (int *)calloc(mgr->n_channels, sizeof(int));
+    if (!nonce_fds || !nonce_ready) { free(nonce_fds); free(nonce_ready); return 0; }
+
+    for (size_t c = 0; c < mgr->n_channels; c++)
+        nonce_fds[c] = lsp->client_fds[c];
+
+    size_t nonces_received = 0;
+    while (nonces_received < mgr->n_channels) {
+        int n_ready = ceremony_select_all(nonce_fds, mgr->n_channels, 30, nonce_ready);
+        if (n_ready <= 0) {
+            fprintf(stderr, "LSP: timeout waiting for nonce replies (%zu/%zu received)\n",
+                    nonces_received, mgr->n_channels);
+            free(nonce_fds); free(nonce_ready);
+            return 0;
+        }
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            if (!nonce_ready[c]) continue;
+
             wire_msg_t nonce_resp;
-            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &nonce_resp, 30) ||
+            if (!wire_recv_skip_ping(lsp->client_fds[c], &nonce_resp) ||
                 nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
-                fprintf(stderr, "LSP: expected CHANNEL_NONCES from client %zu\n", c);
+                fprintf(stderr, "LSP: expected CHANNEL_NONCES from client %zu, got 0x%02x\n",
+                        c, nonce_resp.msg_type);
                 if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
+                free(nonce_fds); free(nonce_ready);
                 return 0;
             }
 
@@ -852,18 +897,24 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             if (!wire_parse_channel_nonces(nonce_resp.json, &resp_ch_id,
                                              client_nonces, MUSIG_NONCE_POOL_MAX,
                                              &client_nonce_count)) {
-                fprintf(stderr, "LSP: failed to parse client nonces\n");
+                fprintf(stderr, "LSP: failed to parse client %zu nonces\n", c);
                 cJSON_Delete(nonce_resp.json);
+                free(nonce_fds); free(nonce_ready);
                 return 0;
             }
             cJSON_Delete(nonce_resp.json);
 
-            channel_set_remote_pubnonces(&entry->channel,
+            channel_set_remote_pubnonces(&mgr->entries[c].channel,
                 (const unsigned char (*)[66])client_nonces, client_nonce_count);
-        }
 
-        entry->ready = 1;
+            nonce_fds[c] = -1;  /* mark as received */
+            nonces_received++;
+            mgr->entries[c].ready = 1;
+        }
     }
+    free(nonce_fds);
+    free(nonce_ready);
+
     return 1;
 }
 
