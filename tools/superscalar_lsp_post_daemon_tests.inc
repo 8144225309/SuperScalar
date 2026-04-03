@@ -2,19 +2,19 @@
     if (breach_test && channels_active) {
         printf("\n=== BREACH TEST ===\n");
         fflush(stdout);
-        printf("Broadcasting factory tree (all %zu nodes)...\n", lsp.factory.n_nodes);
+        printf("Broadcasting factory tree (all %zu nodes)...\n", lsp_p->factory.n_nodes);
 
         int tree_ok;
         if (is_regtest) {
-            tree_ok = broadcast_factory_tree(&lsp.factory, &rt, mine_addr);
+            tree_ok = broadcast_factory_tree(&lsp_p->factory, &rt, mine_addr);
         } else {
-            tree_ok = broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            tree_ok = broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                           mine_addr, 0,
                                                           confirm_timeout_secs);
         }
         if (!tree_ok) {
             fprintf(stderr, "BREACH TEST: factory tree broadcast failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -172,7 +172,7 @@
             report_add_string(&rpt, "result", "cheat_daemon_complete");
             report_close(&rpt);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
@@ -187,7 +187,7 @@
             report_add_string(&rpt, "result", "breach_test_no_watchtower");
             report_close(&rpt);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -214,7 +214,7 @@
                 report_add_string(&rpt, "result", "breach_test_failed");
                 report_close(&rpt);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -227,7 +227,7 @@
         report_add_string(&rpt, "result", "breach_test_complete");
         report_close(&rpt);
         if (use_db) persist_close(&db);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
@@ -238,7 +238,7 @@
         printf("\n=== EXPIRY TEST (Multi-Level Timeout Recovery) ===\n");
 
         /* Step 1: Broadcast kickoff_root (node 0, key-path pre-signed) */
-        factory_node_t *kickoff_root = &lsp.factory.nodes[0];
+        factory_node_t *kickoff_root = &lsp_p->factory.nodes[0];
         {
             char *kr_hex = malloc(kickoff_root->signed_tx.len * 2 + 1);
             hex_encode(kickoff_root->signed_tx.data, kickoff_root->signed_tx.len, kr_hex);
@@ -249,7 +249,7 @@
                         kr_hex, "failed");
                 fprintf(stderr, "EXPIRY TEST: kickoff_root broadcast failed\n");
                 free(kr_hex);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             if (g_db)
@@ -261,7 +261,7 @@
         }
 
         /* Step 2: Broadcast state_root (node 1, key-path pre-signed) */
-        factory_node_t *state_root = &lsp.factory.nodes[1];
+        factory_node_t *state_root = &lsp_p->factory.nodes[1];
         {
             uint32_t state_nseq = state_root->nsequence;
             int nseq_blocks = (state_nseq == NSEQUENCE_DISABLE_BIP68)
@@ -278,7 +278,7 @@
                         sr_hex, "failed");
                 fprintf(stderr, "EXPIRY TEST: state_root broadcast failed\n");
                 free(sr_hex);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             if (g_db)
@@ -293,18 +293,18 @@
         /* Build broadcast chain: walk from first leaf state up to state_root,
            collecting intermediate kickoff+state nodes to broadcast.
            Works for both arity-2 (3 nodes: kl) and arity-1 (5 nodes: kl,sl,ka). */
-        size_t first_leaf_idx = lsp.factory.leaf_node_indices[0];
+        size_t first_leaf_idx = lsp_p->factory.leaf_node_indices[0];
         int chain[16];  /* node indices to broadcast (root-to-leaf order) */
         int chain_len = 0;
         {
             /* Walk from first leaf's kickoff parent up to state_root */
-            int ko_idx = lsp.factory.nodes[first_leaf_idx].parent_index;
+            int ko_idx = lsp_p->factory.nodes[first_leaf_idx].parent_index;
             while (ko_idx >= 0) {
-                int parent_state = lsp.factory.nodes[ko_idx].parent_index;
+                int parent_state = lsp_p->factory.nodes[ko_idx].parent_index;
                 if (parent_state < 0 || parent_state == 1) break; /* stop at state_root children */
                 chain[chain_len++] = parent_state; /* state node (grandparent) */
                 chain[chain_len++] = ko_idx;       /* kickoff node */
-                ko_idx = lsp.factory.nodes[parent_state].parent_index;
+                ko_idx = lsp_p->factory.nodes[parent_state].parent_index;
             }
             chain[chain_len++] = ko_idx; /* the kickoff that's a direct child of state_root */
         }
@@ -316,7 +316,7 @@
         /* Step 3..N: Broadcast intermediate nodes down to the deepest kickoff */
         int step = 3;
         for (int ci = 0; ci < chain_len; ci++) {
-            factory_node_t *nd = &lsp.factory.nodes[chain[ci]];
+            factory_node_t *nd = &lsp_p->factory.nodes[chain[ci]];
             uint32_t nseq = nd->nsequence;
             int nseq_blocks = (nseq == NSEQUENCE_DISABLE_BIP68) ? 0 : (int)(nseq & 0xFFFF);
             if (nseq_blocks > 0)
@@ -333,7 +333,7 @@
                 }
                 fprintf(stderr, "EXPIRY TEST: node[%d] broadcast failed\n", chain[ci]);
                 free(hex);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             if (g_db) {
@@ -349,15 +349,15 @@
         }
 
         /* The deepest kickoff is the last in the chain */
-        factory_node_t *deepest_kickoff = &lsp.factory.nodes[chain[chain_len - 1]];
+        factory_node_t *deepest_kickoff = &lsp_p->factory.nodes[chain[chain_len - 1]];
         /* The leaf state node that times out this kickoff's output */
-        factory_node_t *leaf_state = &lsp.factory.nodes[first_leaf_idx];
+        factory_node_t *leaf_state = &lsp_p->factory.nodes[first_leaf_idx];
 
         /* LSP pubkey for signing + destination */
         secp256k1_xonly_pubkey lsp_xonly;
         if (!secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &lsp_kp)) {
             fprintf(stderr, "EXPIRY TEST: keypair xonly pub failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -386,7 +386,7 @@
             if (!leaf_state->has_taptree) {
                 fprintf(stderr, "EXPIRY TEST: leaf state node[%zu] has no taptree\n",
                         first_leaf_idx);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
@@ -405,7 +405,7 @@
                     &tout, 1)) {
                 fprintf(stderr, "EXPIRY TEST: leaf build failed\n");
                 tx_buf_free(&tu);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
@@ -446,7 +446,7 @@
 
             if (!sent) {
                 fprintf(stderr, "EXPIRY TEST: leaf timeout tx broadcast failed\n");
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             ADVANCE(1);
@@ -457,7 +457,7 @@
 
         /* Mid recovery: Spend state_root:1 via kickoff_right timeout.
            kickoff_right is the second child of state_root (vout 1). */
-        factory_node_t *kickoff_right = &lsp.factory.nodes[state_root->child_indices[1]];
+        factory_node_t *kickoff_right = &lsp_p->factory.nodes[state_root->child_indices[1]];
         uint32_t mid_cltv = kickoff_right->cltv_timeout;
         {
             int height = regtest_get_block_height(&rt);
@@ -473,7 +473,7 @@
         {
             if (!kickoff_right->has_taptree) {
                 fprintf(stderr, "EXPIRY TEST: kickoff_right has no taptree\n");
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
@@ -492,7 +492,7 @@
                     &tout, 1)) {
                 fprintf(stderr, "EXPIRY TEST: mid build failed\n");
                 tx_buf_free(&tu);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
@@ -533,7 +533,7 @@
 
             if (!sent) {
                 fprintf(stderr, "EXPIRY TEST: mid timeout tx broadcast failed\n");
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             ADVANCE(1);
@@ -557,7 +557,7 @@
                           expiry_pass ? "expiry_test_pass" : "expiry_test_fail");
         report_close(&rpt);
         if (use_db) persist_close(&db);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return expiry_pass ? 0 : 1;
@@ -568,7 +568,7 @@
         printf("\n=== DISTRIBUTION TX TEST ===\n");
 
         /* Build distribution TX with demo keypairs (LSP has all keys in demo) */
-        factory_t df = lsp.factory;
+        factory_t df = lsp_p->factory;
         secp256k1_keypair dk[FACTORY_MAX_SIGNERS];
         dk[0] = lsp_kp;
         {
@@ -605,10 +605,10 @@
         unsigned char dist_txid[32];
         if (!factory_build_distribution_tx(&df, &dist_tx, dist_txid,
                                              dist_outputs, n_total,
-                                             lsp.factory.cltv_timeout)) {
+                                             lsp_p->factory.cltv_timeout)) {
             fprintf(stderr, "DISTRIBUTION TX TEST: build failed\n");
             tx_buf_free(&dist_tx);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -620,10 +620,10 @@
 
         /* Mine past CLTV timeout */
         int cur_h = regtest_get_block_height(&rt);
-        int blocks_to_cltv = (int)lsp.factory.cltv_timeout - cur_h;
+        int blocks_to_cltv = (int)lsp_p->factory.cltv_timeout - cur_h;
         if (blocks_to_cltv > 0) {
             printf("Advancing %d blocks to reach CLTV timeout %u...\n",
-                   blocks_to_cltv, lsp.factory.cltv_timeout);
+                   blocks_to_cltv, lsp_p->factory.cltv_timeout);
             ADVANCE(blocks_to_cltv);
         }
 
@@ -640,7 +640,7 @@
         if (!dt_sent) {
             fprintf(stderr, "DISTRIBUTION TX TEST: broadcast failed\n");
             tx_buf_free(&lad->factories[0].distribution_tx);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -654,7 +654,7 @@
         report_close(&rpt);
         if (use_db) persist_close(&db);
         tx_buf_free(&lad->factories[0].distribution_tx);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
@@ -680,7 +680,7 @@
         }
 
         /* We need the factory with real keypairs for signing */
-        factory_t tf = lsp.factory;
+        factory_t tf = lsp_p->factory;
         memcpy(tf.keypairs, all_kps, n_total * sizeof(secp256k1_keypair));
 
         /* Build keyagg for the funding key (used as message) */
@@ -713,7 +713,7 @@
                                                   turnover_msg, all_kps, n_total,
                                                   &ka_copy, NULL, &client_pk)) {
                 fprintf(stderr, "TURNOVER TEST: presig failed for client %d\n", ci);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -729,7 +729,7 @@
             if (!adaptor_adapt(ctx, adapted_sig, presig, client_sec, nonce_parity)) {
                 fprintf(stderr, "TURNOVER TEST: adapt failed for client %d\n", ci);
                 memset(client_sec, 0, 32);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -741,7 +741,7 @@
                                           nonce_parity)) {
                 fprintf(stderr, "TURNOVER TEST: extract failed for client %d\n", ci);
                 memset(client_sec, 0, 32);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -751,7 +751,7 @@
             if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
                 fprintf(stderr, "TURNOVER TEST: verify failed for client %d\n", ci);
                 memset(client_sec, 0, 32);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -771,7 +771,7 @@
         /* Verify all clients departed */
         if (!ladder_can_close(lad, 0)) {
             fprintf(stderr, "TURNOVER TEST: ladder_can_close returned false\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -780,14 +780,14 @@
 
         /* Build close outputs (equal split) */
         tx_output_t to_outputs[FACTORY_MAX_SIGNERS];
-        uint64_t to_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+        uint64_t to_per = (lsp_p->factory.funding_amount_sats - 500) / n_total;
         for (size_t ti = 0; ti < n_total; ti++) {
             to_outputs[ti].amount_sats = to_per;
             memcpy(to_outputs[ti].script_pubkey, fund_spk, 34);
             to_outputs[ti].script_pubkey_len = 34;
         }
         to_outputs[n_total - 1].amount_sats =
-            lsp.factory.funding_amount_sats - 500 - to_per * (n_total - 1);
+            lsp_p->factory.funding_amount_sats - 500 - to_per * (n_total - 1);
 
         /* Build cooperative close using extracted keys */
         tx_buf_t turnover_close_tx;
@@ -797,7 +797,7 @@
                                   (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "TURNOVER TEST: ladder_build_close failed\n");
             tx_buf_free(&turnover_close_tx);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -816,7 +816,7 @@
 
         if (!tc_sent) {
             fprintf(stderr, "TURNOVER TEST: close TX broadcast failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -829,7 +829,7 @@
         report_add_string(&rpt, "result", "turnover_test_complete");
         report_close(&rpt);
         if (use_db) persist_close(&db);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
@@ -854,7 +854,7 @@
             if (imbalance_amt > 0) {
                 printf("Imbalancing: %llu sats from ch0 → ch1\n",
                        (unsigned long long)imbalance_amt);
-                lsp_channels_initiate_payment(mgr, &lsp, 0, 1, imbalance_amt);
+                lsp_channels_initiate_payment(mgr, lsp_p, 0, 1, imbalance_amt);
             }
         }
 
@@ -884,7 +884,7 @@
 
         /* Set threshold and run auto-rebalance */
         mgr->rebalance_threshold_pct = 70;
-        int rebal_count = lsp_channels_auto_rebalance(mgr, &lsp);
+        int rebal_count = lsp_channels_auto_rebalance(mgr, lsp_p);
         printf("Auto-rebalance moved %d channel(s)\n", rebal_count);
 
         /* Verify: total balance conservation */
@@ -925,7 +925,7 @@
             jit_channels_cleanup(mgr);
             free(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -955,14 +955,14 @@
             entries[1].from = 2;
             entries[1].to = 3;
             entries[1].amount_sats = 1500;
-            batch_count = lsp_channels_batch_rebalance(mgr, &lsp, entries, 2);
+            batch_count = lsp_channels_batch_rebalance(mgr, lsp_p, entries, 2);
             printf("Batch rebalance: %d/2 succeeded\n", batch_count);
         } else if (mgr->n_channels >= 2) {
             rebalance_entry_t entries[1];
             entries[0].from = 0;
             entries[0].to = 1;
             entries[0].amount_sats = 2000;
-            batch_count = lsp_channels_batch_rebalance(mgr, &lsp, entries, 1);
+            batch_count = lsp_channels_batch_rebalance(mgr, lsp_p, entries, 1);
             printf("Batch rebalance: %d/1 succeeded\n", batch_count);
         }
 
@@ -991,7 +991,7 @@
             jit_channels_cleanup(mgr);
             free(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -1012,8 +1012,8 @@
             printf("LEAF REALLOC TEST: SKIP\n");
         } else {
             /* Record current leaf node output amounts (authoritative source) */
-            size_t leaf_node_idx = lsp.factory.leaf_node_indices[0];
-            factory_node_t *leaf_node = &lsp.factory.nodes[leaf_node_idx];
+            size_t leaf_node_idx = lsp_p->factory.leaf_node_indices[0];
+            factory_node_t *leaf_node = &lsp_p->factory.nodes[leaf_node_idx];
             uint64_t orig_amounts[3];
             uint64_t orig_total = 0;
             for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++) {
@@ -1036,7 +1036,7 @@
                    (unsigned long long)new_amounts[1],
                    (unsigned long long)new_amounts[2]);
 
-            int rc = lsp_realloc_leaf(mgr, &lsp, 0, new_amounts, 3);
+            int rc = lsp_realloc_leaf(mgr, lsp_p, 0, new_amounts, 3);
             if (rc != 1) {
                 printf("  FAIL: lsp_realloc_leaf returned %d (expected 1)\n", rc);
                 realloc_pass = 0;
@@ -1063,7 +1063,7 @@
             jit_channels_cleanup(mgr);
             free(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -1084,7 +1084,7 @@
             printf("  Creating JIT channel for client %d (%llu sats)...\n",
                    ci, (unsigned long long)jit_amount);
             fflush(stdout);
-            if (!jit_channel_create(mgr, &lsp, (size_t)ci, jit_amount, "test_jit")) {
+            if (!jit_channel_create(mgr, lsp_p, (size_t)ci, jit_amount, "test_jit")) {
                 printf("  Client %d: JIT create FAILED\n", ci);
                 jit_pass = 0;
                 break;
@@ -1106,7 +1106,7 @@
             jit_channels_cleanup(mgr);
             free(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -1141,7 +1141,7 @@
         unsigned char node_id[33];
         size_t node_id_len = 33;
         secp256k1_ec_pubkey_serialize(ctx, node_id, &node_id_len,
-                                       &lsp.lsp_pubkey, SECP256K1_EC_COMPRESSED);
+                                       &lsp_p->lsp_pubkey, SECP256K1_EC_COMPRESSED);
         memcpy(offer.node_id, node_id, 33);
         offer.amount_msat = 1000000;  /* 1000 sats */
         offer.has_amount = 1;
@@ -1259,17 +1259,17 @@
             fflush(stdout);
 
             /* Record pre-buy state */
-            size_t leaf_node_idx = lsp.factory.leaf_node_indices[0];
-            uint64_t pre_lstock = lsp.factory.nodes[leaf_node_idx].outputs[2].amount_sats;
-            uint64_t pre_client = lsp.factory.nodes[leaf_node_idx].outputs[0].amount_sats;
+            size_t leaf_node_idx = lsp_p->factory.leaf_node_indices[0];
+            uint64_t pre_lstock = lsp_p->factory.nodes[leaf_node_idx].outputs[2].amount_sats;
+            uint64_t pre_client = lsp_p->factory.nodes[leaf_node_idx].outputs[0].amount_sats;
 
-            if (!lsp_channels_buy_liquidity(mgr, &lsp, 0, buy_amount)) {
+            if (!lsp_channels_buy_liquidity(mgr, lsp_p, 0, buy_amount)) {
                 printf("  buy_liquidity FAILED\n");
                 buy_pass = 0;
             } else {
                 /* Verify L-stock decreased and client output increased */
-                uint64_t post_lstock = lsp.factory.nodes[leaf_node_idx].outputs[2].amount_sats;
-                uint64_t post_client = lsp.factory.nodes[leaf_node_idx].outputs[0].amount_sats;
+                uint64_t post_lstock = lsp_p->factory.nodes[leaf_node_idx].outputs[2].amount_sats;
+                uint64_t post_client = lsp_p->factory.nodes[leaf_node_idx].outputs[0].amount_sats;
 
                 printf("  L-stock: %llu → %llu (-%llu)\n",
                        (unsigned long long)pre_lstock, (unsigned long long)post_lstock,
@@ -1295,8 +1295,8 @@
         printf("\n=== LARGE FACTORY TEST ===\n");
         printf("  Factory created with %d clients (%d channels)\n",
                n_clients, n_clients);
-        printf("  DW tree nodes: %zu\n", lsp.factory.n_nodes);
-        printf("  Leaf arity: %d\n", lsp.factory.leaf_arity);
+        printf("  DW tree nodes: %zu\n", lsp_p->factory.n_nodes);
+        printf("  Leaf arity: %d\n", lsp_p->factory.leaf_arity);
         fflush(stdout);
         int large_pass = 1;
 
@@ -1318,13 +1318,13 @@
             }
 
             /* Verify DW tree is deeper than 4-client tree */
-            if (lsp.factory.n_nodes <= 6) {
+            if (lsp_p->factory.n_nodes <= 6) {
                 printf("  Tree should have >6 nodes for >4 clients, got %zu\n",
-                       lsp.factory.n_nodes);
+                       lsp_p->factory.n_nodes);
                 large_pass = 0;
             } else {
                 printf("  Tree depth verified: %zu nodes (>6)\n",
-                       lsp.factory.n_nodes);
+                       lsp_p->factory.n_nodes);
             }
 
             printf("LARGE FACTORY TEST: %s\n", large_pass ? "PASS" : "FAIL");
@@ -1350,7 +1350,7 @@
             return 1;
         }
         for (int ci = 0; ci < n_clients; ci++) {
-            rot_pks[ci + 1] = lsp.client_pubkeys[ci];
+            rot_pks[ci + 1] = lsp_p->client_pubkeys[ci];
             rot_kps[ci + 1] = lsp_kp;  /* placeholder — not used for signing */
         }
 
@@ -1371,16 +1371,16 @@
                                                   turnover_msg, rot_kps, n_total,
                                                   &ka_copy, NULL, &client_pk)) {
                 fprintf(stderr, "ROTATION: presig failed client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
             /* Send PTLC_PRESIG to client */
             cJSON *pm = wire_build_ptlc_presig(presig, nonce_parity, turnover_msg);
-            if (!wire_send(lsp.client_fds[ci], MSG_PTLC_PRESIG, pm)) {
+            if (!wire_send(lsp_p->client_fds[ci], MSG_PTLC_PRESIG, pm)) {
                 cJSON_Delete(pm);
                 fprintf(stderr, "ROTATION: send presig failed client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             cJSON_Delete(pm);
@@ -1398,7 +1398,7 @@
                     int elapsed = (int)(t_rn.tv_sec - t_rs.tv_sec);
                     int remain  = 30 - elapsed;
                     if (remain <= 0) break;
-                    if (!wire_recv_timeout(lsp.client_fds[ci], &resp, remain)) break;
+                    if (!wire_recv_timeout(lsp_p->client_fds[ci], &resp, remain)) break;
                     if (resp.msg_type == MSG_PTLC_ADAPTED_SIG) { got_sig = 1; break; }
                     if (resp.msg_type == MSG_ERROR) {
                         if (resp.json) cJSON_Delete(resp.json);
@@ -1413,7 +1413,7 @@
                 if (!got_sig) {
                     if (resp.json) cJSON_Delete(resp.json);
                     fprintf(stderr, "ROTATION: no adapted_sig from client %d\n", ci);
-                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx); return 1;
                 }
             }
@@ -1422,7 +1422,7 @@
             if (!wire_parse_ptlc_adapted_sig(resp.json, adapted_sig)) {
                 cJSON_Delete(resp.json);
                 fprintf(stderr, "ROTATION: parse adapted_sig failed client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             cJSON_Delete(resp.json);
@@ -1432,13 +1432,13 @@
             if (!adaptor_extract_secret(ctx, extracted, adapted_sig, presig,
                                           nonce_parity)) {
                 fprintf(stderr, "ROTATION: extract failed client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
             if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
                 fprintf(stderr, "ROTATION: verify failed client %d\n", ci);
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
@@ -1448,7 +1448,7 @@
 
             /* Send PTLC_COMPLETE */
             cJSON *cm = wire_build_ptlc_complete();
-            wire_send(lsp.client_fds[ci], MSG_PTLC_COMPLETE, cm);
+            wire_send(lsp_p->client_fds[ci], MSG_PTLC_COMPLETE, cm);
             cJSON_Delete(cm);
 
             printf("  Client %d: key extracted via wire PTLC\n", ci + 1);
@@ -1458,19 +1458,19 @@
         printf("Phase B: Ladder close of Factory 0\n");
         if (!ladder_can_close(lad, 0)) {
             fprintf(stderr, "ROTATION: ladder_can_close returned false\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
 
         tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
-        uint64_t rot_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+        uint64_t rot_per = (lsp_p->factory.funding_amount_sats - 500) / n_total;
         for (size_t ti = 0; ti < n_total; ti++) {
             rot_outputs[ti].amount_sats = rot_per;
             memcpy(rot_outputs[ti].script_pubkey, fund_spk, 34);
             rot_outputs[ti].script_pubkey_len = 34;
         }
         rot_outputs[n_total - 1].amount_sats =
-            lsp.factory.funding_amount_sats - 500 - rot_per * (n_total - 1);
+            lsp_p->factory.funding_amount_sats - 500 - rot_per * (n_total - 1);
 
         tx_buf_t rot_close_tx;
         tx_buf_init(&rot_close_tx, 512);
@@ -1478,7 +1478,7 @@
                                   (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "ROTATION: ladder_build_close failed\n");
             tx_buf_free(&rot_close_tx);
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
 
@@ -1494,7 +1494,7 @@
 
         if (!rc_sent) {
             fprintf(stderr, "ROTATION: Factory 0 close TX broadcast failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
         ADVANCE(1);
@@ -1508,7 +1508,7 @@
         char fund2_txid_hex[65];
         if (!regtest_fund_address(&rt, fund_addr, fund2_btc, fund2_txid_hex)) {
             fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
         if (is_regtest) {
@@ -1517,10 +1517,10 @@
             printf("ROTATION: waiting for Factory 1 funding confirmation on %s...\n", network);
             fflush(stdout);
             int conf2 = lsp_wait_for_confirmation_service(chain_be, fund2_txid_hex,
-                                                      confirm_timeout_secs, mgr, &lsp);
+                                                      confirm_timeout_secs, mgr, lsp_p);
             if (conf2 < 1) {
                 fprintf(stderr, "ROTATION: Factory 1 funding not confirmed within timeout\n");
-                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
         }
@@ -1543,13 +1543,13 @@
         }
         if (fund2_amount == 0) {
             fprintf(stderr, "ROTATION: no funding output for Factory 1\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
 
         /* Free old factory in lsp before reusing.
            Ladder entries use detached copies so no double-free risk. */
-        factory_free(&lsp.factory);
+        factory_free(&lsp_p->factory);
 
         /* Compute cltv_timeout for Factory 1 */
         uint32_t cltv2 = 0;
@@ -1565,13 +1565,13 @@
 
         /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients,
            who handle it in their MSG_FACTORY_PROPOSE daemon callback) */
-        if (!lsp_run_factory_creation(&lsp,
+        if (!lsp_run_factory_creation(lsp_p,
                                        fund2_txid, fund2_vout,
                                        fund2_amount,
                                        fund_spk, 34,
                                        step_blocks, 4, cltv2)) {
             fprintf(stderr, "ROTATION: Factory 1 creation failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
 
@@ -1579,13 +1579,13 @@
         {
             int cur_h = regtest_get_block_height(&rt);
             if (cur_h > 0)
-                factory_set_lifecycle(&lsp.factory, (uint32_t)cur_h, 20, 10);
+                factory_set_lifecycle(&lsp_p->factory, (uint32_t)cur_h, 20, 10);
         }
 
         /* Store in ladder slot 1 */
         {
             ladder_factory_t *lf1 = &lad->factories[1];
-            lf1->factory = lsp.factory;
+            lf1->factory = lsp_p->factory;
             lf1->factory_id = lad->next_factory_id++;
             lf1->is_initialized = 1;
             lf1->is_funded = 1;
@@ -1602,19 +1602,19 @@
         mgr2->routing_fee_ppm = routing_fee_ppm;
         mgr2->lsp_balance_pct = lsp_balance_pct;
         mgr2->settlement_interval_blocks = settlement_interval;
-        if (!lsp_channels_init(mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+        if (!lsp_channels_init(mgr2, ctx, &lsp_p->factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
-            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        if (!lsp_channels_exchange_basepoints(mgr2, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(mgr2, lsp_p)) {
             fprintf(stderr, "ROTATION: basepoint exchange for Factory 1 failed\n");
-            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        if (!lsp_channels_send_ready(mgr2, &lsp)) {
+        if (!lsp_channels_send_ready(mgr2, lsp_p)) {
             fprintf(stderr, "ROTATION: send_ready for Factory 1 failed\n");
-            free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            free(mgr2); lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
         printf("  Factory 1 channels ready\n");
@@ -1630,29 +1630,29 @@
             for (int attempt = 0; attempt < 30 && reconnected < (size_t)n_clients; attempt++) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
-                FD_SET(lsp.listen_fd, &rfds);
+                FD_SET(lsp_p->listen_fd, &rfds);
                 struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-                int sel = select(lsp.listen_fd + 1, &rfds, NULL, NULL, &tv);
+                int sel = select(lsp_p->listen_fd + 1, &rfds, NULL, NULL, &tv);
                 if (sel <= 0) continue;
 
-                int new_fd = wire_accept(lsp.listen_fd);
+                int new_fd = wire_accept(lsp_p->listen_fd);
                 if (new_fd < 0) continue;
 
                 /* Noise handshake */
                 int hs;
-                if (lsp.use_nk)
-                    hs = wire_noise_handshake_nk_responder(new_fd, ctx, lsp.nk_seckey);
+                if (lsp_p->use_nk)
+                    hs = wire_noise_handshake_nk_responder(new_fd, ctx, lsp_p->nk_seckey);
                 else
                     hs = wire_noise_handshake_responder(new_fd, ctx);
                 if (!hs) { wire_close(new_fd); continue; }
 
-                if (lsp_channels_handle_reconnect(mgr2, &lsp, new_fd))
+                if (lsp_channels_handle_reconnect(mgr2, lsp_p, new_fd))
                     reconnected++;
             }
             if (reconnected < (size_t)n_clients) {
                 fprintf(stderr, "ROTATION: only %zu/%d clients reconnected\n",
                         reconnected, n_clients);
-                free(mgr2); lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                free(mgr2); lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
             printf("  All %d clients reconnected\n", n_clients);
@@ -1663,16 +1663,16 @@
 
         /* Cooperative close of Factory 1 */
         tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
-        size_t n_close2 = lsp_channels_build_close_outputs(mgr2, &lsp.factory,
+        size_t n_close2 = lsp_channels_build_close_outputs(mgr2, &lsp_p->factory,
                                                              close2_outputs, 500,
                                                              NULL, 0);
         tx_buf_t close2_tx;
         tx_buf_init(&close2_tx, 512);
-        if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2,
+        if (!lsp_run_cooperative_close(lsp_p, &close2_tx, close2_outputs, n_close2,
                                           (uint32_t)regtest_get_block_height(&rt))) {
             fprintf(stderr, "ROTATION: cooperative close of Factory 1 failed\n");
             tx_buf_free(&close2_tx); free(mgr2);
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
 
@@ -1688,7 +1688,7 @@
 
         if (!c2_sent) {
             fprintf(stderr, "ROTATION: Factory 1 close TX broadcast failed\n");
-            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
         ADVANCE(1);
@@ -1702,7 +1702,7 @@
         if (use_db) persist_close(&db);
         tx_buf_free(&lad->factories[0].distribution_tx);
         tx_buf_free(&lad->factories[1].distribution_tx);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
@@ -1717,7 +1717,7 @@
             goto splice_done;
         }
 
-        int sp_fd = lsp.client_fds[0];
+        int sp_fd = lsp_p->client_fds[0];
 
         /* ---- Step 1: Quiescence ---- */
         printf("Step 1: sending STFU to client[0]\n");
@@ -1748,9 +1748,9 @@
         unsigned char sp_current_spk[34];  /* P2TR SPK of the UTXO being spliced */
         unsigned char sp_new_spk[34];      /* P2TR SPK of the new channel output  */
         if (!splice_compute_funding_spk(ctx, sp_current_spk,
-                                          &sp_lsp_pubkey, &lsp.client_pubkeys[0]) ||
+                                          &sp_lsp_pubkey, &lsp_p->client_pubkeys[0]) ||
             !splice_compute_funding_spk(ctx, sp_new_spk,
-                                          &sp_lsp_pubkey, &lsp.client_pubkeys[0])) {
+                                          &sp_lsp_pubkey, &lsp_p->client_pubkeys[0])) {
             fprintf(stderr, "SPLICE TEST: splice_compute_funding_spk failed\n");
             goto splice_done;
         }
@@ -1819,7 +1819,7 @@
         /* Build keyagg for the 2-of-2 channel (matches splice_compute_funding_spk) */
         secp256k1_pubkey sp_agg_pks[2];
         sp_agg_pks[0] = sp_lsp_pubkey;
-        sp_agg_pks[1] = lsp.client_pubkeys[0];
+        sp_agg_pks[1] = lsp_p->client_pubkeys[0];
         musig_keyagg_t sp_keyagg;
         if (!musig_aggregate_keys(ctx, &sp_keyagg, sp_agg_pks, 2)) {
             fprintf(stderr, "SPLICE TEST: musig_aggregate_keys failed\n");
@@ -1963,7 +1963,7 @@
         report_add_string(&rpt, "result", "splice_test_complete");
         report_add_string(&rpt, "splice_txid", sp_splice_txid);
         report_close(&rpt);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 0;
@@ -1972,7 +1972,7 @@
         fprintf(stderr, "SPLICE TEST FAILED\n");
         report_add_string(&rpt, "result", "splice_test_failed");
         report_close(&rpt);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
