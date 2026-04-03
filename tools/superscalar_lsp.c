@@ -1021,7 +1021,6 @@ int main(int argc, char *argv[]) {
     int confirm_timeout_arg = -1;    /* -1 = auto (3600 regtest, 259200 non-regtest) */
     int accept_timeout_arg = 0;      /* 0 = no timeout (block indefinitely) */
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
-    int min_clients_arg = 0;         /* 0 = require all clients (default) */
     int max_conn_rate_arg = 10;      /* max connections per IP per minute */
     int max_handshakes_arg = 4;      /* max concurrent handshakes */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
@@ -1230,13 +1229,6 @@ int main(int argc, char *argv[]) {
             max_connections_arg = atoi(argv[++i]);
             if (max_connections_arg < 1 || max_connections_arg > LSP_MAX_CLIENTS) {
                 fprintf(stderr, "Error: --max-connections must be 1..%d\n", LSP_MAX_CLIENTS);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--min-clients") == 0 && i + 1 < argc) {
-            min_clients_arg = atoi(argv[++i]);
-            if (min_clients_arg < 2) {
-                fprintf(stderr, "Error: --min-clients must be >= 2\n");
                 return 1;
             }
         }
@@ -2326,7 +2318,6 @@ accept_new_factory:
     lsp_p->accept_timeout_sec = accept_timeout_arg;
     if (max_connections_arg > 0)
         lsp_p->max_connections = max_connections_arg;
-    lsp_p->min_factory_clients = min_clients_arg;
     rate_limiter_init(&lsp_p->rate_limiter, max_conn_rate_arg, 60, max_handshakes_arg);
 
     /* Enable NK (server-authenticated) noise handshake */
