@@ -1429,6 +1429,8 @@ extern int test_factory_build_tree_n3(void);
 extern int test_factory_build_tree_n7(void);
 extern int test_factory_build_tree_n9(void);
 extern int test_factory_build_tree_n16(void);
+extern int test_factory_build_tree_n32(void);
+extern int test_factory_build_tree_n64(void);
 
 /* Tree navigation */
 extern int test_factory_path_to_root(void);
@@ -3129,6 +3131,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_build_tree_n7);
     RUN_TEST(test_factory_build_tree_n9);
     RUN_TEST(test_factory_build_tree_n16);
+    RUN_TEST(test_factory_build_tree_n32);
+    RUN_TEST(test_factory_build_tree_n64);
 
     printf("\n=== Arity-1 Leaves ===\n");
     RUN_TEST(test_factory_build_tree_arity1);
