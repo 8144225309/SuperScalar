@@ -38,6 +38,12 @@ typedef struct {
        Defaults to LSP_MAX_CLIENTS; --max-connections overrides. */
     int max_connections;
 
+    /* Minimum clients required to proceed with factory creation.
+       0 = require all expected_clients (default, backward compatible).
+       When set > 0: factory creation proceeds with at least this many
+       clients, even if some don't connect or timeout during ceremony. */
+    int min_factory_clients;
+
     /* NK (server-authenticated) handshake. If use_nk=1, lsp_accept_clients
        uses Noise NK with nk_seckey instead of NN. Default: 0 (NN). */
     int use_nk;
