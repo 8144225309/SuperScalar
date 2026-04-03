@@ -14,6 +14,7 @@
 
 #include "superscalar/admin_rpc.h"
 #include "superscalar/lsp.h"
+#include <sys/stat.h>
 #include "superscalar/wire.h"
 #include "superscalar/rgs.h"
 #include "superscalar/bolt12.h"
@@ -1309,6 +1310,9 @@ int admin_rpc_init(admin_rpc_t *rpc, const char *socket_path)
         rpc->listen_fd = -1;
         return 0;
     }
+    /* Restrict socket access to owner only (defense-in-depth alongside
+       systemd ProtectSystem/RuntimeDirectory permissions). */
+    chmod(socket_path, 0600);
     if (listen(rpc->listen_fd, 4) < 0) {
         close(rpc->listen_fd);
         rpc->listen_fd = -1;
