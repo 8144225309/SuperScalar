@@ -6,7 +6,7 @@
 #include "rate_limit.h"
 #include <secp256k1.h>
 
-#define LSP_MAX_CLIENTS 16
+#define LSP_MAX_CLIENTS 64
 
 typedef struct {
     secp256k1_context *ctx;

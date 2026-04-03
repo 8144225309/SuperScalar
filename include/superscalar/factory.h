@@ -11,10 +11,10 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
-#define FACTORY_MAX_NODES   64
+#define FACTORY_MAX_NODES   256
 #define FACTORY_MAX_OUTPUTS  8
-#define FACTORY_MAX_SIGNERS 16
-#define FACTORY_MAX_LEAVES  16
+#define FACTORY_MAX_SIGNERS 64
+#define FACTORY_MAX_LEAVES  32
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
@@ -155,8 +155,8 @@ typedef struct {
 
     /* Flat revocation secrets (Phase 2: item 2.8).
        ZmnSCPxj recommends flat secrets for multi-signer: each epoch gets
-       an independent random 32-byte secret. Storage: 256*32 = 8KB. */
-    #define FACTORY_MAX_EPOCHS 256
+       an independent random 32-byte secret. Storage: 4096*32 = 128KB. */
+    #define FACTORY_MAX_EPOCHS 4096
     unsigned char revocation_secrets[FACTORY_MAX_EPOCHS][32];
     size_t n_revocation_secrets;
     int use_flat_secrets;  /* 1 = flat, 0 = shachain (legacy) */

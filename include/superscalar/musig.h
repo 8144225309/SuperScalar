@@ -61,7 +61,7 @@ typedef struct {
 } musig_nonce_pool_t;
 
 /* --- Signing session (one per transaction being signed) --- */
-#define MUSIG_SESSION_MAX_SIGNERS 16
+#define MUSIG_SESSION_MAX_SIGNERS 64
 
 typedef struct {
     secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];

@@ -877,9 +877,9 @@ int factory_build_tree(factory_t *f) {
     size_t n_clients = f->n_participants - 1;
 
     /* Validate participant count */
-    if (f->n_participants < 2 || f->n_participants > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "factory_build_tree: invalid participant count %zu (need 2..%d)\n",
-                f->n_participants, FACTORY_MAX_SIGNERS);
+    if (f->n_participants < 2 || f->n_participants > f->config.max_signers) {
+        fprintf(stderr, "factory_build_tree: invalid participant count %zu (need 2..%u)\n",
+                f->n_participants, f->config.max_signers);
         return 0;
     }
 
@@ -906,8 +906,8 @@ int factory_build_tree(factory_t *f) {
     int n_dw_layers = tree_depth + 1;
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
-    if (total_nodes_ub > FACTORY_MAX_NODES) return 0;
-    if (n_leaves > FACTORY_MAX_LEAVES) return 0;
+    if (total_nodes_ub > (int)f->config.max_nodes) return 0;
+    if (n_leaves > (int)f->config.max_leaves) return 0;
     if (n_dw_layers > DW_MAX_LAYERS) return 0;
 
     /* Reinitialize DW counter with correct layer count */
