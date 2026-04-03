@@ -4,9 +4,26 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Production hardening and BIP 158 deposit detection (PR #49). 36/36 orchestrator, 1351 unit tests.
+Factory scaling to 64 participants + production hardening. 36/36 orchestrator, 1353 unit tests.
 
 ### Added
+
+- **64-participant factory support** (`factory.h`, `lsp.h`, `musig.h`): raised FACTORY_MAX_SIGNERS 16→64, FACTORY_MAX_NODES 64→256, FACTORY_MAX_LEAVES 16→32, FACTORY_MAX_EPOCHS 256→4096, LSP_MAX_CLIENTS 16→64, MUSIG_SESSION_MAX_SIGNERS 16→64. With 4-8 laddered factories, an LSP can now serve 256-512 users.
+- **Configurable factory quorum** (`lsp.h`, `lsp.c`, `superscalar_lsp.c`): `--min-clients N` flag allows factory creation to proceed with N-k clients. At 64 clients, the probability of all being online is low; quorum support enables practical deployment.
+- **Parallel basepoint/nonce exchange** (`lsp_channels.c`): replaced serial per-client loops with batch-send + parallel-collect using `ceremony_select_all()`. At 64 clients, setup time drops from O(N×30s) to O(30s) regardless of client count.
+- **N=32 and N=64 factory unit tests** (`test_factory.c`, `test_main.c`): verify tree construction, signing, and advancement at new participant counts. Expanded `seckeys_n` from 16 to 64 entries.
+
+### Fixed
+
+- **Config initialization in pubkeys-only path** (`factory.c`): `factory_init_from_pubkeys()` now calls `factory_config_default()` after memset; previously left config.max_signers=0, causing factory_build_tree() to reject all factories via distributed signing path.
+- **Heap allocation for large structs** (`lsp.c`, `superscalar_lsp.c`): with factory_t at ~3MB, lsp_t and ceremony arrays are now heap-allocated to prevent stack overflow on the default 8MB stack. `lsp_t` uses pointer access (lsp_p->) throughout.
+- **Stack size in test runner** (`run_unit_tests.sh`): added `ulimit -s unlimited` to match CI configuration; ladder_t (8 × factory_t ≈ 26MB) exceeds default stack.
+
+### Architecture improvements
+
+- **Runtime-configurable validation** (`factory.c`): `factory_build_tree()` now validates against `f->config.max_signers` / `f->config.max_nodes` / `f->config.max_leaves` instead of compile-time constants, enabling future runtime configurability.
+
+### Added (pre-existing)
 
 - **Ceremony reconnect retry** (`lsp.c`): on nonce timeout, waits up to 30s for clients to reconnect, re-sends FACTORY_PROPOSE, and collects nonces. Falls back to quorum check only after recovery fails.
 - **Ceremony quorum support** (`lsp.c`): wired `ceremony_has_quorum()` (previously dead code) into all 4 ceremony phases — factory creation nonces/psigs and cooperative close nonces/psigs. Partial client failures no longer abort if quorum is met.
