@@ -55,6 +55,13 @@ typedef struct {
     size_t response_tx_len;
     unsigned char *burn_tx;       /* heap-allocated pre-built L-stock burn tx */
     size_t burn_tx_len;
+
+    /* Reorg resistance: penalty broadcast tracking.
+       After penalty broadcast, entry is KEPT (not removed) until penalty
+       has safe confirmations. If penalty tx disappears (reorg), the entry
+       reverts to normal watching and re-detects the breach. */
+    int penalty_broadcast;        /* 1 = penalty has been broadcast */
+    char penalty_txid[65];        /* hex txid of broadcast penalty */
 } watchtower_entry_t;
 
 #define WATCHTOWER_MAX_CHANNELS 32
@@ -163,6 +170,11 @@ void watchtower_cleanup(watchtower_t *wt);
 /* Clear all watchtower entries (e.g., after factory rotation).
    Frees any allocated data and resets the entry count to 0. */
 void watchtower_clear_entries(watchtower_t *wt);
+
+/* Re-validate watchtower state after a detected reorg.
+   Resets penalty_broadcast for entries whose penalty tx is no longer
+   confirmed or in mempool, allowing re-detection on the next cycle. */
+void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip);
 
 /* Build a CPFP child tx to bump a stuck penalty tx.
    Uses anchor output from penalty tx + wallet UTXO.
