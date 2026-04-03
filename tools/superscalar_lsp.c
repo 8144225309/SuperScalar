@@ -1906,8 +1906,8 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            #define lsp (*lsp_rp)
-            if (!lsp_init(&lsp, ctx, &lsp_kp, port, rec_f->n_participants - 1)) {
+            
+            if (!lsp_init(lsp_rp, ctx, &lsp_kp, port, rec_f->n_participants - 1)) {
                 fprintf(stderr, "LSP recovery: lsp_init failed\n");
                 free(lsp_rp);
                 free(rec_f);
@@ -1916,16 +1916,16 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            g_lsp = &lsp;
-            lsp.use_nk = 1;
-            memcpy(lsp.nk_seckey, lsp_seckey, 32);
+            g_lsp = lsp_rp;
+            lsp_rp->use_nk = 1;
+            memcpy(lsp_rp->nk_seckey, lsp_seckey, 32);
 
             signal(SIGINT, sigint_handler);
             signal(SIGTERM, sigint_handler);
 
             /* Open listen socket for reconnections */
-            lsp.listen_fd = wire_listen(bind_addr, lsp.port);
-            if (lsp.listen_fd < 0) {
+            lsp_rp->listen_fd = wire_listen(bind_addr, lsp_rp->port);
+            if (lsp_rp->listen_fd < 0) {
                 fprintf(stderr, "LSP recovery: listen failed on port %d\n", port);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
@@ -1935,15 +1935,15 @@ int main(int argc, char *argv[]) {
 
             /* Populate pubkeys from recovered factory */
             size_t rec_n_clients = rec_f->n_participants - 1;
-            lsp.n_clients = rec_n_clients;
+            lsp_rp->n_clients = rec_n_clients;
             for (size_t i = 0; i < rec_n_clients; i++)
-                lsp.client_pubkeys[i] = rec_f->pubkeys[i + 1];
+                lsp_rp->client_pubkeys[i] = rec_f->pubkeys[i + 1];
 
             /* Copy factory and set fee estimator */
-            lsp.factory = *rec_f;
+            lsp_rp->factory = *rec_f;
             free(rec_f);
             rec_f = NULL;
-            lsp.factory.fee = fee_est;
+            lsp_rp->factory.fee = fee_est;
 
             /* Load DW counter state from DB */
             {
@@ -1952,11 +1952,11 @@ int main(int argc, char *argv[]) {
                 if (persist_load_dw_counter(&db, 0, &epoch_out, &n_layers_out,
                                               layer_states_out, DW_MAX_LAYERS)) {
                     for (uint32_t li = 0; li < n_layers_out &&
-                         li < lsp.factory.counter.n_layers; li++)
-                        lsp.factory.counter.layers[li].current_state =
+                         li < lsp_rp->factory.counter.n_layers; li++)
+                        lsp_rp->factory.counter.layers[li].current_state =
                             layer_states_out[li];
                     printf("LSP recovery: DW counter loaded (epoch %u)\n",
-                           dw_counter_epoch(&lsp.factory.counter));
+                           dw_counter_epoch(&lsp_rp->factory.counter));
                 }
             }
 
@@ -1964,20 +1964,20 @@ int main(int argc, char *argv[]) {
             {
                 int cur_height = regtest_get_block_height(&rt);
                 if (cur_height > 0)
-                    factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height,
+                    factory_set_lifecycle(&lsp_rp->factory, (uint32_t)cur_height,
                                           active_blocks, dying_blocks);
             }
 
             /* Initialize channels from DB */
             lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
-            if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+            if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_rp); return 1; }
             g_channel_mgr = mgr;
             mgr->fee = fee_est;
-            if (!lsp_channels_init_from_db(mgr, ctx, &lsp.factory, lsp_seckey,
+            if (!lsp_channels_init_from_db(mgr, ctx, &lsp_rp->factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
                 free(mgr);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_rp);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
@@ -2072,12 +2072,12 @@ int main(int argc, char *argv[]) {
             }
             {
                 ladder_factory_t *lf = &rec_lad.factories[0];
-                lf->factory = lsp.factory;
+                lf->factory = lsp_rp->factory;
                 factory_detach_txbufs(&lf->factory);
                 lf->factory_id = rec_lad.next_factory_id++;
                 lf->is_initialized = 1;
                 lf->is_funded = 1;
-                lf->cached_state = factory_get_state(&lsp.factory,
+                lf->cached_state = factory_get_state(&lsp_rp->factory,
                                                        rec_lad.current_block);
                 tx_buf_init(&lf->distribution_tx, 256);
                 rec_lad.n_factories = 1;
@@ -2088,18 +2088,18 @@ int main(int argc, char *argv[]) {
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
             mgr->rot_fee_est = fee_est;
-            memcpy(mgr->rot_fund_spk, lsp.factory.funding_spk,
-                   lsp.factory.funding_spk_len);
-            mgr->rot_fund_spk_len = lsp.factory.funding_spk_len;
+            memcpy(mgr->rot_fund_spk, lsp_rp->factory.funding_spk,
+                   lsp_rp->factory.funding_spk_len);
+            mgr->rot_fund_spk_len = lsp_rp->factory.funding_spk_len;
 
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
                 secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
-                for (size_t i = 0; i < lsp.factory.n_participants; i++)
-                    all_pks[i] = lsp.factory.pubkeys[i];
+                for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
+                    all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
-                                       lsp.factory.n_participants);
+                                       lsp_rp->factory.n_participants);
                 unsigned char is2[32];
                 if (!secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey)) {
                     fprintf(stderr, "LSP recovery: xonly serialize failed\n");
@@ -2245,7 +2245,7 @@ int main(int argc, char *argv[]) {
                 g_admin_rpc.ctx           = ctx;
                 memcpy(g_admin_rpc.node_privkey, lsp_seckey, 32);
                 g_admin_rpc.channel_mgr   = mgr;
-                g_admin_rpc.lsp           = &lsp;
+                g_admin_rpc.lsp           = lsp_rp;
                 strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
                 g_admin_rpc.payments      = &g_payments;
                 g_admin_rpc.invoices      = &g_invoice_tbl;
@@ -2259,7 +2259,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
+            lsp_channels_run_daemon_loop(mgr, lsp_rp, &g_shutdown);
 
             /* Persist updated channel balances on shutdown */
             if (persist_begin(&db)) {
@@ -2281,8 +2281,8 @@ int main(int argc, char *argv[]) {
             jit_channels_cleanup(mgr);
             free(mgr);
             persist_close(&db);
-            lsp_cleanup(&lsp);
-            #undef lsp
+            lsp_cleanup(lsp_rp);
+            
             free(lsp_rp);
             free(rec_lad_p);
             memset(lsp_seckey, 0, 32);
@@ -2306,28 +2306,28 @@ accept_new_factory:
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    #define lsp (*lsp_p)
-    if (!lsp_init(&lsp, ctx, &lsp_kp, port, (size_t)n_clients)) {
+    
+    if (!lsp_init(lsp_p, ctx, &lsp_kp, port, (size_t)n_clients)) {
         fprintf(stderr, "LSP: lsp_init failed\n");
         free(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    g_lsp = &lsp;
-    lsp.accept_timeout_sec = accept_timeout_arg;
+    g_lsp = lsp_p;
+    lsp_p->accept_timeout_sec = accept_timeout_arg;
     if (max_connections_arg > 0)
-        lsp.max_connections = max_connections_arg;
-    rate_limiter_init(&lsp.rate_limiter, max_conn_rate_arg, 60, max_handshakes_arg);
+        lsp_p->max_connections = max_connections_arg;
+    rate_limiter_init(&lsp_p->rate_limiter, max_conn_rate_arg, 60, max_handshakes_arg);
 
     /* Enable NK (server-authenticated) noise handshake */
-    lsp.use_nk = 1;
-    memcpy(lsp.nk_seckey, lsp_seckey, 32);
+    lsp_p->use_nk = 1;
+    memcpy(lsp_p->nk_seckey, lsp_seckey, 32);
     {
         secp256k1_pubkey nk_pub;
         if (!secp256k1_ec_pubkey_create(ctx, &nk_pub, lsp_seckey)) {
             fprintf(stderr, "LSP: failed to derive NK static pubkey\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2364,7 +2364,7 @@ accept_new_factory:
                     s_gp_cfg.peers, GOSSIP_PEER_MAX);
                 s_gp_cfg.ctx = ctx;
                 s_gp_cfg.store = &s_gossip_store;
-                memcpy(s_gp_cfg.our_priv32, lsp.nk_seckey, 32);
+                memcpy(s_gp_cfg.our_priv32, lsp_p->nk_seckey, 32);
                 s_gp_cfg.network = network;
                 s_gp_cfg.shutdown_flag = (volatile int *)&g_shutdown;
 
@@ -2383,7 +2383,7 @@ accept_new_factory:
 
         if (bolt8_listen_port > 0) {
             /* Initialise LN payment/forward/MPP tables */
-            peer_mgr_init(&g_peer_mgr, ctx, lsp.nk_seckey);
+            peer_mgr_init(&g_peer_mgr, ctx, lsp_p->nk_seckey);
             htlc_forward_init(&g_fwd);
             mpp_init(&g_mpp);
             payment_init(&g_payments);
@@ -2391,7 +2391,7 @@ accept_new_factory:
 
             memset(&g_bolt8_cfg, 0, sizeof(g_bolt8_cfg));
             g_bolt8_cfg.bolt8_port = bolt8_listen_port;
-            memcpy(g_bolt8_cfg.static_priv, lsp.nk_seckey, 32);
+            memcpy(g_bolt8_cfg.static_priv, lsp_p->nk_seckey, 32);
             g_bolt8_cfg.ctx = ctx;
             g_bolt8_cfg.peer_mgr = &g_peer_mgr;
             g_bolt8_cfg.ln_dispatch = &g_ln_dispatch;
@@ -2414,7 +2414,7 @@ accept_new_factory:
             g_ln_dispatch.payments     = &g_payments;
             g_ln_dispatch.ctx          = ctx;
             g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
-            memcpy(g_ln_dispatch.our_privkey, lsp.nk_seckey, 32);
+            memcpy(g_ln_dispatch.our_privkey, lsp_p->nk_seckey, 32);
             g_ln_dispatch.invoices = &g_invoice_tbl;
 
             /* Wire LSPS0 callback */
@@ -2460,7 +2460,7 @@ accept_new_factory:
         if (rpc_file_arg) {
             memset(&g_admin_rpc, 0, sizeof(g_admin_rpc));
             g_admin_rpc.ctx          = ctx;
-            memcpy(g_admin_rpc.node_privkey, lsp.nk_seckey, 32);
+            memcpy(g_admin_rpc.node_privkey, lsp_p->nk_seckey, 32);
             g_admin_rpc.pmgr         = &g_peer_mgr;
             g_admin_rpc.channel_mgr  = g_channel_mgr;
             g_admin_rpc.payments     = &g_payments;
@@ -2510,9 +2510,9 @@ accept_new_factory:
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp_p)) {
         fprintf(stderr, "LSP: failed to accept clients\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -2520,39 +2520,39 @@ accept_new_factory:
 
     /* Disable socket timeout during ceremony — on-chain funding confirmation
        can take 10+ minutes on signet/testnet */
-    for (size_t i = 0; i < lsp.n_clients; i++)
-        wire_set_timeout(lsp.client_fds[i], 0);
+    for (size_t i = 0; i < lsp_p->n_clients; i++)
+        wire_set_timeout(lsp_p->client_fds[i], 0);
 
     /* Set peer labels for wire logging (Phase 22) */
-    for (size_t i = 0; i < lsp.n_clients; i++) {
+    for (size_t i = 0; i < lsp_p->n_clients; i++) {
         char label[32];
         snprintf(label, sizeof(label), "client_%zu", i);
-        wire_set_peer_label(lsp.client_fds[i], label);
+        wire_set_peer_label(lsp_p->client_fds[i], label);
     }
 
     /* Report: participants */
     report_begin_section(&rpt, "participants");
-    report_add_pubkey(&rpt, "lsp", ctx, &lsp.lsp_pubkey);
+    report_add_pubkey(&rpt, "lsp", ctx, &lsp_p->lsp_pubkey);
     report_begin_array(&rpt, "clients");
-    for (size_t i = 0; i < lsp.n_clients; i++)
-        report_add_pubkey(&rpt, NULL, ctx, &lsp.client_pubkeys[i]);
+    for (size_t i = 0; i < lsp_p->n_clients; i++)
+        report_add_pubkey(&rpt, NULL, ctx, &lsp_p->client_pubkeys[i]);
     report_end_array(&rpt);
     report_end_section(&rpt);
     report_flush(&rpt);
 
     if (g_shutdown) {
-        lsp_abort_ceremony(&lsp, "LSP shutting down");
-        lsp_cleanup(&lsp);
+        lsp_abort_ceremony(lsp_p, "LSP shutting down");
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
 
     /* === Phase 2: Compute funding address === */
-    size_t n_total = 1 + lsp.n_clients;
+    size_t n_total = 1 + lsp_p->n_clients;
     secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
-    all_pks[0] = lsp.lsp_pubkey;
-    for (size_t i = 0; i < lsp.n_clients; i++)
-        all_pks[i + 1] = lsp.client_pubkeys[i];
+    all_pks[0] = lsp_p->lsp_pubkey;
+    for (size_t i = 0; i < lsp_p->n_clients; i++)
+        all_pks[i + 1] = lsp_p->client_pubkeys[i];
 
     musig_keyagg_t ka;
     musig_aggregate_keys(ctx, &ka, all_pks, n_total);
@@ -2561,7 +2561,7 @@ accept_new_factory:
     unsigned char internal_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) {
         fprintf(stderr, "LSP: xonly serialize failed\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -2573,7 +2573,7 @@ accept_new_factory:
     secp256k1_pubkey tweaked_pk;
     if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) {
         fprintf(stderr, "LSP: tweak add failed\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -2581,7 +2581,7 @@ accept_new_factory:
     secp256k1_xonly_pubkey tweaked_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) {
         fprintf(stderr, "LSP: xonly from pubkey failed\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -2594,7 +2594,7 @@ accept_new_factory:
     unsigned char tweaked_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) {
         fprintf(stderr, "LSP: xonly serialize failed\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -2604,7 +2604,7 @@ accept_new_factory:
     if (rt_ok) {
         if (!regtest_derive_p2tr_address(&rt, tweaked_ser, fund_addr, sizeof(fund_addr))) {
             fprintf(stderr, "LSP: failed to derive funding address\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2624,7 +2624,7 @@ accept_new_factory:
     if (rt_ok) {
         if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) {
             fprintf(stderr, "LSP: failed to get mining address\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2632,7 +2632,7 @@ accept_new_factory:
             regtest_mine_blocks(&rt, 101, mine_addr);
             if (!ensure_funded(&rt, mine_addr)) {
                 fprintf(stderr, "LSP: failed to fund wallet (exhausted regtest?)\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
@@ -2642,7 +2642,7 @@ accept_new_factory:
             if (bal < needed) {
                 fprintf(stderr, "LSP: wallet balance %.8f BTC insufficient (need %.8f). "
                         "Fund via faucet first.\n", bal, needed);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
@@ -2652,7 +2652,7 @@ accept_new_factory:
         /* Light-client mode: HD wallet must be pre-funded externally */
         if (!wallet_src) {
             fprintf(stderr, "LSP: no wallet available in light-client mode\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2669,7 +2669,7 @@ accept_new_factory:
                           fund_spk, sizeof(fund_spk),
                           funding_sats, fee_rate, funding_txid_hex)) {
             fprintf(stderr, "LSP: HD wallet factory funding failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2678,10 +2678,10 @@ accept_new_factory:
         } else {
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
             int conf = lsp_wait_for_confirmation_service(chain_be, funding_txid_hex,
-                                                   confirm_timeout_secs, NULL, &lsp);
+                                                   confirm_timeout_secs, NULL, lsp_p);
             if (conf < 1) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
@@ -2690,7 +2690,7 @@ accept_new_factory:
         double funding_btc = (double)funding_sats / 100000000.0;
         if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
             fprintf(stderr, "LSP: failed to fund factory address\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2700,10 +2700,10 @@ accept_new_factory:
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
             int conf = wait_for_confirmation_servicing(&rt, funding_txid_hex,
                                                          confirm_timeout_secs,
-                                                         &lsp, NULL);
+                                                         lsp_p, NULL);
             if (!conf) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
@@ -2713,7 +2713,7 @@ accept_new_factory:
                           fund_spk, sizeof(fund_spk),
                           funding_sats, fee_rate, funding_txid_hex)) {
             fprintf(stderr, "LSP: light-client factory funding failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
@@ -2741,7 +2741,7 @@ accept_new_factory:
     }
     if (funding_amount == 0) {
         fprintf(stderr, "LSP: could not find funding output\n");
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -2760,8 +2760,8 @@ accept_new_factory:
 
     /* === Phase 4: Run factory creation ceremony === */
     if (g_shutdown) {
-        lsp_abort_ceremony(&lsp, "LSP shutting down");
-        lsp_cleanup(&lsp);
+        lsp_abort_ceremony(lsp_p, "LSP shutting down");
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -2781,40 +2781,40 @@ accept_new_factory:
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
     if (n_level_arity > 0)
-        factory_set_level_arity(&lsp.factory, level_arities, n_level_arity);
+        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
-        factory_set_arity(&lsp.factory, FACTORY_ARITY_1);
-    lsp.factory.placement_mode = (placement_mode_t)placement_mode_arg;
-    lsp.factory.economic_mode = (economic_mode_t)economic_mode_arg;
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
+    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config */
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
-        lsp.factory.profiles[pi].participant_idx = (uint32_t)pi;
+        lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
             /* LSP gets remainder of profit share */
-            lsp.factory.profiles[pi].profit_share_bps =
+            lsp_p->factory.profiles[pi].profit_share_bps =
                 (uint16_t)(10000 - (uint32_t)default_profit_bps * (uint32_t)n_clients);
         } else {
-            lsp.factory.profiles[pi].profit_share_bps = default_profit_bps;
+            lsp_p->factory.profiles[pi].profit_share_bps = default_profit_bps;
         }
-        lsp.factory.profiles[pi].contribution_sats = funding_sats / (uint64_t)(1 + n_clients);
-        lsp.factory.profiles[pi].uptime_score = 1.0f;
-        lsp.factory.profiles[pi].timezone_bucket = 0;
+        lsp_p->factory.profiles[pi].contribution_sats = funding_sats / (uint64_t)(1 + n_clients);
+        lsp_p->factory.profiles[pi].uptime_score = 1.0f;
+        lsp_p->factory.profiles[pi].timezone_bucket = 0;
     }
 
     /* If --test-burn, enable L-stock revocation before tree construction.
        Uses flat secrets (per ZmnSCPxj: no multi-party shachain method exists,
        just store all revocation keys independently).
-       State is preserved across factory_init_from_pubkeys() in lsp.c. */
+       State is preserved across factory_init_from_pubkeys() in lsp_p->c. */
     if (test_burn) {
-        if (!factory_generate_flat_secrets(&lsp.factory, 16)) {
+        if (!factory_generate_flat_secrets(&lsp_p->factory, 16)) {
             fprintf(stderr, "LSP: failed to generate flat revocation secrets\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
         printf("LSP: flat revocation secrets generated for burn test (%zu epochs)\n",
-               lsp.factory.n_revocation_secrets);
+               lsp_p->factory.n_revocation_secrets);
     }
 
     printf("LSP: starting factory creation ceremony...\n");
@@ -2826,7 +2826,7 @@ accept_new_factory:
                 /* Brief pause for clients to stabilize */
                 sleep(5);
             }
-            if (lsp_run_factory_creation(&lsp,
+            if (lsp_run_factory_creation(lsp_p,
                                           funding_txid, funding_vout,
                                           funding_amount,
                                           fund_spk, 34,
@@ -2838,49 +2838,49 @@ accept_new_factory:
         }
         if (!creation_ok) {
             fprintf(stderr, "LSP: factory creation failed after 3 attempts\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
         }
     }
-    printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
+    printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp_p->factory.n_nodes);
 
     /* Set factory lifecycle */
     {
         int cur_height = regtest_get_block_height(&rt);
         if (cur_height > 0) {
-            factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height,
+            factory_set_lifecycle(&lsp_p->factory, (uint32_t)cur_height,
                                   active_blocks, dying_blocks);
             printf("LSP: factory lifecycle set at height %d "
                    "(active=%u, dying=%u, CLTV=%u)\n",
                    cur_height, active_blocks, dying_blocks,
-                   lsp.factory.cltv_timeout);
+                   lsp_p->factory.cltv_timeout);
         }
     }
 
     /* Log DW counter initial state */
     {
-        uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
+        uint32_t epoch = dw_counter_epoch(&lsp_p->factory.counter);
         printf("LSP: DW epoch %u/%u (nSeq delays:", epoch,
-               lsp.factory.counter.total_states);
-        for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {
-            uint16_t d = dw_delay_for_state(&lsp.factory.counter.layers[li].config,
-                                              lsp.factory.counter.layers[li].current_state);
+               lsp_p->factory.counter.total_states);
+        for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++) {
+            uint16_t d = dw_delay_for_state(&lsp_p->factory.counter.layers[li].config,
+                                              lsp_p->factory.counter.layers[li].current_state);
             printf(" L%u=%u", li, d);
         }
         printf(" blocks)\n");
     }
 
     /* Set fee estimator on factory (for computed fees) */
-    lsp.factory.fee = fee_est;
+    lsp_p->factory.fee = fee_est;
 
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t *lad = calloc(1, sizeof(ladder_t));
-    if (!lad) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+    if (!lad) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_p); return 1; }
     if (!ladder_init(lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
         fprintf(stderr, "LSP: ladder_init failed\n");
         free(lad);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -2890,15 +2890,15 @@ accept_new_factory:
         if (cur_h > 0) lad->current_block = (uint32_t)cur_h;
     }
     /* Populate slot 0 with the existing factory (detached copy — no shared
-       tx_buf heap data, preventing double-free if lsp.factory is freed later). */
+       tx_buf heap data, preventing double-free if lsp_p->factory is freed later). */
     {
         ladder_factory_t *lf = &lad->factories[0];
-        lf->factory = lsp.factory;
+        lf->factory = lsp_p->factory;
         factory_detach_txbufs(&lf->factory);
         lf->factory_id = lad->next_factory_id++;
         lf->is_initialized = 1;
         lf->is_funded = 1;
-        lf->cached_state = factory_get_state(&lsp.factory,
+        lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
         tx_buf_init(&lf->distribution_tx, 256);
         lad->n_factories = 1;
@@ -2912,26 +2912,26 @@ accept_new_factory:
             fprintf(stderr, "LSP: warning: persist_begin failed for initial factory\n");
         } else {
             int init_ok = 1;
-            if (!persist_save_factory(&db, &lsp.factory, ctx, 0)) {
+            if (!persist_save_factory(&db, &lsp_p->factory, ctx, 0)) {
                 fprintf(stderr, "LSP: warning: failed to persist factory\n");
                 init_ok = 0;
             }
-            if (init_ok && !persist_save_tree_nodes(&db, &lsp.factory, 0)) {
+            if (init_ok && !persist_save_tree_nodes(&db, &lsp_p->factory, 0)) {
                 fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
                 init_ok = 0;
             }
             if (init_ok) {
                 /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
                 uint32_t init_layers[DW_MAX_LAYERS];
-                for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
-                    init_layers[li] = lsp.factory.counter.layers[li].config.max_states;
-                persist_save_dw_counter(&db, 0, 0, lsp.factory.counter.n_layers, init_layers);
+                for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
+                    init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
+                persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
             }
             if (init_ok) {
                 /* Save ladder factory state (Tier 2) */
                 persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
-                    lsp.factory.created_block, lsp.factory.active_blocks,
-                    lsp.factory.dying_blocks, 0);
+                    lsp_p->factory.created_block, lsp_p->factory.active_blocks,
+                    lsp_p->factory.dying_blocks, 0);
             }
             if (init_ok)
                 persist_commit(&db);
@@ -2942,22 +2942,22 @@ accept_new_factory:
 
     /* Report: factory tree */
     report_begin_section(&rpt, "factory");
-    report_add_uint(&rpt, "n_nodes", lsp.factory.n_nodes);
-    report_add_uint(&rpt, "n_participants", lsp.factory.n_participants);
-    report_add_uint(&rpt, "step_blocks", lsp.factory.step_blocks);
-    report_add_uint(&rpt, "fee_per_tx", lsp.factory.fee_per_tx);
-    report_factory_tree(&rpt, ctx, &lsp.factory);
+    report_add_uint(&rpt, "n_nodes", lsp_p->factory.n_nodes);
+    report_add_uint(&rpt, "n_participants", lsp_p->factory.n_participants);
+    report_add_uint(&rpt, "step_blocks", lsp_p->factory.step_blocks);
+    report_add_uint(&rpt, "fee_per_tx", lsp_p->factory.fee_per_tx);
+    report_factory_tree(&rpt, ctx, &lsp_p->factory);
     report_end_section(&rpt);
     report_flush(&rpt);
 
     /* === Phase 4b: Channel Operations === */
     lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
-    if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(&lsp); return 1; }
+    if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_p); return 1; }
     g_channel_mgr = mgr;
     /* Update admin RPC channel_mgr (was NULL when RPC was initialized earlier) */
     if (g_admin_rpc.ctx) {
         g_admin_rpc.channel_mgr = mgr;
-        g_admin_rpc.lsp = &lsp;
+        g_admin_rpc.lsp = lsp_p;
         strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
     }
     int channels_active = 0;
@@ -2975,16 +2975,16 @@ accept_new_factory:
         mgr->economic_mode = (economic_mode_t)economic_mode_arg;
         mgr->default_profit_bps = default_profit_bps;
         mgr->settlement_interval_blocks = settlement_interval;
-        if (!lsp_channels_init(mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+        if (!lsp_channels_init(mgr, ctx, &lsp_p->factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        if (!lsp_channels_exchange_basepoints(mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(mgr, lsp_p)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -3067,9 +3067,9 @@ accept_new_factory:
            uses the default 1000 sat/kvB from channel_init. The --fee-rate flag
            controls on-chain transaction fees (funding, sweep) only. */
 
-        if (!lsp_channels_send_ready(mgr, &lsp)) {
+        if (!lsp_channels_send_ready(mgr, lsp_p)) {
             fprintf(stderr, "LSP: send CHANNEL_READY failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -3213,9 +3213,9 @@ accept_new_factory:
         if (n_payments > 0) {
             printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
                    n_payments, n_payments * 2);
-            if (!lsp_channels_run_event_loop(mgr, &lsp, (size_t)(n_payments * 2))) {
+            if (!lsp_channels_run_event_loop(mgr, lsp_p, (size_t)(n_payments * 2))) {
                 fprintf(stderr, "LSP: event loop failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -3231,7 +3231,7 @@ accept_new_factory:
 
         if (demo_mode) {
             printf("LSP: channels ready, running demo sequence...\n");
-            if (!lsp_channels_run_demo_sequence(mgr, &lsp)) {
+            if (!lsp_channels_run_demo_sequence(mgr, lsp_p)) {
                 fprintf(stderr, "LSP: demo sequence failed\n");
             }
 
@@ -3240,22 +3240,22 @@ accept_new_factory:
                via split-round MuSig2 with all participants.  Skip when
                --test-burn is set so the burn test can broadcast the
                correctly-signed epoch-0 tree. */
-            if (!test_burn && dw_counter_advance(&lsp.factory.counter)) {
-                uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
+            if (!test_burn && dw_counter_advance(&lsp_p->factory.counter)) {
+                uint32_t epoch = dw_counter_epoch(&lsp_p->factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
-                for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {
+                for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++) {
                     uint16_t d = dw_delay_for_state(
-                        &lsp.factory.counter.layers[li].config,
-                        lsp.factory.counter.layers[li].current_state);
+                        &lsp_p->factory.counter.layers[li].config,
+                        lsp_p->factory.counter.layers[li].current_state);
                     printf(" L%u=%u", li, d);
                 }
                 printf(" blocks)\n");
                 if (use_db) {
                     uint32_t layer_states[DW_MAX_LAYERS];
-                    for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
-                        layer_states[li] = lsp.factory.counter.layers[li].current_state;
+                    for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
+                        layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
                     persist_save_dw_counter(&db, 0, epoch,
-                                             lsp.factory.counter.n_layers,
+                                             lsp_p->factory.counter.n_layers,
                                              layer_states);
                 }
             }
@@ -3273,8 +3273,8 @@ accept_new_factory:
             fflush(stdout);
 
             /* Restore default socket timeout for daemon mode health checks */
-            for (size_t i = 0; i < lsp.n_clients; i++)
-                wire_set_timeout(lsp.client_fds[i], WIRE_DEFAULT_TIMEOUT_SEC);
+            for (size_t i = 0; i < lsp_p->n_clients; i++)
+                wire_set_timeout(lsp_p->client_fds[i], WIRE_DEFAULT_TIMEOUT_SEC);
 
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
@@ -3283,7 +3283,7 @@ accept_new_factory:
             if (g_admin_rpc.listen_fd >= 0)
                 mgr->admin_rpc = &g_admin_rpc;
 
-            lsp_channels_run_daemon_loop(mgr, &lsp, &g_shutdown);
+            lsp_channels_run_daemon_loop(mgr, lsp_p, &g_shutdown);
         }
 
         /* The daemon loop exits when g_shutdown is set — either by the
@@ -3331,8 +3331,8 @@ accept_new_factory:
 
     /* === Phase 5: Cooperative close === */
     if (g_shutdown) {
-        lsp_abort_ceremony(&lsp, "LSP shutting down");
-        lsp_cleanup(&lsp);
+        lsp_abort_ceremony(lsp_p, "LSP shutting down");
+        lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -3361,12 +3361,12 @@ accept_new_factory:
         /* Pass NULL for close_spk so client outputs use per-client P2TR
            addresses derived from their factory pubkeys. LSP output uses
            factory funding SPK (or wallet SPK if needed). */
-        n_close_outputs = lsp_channels_build_close_outputs(mgr, &lsp.factory,
+        n_close_outputs = lsp_channels_build_close_outputs(mgr, &lsp_p->factory,
                                                             close_outputs, 500,
                                                             NULL, 0);
         if (n_close_outputs == 0) {
             fprintf(stderr, "LSP: build close outputs failed\n");
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 1;
@@ -3409,12 +3409,12 @@ accept_new_factory:
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
 
-    if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close_outputs,
+    if (!lsp_run_cooperative_close(lsp_p, &close_tx, close_outputs, n_close_outputs,
                                       chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
                                       (uint32_t)regtest_get_block_height(&rt))) {
         fprintf(stderr, "LSP: cooperative close failed\n");
         tx_buf_free(&close_tx);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -3430,7 +3430,7 @@ accept_new_factory:
                 close_hex, "failed");
         fprintf(stderr, "LSP: broadcast close tx failed\n");
         tx_buf_free(&close_tx);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -3448,7 +3448,7 @@ accept_new_factory:
     int conf = regtest_get_confirmations(&rt, close_txid);
     if (conf < 1) {
         fprintf(stderr, "LSP: close tx not confirmed (conf=%d)\n", conf);
-        lsp_cleanup(&lsp);
+        lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
     }
@@ -3470,7 +3470,9 @@ accept_new_factory:
     jit_channels_cleanup(mgr);
     free(mgr);
     mgr = NULL;
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp_p);
+    free(lsp_p);
+    lsp_p = NULL;
 
     /* Persistent daemon: loop back for a new factory instead of exiting.
        Mark this factory as closed in DB (cooperative close already on chain).
