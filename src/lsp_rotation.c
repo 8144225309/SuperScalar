@@ -39,6 +39,9 @@ int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
         return 0;   /* fallback already done */
     if (retries >= max_ret)
         return -1;  /* exhausted — time for fallback */
+    /* Reorg guard: if height went backward, allow immediate retry */
+    if (cur_height < mgr->rot_last_attempt_block[idx])
+        return 1;  /* height regressed (reorg) — safe to retry now */
     /* Exponential backoff: base * 2^retries blocks (clamped to prevent overflow) */
     uint32_t base = mgr->rot_retry_base_delay > 0 ? mgr->rot_retry_base_delay : 2;
     uint32_t shift = retries < 30 ? retries : 30;
