@@ -144,6 +144,9 @@ typedef struct {
     time_t last_heartbeat;              /* timestamp of last heartbeat output */
     time_t daemon_start_time;           /* timestamp when daemon loop started */
 
+    /* Reorg detection (height decrease → stale cached state) */
+    int32_t last_known_height;          /* highest block height ever observed */
+
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
     uint64_t locked_in_factories_sats;   /* capital in active factories */

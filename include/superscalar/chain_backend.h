@@ -68,6 +68,13 @@ struct chain_backend {
     int  (*unregister_script)(chain_backend_t *self,
                               const unsigned char *spk, size_t spk_len);
 
+    /* Optional reorg notification. When the backend detects a chain
+       reorganisation (tip height decrease), it fires this callback.
+       Higher layers (watchtower, channel manager) register to re-validate
+       cached state. May be NULL (no notification). */
+    void (*reorg_cb)(int new_tip, int old_tip, void *reorg_ctx);
+    void *reorg_cb_ctx;
+
     /* Backend-specific state. */
     void *ctx;
 };

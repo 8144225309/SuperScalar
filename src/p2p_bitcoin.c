@@ -1222,7 +1222,8 @@ int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
 
 int p2p_recv_headers_pow(p2p_conn_t *conn,
                           uint8_t (*hashes_out)[32], size_t max_headers,
-                          uint32_t *nbits_out, uint32_t *timestamps_out)
+                          uint32_t *nbits_out, uint32_t *timestamps_out,
+                          uint8_t (*prev_hashes_out)[32])
 {
     for (int attempt = 0; attempt < 64; attempt++) {
         char     cmd[13];
@@ -1282,6 +1283,8 @@ int p2p_recv_headers_pow(p2p_conn_t *conn,
                                                    ((uint32_t)p[70] << 16) |
                                                    ((uint32_t)p[71] << 24);
                     }
+                    if (prev_hashes_out)
+                        memcpy(prev_hashes_out[n_stored], p + 4, 32);
                     n_stored++;
                 }
                 p   += 81;

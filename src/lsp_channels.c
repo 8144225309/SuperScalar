@@ -3943,18 +3943,24 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     for (size_t c = 0; c < mgr->n_channels; c++)
                         if (lsp->client_fds[c] >= 0) online++;
                     int hb_height = 0;
-                    static int prev_hb_height = 0;
                     const char *fstate_str = "?";
                     if (mgr->watchtower && mgr->watchtower->rt) {
                         hb_height = regtest_get_block_height(mgr->watchtower->rt);
                         /* Reorg detection: tip decreased since last check */
-                        if (prev_hb_height > 0 && hb_height < prev_hb_height) {
+                        if (mgr->last_known_height > 0 && hb_height > 0 &&
+                            hb_height < mgr->last_known_height) {
+                            int depth = mgr->last_known_height - hb_height;
                             fprintf(stderr,
-                                "ALERT: possible chain reorg (tip %d → %d, depth %d)\n",
-                                prev_hb_height, hb_height,
-                                prev_hb_height - hb_height);
+                                "ALERT: chain reorg detected (tip %d → %d, depth %d)\n",
+                                mgr->last_known_height, hb_height, depth);
+                            /* Fire chain backend reorg callback if set */
+                            chain_backend_t *cbe = (chain_backend_t *)mgr->chain_be;
+                            if (cbe && cbe->reorg_cb)
+                                cbe->reorg_cb(hb_height, mgr->last_known_height,
+                                              cbe->reorg_cb_ctx);
                         }
-                        prev_hb_height = hb_height;
+                        if (hb_height > mgr->last_known_height)
+                            mgr->last_known_height = hb_height;
                         factory_state_t fs = factory_get_state(
                             &lsp->factory, (uint32_t)hb_height);
                         fstate_str = (fs == FACTORY_ACTIVE) ? "ACTIVE" :

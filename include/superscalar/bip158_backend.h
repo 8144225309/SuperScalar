@@ -148,6 +148,12 @@ typedef struct {
      * Set via bip158_backend_set_block_connected_cb(); NULL = disabled. */
     void           (*block_connected_cb)(uint32_t height, void *cb_ctx);
     void            *block_connected_ctx;
+
+    /* Block-disconnected callback — fired for each block rolled back during
+     * a detected reorg (called in descending order: tip, tip-1, ..., fork+1).
+     * Set via bip158_backend_set_block_disconnected_cb(); NULL = disabled. */
+    void           (*block_disconnected_cb)(uint32_t height, void *cb_ctx);
+    void            *block_disconnected_ctx;
 } bip158_backend_t;
 
 /* Parse a "HOST:PORT" string.  host_out receives the NUL-terminated hostname,
@@ -371,5 +377,16 @@ void bip158_backend_set_block_connected_cb(bip158_backend_t *backend,
                                             void (*cb)(uint32_t height,
                                                        void *cb_ctx),
                                             void *cb_ctx);
+
+void bip158_backend_set_block_disconnected_cb(bip158_backend_t *backend,
+                                               void (*cb)(uint32_t height,
+                                                          void *cb_ctx),
+                                               void *cb_ctx);
+
+/* Handle a detected reorg: invalidate tx_cache entries above fork_height,
+   roll back tip/header/filter state, fire block_disconnected_cb for each
+   rolled-back block, and persist the corrected checkpoint.
+   Returns the number of blocks rolled back. */
+int bip158_handle_reorg(bip158_backend_t *backend, int fork_height);
 
 #endif /* SUPERSCALAR_BIP158_BACKEND_H */
