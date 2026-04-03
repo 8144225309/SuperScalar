@@ -1879,12 +1879,15 @@ int persist_mark_reorg_stale(persist_t *p, int reorg_height) {
         total += sqlite3_changes(p->db);
     }
 
-    /* ladder_factories: mark factories created above reorg height as stale. */
+    /* ladder_factories: mark factories created above reorg height as stale,
+       AND any factory with partial_rotation=1 (rotation close TX may have
+       been reorged out regardless of created_block). */
     {
         char sql[256];
         snprintf(sql, sizeof(sql),
             "UPDATE ladder_factories SET reorg_stale = 1 "
-            "WHERE created_block > %d AND reorg_stale = 0;",
+            "WHERE (created_block > %d OR partial_rotation = 1) "
+            "AND reorg_stale = 0;",
             reorg_height);
         sqlite3_exec(p->db, sql, NULL, NULL, NULL);
         total += sqlite3_changes(p->db);
