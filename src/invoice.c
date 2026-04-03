@@ -20,16 +20,18 @@
 #include <sys/random.h>
 #endif
 
-/* ---- Portable random bytes ---- */
-static void invoice_rand_bytes(unsigned char *buf, size_t len)
+/* ---- Portable random bytes (fail-safe: no weak fallback) ---- */
+static int invoice_rand_bytes(unsigned char *buf, size_t len)
 {
 #ifdef __linux__
     ssize_t got = getrandom(buf, len, 0);
-    if (got == (ssize_t)len) return;
+    if (got == (ssize_t)len) return 1;
 #endif
-    /* Fallback: use C stdlib rand (test-only quality, not for production) */
-    for (size_t i = 0; i < len; i++)
-        buf[i] = (unsigned char)(rand() & 0xFF);
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    size_t r = fread(buf, 1, len, f);
+    fclose(f);
+    return r == len;
 }
 
 void invoice_init(bolt11_invoice_table_t *tbl)
@@ -64,8 +66,8 @@ int invoice_create(bolt11_invoice_table_t *tbl,
      * Nonce is embedded in invoice metadata (BOLT #11 type 27) so the receiver
      * can re-derive the preimage on demand without storing it. */
     if (!stateless_invoice_gen_nonce(e->stateless_nonce)) {
-        /* /dev/urandom unavailable — fallback to rand() (test-only quality) */
-        invoice_rand_bytes(e->stateless_nonce, 32);
+        if (!invoice_rand_bytes(e->stateless_nonce, 32))
+            return 0;  /* no secure randomness available — refuse to create invoice */
     }
     if (!stateless_invoice_from_nonce(node_privkey, e->stateless_nonce,
                                       e->payment_hash, e->preimage,
