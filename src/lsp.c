@@ -332,9 +332,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect NONCE_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t ceremony;
-        int min_cl = (lsp->min_factory_clients > 0)
-                     ? lsp->min_factory_clients : (int)lsp->n_clients;
-        ceremony_init(&ceremony, lsp->n_clients, 60, min_cl);
+        ceremony_init(&ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
         ceremony.state = CEREMONY_COLLECTING_NONCES;
         size_t nonces_received = 0;
 
@@ -553,9 +551,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect PSIG_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t psig_ceremony;
-        int min_cl2 = (lsp->min_factory_clients > 0)
-                      ? lsp->min_factory_clients : (int)lsp->n_clients;
-        ceremony_init(&psig_ceremony, lsp->n_clients, 60, min_cl2);
+        ceremony_init(&psig_ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
         psig_ceremony.state = CEREMONY_COLLECTING_PSIGS;
         size_t psigs_received = 0;
 

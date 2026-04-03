@@ -9,7 +9,6 @@ Factory scaling to 64 participants + production hardening. 36/36 orchestrator, 1
 ### Added
 
 - **64-participant factory support** (`factory.h`, `lsp.h`, `musig.h`): raised FACTORY_MAX_SIGNERS 16→64, FACTORY_MAX_NODES 64→256, FACTORY_MAX_LEAVES 16→32, FACTORY_MAX_EPOCHS 256→4096, LSP_MAX_CLIENTS 16→64, MUSIG_SESSION_MAX_SIGNERS 16→64. With 4-8 laddered factories, an LSP can now serve 256-512 users.
-- **Configurable factory quorum** (`lsp.h`, `lsp.c`, `superscalar_lsp.c`): `--min-clients N` flag allows factory creation to proceed with N-k clients. At 64 clients, the probability of all being online is low; quorum support enables practical deployment.
 - **Parallel basepoint/nonce exchange** (`lsp_channels.c`): replaced serial per-client loops with batch-send + parallel-collect using `ceremony_select_all()`. At 64 clients, setup time drops from O(N×30s) to O(30s) regardless of client count.
 - **N=32 and N=64 factory unit tests** (`test_factory.c`, `test_main.c`): verify tree construction, signing, and advancement at new participant counts. Expanded `seckeys_n` from 16 to 64 entries.
 
