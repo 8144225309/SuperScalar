@@ -2547,36 +2547,29 @@ int test_factory_arity1_split_round_leaf_advance(void) {
 /* ---- Variable-N tree tests ---- */
 
 /* Secret keys for up to 16 participants */
-static const unsigned char seckeys_n[16][32] = {
-    { [0 ... 31] = 0x10 },  /* LSP */
-    { [0 ... 31] = 0x21 },
-    { [0 ... 31] = 0x32 },
-    { [0 ... 31] = 0x43 },
-    { [0 ... 31] = 0x54 },
-    { [0 ... 31] = 0x65 },
-    { [0 ... 31] = 0x76 },
-    { [0 ... 31] = 0x87 },
-    { [0 ... 31] = 0x98 },
-    { [0 ... 31] = 0xA1 },
-    { [0 ... 31] = 0xB2 },
-    { [0 ... 31] = 0xC3 },
-    { [0 ... 31] = 0xD4 },
-    { [0 ... 31] = 0xE5 },
-    { [0 ... 31] = 0xF6 },
-    { [0 ... 31] = 0x07 },
-};
+/* Generate deterministic secret keys for up to 64 participants.
+   Each key is 32 bytes filled with a unique byte value. */
+static unsigned char seckeys_n[64][32];
+static int seckeys_n_initialized = 0;
+static void ensure_seckeys_n(void) {
+    if (seckeys_n_initialized) return;
+    for (int i = 0; i < 64; i++)
+        memset(seckeys_n[i], (unsigned char)(0x10 + i), 32);
+    seckeys_n_initialized = 1;
+}
 
 /* Generic helper: set up a factory with N participants + given arity */
 static int setup_n_factory(factory_t *f, secp256k1_context *ctx,
                             secp256k1_keypair *kps, size_t n_participants,
                             factory_arity_t arity, uint64_t funding) {
+    ensure_seckeys_n();
     for (size_t i = 0; i < n_participants; i++) {
         if (!secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]))
             return 0;
     }
 
     /* Compute N-of-N funding SPK */
-    secp256k1_pubkey pks[16];
+    secp256k1_pubkey *pks = (secp256k1_pubkey *)calloc(n_participants, sizeof(secp256k1_pubkey));
     for (size_t i = 0; i < n_participants; i++)
         secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
 
@@ -2590,13 +2583,16 @@ static int setup_n_factory(factory_t *f, secp256k1_context *ctx,
 
     musig_keyagg_t tmp = ka;
     secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak))
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak)) {
+        free(pks);
         return 0;
+    }
     secp256k1_xonly_pubkey fund_xonly;
     secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_xonly, NULL, &tweaked_pk);
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &fund_xonly);
+    free(pks);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
@@ -2770,6 +2766,62 @@ int test_factory_build_tree_n16(void) {
     TEST_ASSERT(factory_sign_all(&f), "sign n16 arity2");
     factory_free(&f);
 
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n32(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair *kps = calloc(32, sizeof(secp256k1_keypair));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc n32");
+
+    /* N=32, arity-2: 16 leaves, depth=4 */
+    TEST_ASSERT(setup_n_factory(f, ctx, kps, 32, FACTORY_ARITY_2, 50000000), "setup n32 arity2");
+    TEST_ASSERT(factory_build_tree(f), "build tree n32 arity2");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 16, "16 leaves n32 arity2");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n32 arity2");
+    TEST_ASSERT(factory_sign_all(f), "sign n32 arity2");
+    for (size_t i = 0; i < f->n_nodes; i++)
+        TEST_ASSERT(f->nodes[i].is_signed, "all nodes signed n32");
+    /* Verify advance works */
+    TEST_ASSERT(factory_advance(f), "advance n32");
+    factory_free(f);
+
+    /* N=32, arity-1: 31 leaves */
+    TEST_ASSERT(setup_n_factory(f, ctx, kps, 32, FACTORY_ARITY_1, 50000000), "setup n32 arity1");
+    TEST_ASSERT(factory_build_tree(f), "build tree n32 arity1");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 31, "31 leaves n32 arity1");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n32 arity1");
+    factory_free(f);
+
+    free(kps);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n64(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair *kps = calloc(64, sizeof(secp256k1_keypair));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc n64");
+
+    /* N=64, arity-2: 32 leaves, depth=5 */
+    TEST_ASSERT(setup_n_factory(f, ctx, kps, 64, FACTORY_ARITY_2, 100000000), "setup n64 arity2");
+    TEST_ASSERT(factory_build_tree(f), "build tree n64 arity2");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 32, "32 leaves n64 arity2");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n64 arity2");
+    printf("    n64 arity-2: %zu nodes, depth=5, %d DW layers\n",
+           f->n_nodes, (int)f->counter.n_layers);
+    TEST_ASSERT(factory_sign_all(f), "sign n64 arity2");
+    for (size_t i = 0; i < f->n_nodes; i++)
+        TEST_ASSERT(f->nodes[i].is_signed, "all nodes signed n64");
+    TEST_ASSERT(factory_advance(f), "advance n64");
+    factory_free(f);
+
+    free(kps);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
