@@ -18,6 +18,15 @@ Factory scaling to 64 participants + production hardening. 36/36 orchestrator, 1
 - **Heap allocation for large structs** (`lsp.c`, `superscalar_lsp.c`): with factory_t at ~3MB, lsp_t and ceremony arrays are now heap-allocated to prevent stack overflow on the default 8MB stack. `lsp_t` uses pointer access (lsp_p->) throughout.
 - **Stack size in test runner** (`run_unit_tests.sh`): added `ulimit -s unlimited` to match CI configuration; ladder_t (8 × factory_t ≈ 26MB) exceeds default stack.
 
+### Security hardening (mainnet preparation)
+
+- **Secure invoice randomness** (`invoice.c`): removed `rand()` fallback for preimage generation. Invoice creation now fails if no secure entropy source is available, preventing predictable preimages.
+- **SSL certificate verification** (`fee_estimator_api.c`): enabled `SSL_VERIFY_PEER` with system CA certificates for the mempool.space fee estimation API. Previously disabled (`SSL_VERIFY_NONE`), allowing MITM on fee rate data.
+- **Admin RPC socket permissions** (`admin_rpc.c`): explicit `chmod(0600)` after socket bind ensures owner-only access regardless of process umask.
+- **6-confirmation threshold** (`chain_backend.h`, `factory_recovery.c`): factory tree broadcast now requires 6 confirmations on the funding TX (non-regtest), eliminating reorg risk without a full reorg handler.
+- **Reorg detection** (`lsp_channels.c`): daemon heartbeat now logs an alert if chain tip decreases between checks.
+- **Watchtower broadcast retry** (`watchtower.c`, `persist.c`): failed penalty tx broadcasts are saved as `pending_retry` and automatically re-attempted on each watchtower cycle. Ensures penalties are not lost during temporary chain backend outages.
+
 ### Architecture improvements
 
 - **Runtime-configurable validation** (`factory.c`): `factory_build_tree()` now validates against `f->config.max_signers` / `f->config.max_nodes` / `f->config.max_leaves` instead of compile-time constants, enabling future runtime configurability.
