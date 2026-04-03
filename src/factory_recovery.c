@@ -227,8 +227,9 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
              * this call — in-mempool parent is sufficient for child). */
             int parent_ok = 0;
             if (nd->parent_index < 0) {
-                /* Root node: depends on the factory funding TX */
-                parent_ok = (funding_confs >= 1);
+                /* Root node: depends on the factory funding TX.
+                   Use safe threshold to avoid acting on reorgable txs. */
+                parent_ok = (funding_confs >= MAINNET_SAFE_CONFIRMATIONS);
             } else {
                 fr_node_t *par = find_node(nodes, n, nd->parent_index);
                 int par_i = par ? (int)(par - nodes) : -1;

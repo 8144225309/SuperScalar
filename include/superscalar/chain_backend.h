@@ -5,6 +5,11 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Minimum confirmations before acting on chain events on non-regtest
+   networks. 6-block reorgs have effectively zero probability on Bitcoin
+   mainnet, so this eliminates reorg risk without a full reorg handler. */
+#define MAINNET_SAFE_CONFIRMATIONS 6
+
 /*
  * Chain backend abstraction for SuperScalar watchtower.
  *
