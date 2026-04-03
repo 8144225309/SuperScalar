@@ -369,6 +369,10 @@ void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet)
 int watchtower_check(watchtower_t *wt) {
     if (!wt || !wt->chain) return 0;
 
+    /* Retry any previously failed penalty broadcasts */
+    if (wt->db && wt->db->db)
+        persist_retry_pending_broadcasts(wt->db, wt->chain);
+
     int penalties_broadcast = 0;
 
     /* Pre-compute display-order hex for every entry once */
@@ -555,10 +559,10 @@ int watchtower_check(watchtower_t *wt) {
                     persist_log_broadcast(wt->db, penalty_txid, "penalty",
                                           penalty_hex, "ok");
             } else {
-                fprintf(stderr, "  Penalty tx broadcast failed\n");
+                fprintf(stderr, "  Penalty tx broadcast failed — queued for retry\n");
                 if (wt->db && wt->db->db)
                     persist_log_broadcast(wt->db, "?", "penalty",
-                                          penalty_hex, "failed");
+                                          penalty_hex, "pending_retry");
             }
             free(penalty_hex);
         }
