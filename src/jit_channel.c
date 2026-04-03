@@ -1,4 +1,5 @@
 #include "superscalar/jit_channel.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp.h"
 #include "superscalar/wire.h"
@@ -712,7 +713,10 @@ int jit_channels_check_funding(void *mgr_ptr) {
         /* cppcheck-suppress nullPointerRedundantCheck ; mgr->watchtower checked at line 525 */
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
-        if (conf >= 1) {
+        int safe_conf = (mgr->watchtower->rt &&
+                         strcmp(mgr->watchtower->rt->network, "regtest") == 0)
+                        ? 1 : MAINNET_SAFE_CONFIRMATIONS;
+        if (conf >= safe_conf) {
             jits[i].state = JIT_STATE_OPEN;
             jits[i].funding_confirmed = 1;
             printf("LSP JIT: channel %08x funding confirmed (%d conf)\n",
@@ -732,6 +736,33 @@ int jit_channels_check_funding(void *mgr_ptr) {
         }
     }
     return transitions;
+}
+
+int jit_channels_revalidate_funding(void *mgr_ptr) {
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    if (!mgr || !mgr->jit_channels || !mgr->watchtower || !mgr->watchtower->rt)
+        return 0;
+
+    jit_channel_t *jits = (jit_channel_t *)mgr->jit_channels;
+    int reverted = 0;
+    for (size_t i = 0; i < mgr->n_jit_channels; i++) {
+        if (jits[i].state != JIT_STATE_OPEN) continue;
+        if (jits[i].funding_txid_hex[0] == '\0') continue;
+
+        int conf = regtest_get_confirmations(mgr->watchtower->rt,
+                                               jits[i].funding_txid_hex);
+        if (conf < 0) {
+            fprintf(stderr, "JIT revalidation: channel %08x funding tx gone, "
+                    "reverting to FUNDING state\n", jits[i].jit_channel_id);
+            jits[i].state = JIT_STATE_FUNDING;
+            jits[i].funding_confirmed = 0;
+            if (mgr->persist)
+                persist_update_jit_state((persist_t *)mgr->persist,
+                                           jits[i].jit_channel_id, "funding");
+            reverted++;
+        }
+    }
+    return reverted;
 }
 
 void jit_channels_cleanup(void *mgr_ptr) {
