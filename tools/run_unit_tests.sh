@@ -8,4 +8,5 @@ cd "$BUILD_DIR"
 make -j"$NPROC" 2>&1 | tail -5
 
 echo "=== Running unit tests ==="
+ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
 ./test_superscalar --unit 2>&1
