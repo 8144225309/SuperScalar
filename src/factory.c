@@ -504,6 +504,7 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     f->step_blocks = step_blocks;
     f->states_per_layer = states_per_layer;
     f->fee_per_tx = 200;  /* 1 sat/vB floor for ~200 vB tx; overridden by factory_build_tree */
+    factory_config_default(&f->config);
 
     for (size_t i = 0; i < n_participants; i++)
         f->pubkeys[i] = pubkeys[i];
