@@ -1896,9 +1896,20 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
 
             /* Set up LSP with listen socket only (skip ceremony) */
-            lsp_t lsp;
+            /* Heap-allocate lsp_t — factory_t embedded inside is ~3MB */
+            lsp_t *lsp_rp = calloc(1, sizeof(lsp_t));
+            if (!lsp_rp) {
+                fprintf(stderr, "LSP recovery: lsp_t alloc failed\n");
+                free(rec_f);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            #define lsp (*lsp_rp)
             if (!lsp_init(&lsp, ctx, &lsp_kp, port, rec_f->n_participants - 1)) {
                 fprintf(stderr, "LSP recovery: lsp_init failed\n");
+                free(lsp_rp);
                 free(rec_f);
                 persist_close(&db);
                 memset(lsp_seckey, 0, 32);
@@ -2038,8 +2049,16 @@ int main(int argc, char *argv[]) {
                                      hd_mnemonic, hd_passphrase, hd_lookahead);
             }
 
-            /* Initialize ladder */
-            ladder_t rec_lad;
+            /* Initialize ladder (heap — ladder_t is ~26MB with 8 factories) */
+            ladder_t *rec_lad_p = calloc(1, sizeof(ladder_t));
+            if (!rec_lad_p) {
+                fprintf(stderr, "LSP recovery: ladder alloc failed\n");
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            #define rec_lad (*rec_lad_p)
             if (!ladder_init(&rec_lad, ctx, &lsp_kp, active_blocks, dying_blocks)) {
                 fprintf(stderr, "LSP recovery: ladder_init failed\n");
                 persist_close(&db);
@@ -2064,6 +2083,7 @@ int main(int argc, char *argv[]) {
                 rec_lad.n_factories = 1;
             }
             mgr->ladder = &rec_lad;
+            #undef rec_lad
 
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
@@ -2262,6 +2282,9 @@ int main(int argc, char *argv[]) {
             free(mgr);
             persist_close(&db);
             lsp_cleanup(&lsp);
+            #undef lsp
+            free(lsp_rp);
+            free(rec_lad_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
@@ -2275,9 +2298,18 @@ accept_new_factory:
     printf("LSP: listening on port %d, waiting for %d clients...\n", port, n_clients);
     fflush(stdout);
 
-    lsp_t lsp;
+    /* Heap-allocate lsp_t — factory_t embedded inside is ~3MB at MAX_SIGNERS=64 */
+    lsp_t *lsp_p = calloc(1, sizeof(lsp_t));
+    if (!lsp_p) {
+        fprintf(stderr, "LSP: failed to allocate lsp_t\n");
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    #define lsp (*lsp_p)
     if (!lsp_init(&lsp, ctx, &lsp_kp, port, (size_t)n_clients)) {
         fprintf(stderr, "LSP: lsp_init failed\n");
+        free(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;

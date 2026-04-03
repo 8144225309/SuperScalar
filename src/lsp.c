@@ -378,9 +378,15 @@ int lsp_run_factory_creation(lsp_t *lsp,
                     ceremony.clients[c] = CLIENT_ERROR;
                     continue;
                 }
-                wire_bundle_entry_t client_entries[FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS];
+                size_t ce_cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+                wire_bundle_entry_t *client_entries = calloc(ce_cap, sizeof(wire_bundle_entry_t));
+                if (!client_entries) {
+                    cJSON_Delete(msg.json);
+                    ceremony.clients[c] = CLIENT_ERROR;
+                    continue;
+                }
                 size_t n_entries = wire_parse_bundle(entries_arr, client_entries,
-                                                     FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS, 66);
+                                                     ce_cap, 66);
 
                 int client_ok = 1;
                 for (size_t e = 0; e < n_entries; e++) {
@@ -400,6 +406,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
                     all_nonce_entries[all_nonce_count] = client_entries[e];
                     all_nonce_count++;
                 }
+                free(client_entries);
                 cJSON_Delete(msg.json);
 
                 if (client_ok) {
@@ -587,9 +594,15 @@ int lsp_run_factory_creation(lsp_t *lsp,
                     psig_ceremony.clients[c] = CLIENT_ERROR;
                     continue;
                 }
-                wire_bundle_entry_t client_entries[FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS];
+                size_t pce_cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+                wire_bundle_entry_t *client_entries = calloc(pce_cap, sizeof(wire_bundle_entry_t));
+                if (!client_entries) {
+                    cJSON_Delete(msg.json);
+                    psig_ceremony.clients[c] = CLIENT_ERROR;
+                    continue;
+                }
                 size_t n_entries = wire_parse_bundle(entries_arr, client_entries,
-                                                     FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS, 32);
+                                                     pce_cap, 32);
 
                 int client_ok = 1;
                 for (size_t e = 0; e < n_entries; e++) {
@@ -607,6 +620,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
                         break;
                     }
                 }
+                free(client_entries);
                 cJSON_Delete(msg.json);
 
                 if (client_ok) {
