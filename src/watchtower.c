@@ -472,6 +472,8 @@ int watchtower_check(watchtower_t *wt) {
                    e->channel_id, txid_hex);
             fflush(stdout);
 
+            char factory_resp_txid[65] = {0};  /* saved for reorg tracking */
+
             /* Broadcast the pre-built latest state tx as response */
             if (e->response_tx && e->response_tx_len > 0) {
                 char *resp_hex = (char *)malloc(e->response_tx_len * 2 + 1);
@@ -480,6 +482,8 @@ int watchtower_check(watchtower_t *wt) {
                     char resp_txid[65];
                     if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
+                        memcpy(factory_resp_txid, resp_txid, 64);
+                        factory_resp_txid[64] = '\0';
                         penalties_broadcast++;
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, resp_txid,
@@ -517,9 +521,7 @@ int watchtower_check(watchtower_t *wt) {
 
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
-            /* Use the response_tx txid if we have a txid from broadcast_log,
-               otherwise leave penalty_txid empty — reorg check will re-query */
-            e->penalty_txid[0] = '\0';
+            memcpy(e->penalty_txid, factory_resp_txid, 65);
             i++;
             continue;
         }
@@ -611,6 +613,8 @@ int watchtower_check(watchtower_t *wt) {
 
         /* Sweep HTLC outputs via penalty txs */
         for (size_t h = 0; h < e->n_htlc_outputs; h++) {
+            /* Skip already-swept outputs (amount set to 0 after broadcast) */
+            if (e->htlc_outputs[h].htlc_amount == 0) continue;
             /* Temporarily set ch->htlcs[0] to stored HTLC metadata */
             size_t saved_n = ch->n_htlcs;
             htlc_t saved_h0 = {0};
@@ -777,13 +781,17 @@ int watchtower_check(watchtower_t *wt) {
                 ch->n_htlcs = saved_n;
                 if (saved_n > 0) ch->htlcs[0] = saved_h0;
 
-                /* Remove swept HTLC (swap with last) */
-                e->htlc_outputs[h] = e->htlc_outputs[e->n_htlc_outputs - 1];
-                e->n_htlc_outputs--;
+                /* Mark HTLC as swept but keep in list until the parent
+                   force-close entry is safely confirmed. If the sweep TX
+                   is reorged out, the next watchtower_check will re-attempt. */
+                e->htlc_outputs[h].htlc_amount = 0;  /* mark swept */
             }
 
-            /* If all HTLCs swept, remove the force-close entry */
-            if (e->n_htlc_outputs == 0) {
+            /* If all HTLCs swept (all amounts zeroed), remove the force-close entry */
+            size_t unswept = 0;
+            for (size_t hh = 0; hh < e->n_htlc_outputs; hh++)
+                if (e->htlc_outputs[hh].htlc_amount > 0) unswept++;
+            if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;
                 wt->entries[i] = wt->entries[wt->n_entries - 1];
