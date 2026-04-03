@@ -1777,11 +1777,8 @@ int bip158_handle_reorg(bip158_backend_t *b, int fork_height)
 
     /* Persist corrected checkpoint */
     if (b->db) {
-        extern int persist_save_bip158_checkpoint(void *p,
-            int32_t tip, int32_t hdr, int32_t fhdr,
-            const uint8_t *hdr_blob, size_t hdr_blob_len,
-            const uint8_t *fhdr_blob, size_t fhdr_blob_len);
-        persist_save_bip158_checkpoint(b->db,
+        persist_save_bip158_checkpoint(
+            (persist_t *)b->db,
             b->tip_height, b->headers_synced, b->filter_headers_synced,
             (const uint8_t *)b->header_hashes, sizeof(b->header_hashes),
             (const uint8_t *)b->filter_headers, sizeof(b->filter_headers));
