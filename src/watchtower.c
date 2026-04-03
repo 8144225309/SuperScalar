@@ -1144,6 +1144,10 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
             wt->pending[i].cycles_in_mempool = 0;
         }
     }
+
+    /* Mark stale entries in database so they survive restarts */
+    if (wt->db && wt->db->db)
+        persist_mark_reorg_stale(wt->db, new_tip);
 }
 
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
