@@ -5,9 +5,9 @@
             /* Record epoch-0 nSequence values for before/after comparison */
             uint32_t dwa_initial[FACTORY_MAX_NODES];
             printf("Before advance (epoch %u):\n",
-                   dw_counter_epoch(&lsp.factory.counter));
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                factory_node_t *node = &lsp.factory.nodes[ni];
+                   dw_counter_epoch(&lsp_p->factory.counter));
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                factory_node_t *node = &lsp_p->factory.nodes[ni];
                 dwa_initial[ni] = node->nsequence;
                 printf("  Node %zu: nSequence=0x%X (%u blocks)\n",
                        ni, node->nsequence, node->nsequence);
@@ -16,7 +16,7 @@
             /* Populate keypairs — factory_init_from_pubkeys() leaves them
                zeroed, but factory_sign_all() needs them to generate nonces.
                In demo mode the LSP has all keys (same pattern as distrib/turnover tests).
-               Reorder to match lsp.factory.pubkeys connection order —
+               Reorder to match lsp_p->factory.pubkeys connection order —
                MuSig2 key aggregation is order-dependent (BIP-327). */
             {
                 secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
@@ -36,7 +36,7 @@
                     unsigned char target[33];
                     size_t tlen = 33;
                     secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
-                                                  &lsp.factory.pubkeys[slot],
+                                                  &lsp_p->factory.pubkeys[slot],
                                                   SECP256K1_EC_COMPRESSED);
                     for (size_t k = 0; k < n_total; k++) {
                         secp256k1_pubkey kpub;
@@ -51,23 +51,23 @@
                         }
                     }
                 }
-                memcpy(lsp.factory.keypairs, all_kps,
+                memcpy(lsp_p->factory.keypairs, all_kps,
                        n_total * sizeof(secp256k1_keypair));
             }
 
-            if (!factory_advance(&lsp.factory)) {
+            if (!factory_advance(&lsp_p->factory)) {
                 fprintf(stderr, "DW ADVANCE TEST: factory_advance failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
 
             printf("After advance (epoch %u):\n",
-                   dw_counter_epoch(&lsp.factory.counter));
+                   dw_counter_epoch(&lsp_p->factory.counter));
             int saw_decrease = 0;
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                factory_node_t *node = &lsp.factory.nodes[ni];
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                factory_node_t *node = &lsp_p->factory.nodes[ni];
                 printf("  Node %zu: nSequence=0x%X (%u blocks, was 0x%X)\n",
                        ni, node->nsequence, node->nsequence, dwa_initial[ni]);
                 /* Compare before/after: any node that had nSequence > 0
@@ -78,13 +78,13 @@
 
             /* Force-close with the re-signed tree */
             printf("\nBroadcasting re-signed tree (%zu nodes) on %s...\n",
-                   lsp.factory.n_nodes, network);
+                   lsp_p->factory.n_nodes, network);
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DW ADVANCE TEST: tree broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -94,7 +94,7 @@
                    saw_decrease ? "PASSED" : "FAILED");
             if (saw_decrease)
                 printf("All %zu nodes confirmed with advanced DW counter.\n",
-                       lsp.factory.n_nodes);
+                       lsp_p->factory.n_nodes);
             else
                 fprintf(stderr, "DW ADVANCE TEST: no nSequence decrease detected\n");
 
@@ -103,7 +103,7 @@
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return saw_decrease ? 0 : 1;
@@ -132,7 +132,7 @@
                     }
                 }
             }
-            /* Reorder exh_kps to match lsp.factory.pubkeys connection order.
+            /* Reorder exh_kps to match lsp_p->factory.pubkeys connection order.
                MuSig2 key aggregation is order-dependent (BIP-327). */
             {
                 secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
@@ -141,7 +141,7 @@
                     unsigned char target[33];
                     size_t tlen = 33;
                     secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
-                                                  &lsp.factory.pubkeys[slot],
+                                                  &lsp_p->factory.pubkeys[slot],
                                                   SECP256K1_EC_COMPRESSED);
                     for (size_t k = 0; k < n_total; k++) {
                         secp256k1_pubkey kpub;
@@ -158,32 +158,32 @@
                 }
             }
 
-            memcpy(lsp.factory.keypairs, exh_kps,
+            memcpy(lsp_p->factory.keypairs, exh_kps,
                    n_total * sizeof(secp256k1_keypair));
 
             /* Record initial nSequence for all nodes */
             uint32_t initial_nseq[FACTORY_MAX_NODES];
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++)
-                initial_nseq[ni] = lsp.factory.nodes[ni].nsequence;
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++)
+                initial_nseq[ni] = lsp_p->factory.nodes[ni].nsequence;
 
             printf("Epoch 0 (initial):\n");
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++)
-                printf("  Node %zu: nSequence=%u\n", ni, lsp.factory.nodes[ni].nsequence);
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++)
+                printf("  Node %zu: nSequence=%u\n", ni, lsp_p->factory.nodes[ni].nsequence);
 
             /* Advance states_per_layer - 1 times to reach zero */
             int max_advances = states_per_layer - 1;
             int any_zero = 0;
             int any_decreased = 0;
             for (int adv = 0; adv < max_advances; adv++) {
-                if (!factory_advance(&lsp.factory)) {
+                if (!factory_advance(&lsp_p->factory)) {
                     fprintf(stderr, "DW EXHIBITION: factory_advance failed at step %d\n", adv + 1);
                     exhibition_pass = 0;
                     break;
                 }
                 printf("Epoch %u (advance %d/%d):\n",
-                       dw_counter_epoch(&lsp.factory.counter), adv + 1, max_advances);
-                for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                    uint32_t cur = lsp.factory.nodes[ni].nsequence;
+                       dw_counter_epoch(&lsp_p->factory.counter), adv + 1, max_advances);
+                for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                    uint32_t cur = lsp_p->factory.nodes[ni].nsequence;
                     int32_t delta = (int32_t)cur - (int32_t)initial_nseq[ni];
                     printf("  Node %zu: nSequence=%u (delta=%d)\n", ni, cur, delta);
                     if (cur == 0) any_zero = 1;
@@ -191,9 +191,9 @@
             }
 
             /* Verify: all state nodes decreased from initial AND at least one reached 0 */
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
                 if (initial_nseq[ni] > 0 && initial_nseq[ni] != 0xFFFFFFFF &&
-                    lsp.factory.nodes[ni].nsequence < initial_nseq[ni])
+                    lsp_p->factory.nodes[ni].nsequence < initial_nseq[ni])
                     any_decreased = 1;
             }
 
@@ -208,9 +208,9 @@
 
             /* Record Factory 0 final nSequence for Phase 3 comparison */
             uint32_t f0_final_nseq = 0;
-            for (size_t ni = 0; ni < lsp.factory.n_nodes; ni++) {
-                if (lsp.factory.nodes[ni].nsequence != 0xFFFFFFFF && lsp.factory.nodes[ni].nsequence > f0_final_nseq)
-                    f0_final_nseq = lsp.factory.nodes[ni].nsequence;
+            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                if (lsp_p->factory.nodes[ni].nsequence != 0xFFFFFFFF && lsp_p->factory.nodes[ni].nsequence > f0_final_nseq)
+                    f0_final_nseq = lsp_p->factory.nodes[ni].nsequence;
             }
 
             /* --- Phase 2: PTLC-Assisted Exit — Close Without Clients --- */
@@ -292,14 +292,14 @@
 
             /* Build close outputs (equal split minus 500 sat fee) */
             tx_output_t exh_outputs[FACTORY_MAX_SIGNERS];
-            uint64_t exh_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+            uint64_t exh_per = (lsp_p->factory.funding_amount_sats - 500) / n_total;
             for (size_t ti = 0; ti < n_total; ti++) {
                 exh_outputs[ti].amount_sats = exh_per;
                 memcpy(exh_outputs[ti].script_pubkey, fund_spk, 34);
                 exh_outputs[ti].script_pubkey_len = 34;
             }
             exh_outputs[n_total - 1].amount_sats =
-                lsp.factory.funding_amount_sats - 500 - exh_per * (n_total - 1);
+                lsp_p->factory.funding_amount_sats - 500 - exh_per * (n_total - 1);
 
             /* Build cooperative close using extracted keys */
             tx_buf_t exh_close_tx;
@@ -494,7 +494,7 @@
                             printf("\n--- nSequence Contrast ---\n");
                             printf("  Factory 0 (epoch %u, fully advanced): "
                                    "max state node nSequence=%u\n",
-                                   dw_counter_epoch(&lsp.factory.counter), f0_final_nseq);
+                                   dw_counter_epoch(&lsp_p->factory.counter), f0_final_nseq);
                             printf("  Factory 1 (epoch 0, fresh):           "
                                    "max state node nSequence=%u\n", f1_initial_nseq);
                             printf("  Delta: %u blocks\n",
@@ -545,7 +545,7 @@
             free(exh_f1);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return exhibition_pass ? 0 : 1;
@@ -555,19 +555,19 @@
         if (test_leaf_advance) {
             printf("\n=== LEAF ADVANCE TEST ===\n");
 
-            if (lsp.factory.n_leaf_nodes < 2) {
+            if (lsp_p->factory.n_leaf_nodes < 2) {
                 fprintf(stderr, "LEAF ADVANCE TEST: need >= 2 leaf nodes\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
 
             /* Record nSequence for both leaves before */
-            size_t left_ni = lsp.factory.leaf_node_indices[0];
-            size_t right_ni = lsp.factory.leaf_node_indices[1];
-            uint32_t left_nseq_before = lsp.factory.nodes[left_ni].nsequence;
-            uint32_t right_nseq_before = lsp.factory.nodes[right_ni].nsequence;
+            size_t left_ni = lsp_p->factory.leaf_node_indices[0];
+            size_t right_ni = lsp_p->factory.leaf_node_indices[1];
+            uint32_t left_nseq_before = lsp_p->factory.nodes[left_ni].nsequence;
+            uint32_t right_nseq_before = lsp_p->factory.nodes[right_ni].nsequence;
 
             printf("Before leaf advance:\n");
             printf("  Left  leaf (node %zu): nSequence=0x%X\n", left_ni, left_nseq_before);
@@ -586,7 +586,7 @@
                         return 1;
                     }
                 }
-                /* Reorder all_kps to match lsp.factory.pubkeys connection order (BIP-327). */
+                /* Reorder all_kps to match lsp_p->factory.pubkeys connection order (BIP-327). */
                 {
                     secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
                     memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
@@ -594,7 +594,7 @@
                         unsigned char target[33];
                         size_t tlen = 33;
                         secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
-                                                      &lsp.factory.pubkeys[slot],
+                                                      &lsp_p->factory.pubkeys[slot],
                                                       SECP256K1_EC_COMPRESSED);
                         for (size_t k = 0; k < n_total; k++) {
                             secp256k1_pubkey kpub;
@@ -610,21 +610,21 @@
                         }
                     }
                 }
-                memcpy(lsp.factory.keypairs, all_kps,
+                memcpy(lsp_p->factory.keypairs, all_kps,
                        n_total * sizeof(secp256k1_keypair));
             }
 
             /* Advance LEFT leaf only */
-            if (!factory_advance_leaf(&lsp.factory, 0)) {
+            if (!factory_advance_leaf(&lsp_p->factory, 0)) {
                 fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(0) failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
 
-            uint32_t left_nseq_after = lsp.factory.nodes[left_ni].nsequence;
-            uint32_t right_nseq_after = lsp.factory.nodes[right_ni].nsequence;
+            uint32_t left_nseq_after = lsp_p->factory.nodes[left_ni].nsequence;
+            uint32_t right_nseq_after = lsp_p->factory.nodes[right_ni].nsequence;
 
             printf("After advancing LEFT leaf only:\n");
             printf("  Left  leaf (node %zu): nSequence=0x%X (was 0x%X)\n",
@@ -638,11 +638,11 @@
             /* Force-close with the re-signed tree */
             printf("\nBroadcasting tree with per-leaf advance on %s...\n", network);
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "LEAF ADVANCE TEST: tree broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -659,7 +659,7 @@
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return pass ? 0 : 1;
@@ -684,7 +684,7 @@
                     }
                 }
 
-            /* Reorder all_kps to match lsp.factory.pubkeys[] connection order */
+            /* Reorder all_kps to match lsp_p->factory.pubkeys[] connection order */
             {
                 secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
                 memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
@@ -692,7 +692,7 @@
                     unsigned char target_ser[33];
                     size_t tlen = 33;
                     secp256k1_ec_pubkey_serialize(ctx, target_ser, &tlen,
-                                                  &lsp.factory.pubkeys[slot],
+                                                  &lsp_p->factory.pubkeys[slot],
                                                   SECP256K1_EC_COMPRESSED);
                     for (size_t k = 0; k < (size_t)n_total; k++) {
                         secp256k1_pubkey kpub;
@@ -732,7 +732,7 @@
                     fprintf(stderr, "  Fund wallet and retry.\n");
                     jit_channels_cleanup(mgr);
                     if (use_db) persist_close(&db);
-                    lsp_cleanup(&lsp);
+                    lsp_cleanup(lsp_p);
                     memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx);
                     return 1;
@@ -747,7 +747,7 @@
                 fprintf(stderr, "DUAL FACTORY TEST: fund Factory 1 failed\n");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -763,7 +763,7 @@
                     fprintf(stderr, "DUAL FACTORY TEST: funding not confirmed\n");
                     jit_channels_cleanup(mgr);
                     if (use_db) persist_close(&db);
-                    lsp_cleanup(&lsp);
+                    lsp_cleanup(lsp_p);
                     memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx);
                     return 1;
@@ -792,7 +792,7 @@
                 fprintf(stderr, "DUAL FACTORY TEST: no funding output found\n");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -811,7 +811,7 @@
                 fprintf(stderr, "DUAL FACTORY TEST: factory_init failed\n");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -836,7 +836,7 @@
                 factory_free(&f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -846,7 +846,7 @@
                 factory_free(&f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -900,21 +900,21 @@
 
             /* Force-close both trees to show two independent factory trees on-chain */
             printf("Broadcasting Factory 0 tree (%zu nodes) on %s...\n",
-                   lsp.factory.n_nodes, network);
+                   lsp_p->factory.n_nodes, network);
             fflush(stdout);
 
-            /* Populate keypairs on lsp.factory (ladder copy has detached tx buffers) */
-            memcpy(lsp.factory.keypairs, all_kps,
+            /* Populate keypairs on lsp_p->factory (ladder copy has detached tx buffers) */
+            memcpy(lsp_p->factory.keypairs, all_kps,
                    n_total * sizeof(secp256k1_keypair));
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 0 tree broadcast failed\n");
                 factory_free(&f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -932,7 +932,7 @@
                 factory_free(&f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -950,7 +950,7 @@
             factory_free(&f1);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return both_active ? 0 : 1;
@@ -964,7 +964,7 @@
             int sv[2];
             if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
                 fprintf(stderr, "BRIDGE TEST: socketpair failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -974,7 +974,7 @@
 
             /* Set bridge_fd on the channel manager */
             lsp_channels_set_bridge(mgr, lsp_bridge_fd);
-            lsp.bridge_fd = lsp_bridge_fd;
+            lsp_p->bridge_fd = lsp_bridge_fd;
             printf("Bridge: simulated connection established\n");
 
             /* Ask client 0 to create invoice so it has the preimage locally */
@@ -987,7 +987,7 @@
             {
                 cJSON *inv_req = cJSON_CreateObject();
                 cJSON_AddNumberToObject(inv_req, "amount_msat", (double)amount_msat);
-                wire_send(lsp.client_fds[dest_client], MSG_CREATE_INVOICE, inv_req);
+                wire_send(lsp_p->client_fds[dest_client], MSG_CREATE_INVOICE, inv_req);
                 cJSON_Delete(inv_req);
 
                 /* Sleep to let clients finish in-flight commit exchanges before
@@ -1010,7 +1010,7 @@
                     int _remaining = 60 - _elapsed;
                     if (_remaining <= 0) break;
                     wire_msg_t m;
-                    if (!wire_recv_timeout(lsp.client_fds[dest_client], &m, _remaining))
+                    if (!wire_recv_timeout(lsp_p->client_fds[dest_client], &m, _remaining))
                         break;
                     if (m.msg_type == MSG_INVOICE_CREATED && !got_invoice_created) {
                         cJSON *hash_j = cJSON_GetObjectItem(m.json, "payment_hash");
@@ -1034,7 +1034,7 @@
                 if (!got_invoice_created) {
                     fprintf(stderr, "BRIDGE TEST: no INVOICE_CREATED from client\n");
                     close(bridge_test_fd); close(lsp_bridge_fd);
-                    lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx); return 1;
                 }
             }
@@ -1051,7 +1051,7 @@
                 cJSON_Delete(add_msg);
                 close(bridge_test_fd);
                 close(lsp_bridge_fd);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1065,17 +1065,17 @@
                 fprintf(stderr, "BRIDGE TEST: LSP recv from bridge failed\n");
                 close(bridge_test_fd);
                 close(lsp_bridge_fd);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            if (!lsp_channels_handle_bridge_msg(mgr, &lsp, &bridge_msg)) {
+            if (!lsp_channels_handle_bridge_msg(mgr, lsp_p, &bridge_msg)) {
                 fprintf(stderr, "BRIDGE TEST: handle_bridge_msg failed\n");
                 cJSON_Delete(bridge_msg.json);
                 close(bridge_test_fd);
                 close(lsp_bridge_fd);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1090,8 +1090,8 @@
                 int pumped = 0;
                 for (int attempt = 0; attempt < 20 && !pumped; attempt++) {
                     wire_msg_t client_msg;
-                    if (wire_recv_timeout(lsp.client_fds[dest_client], &client_msg, 1)) {
-                        lsp_channels_handle_msg(mgr, &lsp, dest_client, &client_msg);
+                    if (wire_recv_timeout(lsp_p->client_fds[dest_client], &client_msg, 1)) {
+                        lsp_channels_handle_msg(mgr, lsp_p, dest_client, &client_msg);
                         if (client_msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
                             printf("Bridge: client %zu sent FULFILL, relayed to bridge\n", dest_client);
                             pumped = 1;
@@ -1142,25 +1142,25 @@
         if (force_close) {
             printf("\n=== FORCE CLOSE ===\n");
             printf("Broadcasting factory tree (%zu nodes) on %s...\n",
-                   lsp.factory.n_nodes, network);
+                   lsp_p->factory.n_nodes, network);
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "FORCE CLOSE: tree broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
 
             printf("\n=== FORCE CLOSE COMPLETE ===\n");
-            printf("All %zu nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+            printf("All %zu nodes confirmed on-chain.\n", lsp_p->factory.n_nodes);
             /* Phase L: register root node tx for CPFP monitoring */
-            if (g_watchtower_ready && lsp.factory.n_nodes > 0) {
+            if (g_watchtower_ready && lsp_p->factory.n_nodes > 0) {
                 char root_txid_hex[65];
                 unsigned char root_txid_rev[32];
-                memcpy(root_txid_rev, lsp.factory.nodes[0].txid, 32);
+                memcpy(root_txid_rev, lsp_p->factory.nodes[0].txid, 32);
                 reverse_bytes(root_txid_rev, 32);
                 hex_encode(root_txid_rev, 32, root_txid_hex);
                 watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
@@ -1172,7 +1172,7 @@
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
@@ -1182,17 +1182,17 @@
         if (test_burn) {
             printf("\n=== BURN TX TEST ===\n");
 
-            if (!lsp.factory.has_shachain) {
+            if (!lsp_p->factory.has_shachain) {
                 fprintf(stderr, "BURN TEST: factory has no shachain (internal error)\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
 
             /* Identify first leaf node and its L-stock output */
-            size_t leaf_idx = lsp.factory.leaf_node_indices[0];
-            factory_node_t *leaf = &lsp.factory.nodes[leaf_idx];
+            size_t leaf_idx = lsp_p->factory.leaf_node_indices[0];
+            factory_node_t *leaf = &lsp_p->factory.nodes[leaf_idx];
             uint32_t l_stock_vout = (uint32_t)(leaf->n_outputs - 1);
             uint64_t l_stock_amount = leaf->outputs[l_stock_vout].amount_sats;
 
@@ -1202,28 +1202,28 @@
 
             /* Step 1: Broadcast full factory tree */
             printf("Broadcasting factory tree (%zu nodes) on %s...\n",
-                   lsp.factory.n_nodes, network);
+                   lsp_p->factory.n_nodes, network);
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "BURN TEST: tree broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            printf("All %zu tree nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+            printf("All %zu tree nodes confirmed on-chain.\n", lsp_p->factory.n_nodes);
 
             /* Step 2: Build burn TX for epoch 0 L-stock */
             tx_buf_t burn_tx;
             tx_buf_init(&burn_tx, 256);
-            if (!factory_build_burn_tx(&lsp.factory, &burn_tx,
+            if (!factory_build_burn_tx(&lsp_p->factory, &burn_tx,
                                          leaf->txid, l_stock_vout,
                                          l_stock_amount, 0)) {
                 fprintf(stderr, "BURN TEST: factory_build_burn_tx failed\n");
                 tx_buf_free(&burn_tx);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1242,7 +1242,7 @@
 
             if (!sent) {
                 fprintf(stderr, "BURN TEST: burn TX broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1260,7 +1260,7 @@
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
@@ -1272,7 +1272,7 @@
 
             if (mgr->n_channels < 2) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: need at least 2 channels\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1289,10 +1289,10 @@
                    "current_height=%u)\n",
                    (unsigned long long)htlc_amount, htlc_cltv, current_height);
 
-            if (!lsp_channels_add_pending_htlc(mgr, &lsp, 0, htlc_amount,
+            if (!lsp_channels_add_pending_htlc(mgr, lsp_p, 0, htlc_amount,
                                                  dummy_hash, htlc_cltv)) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: add_pending_htlc failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1300,18 +1300,18 @@
 
             /* Step 2: Broadcast the factory tree */
             printf("Broadcasting factory tree (%zu nodes) on %s...\n",
-                   lsp.factory.n_nodes, network);
+                   lsp_p->factory.n_nodes, network);
 
-            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: tree broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            printf("All %zu tree nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+            printf("All %zu tree nodes confirmed on-chain.\n", lsp_p->factory.n_nodes);
 
             /* Step 3: Build and broadcast the commitment TX (has HTLC output) */
             channel_t *ch0 = &mgr->entries[0].channel;
@@ -1322,7 +1322,7 @@
             if (!channel_build_commitment_tx(ch0, &commit_unsigned, commit_txid)) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: build commitment TX failed\n");
                 tx_buf_free(&commit_unsigned);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1336,7 +1336,7 @@
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: client keypair failed\n");
                 memset(cli_sec, 0, 32);
                 tx_buf_free(&commit_unsigned);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1349,7 +1349,7 @@
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: sign commitment failed\n");
                 tx_buf_free(&commit_signed);
                 tx_buf_free(&commit_unsigned);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1368,7 +1368,7 @@
 
             if (!sent) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: commitment broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1469,7 +1469,7 @@
                     htlc_spk, htlc_spk_len, htlc_index)) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: build timeout TX failed\n");
                 tx_buf_free(&timeout_tx);
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1487,7 +1487,7 @@
 
             if (!timeout_sent) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: timeout TX broadcast failed\n");
-                lsp_cleanup(&lsp);
+                lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
@@ -1502,7 +1502,7 @@
             report_close(&rpt);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
-            lsp_cleanup(&lsp);
+            lsp_cleanup(lsp_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
             return 0;
