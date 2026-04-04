@@ -804,7 +804,7 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
     backend->base.register_script   = cb_register_script;
     backend->base.unregister_script = cb_unregister_script;
     backend->base.ctx               = backend;
-    backend->base.safe_confirmations = MAINNET_SAFE_CONFIRMATIONS;
+    conf_targets_default(&backend->base.conf);
 
     backend->tip_height             = -1;  /* unknown until first sync */
     backend->headers_synced         = -1;  /* no block headers yet     */
