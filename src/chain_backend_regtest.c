@@ -1,5 +1,6 @@
 #include "superscalar/chain_backend.h"
 #include "superscalar/regtest.h"
+#include <string.h>
 
 /*
  * chain_backend_t implementation backed by the existing regtest_t / bitcoin-cli
