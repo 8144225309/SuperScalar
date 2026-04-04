@@ -25,6 +25,7 @@ typedef struct watchtower_htlc {
     htlc_direction_t direction;
     unsigned char payment_hash[32];
     uint32_t cltv_expiry;
+    char sweep_txid[65];          /* hex txid of broadcast timeout sweep (empty = not yet swept) */
 } watchtower_htlc_t;
 
 typedef struct {

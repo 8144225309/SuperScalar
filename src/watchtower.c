@@ -737,12 +737,40 @@ int watchtower_check(watchtower_t *wt) {
                 ch = wt->channels[e->channel_id];
             if (!ch) continue;
 
-            for (size_t h = 0; h < e->n_htlc_outputs; ) {
+            for (size_t h = 0; h < e->n_htlc_outputs; h++) {
                 watchtower_htlc_t *htlc = &e->htlc_outputs[h];
-                if ((uint32_t)current_height < htlc->cltv_expiry) {
-                    h++;
+
+                /* Already swept and confirmed — skip */
+                if (htlc->htlc_amount == 0 && htlc->sweep_txid[0] == '\0')
                     continue;
+
+                /* Sweep was broadcast — check if confirmed */
+                if (htlc->sweep_txid[0] != '\0') {
+                    int sweep_conf = wt->chain->get_confirmations(
+                                         wt->chain, htlc->sweep_txid);
+                    if (sweep_conf >= MAINNET_SAFE_CONFIRMATIONS) {
+                        /* Safely confirmed — mark as fully swept */
+                        htlc->htlc_amount = 0;
+                        htlc->sweep_txid[0] = '\0';
+                    } else if (sweep_conf < 0 &&
+                               !wt->chain->is_in_mempool(wt->chain, htlc->sweep_txid)) {
+                        /* Sweep TX vanished (reorg) — reset for re-broadcast */
+                        fprintf(stderr, "  HTLC sweep %s reorged out, will re-broadcast\n",
+                                htlc->sweep_txid);
+                        htlc->sweep_txid[0] = '\0';
+                        /* fall through to re-broadcast below */
+                    } else {
+                        /* Still in mempool or partially confirmed — wait */
+                        continue;
+                    }
                 }
+
+                /* If amount is zero, this HTLC is done */
+                if (htlc->htlc_amount == 0) continue;
+
+                /* CLTV not yet expired — skip */
+                if ((uint32_t)current_height < htlc->cltv_expiry)
+                    continue;
 
                 /* CLTV expired — build and broadcast timeout tx */
                 size_t saved_n = ch->n_htlcs;
@@ -769,6 +797,11 @@ int watchtower_check(watchtower_t *wt) {
                             printf("  HTLC timeout sweep (vout %u, cltv %u): %s\n",
                                    htlc->htlc_vout, htlc->cltv_expiry, txid);
                             penalties_broadcast++;
+                            /* Track the sweep txid for confirmation monitoring */
+                            memcpy(htlc->sweep_txid, txid, 65);
+                            /* Register for CPFP monitoring */
+                            watchtower_add_pending_tx(wt, txid, 1,
+                                                      WATCHTOWER_ANCHOR_AMOUNT);
                             if (wt->db && wt->db->db)
                                 persist_log_broadcast(wt->db, txid,
                                                       "htlc_timeout", tx_hex, "ok");
@@ -780,17 +813,14 @@ int watchtower_check(watchtower_t *wt) {
 
                 ch->n_htlcs = saved_n;
                 if (saved_n > 0) ch->htlcs[0] = saved_h0;
-
-                /* Mark HTLC as swept but keep in list until the parent
-                   force-close entry is safely confirmed. If the sweep TX
-                   is reorged out, the next watchtower_check will re-attempt. */
-                e->htlc_outputs[h].htlc_amount = 0;  /* mark swept */
             }
 
-            /* If all HTLCs swept (all amounts zeroed), remove the force-close entry */
+            /* If all HTLCs fully swept (amount=0 and no pending sweep), remove entry */
             size_t unswept = 0;
             for (size_t hh = 0; hh < e->n_htlc_outputs; hh++)
-                if (e->htlc_outputs[hh].htlc_amount > 0) unswept++;
+                if (e->htlc_outputs[hh].htlc_amount > 0 ||
+                    e->htlc_outputs[hh].sweep_txid[0] != '\0')
+                    unswept++;
             if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;

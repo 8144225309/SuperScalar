@@ -151,15 +151,17 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 }
 
 int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
-                               int timeout_secs)
+                               int timeout_secs, int min_confs)
 {
-    return lsp_wait_for_confirmation_service(chain, txid_hex, timeout_secs, NULL, NULL);
+    return lsp_wait_for_confirmation_service(chain, txid_hex, timeout_secs, min_confs, NULL, NULL);
 }
 
 int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_hex,
-                                       int timeout_secs, void *mgr_ptr, void *lsp_ptr)
+                                       int timeout_secs, int min_confs,
+                                       void *mgr_ptr, void *lsp_ptr)
 {
     if (!chain || !txid_hex) return 0;
+    if (min_confs < 1) min_confs = 1;
 
     lsp_t *lsp = (lsp_t *)lsp_ptr;
     (void)mgr_ptr;  /* used only as opaque arg to lsp_accept_and_queue_connection */
@@ -169,7 +171,7 @@ int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_h
         int waited = 0;
         while (waited < timeout_secs) {
             int confs = chain->get_confirmations(chain, txid_hex);
-            if (confs >= 1) return 1;
+            if (confs >= min_confs) return 1;
             sleep(15);
             waited += 15;
         }
@@ -193,7 +195,7 @@ int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_h
         /* Check confirmations every 15 s */
         if (tv_now.tv_sec - last_conf_check >= 15) {
             int confs = chain->get_confirmations(chain, txid_hex);
-            if (confs >= 1) return 1;
+            if (confs >= min_confs) return 1;
             last_conf_check = tv_now.tv_sec;
         }
 

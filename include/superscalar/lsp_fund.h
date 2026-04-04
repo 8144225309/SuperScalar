@@ -27,11 +27,13 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
                  char *txid_out_65);
 
 /*
- * Poll chain backend until txid is confirmed or timeout_secs elapses.
+ * Poll chain backend until txid has >= min_confs confirmations or timeout.
+ * min_confs: use MAINNET_SAFE_CONFIRMATIONS (6) for mainnet safety,
+ *            or 1 for regtest where reorg risk is simulated separately.
  * Polls every 15 seconds. Returns 1 if confirmed, 0 on timeout.
  */
 int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
-                               int timeout_secs);
+                               int timeout_secs, int min_confs);
 
 /*
  * Same as lsp_wait_for_confirmation but services the listen socket during the
@@ -39,6 +41,7 @@ int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
  * plain sleep-only version.
  */
 int lsp_wait_for_confirmation_service(chain_backend_t *chain, const char *txid_hex,
-                                       int timeout_secs, void *mgr, void *lsp);
+                                       int timeout_secs, int min_confs,
+                                       void *mgr, void *lsp);
 
 #endif /* SUPERSCALAR_LSP_FUND_H */

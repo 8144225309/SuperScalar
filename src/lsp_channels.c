@@ -3472,6 +3472,28 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    watchtower_check is deferred to once per 60s (below). */
                 if (mgr->watchtower && mgr->watchtower->rt) {
                     int height = regtest_get_block_height(mgr->watchtower->rt);
+                /* Reorg detection: height decreased since last check */
+                {
+                    static int32_t daemon_last_height = 0;
+                    if (daemon_last_height > 0 && height > 0 &&
+                        height < daemon_last_height) {
+                        fprintf(stderr, "LSP: REORG detected — height %d → %d "
+                                "(depth %d)\n", daemon_last_height, height,
+                                daemon_last_height - height);
+                        /* Re-validate watchtower entries */
+                        watchtower_on_reorg(mgr->watchtower, height,
+                                           daemon_last_height);
+                        /* Immediate watchtower check to re-detect breaches */
+                        watchtower_check(mgr->watchtower);
+                        /* Re-run factory recovery to re-broadcast lost TXs */
+                        if (mgr->persist) {
+                            chain_backend_t *chain_rec = mgr->watchtower->chain;
+                            factory_recovery_scan((persist_t *)mgr->persist,
+                                                  chain_rec);
+                        }
+                    }
+                    if (height > 0) daemon_last_height = height;
+                }
                 if (height > 0) {
                     for (size_t c = 0; c < mgr->n_channels; c++) {
                         channel_t *ch = &mgr->entries[c].channel;
