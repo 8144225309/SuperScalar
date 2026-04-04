@@ -805,6 +805,7 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
     backend->base.unregister_script = cb_unregister_script;
     backend->base.ctx               = backend;
     conf_targets_default(&backend->base.conf);
+    backend->base.is_regtest = (network && strcmp(network, "regtest") == 0);
 
     backend->tip_height             = -1;  /* unknown until first sync */
     backend->headers_synced         = -1;  /* no block headers yet     */

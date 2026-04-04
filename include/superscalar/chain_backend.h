@@ -134,6 +134,10 @@ struct chain_backend {
     /* Per-operation confirmation depth targets. */
     conf_targets_t conf;
 
+    /* Set to 1 if this backend is running on regtest. Allows code without
+       access to regtest_t to branch correctly. Set by init functions. */
+    int is_regtest;
+
     /* Backend-specific state. */
     void *ctx;
 };
