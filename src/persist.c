@@ -1,4 +1,5 @@
 #include "superscalar/persist.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
@@ -1772,6 +1773,47 @@ int persist_log_broadcast(persist_t *p, const char *txid,
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+/* Retry failed penalty broadcasts. Returns count re-broadcast. */
+int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
+    if (!p || !p->db || !chain) return 0;
+
+    const char *sql =
+        "SELECT id, raw_hex FROM broadcast_log "
+        "WHERE result = 'pending_retry' AND raw_hex IS NOT NULL "
+        "ORDER BY broadcast_time ASC LIMIT 16;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    int retried = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int row_id = sqlite3_column_int(stmt, 0);
+        const char *raw_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (!raw_hex) continue;
+
+        char txid_out[65] = {0};
+        if (chain->send_raw_tx(chain, raw_hex, txid_out)) {
+            fprintf(stderr, "Watchtower: retry broadcast succeeded: %s\n", txid_out);
+            /* Mark as ok */
+            const char *upd = "UPDATE broadcast_log SET result='ok', txid=? WHERE id=?;";
+            sqlite3_stmt *u;
+            if (sqlite3_prepare_v2(p->db, upd, -1, &u, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(u, 1, txid_out, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(u, 2, row_id);
+                sqlite3_step(u);
+                sqlite3_finalize(u);
+            }
+            retried++;
+        } else {
+            /* Still failing — leave as pending_retry for next cycle */
+            fprintf(stderr, "Watchtower: retry broadcast still failing (id=%d)\n", row_id);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return retried;
 }
 
 /* --- Signing progress tracking --- */
