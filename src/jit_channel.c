@@ -620,7 +620,8 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     } else {
         int timeout = mgr->confirm_timeout_secs > 0 ?
                       mgr->confirm_timeout_secs : 7200;
-        int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout);
+        int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout,
+                                                    MAINNET_SAFE_CONFIRMATIONS);
         if (!confirmed) {
             fprintf(stderr, "LSP JIT close: confirmation timeout for client %zu\n",
                     client_idx);
@@ -628,10 +629,22 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
         }
     }
 
+    /* Re-verify close TX still has safe confirmations before removing
+       watchtower entries. This guards against a reorg between the wait
+       returning and the removal happening. */
+    if (!mgr->rot_is_regtest) {
+        int recheck = chain_be->get_confirmations(chain_be, close_txid);
+        if (recheck < MAINNET_SAFE_CONFIRMATIONS) {
+            fprintf(stderr, "LSP JIT close: close TX lost confirmations "
+                    "(was safe, now %d) — keeping watchtower entries\n", recheck);
+            return 0;
+        }
+    }
+
     /* Update state */
     jit->state = JIT_STATE_CLOSED;
 
-    /* Cleanup watchtower */
+    /* Cleanup watchtower — safe because close TX has >= 6 confirmations */
     if (mgr->watchtower) {
         size_t wt_idx = mgr->n_channels + client_idx;
         watchtower_remove_channel(mgr->watchtower, (uint32_t)wt_idx);
