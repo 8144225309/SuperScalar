@@ -723,11 +723,9 @@ int jit_channels_check_funding(void *mgr_ptr) {
         if (jits[i].state != JIT_STATE_FUNDING) continue;
         if (jits[i].funding_txid_hex[0] == '\0') continue;
 
-        /* cppcheck-suppress nullPointerRedundantCheck ; mgr->watchtower checked at line 525 */
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
-        int is_rt = (mgr->watchtower->rt &&
-                     strcmp(mgr->watchtower->rt->network, "regtest") == 0);
+        int is_rt = (strcmp(mgr->watchtower->rt->network, "regtest") == 0);
         int safe_conf = chain_funding_confs(mgr->watchtower->chain, is_rt);
         if (conf >= safe_conf) {
             jits[i].state = JIT_STATE_OPEN;
@@ -735,11 +733,9 @@ int jit_channels_check_funding(void *mgr_ptr) {
             printf("LSP JIT: channel %08x funding confirmed (%d conf)\n",
                    jits[i].jit_channel_id, conf);
 
-            /* Register with watchtower */
-            if (mgr->watchtower) {
-                size_t wt_idx = mgr->n_channels + jits[i].client_idx;
-                watchtower_set_channel(mgr->watchtower, wt_idx, &jits[i].channel);
-            }
+            /* Register with watchtower (guaranteed non-NULL by guard at function entry) */
+            size_t wt_idx = mgr->n_channels + jits[i].client_idx;
+            watchtower_set_channel(mgr->watchtower, wt_idx, &jits[i].channel);
 
             /* Persist state change */
             if (mgr->persist)
