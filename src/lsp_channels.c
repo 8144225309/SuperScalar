@@ -672,7 +672,8 @@ static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             msg->msg_type == MSG_CLOSE_REQUEST ||
             msg->msg_type == MSG_LSPS_REQUEST ||
             msg->msg_type == MSG_QUEUE_POLL ||
-            msg->msg_type == MSG_QUEUE_DONE) {
+            msg->msg_type == MSG_QUEUE_DONE ||
+            msg->msg_type == MSG_PONG) {
             lsp_channels_handle_msg(mgr, lsp, client_idx, msg);
             if (msg->json) { cJSON_Delete(msg->json); msg->json = NULL; }
             continue;
@@ -2202,6 +2203,11 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            it up here. Safe to discard. */
         printf("LSP: discarding stale PTLC_ADAPTED_SIG from client %zu\n",
                client_idx);
+        return 1;
+
+    case MSG_PONG:
+        /* Keepalive response — daemon sends PING every 30s, clients reply PONG.
+           These can arrive at any time during the event/daemon loop. */
         return 1;
 
     case MSG_STFU: {
