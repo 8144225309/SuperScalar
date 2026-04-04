@@ -13,8 +13,16 @@
  * Mobile / hardware-wallet implementations can provide their own.
  */
 
+typedef enum {
+    WALLET_SOURCE_NONE = 0,
+    WALLET_SOURCE_RPC  = 1,
+    WALLET_SOURCE_HD   = 2
+} wallet_source_type_t;
+
 typedef struct wallet_source wallet_source_t;
 struct wallet_source {
+    wallet_source_type_t type;
+
     /*
      * Select a wallet UTXO with value >= min_sats.
      * On success: fills txid_hex (65 chars, display order), *vout, *amount,

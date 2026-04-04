@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "superscalar/sha256.h"
+#include "superscalar/wallet_source.h"
 
 /* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
 
@@ -3451,18 +3452,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     static time_t last_deposit_check = 0;
                     if (!last_deposit_check) last_deposit_check = tnow;
                     if (tnow - last_deposit_check >= 30 && mgr->wallet_src) {
-                        extern uint64_t wallet_source_hd_get_balance(const void *);
-                        extern uint32_t wallet_source_hd_extend_gap(void *);
-                        uint64_t bal = wallet_source_hd_get_balance(mgr->wallet_src);
-                        if (bal != mgr->available_balance_sats) {
-                            if (bal > mgr->available_balance_sats)
-                                printf("LSP: deposit detected — wallet balance: %llu sats (+%llu)\n",
-                                       (unsigned long long)bal,
-                                       (unsigned long long)(bal - mgr->available_balance_sats));
-                            mgr->available_balance_sats = bal;
+                        wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+                        if (ws->type == WALLET_SOURCE_HD) {
+                            extern uint64_t wallet_source_hd_get_balance(const void *);
+                            extern uint32_t wallet_source_hd_extend_gap(void *);
+                            uint64_t bal = wallet_source_hd_get_balance(mgr->wallet_src);
+                            if (bal != mgr->available_balance_sats) {
+                                if (bal > mgr->available_balance_sats)
+                                    printf("LSP: deposit detected — wallet balance: %llu sats (+%llu)\n",
+                                           (unsigned long long)bal,
+                                           (unsigned long long)(bal - mgr->available_balance_sats));
+                                mgr->available_balance_sats = bal;
+                            }
+                            /* Extend gap limit if needed */
+                            wallet_source_hd_extend_gap(mgr->wallet_src);
                         }
-                        /* Extend gap limit if needed */
-                        wallet_source_hd_extend_gap(mgr->wallet_src);
                         last_deposit_check = tnow;
                     }
                 }

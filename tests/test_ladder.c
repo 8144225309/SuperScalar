@@ -101,8 +101,9 @@ int test_ladder_create_factories(void) {
                                       fund_spk, &fund_tweaked),
                 "compute funding spk");
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);  /* 100 active, 30 dying */
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);  /* 100 active, 30 dying */
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
@@ -110,31 +111,32 @@ int test_ladder_create_factories(void) {
     /* Create 3 factories at different blocks */
     for (int i = 0; i < 3; i++) {
         fake_txid[0] = (unsigned char)i;
-        ladder_advance_block(&lad, (uint32_t)(i * 100));
-        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+        ladder_advance_block(lad, (uint32_t)(i * 100));
+        TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                            fake_txid, 0, fund_spk, 34),
                     "create factory");
     }
 
-    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories");
-    TEST_ASSERT_EQ(lad.factories[0].factory_id, 0, "factory 0 id");
-    TEST_ASSERT_EQ(lad.factories[1].factory_id, 1, "factory 1 id");
-    TEST_ASSERT_EQ(lad.factories[2].factory_id, 2, "factory 2 id");
+    TEST_ASSERT_EQ(lad->n_factories, 3, "3 factories");
+    TEST_ASSERT_EQ(lad->factories[0].factory_id, 0, "factory 0 id");
+    TEST_ASSERT_EQ(lad->factories[1].factory_id, 1, "factory 1 id");
+    TEST_ASSERT_EQ(lad->factories[2].factory_id, 2, "factory 2 id");
 
     /* Verify lifecycle params */
-    TEST_ASSERT_EQ(lad.factories[0].factory.active_blocks, 100, "f0 active");
-    TEST_ASSERT_EQ(lad.factories[0].factory.dying_blocks, 30, "f0 dying");
-    TEST_ASSERT_EQ(lad.factories[0].factory.created_block, 0, "f0 created");
-    TEST_ASSERT_EQ(lad.factories[1].factory.created_block, 100, "f1 created");
-    TEST_ASSERT_EQ(lad.factories[2].factory.created_block, 200, "f2 created");
+    TEST_ASSERT_EQ(lad->factories[0].factory.active_blocks, 100, "f0 active");
+    TEST_ASSERT_EQ(lad->factories[0].factory.dying_blocks, 30, "f0 dying");
+    TEST_ASSERT_EQ(lad->factories[0].factory.created_block, 0, "f0 created");
+    TEST_ASSERT_EQ(lad->factories[1].factory.created_block, 100, "f1 created");
+    TEST_ASSERT_EQ(lad->factories[2].factory.created_block, 200, "f2 created");
 
     /* All should be initialized and funded */
     for (int i = 0; i < 3; i++) {
-        TEST_ASSERT(lad.factories[i].is_initialized, "initialized");
-        TEST_ASSERT(lad.factories[i].is_funded, "funded");
+        TEST_ASSERT(lad->factories[i].is_initialized, "initialized");
+        TEST_ASSERT(lad->factories[i].is_funded, "funded");
     }
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -153,45 +155,47 @@ int test_ladder_state_transitions(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
     /* Create factory at block 0 */
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* At block 0: ACTIVE */
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 0");
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "active at 0");
 
     /* At block 50: still ACTIVE */
-    ladder_advance_block(&lad, 50);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 50");
+    ladder_advance_block(lad, 50);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "active at 50");
 
     /* At block 99: last ACTIVE block */
-    ladder_advance_block(&lad, 99);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active at 99");
+    ladder_advance_block(lad, 99);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "active at 99");
 
     /* At block 100: DYING starts */
-    ladder_advance_block(&lad, 100);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying at 100");
+    ladder_advance_block(lad, 100);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "dying at 100");
 
     /* At block 129: last DYING block */
-    ladder_advance_block(&lad, 129);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying at 129");
+    ladder_advance_block(lad, 129);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "dying at 129");
 
     /* At block 130: EXPIRED */
-    ladder_advance_block(&lad, 130);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "expired at 130");
+    ladder_advance_block(lad, 130);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_EXPIRED, "expired at 130");
 
     /* Verify helpers */
-    ladder_factory_t *active = ladder_get_active(&lad);
+    ladder_factory_t *active = ladder_get_active(lad);
     TEST_ASSERT(active == NULL, "no active factory");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -215,18 +219,19 @@ int test_ladder_key_turnover_close(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Can't close yet */
-    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't close yet");
+    TEST_ASSERT(!ladder_can_close(lad, 0), "can't close yet");
 
     /* Simulate PTLC key turnover for each client */
     secp256k1_pubkey all_pks[5];
@@ -258,13 +263,13 @@ int test_ladder_key_turnover_close(void) {
                                             nonce_parity),
                     "extract");
 
-        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+        TEST_ASSERT(ladder_record_key_turnover(lad, 0, (uint32_t)(c + 1),
                                                 extracted),
                     "record turnover");
     }
 
     /* Now can close */
-    TEST_ASSERT(ladder_can_close(&lad, 0), "can close now");
+    TEST_ASSERT(ladder_can_close(lad, 0), "can close now");
 
     /* Build close tx */
     tx_output_t output;
@@ -274,12 +279,13 @@ int test_ladder_key_turnover_close(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &output, 1, 0),
+    TEST_ASSERT(ladder_build_close(lad, 0, &close_tx, &output, 1, 0),
                 "build close");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
     tx_buf_free(&close_tx);
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -299,49 +305,51 @@ int test_ladder_overlapping(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid1[32], fake_txid2[32];
     memset(fake_txid1, 0xAA, 32);
     memset(fake_txid2, 0xBB, 32);
 
     /* Create factory 0 at block 0 */
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid1, 0, fund_spk, 34),
                 "create factory 0");
 
     /* Advance to block 100: factory 0 enters dying */
-    ladder_advance_block(&lad, 100);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f0 dying");
+    ladder_advance_block(lad, 100);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "f0 dying");
 
     /* Create factory 1 at block 100 */
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid2, 0, fund_spk, 34),
                 "create factory 1");
 
     /* Update block to re-evaluate states */
-    ladder_advance_block(&lad, 100);
+    ladder_advance_block(lad, 100);
 
     /* Verify both exist with correct states */
-    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories");
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f0 dying");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f1 active");
+    TEST_ASSERT_EQ(lad->n_factories, 2, "2 factories");
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "f0 dying");
+    TEST_ASSERT_EQ(lad->factories[1].cached_state, FACTORY_ACTIVE, "f1 active");
 
     /* Get active/dying by state */
-    ladder_factory_t *active = ladder_get_active(&lad);
-    ladder_factory_t *dying = ladder_get_dying(&lad);
+    ladder_factory_t *active = ladder_get_active(lad);
+    ladder_factory_t *dying = ladder_get_dying(lad);
     TEST_ASSERT(active != NULL, "found active");
     TEST_ASSERT(dying != NULL, "found dying");
     TEST_ASSERT_EQ(active->factory_id, 1, "active is f1");
     TEST_ASSERT_EQ(dying->factory_id, 0, "dying is f0");
 
     /* Advance past factory 0 expiry */
-    ladder_advance_block(&lad, 130);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f1 still active");
+    ladder_advance_block(lad, 130);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
+    TEST_ASSERT_EQ(lad->factories[1].cached_state, FACTORY_ACTIVE, "f1 still active");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -447,17 +455,18 @@ int test_regtest_ladder_lifecycle(void) {
     TEST_ASSERT(found_vout >= 0, "find vout");
 
     /* Use small block counts for regtest: active=10, dying=5 */
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 10, 5);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 10, 5);
 
     /* Get current block height */
     char *height_str = regtest_exec(&rt, "getblockcount", "");
     TEST_ASSERT(height_str != NULL, "getblockcount");
     uint32_t start_height = (uint32_t)atoi(height_str);
     free(height_str);
-    lad.current_block = start_height;
+    lad->current_block = start_height;
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund_amount,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, fund_amount,
                                        fund_txid_bytes, (uint32_t)found_vout,
                                        fund_spk, 34),
                 "create factory");
@@ -465,25 +474,26 @@ int test_regtest_ladder_lifecycle(void) {
 
     /* ACTIVE: mine 5 blocks, verify still active */
     regtest_mine_blocks(&rt, 5, mine_addr);
-    ladder_advance_block(&lad, start_height + 5);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "active +5");
+    ladder_advance_block(lad, start_height + 5);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "active +5");
     printf("  Block %u: ACTIVE\n", start_height + 5);
 
     /* DYING: mine 5 more (total 10), should be dying */
     regtest_mine_blocks(&rt, 5, mine_addr);
-    ladder_advance_block(&lad, start_height + 10);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "dying +10");
+    ladder_advance_block(lad, start_height + 10);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "dying +10");
     printf("  Block %u: DYING\n", start_height + 10);
 
     /* EXPIRED: mine 5 more (total 15), should be expired */
     regtest_mine_blocks(&rt, 5, mine_addr);
-    ladder_advance_block(&lad, start_height + 15);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "expired +15");
+    ladder_advance_block(lad, start_height + 15);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_EXPIRED, "expired +15");
     printf("  Block %u: EXPIRED\n", start_height + 15);
 
     printf("  Lifecycle transitions verified on-chain!\n");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -559,19 +569,20 @@ int test_regtest_ladder_ptlc_migration(void) {
     uint32_t start_height = (uint32_t)atoi(height_str);
     free(height_str);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 10, 5);  /* active=10, dying=5 */
-    lad.current_block = start_height;
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 10, 5);  /* active=10, dying=5 */
+    lad->current_block = start_height;
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund1_amount,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, fund1_amount,
                                        fund1_txid, (uint32_t)fund1_vout,
                                        fund_spk, 34),
                 "create factory 1");
 
     /* Advance to dying period */
     regtest_mine_blocks(&rt, 10, mine_addr);
-    ladder_advance_block(&lad, start_height + 10);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 dying");
+    ladder_advance_block(lad, start_height + 10);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "f1 dying");
     printf("  Factory 1 now DYING at block %u\n", start_height + 10);
 
     /* PTLC key turnover for all 4 clients */
@@ -604,11 +615,11 @@ int test_regtest_ladder_ptlc_migration(void) {
                                             nonce_parity),
                     "extract");
 
-        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+        TEST_ASSERT(ladder_record_key_turnover(lad, 0, (uint32_t)(c + 1),
                                                 extracted),
                     "record turnover");
     }
-    TEST_ASSERT(ladder_can_close(&lad, 0), "can close factory 1");
+    TEST_ASSERT(ladder_can_close(lad, 0), "can close factory 1");
 
     /* Build and broadcast cooperative close of factory 1 */
     /* Output goes to a fresh P2TR address the LSP controls */
@@ -633,7 +644,7 @@ int test_regtest_ladder_ptlc_migration(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1, 0),
+    TEST_ASSERT(ladder_build_close(lad, 0, &close_tx, &close_output, 1, 0),
                 "build close tx");
 
     char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
@@ -681,19 +692,20 @@ int test_regtest_ladder_ptlc_migration(void) {
     height_str = regtest_exec(&rt, "getblockcount", "");
     uint32_t cur_height = (uint32_t)atoi(height_str);
     free(height_str);
-    ladder_advance_block(&lad, cur_height);
+    ladder_advance_block(lad, cur_height);
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, fund2_amount,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, fund2_amount,
                                        fund2_txid, (uint32_t)fund2_vout,
                                        fund_spk, 34),
                 "create factory 2");
 
-    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories in ladder");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
+    TEST_ASSERT_EQ(lad->n_factories, 2, "2 factories in ladder");
+    TEST_ASSERT_EQ(lad->factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
     printf("  Factory 2 created and ACTIVE. Full migration demo complete!\n");
 
     tx_buf_free(&close_tx);
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -868,8 +880,9 @@ int test_ladder_evict_expired(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
@@ -877,28 +890,29 @@ int test_ladder_evict_expired(void) {
     /* Create 3 factories at blocks 0, 100, 200 */
     for (int i = 0; i < 3; i++) {
         fake_txid[0] = (unsigned char)i;
-        ladder_advance_block(&lad, (uint32_t)(i * 100));
-        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+        ladder_advance_block(lad, (uint32_t)(i * 100));
+        TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                            fake_txid, 0, fund_spk, 34),
                     "create factory");
     }
-    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories");
+    TEST_ASSERT_EQ(lad->n_factories, 3, "3 factories");
 
     /* Advance to block 310: factory 0 EXPIRED (0+100+30=130), factory 1 EXPIRED (100+100+30=230),
        factory 2 DYING (200+100=300..330) */
-    ladder_advance_block(&lad, 310);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_EXPIRED, "f1 expired");
-    TEST_ASSERT_EQ(lad.factories[2].cached_state, FACTORY_DYING, "f2 dying");
+    ladder_advance_block(lad, 310);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
+    TEST_ASSERT_EQ(lad->factories[1].cached_state, FACTORY_EXPIRED, "f1 expired");
+    TEST_ASSERT_EQ(lad->factories[2].cached_state, FACTORY_DYING, "f2 dying");
 
     /* Evict expired */
-    size_t freed = ladder_evict_expired(&lad);
+    size_t freed = ladder_evict_expired(lad);
     TEST_ASSERT_EQ(freed, 2, "freed 2 slots");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory remaining");
-    TEST_ASSERT_EQ(lad.factories[0].factory_id, 2, "remaining is factory 2");
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "still dying");
+    TEST_ASSERT_EQ(lad->n_factories, 1, "1 factory remaining");
+    TEST_ASSERT_EQ(lad->factories[0].factory_id, 2, "remaining is factory 2");
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "still dying");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -918,49 +932,51 @@ int test_rotation_trigger_condition(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Save old state */
-    factory_state_t old_state = lad.factories[0].cached_state;
+    factory_state_t old_state = lad->factories[0].cached_state;
     TEST_ASSERT_EQ(old_state, FACTORY_ACTIVE, "starts active");
 
     /* Advance to DYING */
-    ladder_advance_block(&lad, 100);
-    factory_state_t new_state = lad.factories[0].cached_state;
+    ladder_advance_block(lad, 100);
+    factory_state_t new_state = lad->factories[0].cached_state;
     TEST_ASSERT_EQ(new_state, FACTORY_DYING, "now dying");
 
     /* Simulate trigger condition check */
     uint32_t attempted_mask = 0;
     int should_trigger = (new_state == FACTORY_DYING &&
                           old_state == FACTORY_ACTIVE &&
-                          !(attempted_mask & (1u << lad.factories[0].factory_id)));
+                          !(attempted_mask & (1u << lad->factories[0].factory_id)));
     TEST_ASSERT(should_trigger, "trigger fires on ACTIVE->DYING");
 
     /* Mark as attempted */
-    attempted_mask |= (1u << lad.factories[0].factory_id);
+    attempted_mask |= (1u << lad->factories[0].factory_id);
 
     /* Same transition again (e.g. re-checking same height) — should NOT trigger */
     old_state = new_state;
-    ladder_advance_block(&lad, 101);
-    new_state = lad.factories[0].cached_state;
+    ladder_advance_block(lad, 101);
+    new_state = lad->factories[0].cached_state;
     should_trigger = (new_state == FACTORY_DYING &&
                       old_state == FACTORY_ACTIVE &&
-                      !(attempted_mask & (1u << lad.factories[0].factory_id)));
+                      !(attempted_mask & (1u << lad->factories[0].factory_id)));
     TEST_ASSERT(!should_trigger, "no double trigger (state same)");
 
     /* Factory 0 already attempted, so even with forced condition it's masked */
-    should_trigger = (1 && !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    should_trigger = (1 && !(attempted_mask & (1u << lad->factories[0].factory_id)));
     TEST_ASSERT(!should_trigger, "masked by attempted_mask");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1439,13 +1455,14 @@ int test_ladder_partial_departure_blocks_close(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
@@ -1480,13 +1497,13 @@ int test_ladder_partial_departure_blocks_close(void) {
                                             nonce_parity),
                     "extract");
 
-        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+        TEST_ASSERT(ladder_record_key_turnover(lad, 0, (uint32_t)(c + 1),
                                                 extracted),
                     "record turnover");
     }
 
     /* 2 of 4 departed — cannot close */
-    TEST_ASSERT(!ladder_can_close(&lad, 0), "2/4 departed: cannot close");
+    TEST_ASSERT(!ladder_can_close(lad, 0), "2/4 departed: cannot close");
 
     /* ladder_build_close should also fail with missing clients */
     tx_output_t output;
@@ -1495,7 +1512,7 @@ int test_ladder_partial_departure_blocks_close(void) {
     output.script_pubkey_len = 34;
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(!ladder_build_close(&lad, 0, &close_tx, &output, 1, 0),
+    TEST_ASSERT(!ladder_build_close(lad, 0, &close_tx, &output, 1, 0),
                 "build_close fails with partial departure");
     tx_buf_free(&close_tx);
 
@@ -1520,15 +1537,16 @@ int test_ladder_partial_departure_blocks_close(void) {
                                             nonce_parity),
                     "extract");
 
-        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+        TEST_ASSERT(ladder_record_key_turnover(lad, 0, (uint32_t)(c + 1),
                                                 extracted),
                     "record turnover");
     }
 
     /* All 4 departed — can close */
-    TEST_ASSERT(ladder_can_close(&lad, 0), "4/4 departed: can close");
+    TEST_ASSERT(ladder_can_close(lad, 0), "4/4 departed: can close");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1550,22 +1568,23 @@ int test_ladder_restructure_fewer_clients(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
     /* Create original factory with 4 clients (5 participants total) — works */
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create original factory");
-    TEST_ASSERT_EQ(lad.factories[0].factory.n_participants, 5,
+    TEST_ASSERT_EQ(lad->factories[0].factory.n_participants, 5,
                    "original has 5 participants");
 
     /* Advance to DYING */
-    ladder_advance_block(&lad, 100);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "factory dying");
+    ladder_advance_block(lad, 100);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "factory dying");
 
     /* With generalized N, factories can be created with 2+ clients (arity-2).
        Only LSP+1 (2 participants) should fail for arity-2 (needs >=2 clients). */
@@ -1573,32 +1592,33 @@ int test_ladder_restructure_fewer_clients(void) {
     memset(fake_txid2, 0xBB, 32);
 
     /* Attempt with 1 client (2 participants) — fails (arity-2 needs >= 2 clients) */
-    int result_1 = ladder_create_factory(&lad, client_kps, 1, 100000,
+    int result_1 = ladder_create_factory(lad, client_kps, 1, 100000,
                                           fake_txid2, 0, fund_spk, 34);
     TEST_ASSERT(!result_1, "2 participants (LSP+1) fails gracefully");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "factory count unchanged after failure");
+    TEST_ASSERT_EQ(lad->n_factories, 1, "factory count unchanged after failure");
 
     /* Attempt with 2 clients (3 participants) — succeeds with generalized N */
     secp256k1_keypair online_kps[2];
     online_kps[0] = client_kps[0];
     online_kps[1] = client_kps[1];
 
-    int result_2 = ladder_create_factory(&lad, online_kps, 2, 100000,
+    int result_2 = ladder_create_factory(lad, online_kps, 2, 100000,
                                           fake_txid2, 0, fund_spk, 34);
     TEST_ASSERT(result_2, "3 participants (LSP+2) succeeds");
-    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories after LSP+2");
+    TEST_ASSERT_EQ(lad->n_factories, 2, "2 factories after LSP+2");
 
     /* Create another with full 4 clients */
     unsigned char fake_txid3[32];
     memset(fake_txid3, 0xCC, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid3, 0, fund_spk, 34),
                 "full 4 clients (5 participants) works");
-    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories total");
-    TEST_ASSERT_EQ(lad.factories[2].cached_state, FACTORY_ACTIVE,
+    TEST_ASSERT_EQ(lad->n_factories, 3, "3 factories total");
+    TEST_ASSERT_EQ(lad->factories[2].cached_state, FACTORY_ACTIVE,
                    "new factory is ACTIVE");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1728,24 +1748,25 @@ int test_ladder_full_rotation_cycle(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid1[32];
     memset(fake_txid1, 0xAA, 32);
 
     /* Phase 1: Create first factory at block 0 */
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid1, 0, fund_spk, 34),
                 "create factory 1");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory");
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "f1 active");
+    TEST_ASSERT_EQ(lad->n_factories, 1, "1 factory");
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "f1 active");
 
     /* Phase 2: Advance to DYING */
-    ladder_advance_block(&lad, 100);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 dying");
-    TEST_ASSERT(ladder_get_dying(&lad) != NULL, "dying factory found");
-    TEST_ASSERT(ladder_get_active(&lad) == NULL, "no active factory");
+    ladder_advance_block(lad, 100);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "f1 dying");
+    TEST_ASSERT(ladder_get_dying(lad) != NULL, "dying factory found");
+    TEST_ASSERT(ladder_get_active(lad) == NULL, "no active factory");
 
     /* Phase 3: PTLC key turnover for all 4 clients */
     secp256k1_pubkey all_pks[5];
@@ -1777,11 +1798,11 @@ int test_ladder_full_rotation_cycle(void) {
                                             nonce_parity),
                     "extract");
 
-        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, (uint32_t)(c + 1),
+        TEST_ASSERT(ladder_record_key_turnover(lad, 0, (uint32_t)(c + 1),
                                                 extracted),
                     "record turnover");
     }
-    TEST_ASSERT(ladder_can_close(&lad, 0), "can close factory 1");
+    TEST_ASSERT(ladder_can_close(lad, 0), "can close factory 1");
 
     /* Phase 4: Build cooperative close */
     tx_output_t close_output;
@@ -1791,7 +1812,7 @@ int test_ladder_full_rotation_cycle(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, &close_output, 1, 0),
+    TEST_ASSERT(ladder_build_close(lad, 0, &close_tx, &close_output, 1, 0),
                 "build close tx");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
@@ -1799,32 +1820,33 @@ int test_ladder_full_rotation_cycle(void) {
     unsigned char fake_txid2[32];
     memset(fake_txid2, 0xBB, 32);
 
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid2, 0, fund_spk, 34),
                 "create factory 2");
-    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories");
+    TEST_ASSERT_EQ(lad->n_factories, 2, "2 factories");
 
     /* Factory 1 is still DYING, factory 2 is ACTIVE */
-    ladder_advance_block(&lad, 100);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f1 still dying");
-    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
+    ladder_advance_block(lad, 100);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_DYING, "f1 still dying");
+    TEST_ASSERT_EQ(lad->factories[1].cached_state, FACTORY_ACTIVE, "f2 active");
 
     /* Phase 6: Advance past factory 1 expiry, evict */
-    ladder_advance_block(&lad, 130);
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f1 expired");
+    ladder_advance_block(lad, 130);
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_EXPIRED, "f1 expired");
 
-    size_t freed = ladder_evict_expired(&lad);
+    size_t freed = ladder_evict_expired(lad);
     TEST_ASSERT_EQ(freed, 1, "evicted 1 factory");
-    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory remaining");
-    TEST_ASSERT_EQ(lad.factories[0].factory_id, 1, "remaining is factory 2");
-    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_ACTIVE, "f2 still active");
+    TEST_ASSERT_EQ(lad->n_factories, 1, "1 factory remaining");
+    TEST_ASSERT_EQ(lad->factories[0].factory_id, 1, "remaining is factory 2");
+    TEST_ASSERT_EQ(lad->factories[0].cached_state, FACTORY_ACTIVE, "f2 still active");
 
     /* Verify the active factory is functional */
-    TEST_ASSERT(ladder_get_active(&lad) != NULL, "active factory accessible");
-    TEST_ASSERT(ladder_get_dying(&lad) == NULL, "no dying factory");
+    TEST_ASSERT(ladder_get_active(lad) != NULL, "active factory accessible");
+    TEST_ASSERT(ladder_get_dying(lad) == NULL, "no dying factory");
 
     tx_buf_free(&close_tx);
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1845,58 +1867,60 @@ int test_ladder_evict_and_reuse_slot(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 10, 5);  /* short lifecycle for testing */
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 10, 5);  /* short lifecycle for testing */
 
     /* Fill all LADDER_MAX_FACTORIES (8) slots */
     for (int i = 0; i < LADDER_MAX_FACTORIES; i++) {
         unsigned char fake_txid[32];
         memset(fake_txid, (unsigned char)(0xA0 + i), 32);
-        ladder_advance_block(&lad, (uint32_t)(i * 10));
-        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+        ladder_advance_block(lad, (uint32_t)(i * 10));
+        TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                            fake_txid, 0, fund_spk, 34),
                     "create factory to fill slots");
     }
-    TEST_ASSERT_EQ(lad.n_factories, LADDER_MAX_FACTORIES, "ladder full");
+    TEST_ASSERT_EQ(lad->n_factories, LADDER_MAX_FACTORIES, "ladder full");
 
     /* One more should fail */
     unsigned char overflow_txid[32];
     memset(overflow_txid, 0xFF, 32);
-    TEST_ASSERT(!ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(!ladder_create_factory(lad, client_kps, 4, 100000,
                                         overflow_txid, 0, fund_spk, 34),
                 "overflow rejected");
 
     /* Advance past the first 6 factories' expiry (each at block i*10 + 10 + 5) */
-    ladder_advance_block(&lad, 65);
+    ladder_advance_block(lad, 65);
 
     /* Count expired */
     int expired_count = 0;
-    for (size_t i = 0; i < lad.n_factories; i++) {
-        if (lad.factories[i].cached_state == FACTORY_EXPIRED)
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        if (lad->factories[i].cached_state == FACTORY_EXPIRED)
             expired_count++;
     }
     TEST_ASSERT(expired_count >= 4, "at least 4 expired");
 
     /* Evict expired */
-    size_t freed = ladder_evict_expired(&lad);
+    size_t freed = ladder_evict_expired(lad);
     TEST_ASSERT(freed >= 4, "freed expired slots");
-    TEST_ASSERT(lad.n_factories <= 4, "compacted");
+    TEST_ASSERT(lad->n_factories <= 4, "compacted");
 
     /* Now create a new factory in the freed slot */
     unsigned char new_txid[32];
     memset(new_txid, 0xEE, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        new_txid, 0, fund_spk, 34),
                 "create factory in freed slot");
 
     /* Verify the new factory is ACTIVE and has correct ID */
-    ladder_factory_t *newest = &lad.factories[lad.n_factories - 1];
+    ladder_factory_t *newest = &lad->factories[lad->n_factories - 1];
     TEST_ASSERT(newest->is_initialized, "new factory initialized");
     TEST_ASSERT_EQ(newest->cached_state, FACTORY_ACTIVE, "new factory active");
     TEST_ASSERT(newest->factory_id >= LADDER_MAX_FACTORIES,
                 "new factory has fresh ID (not reused)");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2066,24 +2090,25 @@ int test_ladder_get_cooperative_clients(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Depart clients 1 and 3 (indices 1,3 in 1-based participant idx) */
     unsigned char fake_key[32];
     memset(fake_key, 0x11, 32);
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
     memset(fake_key, 0x33, 32);
-    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+    ladder_record_key_turnover(lad, 0, 3, fake_key);
 
     uint32_t coop[8];
-    size_t n = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    size_t n = ladder_get_cooperative_clients(lad, 0, coop, 8);
     TEST_ASSERT_EQ(n, 2, "2 cooperative");
     /* Should be clients 1 and 3 */
     int found1 = 0, found3 = 0;
@@ -2094,7 +2119,8 @@ int test_ladder_get_cooperative_clients(void) {
     TEST_ASSERT(found1, "found client 1");
     TEST_ASSERT(found3, "found client 3");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2112,24 +2138,25 @@ int test_ladder_get_uncooperative_clients(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Depart clients 1 and 3 */
     unsigned char fake_key[32];
     memset(fake_key, 0x11, 32);
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
     memset(fake_key, 0x33, 32);
-    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+    ladder_record_key_turnover(lad, 0, 3, fake_key);
 
     uint32_t uncoop[8];
-    size_t n = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    size_t n = ladder_get_uncooperative_clients(lad, 0, uncoop, 8);
     TEST_ASSERT_EQ(n, 2, "2 uncooperative");
     /* Should be clients 2 and 4 */
     int found2 = 0, found4 = 0;
@@ -2140,7 +2167,8 @@ int test_ladder_get_uncooperative_clients(void) {
     TEST_ASSERT(found2, "found client 2");
     TEST_ASSERT(found4, "found client 4");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2158,12 +2186,13 @@ int test_ladder_can_partial_close_thresholds(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
@@ -2171,26 +2200,27 @@ int test_ladder_can_partial_close_thresholds(void) {
     memset(fake_key, 0xFF, 32);
 
     /* 0 departed: no */
-    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "0/4: no partial close");
+    TEST_ASSERT(!ladder_can_partial_close(lad, 0), "0/4: no partial close");
 
     /* 1 departed: no */
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
-    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "1/4: no partial close");
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
+    TEST_ASSERT(!ladder_can_partial_close(lad, 0), "1/4: no partial close");
 
     /* 2 departed: yes */
-    ladder_record_key_turnover(&lad, 0, 2, fake_key);
-    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "2/4: partial close OK");
+    ladder_record_key_turnover(lad, 0, 2, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(lad, 0), "2/4: partial close OK");
 
     /* 3 departed: yes */
-    ladder_record_key_turnover(&lad, 0, 3, fake_key);
-    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "3/4: partial close OK");
+    ladder_record_key_turnover(lad, 0, 3, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(lad, 0), "3/4: partial close OK");
 
     /* 4 departed (all): yes (but full close would also work) */
-    ladder_record_key_turnover(&lad, 0, 4, fake_key);
-    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "4/4: partial close OK");
-    TEST_ASSERT(ladder_can_close(&lad, 0), "4/4: full close also OK");
+    ladder_record_key_turnover(lad, 0, 4, fake_key);
+    TEST_ASSERT(ladder_can_partial_close(lad, 0), "4/4: partial close OK");
+    TEST_ASSERT(ladder_can_close(lad, 0), "4/4: full close also OK");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2208,44 +2238,46 @@ int test_partial_rotation_3of4(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Depart 3 of 4 clients */
     unsigned char fake_key[32];
     memset(fake_key, 0xFF, 32);
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
-    ladder_record_key_turnover(&lad, 0, 2, fake_key);
-    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
+    ladder_record_key_turnover(lad, 0, 2, fake_key);
+    ladder_record_key_turnover(lad, 0, 3, fake_key);
 
     /* Full close should fail (client 4 not departed) */
-    TEST_ASSERT(!ladder_can_close(&lad, 0), "full close fails");
+    TEST_ASSERT(!ladder_can_close(lad, 0), "full close fails");
 
     /* Partial close should work */
-    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "partial close OK");
+    TEST_ASSERT(ladder_can_partial_close(lad, 0), "partial close OK");
 
     /* Get cooperative set */
     uint32_t coop[8];
-    size_t n_coop = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    size_t n_coop = ladder_get_cooperative_clients(lad, 0, coop, 8);
     TEST_ASSERT_EQ(n_coop, 3, "3 cooperative clients");
 
     /* Get uncooperative set */
     uint32_t uncoop[8];
-    size_t n_uncoop = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    size_t n_uncoop = ladder_get_uncooperative_clients(lad, 0, uncoop, 8);
     TEST_ASSERT_EQ(n_uncoop, 1, "1 uncooperative client");
     TEST_ASSERT_EQ(uncoop[0], 4, "client 4 uncooperative");
 
     /* Mark partial rotation done */
-    lad.factories[0].partial_rotation_done = 1;
-    TEST_ASSERT_EQ(lad.factories[0].partial_rotation_done, 1, "flag set");
+    lad->factories[0].partial_rotation_done = 1;
+    TEST_ASSERT_EQ(lad->factories[0].partial_rotation_done, 1, "flag set");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2263,33 +2295,35 @@ int test_partial_rotation_2of4(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Depart only 2 */
     unsigned char fake_key[32];
     memset(fake_key, 0xFF, 32);
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
-    ladder_record_key_turnover(&lad, 0, 4, fake_key);
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
+    ladder_record_key_turnover(lad, 0, 4, fake_key);
 
-    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't full close");
-    TEST_ASSERT(ladder_can_partial_close(&lad, 0), "can partial close");
+    TEST_ASSERT(!ladder_can_close(lad, 0), "can't full close");
+    TEST_ASSERT(ladder_can_partial_close(lad, 0), "can partial close");
 
     uint32_t coop[8];
-    size_t n = ladder_get_cooperative_clients(&lad, 0, coop, 8);
+    size_t n = ladder_get_cooperative_clients(lad, 0, coop, 8);
     TEST_ASSERT_EQ(n, 2, "2 cooperative");
 
     uint32_t uncoop[8];
-    n = ladder_get_uncooperative_clients(&lad, 0, uncoop, 8);
+    n = ladder_get_uncooperative_clients(lad, 0, uncoop, 8);
     TEST_ASSERT_EQ(n, 2, "2 uncooperative");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2307,24 +2341,26 @@ int test_partial_rotation_insufficient(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Depart only 1 — insufficient */
     unsigned char fake_key[32];
     memset(fake_key, 0xFF, 32);
-    ladder_record_key_turnover(&lad, 0, 2, fake_key);
+    ladder_record_key_turnover(lad, 0, 2, fake_key);
 
-    TEST_ASSERT(!ladder_can_close(&lad, 0), "can't full close");
-    TEST_ASSERT(!ladder_can_partial_close(&lad, 0), "can't partial close either");
+    TEST_ASSERT(!ladder_can_close(lad, 0), "can't full close");
+    TEST_ASSERT(!ladder_can_partial_close(lad, 0), "can't partial close either");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2343,17 +2379,18 @@ int test_partial_rotation_preserves_distribution_tx(void) {
     secp256k1_xonly_pubkey fund_tweaked;
     compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
 
-    ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    if (!lad) return 0;
+    ladder_init(lad, ctx, &lsp_kp, 100, 30);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
-    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000,
                                        fake_txid, 0, fund_spk, 34),
                 "create factory");
 
     /* Build a fake distribution TX to prove it survives partial rotation */
-    tx_buf_t *dist = &lad.factories[0].distribution_tx;
+    tx_buf_t *dist = &lad->factories[0].distribution_tx;
     unsigned char fake_dist[] = {0xDE, 0xAD, 0xBE, 0xEF};
     memcpy(dist->data + dist->len, fake_dist, 4);
     dist->len += 4;
@@ -2362,18 +2399,19 @@ int test_partial_rotation_preserves_distribution_tx(void) {
     /* Depart 3 clients, mark partial rotation */
     unsigned char fake_key[32];
     memset(fake_key, 0xFF, 32);
-    ladder_record_key_turnover(&lad, 0, 1, fake_key);
-    ladder_record_key_turnover(&lad, 0, 2, fake_key);
-    ladder_record_key_turnover(&lad, 0, 3, fake_key);
+    ladder_record_key_turnover(lad, 0, 1, fake_key);
+    ladder_record_key_turnover(lad, 0, 2, fake_key);
+    ladder_record_key_turnover(lad, 0, 3, fake_key);
 
-    lad.factories[0].partial_rotation_done = 1;
+    lad->factories[0].partial_rotation_done = 1;
 
     /* Distribution TX should be untouched */
     TEST_ASSERT_EQ(dist->len, orig_len, "dist tx length preserved");
     TEST_ASSERT(memcmp(dist->data + (dist->len - 4), fake_dist, 4) == 0,
                 "dist tx data preserved");
 
-    ladder_free(&lad);
+    ladder_free(lad);
+    free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
 }
