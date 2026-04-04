@@ -297,6 +297,9 @@ static void usage(const char *prog) {
         "  --test-bip39        Full factory lifecycle with BIP39 HD-derived LSP key\n"
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
+        "  --safe-confs N      Confirmation depth for safety-critical operations (default: %d).\n"
+        "                        0=turbo/0-conf, 1=fast, 3=LND/CLN standard, 6=max safety.\n"
+        "                        On regtest, code always uses 1 regardless of this setting.\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
@@ -338,7 +341,7 @@ static void usage(const char *prog) {
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
-        prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
+        prog, LSP_MAX_CLIENTS, MAINNET_SAFE_CONFIRMATIONS, LSP_MAX_CLIENTS);
 }
 
 /* Ensure wallet has funds (handle exhausted regtest chains) */
@@ -1056,6 +1059,7 @@ int main(int argc, char *argv[]) {
     int dynamic_fees = 0;
     const char *fee_estimator_arg = NULL; /* --fee-estimator MODE */
     int heartbeat_interval = 0;  /* 0 = disabled; seconds between daemon status lines */
+    int safe_confs_arg = 0;      /* 0 = use default (MAINNET_SAFE_CONFIRMATIONS) */
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
     int backup_verify_arg = 0;
@@ -1308,6 +1312,8 @@ int main(int argc, char *argv[]) {
             fee_estimator_arg = argv[++i];
         else if (strcmp(argv[i], "--heartbeat-interval") == 0 && i + 1 < argc)
             heartbeat_interval = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--safe-confs") == 0 && i + 1 < argc)
+            safe_confs_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-after") == 0 && i + 1 < argc)
             fee_bump_after = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-max") == 0 && i + 1 < argc)
@@ -1876,6 +1882,13 @@ int main(int argc, char *argv[]) {
     } else {
         chain_be = (chain_backend_t *)&g_bip158;
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
+    }
+
+    /* Apply --safe-confs override (0 = turbo/0-conf, 1-6 = custom depth) */
+    if (safe_confs_arg > 0) {
+        chain_be->safe_confirmations = safe_confs_arg;
+        printf("LSP: safe confirmation depth set to %d (--safe-confs)\n",
+               safe_confs_arg);
     }
 
     /* === Recovery probe: skip ceremony if factory exists in DB === */
@@ -2679,7 +2692,7 @@ accept_new_factory:
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
             int conf = lsp_wait_for_confirmation_service(chain_be, funding_txid_hex,
                                                    confirm_timeout_secs,
-                                                   MAINNET_SAFE_CONFIRMATIONS, NULL, lsp_p);
+                                                   chain_safe_confs(chain_be, 0), NULL, lsp_p);
             if (conf < 1) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
                 lsp_cleanup(lsp_p);

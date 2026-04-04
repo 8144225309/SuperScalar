@@ -5,9 +5,11 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* Minimum confirmations before acting on chain events on non-regtest
-   networks. 6-block reorgs have effectively zero probability on Bitcoin
-   mainnet, so this eliminates reorg risk without a full reorg handler. */
+/* Default confirmation depth for mainnet safety. Runtime-configurable
+   via chain_backend_t.safe_confirmations or --safe-confs CLI flag.
+   LN ecosystem norms: LND defaults to 3, CLN to 1-3, Phoenix to 0.
+   6 is the most conservative (original Bitcoin whitepaper).
+   On regtest, the code uses 1 regardless of this setting. */
 #define MAINNET_SAFE_CONFIRMATIONS 6
 
 /*
@@ -75,9 +77,31 @@ struct chain_backend {
     void (*reorg_cb)(int new_tip, int old_tip, void *reorg_ctx);
     void *reorg_cb_ctx;
 
+    /* Runtime-configurable confirmation depth for safety-critical decisions.
+       Defaults to MAINNET_SAFE_CONFIRMATIONS (6). Set via --safe-confs flag.
+       On regtest, code uses 1 regardless. Common values:
+         0 = turbo/0-conf (trusted LSP, small amounts)
+         1 = fast settlement (single conf)
+         3 = LND/CLN standard
+         6 = maximum safety (Bitcoin whitepaper convention)
+       Initialized by chain_backend_regtest_init() or manually. */
+    int safe_confirmations;
+
     /* Backend-specific state. */
     void *ctx;
 };
+
+/* Return the effective safe confirmation depth.
+   On regtest, always returns 1 (fast testing).
+   On other networks, returns backend->safe_confirmations.
+   If backend is NULL, returns MAINNET_SAFE_CONFIRMATIONS as fallback. */
+static inline int chain_safe_confs(const chain_backend_t *backend, int is_regtest)
+{
+    if (is_regtest) return 1;
+    if (backend && backend->safe_confirmations > 0)
+        return backend->safe_confirmations;
+    return MAINNET_SAFE_CONFIRMATIONS;
+}
 
 /*
  * Regtest (bitcoin-cli RPC) implementation.

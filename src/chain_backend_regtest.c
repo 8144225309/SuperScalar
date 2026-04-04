@@ -60,4 +60,5 @@ void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt)
     backend->register_script   = cb_register_script;
     backend->unregister_script = cb_unregister_script;
     backend->ctx               = rt;
+    backend->safe_confirmations = MAINNET_SAFE_CONFIRMATIONS;
 }

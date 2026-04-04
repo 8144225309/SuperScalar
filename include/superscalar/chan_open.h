@@ -50,6 +50,8 @@ typedef struct {
     uint16_t max_accepted_htlcs;    /* default 483 */
     int      announce_channel;      /* 1 = public channel */
     int      zero_conf;             /* 1 = send minimum_depth=0 (LSPS2 / Phoenix compat) */
+    uint32_t minimum_depth;         /* required confs for funding (0 = use zero_conf logic,
+                                       default 3 if not set and not zero_conf) */
     /* Wallet for UTXO selection and signing (NULL = skip tx building) */
     wallet_source_t *wallet;
     /* Local channel keys (from channel_t) */
