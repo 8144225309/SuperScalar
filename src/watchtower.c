@@ -748,7 +748,9 @@ int watchtower_check(watchtower_t *wt) {
                 if (htlc->sweep_txid[0] != '\0') {
                     int sweep_conf = wt->chain->get_confirmations(
                                          wt->chain, htlc->sweep_txid);
-                    if (sweep_conf >= MAINNET_SAFE_CONFIRMATIONS) {
+                    int sweep_safe = (wt->rt && strcmp(wt->rt->network, "regtest") == 0)
+                                     ? 1 : MAINNET_SAFE_CONFIRMATIONS;
+                    if (sweep_conf >= sweep_safe) {
                         /* Safely confirmed — mark as fully swept */
                         htlc->htlc_amount = 0;
                         htlc->sweep_txid[0] = '\0';
