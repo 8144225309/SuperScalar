@@ -3468,6 +3468,17 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_readiness_null);
     RUN_TEST(test_rotation_readiness_none_connected);
     RUN_TEST(test_rotation_readiness_partial);
+
+    /* === Reorg Resistance === */
+    printf("\n=== Reorg Resistance ===\n");
+    extern int test_reorg_bip158_tx_cache_invalidation(void);
+    extern int test_reorg_bip158_callback_fires(void);
+    extern int test_reorg_htlc_timeout_no_premature_fail(void);
+    extern int test_reorg_bip158_noop(void);
+    RUN_TEST(test_reorg_bip158_tx_cache_invalidation);
+    RUN_TEST(test_reorg_bip158_callback_fires);
+    RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
+    RUN_TEST(test_reorg_bip158_noop);
 }
 
 extern int regtest_init_faucet(void);

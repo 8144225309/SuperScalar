@@ -297,6 +297,12 @@ static void usage(const char *prog) {
         "  --test-bip39        Full factory lifecycle with BIP39 HD-derived LSP key\n"
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
+        "  --safe-confs N      Set ALL confirmation depths at once (shorthand).\n"
+        "  --funding-confs N   Funding TX depth before acting (default: %d, CLN=3, LND=1-6)\n"
+        "  --close-confs N     Close TX depth before removing entries (default: %d, LDK=6)\n"
+        "  --penalty-confs N   Penalty TX depth before removing breach entry (default: %d)\n"
+        "  --sweep-confs N     HTLC sweep depth before considering settled (default: %d)\n"
+        "                        On regtest, all operations use 1 regardless.\n"
         "  --heartbeat-interval N  Print daemon status every N seconds (default: 0 = disabled)\n"
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
@@ -338,7 +344,10 @@ static void usage(const char *prog) {
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
-        prog, LSP_MAX_CLIENTS, LSP_MAX_CLIENTS);
+        prog, LSP_MAX_CLIENTS,
+        CONF_DEFAULT_FUNDING, CONF_DEFAULT_CLOSE,
+        CONF_DEFAULT_PENALTY, CONF_DEFAULT_SWEEP,
+        LSP_MAX_CLIENTS);
 }
 
 /* Ensure wallet has funds (handle exhausted regtest chains) */
@@ -1056,6 +1065,11 @@ int main(int argc, char *argv[]) {
     int dynamic_fees = 0;
     const char *fee_estimator_arg = NULL; /* --fee-estimator MODE */
     int heartbeat_interval = 0;  /* 0 = disabled; seconds between daemon status lines */
+    int safe_confs_arg = 0;      /* 0 = use defaults; >0 = set all four at once */
+    int funding_confs_arg = 0;   /* --funding-confs: per-operation override */
+    int close_confs_arg = 0;     /* --close-confs */
+    int penalty_confs_arg = 0;   /* --penalty-confs */
+    int sweep_confs_arg = 0;     /* --sweep-confs */
     const char *backup_path_arg = NULL;
     const char *restore_path_arg = NULL;
     int backup_verify_arg = 0;
@@ -1308,6 +1322,16 @@ int main(int argc, char *argv[]) {
             fee_estimator_arg = argv[++i];
         else if (strcmp(argv[i], "--heartbeat-interval") == 0 && i + 1 < argc)
             heartbeat_interval = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--safe-confs") == 0 && i + 1 < argc)
+            safe_confs_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--funding-confs") == 0 && i + 1 < argc)
+            funding_confs_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--close-confs") == 0 && i + 1 < argc)
+            close_confs_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--penalty-confs") == 0 && i + 1 < argc)
+            penalty_confs_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--sweep-confs") == 0 && i + 1 < argc)
+            sweep_confs_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-after") == 0 && i + 1 < argc)
             fee_bump_after = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fee-bump-max") == 0 && i + 1 < argc)
@@ -1876,6 +1900,23 @@ int main(int argc, char *argv[]) {
     } else {
         chain_be = (chain_backend_t *)&g_bip158;
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
+    }
+
+    /* Apply confirmation depth overrides.
+       --safe-confs sets all four; per-operation flags override individually. */
+    if (safe_confs_arg > 0) {
+        conf_targets_set_all(&chain_be->conf, safe_confs_arg);
+        printf("LSP: all confirmation depths set to %d (--safe-confs)\n",
+               safe_confs_arg);
+    }
+    if (funding_confs_arg > 0) chain_be->conf.funding = funding_confs_arg;
+    if (close_confs_arg > 0)   chain_be->conf.close   = close_confs_arg;
+    if (penalty_confs_arg > 0) chain_be->conf.penalty = penalty_confs_arg;
+    if (sweep_confs_arg > 0)   chain_be->conf.sweep   = sweep_confs_arg;
+    if (funding_confs_arg || close_confs_arg || penalty_confs_arg || sweep_confs_arg) {
+        printf("LSP: confirmation depths — funding=%d close=%d penalty=%d sweep=%d\n",
+               chain_be->conf.funding, chain_be->conf.close,
+               chain_be->conf.penalty, chain_be->conf.sweep);
     }
 
     /* === Recovery probe: skip ceremony if factory exists in DB === */
@@ -2678,7 +2719,8 @@ accept_new_factory:
         } else {
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
             int conf = lsp_wait_for_confirmation_service(chain_be, funding_txid_hex,
-                                                   confirm_timeout_secs, NULL, lsp_p);
+                                                   confirm_timeout_secs,
+                                                   chain_funding_confs(chain_be, chain_be->is_regtest), NULL, lsp_p);
             if (conf < 1) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
                 lsp_cleanup(lsp_p);

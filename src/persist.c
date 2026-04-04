@@ -611,6 +611,28 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v11: reorg resistance — add staleness tracking columns */
+    if (db_version < 11) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE broadcast_log ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE tree_nodes ADD COLUMN validated_at_height INTEGER DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE tree_nodes ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE jit_channels ADD COLUMN funded_height INTEGER DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE jit_channels ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ladder_factories ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1814,6 +1836,76 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
     }
     sqlite3_finalize(stmt);
     return retried;
+}
+
+/* --- Reorg staleness tracking --- */
+
+int persist_mark_reorg_stale(persist_t *p, int reorg_height) {
+    if (!p || !p->db || reorg_height < 0) return 0;
+
+    int total = 0;
+
+    /* broadcast_log: mark 'ok' entries as potentially stale.
+       We keep the data — just flag it so operators can audit. */
+    {
+        const char *sql =
+            "UPDATE broadcast_log SET reorg_stale = 1 "
+            "WHERE result = 'ok' AND reorg_stale = 0;";
+        sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+        total += sqlite3_changes(p->db);
+    }
+
+    /* tree_nodes: mark nodes validated above the reorg height as stale.
+       Factory recovery will skip stale nodes until re-validated. */
+    {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "UPDATE tree_nodes SET reorg_stale = 1 "
+            "WHERE validated_at_height > %d AND reorg_stale = 0;",
+            reorg_height);
+        sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+        total += sqlite3_changes(p->db);
+    }
+
+    /* jit_channels: mark funded channels above reorg height as stale.
+       jit_channels_revalidate_funding() will re-check on next cycle. */
+    {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "UPDATE jit_channels SET reorg_stale = 1 "
+            "WHERE state = 'open' AND created_block > %d AND reorg_stale = 0;",
+            reorg_height);
+        sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+        total += sqlite3_changes(p->db);
+    }
+
+    /* ladder_factories: mark factories created above reorg height as stale,
+       AND any factory with partial_rotation=1 (rotation close TX may have
+       been reorged out regardless of created_block). */
+    {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "UPDATE ladder_factories SET reorg_stale = 1 "
+            "WHERE (created_block > %d OR partial_rotation = 1) "
+            "AND reorg_stale = 0;",
+            reorg_height);
+        sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+        total += sqlite3_changes(p->db);
+    }
+
+    /* watchtower_pending: reset cycles for re-evaluation */
+    {
+        const char *sql =
+            "UPDATE watchtower_pending SET cycles_in_mempool = 0;";
+        sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+        total += sqlite3_changes(p->db);
+    }
+
+    if (total > 0)
+        fprintf(stderr, "persist_mark_reorg_stale: marked %d entries stale "
+                "(reorg to height %d)\n", total, reorg_height);
+
+    return total;
 }
 
 /* --- Signing progress tracking --- */

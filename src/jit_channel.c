@@ -1,4 +1,5 @@
 #include "superscalar/jit_channel.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/lsp.h"
 #include "superscalar/wire.h"
@@ -619,7 +620,8 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     } else {
         int timeout = mgr->confirm_timeout_secs > 0 ?
                       mgr->confirm_timeout_secs : 7200;
-        int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout);
+        int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout,
+                                                    chain_close_confs(chain_be, chain_be->is_regtest));
         if (!confirmed) {
             fprintf(stderr, "LSP JIT close: confirmation timeout for client %zu\n",
                     client_idx);
@@ -627,10 +629,22 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
         }
     }
 
+    /* Re-verify close TX still has safe confirmations before removing
+       watchtower entries. This guards against a reorg between the wait
+       returning and the removal happening. */
+    if (!mgr->rot_is_regtest) {
+        int recheck = chain_be->get_confirmations(chain_be, close_txid);
+        if (recheck < chain_close_confs(chain_be, chain_be->is_regtest)) {
+            fprintf(stderr, "LSP JIT close: close TX lost confirmations "
+                    "(was safe, now %d) — keeping watchtower entries\n", recheck);
+            return 0;
+        }
+    }
+
     /* Update state */
     jit->state = JIT_STATE_CLOSED;
 
-    /* Cleanup watchtower */
+    /* Cleanup watchtower — safe because close TX has >= 6 confirmations */
     if (mgr->watchtower) {
         size_t wt_idx = mgr->n_channels + client_idx;
         watchtower_remove_channel(mgr->watchtower, (uint32_t)wt_idx);
@@ -712,7 +726,10 @@ int jit_channels_check_funding(void *mgr_ptr) {
         /* cppcheck-suppress nullPointerRedundantCheck ; mgr->watchtower checked at line 525 */
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
-        if (conf >= 1) {
+        int is_rt = (mgr->watchtower->rt &&
+                     strcmp(mgr->watchtower->rt->network, "regtest") == 0);
+        int safe_conf = chain_funding_confs(mgr->watchtower->chain, is_rt);
+        if (conf >= safe_conf) {
             jits[i].state = JIT_STATE_OPEN;
             jits[i].funding_confirmed = 1;
             printf("LSP JIT: channel %08x funding confirmed (%d conf)\n",
@@ -732,6 +749,33 @@ int jit_channels_check_funding(void *mgr_ptr) {
         }
     }
     return transitions;
+}
+
+int jit_channels_revalidate_funding(void *mgr_ptr) {
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    if (!mgr || !mgr->jit_channels || !mgr->watchtower || !mgr->watchtower->rt)
+        return 0;
+
+    jit_channel_t *jits = (jit_channel_t *)mgr->jit_channels;
+    int reverted = 0;
+    for (size_t i = 0; i < mgr->n_jit_channels; i++) {
+        if (jits[i].state != JIT_STATE_OPEN) continue;
+        if (jits[i].funding_txid_hex[0] == '\0') continue;
+
+        int conf = regtest_get_confirmations(mgr->watchtower->rt,
+                                               jits[i].funding_txid_hex);
+        if (conf < 0) {
+            fprintf(stderr, "JIT revalidation: channel %08x funding tx gone, "
+                    "reverting to FUNDING state\n", jits[i].jit_channel_id);
+            jits[i].state = JIT_STATE_FUNDING;
+            jits[i].funding_confirmed = 0;
+            if (mgr->persist)
+                persist_update_jit_state((persist_t *)mgr->persist,
+                                           jits[i].jit_channel_id, "funding");
+            reverted++;
+        }
+    }
+    return reverted;
 }
 
 void jit_channels_cleanup(void *mgr_ptr) {

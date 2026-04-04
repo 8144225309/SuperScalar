@@ -153,7 +153,11 @@ size_t chan_build_accept_channel(const unsigned char temp_chan_id[32],
     put_u64(buf + pos, p->max_htlc_value_msat); pos += 8;
     put_u64(buf + pos, p->channel_reserve_sats); pos += 8;
     put_u64(buf + pos, p->htlc_minimum_msat); pos += 8;
-    put_u32(buf + pos, p->zero_conf ? 0 : 3); pos += 4; /* minimum_depth */
+    {
+        uint32_t mdepth = p->zero_conf ? 0
+                        : (p->minimum_depth > 0 ? p->minimum_depth : 3);
+        put_u32(buf + pos, mdepth); pos += 4; /* minimum_depth */
+    }
     put_u16(buf + pos, (uint16_t)p->to_self_delay); pos += 2;
     put_u16(buf + pos, p->max_accepted_htlcs); pos += 2;
     memcpy(buf + pos, p->funding_pubkey, 33); pos += 33;

@@ -414,6 +414,34 @@ int watchtower_check(watchtower_t *wt) {
     for (size_t i = 0; i < wt->n_entries; ) {
         watchtower_entry_t *e = &wt->entries[i];
 
+        /* Reorg resistance: if penalty was already broadcast, check its confirmation.
+           Only remove when penalty is safely confirmed. If penalty vanished (reorg),
+           reset and re-detect the breach on this cycle. */
+        if (e->penalty_broadcast && e->penalty_txid[0]) {
+            int pconf = wt->chain->get_confirmations(wt->chain, e->penalty_txid);
+            int is_rt = (wt->rt && strcmp(wt->rt->network, "regtest") == 0);
+            int safe = chain_penalty_confs(wt->chain, is_rt);
+            if (pconf >= safe) {
+                /* Penalty safely confirmed — remove entry */
+                free(e->htlc_outputs); free(e->ptlc_outputs);
+                free(e->response_tx); free(e->burn_tx);
+                wt->entries[i] = wt->entries[wt->n_entries - 1];
+                wt->n_entries--;
+                continue;  /* re-check swapped entry at index i */
+            }
+            if (pconf < 0 && !wt->chain->is_in_mempool(wt->chain, e->penalty_txid)) {
+                /* Penalty tx vanished (reorg) — reset and re-detect */
+                fprintf(stderr, "Watchtower: penalty %s vanished (reorg?), re-watching\n",
+                        e->penalty_txid);
+                e->penalty_broadcast = 0;
+                e->penalty_txid[0] = '\0';
+                /* Fall through to normal breach detection below */
+            } else {
+                i++;  /* penalty still in mempool or partially confirmed, wait */
+                continue;
+            }
+        }
+
         const char *txid_hex = txid_hexes[i];
 
         /* Check if old commitment is on chain or in mempool */
@@ -444,6 +472,8 @@ int watchtower_check(watchtower_t *wt) {
                    e->channel_id, txid_hex);
             fflush(stdout);
 
+            char factory_resp_txid[65] = {0};  /* saved for reorg tracking */
+
             /* Broadcast the pre-built latest state tx as response */
             if (e->response_tx && e->response_tx_len > 0) {
                 char *resp_hex = (char *)malloc(e->response_tx_len * 2 + 1);
@@ -452,6 +482,8 @@ int watchtower_check(watchtower_t *wt) {
                     char resp_txid[65];
                     if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
+                        memcpy(factory_resp_txid, resp_txid, 64);
+                        factory_resp_txid[64] = '\0';
                         penalties_broadcast++;
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, resp_txid,
@@ -487,18 +519,10 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
-            /* Free response_tx, burn_tx and remove entry */
-            free(e->response_tx);
-            e->response_tx = NULL;
-            free(e->burn_tx);
-            e->burn_tx = NULL;
-            {
-                size_t _last = wt->n_entries - 1;
-                memcpy(txid_hexes[i], txid_hexes[_last], 65);
-                batch_confs[i] = batch_confs[_last];
-                wt->entries[i] = wt->entries[_last];
-            }
-            wt->n_entries--;
+            /* Mark as penalty-broadcast (keep entry for reorg resistance) */
+            e->penalty_broadcast = 1;
+            memcpy(e->penalty_txid, factory_resp_txid, 65);
+            i++;
             continue;
         }
 
@@ -589,6 +613,8 @@ int watchtower_check(watchtower_t *wt) {
 
         /* Sweep HTLC outputs via penalty txs */
         for (size_t h = 0; h < e->n_htlc_outputs; h++) {
+            /* Skip already-swept outputs (amount set to 0 after broadcast) */
+            if (e->htlc_outputs[h].htlc_amount == 0) continue;
             /* Temporarily set ch->htlcs[0] to stored HTLC metadata */
             size_t saved_n = ch->n_htlcs;
             htlc_t saved_h0 = {0};
@@ -689,15 +715,13 @@ int watchtower_check(watchtower_t *wt) {
                 ch->ptlcs[0] = saved_p0;
         }
 
-        /* Remove this entry (swap with last); sync batch arrays for next iter */
-        {
-            size_t _last = wt->n_entries - 1;
-            memcpy(txid_hexes[i], txid_hexes[_last], 65);
-            batch_confs[i] = batch_confs[_last];
-            wt->entries[i] = wt->entries[_last];
-        }
-        wt->n_entries--;
-        /* Don't increment i — check the swapped entry */
+        /* Mark as penalty-broadcast (keep entry for reorg resistance) */
+        e->penalty_broadcast = 1;
+        if (penalty_sent)
+            memcpy(e->penalty_txid, penalty_txid, 65);
+        else
+            e->penalty_txid[0] = '\0';
+        i++;
     }
 
     /* Force-close HTLC timeout sweep: check if any expired HTLCs can be swept */
@@ -713,12 +737,42 @@ int watchtower_check(watchtower_t *wt) {
                 ch = wt->channels[e->channel_id];
             if (!ch) continue;
 
-            for (size_t h = 0; h < e->n_htlc_outputs; ) {
+            for (size_t h = 0; h < e->n_htlc_outputs; h++) {
                 watchtower_htlc_t *htlc = &e->htlc_outputs[h];
-                if ((uint32_t)current_height < htlc->cltv_expiry) {
-                    h++;
+
+                /* Already swept and confirmed — skip */
+                if (htlc->htlc_amount == 0 && htlc->sweep_txid[0] == '\0')
                     continue;
+
+                /* Sweep was broadcast — check if confirmed */
+                if (htlc->sweep_txid[0] != '\0') {
+                    int sweep_conf = wt->chain->get_confirmations(
+                                         wt->chain, htlc->sweep_txid);
+                    int sweep_rt = (wt->rt && strcmp(wt->rt->network, "regtest") == 0);
+                    int sweep_safe = chain_sweep_confs(wt->chain, sweep_rt);
+                    if (sweep_conf >= sweep_safe) {
+                        /* Safely confirmed — mark as fully swept */
+                        htlc->htlc_amount = 0;
+                        htlc->sweep_txid[0] = '\0';
+                    } else if (sweep_conf < 0 &&
+                               !wt->chain->is_in_mempool(wt->chain, htlc->sweep_txid)) {
+                        /* Sweep TX vanished (reorg) — reset for re-broadcast */
+                        fprintf(stderr, "  HTLC sweep %s reorged out, will re-broadcast\n",
+                                htlc->sweep_txid);
+                        htlc->sweep_txid[0] = '\0';
+                        /* fall through to re-broadcast below */
+                    } else {
+                        /* Still in mempool or partially confirmed — wait */
+                        continue;
+                    }
                 }
+
+                /* If amount is zero, this HTLC is done */
+                if (htlc->htlc_amount == 0) continue;
+
+                /* CLTV not yet expired — skip */
+                if ((uint32_t)current_height < htlc->cltv_expiry)
+                    continue;
 
                 /* CLTV expired — build and broadcast timeout tx */
                 size_t saved_n = ch->n_htlcs;
@@ -745,6 +799,11 @@ int watchtower_check(watchtower_t *wt) {
                             printf("  HTLC timeout sweep (vout %u, cltv %u): %s\n",
                                    htlc->htlc_vout, htlc->cltv_expiry, txid);
                             penalties_broadcast++;
+                            /* Track the sweep txid for confirmation monitoring */
+                            memcpy(htlc->sweep_txid, txid, 65);
+                            /* Register for CPFP monitoring */
+                            watchtower_add_pending_tx(wt, txid, 1,
+                                                      WATCHTOWER_ANCHOR_AMOUNT);
                             if (wt->db && wt->db->db)
                                 persist_log_broadcast(wt->db, txid,
                                                       "htlc_timeout", tx_hex, "ok");
@@ -756,14 +815,15 @@ int watchtower_check(watchtower_t *wt) {
 
                 ch->n_htlcs = saved_n;
                 if (saved_n > 0) ch->htlcs[0] = saved_h0;
-
-                /* Remove swept HTLC (swap with last) */
-                e->htlc_outputs[h] = e->htlc_outputs[e->n_htlc_outputs - 1];
-                e->n_htlc_outputs--;
             }
 
-            /* If all HTLCs swept, remove the force-close entry */
-            if (e->n_htlc_outputs == 0) {
+            /* If all HTLCs fully swept (amount=0 and no pending sweep), remove entry */
+            size_t unswept = 0;
+            for (size_t hh = 0; hh < e->n_htlc_outputs; hh++)
+                if (e->htlc_outputs[hh].htlc_amount > 0 ||
+                    e->htlc_outputs[hh].sweep_txid[0] != '\0')
+                    unswept++;
+            if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;
                 wt->entries[i] = wt->entries[wt->n_entries - 1];
@@ -1093,6 +1153,41 @@ void watchtower_clear_entries(watchtower_t *wt) {
         }
     }
     wt->n_entries = 0;
+}
+
+void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
+    if (!wt || !wt->chain) return;
+    fprintf(stderr, "Watchtower: reorg detected (%d → %d), re-validating %zu entries\n",
+            old_tip, new_tip, wt->n_entries);
+
+    /* Reset penalty_broadcast for entries whose penalty tx vanished */
+    for (size_t i = 0; i < wt->n_entries; i++) {
+        watchtower_entry_t *e = &wt->entries[i];
+        if (!e->penalty_broadcast || !e->penalty_txid[0])
+            continue;
+        int conf = wt->chain->get_confirmations(wt->chain, e->penalty_txid);
+        if (conf < 0 && !wt->chain->is_in_mempool(wt->chain, e->penalty_txid)) {
+            fprintf(stderr, "  Entry ch=%u cn=%llu: penalty %s reorged out, re-watching\n",
+                    e->channel_id, (unsigned long long)e->commit_num,
+                    e->penalty_txid);
+            e->penalty_broadcast = 0;
+            e->penalty_txid[0] = '\0';
+        }
+    }
+
+    /* Re-validate pending CPFP entries */
+    for (size_t i = 0; i < wt->n_pending; i++) {
+        int conf = wt->chain->get_confirmations(wt->chain, wt->pending[i].txid);
+        if (conf < 0 && !wt->chain->is_in_mempool(wt->chain, wt->pending[i].txid)) {
+            fprintf(stderr, "  Pending penalty %s reorged out\n", wt->pending[i].txid);
+            /* Reset cycle counter — will be retried from broadcast_log */
+            wt->pending[i].cycles_in_mempool = 0;
+        }
+    }
+
+    /* Mark stale entries in database so they survive restarts */
+    if (wt->db && wt->db->db)
+        persist_mark_reorg_stale(wt->db, new_tip);
 }
 
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {

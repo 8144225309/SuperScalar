@@ -5,10 +5,66 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* Minimum confirmations before acting on chain events on non-regtest
-   networks. 6-block reorgs have effectively zero probability on Bitcoin
-   mainnet, so this eliminates reorg risk without a full reorg handler. */
+/* Default confirmation depths per operation type.
+   Aligned with LN ecosystem norms (CLN, LND, LDK, Eclair).
+   On regtest, all operations use 1 regardless of these settings. */
+#define CONF_DEFAULT_FUNDING  3   /* CLN mainnet default; LND scales 1-6 by capacity */
+#define CONF_DEFAULT_CLOSE    6   /* LDK ANTI_REORG_DELAY; LND min 3, typically 3-6 */
+#define CONF_DEFAULT_PENALTY  6   /* LDK ANTI_REORG_DELAY; safety-critical */
+#define CONF_DEFAULT_SWEEP    6   /* LDK ANTI_REORG_DELAY; HTLC timeout sweeps */
+
+/* Legacy alias — kept for any code that references the old constant. */
 #define MAINNET_SAFE_CONFIRMATIONS 6
+
+/* Per-operation confirmation depth targets.
+   Different operations have different speed/safety tradeoffs:
+
+   funding:  How deep must a funding TX be before acting on it?
+             Lower = faster UX, higher reorg risk.
+             Factory funding is amplified risk (one reorg kills ALL channels).
+             CLN=3, LND=1-6 scaled by capacity, LDK=6, Eclair=8.
+             CLI: --funding-confs N
+
+   close:    How deep must a cooperative close TX be before removing
+             watchtower entries and considering the channel closed?
+             LDK=6, LND=3-6 scaled with min 3.
+             CLI: --close-confs N
+
+   penalty:  How deep must a penalty/justice TX be before removing
+             the watchtower breach entry? Removing too early means
+             a reorg could undo the penalty and the breach goes undetected.
+             LDK=6, CLN=100 (irrevocable), LND=spend-based.
+             CLI: --penalty-confs N
+
+   sweep:    How deep must an HTLC timeout sweep TX be before
+             considering the output fully settled?
+             CLI: --sweep-confs N
+
+   Use --safe-confs N to set all four at once. */
+typedef struct {
+    int funding;
+    int close;
+    int penalty;
+    int sweep;
+} conf_targets_t;
+
+/* Initialize conf_targets to ecosystem-aligned defaults. */
+static inline void conf_targets_default(conf_targets_t *ct)
+{
+    ct->funding = CONF_DEFAULT_FUNDING;
+    ct->close   = CONF_DEFAULT_CLOSE;
+    ct->penalty = CONF_DEFAULT_PENALTY;
+    ct->sweep   = CONF_DEFAULT_SWEEP;
+}
+
+/* Set all targets to the same value (--safe-confs shorthand). */
+static inline void conf_targets_set_all(conf_targets_t *ct, int n)
+{
+    ct->funding = n;
+    ct->close   = n;
+    ct->penalty = n;
+    ct->sweep   = n;
+}
 
 /*
  * Chain backend abstraction for SuperScalar watchtower.
@@ -68,9 +124,48 @@ struct chain_backend {
     int  (*unregister_script)(chain_backend_t *self,
                               const unsigned char *spk, size_t spk_len);
 
+    /* Optional reorg notification. When the backend detects a chain
+       reorganisation (tip height decrease), it fires this callback.
+       Higher layers (watchtower, channel manager) register to re-validate
+       cached state. May be NULL (no notification). */
+    void (*reorg_cb)(int new_tip, int old_tip, void *reorg_ctx);
+    void *reorg_cb_ctx;
+
+    /* Per-operation confirmation depth targets. */
+    conf_targets_t conf;
+
+    /* Set to 1 if this backend is running on regtest. Allows code without
+       access to regtest_t to branch correctly. Set by init functions. */
+    int is_regtest;
+
     /* Backend-specific state. */
     void *ctx;
 };
+
+/* Return the effective confirmation depth for each operation type.
+   On regtest, always returns 1 (fast testing).
+   On other networks, returns the configured target. */
+static inline int chain_funding_confs(const chain_backend_t *b, int is_regtest) {
+    if (is_regtest) return 1;
+    return (b && b->conf.funding > 0) ? b->conf.funding : CONF_DEFAULT_FUNDING;
+}
+static inline int chain_close_confs(const chain_backend_t *b, int is_regtest) {
+    if (is_regtest) return 1;
+    return (b && b->conf.close > 0) ? b->conf.close : CONF_DEFAULT_CLOSE;
+}
+static inline int chain_penalty_confs(const chain_backend_t *b, int is_regtest) {
+    if (is_regtest) return 1;
+    return (b && b->conf.penalty > 0) ? b->conf.penalty : CONF_DEFAULT_PENALTY;
+}
+static inline int chain_sweep_confs(const chain_backend_t *b, int is_regtest) {
+    if (is_regtest) return 1;
+    return (b && b->conf.sweep > 0) ? b->conf.sweep : CONF_DEFAULT_SWEEP;
+}
+
+/* Legacy helper — returns funding confs (backward compat for code using chain_safe_confs). */
+static inline int chain_safe_confs(const chain_backend_t *b, int is_regtest) {
+    return chain_funding_confs(b, is_regtest);
+}
 
 /*
  * Regtest (bitcoin-cli RPC) implementation.

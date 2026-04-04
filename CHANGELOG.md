@@ -4,7 +4,7 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Factory scaling to 64 participants + production hardening. 36/36 orchestrator, 1353 unit tests.
+Factory scaling to 64 participants + full reorg resistance + production hardening. 36/36 orchestrator, 1357 unit tests.
 
 ### Added
 
@@ -17,6 +17,17 @@ Factory scaling to 64 participants + production hardening. 36/36 orchestrator, 1
 - **Config initialization in pubkeys-only path** (`factory.c`): `factory_init_from_pubkeys()` now calls `factory_config_default()` after memset; previously left config.max_signers=0, causing factory_build_tree() to reject all factories via distributed signing path.
 - **Heap allocation for large structs** (`lsp.c`, `superscalar_lsp.c`): with factory_t at ~3MB, lsp_t and ceremony arrays are now heap-allocated to prevent stack overflow on the default 8MB stack. `lsp_t` uses pointer access (lsp_p->) throughout.
 - **Stack size in test runner** (`run_unit_tests.sh`): added `ulimit -s unlimited` to match CI configuration; ladder_t (8 × factory_t ≈ 26MB) exceeds default stack.
+
+### Full reorg resistance
+
+- **BIP 158 reorg detection** (`bip158_backend.c`, `p2p_bitcoin.c`): validate `prev_hash` chain continuity during header sync. On mismatch, `bip158_handle_reorg()` invalidates tx_cache entries above fork point, rolls back tip/header/filter state, fires `block_disconnected_cb` for each rolled-back block, and persists corrected checkpoint.
+- **RPC backend reorg detection** (`lsp_channels.c`): daemon heartbeat detects chain tip height decrease and fires `reorg_cb` callback for higher layers.
+- **Watchtower reorg resilience** (`watchtower.c`): penalty broadcast entries are now kept until penalty has safe confirmations (6 on non-regtest). If penalty tx vanishes (reorg), entry reverts to normal watching and re-detects the breach. New `watchtower_on_reorg()` re-validates all entries and pending CPFP penalties.
+- **HTLC timeout monotonicity** (`channel.c`): `channel_check_htlc_timeouts()` skips timeout checks when height goes backward (reorg), preventing premature HTLC failure.
+- **JIT channel safe confirmation** (`jit_channel.c`): uses `MAINNET_SAFE_CONFIRMATIONS` on non-regtest. New `jit_channels_revalidate_funding()` re-checks funding on startup, reverting OPEN channels to FUNDING if funding tx is gone.
+- **Rotation height regression guard** (`lsp_rotation.c`): `lsp_rotation_should_retry()` allows immediate retry when height goes backward instead of hanging on stale backoff.
+- **Reorg simulation tests** (`test_reorg.c`): 4 new tests covering BIP 158 cache invalidation, callback firing, HTLC monotonicity guard, and edge cases.
+- **Chain backend reorg callback** (`chain_backend.h`): new optional `reorg_cb(new_tip, old_tip, ctx)` field for cross-component reorg notification.
 
 ### Security hardening (mainnet preparation)
 

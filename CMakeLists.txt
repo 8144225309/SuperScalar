@@ -289,6 +289,7 @@ add_executable(test_superscalar
     tests/test_onion_message.c
     tests/test_scb_recovery.c
     tests/test_bolt9_features.c
+    tests/test_reorg.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

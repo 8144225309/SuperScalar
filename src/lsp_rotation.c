@@ -39,6 +39,9 @@ int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
         return 0;   /* fallback already done */
     if (retries >= max_ret)
         return -1;  /* exhausted — time for fallback */
+    /* Reorg guard: if height went backward, allow immediate retry */
+    if (cur_height < mgr->rot_last_attempt_block[idx])
+        return 1;  /* height regressed (reorg) — safe to retry now */
     /* Exponential backoff: base * 2^retries blocks (clamped to prevent overflow) */
     uint32_t base = mgr->rot_retry_base_delay > 0 ? mgr->rot_retry_base_delay : 2;
     uint32_t shift = retries < 30 ? retries : 30;
@@ -408,7 +411,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             int confirmed = 0;
             for (int attempt = 0; attempt < 2; attempt++) {
                 if (chain_be) {
-                    if (lsp_wait_for_confirmation_service(chain_be, rc_txid, rot_timeout, mgr, lsp)) {
+                    if (lsp_wait_for_confirmation_service(chain_be, rc_txid, rot_timeout,
+                                                           chain_close_confs(chain_be, chain_be->is_regtest), mgr, lsp)) {
                         confirmed = 1; break;
                     }
                     if (chain_be->is_in_mempool(chain_be, rc_txid)) {
@@ -503,7 +507,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         int confirmed = 0;
         for (int attempt = 0; attempt < 2; attempt++) {
             if (chain_be) {
-                if (lsp_wait_for_confirmation_service(chain_be, fund_txid_hex, rot_timeout, mgr, lsp)) {
+                if (lsp_wait_for_confirmation_service(chain_be, fund_txid_hex, rot_timeout,
+                                                       chain_funding_confs(chain_be, chain_be->is_regtest), mgr, lsp)) {
                     confirmed = 1; break;
                 }
                 if (chain_be->is_in_mempool(chain_be, fund_txid_hex)) {
