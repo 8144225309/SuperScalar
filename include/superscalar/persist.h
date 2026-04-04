@@ -214,6 +214,12 @@ int persist_log_broadcast(persist_t *p, const char *txid,
                            const char *source, const char *raw_hex,
                            const char *result);
 
+/* Retry previously failed penalty broadcasts (result='pending_retry').
+   Queries the broadcast_log table and re-attempts send_raw_tx via chain.
+   Returns count of successfully re-broadcast transactions. */
+struct chain_backend;
+int persist_retry_pending_broadcasts(persist_t *p, struct chain_backend *chain);
+
 /* --- Signing progress tracking --- */
 
 /* Save nonce/partial-sig receipt for one signer on one tree node. */

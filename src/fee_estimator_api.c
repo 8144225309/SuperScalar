@@ -90,7 +90,8 @@ char *ss_http_get_simple(const char *url, void *ctx)
     if (strcmp(scheme, "https") == 0) {
         SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
         if (!sctx) { close(fd); return NULL; }
-        SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_default_verify_paths(sctx);
+        SSL_CTX_set_verify(sctx, SSL_VERIFY_PEER, NULL);
         SSL *ssl = SSL_new(sctx);
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, host);
