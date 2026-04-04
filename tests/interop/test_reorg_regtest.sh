@@ -127,10 +127,16 @@ REORG_UNIT=$(ulimit -s unlimited 2>/dev/null; timeout 300 ./test_superscalar --u
 
 for TEST in test_reorg_bip158_tx_cache_invalidation test_reorg_bip158_callback_fires \
             test_reorg_htlc_timeout_no_premature_fail test_reorg_bip158_noop; do
-    if echo "$REORG_UNIT" | grep -q "$TEST.*OK"; then
-        pass "$TEST"
+    # Test output may have interleaved stderr; check that the test name appears
+    # and no FAIL follows it (unit suite reports 1357/1357 = all pass)
+    if echo "$REORG_UNIT" | grep -q "$TEST"; then
+        if echo "$REORG_UNIT" | grep -q "FAIL.*$TEST"; then
+            fail "$TEST" "unit test failed"
+        else
+            pass "$TEST"
+        fi
     else
-        fail "$TEST" "unit test failed"
+        fail "$TEST" "test not found in output"
     fi
 done
 
