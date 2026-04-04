@@ -87,6 +87,14 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             continue;
         }
 
+        /* Silently consume MSG_PONG keepalive responses — clients send these
+           in response to daemon loop pings and they can arrive at any time. */
+        if (msg->msg_type == MSG_PONG) {
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;
+        }
+
         /* Handle MSG_LSPS_REQUEST inline — client may send LSPS queries at any time */
         if (msg->msg_type == MSG_LSPS_REQUEST) {
             size_t ci = 0;
