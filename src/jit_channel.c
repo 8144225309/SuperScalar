@@ -621,7 +621,7 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
         int timeout = mgr->confirm_timeout_secs > 0 ?
                       mgr->confirm_timeout_secs : 7200;
         int confirmed = lsp_wait_for_confirmation(chain_be, close_txid, timeout,
-                                                    MAINNET_SAFE_CONFIRMATIONS);
+                                                    chain_safe_confs(chain_be, 0));
         if (!confirmed) {
             fprintf(stderr, "LSP JIT close: confirmation timeout for client %zu\n",
                     client_idx);
@@ -634,7 +634,7 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
        returning and the removal happening. */
     if (!mgr->rot_is_regtest) {
         int recheck = chain_be->get_confirmations(chain_be, close_txid);
-        if (recheck < MAINNET_SAFE_CONFIRMATIONS) {
+        if (recheck < chain_safe_confs(chain_be, 0)) {
             fprintf(stderr, "LSP JIT close: close TX lost confirmations "
                     "(was safe, now %d) — keeping watchtower entries\n", recheck);
             return 0;
@@ -726,9 +726,9 @@ int jit_channels_check_funding(void *mgr_ptr) {
         /* cppcheck-suppress nullPointerRedundantCheck ; mgr->watchtower checked at line 525 */
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
-        int safe_conf = (mgr->watchtower->rt &&
-                         strcmp(mgr->watchtower->rt->network, "regtest") == 0)
-                        ? 1 : MAINNET_SAFE_CONFIRMATIONS;
+        int is_rt = (mgr->watchtower->rt &&
+                     strcmp(mgr->watchtower->rt->network, "regtest") == 0);
+        int safe_conf = chain_safe_confs(mgr->watchtower->chain, is_rt);
         if (conf >= safe_conf) {
             jits[i].state = JIT_STATE_OPEN;
             jits[i].funding_confirmed = 1;

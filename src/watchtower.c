@@ -419,8 +419,8 @@ int watchtower_check(watchtower_t *wt) {
            reset and re-detect the breach on this cycle. */
         if (e->penalty_broadcast && e->penalty_txid[0]) {
             int pconf = wt->chain->get_confirmations(wt->chain, e->penalty_txid);
-            int safe = (wt->rt && strcmp(wt->rt->network, "regtest") == 0) ? 1
-                       : MAINNET_SAFE_CONFIRMATIONS;
+            int is_rt = (wt->rt && strcmp(wt->rt->network, "regtest") == 0);
+            int safe = chain_safe_confs(wt->chain, is_rt);
             if (pconf >= safe) {
                 /* Penalty safely confirmed — remove entry */
                 free(e->htlc_outputs); free(e->ptlc_outputs);
@@ -748,8 +748,8 @@ int watchtower_check(watchtower_t *wt) {
                 if (htlc->sweep_txid[0] != '\0') {
                     int sweep_conf = wt->chain->get_confirmations(
                                          wt->chain, htlc->sweep_txid);
-                    int sweep_safe = (wt->rt && strcmp(wt->rt->network, "regtest") == 0)
-                                     ? 1 : MAINNET_SAFE_CONFIRMATIONS;
+                    int sweep_rt = (wt->rt && strcmp(wt->rt->network, "regtest") == 0);
+                    int sweep_safe = chain_safe_confs(wt->chain, sweep_rt);
                     if (sweep_conf >= sweep_safe) {
                         /* Safely confirmed — mark as fully swept */
                         htlc->htlc_amount = 0;

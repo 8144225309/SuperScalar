@@ -28,8 +28,8 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 
 /*
  * Poll chain backend until txid has >= min_confs confirmations or timeout.
- * min_confs: use MAINNET_SAFE_CONFIRMATIONS (6) for mainnet safety,
- *            or 1 for regtest where reorg risk is simulated separately.
+ * min_confs: use chain_safe_confs(backend, is_regtest) for the runtime-
+ *            configurable threshold. On regtest, pass 1 directly.
  * Polls every 15 seconds. Returns 1 if confirmed, 0 on timeout.
  */
 int lsp_wait_for_confirmation(chain_backend_t *chain, const char *txid_hex,
