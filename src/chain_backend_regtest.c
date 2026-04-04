@@ -1,5 +1,6 @@
 #include "superscalar/chain_backend.h"
 #include "superscalar/regtest.h"
+#include <string.h>
 
 /*
  * chain_backend_t implementation backed by the existing regtest_t / bitcoin-cli
@@ -60,4 +61,6 @@ void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt)
     backend->register_script   = cb_register_script;
     backend->unregister_script = cb_unregister_script;
     backend->ctx               = rt;
+    backend->is_regtest        = (rt && strcmp(rt->network, "regtest") == 0);
+    conf_targets_default(&backend->conf);
 }

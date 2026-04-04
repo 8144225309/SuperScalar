@@ -136,6 +136,15 @@ int main(int argc, char *argv[]) {
                        (long)time(NULL), height, penalties);
             }
             last_height = height;
+        } else if (last_height > 0 && height < last_height) {
+            /* Reorg detected — re-validate all watchtower entries */
+            fprintf(stderr, "[%ld] REORG: height %d → %d (depth %d)\n",
+                    (long)time(NULL), last_height, height,
+                    last_height - height);
+            watchtower_on_reorg(&wt, height, last_height);
+            last_height = height;
+            /* Run a watchtower check immediately after reorg */
+            watchtower_check(&wt);
         }
 
         /* Heartbeat */

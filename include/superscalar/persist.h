@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 10
+#define PERSIST_SCHEMA_VERSION 11
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -219,6 +219,14 @@ int persist_log_broadcast(persist_t *p, const char *txid,
    Returns count of successfully re-broadcast transactions. */
 struct chain_backend;
 int persist_retry_pending_broadcasts(persist_t *p, struct chain_backend *chain);
+
+/* --- Reorg staleness tracking --- */
+
+/* Mark database entries as stale after a reorg to the given height.
+   Affected tables: broadcast_log, tree_nodes, jit_channels, ladder_factories.
+   Entries are marked stale (not deleted) for audit and recovery purposes.
+   Returns total number of rows marked stale across all tables. */
+int persist_mark_reorg_stale(persist_t *p, int reorg_height);
 
 /* --- Signing progress tracking --- */
 

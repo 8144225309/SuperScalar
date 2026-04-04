@@ -152,6 +152,10 @@ typedef struct {
     unsigned char chan_merkle_root[32];
     int has_chan_merkle_root;
 
+    /* Reorg resistance: highest height ever used for HTLC timeout check.
+       Prevents premature HTLC failure when height goes backward during reorg. */
+    uint32_t      last_htlc_check_height;
+
     /* Dynamic commitment: negotiated channel type (BOLT #2 PR #880) */
     uint32_t      channel_type_bits;         /* feature bits from channel_type TLV */
 

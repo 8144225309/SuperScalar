@@ -1686,6 +1686,13 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
 /* ---- HTLC timeout enforcement ---- */
 
 int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height) {
+    /* Monotonicity guard: if height went backward (reorg), skip timeout
+       checks to prevent premature HTLC failure. The height will advance
+       past the old peak once the new chain catches up. */
+    if (current_height < ch->last_htlc_check_height)
+        return 0;
+    ch->last_htlc_check_height = current_height;
+
     int failed = 0;
     for (size_t i = 0; i < ch->n_htlcs; i++) {
         if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&

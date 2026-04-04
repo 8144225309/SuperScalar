@@ -346,7 +346,8 @@ int p2p_validate_difficulty_transition(uint32_t old_bits, uint32_t new_bits,
  */
 int p2p_recv_headers_pow(p2p_conn_t *conn,
                           uint8_t (*hashes_out)[32], size_t max_headers,
-                          uint32_t *nbits_out, uint32_t *timestamps_out);
+                          uint32_t *nbits_out, uint32_t *timestamps_out,
+                          uint8_t (*prev_hashes_out)[32]);
 
 /*
  * Like p2p_connect() but uses a non-blocking connect() with timeout_ms

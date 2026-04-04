@@ -804,6 +804,8 @@ int bip158_backend_init(bip158_backend_t *backend, const char *network)
     backend->base.register_script   = cb_register_script;
     backend->base.unregister_script = cb_unregister_script;
     backend->base.ctx               = backend;
+    conf_targets_default(&backend->base.conf);
+    backend->base.is_regtest = (network && strcmp(network, "regtest") == 0);
 
     backend->tip_height             = -1;  /* unknown until first sync */
     backend->headers_synced         = -1;  /* no block headers yet     */
@@ -1003,12 +1005,33 @@ static int bip158_sync_headers(bip158_backend_t *b)
 
         uint32_t nbits_batch[2000];
         uint32_t ts_batch[2000];
-        int n = p2p_recv_headers_pow(&b->peers[b->current_peer], new_hashes, 2000, nbits_batch, ts_batch);
+        uint8_t  prev_hashes[2000][32];
+        int n = p2p_recv_headers_pow(&b->peers[b->current_peer], new_hashes, 2000,
+                                      nbits_batch, ts_batch, prev_hashes);
         if (n < 0) { result = -1; break; }
         if (n == 0) break;  /* peer has nothing more to send */
 
         for (int i = 0; i < n; i++) {
             int height = start_height + i;
+
+            /* Reorg detection: validate chain continuity via prev_hash */
+            if (height > 0 && b->headers_synced >= height - 1) {
+                int prev_idx = (height - 1) % BIP158_HEADER_WINDOW;
+                if (memcmp(prev_hashes[i], b->header_hashes[prev_idx], 32) != 0) {
+                    /* prev_hash mismatch — peer is on a different chain.
+                       Walk backward to find the fork point. */
+                    int fork_height = height - 1;
+                    /* The fork is at least at height-1; the peer's chain diverged here.
+                       For simplicity, reorg to the block before the mismatch. */
+                    fprintf(stderr, "BIP158: prev_hash mismatch at height %d "
+                            "(chain fork detected)\n", height);
+                    bip158_handle_reorg(b, fork_height);
+                    /* Restart header sync from new tip */
+                    result = b->tip_height;
+                    goto headers_done;
+                }
+            }
+
             memcpy(b->header_hashes[height % BIP158_HEADER_WINDOW],
                    new_hashes[i], 32);
             b->nBits_ring[height % BIP158_HEADER_WINDOW] = nbits_batch[i];
@@ -1704,4 +1727,64 @@ void bip158_backend_set_block_connected_cb(bip158_backend_t *backend,
     if (!backend) return;
     backend->block_connected_cb  = cb;
     backend->block_connected_ctx = cb_ctx;
+}
+
+void bip158_backend_set_block_disconnected_cb(bip158_backend_t *backend,
+                                               void (*cb)(uint32_t height,
+                                                          void *cb_ctx),
+                                               void *cb_ctx)
+{
+    if (!backend) return;
+    backend->block_disconnected_cb  = cb;
+    backend->block_disconnected_ctx = cb_ctx;
+}
+
+int bip158_handle_reorg(bip158_backend_t *b, int fork_height)
+{
+    if (!b || fork_height < 0) return 0;
+    if (b->tip_height <= fork_height) return 0;  /* no rollback needed */
+
+    int rolled_back = (int)b->tip_height - fork_height;
+    fprintf(stderr, "BIP158: reorg detected — rolling back from %d to %d (%d blocks)\n",
+            (int)b->tip_height, fork_height, rolled_back);
+
+    /* Fire block_disconnected_cb for each rolled-back height (descending) */
+    if (b->block_disconnected_cb) {
+        for (int h = (int)b->tip_height; h > fork_height; h--)
+            b->block_disconnected_cb((uint32_t)h, b->block_disconnected_ctx);
+    }
+
+    /* Invalidate tx_cache entries above fork height */
+    for (size_t i = 0; i < b->n_tx_cache; i++) {
+        if (b->tx_cache[i].height > fork_height) {
+            memset(b->tx_cache[i].txid, 0, 32);
+            b->tx_cache[i].height = -1;
+        }
+    }
+
+    /* Roll back state */
+    b->tip_height = fork_height;
+    if (b->headers_synced > fork_height)
+        b->headers_synced = fork_height;
+    if (b->filter_headers_synced > fork_height)
+        b->filter_headers_synced = fork_height;
+
+    /* Clear mempool cache (may contain txs from reorged blocks) */
+    b->mempool_cache_count = 0;
+    b->mempool_cache_head  = 0;
+
+    /* Fire the chain_backend reorg callback if set */
+    if (b->base.reorg_cb)
+        b->base.reorg_cb(fork_height, fork_height + rolled_back, b->base.reorg_cb_ctx);
+
+    /* Persist corrected checkpoint */
+    if (b->db) {
+        persist_save_bip158_checkpoint(
+            (persist_t *)b->db,
+            b->tip_height, b->headers_synced, b->filter_headers_synced,
+            (const uint8_t *)b->header_hashes, sizeof(b->header_hashes),
+            (const uint8_t *)b->filter_headers, sizeof(b->filter_headers));
+    }
+
+    return rolled_back;
 }
