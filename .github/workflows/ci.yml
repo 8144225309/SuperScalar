@@ -61,7 +61,7 @@ jobs:
       - name: Build and test in ARM64 container
         run: |
           docker run --rm --platform linux/arm64 \
-            --ulimit stack=134217728:134217728 \
+            --ulimit stack=-1:-1 \
             -v "${{ github.workspace }}:/src" -w /src \
             ubuntu:24.04 bash -c '
               apt-get update && apt-get install -y cmake gcc g++ git \
@@ -69,7 +69,7 @@ jobs:
               cmake -B build -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
               cmake --build build --parallel
-              ulimit -s 131072 2>/dev/null || ulimit -s unlimited 2>/dev/null || true
+              ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
               cd build && ./test_superscalar --unit
             '
 

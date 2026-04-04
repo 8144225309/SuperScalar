@@ -385,6 +385,7 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     ws->base.sign_input     = hd_sign_input;
     ws->base.release_utxo   = hd_release_utxo;
     ws->base.free           = hd_free;
+    ws->base.type           = WALLET_SOURCE_HD;
     ws->ctx      = ctx;
     ws->db       = db;
     ws->bip158   = bip158;

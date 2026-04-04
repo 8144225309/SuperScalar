@@ -241,5 +241,6 @@ void wallet_source_rpc_init(wallet_source_rpc_t *ws, void *rt)
     ws->base.sign_input     = rpc_sign_input;
     ws->base.release_utxo   = rpc_release_utxo;
     ws->base.free           = NULL;
+    ws->base.type           = WALLET_SOURCE_RPC;
     ws->rt = rt;
 }
