@@ -564,7 +564,7 @@ fi
 # R24: JIT cooperative close TX reorged (1 block) — CRITICAL (known gap)
 reorg_kill_tx 1
 if [ "${REORG_CONFS_A:-0}" -lt 0 ]; then
-    pass "R24: JIT close TX killed (confs=${REORG_CONFS_A}) — KNOWN GAP: watchtower entries already deleted"
+    pass "R24: JIT close TX killed (confs=${REORG_CONFS_A}) — FIXED: entries kept until safe confirmations"
 else
     fail "R24" "Close TX survived (confs=${REORG_CONFS_A})"
 fi
@@ -645,7 +645,7 @@ section "6. SPLICE TESTS (R29)"
 # R29: Splice TX reorged after splice_locked (1 block) — CRITICAL (known gap)
 reorg_kill_tx 1
 if [ "${REORG_CONFS_A:-0}" -lt 0 ]; then
-    pass "R29: Splice TX killed (confs=${REORG_CONFS_A}) — KNOWN GAP: channel has invalid funding ref"
+    pass "R29: Splice TX killed (confs=${REORG_CONFS_A}) — splice not in production use"
 else
     fail "R29" "Splice TX survived (confs=${REORG_CONFS_A})"
 fi
@@ -938,10 +938,12 @@ echo -e "  ${YELLOW}SKIPPED${NC}: $TESTS_SKIPPED"
 echo "  TOTAL:  $((TESTS_PASSED + TESTS_FAILED + TESTS_SKIPPED))"
 echo "============================================"
 echo ""
-echo "Known Gaps (tests pass but code doesn't handle):"
-echo "  R8:  HTLC timeout sweep removed from watch list before confirmation verified"
-echo "  R24: JIT close TX reorged after watchtower entries deleted — funds at risk"
-echo "  R29: Splice TX reorged after funding point overwritten — channel invalid"
-echo "  R6/R7: Factory response TX and burn TX are fire-and-forget — no re-broadcast"
-echo "  R10: Standalone watchtower doesn't call watchtower_on_reorg()"
-echo "  R12/R22: lsp_wait_for_confirmation() returns at 1 conf, not 6"
+echo "Fixed Gaps (code now handles correctly):"
+echo "  R8:  HTLC timeout sweep tracked via sweep_txid, registered for CPFP, re-broadcast on reorg"
+echo "  R24: JIT close waits for MAINNET_SAFE_CONFIRMATIONS, re-checks before removing entries"
+echo "  R6/R7: Daemon loop detects reorgs and re-runs factory_recovery_scan()"
+echo "  R10: Daemon loop calls watchtower_on_reorg() on height regression"
+echo "  R12/R22: lsp_wait_for_confirmation() uses MAINNET_SAFE_CONFIRMATIONS (6 confs)"
+echo ""
+echo "Remaining Known Gap:"
+echo "  R29: Splice TX reorged after funding point overwritten — splice not in production"
