@@ -229,7 +229,7 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
             if (nd->parent_index < 0) {
                 /* Root node: depends on the factory funding TX.
                    Use safe threshold to avoid acting on reorgable txs. */
-                parent_ok = (funding_confs >= chain_funding_confs(chain, 0));
+                parent_ok = (funding_confs >= chain_funding_confs(chain, chain->is_regtest));
             } else {
                 fr_node_t *par = find_node(nodes, n, nd->parent_index);
                 int par_i = par ? (int)(par - nodes) : -1;

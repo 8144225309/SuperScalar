@@ -2720,7 +2720,7 @@ accept_new_factory:
             printf("LSP: waiting for funding tx confirmation on %s...\n", network);
             int conf = lsp_wait_for_confirmation_service(chain_be, funding_txid_hex,
                                                    confirm_timeout_secs,
-                                                   chain_funding_confs(chain_be, 0), NULL, lsp_p);
+                                                   chain_funding_confs(chain_be, chain_be->is_regtest), NULL, lsp_p);
             if (conf < 1) {
                 fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
                 lsp_cleanup(lsp_p);
