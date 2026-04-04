@@ -170,12 +170,12 @@ test_R11() {
     local txid=$($RPCW sendtoaddress "$addr" 0.001)
     mine 1
 
-    local confs=$($RPCW gettransaction "$txid" | grep -o '"confirmations":[0-9]*' | grep -o '[0-9]*')
+    local confs=$($RPCW gettransaction "$txid" | grep '"confirmations"' | grep -o '[0-9-]*' | head -1)
     if [ "$confs" -ge 1 ]; then
         # Reorg it out
         reorg_to $h
         mine 1
-        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep -o '"confirmations":-\?[0-9]*' | grep -o '-\?[0-9]*' || echo "-1")
+        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep '"confirmations"' | grep -o '\-\?[0-9]*' | head -1 || echo "-1")
         if [ "$confs2" -le 0 ]; then
             pass "R11: Funding TX reorged from 1 conf to $confs2"
         else
@@ -194,11 +194,11 @@ test_R12() {
     local txid=$($RPCW sendtoaddress "$addr" 0.001)
     mine 5
 
-    local confs=$($RPCW gettransaction "$txid" | grep -o '"confirmations":[0-9]*' | grep -o '[0-9]*')
+    local confs=$($RPCW gettransaction "$txid" | grep '"confirmations"' | grep -o '[0-9-]*' | head -1)
     if [ "$confs" -ge 5 ]; then
         reorg_to $h
         mine 1
-        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep -o '"confirmations":-\?[0-9]*' | grep -o '-\?[0-9]*' || echo "-1")
+        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep '"confirmations"' | grep -o '\-\?[0-9]*' | head -1 || echo "-1")
         if [ "$confs2" -le 0 ]; then
             pass "R12: Funding at 5 confs reorged to $confs2 — below safe threshold works"
         else
@@ -217,11 +217,11 @@ test_R12b() {
     local txid=$($RPCW sendtoaddress "$addr" 0.001)
     mine 7
 
-    local confs=$($RPCW gettransaction "$txid" | grep -o '"confirmations":[0-9]*' | grep -o '[0-9]*')
+    local confs=$($RPCW gettransaction "$txid" | grep '"confirmations"' | grep -o '[0-9-]*' | head -1)
     if [ "$confs" -ge 7 ]; then
         reorg_to $h
         mine 1
-        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep -o '"confirmations":-\?[0-9]*' | grep -o '-\?[0-9]*' || echo "-1")
+        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep '"confirmations"' | grep -o '\-\?[0-9]*' | head -1 || echo "-1")
         if [ "$confs2" -le 0 ]; then
             pass "R12b: Funding at 7 confs (past safe) reorged to $confs2 — deep reorg works"
         else
@@ -285,12 +285,12 @@ test_conf_depth() {
     local txid=$($RPCW sendtoaddress "$addr" 0.0001)
     mine $depth
 
-    local confs=$($RPCW gettransaction "$txid" | grep -o '"confirmations":[0-9]*' | grep -o '[0-9]*')
+    local confs=$($RPCW gettransaction "$txid" | grep '"confirmations"' | grep -o '[0-9-]*' | head -1)
     if [ "$confs" -ge "$depth" ]; then
         # Full reorg — should remove TX
         reorg_to $h
         mine 1
-        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep -o '"confirmations":-\?[0-9]*' | grep -o '-\?[0-9]*' || echo "-1")
+        local confs2=$($RPCW gettransaction "$txid" 2>/dev/null | grep '"confirmations"' | grep -o '\-\?[0-9]*' | head -1 || echo "-1")
         if [ "$confs2" -le 0 ]; then
             pass "$label: $depth-conf TX removed by $depth-block reorg"
         else
