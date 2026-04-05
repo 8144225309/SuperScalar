@@ -442,13 +442,11 @@ static int channel_ensure_revocations_cap(channel_t *ch, size_t needed) {
     size_t new_cap = ch->revocations_cap ? ch->revocations_cap * 2 : 512;
     while (new_cap < needed) new_cap *= 2;
     unsigned char (*new_rev)[32] = realloc(ch->received_revocations, new_cap * 32);
+    if (!new_rev) return 0;
+    ch->received_revocations = new_rev;
     uint8_t *new_valid = realloc(ch->received_revocation_valid, new_cap);
-    if (!new_rev || !new_valid) {
-        /* On partial failure, keep whichever pointer succeeded */
-        if (new_rev) ch->received_revocations = new_rev;
-        if (new_valid) ch->received_revocation_valid = new_valid;
-        return 0;
-    }
+    if (!new_valid) return 0;
+    ch->received_revocation_valid = new_valid;
     memset(new_rev + ch->revocations_cap, 0, (new_cap - ch->revocations_cap) * 32);
     memset(new_valid + ch->revocations_cap, 0, new_cap - ch->revocations_cap);
     ch->received_revocations = new_rev;
