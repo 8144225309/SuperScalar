@@ -28,6 +28,7 @@
 
 #include "superscalar/sha256.h"
 #include "superscalar/wallet_source.h"
+#include "superscalar/wallet_source_hd.h"
 
 /* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
 
@@ -3454,9 +3455,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (tnow - last_deposit_check >= 30 && mgr->wallet_src) {
                         wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
                         if (ws->type == WALLET_SOURCE_HD) {
-                            extern uint64_t wallet_source_hd_get_balance(const void *);
-                            extern uint32_t wallet_source_hd_extend_gap(void *);
-                            uint64_t bal = wallet_source_hd_get_balance(mgr->wallet_src);
+                            wallet_source_hd_t *hd = (wallet_source_hd_t *)ws;
+                            uint64_t bal = wallet_source_hd_get_balance(hd);
                             if (bal != mgr->available_balance_sats) {
                                 if (bal > mgr->available_balance_sats)
                                     printf("LSP: deposit detected — wallet balance: %llu sats (+%llu)\n",
@@ -3465,7 +3465,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 mgr->available_balance_sats = bal;
                             }
                             /* Extend gap limit if needed */
-                            wallet_source_hd_extend_gap(mgr->wallet_src);
+                            wallet_source_hd_extend_gap(hd);
                         }
                         last_deposit_check = tnow;
                     }

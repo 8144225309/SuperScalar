@@ -13,6 +13,8 @@
  */
 
 #include "superscalar/admin_rpc.h"
+#include "superscalar/wallet_source.h"
+#include "superscalar/wallet_source_hd.h"
 #include "superscalar/lsp.h"
 #include <sys/stat.h>
 #include "superscalar/wire.h"
@@ -1251,11 +1253,12 @@ size_t admin_rpc_handle_request(admin_rpc_t *rpc,
         result = method_listfunds(rpc);
     } else if (strcmp(m, "getdepositaddress") == 0) {
         /* Return a bech32m P2TR deposit address from the HD wallet */
-        if (rpc->wallet) {
+        wallet_source_t *dep_ws = (wallet_source_t *)rpc->wallet;
+        if (dep_ws && dep_ws->type == WALLET_SOURCE_HD) {
             char addr[128] = {0};
-            extern int wallet_source_hd_get_address(const void *, uint32_t, char *, size_t);
+            extern int wallet_source_hd_get_address(const wallet_source_hd_t *, uint32_t, char *, size_t);
             /* Use index 0 for the primary deposit address */
-            if (wallet_source_hd_get_address(rpc->wallet, 0, addr, sizeof(addr))) {
+            if (wallet_source_hd_get_address((const wallet_source_hd_t *)rpc->wallet, 0, addr, sizeof(addr))) {
                 result = cJSON_CreateObject();
                 cJSON_AddStringToObject(result, "address", addr);
                 cJSON_AddStringToObject(result, "type", "p2tr");
