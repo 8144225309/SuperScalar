@@ -166,6 +166,7 @@ int test_reconnect_pubkey_match(void) {
     /* Send MSG_RECONNECT from sv[1] as client 2 (index 2) */
     {
         cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
+        /* cppcheck-suppress memleak ; TEST_ASSERT leaks on failure — test-only, process exits */
         TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect failed");
         cJSON_Delete(reconn);
     }
