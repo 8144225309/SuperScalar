@@ -2004,10 +2004,16 @@
         unsigned char fund2_spk[256];
         size_t fund2_spk_len = 0;
         uint32_t fund2_vout = 0;
-        if (!regtest_find_output(&rt, fund2_txid_hex, fund_spk, 34,
-                                   &fund2_amount, &fund2_vout,
-                                   fund2_spk, &fund2_spk_len)) {
-            fprintf(stderr, "PARTIAL ROTATION: find output for new factory failed\n");
+        for (uint32_t v = 0; v < 4; v++) {
+            regtest_get_tx_output(&rt, fund2_txid_hex, v,
+                                  &fund2_amount, fund2_spk, &fund2_spk_len);
+            if (fund2_spk_len == 34 && memcmp(fund2_spk, fund_spk, 34) == 0) {
+                fund2_vout = v;
+                break;
+            }
+        }
+        if (fund2_amount == 0) {
+            fprintf(stderr, "PARTIAL ROTATION: no funding output for new factory\n");
             lsp_p->n_clients = saved_n;
             memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
             memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
