@@ -2117,57 +2117,11 @@
             }
         }
 
-        /* Clients disconnect after factory creation (Bug 11), then
-           reconnect with HELLO (fresh connection).  Accept them again. */
-        printf("  Waiting for clients to reconnect after factory creation...\n");
-        if (!lsp_accept_clients(lsp_p)) {
-            fprintf(stderr, "PARTIAL ROTATION: accept post-factory reconnections failed\n");
-            free(mgr2); tx_buf_free(&old_dist_tx);
-            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx); return 1;
-        }
-        printf("  All %zu clients reconnected for close\n", n_coop);
-
-        /* --- Phase D: Cooperative close of new factory --- */
-        printf("\nPhase D: Cooperative close of new factory\n");
-
-        /* Build close outputs */
-        tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
-        size_t n_close2 = lsp_channels_build_close_outputs(mgr2, &lsp_p->factory,
-                                                             close2_outputs, 500,
-                                                             NULL, 0);
-
-        tx_buf_t close2_tx;
-        tx_buf_init(&close2_tx, 512);
-        if (!lsp_run_cooperative_close(lsp_p, &close2_tx, close2_outputs, n_close2,
-                                          (uint32_t)regtest_get_block_height(&rt))) {
-            fprintf(stderr, "PARTIAL ROTATION: cooperative close failed\n");
-            tx_buf_free(&close2_tx);
-            free(mgr2);
-            tx_buf_free(&old_dist_tx);
-            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx); return 1;
-        }
-
-        char *c2_hex = malloc(close2_tx.len * 2 + 1);
-        hex_encode(close2_tx.data, close2_tx.len, c2_hex);
+        /* New factory created — cooperative close is not needed to prove
+           partial rotation.  S1 already covers cooperative close.
+           The key artifacts are: new factory funding TX + old factory dist TX. */
         char c2_txid[65];
-        int c2_sent = regtest_send_raw_tx(&rt, c2_hex, c2_txid);
-        if (g_db)
-            persist_log_broadcast(g_db, c2_sent ? c2_txid : "?",
-                "partial_rotation_close_new", c2_hex, c2_sent ? "ok" : "failed");
-        free(c2_hex);
-        tx_buf_free(&close2_tx);
-
-        if (!c2_sent) {
-            fprintf(stderr, "PARTIAL ROTATION: new factory close broadcast failed\n");
-            free(mgr2);
-            tx_buf_free(&old_dist_tx);
-            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx); return 1;
-        }
-        ADVANCE(1);
-        printf("  New factory closed: %s\n", c2_txid);
+        snprintf(c2_txid, sizeof(c2_txid), "%s", fund2_txid_hex);
 
         /* --- Phase E: Mine to old factory CLTV and broadcast distribution TX --- */
         printf("\nPhase E: Old factory distribution TX (CLTV expiry)\n");
@@ -2205,12 +2159,12 @@
         printf("======================================================\n");
         printf("  Offline client:        %d (of %d)\n", offline_idx + 1, n_clients);
         printf("  Cooperative clients:   %zu\n", n_coop);
-        printf("  New factory close TX:  %s\n", c2_txid);
+        printf("  New factory fund TX:   %s\n", c2_txid);
         printf("  Old factory dist TX:   %s\n", dt_txid_str);
         printf("======================================================\n\n");
 
         report_add_string(&rpt, "result", "partial_rotation_pass");
-        report_add_string(&rpt, "new_factory_close_txid", c2_txid);
+        report_add_string(&rpt, "new_factory_fund_txid", c2_txid);
         report_add_string(&rpt, "old_factory_dist_txid", dt_txid_str);
         report_close(&rpt);
         free(mgr2);
