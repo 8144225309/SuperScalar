@@ -2071,10 +2071,10 @@
         }
 
         /* Build close outputs */
-        size_t n_close2 = 0;
-        tx_output_t close2_outputs[FACTORY_MAX_SIGNERS * 2];
-        lsp_channels_build_close_outputs(mgr2, &lsp_p->factory,
-            close2_outputs, &n_close2);
+        tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
+        size_t n_close2 = lsp_channels_build_close_outputs(mgr2, &lsp_p->factory,
+                                                             close2_outputs, 500,
+                                                             NULL, 0);
 
         tx_buf_t close2_tx;
         tx_buf_init(&close2_tx, 512);
