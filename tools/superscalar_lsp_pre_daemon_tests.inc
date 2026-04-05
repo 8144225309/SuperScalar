@@ -867,6 +867,7 @@
                 ladder_factory_t *lf1 = &lad->factories[1];
                 lf1->factory = *f1;
                 factory_detach_txbufs(&lf1->factory);
+                free(f1);
                 lf1->factory_id = lad->next_factory_id++;
                 lf1->is_initialized = 1;
                 lf1->is_funded = 1;
