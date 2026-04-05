@@ -1874,8 +1874,20 @@
         printf("\nPhase B: Disconnecting client %d (simulating offline)\n",
                offline_idx + 1);
         if (lsp_p->client_fds[offline_idx] >= 0) {
+            /* Send ERROR so client exits cleanly instead of retrying */
+            cJSON *err = cJSON_CreateObject();
+            cJSON_AddStringToObject(err, "reason", "partial_rotation_offline");
+            wire_send(lsp_p->client_fds[offline_idx], MSG_ERROR, err);
+            cJSON_Delete(err);
             wire_close(lsp_p->client_fds[offline_idx]);
             lsp_p->client_fds[offline_idx] = -1;
+        }
+        /* Close listen socket to prevent offline client's reconnection
+           from interfering with the cooperative subset factory creation.
+           Will be reopened by lsp_accept_clients. */
+        if (lsp_p->listen_fd >= 0) {
+            wire_close(lsp_p->listen_fd);
+            lsp_p->listen_fd = -1;
         }
 
         /* Save old factory's CLTV timeout for Phase E */
