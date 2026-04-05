@@ -443,10 +443,14 @@ static int channel_ensure_revocations_cap(channel_t *ch, size_t needed) {
     while (new_cap < needed) new_cap *= 2;
     unsigned char (*new_rev)[32] = realloc(ch->received_revocations, new_cap * 32);
     if (!new_rev) return 0;
-    ch->received_revocations = new_rev;
     uint8_t *new_valid = realloc(ch->received_revocation_valid, new_cap);
-    if (!new_valid) return 0;
-    ch->received_revocation_valid = new_valid;
+    if (!new_valid) {
+        /* First realloc succeeded but second failed. Shrink the first
+           back to the original size so both arrays stay in sync. */
+        unsigned char (*shrunk)[32] = realloc(new_rev, ch->revocations_cap * 32);
+        ch->received_revocations = shrunk ? shrunk : new_rev;
+        return 0;
+    }
     memset(new_rev + ch->revocations_cap, 0, (new_cap - ch->revocations_cap) * 32);
     memset(new_valid + ch->revocations_cap, 0, new_cap - ch->revocations_cap);
     ch->received_revocations = new_rev;
