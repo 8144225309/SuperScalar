@@ -204,17 +204,18 @@ int test_lsp_channel_init(void) {
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDD;
-    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channel manager */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4),
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4),
                 "lsp_channels_init");
     TEST_ASSERT_EQ(mgr.n_channels, 4, "n_channels");
 
@@ -233,7 +234,8 @@ int test_lsp_channel_init(void) {
                         entry->channel.funding_amount - commit_fee, "balance sum");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -741,16 +743,17 @@ int test_regtest_intra_factory_payment(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
@@ -762,19 +765,19 @@ int test_regtest_intra_factory_payment(void) {
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
-        if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        if (!lsp_channels_send_ready(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: send channel_ready failed\n");
             lsp_ok = 0;
         }
@@ -787,12 +790,12 @@ int test_regtest_intra_factory_payment(void) {
     if (lsp_ok) {
         /* Step 1: Receive ADD_HTLC from Client A (index 0) */
         wire_msg_t msg;
-        if (!wire_recv(lsp.client_fds[0], &msg)) {
+        if (!wire_recv(lsp->client_fds[0], &msg)) {
             fprintf(stderr, "LSP: recv from client 0 failed\n");
             lsp_ok = 0;
         } else {
             if (msg.msg_type == MSG_UPDATE_ADD_HTLC) {
-                if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 0, &msg)) {
+                if (!lsp_channels_handle_msg(&ch_mgr, lsp, 0, &msg)) {
                     fprintf(stderr, "LSP: handle ADD_HTLC failed\n");
                     lsp_ok = 0;
                 }
@@ -806,12 +809,12 @@ int test_regtest_intra_factory_payment(void) {
 
         /* Step 2: Receive FULFILL_HTLC from Client B (index 1) */
         if (lsp_ok) {
-            if (!wire_recv(lsp.client_fds[1], &msg)) {
+            if (!wire_recv(lsp->client_fds[1], &msg)) {
                 fprintf(stderr, "LSP: recv from client 1 failed\n");
                 lsp_ok = 0;
             } else {
                 if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
-                    if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 1, &msg)) {
+                    if (!lsp_channels_handle_msg(&ch_mgr, lsp, 1, &msg)) {
                         fprintf(stderr, "LSP: handle FULFILL_HTLC failed\n");
                         lsp_ok = 0;
                     }
@@ -885,7 +888,7 @@ int test_regtest_intra_factory_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -907,7 +910,8 @@ int test_regtest_intra_factory_payment(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Wait for children */
     int all_children_ok = 1;
@@ -1122,16 +1126,17 @@ int test_regtest_multi_payment(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
@@ -1143,19 +1148,19 @@ int test_regtest_multi_payment(void) {
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
-        if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        if (!lsp_channels_send_ready(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: send channel_ready failed\n");
             lsp_ok = 0;
         }
@@ -1163,7 +1168,7 @@ int test_regtest_multi_payment(void) {
 
     /* Run event loop: 4 payments x 2 messages each = 8 messages */
     if (lsp_ok) {
-        if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 8)) {
+        if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 8)) {
             fprintf(stderr, "LSP: event loop failed\n");
             lsp_ok = 0;
         }
@@ -1242,7 +1247,7 @@ int test_regtest_multi_payment(void) {
     if (lsp_ok) {
         uint64_t close_fee = 500;
         tx_output_t close_outputs[5];  /* 1 LSP + 4 clients */
-        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp.factory,
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
                                                            close_outputs, close_fee,
                                                            NULL, 0);
         TEST_ASSERT(n_close == 5, "build close outputs returned 5");
@@ -1257,7 +1262,7 @@ int test_regtest_multi_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1298,7 +1303,8 @@ int test_regtest_multi_payment(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Wait for children */
     int all_children_ok = 1;
@@ -1345,12 +1351,13 @@ int test_fee_policy_balance_split(void) {
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDD;
-    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     fee_estimator_static_t fe;
     fee_estimator_static_init(&fe, 1000);
@@ -1360,7 +1367,7 @@ int test_fee_policy_balance_split(void) {
     {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
-        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init default");
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init default");
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t usable = ch->funding_amount - commit_fee;
@@ -1374,7 +1381,7 @@ int test_fee_policy_balance_split(void) {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
         mgr.lsp_balance_pct = 70;
-        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 70%");
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init 70%");
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t usable = ch->funding_amount - commit_fee;
@@ -1389,7 +1396,7 @@ int test_fee_policy_balance_split(void) {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
         mgr.lsp_balance_pct = 20;
-        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 20%");
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init 20%");
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t usable = ch->funding_amount - commit_fee;
@@ -1404,7 +1411,7 @@ int test_fee_policy_balance_split(void) {
         lsp_channel_mgr_t mgr;
         memset(&mgr, 0, sizeof(mgr));
         mgr.lsp_balance_pct = 150;
-        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init 150%");
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init 150%");
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t usable = ch->funding_amount - commit_fee;
@@ -1419,12 +1426,13 @@ int test_fee_policy_balance_split(void) {
         memset(&mgr, 0, sizeof(mgr));
         mgr.routing_fee_ppm = 1000;
         mgr.lsp_balance_pct = 60;
-        TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init fee");
+        TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init fee");
         TEST_ASSERT_EQ(mgr.routing_fee_ppm, 1000, "fee_ppm preserved");
         TEST_ASSERT_EQ(mgr.lsp_balance_pct, 60, "balance_pct preserved");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1509,20 +1517,21 @@ int test_fee_estimator_wiring(void) {
         if (!secp256k1_keypair_create(ctx, &all_kps[i], s)) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
-    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Init mgr with fee estimator */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.fee = &fe;
     mgr.lsp_balance_pct = 50;
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec, 4), "init with fee");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with fee");
 
     /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator —
      * client always uses the default 1000 sat/kvB from channel_init, so both
@@ -1532,7 +1541,8 @@ int test_fee_estimator_wiring(void) {
                        "channel uses default 1000 sat/kvB (not wired from estimator)");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1552,20 +1562,21 @@ int test_fee_estimator_null_fallback(void) {
         if (!secp256k1_keypair_create(ctx, &all_kps[i], s)) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
-    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Init mgr with NULL fee (should fallback to 1000) */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.fee = NULL;
     mgr.lsp_balance_pct = 50;
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec, 4), "init with NULL fee");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with NULL fee");
 
     /* All channels should have default fee rate */
     for (size_t c = 0; c < 4; c++) {
@@ -1573,7 +1584,8 @@ int test_fee_estimator_null_fallback(void) {
                        "channel has default 1000 sat/kvB");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1588,16 +1600,18 @@ int test_accept_timeout(void) {
     secp256k1_keypair kp;
     TEST_ASSERT(secp256k1_keypair_create(ctx, &kp, sec), "keypair create");
 
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    TEST_ASSERT(lsp_init(&lsp, ctx, &kp, 19876, 1), "lsp_init");
-    lsp.accept_timeout_sec = 1;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    TEST_ASSERT(lsp_init(lsp, ctx, &kp, 19876, 1), "lsp_init");
+    lsp->accept_timeout_sec = 1;
 
     /* No client connects — should timeout and return 0 */
-    int ok = lsp_accept_clients(&lsp);
+    int ok = lsp_accept_clients(lsp);
     TEST_ASSERT(ok == 0, "accept should timeout with no client");
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1887,15 +1901,16 @@ int test_regtest_lsp_restart_recovery(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_run_factory_creation(&lsp, funding_txid, funding_vout,
+    if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
                                              10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
@@ -1904,15 +1919,15 @@ int test_regtest_lsp_restart_recovery(void) {
 
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
-    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4)) {
         fprintf(stderr, "LSP: channel init failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: basepoint exchange failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: send channel_ready failed\n");
         lsp_ok = 0;
     }
@@ -1920,12 +1935,12 @@ int test_regtest_lsp_restart_recovery(void) {
     /* Phase 2: Process a payment (Client A → Client B, 5000 sats) */
     if (lsp_ok) {
         wire_msg_t msg;
-        if (!wire_recv(lsp.client_fds[0], &msg)) {
+        if (!wire_recv(lsp->client_fds[0], &msg)) {
             fprintf(stderr, "LSP: recv from client 0 failed\n");
             lsp_ok = 0;
         } else {
             if (msg.msg_type == MSG_UPDATE_ADD_HTLC) {
-                if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 0, &msg)) {
+                if (!lsp_channels_handle_msg(&ch_mgr, lsp, 0, &msg)) {
                     fprintf(stderr, "LSP: handle ADD_HTLC failed\n");
                     lsp_ok = 0;
                 }
@@ -1937,12 +1952,12 @@ int test_regtest_lsp_restart_recovery(void) {
             cJSON_Delete(msg.json);
         }
         if (lsp_ok) {
-            if (!wire_recv(lsp.client_fds[1], &msg)) {
+            if (!wire_recv(lsp->client_fds[1], &msg)) {
                 fprintf(stderr, "LSP: recv from client 1 failed\n");
                 lsp_ok = 0;
             } else {
                 if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
-                    if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 1, &msg)) {
+                    if (!lsp_channels_handle_msg(&ch_mgr, lsp, 1, &msg)) {
                         fprintf(stderr, "LSP: handle FULFILL_HTLC failed\n");
                         lsp_ok = 0;
                     }
@@ -1998,7 +2013,7 @@ int test_regtest_lsp_restart_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp.factory, ctx, 0)) {
+    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }
@@ -2030,24 +2045,25 @@ int test_regtest_lsp_restart_recovery(void) {
     }
 
     /* Phase 6: Recover from SQLite */
-    factory_t rec_f;
+    factory_t *rec_f = calloc(1, sizeof(factory_t));
+    if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
-    memset(&rec_f, 0, sizeof(rec_f));
+
     memset(&rec_mgr, 0, sizeof(rec_mgr));
     if (lsp_ok) {
         printf("LSP: === RECOVERING FROM SQLITE ===\n");
-        if (!persist_load_factory(&db, 0, &rec_f, ctx)) {
+        if (!persist_load_factory(&db, 0, rec_f, ctx)) {
             fprintf(stderr, "LSP: persist_load_factory failed\n");
             lsp_ok = 0;
         }
     }
-    if (lsp_ok && rec_f.n_participants != 5) {
+    if (lsp_ok && rec_f->n_participants != 5) {
         fprintf(stderr, "LSP: recovered n_participants=%zu, expected 5\n",
-                rec_f.n_participants);
+                rec_f->n_participants);
         lsp_ok = 0;
     }
     if (lsp_ok) {
-        if (!lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+        if (!lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                          seckeys[0], 4, &db)) {
             fprintf(stderr, "LSP: init_from_db failed\n");
             lsp_ok = 0;
@@ -2126,7 +2142,7 @@ int test_regtest_lsp_restart_recovery(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs,
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
@@ -2149,7 +2165,8 @@ int test_regtest_lsp_restart_recovery(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Wait for children */
     int all_children_ok = 1;
@@ -2163,6 +2180,7 @@ int test_regtest_lsp_restart_recovery(void) {
         }
     }
 
+    free(rec_f);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
 }
@@ -2183,21 +2201,22 @@ int test_profit_settlement_calculation(void) {
     }
 
     /* Build a minimal factory with profit-shared economics */
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    f.economic_mode = ECON_PROFIT_SHARED;
-    f.n_participants = 4; /* LSP + 3 clients */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    f->economic_mode = ECON_PROFIT_SHARED;
+    f->n_participants = 4; /* LSP + 3 clients */
     /* LSP gets 40%, each client gets 20% = 2000 bps */
-    f.profiles[0].profit_share_bps = 4000;
-    f.profiles[1].profit_share_bps = 2000;
-    f.profiles[2].profit_share_bps = 2000;
-    f.profiles[3].profit_share_bps = 2000;
+    f->profiles[0].profit_share_bps = 4000;
+    f->profiles[1].profit_share_bps = 2000;
+    f->profiles[2].profit_share_bps = 2000;
+    f->profiles[3].profit_share_bps = 2000;
 
     /* Accumulate 10000 sats in fees */
     mgr.accumulated_fees_sats = 10000;
     mgr.economic_mode = ECON_PROFIT_SHARED;
 
-    int settled = lsp_channels_settle_profits(&mgr, &f);
+    int settled = lsp_channels_settle_profits(&mgr, f);
     TEST_ASSERT(settled > 0, "settlement happened");
 
     /* Each client should receive 2000 bps of 10000 = 2000 sats */
@@ -2210,6 +2229,7 @@ int test_profit_settlement_calculation(void) {
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
     free(mgr.entries);
+    free(f);
     return 1;
 }
 
@@ -2224,29 +2244,31 @@ int test_settlement_trigger_at_interval(void) {
     mgr.entries[1].channel.local_amount = 50000;
     mgr.entries[1].channel.remote_amount = 50000;
 
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    f.n_participants = 3;
-    f.profiles[0].profit_share_bps = 5000;
-    f.profiles[1].profit_share_bps = 2500;
-    f.profiles[2].profit_share_bps = 2500;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    f->n_participants = 3;
+    f->profiles[0].profit_share_bps = 5000;
+    f->profiles[1].profit_share_bps = 2500;
+    f->profiles[2].profit_share_bps = 2500;
 
     /* LSP-takes-all mode: no settlement */
     mgr.economic_mode = ECON_LSP_TAKES_ALL;
     mgr.accumulated_fees_sats = 5000;
-    f.economic_mode = ECON_LSP_TAKES_ALL;
-    int settled = lsp_channels_settle_profits(&mgr, &f);
+    f->economic_mode = ECON_LSP_TAKES_ALL;
+    int settled = lsp_channels_settle_profits(&mgr, f);
     TEST_ASSERT_EQ(settled, 0, "no settlement in LSP-takes-all mode");
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 5000, "fees unchanged");
 
     /* Profit-shared but zero fees: no settlement */
     mgr.economic_mode = ECON_PROFIT_SHARED;
     mgr.accumulated_fees_sats = 0;
-    f.economic_mode = ECON_PROFIT_SHARED;
-    settled = lsp_channels_settle_profits(&mgr, &f);
+    f->economic_mode = ECON_PROFIT_SHARED;
+    settled = lsp_channels_settle_profits(&mgr, f);
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
     free(mgr.entries);
+    free(f);
     return 1;
 }
 
@@ -2257,22 +2279,24 @@ int test_on_close_includes_unsettled(void) {
     mgr.accumulated_fees_sats = 8000;
     mgr.economic_mode = ECON_PROFIT_SHARED;
 
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    f.economic_mode = ECON_PROFIT_SHARED;
-    f.n_participants = 3;
-    f.profiles[0].profit_share_bps = 4000; /* LSP */
-    f.profiles[1].profit_share_bps = 3000; /* client 0 */
-    f.profiles[2].profit_share_bps = 3000; /* client 1 */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    f->economic_mode = ECON_PROFIT_SHARED;
+    f->n_participants = 3;
+    f->profiles[0].profit_share_bps = 4000; /* LSP */
+    f->profiles[1].profit_share_bps = 3000; /* client 0 */
+    f->profiles[2].profit_share_bps = 3000; /* client 1 */
 
     /* Client 0: 3000 bps of 8000 = 2400 sats */
-    uint64_t share0 = lsp_channels_unsettled_share(&mgr, &f, 0);
+    uint64_t share0 = lsp_channels_unsettled_share(&mgr, f, 0);
     TEST_ASSERT_EQ(share0, 2400, "client 0 unsettled share");
 
     /* Client 1: 3000 bps of 8000 = 2400 sats */
-    uint64_t share1 = lsp_channels_unsettled_share(&mgr, &f, 1);
+    uint64_t share1 = lsp_channels_unsettled_share(&mgr, f, 1);
     TEST_ASSERT_EQ(share1, 2400, "client 1 unsettled share");
 
+    free(f);
     return 1;
 }
 
@@ -2421,15 +2445,16 @@ int test_regtest_crash_double_recovery(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_run_factory_creation(&lsp, funding_txid, funding_vout,
+    if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
                                              10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
@@ -2438,15 +2463,15 @@ int test_regtest_crash_double_recovery(void) {
 
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
-    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4)) {
         fprintf(stderr, "LSP: channel init failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: basepoint exchange failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: send channel_ready failed\n");
         lsp_ok = 0;
     }
@@ -2454,12 +2479,12 @@ int test_regtest_crash_double_recovery(void) {
     /* Process payment (Client A → Client B, 5000 sats) */
     if (lsp_ok) {
         wire_msg_t msg;
-        if (!wire_recv(lsp.client_fds[0], &msg)) {
+        if (!wire_recv(lsp->client_fds[0], &msg)) {
             fprintf(stderr, "LSP: recv from client 0 failed\n");
             lsp_ok = 0;
         } else {
             if (msg.msg_type == MSG_UPDATE_ADD_HTLC) {
-                if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 0, &msg)) {
+                if (!lsp_channels_handle_msg(&ch_mgr, lsp, 0, &msg)) {
                     fprintf(stderr, "LSP: handle ADD_HTLC failed\n");
                     lsp_ok = 0;
                 }
@@ -2471,12 +2496,12 @@ int test_regtest_crash_double_recovery(void) {
             cJSON_Delete(msg.json);
         }
         if (lsp_ok) {
-            if (!wire_recv(lsp.client_fds[1], &msg)) {
+            if (!wire_recv(lsp->client_fds[1], &msg)) {
                 fprintf(stderr, "LSP: recv from client 1 failed\n");
                 lsp_ok = 0;
             } else {
                 if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
-                    if (!lsp_channels_handle_msg(&ch_mgr, &lsp, 1, &msg)) {
+                    if (!lsp_channels_handle_msg(&ch_mgr, lsp, 1, &msg)) {
                         fprintf(stderr, "LSP: handle FULFILL_HTLC failed\n");
                         lsp_ok = 0;
                     }
@@ -2524,7 +2549,7 @@ int test_regtest_crash_double_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp.factory, ctx, 0)) {
+    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }
@@ -2555,17 +2580,18 @@ int test_regtest_crash_double_recovery(void) {
     }
 
     /* Recover #1 */
-    factory_t rec_f;
+    factory_t *rec_f = calloc(1, sizeof(factory_t));
+    if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
-    memset(&rec_f, 0, sizeof(rec_f));
+
     memset(&rec_mgr, 0, sizeof(rec_mgr));
     if (lsp_ok) {
-        if (!persist_load_factory(&db, 0, &rec_f, ctx)) {
+        if (!persist_load_factory(&db, 0, rec_f, ctx)) {
             fprintf(stderr, "LSP: load factory #1 failed\n");
             lsp_ok = 0;
         }
     }
-    if (lsp_ok && !lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+    if (lsp_ok && !lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                                seckeys[0], 4, &db)) {
         fprintf(stderr, "LSP: init_from_db #1 failed\n");
         lsp_ok = 0;
@@ -2633,16 +2659,17 @@ int test_regtest_crash_double_recovery(void) {
 
     /* Recover #2 */
     lsp_channel_mgr_t rec_mgr2;
-    factory_t rec_f2;
-    memset(&rec_f2, 0, sizeof(rec_f2));
+    factory_t *rec_f2 = calloc(1, sizeof(factory_t));
+    if (!rec_f2) return 0;
+
     memset(&rec_mgr2, 0, sizeof(rec_mgr2));
     if (lsp_ok) {
-        if (!persist_load_factory(&db, 0, &rec_f2, ctx)) {
+        if (!persist_load_factory(&db, 0, rec_f2, ctx)) {
             fprintf(stderr, "LSP: load factory #2 failed\n");
             lsp_ok = 0;
         }
     }
-    if (lsp_ok && !lsp_channels_init_from_db(&rec_mgr2, ctx, &rec_f2,
+    if (lsp_ok && !lsp_channels_init_from_db(&rec_mgr2, ctx, rec_f2,
                                                seckeys[0], 4, &db)) {
         fprintf(stderr, "LSP: init_from_db #2 failed\n");
         lsp_ok = 0;
@@ -2698,7 +2725,7 @@ int test_regtest_crash_double_recovery(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs,
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
@@ -2721,7 +2748,8 @@ int test_regtest_crash_double_recovery(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Wait for children */
     int all_children_ok = 1;
@@ -2735,6 +2763,8 @@ int test_regtest_crash_double_recovery(void) {
         }
     }
 
+    free(rec_f);
+    free(rec_f2);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
 }
@@ -2879,15 +2909,16 @@ int test_regtest_tcp_reconnect(void) {
     }
 
     /* Parent: run LSP — factory creation + channels + one payment */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_run_factory_creation(&lsp, funding_txid, funding_vout,
+    if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
                                              10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
@@ -2896,21 +2927,21 @@ int test_regtest_tcp_reconnect(void) {
 
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
-    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4)) {
         fprintf(stderr, "LSP: channel init failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: basepoint exchange failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, &lsp)) {
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) {
         fprintf(stderr, "LSP: send channel_ready failed\n");
         lsp_ok = 0;
     }
 
     /* Process one payment: ADD_HTLC from sender + FULFILL from payee */
-    if (lsp_ok && !lsp_channels_run_event_loop(&ch_mgr, &lsp, 2)) {
+    if (lsp_ok && !lsp_channels_run_event_loop(&ch_mgr, lsp, 2)) {
         fprintf(stderr, "LSP: event loop failed\n");
         lsp_ok = 0;
     }
@@ -2931,9 +2962,9 @@ int test_regtest_tcp_reconnect(void) {
         waitpid(child_pids[1], &wst, 0);
         child_pids[1] = -1;
 
-        if (lsp.client_fds[1] >= 0) {
-            wire_close(lsp.client_fds[1]);
-            lsp.client_fds[1] = -1;
+        if (lsp->client_fds[1] >= 0) {
+            wire_close(lsp->client_fds[1]);
+            lsp->client_fds[1] = -1;
         }
         ch_mgr.entries[1].offline_detected = 1;
         printf("LSP: client B killed, fd closed\n");
@@ -3009,19 +3040,19 @@ int test_regtest_tcp_reconnect(void) {
 
     /* Parent: accept and handle reconnection */
     if (lsp_ok && reconn_pid > 0) {
-        int nfd = wire_accept(lsp.listen_fd);
+        int nfd = wire_accept(lsp->listen_fd);
         if (nfd < 0) { fprintf(stderr, "LSP: accept reconnect failed\n"); lsp_ok = 0; }
 
         if (lsp_ok && !wire_noise_handshake_responder(nfd, ctx)) {
             fprintf(stderr, "LSP: reconnect noise hs failed\n"); wire_close(nfd); lsp_ok = 0;
         }
 
-        if (lsp_ok && !lsp_channels_handle_reconnect(&ch_mgr, &lsp, nfd)) {
+        if (lsp_ok && !lsp_channels_handle_reconnect(&ch_mgr, lsp, nfd)) {
             fprintf(stderr, "LSP: handle_reconnect failed\n"); lsp_ok = 0;
         }
 
         if (lsp_ok) {
-            TEST_ASSERT(lsp.client_fds[1] >= 0, "client B fd reconnected");
+            TEST_ASSERT(lsp->client_fds[1] >= 0, "client B fd reconnected");
             TEST_ASSERT_EQ((long)ch_mgr.entries[1].channel.local_amount,
                             (long)pre_local, "local preserved");
             TEST_ASSERT_EQ((long)ch_mgr.entries[1].channel.remote_amount,
@@ -3045,7 +3076,8 @@ int test_regtest_tcp_reconnect(void) {
         }
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Kill remaining children (blocked on close ceremony) */
     for (int c = 0; c < 4; c++) {
@@ -3078,75 +3110,77 @@ int test_cli_command_parsing(void) {
     mgr.entries[1].channel.local_amount = 30000;
     mgr.entries[1].channel.remote_amount = 70000;
 
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
-    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    lsp.clients_cap = LSP_MAX_CLIENTS;
-    lsp.client_fds[0] = -1;
-    lsp.client_fds[1] = -1;
-    lsp.client_fds[2] = -1;
-    lsp.client_fds[3] = -1;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->client_fds[0] = -1;
+    lsp->client_fds[1] = -1;
+    lsp->client_fds[2] = -1;
+    lsp->client_fds[3] = -1;
 
     volatile sig_atomic_t shutdown_flag = 0;
 
     /* Test "help" — should be recognized */
-    int ok = lsp_channels_handle_cli_line(&mgr, &lsp, "help", &shutdown_flag);
+    int ok = lsp_channels_handle_cli_line(&mgr, lsp, "help", &shutdown_flag);
     TEST_ASSERT(ok, "help should be recognized");
 
     /* Test "status" — should be recognized */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "status", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "status", &shutdown_flag);
     TEST_ASSERT(ok, "status should be recognized");
 
     /* Test "close" — should set shutdown flag */
     shutdown_flag = 0;
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "close", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "close", &shutdown_flag);
     TEST_ASSERT(ok, "close should be recognized");
     TEST_ASSERT(shutdown_flag == 1, "close should set shutdown flag");
 
     /* Test "rotate" — should be recognized (will fail but not crash) */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rotate", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "rotate", &shutdown_flag);
     TEST_ASSERT(ok, "rotate should be recognized");
 
     /* Test "pay" with invalid args — should be recognized */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 0 1 1000", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "pay 0 1 1000", &shutdown_flag);
     TEST_ASSERT(ok, "pay should be recognized");
 
     /* Test "pay" self-payment rejection */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 0 0 1000", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "pay 0 0 1000", &shutdown_flag);
     TEST_ASSERT(ok, "pay self should be recognized (prints error)");
 
     /* Test "pay" out-of-range index */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay 99 0 1000", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "pay 99 0 1000", &shutdown_flag);
     TEST_ASSERT(ok, "pay out-of-range should be recognized");
 
     /* Test "pay" bad args */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "pay badargs", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "pay badargs", &shutdown_flag);
     TEST_ASSERT(ok, "pay bad args should be recognized");
 
     /* Test "rebalance" — should be recognized (same as pay) */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance 0 1 1000", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "rebalance 0 1 1000", &shutdown_flag);
     TEST_ASSERT(ok, "rebalance should be recognized");
 
     /* Test "rebalance" self-rejection */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance 0 0 1000", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "rebalance 0 0 1000", &shutdown_flag);
     TEST_ASSERT(ok, "rebalance self should be recognized (prints error)");
 
     /* Test "rebalance" bad args */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "rebalance badargs", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "rebalance badargs", &shutdown_flag);
     TEST_ASSERT(ok, "rebalance bad args should be recognized");
 
     /* Test unknown command — should return 0 */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "foobar", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "foobar", &shutdown_flag);
     TEST_ASSERT(!ok, "unknown command should return 0");
 
     /* Test empty string — should return 1 (no-op) */
-    ok = lsp_channels_handle_cli_line(&mgr, &lsp, "", &shutdown_flag);
+    ok = lsp_channels_handle_cli_line(&mgr, lsp, "", &shutdown_flag);
     TEST_ASSERT(ok, "empty string should be recognized (no-op)");
 
     free(mgr.entries);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3172,13 +3206,14 @@ int test_fee_accumulation_and_settlement(void) {
         mgr.entries[i].ready = 1;
     }
 
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    f.economic_mode = ECON_PROFIT_SHARED;
-    f.n_participants = 3; /* LSP + 2 clients */
-    f.profiles[0].profit_share_bps = 5000; /* LSP: 50% */
-    f.profiles[1].profit_share_bps = 2500; /* Client 0: 25% */
-    f.profiles[2].profit_share_bps = 2500; /* Client 1: 25% */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    f->economic_mode = ECON_PROFIT_SHARED;
+    f->n_participants = 3; /* LSP + 2 clients */
+    f->profiles[0].profit_share_bps = 5000; /* LSP: 50% */
+    f->profiles[1].profit_share_bps = 2500; /* Client 0: 25% */
+    f->profiles[2].profit_share_bps = 2500; /* Client 1: 25% */
 
     /* Simulate 3 routed payments using the same formula as production code */
     uint64_t payments_msat[] = { 1000000, 500000, 2000000 }; /* 1000, 500, 2000 sats */
@@ -3215,7 +3250,7 @@ int test_fee_accumulation_and_settlement(void) {
     /* Settle profits */
     uint64_t pre_local_0 = mgr.entries[0].channel.local_amount;
     uint64_t pre_remote_0 = mgr.entries[0].channel.remote_amount;
-    int settled = lsp_channels_settle_profits(&mgr, &f);
+    int settled = lsp_channels_settle_profits(&mgr, f);
     TEST_ASSERT(settled > 0, "settlement happened");
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
 
@@ -3229,6 +3264,7 @@ int test_fee_accumulation_and_settlement(void) {
                    "LSP local decreased by share");
 
     free(mgr.entries);
+    free(f);
     return 1;
 }
 
@@ -3246,17 +3282,18 @@ int test_close_outputs_wallet_spk(void) {
     mgr.entries[1].channel.local_amount = 4000;
     mgr.entries[1].channel.remote_amount = 2000;
 
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    f.funding_amount_sats = 5000 + 3000 + 4000 + 2000 + 500;  /* balances + fee */
-    memset(f.funding_spk, 0xAA, 34);
-    f.funding_spk_len = 34;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    f->funding_amount_sats = 5000 + 3000 + 4000 + 2000 + 500;  /* balances + fee */
+    memset(f->funding_spk, 0xAA, 34);
+    f->funding_spk_len = 34;
 
     uint64_t close_fee = 500;
 
     /* Test 1: NULL SPK — should use factory funding SPK */
     tx_output_t outputs[3];
-    size_t n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+    size_t n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
                                                   NULL, 0);
     TEST_ASSERT_EQ(n, 3, "NULL SPK: 3 outputs");
 
@@ -3280,7 +3317,7 @@ int test_close_outputs_wallet_spk(void) {
     unsigned char wallet_spk[34];
     memset(wallet_spk, 0xBB, 34);
 
-    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+    n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
                                            wallet_spk, 34);
     TEST_ASSERT_EQ(n, 3, "wallet SPK: 3 outputs");
 
@@ -3298,7 +3335,7 @@ int test_close_outputs_wallet_spk(void) {
     uint64_t sum = close_fee;
     for (size_t i = 0; i < n; i++)
         sum += outputs[i].amount_sats;
-    TEST_ASSERT_EQ(sum, f.funding_amount_sats, "balance invariant holds");
+    TEST_ASSERT_EQ(sum, f->funding_amount_sats, "balance invariant holds");
 
     /* Test 3: Per-client close addresses (NULL SPK + populated entry close_spk) */
     unsigned char client0_spk[34], client1_spk[34];
@@ -3309,7 +3346,7 @@ int test_close_outputs_wallet_spk(void) {
     memcpy(mgr.entries[1].close_spk, client1_spk, 34);
     mgr.entries[1].close_spk_len = 34;
 
-    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+    n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
                                            NULL, 0);
     TEST_ASSERT_EQ(n, 3, "per-client: 3 outputs");
     TEST_ASSERT(memcmp(outputs[0].script_pubkey, expected_factory_spk, 34) == 0,
@@ -3320,7 +3357,7 @@ int test_close_outputs_wallet_spk(void) {
                 "per-client: client 1 uses own close address");
 
     /* Test 4: Override still takes precedence even with per-client addresses set */
-    n = lsp_channels_build_close_outputs(&mgr, &f, outputs, close_fee,
+    n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
                                            wallet_spk, 34);
     TEST_ASSERT_EQ(n, 3, "override+per-client: 3 outputs");
     TEST_ASSERT(memcmp(outputs[1].script_pubkey, wallet_spk, 34) == 0,
@@ -3329,6 +3366,7 @@ int test_close_outputs_wallet_spk(void) {
                 "override+per-client: client 1 uses override (rotation mode)");
 
     free(mgr.entries);
+    free(f);
     return 1;
 }
 

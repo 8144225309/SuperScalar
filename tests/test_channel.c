@@ -853,21 +853,22 @@ int test_regtest_channel_unilateral(void) {
 
     /* Build factory tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
 
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+        TEST_ASSERT(factory_advance(f), "advance to max epoch");
 
     /* Broadcast factory tree sequentially: one tx per mine */
     char txid_hexes[6][65];
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
         int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
@@ -878,7 +879,7 @@ int test_regtest_channel_unilateral(void) {
     printf("  Factory tree confirmed on-chain\n");
 
     /* Get leaf state tx (node 3 = state_left) channel A output (vout 0) info */
-    factory_node_t *leaf = &f.nodes[3];
+    factory_node_t *leaf = &f->nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
 
@@ -1095,7 +1096,8 @@ int test_regtest_channel_unilateral(void) {
     tx_buf_free(&commit_signed);
     tx_buf_free(&spend_unsigned);
     tx_buf_free(&spend_signed);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2460,21 +2462,22 @@ int test_regtest_channel_coop_close(void) {
                                     &found_vout, &fund_amount),
                 "find factory vout");
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
 
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+        TEST_ASSERT(factory_advance(f), "advance to max epoch");
 
     /* Broadcast factory tree sequentially: one tx per mine */
     char txid_hexes[6][65];
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
         int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
@@ -2485,7 +2488,7 @@ int test_regtest_channel_coop_close(void) {
     printf("  Factory tree confirmed on-chain\n");
 
     /* Set up channel from leaf state_left (node 3) output 0 */
-    factory_node_t *leaf = &f.nodes[3];
+    factory_node_t *leaf = &f->nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];
@@ -2581,7 +2584,8 @@ int test_regtest_channel_coop_close(void) {
     printf("  Channel cooperative close confirmed! Tree published, channel settled cooperatively.\n");
 
     tx_buf_free(&close_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
     return 1;
@@ -2936,35 +2940,37 @@ int test_factory_advance_past_exhaustion(void) {
         if (!secp256k1_keypair_create(ctx, &keypairs[i], seckeys[i])) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, keypairs, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, keypairs, 5, 10, 4);
 
     unsigned char seed[32] = {0};
-    factory_set_shachain_seed(&f, seed);
+    factory_set_shachain_seed(f, seed);
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
     unsigned char fund_spk[34] = {0x51, 0x20};
     memset(fund_spk + 2, 0xCC, 32);
-    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    f.cltv_timeout = 200;
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    f->cltv_timeout = 200;
 
-    factory_build_tree(&f);
-    factory_sign_all(&f);
+    factory_build_tree(f);
+    factory_sign_all(f);
 
     /* With 1 layer and max_states=4, we can advance 3 times (states 0→1→2→3) */
     int advances = 0;
-    while (factory_advance(&f)) advances++;
+    while (factory_advance(f)) advances++;
 
     /* Factory should be exhausted now */
     TEST_ASSERT(advances > 0, "should advance at least once");
-    TEST_ASSERT(dw_counter_is_exhausted(&f.counter), "counter exhausted");
+    TEST_ASSERT(dw_counter_is_exhausted(&f->counter), "counter exhausted");
 
     /* Further advance must return 0 */
-    TEST_ASSERT(!factory_advance(&f), "advance past exhaustion rejected");
-    TEST_ASSERT(!factory_advance(&f), "second attempt also rejected");
+    TEST_ASSERT(!factory_advance(f), "advance past exhaustion rejected");
+    TEST_ASSERT(!factory_advance(f), "second attempt also rejected");
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3051,21 +3057,22 @@ int test_regtest_channel_penalty(void) {
                                     &found_vout, &fund_amount),
                 "find factory vout");
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
 
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+        TEST_ASSERT(factory_advance(f), "advance to max epoch");
 
     /* Broadcast factory tree sequentially: one tx per mine */
     char txid_hexes[6][65];
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
         int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
@@ -3076,7 +3083,7 @@ int test_regtest_channel_penalty(void) {
     printf("  Factory tree confirmed on-chain\n");
 
     /* Set up channel from leaf state_left (node 3) output 0 */
-    factory_node_t *leaf = &f.nodes[3];
+    factory_node_t *leaf = &f->nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];
@@ -3240,7 +3247,8 @@ int test_regtest_channel_penalty(void) {
     tx_buf_free(&commit0_unsigned);
     tx_buf_free(&commit0_signed);
     tx_buf_free(&penalty_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&cheater_ch);
     channel_cleanup(&honest_ch);
@@ -3682,21 +3690,22 @@ int test_regtest_penalty_with_htlcs(void) {
                                     &found_vout, &fund_amount),
                 "find factory vout");
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
 
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+        TEST_ASSERT(factory_advance(f), "advance to max epoch");
 
     /* Broadcast factory tree sequentially: one tx per mine */
     char txid_hexes[6][65];
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
         int bsent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
@@ -3706,7 +3715,7 @@ int test_regtest_penalty_with_htlcs(void) {
     }
 
     /* Set up cheater + honest channels on leaf state_left (node 3) output 0 */
-    factory_node_t *leaf = &f.nodes[3];
+    factory_node_t *leaf = &f->nodes[3];
     unsigned char chan_funding_txid[32];
     memcpy(chan_funding_txid, leaf->txid, 32);
     unsigned char chan_spk[34];
@@ -3922,7 +3931,8 @@ int test_regtest_penalty_with_htlcs(void) {
     tx_buf_free(&commit1_signed);
     tx_buf_free(&penalty_tx);
     tx_buf_free(&htlc_penalty_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&cheater_ch);
     channel_cleanup(&honest_ch);

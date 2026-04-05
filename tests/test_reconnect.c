@@ -118,19 +118,20 @@ int test_reconnect_pubkey_match(void) {
     TEST_ASSERT(r == 0, "socketpair failed");
 
     /* Set up lsp_t with known pubkeys */
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
-    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    lsp.clients_cap = LSP_MAX_CLIENTS;
-    lsp.ctx = ctx;
-    lsp.lsp_pubkey = lsp_pk;
-    lsp.n_clients = 4;
-    lsp.listen_fd = -1;
-    lsp.bridge_fd = -1;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->ctx = ctx;
+    lsp->lsp_pubkey = lsp_pk;
+    lsp->n_clients = 4;
+    lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
     for (int i = 0; i < 4; i++) {
-        lsp.client_pubkeys[i] = client_pks[i];
-        lsp.client_fds[i] = -1;  /* all disconnected */
+        lsp->client_pubkeys[i] = client_pks[i];
+        lsp->client_fds[i] = -1;  /* all disconnected */
     }
 
     /* Set up factory with all pubkeys */
@@ -139,22 +140,23 @@ int test_reconnect_pubkey_match(void) {
     for (int i = 0; i < 4; i++)
         all_pks[i + 1] = client_pks[i];
 
-    factory_t factory;
-    factory_init_from_pubkeys(&factory, ctx, all_pks, 5, 10, 4);
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
-    factory_set_funding(&factory, fake_txid, 0, 100000, fake_spk, 34);
-    factory_build_tree(&factory);
-    lsp.factory = factory;
+    factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    factory_build_tree(factory);
+    lsp->factory = *factory;
 
     /* Set up channel manager */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &factory, lsp_sec, 4),
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, factory, lsp_sec, 4),
                 "lsp_channels_init failed");
 
     /* Send MSG_RECONNECT from sv[1] as client 2 (index 2) */
@@ -224,20 +226,22 @@ int test_reconnect_pubkey_match(void) {
 
     /* Parent: handle reconnect from sv[0] */
     close(sv[1]);
-    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv[0]);
+    int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
     TEST_ASSERT(ok, "handle_reconnect failed");
 
     /* Verify client_fds[2] was set */
-    TEST_ASSERT(lsp.client_fds[2] >= 0, "client_fds[2] not set");
+    TEST_ASSERT(lsp->client_fds[2] >= 0, "client_fds[2] not set");
 
     int status;
     waitpid(pid, &status, 0);
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
-    factory_free(&factory);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -346,24 +350,25 @@ int test_client_persist_reload(void) {
     }
 
     /* Build factory */
-    factory_t factory;
-    factory_init_from_pubkeys(&factory, ctx, pks, 5, 10, 4);
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
-    factory_set_funding(&factory, fake_txid, 0, 100000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&factory), "factory_build_tree");
+    factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
     /* Initialize a channel (client 0 = participant index 1) */
     channel_t ch;
     TEST_ASSERT(channel_init(&ch, ctx, seckeys[1], &pks[1], &pks[0],
-                              factory.nodes[4].txid, 0,
-                              factory.nodes[4].outputs[0].amount_sats,
-                              factory.nodes[4].outputs[0].script_pubkey,
-                              factory.nodes[4].outputs[0].script_pubkey_len,
+                              factory->nodes[4].txid, 0,
+                              factory->nodes[4].outputs[0].amount_sats,
+                              factory->nodes[4].outputs[0].script_pubkey,
+                              factory->nodes[4].outputs[0].script_pubkey_len,
                               12000, 12000, 144), "channel_init");
     ch.commitment_number = 7;  /* simulate some updates */
 
@@ -372,7 +377,7 @@ int test_client_persist_reload(void) {
     TEST_ASSERT(persist_open(&db, NULL), "persist_open");
 
     /* Save factory */
-    TEST_ASSERT(persist_save_factory(&db, &factory, ctx, 0), "persist_save_factory");
+    TEST_ASSERT(persist_save_factory(&db, factory, ctx, 0), "persist_save_factory");
 
     /* Save channel */
     TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "persist_save_channel");
@@ -382,11 +387,12 @@ int test_client_persist_reload(void) {
         10000, 14000, 7), "persist_update_channel_balance");
 
     /* Load factory back */
-    factory_t loaded_factory;
-    TEST_ASSERT(persist_load_factory(&db, 0, &loaded_factory, ctx), "persist_load_factory");
-    TEST_ASSERT_EQ(loaded_factory.funding_amount_sats, factory.funding_amount_sats,
+    factory_t *loaded_factory = calloc(1, sizeof(factory_t));
+    if (!loaded_factory) return 0;
+    TEST_ASSERT(persist_load_factory(&db, 0, loaded_factory, ctx), "persist_load_factory");
+    TEST_ASSERT_EQ(loaded_factory->funding_amount_sats, factory->funding_amount_sats,
                    "funding_amount mismatch");
-    TEST_ASSERT_MEM_EQ(loaded_factory.funding_txid, factory.funding_txid, 32,
+    TEST_ASSERT_MEM_EQ(loaded_factory->funding_txid, factory->funding_txid, 32,
                        "funding_txid mismatch");
 
     /* Load channel state back */
@@ -400,8 +406,10 @@ int test_client_persist_reload(void) {
 
     channel_cleanup(&ch);
     persist_close(&db);
-    factory_free(&factory);
-    factory_free(&loaded_factory);
+    factory_free(factory);
+    free(factory);
+    factory_free(loaded_factory);
+    free(loaded_factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -510,20 +518,21 @@ int test_balance_reporting(void) {
         if (!secp256k1_ec_pubkey_create(ctx, &pks[i], sec)) return 0;
     }
 
-    factory_t factory;
-    factory_init_from_pubkeys(&factory, ctx, pks, 5, 10, 4);
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
-    factory_set_funding(&factory, fake_txid, 0, 100000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&factory), "factory_build_tree");
+    factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &factory, lsp_sec, 4),
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, factory, lsp_sec, 4),
                 "lsp_channels_init");
     TEST_ASSERT(mgr.n_channels > 0, "channels were initialized");
 
@@ -540,7 +549,8 @@ int test_balance_reporting(void) {
     /* NULL should be a no-op */
     lsp_channels_print_balances(NULL);
 
-    factory_free(&factory);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1692,39 +1702,40 @@ int test_mine_blocks_non_regtest(void) {
 
 /* Test: factory lifecycle state transitions ACTIVE→DYING→EXPIRED */
 int test_factory_lifecycle_daemon_check(void) {
-    factory_t f;
-    memset(&f, 0, sizeof(f));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
 
     /* Set lifecycle: created at block 100, active 20 blocks, dying 10 blocks */
-    factory_set_lifecycle(&f, 100, 20, 10);
+    factory_set_lifecycle(f, 100, 20, 10);
 
     /* At block 110: still ACTIVE */
-    factory_state_t s = factory_get_state(&f, 110);
+    factory_state_t s = factory_get_state(f, 110);
     TEST_ASSERT_EQ(s, FACTORY_ACTIVE, "block 110 = ACTIVE");
 
     /* At block 119: last ACTIVE block */
-    s = factory_get_state(&f, 119);
+    s = factory_get_state(f, 119);
     TEST_ASSERT_EQ(s, FACTORY_ACTIVE, "block 119 = ACTIVE (last)");
 
     /* At block 120: transitions to DYING */
-    s = factory_get_state(&f, 120);
+    s = factory_get_state(f, 120);
     TEST_ASSERT_EQ(s, FACTORY_DYING, "block 120 = DYING");
 
     /* Check blocks_until_expired from DYING */
-    uint32_t remaining = factory_blocks_until_expired(&f, 120);
+    uint32_t remaining = factory_blocks_until_expired(f, 120);
     TEST_ASSERT_EQ(remaining, 10, "10 blocks until expired at 120");
 
-    remaining = factory_blocks_until_expired(&f, 125);
+    remaining = factory_blocks_until_expired(f, 125);
     TEST_ASSERT_EQ(remaining, 5, "5 blocks until expired at 125");
 
     /* At block 130: transitions to EXPIRED */
-    s = factory_get_state(&f, 130);
+    s = factory_get_state(f, 130);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 130 = EXPIRED");
 
     /* At block 200: still EXPIRED */
-    s = factory_get_state(&f, 200);
+    s = factory_get_state(f, 200);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
 
+    free(f);
     return 1;
 }
 
@@ -1871,17 +1882,18 @@ int test_ladder_daemon_integration(void) {
     lad->current_block = 100;
 
     /* Manually populate slot 0 */
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    factory_set_lifecycle(&f, 100, 20, 10);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    factory_set_lifecycle(f, 100, 20, 10);
 
     ladder_factory_t *lf = &lad->factories[0];
-    lf->factory = f;
+    lf->factory = *f;
     factory_detach_txbufs(&lf->factory);
     lf->factory_id = lad->next_factory_id++;
     lf->is_initialized = 1;
     lf->is_funded = 1;
-    lf->cached_state = factory_get_state(&f, 100);
+    lf->cached_state = factory_get_state(f, 100);
     tx_buf_init(&lf->distribution_tx, 16);
     lad->n_factories = 1;
 
@@ -1896,6 +1908,7 @@ int test_ladder_daemon_integration(void) {
     TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
 
     tx_buf_free(&lf->distribution_tx);
+    free(f);
     free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
@@ -1917,23 +1930,24 @@ int test_distribution_tx_amounts(void) {
         if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0x01, 32);
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
-    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
-    factory_set_lifecycle(&f, 100, 20, 10);
-    f.cltv_timeout = 135;
+    factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
+    factory_set_lifecycle(f, 100, 20, 10);
+    f->cltv_timeout = 135;
 
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
     /* Advance counter to max for signing */
-    for (uint32_t i = 0; i < f.counter.total_states - 1; i++)
-        dw_counter_advance(&f.counter);
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    for (uint32_t i = 0; i < f->counter.total_states - 1; i++)
+        dw_counter_advance(&f->counter);
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* Build distribution TX with equal split */
     tx_output_t outputs[5];
@@ -1947,8 +1961,8 @@ int test_distribution_tx_amounts(void) {
     tx_buf_t dist_tx;
     tx_buf_init(&dist_tx, 512);
     unsigned char dist_txid[32];
-    int ok = factory_build_distribution_tx(&f, &dist_tx, dist_txid,
-                                             outputs, 5, f.cltv_timeout);
+    int ok = factory_build_distribution_tx(f, &dist_tx, dist_txid,
+                                             outputs, 5, f->cltv_timeout);
     TEST_ASSERT(ok, "distribution TX built");
     TEST_ASSERT(dist_tx.len > 0, "distribution TX non-empty");
 
@@ -1959,7 +1973,8 @@ int test_distribution_tx_amounts(void) {
     TEST_ASSERT_EQ(total, 100000, "outputs sum to funding amount");
 
     tx_buf_free(&dist_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2508,13 +2523,15 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     secp256k1_pubkey lsp_pk;
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
-    factory_t factory;
-    lsp_t lsp;
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
     lsp_channel_mgr_t mgr;
     persist_t db;
 
     TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
-                client_secs, &factory, &lsp, &mgr, &db),
+                client_secs, factory, lsp, &mgr, &db),
                 "setup_reconnect_env failed");
 
     /* Persist initial state for client 2 (cn=0, local=12500, remote=12500) */
@@ -2545,7 +2562,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     }
 
     close(sv[1]);
-    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv[0]);
+    int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
     TEST_ASSERT(ok, "handle_reconnect should succeed with rollback");
 
     /* Verify channel was rolled back to DB state */
@@ -2558,9 +2575,11 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
 
     persist_close(&db);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
-    factory_free(&factory);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2572,13 +2591,15 @@ int test_reconnect_commitment_mismatch_reject(void) {
     secp256k1_pubkey lsp_pk;
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
-    factory_t factory;
-    lsp_t lsp;
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
     lsp_channel_mgr_t mgr;
     persist_t db;
 
     TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
-                client_secs, &factory, &lsp, &mgr, &db),
+                client_secs, factory, lsp, &mgr, &db),
                 "setup_reconnect_env failed");
 
     /* Set LSP's cn = 5, client will send cn = 0 (diff = 5, irreconcilable) */
@@ -2608,7 +2629,7 @@ int test_reconnect_commitment_mismatch_reject(void) {
     cJSON_Delete(reconn2);
     close(sv2[1]);
 
-    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv2[0]);
+    int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv2[0]);
     TEST_ASSERT(!ok, "handle_reconnect should fail for large mismatch");
 
     /* Also test: no persistence + mismatch by 1 → fails */
@@ -2623,13 +2644,15 @@ int test_reconnect_commitment_mismatch_reject(void) {
     cJSON_Delete(reconn3);
     close(sv3[1]);
 
-    ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv3[0]);
+    ok = lsp_channels_handle_reconnect(&mgr, lsp, sv3[0]);
     TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
 
     persist_close(&db);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
-    factory_free(&factory);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2641,13 +2664,15 @@ int test_reconnect_htlc_replay(void) {
     secp256k1_pubkey lsp_pk;
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
-    factory_t factory;
-    lsp_t lsp;
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
     lsp_channel_mgr_t mgr;
     persist_t db;
 
     TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
-                client_secs, &factory, &lsp, &mgr, &db),
+                client_secs, factory, lsp, &mgr, &db),
                 "setup_reconnect_env failed");
 
     /* Create a payment_hash and register an invoice destined for client 1 */
@@ -2747,7 +2772,7 @@ int test_reconnect_htlc_replay(void) {
     }
 
     close(sv[1]);
-    int ok = lsp_channels_handle_reconnect(&mgr, &lsp, sv[0]);
+    int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
     TEST_ASSERT(ok, "handle_reconnect with replay should succeed");
 
     /* Verify HTLC was replayed to dest channel */
@@ -2773,9 +2798,11 @@ int test_reconnect_htlc_replay(void) {
                 "child process failed");
 
     persist_close(&db);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
-    factory_free(&factory);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }
