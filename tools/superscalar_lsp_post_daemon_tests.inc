@@ -2071,9 +2071,9 @@
         printf("  New factory created with %zu clients (CLTV=%u)\n",
                n_coop, cltv2);
 
-        /* --- Phase D: Cooperative close of new factory --- */
-        printf("\nPhase D: Cooperative close of new factory\n");
-
+        /* --- Phase C.5: Init channels + wait for client reconnections ---
+           Clients disconnect after factory creation (Bug 11 fix: reload
+           state from DB).  Must accept reconnections before close. */
         lsp_channel_mgr_t *mgr2 = calloc(1, sizeof(lsp_channel_mgr_t));
         if (!mgr2) {
             tx_buf_free(&old_dist_tx);
@@ -2088,14 +2088,55 @@
             secp256k1_context_destroy(ctx); return 1;
         }
 
-        /* Send CHANNEL_READY */
+        /* Send CHANNEL_READY to still-connected clients */
         for (size_t ci2 = 0; ci2 < n_coop; ci2++) {
-            cJSON *cr = wire_build_channel_ready(mgr2->entries[ci2].channel_id,
-                mgr2->entries[ci2].channel.local_amount,
-                mgr2->entries[ci2].channel.remote_amount);
-            wire_send(lsp_p->client_fds[ci2], MSG_CHANNEL_READY, cr);
-            cJSON_Delete(cr);
+            if (lsp_p->client_fds[ci2] >= 0) {
+                cJSON *cr = wire_build_channel_ready(mgr2->entries[ci2].channel_id,
+                    mgr2->entries[ci2].channel.local_amount,
+                    mgr2->entries[ci2].channel.remote_amount);
+                wire_send(lsp_p->client_fds[ci2], MSG_CHANNEL_READY, cr);
+                cJSON_Delete(cr);
+            }
         }
+
+        /* Wait for client reconnections (Bug 11: clients disconnect after
+           factory creation to reload state from DB, then reconnect) */
+        {
+            size_t reconnected = 0;
+            printf("  Waiting for client reconnections...\n");
+            for (int attempt = 0; attempt < 30 && reconnected < n_coop; attempt++) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(lsp_p->listen_fd, &rfds);
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                int sel = select(lsp_p->listen_fd + 1, &rfds, NULL, NULL, &tv);
+                if (sel <= 0) continue;
+
+                int new_fd = wire_accept(lsp_p->listen_fd);
+                if (new_fd < 0) continue;
+
+                int hs;
+                if (lsp_p->use_nk)
+                    hs = wire_noise_handshake_nk_responder(new_fd, ctx, lsp_p->nk_seckey);
+                else
+                    hs = wire_noise_handshake_responder(new_fd, ctx);
+                if (!hs) { wire_close(new_fd); continue; }
+
+                if (lsp_channels_handle_reconnect(mgr2, lsp_p, new_fd))
+                    reconnected++;
+            }
+            if (reconnected < n_coop) {
+                fprintf(stderr, "PARTIAL ROTATION: only %zu/%zu clients reconnected\n",
+                        reconnected, n_coop);
+                free(mgr2); tx_buf_free(&old_dist_tx);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            printf("  All %zu clients reconnected\n", n_coop);
+        }
+
+        /* --- Phase D: Cooperative close of new factory --- */
+        printf("\nPhase D: Cooperative close of new factory\n");
 
         /* Build close outputs */
         tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
