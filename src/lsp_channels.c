@@ -3,6 +3,7 @@
 #include "superscalar/ceremony.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/factory_recovery.h"
+#include "superscalar/sweeper.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/lsps.h"
 #include "superscalar/splice.h"
@@ -3830,6 +3831,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 else if (mgr->watchtower && (tnow - last_wt_check) >= 60) {
                     last_wt_check = tnow;
                     watchtower_check(mgr->watchtower);
+                    /* Detect commitment TXs on-chain and register sweeps */
+                    if (mgr->sweeper)
+                        lsp_channels_detect_commitment_sweeps(mgr);
+                    /* Run sweeper on same cycle */
+                    if (mgr->sweeper)
+                        sweeper_check((sweeper_t *)mgr->sweeper);
                 }
             }
 
@@ -4156,4 +4163,85 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Demo mode + payment initiation moved to lsp_demo.c */
+
+/* ------------------------------------------------------------------ */
+/* Auto-sweep outputs after force-close                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Detect commitment TXs on-chain and register to_local outputs with the
+ * sweeper for CSV-delayed sweep.
+ *
+ * After a force-close, the client broadcasts their commitment TX (they hold
+ * the fully-signed MuSig2 version). The LSP detects the commitment TX on
+ * chain and sweeps the to_local output after the CSV delay.
+ *
+ * Called from the daemon loop alongside watchtower_check().
+ */
+int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr)
+{
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    extern void reverse_bytes(unsigned char *, size_t);
+
+    if (!mgr || !mgr->watchtower || !mgr->sweeper) return 0;
+
+    chain_backend_t *chain = mgr->watchtower->chain;
+    sweeper_t *sw = (sweeper_t *)mgr->sweeper;
+    if (!chain) return 0;
+
+    int n_registered = 0;
+
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        if (ch->funding_amount == 0) continue;
+
+        /* Build the expected commitment TX to get its txid */
+        tx_buf_t unsigned_tx;
+        tx_buf_init(&unsigned_tx, 512);
+        unsigned char commit_txid[32];
+        if (!channel_build_commitment_tx(ch, &unsigned_tx, commit_txid)) {
+            tx_buf_free(&unsigned_tx);
+            continue;
+        }
+        tx_buf_free(&unsigned_tx);
+
+        /* Check if this commitment TX is on-chain */
+        unsigned char display_txid[32];
+        memcpy(display_txid, commit_txid, 32);
+        reverse_bytes(display_txid, 32);
+        char txid_hex[65];
+        hex_encode(display_txid, 32, txid_hex);
+
+        int confs = chain->get_confirmations(chain, txid_hex);
+        if (confs < 1) continue;  /* Not confirmed yet */
+
+        /* Check if we already registered a sweep for this output */
+        int already = 0;
+        for (size_t s = 0; s < sw->n_entries; s++) {
+            if (memcmp(sw->entries[s].source_txid, commit_txid, 32) == 0 &&
+                sw->entries[s].type == SWEEP_TO_LOCAL) {
+                already = 1;
+                break;
+            }
+        }
+        if (already) continue;
+
+        /* Register to_local output (vout 0) for CSV-delayed sweep.
+           The to_local output has a CSV delay of to_self_delay blocks. */
+        if (ch->local_amount >= CHANNEL_DUST_LIMIT_SATS) {
+            sweeper_add(sw, SWEEP_TO_LOCAL,
+                        commit_txid, 0, ch->local_amount,
+                        ch->to_self_delay,
+                        (uint32_t)c, 0, ch->commitment_number);
+            printf("LSP sweeper: channel %zu — commitment confirmed, "
+                   "registered to_local sweep (%llu sats, CSV %u)\n",
+                   c, (unsigned long long)ch->local_amount,
+                   ch->to_self_delay);
+            fflush(stdout);
+            n_registered++;
+        }
+    }
+
+    return n_registered;
+}
 

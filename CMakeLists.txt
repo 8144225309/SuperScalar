@@ -185,6 +185,7 @@ add_library(superscalar
     src/invoice.c
     src/admin_rpc.c
     src/factory_recovery.c
+    src/sweeper.c
     src/scb.c
     src/onion_message.c
     src/scb_recovery.c

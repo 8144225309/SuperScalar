@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 11
+#define PERSIST_SCHEMA_VERSION 12
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -688,5 +688,25 @@ int persist_save_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
 int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
                                 unsigned char *blob_out, uint16_t *blob_len_out,
                                 size_t blob_cap);
+
+/* --- Pending sweeps (schema v12) --- */
+
+/* Forward declaration — full definition in sweeper.h */
+#ifndef SUPERSCALAR_SWEEPER_H
+typedef struct sweep_entry sweep_entry_t;
+#endif
+
+/* Save a pending sweep entry. */
+int persist_save_sweep(persist_t *p, const sweep_entry_t *e);
+
+/* Load all non-confirmed sweep entries. Returns 1 on success. */
+int persist_load_sweeps(persist_t *p, sweep_entry_t *entries,
+                         size_t *n_entries, size_t max_entries);
+
+/* Delete a sweep entry by ID. */
+int persist_delete_sweep(persist_t *p, uint32_t sweep_id);
+
+/* Delete all sweep entries for a factory. */
+int persist_delete_sweeps_for_factory(persist_t *p, uint32_t factory_id);
 
 #endif /* SUPERSCALAR_PERSIST_H */
