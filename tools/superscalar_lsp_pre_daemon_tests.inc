@@ -911,7 +911,7 @@
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 0 tree broadcast failed\n");
-                free(f1);
+                free(f1); f1 = NULL;
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -929,7 +929,7 @@
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 1 tree broadcast failed\n");
-                free(f1);
+                free(f1); f1 = NULL;
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
