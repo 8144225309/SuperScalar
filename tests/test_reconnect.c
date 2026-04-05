@@ -141,7 +141,7 @@ int test_reconnect_pubkey_match(void) {
         all_pks[i + 1] = client_pks[i];
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    if (!factory) return 0;
+    if (!factory) { free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp); return 0; }
     factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
@@ -2526,7 +2526,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp) return 0;
+    if (!lsp) { free(factory); return 0; }
     lsp_channel_mgr_t mgr;
     persist_t db;
 
@@ -2594,7 +2594,7 @@ int test_reconnect_commitment_mismatch_reject(void) {
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp) return 0;
+    if (!lsp) { free(factory); return 0; }
     lsp_channel_mgr_t mgr;
     persist_t db;
 
@@ -2667,7 +2667,7 @@ int test_reconnect_htlc_replay(void) {
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp) return 0;
+    if (!lsp) { free(factory); return 0; }
     lsp_channel_mgr_t mgr;
     persist_t db;
 
