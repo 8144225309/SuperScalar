@@ -45,6 +45,11 @@ cln_lock = threading.Lock()  # serializes writes to CLN stdout
 # Keysend TLV type used by CLN/LND for spontaneous payments (BOLT TLV)
 KEYSEND_TLV_TYPE = "5482373484"
 
+# min_final_cltv_expiry for factory invoices.  Must exceed LSP's
+# FACTORY_CLTV_DELTA (40) so the HTLC arriving at the LSP still has
+# enough blocks of margin before the timeout check fires.
+FACTORY_INVOICE_CLTV = 80
+
 
 _KNOWN_NETWORKS = {"bitcoin", "testnet", "signet", "regtest", "testnet4", "liquidv1"}
 
@@ -278,7 +283,8 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             f"label={label}",
             "description=SuperScalar factory payment",
             "expiry=3600",
-            f"preimage={preimage_hex}"
+            f"preimage={preimage_hex}",
+            f"cltv={FACTORY_INVOICE_CLTV}"
         )
         if ROUTE_HINT:
             cmd.append(f"exposeprivatechannels={ROUTE_HINT}")
