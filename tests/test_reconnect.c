@@ -156,8 +156,12 @@ int test_reconnect_pubkey_match(void) {
     /* Set up channel manager */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, factory, lsp_sec, 4),
-                "lsp_channels_init failed");
+    if (!lsp_channels_init(&mgr, ctx, factory, lsp_sec, 4)) {
+        printf("  FAIL: %s: lsp_channels_init failed\n", __func__);
+        factory_free(factory); free(factory);
+        free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp);
+        return 0;
+    }
 
     /* Send MSG_RECONNECT from sv[1] as client 2 (index 2) */
     {
