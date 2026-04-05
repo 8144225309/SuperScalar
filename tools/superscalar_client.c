@@ -708,10 +708,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) continue;  /* EINTR */
 
-        /* Periodic watchtower check — runs every ~10s regardless of select()
-           result.  Previous code only ran on timeout (ret==0), so active
-           sockets could starve the watchtower indefinitely. */
-        {
+        if (ret == 0) {
+            /* No socket data — run watchtower during idle time only.
+               watchtower_check() spawns many bitcoin-cli subprocesses and
+               can block for 10-60s on signet.  Running it BEFORE message
+               dispatch caused CREATE_INVOICE timeouts (S14). */
             static time_t last_wt = 0;
             time_t tnow = time(NULL);
             if (last_wt == 0) last_wt = tnow;
@@ -719,9 +720,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
+            continue;
         }
-
-        if (ret == 0) continue;  /* no socket data — loop back */
 
         if (!wire_recv(fd, &msg)) {
             fprintf(stderr, "Client %u: daemon recv failed (disconnected)\n", my_index);
