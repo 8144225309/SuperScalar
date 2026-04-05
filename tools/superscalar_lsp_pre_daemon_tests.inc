@@ -798,9 +798,11 @@
                 return 1;
             }
 
-            /* Build Factory 1 locally (demo mode: we have all keypairs,
-               no wire ceremony needed; heap — factory_t is ~3MB) */
-            factory_t *f1 = calloc(1, sizeof(factory_t));
+            /* Build Factory 1 directly in ladder slot 1 (factory_t is ~3MB,
+               already heap-allocated as part of ladder_t) */
+            ladder_factory_t *lf1 = &lad->factories[1];
+            factory_t *f1 = &lf1->factory;
+            memset(f1, 0, sizeof(factory_t));
             if (n_level_arity > 0)
                 factory_set_level_arity(f1, level_arities, n_level_arity);
             else if (leaf_arity == 1)
@@ -832,7 +834,7 @@
 
             if (!factory_build_tree(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_build_tree failed\n");
-                factory_free(f1); free(f1);
+                factory_free(f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -842,7 +844,7 @@
             }
             if (!factory_sign_all(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_sign_all failed\n");
-                factory_free(f1); free(f1);
+                factory_free(f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -862,19 +864,13 @@
 
             printf("Factory 1 created: %zu nodes signed\n", f1->n_nodes);
 
-            /* Store Factory 1 in ladder slot 1 */
-            {
-                ladder_factory_t *lf1 = &lad->factories[1];
-                lf1->factory = *f1;
-                factory_detach_txbufs(&lf1->factory);
-                free(f1);
-                lf1->factory_id = lad->next_factory_id++;
-                lf1->is_initialized = 1;
-                lf1->is_funded = 1;
-                lf1->cached_state = FACTORY_ACTIVE;
-                tx_buf_init(&lf1->distribution_tx, 256);
-                lad->n_factories = 2;
-            }
+            /* Finalize ladder slot 1 (f1 already points into lf1->factory) */
+            lf1->factory_id = lad->next_factory_id++;
+            lf1->is_initialized = 1;
+            lf1->is_funded = 1;
+            lf1->cached_state = FACTORY_ACTIVE;
+            tx_buf_init(&lf1->distribution_tx, 256);
+            lad->n_factories = 2;
 
             /* Update ladder block height */
             {
@@ -911,7 +907,6 @@
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 0 tree broadcast failed\n");
-                free(f1); f1 = NULL;
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -929,7 +924,6 @@
                                                       mine_addr, is_regtest,
                                                       confirm_timeout_secs)) {
                 fprintf(stderr, "DUAL FACTORY TEST: Factory 1 tree broadcast failed\n");
-                free(f1); f1 = NULL;
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -947,7 +941,6 @@
             report_add_string(&rpt, "result",
                               both_active ? "dual_factory_pass" : "dual_factory_fail");
             report_close(&rpt);
-            free(f1);
             jit_channels_cleanup(mgr);
             if (use_db) persist_close(&db);
             lsp_cleanup(lsp_p);
