@@ -602,6 +602,29 @@ def main():
 
             global _can_log_to_cln
             _can_log_to_cln = True
+
+            # Re-populate registered_invoices from CLN's invoice DB.
+            # On plugin restart (CLN restart), the in-memory set is empty
+            # but CLN still has the invoices with "superscalar-" labels.
+            try:
+                cmd = cli_cmd("listinvoices")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    invs = json.loads(result.stdout).get("invoices", [])
+                    recovered = 0
+                    for inv in invs:
+                        if inv.get("status") == "unpaid" and \
+                           inv.get("label", "").startswith("superscalar-"):
+                            ph = inv.get("payment_hash", "")
+                            if ph:
+                                with lock:
+                                    registered_invoices.add(ph)
+                                recovered += 1
+                    if recovered:
+                        log(f"Recovered {recovered} unpaid factory invoices from CLN DB")
+            except Exception as e:
+                log(f"Invoice recovery failed: {e}")
+
             log(f"Plugin initialized (bridge={'connected' if connected else 'disconnected'}, "
                 f"cli={LIGHTNING_CLI}, dir={LIGHTNING_DIR})")
 
