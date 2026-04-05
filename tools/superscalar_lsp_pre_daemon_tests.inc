@@ -1500,3 +1500,177 @@
             secp256k1_context_destroy(ctx);
             return 0;
         }
+
+        /* === MULTI-HTLC FORCE-CLOSE TEST (S28) ===
+           Add pending HTLCs on ALL channels simultaneously, then force-close.
+           Produces n_channels HTLC timeout TXs — each with its own CSV/CLTV.
+           Demonstrates production-realistic concurrent HTLC settlement. */
+        if (test_multi_htlc_force_close) {
+            printf("\n=== MULTI-HTLC FORCE-CLOSE TEST ===\n");
+
+            size_t n_ch = mgr->n_channels;
+            if (n_ch < 2) {
+                fprintf(stderr, "MULTI-HTLC FORCE-CLOSE: need >= 2 channels\n");
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            /* Step 1: Add pending HTLCs on each channel with staggered CLTVs */
+            uint32_t mhfc_height = (uint32_t)regtest_get_block_height(&rt);
+            printf("Adding HTLCs on %zu channels (current_height=%u):\n",
+                   n_ch, mhfc_height);
+
+            static const unsigned char hash_fills[] = { 0xAA, 0xBB, 0xCC, 0xDD };
+            static const uint64_t htlc_amounts[] = { 1000, 1500, 2000, 500 };
+
+            for (size_t ci = 0; ci < n_ch && ci < 4; ci++) {
+                unsigned char phash[32];
+                memset(phash, hash_fills[ci], 32);
+                uint32_t cltv = mhfc_height + 10 + (uint32_t)ci * 5;
+
+                if (!lsp_channels_add_pending_htlc(mgr, lsp_p, ci,
+                        htlc_amounts[ci], phash, cltv)) {
+                    fprintf(stderr, "MULTI-HTLC: add_pending_htlc failed ch %zu\n", ci);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
+                printf("  Channel %zu: %llu sats, CLTV=%u\n",
+                       ci, (unsigned long long)htlc_amounts[ci], cltv);
+            }
+
+            /* Step 2: Broadcast factory tree */
+            printf("Broadcasting factory tree (%zu nodes) on %s...\n",
+                   lsp_p->factory.n_nodes, network);
+
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
+                    mine_addr, is_regtest, confirm_timeout_secs)) {
+                fprintf(stderr, "MULTI-HTLC: tree broadcast failed\n");
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            printf("All %zu tree nodes confirmed.\n", lsp_p->factory.n_nodes);
+
+            /* Step 3: Build + broadcast commitment TX for each channel */
+            static const unsigned char cli_fills[] = { 0x22, 0x33, 0x44, 0x55 };
+            char commit_txids[4][65];
+            int n_commits = 0;
+
+            for (size_t ci = 0; ci < n_ch && ci < 4; ci++) {
+                channel_t *ch = &mgr->entries[ci].channel;
+
+                tx_buf_t cu;
+                tx_buf_init(&cu, 512);
+                unsigned char ctxid[32];
+                if (!channel_build_commitment_tx(ch, &cu, ctxid)) {
+                    fprintf(stderr, "MULTI-HTLC: build commitment %zu failed\n", ci);
+                    tx_buf_free(&cu);
+                    continue;
+                }
+
+                unsigned char csec[32];
+                memset(csec, cli_fills[ci], 32);
+                secp256k1_keypair ckp;
+                secp256k1_keypair_create(ctx, &ckp, csec);
+                memset(csec, 0, 32);
+
+                tx_buf_t cs;
+                tx_buf_init(&cs, 512);
+                if (!channel_sign_commitment(ch, &cs, &cu, &ckp)) {
+                    fprintf(stderr, "MULTI-HTLC: sign commitment %zu failed\n", ci);
+                    tx_buf_free(&cs); tx_buf_free(&cu);
+                    continue;
+                }
+                tx_buf_free(&cu);
+
+                char *chex = malloc(cs.len * 2 + 1);
+                hex_encode(cs.data, cs.len, chex);
+                int csent = regtest_send_raw_tx(&rt, chex, commit_txids[ci]);
+                if (g_db) {
+                    char label[64];
+                    snprintf(label, sizeof(label), "multi_htlc_commit_%zu", ci);
+                    persist_log_broadcast(g_db, csent ? commit_txids[ci] : "?",
+                        label, chex, csent ? "ok" : "failed");
+                }
+                free(chex);
+                tx_buf_free(&cs);
+
+                if (csent) {
+                    printf("  Commitment %zu broadcast: %s\n", ci, commit_txids[ci]);
+                    n_commits++;
+                } else {
+                    fprintf(stderr, "MULTI-HTLC: commitment %zu broadcast failed\n", ci);
+                }
+            }
+            ADVANCE(1);
+
+            /* Step 4: Mine past all CLTVs + CSV delay */
+            uint32_t max_cltv = mhfc_height + 10 + (uint32_t)(n_ch - 1) * 5;
+            uint32_t csv_delay = mgr->entries[0].channel.to_self_delay;
+            uint32_t target = max_cltv + csv_delay + 1;
+            uint32_t cur = (uint32_t)regtest_get_block_height(&rt);
+            if (cur < target) {
+                printf("Advancing %u blocks (CLTV=%u + CSV=%u)...\n",
+                       target - cur, max_cltv, csv_delay);
+                ADVANCE((int)(target - cur));
+            }
+
+            /* Step 5: Build + broadcast HTLC timeout TXs for each channel */
+            int n_timeouts = 0;
+            for (size_t ci = 0; ci < n_ch && ci < 4; ci++) {
+                channel_t *ch = &mgr->entries[ci].channel;
+                if (ch->n_htlcs == 0) continue;
+
+                unsigned char ctxid[32];
+                hex_decode(commit_txids[ci], ctxid, 32);
+                reverse_bytes(ctxid, 32);
+
+                size_t hi = ch->n_htlcs - 1;
+                tx_buf_t ttx;
+                tx_buf_init(&ttx, 256);
+
+                if (!channel_build_htlc_timeout_tx(ch, &ttx,
+                        ctxid, 2, htlc_amounts[ci],
+                        ch->htlcs[hi].cltv_expiry, fund_spk, 34)) {
+                    fprintf(stderr, "MULTI-HTLC: build timeout TX %zu failed\n", ci);
+                    tx_buf_free(&ttx);
+                    continue;
+                }
+
+                char *thex = malloc(ttx.len * 2 + 1);
+                hex_encode(ttx.data, ttx.len, thex);
+                char ttxid[65];
+                int tsent = regtest_send_raw_tx(&rt, thex, ttxid);
+                if (g_db) {
+                    char label[64];
+                    snprintf(label, sizeof(label), "multi_htlc_timeout_%zu", ci);
+                    persist_log_broadcast(g_db, tsent ? ttxid : "?",
+                        label, thex, tsent ? "ok" : "failed");
+                }
+                free(thex);
+                tx_buf_free(&ttx);
+
+                if (tsent) {
+                    printf("  HTLC timeout %zu: %s\n", ci, ttxid);
+                    n_timeouts++;
+                } else {
+                    fprintf(stderr, "MULTI-HTLC: timeout TX %zu broadcast failed\n", ci);
+                }
+            }
+            ADVANCE(1);
+
+            int mhfc_pass = (n_commits >= 2 && n_timeouts >= 2);
+            printf("\n=== MULTI-HTLC FORCE-CLOSE %s ===\n",
+                   mhfc_pass ? "PASSED" : "FAILED");
+            printf("  Commitments broadcast: %d/%zu\n", n_commits, n_ch);
+            printf("  HTLC timeouts swept:   %d/%zu\n", n_timeouts, n_ch);
+
+            report_add_string(&rpt, "result",
+                mhfc_pass ? "multi_htlc_force_close_pass" : "multi_htlc_force_close_fail");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return mhfc_pass ? 0 : 1;
+        }

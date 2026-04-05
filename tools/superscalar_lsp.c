@@ -282,6 +282,7 @@ static void usage(const char *prog) {
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
+        "  --test-multi-htlc-force-close  After demo: add HTLCs on ALL channels, force-close, broadcast all timeout TXs\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1024,6 +1025,7 @@ int main(int argc, char *argv[]) {
     int force_close = 0;
     int test_burn = 0;
     int test_htlc_force_close = 0;
+    int test_multi_htlc_force_close = 0;
     int test_dw_advance = 0;
     int test_leaf_advance = 0;
     int test_dual_factory = 0;
@@ -1222,6 +1224,8 @@ int main(int argc, char *argv[]) {
             test_burn = 1;
         else if (strcmp(argv[i], "--test-htlc-force-close") == 0)
             test_htlc_force_close = 1;
+        else if (strcmp(argv[i], "--test-multi-htlc-force-close") == 0)
+            test_multi_htlc_force_close = 1;
         else if (strcmp(argv[i], "--test-dw-advance") == 0)
             test_dw_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
@@ -3011,7 +3015,8 @@ accept_new_factory:
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
-        test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
+        test_htlc_force_close || test_multi_htlc_force_close ||
+        test_rebalance || test_batch_rebalance || test_realloc ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
         test_buy_liquidity || test_large_factory) {
         /* Set fee policy before init (init preserves these across memset) */
