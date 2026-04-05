@@ -1069,37 +1069,40 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     cJSON_Delete(msg.json);
 
-    /* Build factory locally */
-    factory_t factory;
-    factory_init_from_pubkeys(&factory, ctx, all_pubkeys, n_participants,
+    /* Build factory locally (heap — factory_t is ~3MB) */
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
-    factory.cltv_timeout = cltv_timeout;
-    factory.fee_per_tx = fee_per_tx;
-    factory.placement_mode = (placement_mode_t)placement_mode;
-    factory.economic_mode = (economic_mode_t)economic_mode;
-    memcpy(factory.profiles, profiles, sizeof(profiles));
+    factory->cltv_timeout = cltv_timeout;
+    factory->fee_per_tx = fee_per_tx;
+    factory->placement_mode = (placement_mode_t)placement_mode;
+    factory->economic_mode = (economic_mode_t)economic_mode;
+    memcpy(factory->profiles, profiles, sizeof(profiles));
     if (n_level_arity > 0)
-        factory_set_level_arity(&factory, level_arities, n_level_arity);
+        factory_set_level_arity(factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
-        factory_set_arity(&factory, FACTORY_ARITY_1);
+        factory_set_arity(factory, FACTORY_ARITY_1);
     if (n_parsed_hashes > 0)
-        factory_set_l_stock_hashes(&factory, parsed_l_stock_hashes, n_parsed_hashes);
-    factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
+        factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
+    factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
-    if (!factory_build_tree(&factory)) {
+    if (!factory_build_tree(factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
         client_send_error(fd, "factory_build_tree failed");
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         wire_close(fd);
         return 0;
     }
 
     /* Initialize signing sessions */
-    if (!factory_sessions_init(&factory)) {
+    if (!factory_sessions_init(factory)) {
         fprintf(stderr, "Client: factory_sessions_init failed\n");
         client_send_error(fd, "factory_sessions_init failed");
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         wire_close(fd);
         return 0;
     }
@@ -1108,7 +1111,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     unsigned char my_seckey[32];
     secp256k1_keypair_sec(ctx, my_seckey, keypair);
 
-    size_t my_node_count = factory_count_nodes_for_participant(&factory, my_index);
+    size_t my_node_count = factory_count_nodes_for_participant(factory, my_index);
 
     /* Pre-generate nonce pool */
     musig_nonce_pool_t my_pool;
@@ -1117,7 +1120,8 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: nonce pool generation failed\n");
         client_send_error(fd, "nonce pool generation failed");
         memset(my_seckey, 0, 32);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         wire_close(fd);
         return 0;
     }
@@ -1131,14 +1135,15 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: alloc failed\n");
         client_send_error(fd, "allocation failed");
         free(nonce_entries);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         wire_close(fd);
         return 0;
     }
 
     size_t nonce_count = 0;
-    for (size_t i = 0; i < factory.n_nodes; i++) {
-        int slot = factory_find_signer_slot(&factory, i, my_index);
+    for (size_t i = 0; i < factory->n_nodes; i++) {
+        int slot = factory_find_signer_slot(factory, i, my_index);
         if (slot < 0) continue;
 
         secp256k1_musig_secnonce *sec;
@@ -1177,7 +1182,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         goto fail;
     }
 
-    if (!factory_sessions_init(&factory)) {
+    if (!factory_sessions_init(factory)) {
         fprintf(stderr, "Client: re-init sessions failed\n");
         cJSON_Delete(msg.json);
         goto fail;
@@ -1195,7 +1200,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                 cJSON_Delete(msg.json);
                 goto fail;
             }
-            if (!factory_session_set_nonce(&factory, all_entries[e].node_idx,
+            if (!factory_session_set_nonce(factory, all_entries[e].node_idx,
                                             all_entries[e].signer_slot, &pn)) {
                 fprintf(stderr, "Client: set nonce failed node %u slot %u\n",
                         all_entries[e].node_idx, all_entries[e].signer_slot);
@@ -1207,7 +1212,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     cJSON_Delete(msg.json);
 
     /* Finalize nonces */
-    if (!factory_sessions_finalize(&factory)) {
+    if (!factory_sessions_finalize(factory)) {
         fprintf(stderr, "Client: factory_sessions_finalize failed\n");
         goto fail;
     }
@@ -1223,13 +1228,13 @@ int client_run_with_channels(secp256k1_context *ctx,
         size_t psig_count = 0;
 
         size_t psig_nonce_idx = 0;
-        for (size_t i = 0; i < factory.n_nodes; i++) {
-            int slot = factory_find_signer_slot(&factory, i, my_index);
+        for (size_t i = 0; i < factory->n_nodes; i++) {
+            int slot = factory_find_signer_slot(factory, i, my_index);
             if (slot < 0) continue;
 
             secp256k1_musig_partial_sig psig;
             if (!musig_create_partial_sig(ctx, &psig, my_secnonce_ptrs[psig_nonce_idx],
-                                           keypair, &factory.nodes[i].signing_session)) {
+                                           keypair, &factory->nodes[i].signing_session)) {
                 fprintf(stderr, "Client: partial sig failed node %zu\n", i);
                 free(psig_entries);
                 goto fail;
@@ -1380,7 +1385,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
         /* Initialize client-side channel */
         channel_t channel;
-        if (!client_init_channel(&channel, ctx, &factory, keypair, my_index,
+        if (!client_init_channel(&channel, ctx, factory, keypair, my_index,
                                   &lsp_pay_bp, &lsp_delay_bp,
                                   &lsp_revoc_bp, &lsp_htlc_bp,
                                   bp_ps, bp_ds, bp_rs, bp_hs, NULL)) {
@@ -1473,7 +1478,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
         /* Call the channel callback */
         int cb_ret = channel_cb(fd, &channel, my_index, ctx, keypair,
-                                 &factory, n_participants, user_data);
+                                 factory, n_participants, user_data);
         if (cb_ret == 2) {
             /* Callback already handled close ceremony */
             goto done;
@@ -1485,7 +1490,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                    &factory, n_participants, NULL, 0)) {
+                                    factory, n_participants, NULL, 0)) {
         goto fail;
     }
 
@@ -1493,13 +1498,15 @@ int client_run_with_channels(secp256k1_context *ctx,
 
 done:
     free(nonce_entries);
-    factory_free(&factory);
+    factory_free(factory);
+    free(factory);
     wire_close(fd);
     return 1;
 
 fail:
     free(nonce_entries);
-    factory_free(&factory);
+    factory_free(factory);
+    free(factory);
     wire_close(fd);
     return 0;
 }
@@ -1515,24 +1522,26 @@ int client_run_reconnect(secp256k1_context *ctx,
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    /* 1. Load factory from DB */
-    factory_t factory;
-    if (!persist_load_factory(db, 0, &factory, ctx)) {
+    /* 1. Load factory from DB (heap — factory_t is ~3MB) */
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    if (!persist_load_factory(db, 0, factory, ctx)) {
         fprintf(stderr, "Client reconnect: failed to load factory from DB\n");
+        free(factory);
         return 0;
     }
 
-    /* 2. Determine my_index by matching pubkey against factory.pubkeys[] */
+    /* 2. Determine my_index by matching pubkey against factory->pubkeys[] */
     uint32_t my_index = 0;
     {
         unsigned char my_ser[33], cmp_ser[33];
         size_t len1 = 33, len2 = 33;
         secp256k1_ec_pubkey_serialize(ctx, my_ser, &len1, &my_pubkey,
                                        SECP256K1_EC_COMPRESSED);
-        for (size_t i = 0; i < factory.n_participants; i++) {
+        for (size_t i = 0; i < factory->n_participants; i++) {
             len2 = 33;
             secp256k1_ec_pubkey_serialize(ctx, cmp_ser, &len2,
-                                           &factory.pubkeys[i],
+                                           &factory->pubkeys[i],
                                            SECP256K1_EC_COMPRESSED);
             if (memcmp(my_ser, cmp_ser, 33) == 0) {
                 my_index = (uint32_t)i;
@@ -1541,18 +1550,20 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
         if (my_index == 0) {
             fprintf(stderr, "Client reconnect: pubkey not found in factory\n");
-            factory_free(&factory);
+            factory_free(factory);
+            free(factory);
             return 0;
         }
     }
 
-    size_t n_participants = factory.n_participants;
+    size_t n_participants = factory->n_participants;
 
     /* 3. Connect to LSP */
     int fd = wire_connect(host, port);
     if (fd < 0) {
         fprintf(stderr, "Client reconnect: connect failed\n");
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         return 0;
     }
     wire_set_peer_label(fd, "lsp");
@@ -1566,7 +1577,8 @@ int client_run_reconnect(secp256k1_context *ctx,
     if (!reconn_hs_ok) {
         fprintf(stderr, "Client reconnect: noise handshake failed\n");
         wire_close(fd);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         return 0;
     }
 
@@ -1583,7 +1595,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: send MSG_RECONNECT failed\n");
             cJSON_Delete(reconn);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         cJSON_Delete(reconn);
@@ -1595,7 +1607,8 @@ int client_run_reconnect(secp256k1_context *ctx,
     if (!persist_load_basepoints(db, client_idx, local_secs, remote_bps)) {
         fprintf(stderr, "Client reconnect: no basepoints in DB for channel %u\n", client_idx);
         wire_close(fd);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         return 0;
     }
 
@@ -1606,19 +1619,21 @@ int client_run_reconnect(secp256k1_context *ctx,
         !secp256k1_ec_pubkey_parse(ctx, &reconn_lsp_htlc_bp, remote_bps[3], 33)) {
         fprintf(stderr, "Client reconnect: failed to parse remote basepoints\n");
         wire_close(fd);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         return 0;
     }
 
     channel_t channel;
-    if (!client_init_channel(&channel, ctx, &factory, keypair, my_index,
+    if (!client_init_channel(&channel, ctx, factory, keypair, my_index,
                               &reconn_lsp_pay_bp, &reconn_lsp_delay_bp,
                               &reconn_lsp_revoc_bp, &reconn_lsp_htlc_bp,
                               local_secs[0], local_secs[1], local_secs[2], local_secs[3], NULL)) {
         fprintf(stderr, "Client reconnect: channel init failed\n");
         memset(local_secs, 0, sizeof(local_secs));
         wire_close(fd);
-        factory_free(&factory);
+        factory_free(factory);
+        free(factory);
         return 0;
     }
     memset(local_secs, 0, sizeof(local_secs));
@@ -1677,7 +1692,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: expected CHANNEL_NONCES from LSP\n");
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
 
@@ -1690,7 +1705,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: failed to parse LSP nonces\n");
             cJSON_Delete(msg.json);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -1699,7 +1714,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         if (!channel_init_nonce_pool(&channel, lsp_nonce_count)) {
             fprintf(stderr, "Client reconnect: nonce pool init failed\n");
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
 
@@ -1709,7 +1724,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             (unsigned char (*)[66])calloc(my_nonce_count, 66);
         if (!my_pubnonces_ser) {
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         for (size_t i = 0; i < my_nonce_count; i++) {
@@ -1727,7 +1742,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             cJSON_Delete(nonce_reply);
             free(my_pubnonces_ser);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         cJSON_Delete(nonce_reply);
@@ -1749,7 +1764,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         if (!wire_recv(fd, &msg)) {
             fprintf(stderr, "Client reconnect: recv failed expecting RECONNECT_ACK\n");
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
@@ -1760,7 +1775,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             if (!wire_recv(fd, &msg)) {
                 fprintf(stderr, "Client reconnect: recv failed after CS retransmit\n");
                 wire_close(fd);
-                factory_free(&factory);
+                factory_free(factory); free(factory);
                 return 0;
             }
         }
@@ -1769,7 +1784,7 @@ int client_run_reconnect(secp256k1_context *ctx,
                     msg.msg_type);
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
 
@@ -1780,7 +1795,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: failed to parse RECONNECT_ACK\n");
             cJSON_Delete(msg.json);
             wire_close(fd);
-            factory_free(&factory);
+            factory_free(factory); free(factory);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -1811,27 +1826,27 @@ int client_run_reconnect(secp256k1_context *ctx,
     int cb_ret = 0;
     if (channel_cb) {
         cb_ret = channel_cb(fd, &channel, my_index, ctx, keypair,
-                              &factory, n_participants, user_data);
+                              factory, n_participants, user_data);
     }
 
     if (cb_ret == 2) {
         /* Callback handled close */
-        factory_free(&factory);
+        factory_free(factory); free(factory);
         wire_close(fd);
         return 1;
     }
     if (cb_ret == 1) {
         /* Run close ceremony */
         int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                                  &factory, n_participants,
+                                                  factory, n_participants,
                                                   NULL, 0);
-        factory_free(&factory);
+        factory_free(factory); free(factory);
         wire_close(fd);
         return close_ok;
     }
 
     /* cb_ret == 0: error or disconnect */
-    factory_free(&factory);
+    factory_free(factory); free(factory);
     wire_close(fd);
     return 0;
 }

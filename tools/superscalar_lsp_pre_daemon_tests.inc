@@ -799,15 +799,14 @@
             }
 
             /* Build Factory 1 locally (demo mode: we have all keypairs,
-               no wire ceremony needed) */
-            factory_t f1;
-            memset(&f1, 0, sizeof(f1));
+               no wire ceremony needed; heap — factory_t is ~3MB) */
+            factory_t *f1 = calloc(1, sizeof(factory_t));
             if (n_level_arity > 0)
-                factory_set_level_arity(&f1, level_arities, n_level_arity);
+                factory_set_level_arity(f1, level_arities, n_level_arity);
             else if (leaf_arity == 1)
-                factory_set_arity(&f1, FACTORY_ARITY_1);
+                factory_set_arity(f1, FACTORY_ARITY_1);
 
-            if (!factory_init(&f1, ctx, all_kps, n_total, step_blocks, 4)) {
+            if (!factory_init(f1, ctx, all_kps, n_total, step_blocks, 4)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_init failed\n");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
@@ -821,19 +820,19 @@
             {
                 int cur_h = regtest_get_block_height(&rt);
                 if (cltv_timeout_arg > 0) {
-                    f1.cltv_timeout = (uint32_t)cltv_timeout_arg;
+                    f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
                 } else if (cur_h > 0) {
                     int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
-                    f1.cltv_timeout = (uint32_t)cur_h + offset;
+                    f1->cltv_timeout = (uint32_t)cur_h + offset;
                 }
             }
 
-            factory_set_funding(&f1, fund2_txid, fund2_vout, fund2_amount,
+            factory_set_funding(f1, fund2_txid, fund2_vout, fund2_amount,
                                 fund_spk, 34);
 
-            if (!factory_build_tree(&f1)) {
+            if (!factory_build_tree(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_build_tree failed\n");
-                factory_free(&f1);
+                factory_free(f1); free(f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -841,9 +840,9 @@
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            if (!factory_sign_all(&f1)) {
+            if (!factory_sign_all(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_sign_all failed\n");
-                factory_free(&f1);
+                factory_free(f1); free(f1);
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -856,18 +855,19 @@
             {
                 int cur_h = regtest_get_block_height(&rt);
                 if (cur_h > 0)
-                    factory_set_lifecycle(&f1, (uint32_t)cur_h,
+                    factory_set_lifecycle(f1, (uint32_t)cur_h,
                                           active_blocks, dying_blocks);
             }
-            f1.fee = fee_est;
+            f1->fee = fee_est;
 
-            printf("Factory 1 created: %zu nodes signed\n", f1.n_nodes);
+            printf("Factory 1 created: %zu nodes signed\n", f1->n_nodes);
 
             /* Store Factory 1 in ladder slot 1 */
             {
                 ladder_factory_t *lf1 = &lad->factories[1];
-                lf1->factory = f1;
+                lf1->factory = *f1;
                 factory_detach_txbufs(&lf1->factory);
+                free(f1);
                 lf1->factory_id = lad->next_factory_id++;
                 lf1->is_initialized = 1;
                 lf1->is_funded = 1;
