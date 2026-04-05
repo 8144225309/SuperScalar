@@ -319,34 +319,38 @@ int test_persist_factory_round_trip(void) {
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDD;
-    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Save factory */
-    TEST_ASSERT(persist_save_factory(&db, &f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
 
     /* Load factory into new struct */
-    factory_t f2;
-    TEST_ASSERT(persist_load_factory(&db, 0, &f2, ctx), "load factory");
+    factory_t *f2 = calloc(1, sizeof(factory_t));
+    if (!f2) return 0;
+    TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "load factory");
 
     /* Verify */
-    TEST_ASSERT_EQ(f2.n_participants, 5, "n_participants");
-    TEST_ASSERT_EQ(f2.step_blocks, 10, "step_blocks");
-    TEST_ASSERT_EQ(f2.funding_amount_sats, 1000000, "funding_amount");
-    TEST_ASSERT_EQ(f2.n_nodes, f.n_nodes, "n_nodes");
+    TEST_ASSERT_EQ(f2->n_participants, 5, "n_participants");
+    TEST_ASSERT_EQ(f2->step_blocks, 10, "step_blocks");
+    TEST_ASSERT_EQ(f2->funding_amount_sats, 1000000, "funding_amount");
+    TEST_ASSERT_EQ(f2->n_nodes, f->n_nodes, "n_nodes");
 
     /* Verify txids match (the tree was rebuilt, so all node txids should match) */
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        TEST_ASSERT(memcmp(f.nodes[i].txid, f2.nodes[i].txid, 32) == 0,
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        TEST_ASSERT(memcmp(f->nodes[i].txid, f2->nodes[i].txid, 32) == 0,
                     "node txid matches");
     }
 
-    factory_free(&f);
-    factory_free(&f2);
+    factory_free(f);
+    free(f);
+    factory_free(f2);
+    free(f2);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
     return 1;
@@ -753,10 +757,11 @@ int test_lsp_recovery_round_trip(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[3], extra_sec3)) return 0;  /* Client 2 */
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;  /* Client 3 */
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
-    f.cltv_timeout = 200;
-    f.fee_per_tx = 500;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->cltv_timeout = 200;
+    f->fee_per_tx = 500;
 
     /* Set funding (need valid funding for channel init) */
     musig_keyagg_t ka;
@@ -775,13 +780,13 @@ int test_lsp_recovery_round_trip(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
-    factory_set_funding(&f, fake_txid, 0, 200000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels the normal way */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init channels");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init channels");
 
     /* Simulate basepoint exchange: set remote basepoints */
     for (size_t c = 0; c < 4; c++) {
@@ -810,7 +815,7 @@ int test_lsp_recovery_round_trip(void) {
 
     /* Persist: factory, channels, basepoints */
     TEST_ASSERT(persist_begin(&db), "begin");
-    TEST_ASSERT(persist_save_factory(&db, &f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
     for (size_t c = 0; c < 4; c++) {
         TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                            (uint32_t)c), "save channel");
@@ -852,14 +857,15 @@ int test_lsp_recovery_round_trip(void) {
     TEST_ASSERT(persist_commit(&db), "commit");
 
     /* Now recover: load factory from DB, init channels from DB */
-    factory_t rec_f;
-    memset(&rec_f, 0, sizeof(rec_f));
-    TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "load factory");
-    TEST_ASSERT_EQ(rec_f.n_participants, 5, "n_participants");
+    factory_t *rec_f = calloc(1, sizeof(factory_t));
+    if (!rec_f) return 0;
+
+    TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "load factory");
+    TEST_ASSERT_EQ(rec_f->n_participants, 5, "n_participants");
 
     lsp_channel_mgr_t rec_mgr;
     memset(&rec_mgr, 0, sizeof(rec_mgr));
-    TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+    TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                             seckeys[0], 4, &db),
                 "init from db");
     TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "n_channels");
@@ -943,6 +949,8 @@ int test_lsp_recovery_round_trip(void) {
     /* Channel 1 should have no HTLCs */
     TEST_ASSERT_EQ(rec_mgr.entries[1].channel.n_htlcs, 0, "ch1 no htlcs");
 
+    free(rec_f);
+    free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
     return 1;
@@ -1152,9 +1160,10 @@ int test_persist_validate_factory_load(void) {
         NULL, NULL, NULL);
     TEST_ASSERT(rc == SQLITE_OK, "insert invalid factory");
 
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    int loaded = persist_load_factory(&db, 10, &f, ctx);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    int loaded = persist_load_factory(&db, 10, f, ctx);
     TEST_ASSERT(loaded == 0, "n_participants=1 rejected");
 
     /* Insert factory with funding_amount = 0 */
@@ -1165,7 +1174,7 @@ int test_persist_validate_factory_load(void) {
         "VALUES (11, 5, '00', 0, 0, 10, 8, 200, 500, 2);",
         NULL, NULL, NULL);
     TEST_ASSERT(rc == SQLITE_OK, "insert zero-amount factory");
-    loaded = persist_load_factory(&db, 11, &f, ctx);
+    loaded = persist_load_factory(&db, 11, f, ctx);
     TEST_ASSERT(loaded == 0, "funding_amount=0 rejected");
 
     /* Insert factory with states_per_layer = 0 */
@@ -1176,7 +1185,7 @@ int test_persist_validate_factory_load(void) {
         "VALUES (12, 5, '00', 0, 100000, 10, 0, 200, 500, 2);",
         NULL, NULL, NULL);
     TEST_ASSERT(rc == SQLITE_OK, "insert zero-states factory");
-    loaded = persist_load_factory(&db, 12, &f, ctx);
+    loaded = persist_load_factory(&db, 12, f, ctx);
     TEST_ASSERT(loaded == 0, "states_per_layer=0 rejected");
 
     /* Insert factory with step_blocks = 0 */
@@ -1187,9 +1196,10 @@ int test_persist_validate_factory_load(void) {
         "VALUES (13, 5, '00', 0, 100000, 0, 8, 200, 500, 2);",
         NULL, NULL, NULL);
     TEST_ASSERT(rc == SQLITE_OK, "insert zero-step factory");
-    loaded = persist_load_factory(&db, 13, &f, ctx);
+    loaded = persist_load_factory(&db, 13, f, ctx);
     TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
 
+    free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
     return 1;
@@ -1257,10 +1267,11 @@ int test_persist_crash_stress(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[3], extra_sec3)) return 0;
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
-    f.cltv_timeout = 200;
-    f.fee_per_tx = 500;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->cltv_timeout = 200;
+    f->fee_per_tx = 500;
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
@@ -1279,13 +1290,13 @@ int test_persist_crash_stress(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
-    factory_set_funding(&f, fake_txid, 0, 200000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4), "init channels");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init channels");
 
     /* Simulate basepoint exchange */
     for (size_t c = 0; c < 4; c++) {
@@ -1309,7 +1320,7 @@ int test_persist_crash_stress(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c1 open");
         TEST_ASSERT(persist_begin(&db), "c1 begin");
-        TEST_ASSERT(persist_save_factory(&db, &f, ctx, 0), "c1 save factory");
+        TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "c1 save factory");
         for (size_t c = 0; c < 4; c++) {
             TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                                (uint32_t)c), "c1 save ch");
@@ -1342,20 +1353,20 @@ int test_persist_crash_stress(void) {
 
     /* Zero everything */
     memset(&mgr, 0, sizeof(mgr));
-    memset(&f, 0, sizeof(f));
 
     /* Recover cycle 1 */
     {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c1 reopen");
-        factory_t rec_f;
-        memset(&rec_f, 0, sizeof(rec_f));
-        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c1 load factory");
-        TEST_ASSERT_EQ(rec_f.n_participants, 5, "c1 n_participants");
+        factory_t *rec_f = calloc(1, sizeof(factory_t));
+        if (!rec_f) return 0;
+
+        TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c1 load factory");
+        TEST_ASSERT_EQ(rec_f->n_participants, 5, "c1 n_participants");
 
         lsp_channel_mgr_t rec_mgr;
         memset(&rec_mgr, 0, sizeof(rec_mgr));
-        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                                 seckeys[0], 4, &db),
                     "c1 init from db");
         TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "c1 n_channels");
@@ -1377,7 +1388,8 @@ int test_persist_crash_stress(void) {
 
         /* Copy recovered state into mgr/f for next cycle */
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
-        memcpy(&f, &rec_f, sizeof(f));
+        memcpy(f, rec_f, sizeof(*f));
+        free(rec_f);
         persist_close(&db);
     }
 
@@ -1447,19 +1459,19 @@ int test_persist_crash_stress(void) {
     }
 
     memset(&mgr, 0, sizeof(mgr));
-    memset(&f, 0, sizeof(f));
 
     /* Recover cycle 2 */
     {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c2 reopen");
-        factory_t rec_f;
-        memset(&rec_f, 0, sizeof(rec_f));
-        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c2 load factory");
+        factory_t *rec_f = calloc(1, sizeof(factory_t));
+        if (!rec_f) return 0;
+
+        TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c2 load factory");
 
         lsp_channel_mgr_t rec_mgr;
         memset(&rec_mgr, 0, sizeof(rec_mgr));
-        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                                 seckeys[0], 4, &db),
                     "c2 init from db");
         TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "c2 n_channels");
@@ -1492,7 +1504,8 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 0, "c2 ch3 htlc count");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
-        memcpy(&f, &rec_f, sizeof(f));
+        memcpy(f, rec_f, sizeof(*f));
+        free(rec_f);
         persist_close(&db);
     }
 
@@ -1550,19 +1563,19 @@ int test_persist_crash_stress(void) {
     }
 
     memset(&mgr, 0, sizeof(mgr));
-    memset(&f, 0, sizeof(f));
 
     /* Recover cycle 3 */
     {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c3 reopen");
-        factory_t rec_f;
-        memset(&rec_f, 0, sizeof(rec_f));
-        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c3 load factory");
+        factory_t *rec_f = calloc(1, sizeof(factory_t));
+        if (!rec_f) return 0;
+
+        TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c3 load factory");
 
         lsp_channel_mgr_t rec_mgr;
         memset(&rec_mgr, 0, sizeof(rec_mgr));
-        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                                 seckeys[0], 4, &db),
                     "c3 init from db");
 
@@ -1584,16 +1597,17 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.htlcs[1].id, 11, "c3 ch3 htlc1 id");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
-        memcpy(&f, &rec_f, sizeof(f));
+        memcpy(f, rec_f, sizeof(*f));
+        free(rec_f);
         persist_close(&db);
     }
 
     /* ===== Cycle 4: Extreme values ===== */
-    uint64_t commit_fee = f.fee_per_tx;
+    uint64_t commit_fee = f->fee_per_tx;
     mgr.entries[0].channel.local_amount = 0;
-    mgr.entries[0].channel.remote_amount = f.funding_amount_sats / 4 - commit_fee;
+    mgr.entries[0].channel.remote_amount = f->funding_amount_sats / 4 - commit_fee;
     mgr.entries[0].channel.commitment_number = 200;
-    mgr.entries[1].channel.local_amount = f.funding_amount_sats / 4 - commit_fee;
+    mgr.entries[1].channel.local_amount = f->funding_amount_sats / 4 - commit_fee;
     mgr.entries[1].channel.remote_amount = 0;
     mgr.entries[1].channel.commitment_number = 255;
 
@@ -1639,19 +1653,19 @@ int test_persist_crash_stress(void) {
     }
 
     memset(&mgr, 0, sizeof(mgr));
-    memset(&f, 0, sizeof(f));
 
     /* Recover cycle 4 */
     {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c4 reopen");
-        factory_t rec_f;
-        memset(&rec_f, 0, sizeof(rec_f));
-        TEST_ASSERT(persist_load_factory(&db, 0, &rec_f, ctx), "c4 load factory");
+        factory_t *rec_f = calloc(1, sizeof(factory_t));
+        if (!rec_f) return 0;
+
+        TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c4 load factory");
 
         lsp_channel_mgr_t rec_mgr;
         memset(&rec_mgr, 0, sizeof(rec_mgr));
-        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, &rec_f,
+        TEST_ASSERT(lsp_channels_init_from_db(&rec_mgr, ctx, rec_f,
                                                 seckeys[0], 4, &db),
                     "c4 init from db");
 
@@ -1680,9 +1694,11 @@ int test_persist_crash_stress(void) {
         /* ch3 still has 2 HTLCs from cycle 3 */
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 2, "c4 ch3 2 htlcs");
 
+        free(rec_f);
         persist_close(&db);
     }
 
+    free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);
     return 1;
@@ -1705,25 +1721,26 @@ int test_persist_crash_dw_state(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[3], s3)) return 0;
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
 
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
 
     /* Advance DW counter 5 times */
     for (int i = 0; i < 5; i++) {
-        TEST_ASSERT(dw_counter_advance(&f.counter), "advance counter");
+        TEST_ASSERT(dw_counter_advance(&f->counter), "advance counter");
     }
 
-    uint32_t epoch_after5 = f.counter.current_epoch;
+    uint32_t epoch_after5 = f->counter.current_epoch;
     uint32_t layers_after5[DW_MAX_LAYERS];
-    for (uint32_t i = 0; i < f.counter.n_layers; i++) {
-        layers_after5[i] = f.counter.layers[i].current_state;
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        layers_after5[i] = f->counter.layers[i].current_state;
     }
 
     /* Enable per-leaf mode and set leaf states */
-    f.per_leaf_enabled = 1;
-    f.n_leaf_nodes = 2;
-    f.leaf_layers[0].current_state = 2;
-    f.leaf_layers[1].current_state = 1;
+    f->per_leaf_enabled = 1;
+    f->n_leaf_nodes = 2;
+    f->leaf_layers[0].current_state = 2;
+    f->leaf_layers[1].current_state = 1;
 
     /* ===== Persist cycle 1 ===== */
     {
@@ -1731,28 +1748,28 @@ int test_persist_crash_dw_state(void) {
         TEST_ASSERT(persist_open(&db, path), "dw c1 open");
 
         uint32_t layer_states[DW_MAX_LAYERS];
-        for (uint32_t i = 0; i < f.counter.n_layers; i++)
-            layer_states[i] = f.counter.layers[i].current_state;
+        for (uint32_t i = 0; i < f->counter.n_layers; i++)
+            layer_states[i] = f->counter.layers[i].current_state;
 
         uint32_t leaf_states[8];
-        for (int i = 0; i < f.n_leaf_nodes; i++)
-            leaf_states[i] = f.leaf_layers[i].current_state;
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
 
         TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0,
-                        f.counter.current_epoch, f.counter.n_layers,
-                        layer_states, f.per_leaf_enabled,
-                        leaf_states, f.n_leaf_nodes), "dw c1 save");
+                        f->counter.current_epoch, f->counter.n_layers,
+                        layer_states, f->per_leaf_enabled,
+                        leaf_states, f->n_leaf_nodes), "dw c1 save");
         persist_close(&db);
     }
 
     /* Save expected n_layers for verification */
-    uint32_t saved_n_layers = f.counter.n_layers;
+    uint32_t saved_n_layers = f->counter.n_layers;
 
     /* Zero factory DW state */
-    memset(&f.counter, 0, sizeof(f.counter));
-    f.per_leaf_enabled = 0;
-    memset(f.leaf_layers, 0, sizeof(f.leaf_layers));
-    f.n_leaf_nodes = 0;
+    memset(&f->counter, 0, sizeof(f->counter));
+    f->per_leaf_enabled = 0;
+    memset(f->leaf_layers, 0, sizeof(f->leaf_layers));
+    f->n_leaf_nodes = 0;
 
     /* Recover cycle 1 */
     {
@@ -1783,44 +1800,44 @@ int test_persist_crash_dw_state(void) {
     }
 
     /* ===== Persist cycle 2: advance more, re-persist ===== */
-    dw_counter_init(&f.counter, saved_n_layers, 10, 4);
-    for (int i = 0; i < 5; i++) dw_counter_advance(&f.counter);
+    dw_counter_init(&f->counter, saved_n_layers, 10, 4);
+    for (int i = 0; i < 5; i++) dw_counter_advance(&f->counter);
     /* Advance 3 more times */
     for (int i = 0; i < 3; i++) {
-        TEST_ASSERT(dw_counter_advance(&f.counter), "advance counter more");
+        TEST_ASSERT(dw_counter_advance(&f->counter), "advance counter more");
     }
 
-    uint32_t epoch_after8 = f.counter.current_epoch;
+    uint32_t epoch_after8 = f->counter.current_epoch;
     uint32_t layers_after8[DW_MAX_LAYERS];
-    for (uint32_t i = 0; i < f.counter.n_layers; i++) {
-        layers_after8[i] = f.counter.layers[i].current_state;
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        layers_after8[i] = f->counter.layers[i].current_state;
     }
 
-    f.per_leaf_enabled = 1;
-    f.n_leaf_nodes = 2;
-    f.leaf_layers[0].current_state = 3;
-    f.leaf_layers[1].current_state = 1;
+    f->per_leaf_enabled = 1;
+    f->n_leaf_nodes = 2;
+    f->leaf_layers[0].current_state = 3;
+    f->leaf_layers[1].current_state = 1;
 
     {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c2 open");
 
         uint32_t layer_states[DW_MAX_LAYERS];
-        for (uint32_t i = 0; i < f.counter.n_layers; i++)
-            layer_states[i] = f.counter.layers[i].current_state;
+        for (uint32_t i = 0; i < f->counter.n_layers; i++)
+            layer_states[i] = f->counter.layers[i].current_state;
 
         uint32_t leaf_states[8];
-        for (int i = 0; i < f.n_leaf_nodes; i++)
-            leaf_states[i] = f.leaf_layers[i].current_state;
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
 
         TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0,
-                        f.counter.current_epoch, f.counter.n_layers,
-                        layer_states, f.per_leaf_enabled,
-                        leaf_states, f.n_leaf_nodes), "dw c2 save");
+                        f->counter.current_epoch, f->counter.n_layers,
+                        layer_states, f->per_leaf_enabled,
+                        leaf_states, f->n_leaf_nodes), "dw c2 save");
         persist_close(&db);
     }
 
-    memset(&f.counter, 0, sizeof(f.counter));
+    memset(&f->counter, 0, sizeof(f->counter));
 
     /* Recover cycle 2 */
     {
@@ -1848,6 +1865,7 @@ int test_persist_crash_dw_state(void) {
         persist_close(&db);
     }
 
+    free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);
     return 1;

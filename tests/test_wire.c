@@ -70,14 +70,15 @@ int test_wire_pubkey_only_factory(void) {
     if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build factory with keypairs (reference) */
-    factory_t f_ref;
-    factory_init(&f_ref, ctx, kps, 5, 10, 4);
+    factory_t *f_ref = calloc(1, sizeof(factory_t));
+    if (!f_ref) return 0;
+    factory_init(f_ref, ctx, kps, 5, 10, 4);
 
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xAA;
     unsigned char fake_spk[34] = {0x51, 0x20};
-    factory_set_funding(&f_ref, fake_txid, 0, 10000000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f_ref), "ref build tree");
+    factory_set_funding(f_ref, fake_txid, 0, 10000000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(f_ref), "ref build tree");
 
     /* Build factory with pubkeys only */
     secp256k1_pubkey pks[5];
@@ -85,28 +86,31 @@ int test_wire_pubkey_only_factory(void) {
         if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
     }
 
-    factory_t f_pk;
-    factory_init_from_pubkeys(&f_pk, ctx, pks, 5, 10, 4);
-    factory_set_funding(&f_pk, fake_txid, 0, 10000000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f_pk), "pubkey-only build tree");
+    factory_t *f_pk = calloc(1, sizeof(factory_t));
+    if (!f_pk) return 0;
+    factory_init_from_pubkeys(f_pk, ctx, pks, 5, 10, 4);
+    factory_set_funding(f_pk, fake_txid, 0, 10000000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(f_pk), "pubkey-only build tree");
 
     /* Compare: same number of nodes */
-    TEST_ASSERT_EQ(f_pk.n_nodes, f_ref.n_nodes, "node count mismatch");
+    TEST_ASSERT_EQ(f_pk->n_nodes, f_ref->n_nodes, "node count mismatch");
 
     /* Compare each node's unsigned tx */
-    for (size_t i = 0; i < f_ref.n_nodes; i++) {
-        TEST_ASSERT_EQ(f_pk.nodes[i].unsigned_tx.len, f_ref.nodes[i].unsigned_tx.len,
+    for (size_t i = 0; i < f_ref->n_nodes; i++) {
+        TEST_ASSERT_EQ(f_pk->nodes[i].unsigned_tx.len, f_ref->nodes[i].unsigned_tx.len,
                         "unsigned tx len mismatch");
-        TEST_ASSERT_MEM_EQ(f_pk.nodes[i].unsigned_tx.data,
-                            f_ref.nodes[i].unsigned_tx.data,
-                            f_ref.nodes[i].unsigned_tx.len,
+        TEST_ASSERT_MEM_EQ(f_pk->nodes[i].unsigned_tx.data,
+                            f_ref->nodes[i].unsigned_tx.data,
+                            f_ref->nodes[i].unsigned_tx.len,
                             "unsigned tx data mismatch");
-        TEST_ASSERT_MEM_EQ(f_pk.nodes[i].txid, f_ref.nodes[i].txid, 32,
+        TEST_ASSERT_MEM_EQ(f_pk->nodes[i].txid, f_ref->nodes[i].txid, 32,
                             "txid mismatch");
     }
 
-    factory_free(&f_ref);
-    factory_free(&f_pk);
+    factory_free(f_ref);
+    free(f_ref);
+    factory_free(f_pk);
+    free(f_pk);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -275,8 +279,9 @@ int test_wire_close_unsigned(void) {
     if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build reference factory */
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 10, 4);
 
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xBB;
@@ -301,8 +306,8 @@ int test_wire_close_unsigned(void) {
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    factory_set_funding(&f, fake_txid, 0, 10000000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 10000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Build unsigned close tx */
     tx_output_t outputs[2];
@@ -317,7 +322,7 @@ int test_wire_close_unsigned(void) {
     tx_buf_init(&unsigned_tx, 256);
     unsigned char sighash[32];
 
-    TEST_ASSERT(factory_build_cooperative_close_unsigned(&f, &unsigned_tx, sighash,
+    TEST_ASSERT(factory_build_cooperative_close_unsigned(f, &unsigned_tx, sighash,
                                                           outputs, 2, 0),
                 "close unsigned");
     TEST_ASSERT(unsigned_tx.len > 0, "unsigned tx not empty");
@@ -327,7 +332,8 @@ int test_wire_close_unsigned(void) {
     TEST_ASSERT(memcmp(sighash, zeros, 32) != 0, "sighash non-zero");
 
     tx_buf_free(&unsigned_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -340,8 +346,9 @@ int test_wire_distributed_signing(void) {
     if (!make_keypairs(ctx, kps)) return 0;
 
     /* Build reference factory with all keypairs, sign it the old way */
-    factory_t f_ref;
-    factory_init(&f_ref, ctx, kps, 5, 10, 4);
+    factory_t *f_ref = calloc(1, sizeof(factory_t));
+    if (!f_ref) return 0;
+    factory_init(f_ref, ctx, kps, 5, 10, 4);
 
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xCC;
@@ -366,8 +373,8 @@ int test_wire_distributed_signing(void) {
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    factory_set_funding(&f_ref, fake_txid, 0, 10000000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f_ref), "ref build tree");
+    factory_set_funding(f_ref, fake_txid, 0, 10000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f_ref), "ref build tree");
 
     /* Now do it via distributed split-round signing:
        Use pubkey-only factory for each "party", share nonces via memory. */
@@ -382,10 +389,10 @@ int test_wire_distributed_signing(void) {
 
     /* Verify all unsigned txs match reference */
     for (int p = 0; p < 5; p++) {
-        for (size_t n = 0; n < f_ref.n_nodes; n++) {
+        for (size_t n = 0; n < f_ref->n_nodes; n++) {
             TEST_ASSERT_MEM_EQ(factories[p].nodes[n].unsigned_tx.data,
-                                f_ref.nodes[n].unsigned_tx.data,
-                                f_ref.nodes[n].unsigned_tx.len,
+                                f_ref->nodes[n].unsigned_tx.data,
+                                f_ref->nodes[n].unsigned_tx.len,
                                 "distributed tx mismatch");
         }
     }
@@ -470,7 +477,7 @@ int test_wire_distributed_signing(void) {
     TEST_ASSERT(factory_sessions_complete(&factories[0]), "complete signing");
 
     /* Verify signed txs match reference: sign ref and compare */
-    TEST_ASSERT(factory_sign_all(&f_ref), "sign ref");
+    TEST_ASSERT(factory_sign_all(f_ref), "sign ref");
 
     /* The signatures will differ (different nonces), but the unsigned txs are identical
        and both should be valid. Just verify completion succeeded. */
@@ -481,7 +488,8 @@ int test_wire_distributed_signing(void) {
 
     for (int p = 0; p < 5; p++)
         factory_free(&factories[p]);
-    factory_free(&f_ref);
+    factory_free(f_ref);
+    free(f_ref);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -554,8 +562,9 @@ int test_basepoint_independence(void) {
     }
 
     /* Build a factory for testing */
-    factory_t f;
-    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32];
     memset(fake_txid, 0xDD, 32);
 
@@ -566,13 +575,13 @@ int test_basepoint_independence(void) {
     xonly = ka.agg_pubkey;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &xonly);
-    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
-    factory_build_tree(&f);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    factory_build_tree(f);
 
     /* Init LSP channel manager */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4),
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4),
                 "lsp_channels_init");
 
     /* Verify remote basepoints are ZEROED (not populated by init) */
@@ -602,7 +611,8 @@ int test_basepoint_independence(void) {
                     "local_payment_basepoint should be populated");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -737,16 +747,17 @@ int test_regtest_wire_factory(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
 
     int lsp_ok = 1;
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
@@ -774,7 +785,7 @@ int test_regtest_wire_factory(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, 5, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -797,7 +808,8 @@ int test_regtest_wire_factory(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     /* Wait for all children */
     int all_children_ok = 1;
@@ -941,19 +953,20 @@ int test_regtest_wire_factory_arity1(void) {
     }
 
     /* Parent: LSP with arity-1 */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
 
     int lsp_ok = 1;
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
     /* Set arity-1 BEFORE factory creation */
-    lsp.factory.leaf_arity = FACTORY_ARITY_1;
+    lsp->factory.leaf_arity = FACTORY_ARITY_1;
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
@@ -964,13 +977,13 @@ int test_regtest_wire_factory_arity1(void) {
 
     /* Verify arity-1 tree: 14 nodes, 4 leaf nodes */
     if (lsp_ok) {
-        TEST_ASSERT(lsp.factory.n_nodes == 14, "14 nodes");
-        TEST_ASSERT(lsp.factory.n_leaf_nodes == 4, "4 leaf nodes");
-        TEST_ASSERT(lsp.factory.leaf_arity == FACTORY_ARITY_1, "arity-1");
-        TEST_ASSERT(lsp.factory.counter.n_layers == 3, "3 DW layers");
+        TEST_ASSERT(lsp->factory.n_nodes == 14, "14 nodes");
+        TEST_ASSERT(lsp->factory.n_leaf_nodes == 4, "4 leaf nodes");
+        TEST_ASSERT(lsp->factory.leaf_arity == FACTORY_ARITY_1, "arity-1");
+        TEST_ASSERT(lsp->factory.counter.n_layers == 3, "3 DW layers");
         printf("  Arity-1 factory: %zu nodes, %d leaf nodes, %u DW layers\n",
-               lsp.factory.n_nodes, lsp.factory.n_leaf_nodes,
-               lsp.factory.counter.n_layers);
+               lsp->factory.n_nodes, lsp->factory.n_leaf_nodes,
+               lsp->factory.counter.n_layers);
     }
 
     /* Cooperative close (same as arity-2 — 5-of-5 on funding output) */
@@ -989,7 +1002,7 @@ int test_regtest_wire_factory_arity1(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, 5, 0)) {
             fprintf(stderr, "LSP: cooperative close (arity-1) failed\n");
             lsp_ok = 0;
         } else {
@@ -1011,7 +1024,8 @@ int test_regtest_wire_factory_arity1(void) {
         tx_buf_free(&close_tx);
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
 
     int all_children_ok = 1;
     for (int c = 0; c < 4; c++) {
@@ -1147,8 +1161,9 @@ int test_placement_profiles_wire_round_trip(void) {
         (void)ok;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
     unsigned char fake_txid[32];
     memset(fake_txid, 0xBB, 32);
 
@@ -1160,39 +1175,39 @@ int test_placement_profiles_wire_round_trip(void) {
     musig_aggregate_keys(ctx, &ka, pks, 5);
     build_p2tr_script_pubkey(fund_spk, &ka.agg_pubkey);
 
-    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
 
     /* Set placement and profiles */
-    f.placement_mode = PLACEMENT_INWARD;
-    f.economic_mode = ECON_PROFIT_SHARED;
-    f.profiles[0].participant_idx = 0;
-    f.profiles[0].contribution_sats = 50000;
-    f.profiles[0].profit_share_bps = 4000;
-    f.profiles[0].uptime_score = 1.0f;
-    f.profiles[0].timezone_bucket = 12;
-    f.profiles[1].participant_idx = 1;
-    f.profiles[1].contribution_sats = 20000;
-    f.profiles[1].profit_share_bps = 2000;
-    f.profiles[1].uptime_score = 0.8f;
-    f.profiles[1].timezone_bucket = 5;
-    f.profiles[2].participant_idx = 2;
-    f.profiles[2].contribution_sats = 15000;
-    f.profiles[2].profit_share_bps = 1500;
-    f.profiles[2].uptime_score = 0.6f;
-    f.profiles[2].timezone_bucket = 18;
-    f.profiles[3].participant_idx = 3;
-    f.profiles[3].contribution_sats = 10000;
-    f.profiles[3].profit_share_bps = 1500;
-    f.profiles[3].uptime_score = 0.4f;
-    f.profiles[3].timezone_bucket = 0;
-    f.profiles[4].participant_idx = 4;
-    f.profiles[4].contribution_sats = 5000;
-    f.profiles[4].profit_share_bps = 1000;
-    f.profiles[4].uptime_score = 0.2f;
-    f.profiles[4].timezone_bucket = 23;
+    f->placement_mode = PLACEMENT_INWARD;
+    f->economic_mode = ECON_PROFIT_SHARED;
+    f->profiles[0].participant_idx = 0;
+    f->profiles[0].contribution_sats = 50000;
+    f->profiles[0].profit_share_bps = 4000;
+    f->profiles[0].uptime_score = 1.0f;
+    f->profiles[0].timezone_bucket = 12;
+    f->profiles[1].participant_idx = 1;
+    f->profiles[1].contribution_sats = 20000;
+    f->profiles[1].profit_share_bps = 2000;
+    f->profiles[1].uptime_score = 0.8f;
+    f->profiles[1].timezone_bucket = 5;
+    f->profiles[2].participant_idx = 2;
+    f->profiles[2].contribution_sats = 15000;
+    f->profiles[2].profit_share_bps = 1500;
+    f->profiles[2].uptime_score = 0.6f;
+    f->profiles[2].timezone_bucket = 18;
+    f->profiles[3].participant_idx = 3;
+    f->profiles[3].contribution_sats = 10000;
+    f->profiles[3].profit_share_bps = 1500;
+    f->profiles[3].uptime_score = 0.4f;
+    f->profiles[3].timezone_bucket = 0;
+    f->profiles[4].participant_idx = 4;
+    f->profiles[4].contribution_sats = 5000;
+    f->profiles[4].profit_share_bps = 1000;
+    f->profiles[4].uptime_score = 0.2f;
+    f->profiles[4].timezone_bucket = 23;
 
     /* Serialize */
-    cJSON *j = wire_build_factory_propose(&f);
+    cJSON *j = wire_build_factory_propose(f);
     TEST_ASSERT(j != NULL, "serialize propose");
 
     /* Parse back placement_mode */
@@ -1236,7 +1251,8 @@ int test_placement_profiles_wire_round_trip(void) {
     TEST_ASSERT_EQ((int)v->valuedouble, 23, "profile 4 tz_bucket");
 
     cJSON_Delete(j);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }

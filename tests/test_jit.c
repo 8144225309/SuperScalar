@@ -1115,22 +1115,23 @@ int test_regtest_jit_daemon_trigger(void) {
 
     /* Create minimal factory with short lifecycle */
     int base_height = regtest_get_block_height(&rt);
-    factory_t f;
-    memset(&f, 0, sizeof(f));
-    factory_set_lifecycle(&f, (uint32_t)base_height, 5, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    factory_set_lifecycle(f, (uint32_t)base_height, 5, 5);
 
     /* Verify state transitions */
-    TEST_ASSERT(factory_get_state(&f, (uint32_t)base_height) == FACTORY_ACTIVE,
+    TEST_ASSERT(factory_get_state(f, (uint32_t)base_height) == FACTORY_ACTIVE,
                 "should be ACTIVE at creation");
 
     regtest_mine_blocks(&rt, 5, mine_addr);
     int h2 = regtest_get_block_height(&rt);
-    TEST_ASSERT(factory_get_state(&f, (uint32_t)h2) == FACTORY_DYING,
+    TEST_ASSERT(factory_get_state(f, (uint32_t)h2) == FACTORY_DYING,
                 "should be DYING after active_blocks");
 
     regtest_mine_blocks(&rt, 5, mine_addr);
     int h3 = regtest_get_block_height(&rt);
-    TEST_ASSERT(factory_get_state(&f, (uint32_t)h3) == FACTORY_EXPIRED,
+    TEST_ASSERT(factory_get_state(f, (uint32_t)h3) == FACTORY_EXPIRED,
                 "should be EXPIRED after dying_blocks");
 
     /* Set up watchtower with regtest connection */
@@ -1157,16 +1158,17 @@ int test_regtest_jit_daemon_trigger(void) {
     jit_channels_init(&mgr);
 
     /* Set up lsp_t with factory */
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
-    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    lsp.clients_cap = LSP_MAX_CLIENTS;
-    lsp.factory = f;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->factory = *f;
 
     /* Verify daemon loop JIT trigger conditions */
     int h = regtest_get_block_height(mgr.watchtower->rt);
-    factory_state_t fs = factory_get_state(&lsp.factory, (uint32_t)h);
+    factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
     TEST_ASSERT(fs == FACTORY_EXPIRED, "daemon should detect factory EXPIRED");
     TEST_ASSERT(mgr.jit_enabled, "JIT should be enabled");
     TEST_ASSERT(!jit_channel_is_active(&mgr, 0), "no active JIT for client 0");
@@ -1174,7 +1176,7 @@ int test_regtest_jit_daemon_trigger(void) {
     /* Create socketpair for client wire protocol */
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-    lsp.client_fds[0] = sv[0];
+    lsp->client_fds[0] = sv[0];
 
     /* Start client thread to handle JIT protocol */
     jit_client_ctx_t client_args;
@@ -1187,7 +1189,7 @@ int test_regtest_jit_daemon_trigger(void) {
     pthread_create(&tid, NULL, jit_client_handler, &client_args);
 
     /* Call jit_channel_create — same as daemon loop would at line 1891 */
-    int ok = jit_channel_create(&mgr, &lsp, 0, 50000, "factory_expired");
+    int ok = jit_channel_create(&mgr, lsp, 0, 50000, "factory_expired");
     TEST_ASSERT(ok, "jit_channel_create should succeed");
 
     /* Verify JIT channel is active */
@@ -1206,8 +1208,10 @@ int test_regtest_jit_daemon_trigger(void) {
     /* Cleanup */
     jit_channels_cleanup(&mgr);
     free(mgr.entries);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    free(f);
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);

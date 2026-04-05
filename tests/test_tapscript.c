@@ -268,53 +268,55 @@ int test_factory_tree_with_timeout(void) {
     memset(fake_txid, 0xAA, 32);
 
     /* Build factory WITH cltv_timeout */
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 2, 4);
-    f.cltv_timeout = 1000;  /* some block height */
-    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree with timeout");
-    TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    f->cltv_timeout = 1000;  /* some block height */
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree with timeout");
+    TEST_ASSERT_EQ(f->n_nodes, 6, "6 nodes");
 
     /* All non-root nodes should have taptree (staggered CLTVs).
        DFS order: ko_root[0], st_root[1], ko_left[2], st_left[3], ko_right[4], st_right[5] */
-    TEST_ASSERT(f.nodes[0].has_taptree == 0, "kickoff_root no taptree");
-    TEST_ASSERT(f.nodes[1].has_taptree == 1, "state_root has taptree");
-    TEST_ASSERT(f.nodes[2].has_taptree == 1, "kickoff_left has taptree");
-    TEST_ASSERT(f.nodes[3].has_taptree == 1, "state_left has taptree");
-    TEST_ASSERT(f.nodes[4].has_taptree == 1, "kickoff_right has taptree");
-    TEST_ASSERT(f.nodes[5].has_taptree == 1, "state_right has taptree");
+    TEST_ASSERT(f->nodes[0].has_taptree == 0, "kickoff_root no taptree");
+    TEST_ASSERT(f->nodes[1].has_taptree == 1, "state_root has taptree");
+    TEST_ASSERT(f->nodes[2].has_taptree == 1, "kickoff_left has taptree");
+    TEST_ASSERT(f->nodes[3].has_taptree == 1, "state_left has taptree");
+    TEST_ASSERT(f->nodes[4].has_taptree == 1, "kickoff_right has taptree");
+    TEST_ASSERT(f->nodes[5].has_taptree == 1, "state_right has taptree");
 
     /* Verify per-node staggered CLTV values (DFS order) */
-    TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root cltv = 1000 (root)");
-    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid ko)");
-    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
-    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 995, "kickoff_right cltv = 995 (mid ko)");
-    TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990, "state_right cltv = 990 (leaf)");
+    TEST_ASSERT_EQ(f->nodes[1].cltv_timeout, 1000, "state_root cltv = 1000 (root)");
+    TEST_ASSERT_EQ(f->nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid ko)");
+    TEST_ASSERT_EQ(f->nodes[3].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
+    TEST_ASSERT_EQ(f->nodes[4].cltv_timeout, 995, "kickoff_right cltv = 995 (mid ko)");
+    TEST_ASSERT_EQ(f->nodes[5].cltv_timeout, 990, "state_right cltv = 990 (leaf)");
 
     /* Build factory WITHOUT cltv_timeout for comparison */
-    factory_t f2;
-    factory_init(&f2, ctx, kps, 5, 2, 4);
-    f2.cltv_timeout = 0;
-    factory_set_funding(&f2, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f2), "build tree without timeout");
+    factory_t *f2 = calloc(1, sizeof(factory_t));
+    if (!f2) return 0;
+    factory_init(f2, ctx, kps, 5, 2, 4);
+    f2->cltv_timeout = 0;
+    factory_set_funding(f2, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f2), "build tree without timeout");
 
     /* spending_spk of taptree nodes should differ between f and f2 */
-    TEST_ASSERT(memcmp(f.nodes[1].spending_spk, f2.nodes[1].spending_spk, 34) != 0,
+    TEST_ASSERT(memcmp(f->nodes[1].spending_spk, f2->nodes[1].spending_spk, 34) != 0,
                 "state_root spk differs with taptree");
-    TEST_ASSERT(memcmp(f.nodes[2].spending_spk, f2.nodes[2].spending_spk, 34) != 0,
+    TEST_ASSERT(memcmp(f->nodes[2].spending_spk, f2->nodes[2].spending_spk, 34) != 0,
                 "kickoff_left spk differs with taptree");
-    TEST_ASSERT(memcmp(f.nodes[3].spending_spk, f2.nodes[3].spending_spk, 34) != 0,
+    TEST_ASSERT(memcmp(f->nodes[3].spending_spk, f2->nodes[3].spending_spk, 34) != 0,
                 "state_left spk differs with taptree");
 
     /* spending_spk of kickoff_root should be SAME (no taptree on either) */
-    TEST_ASSERT(memcmp(f.nodes[0].spending_spk, f2.nodes[0].spending_spk, 34) == 0,
+    TEST_ASSERT(memcmp(f->nodes[0].spending_spk, f2->nodes[0].spending_spk, 34) == 0,
                 "kickoff_root spk same without taptree");
 
     /* All 6 txs should sign and verify via key-path */
-    TEST_ASSERT(factory_sign_all(&f), "sign all with timeout");
+    TEST_ASSERT(factory_sign_all(f), "sign all with timeout");
 
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         TEST_ASSERT(node->is_signed, "node signed");
 
         /* Recompute sighash and verify */
@@ -323,11 +325,11 @@ int test_factory_tree_with_timeout(void) {
         uint64_t prev_amount;
 
         if (node->parent_index < 0) {
-            prev_spk = f.funding_spk;
-            prev_spk_len = f.funding_spk_len;
-            prev_amount = f.funding_amount_sats;
+            prev_spk = f->funding_spk;
+            prev_spk_len = f->funding_spk_len;
+            prev_amount = f->funding_amount_sats;
         } else {
-            factory_node_t *parent = &f.nodes[node->parent_index];
+            factory_node_t *parent = &f->nodes[node->parent_index];
             prev_spk = parent->outputs[node->parent_vout].script_pubkey;
             prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
             prev_amount = parent->outputs[node->parent_vout].amount_sats;
@@ -349,8 +351,10 @@ int test_factory_tree_with_timeout(void) {
         TEST_ASSERT(valid, msg);
     }
 
-    factory_free(&f);
-    factory_free(&f2);
+    factory_free(f);
+    free(f);
+    factory_free(f2);
+    free(f2);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -537,25 +541,26 @@ int test_regtest_timeout_spend(void) {
 
     /* Init factory with timeout, build tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
-    f.cltv_timeout = cltv_timeout;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
+    f->cltv_timeout = cltv_timeout;
 
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
 
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(&f), "advance to max epoch");
+        TEST_ASSERT(factory_advance(f), "advance to max epoch");
     printf("  Tree built: %zu nodes, kickoff_left has_taptree=%d\n",
-           f.n_nodes, f.nodes[2].has_taptree);
+           f->n_nodes, f->nodes[2].has_taptree);
 
     /* Broadcast kickoff_root (node 0), mine 1 block */
     {
-        char *tx_hex = (char *)malloc(f.nodes[0].signed_tx.len * 2 + 1);
-        hex_encode(f.nodes[0].signed_tx.data, f.nodes[0].signed_tx.len, tx_hex);
+        char *tx_hex = (char *)malloc(f->nodes[0].signed_tx.len * 2 + 1);
+        hex_encode(f->nodes[0].signed_tx.data, f->nodes[0].signed_tx.len, tx_hex);
         char txid[65];
         int sent = regtest_send_raw_tx(&rt, tx_hex, txid);
         free(tx_hex);
@@ -566,8 +571,8 @@ int test_regtest_timeout_spend(void) {
 
     /* Broadcast state_root (node 1), mine 1 block (nSeq=0 since maxed) */
     {
-        char *tx_hex = (char *)malloc(f.nodes[1].signed_tx.len * 2 + 1);
-        hex_encode(f.nodes[1].signed_tx.data, f.nodes[1].signed_tx.len, tx_hex);
+        char *tx_hex = (char *)malloc(f->nodes[1].signed_tx.len * 2 + 1);
+        hex_encode(f->nodes[1].signed_tx.data, f->nodes[1].signed_tx.len, tx_hex);
         char txid[65];
         int sent = regtest_send_raw_tx(&rt, tx_hex, txid);
         free(tx_hex);
@@ -581,8 +586,8 @@ int test_regtest_timeout_spend(void) {
 
     /* state_root output 0 is the one we want to spend via timeout.
        It pays to kickoff_left's spending_spk (which has the taptree). */
-    factory_node_t *state_root = &f.nodes[1];
-    factory_node_t *kickoff_left = &f.nodes[2];
+    factory_node_t *state_root = &f->nodes[1];
+    factory_node_t *kickoff_left = &f->nodes[2];
 
     /* Get state_root txid in display order */
     unsigned char sr_txid_display[32];
@@ -714,7 +719,8 @@ int test_regtest_timeout_spend(void) {
 
     tx_buf_free(&timeout_unsigned);
     tx_buf_free(&timeout_signed);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -752,16 +758,17 @@ int test_multi_level_timeout_unit(void) {
     unsigned char fake_txid[32];
     memset(fake_txid, 0xCC, 32);
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 2, 4);
-    f.cltv_timeout = 1000;
-    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    f->cltv_timeout = 1000;
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT_EQ(f->n_nodes, 6, "6 nodes");
 
     /* Verify each taptree node has correct CLTV in its timeout_leaf script */
-    for (size_t i = 1; i < f.n_nodes; i++) {
-        factory_node_t *node = &f.nodes[i];
+    for (size_t i = 1; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
         TEST_ASSERT(node->has_taptree == 1, "node has taptree");
         TEST_ASSERT(node->timeout_leaf.script_len > 0, "script non-empty");
 
@@ -774,28 +781,29 @@ int test_multi_level_timeout_unit(void) {
     }
 
     /* Verify CLTV ordering: leaf < mid ko < root (DFS order) */
-    TEST_ASSERT(f.nodes[3].cltv_timeout < f.nodes[2].cltv_timeout,
+    TEST_ASSERT(f->nodes[3].cltv_timeout < f->nodes[2].cltv_timeout,
                 "state_left cltv < kickoff_left cltv");
-    TEST_ASSERT(f.nodes[5].cltv_timeout < f.nodes[4].cltv_timeout,
+    TEST_ASSERT(f->nodes[5].cltv_timeout < f->nodes[4].cltv_timeout,
                 "state_right cltv < kickoff_right cltv");
-    TEST_ASSERT(f.nodes[2].cltv_timeout < f.nodes[1].cltv_timeout,
+    TEST_ASSERT(f->nodes[2].cltv_timeout < f->nodes[1].cltv_timeout,
                 "mid cltv < root cltv");
 
     /* Verify exact values: step=5, DFS order */
-    TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root = base");
-    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995,  "kickoff_left = base-5");
-    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 990,  "state_left = base-10");
-    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 995,  "kickoff_right = base-5");
-    TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990,  "state_right = base-10");
+    TEST_ASSERT_EQ(f->nodes[1].cltv_timeout, 1000, "state_root = base");
+    TEST_ASSERT_EQ(f->nodes[2].cltv_timeout, 995,  "kickoff_left = base-5");
+    TEST_ASSERT_EQ(f->nodes[3].cltv_timeout, 990,  "state_left = base-10");
+    TEST_ASSERT_EQ(f->nodes[4].cltv_timeout, 995,  "kickoff_right = base-5");
+    TEST_ASSERT_EQ(f->nodes[5].cltv_timeout, 990,  "state_right = base-10");
 
     /* All 6 txs should sign and verify via key-path */
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
-    for (size_t i = 0; i < f.n_nodes; i++) {
-        TEST_ASSERT(f.nodes[i].is_signed, "node signed");
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        TEST_ASSERT(f->nodes[i].is_signed, "node signed");
     }
 
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
