@@ -370,7 +370,6 @@ int test_regtest_factory_tree(void) {
     if (!regtest_init(&rt)) {
         printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        free(f);
         return 0;
     }
     regtest_create_wallet(&rt, "test_factory");
@@ -1154,7 +1153,6 @@ int test_regtest_burn_tx(void) {
     if (!regtest_init(&rt)) {
         printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        free(f);
         return 0;
     }
     regtest_create_wallet(&rt, "test_burn");
@@ -1545,7 +1543,6 @@ int test_regtest_factory_coop_close(void) {
     if (!regtest_init(&rt)) {
         printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        free(f);
         return 0;
     }
     regtest_create_wallet(&rt, "test_coop_f");
@@ -2921,7 +2918,6 @@ int test_regtest_tree_ordering(void) {
     if (!regtest_init(&rt)) {
         printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        free(f);
         return 0;
     }
     regtest_create_wallet(&rt, "test_tree_ord");
@@ -3074,7 +3070,6 @@ int test_regtest_dw_exhaustion_close(void) {
     if (!regtest_init(&rt)) {
         printf("  FAIL: bitcoind not running\n");
         secp256k1_context_destroy(ctx);
-        free(f);
         return 0;
     }
     regtest_create_wallet(&rt, "test_dw_exhaust");
