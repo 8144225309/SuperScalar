@@ -284,6 +284,7 @@ static void usage(const char *prog) {
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
+        "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
@@ -1009,6 +1010,7 @@ int main(int argc, char *argv[]) {
     int test_distrib = 0;
     int test_turnover = 0;
     int test_rotation = 0;
+    int test_partial_rotation = 0;
     int test_splice = 0;
     const char *test_splice_client_seckey = NULL;  /* hex seckey for test signing */
     int32_t active_blocks_arg = -1;  /* -1 = auto */
@@ -1152,6 +1154,8 @@ int main(int argc, char *argv[]) {
             test_turnover = 1;
         else if (strcmp(argv[i], "--test-rotation") == 0)
             test_rotation = 1;
+        else if (strcmp(argv[i], "--test-partial-rotation") == 0)
+            test_partial_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
         else if (strcmp(argv[i], "--test-rebalance") == 0)
@@ -3005,7 +3009,8 @@ accept_new_factory:
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
-        test_distrib || test_turnover || test_rotation || force_close || test_burn ||
+        test_distrib || test_turnover || test_rotation || test_partial_rotation ||
+        force_close || test_burn ||
         test_htlc_force_close || test_rebalance || test_batch_rebalance || test_realloc ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
         test_buy_liquidity || test_large_factory) {
