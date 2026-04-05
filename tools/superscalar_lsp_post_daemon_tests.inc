@@ -1709,6 +1709,458 @@
         return 0;
     }
 
+    /* === PARTIAL ROTATION TEST ===
+       Demonstrates the most common real-world failure: 1 of 4 clients goes
+       offline.  The LSP performs a partial rotation — PTLC turnover with
+       3 cooperative clients, creates a new factory with the cooperative
+       subset, and the old factory expires naturally with its distribution TX.
+
+       On-chain artifacts:
+         1. New factory funding TX (3 cooperative clients + LSP)
+         2. New factory cooperative close TX
+         3. Old factory distribution TX (nLockTime fallback after CLTV expiry)
+    */
+    if (test_partial_rotation && channels_active) {
+        printf("\n=== PARTIAL ROTATION TEST ===\n");
+        printf("Scenario: Client 4 goes offline, LSP rotates with clients 1-3\n\n");
+
+        if (n_clients < 3) {
+            fprintf(stderr, "PARTIAL ROTATION: need >= 3 clients (have %d)\n", n_clients);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+
+        /* Index of the client to simulate as offline */
+        int offline_idx = n_clients - 1;  /* last client */
+
+        /* --- Phase A: PTLC key turnover for cooperative clients --- */
+        printf("Phase A: PTLC key turnover (skipping client %d — offline)\n",
+               offline_idx + 1);
+
+        /* Build keypair/pubkey arrays matching production pattern */
+        secp256k1_keypair pr_kps[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pr_pks[FACTORY_MAX_SIGNERS];
+        pr_kps[0] = lsp_kp;
+        if (!secp256k1_keypair_pub(ctx, &pr_pks[0], &lsp_kp)) {
+            fprintf(stderr, "PARTIAL ROTATION: keypair_pub failed for LSP\n");
+            return 1;
+        }
+        for (int ci = 0; ci < n_clients; ci++) {
+            pr_pks[ci + 1] = lsp_p->client_pubkeys[ci];
+            pr_kps[ci + 1] = lsp_kp;  /* placeholder — not used for signing */
+        }
+
+        musig_keyagg_t pr_ka;
+        musig_aggregate_keys(ctx, &pr_ka, pr_pks, n_total);
+
+        unsigned char turnover_msg[32];
+        sha256_tagged("turnover", (const unsigned char *)"turnover", 8, turnover_msg);
+
+        int n_departed = 0;
+        for (int ci = 0; ci < n_clients; ci++) {
+            if (ci == offline_idx) {
+                printf("  Client %d: SKIPPED (offline)\n", ci + 1);
+                continue;
+            }
+            uint32_t pidx = (uint32_t)(ci + 1);
+            secp256k1_pubkey client_pk = pr_pks[pidx];
+
+            unsigned char presig[64];
+            int nonce_parity;
+            musig_keyagg_t ka_copy = pr_ka;
+            if (!adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                                                  turnover_msg, pr_kps, n_total,
+                                                  &ka_copy, NULL, &client_pk)) {
+                fprintf(stderr, "PARTIAL ROTATION: presig failed client %d\n", ci);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            /* Send PTLC_PRESIG to client */
+            cJSON *pm = wire_build_ptlc_presig(presig, nonce_parity, turnover_msg);
+            if (!wire_send(lsp_p->client_fds[ci], MSG_PTLC_PRESIG, pm)) {
+                cJSON_Delete(pm);
+                fprintf(stderr, "PARTIAL ROTATION: send presig failed client %d\n", ci);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            cJSON_Delete(pm);
+
+            /* Recv PTLC_ADAPTED_SIG (30s timeout, drain stray messages) */
+            wire_msg_t resp;
+            memset(&resp, 0, sizeof(resp));
+            {
+                struct timeval t_rs, t_rn;
+                gettimeofday(&t_rs, NULL);
+                int got_sig = 0;
+                while (1) {
+                    gettimeofday(&t_rn, NULL);
+                    int elapsed = (int)(t_rn.tv_sec - t_rs.tv_sec);
+                    int remain = 30 - elapsed;
+                    if (remain <= 0) break;
+                    if (!wire_recv_timeout(lsp_p->client_fds[ci], &resp, remain)) break;
+                    if (resp.msg_type == MSG_PTLC_ADAPTED_SIG) { got_sig = 1; break; }
+                    if (resp.msg_type == MSG_ERROR) {
+                        if (resp.json) cJSON_Delete(resp.json);
+                        memset(&resp, 0, sizeof(resp));
+                        break;
+                    }
+                    if (resp.json) cJSON_Delete(resp.json);
+                    memset(&resp, 0, sizeof(resp));
+                }
+                if (!got_sig) {
+                    if (resp.json) cJSON_Delete(resp.json);
+                    fprintf(stderr, "PARTIAL ROTATION: no adapted_sig from client %d\n", ci);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
+            }
+
+            unsigned char adapted_sig[64];
+            if (!wire_parse_ptlc_adapted_sig(resp.json, adapted_sig)) {
+                cJSON_Delete(resp.json);
+                fprintf(stderr, "PARTIAL ROTATION: parse adapted_sig failed client %d\n", ci);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            cJSON_Delete(resp.json);
+
+            /* Extract client's secret key */
+            unsigned char extracted[32];
+            if (!adaptor_extract_secret(ctx, extracted, adapted_sig, presig,
+                                          nonce_parity)) {
+                fprintf(stderr, "PARTIAL ROTATION: extract failed client %d\n", ci);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
+                fprintf(stderr, "PARTIAL ROTATION: verify failed client %d\n", ci);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            ladder_record_key_turnover(lad, 0, pidx, extracted);
+            if (use_db)
+                persist_save_departed_client(&db, 0, pidx, extracted);
+
+            /* Send PTLC_COMPLETE */
+            cJSON *cm = wire_build_ptlc_complete();
+            wire_send(lsp_p->client_fds[ci], MSG_PTLC_COMPLETE, cm);
+            cJSON_Delete(cm);
+
+            printf("  Client %d: key extracted via wire PTLC\n", ci + 1);
+            n_departed++;
+        }
+
+        printf("  %d/%d clients departed (client %d offline)\n",
+               n_departed, n_clients, offline_idx + 1);
+
+        /* Verify partial close preconditions */
+        int can_partial = ladder_can_partial_close(lad, 0);
+        int can_full = ladder_can_close(lad, 0);
+        printf("  ladder_can_close=%d  ladder_can_partial_close=%d\n",
+               can_full, can_partial);
+
+        if (!can_partial) {
+            fprintf(stderr, "PARTIAL ROTATION: ladder_can_partial_close returned false "
+                    "(n_departed=%d, need >= 2)\n", n_departed);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        /* --- Phase B: Disconnect offline client --- */
+        printf("\nPhase B: Disconnecting client %d (simulating offline)\n",
+               offline_idx + 1);
+        if (lsp_p->client_fds[offline_idx] >= 0) {
+            wire_close(lsp_p->client_fds[offline_idx]);
+            lsp_p->client_fds[offline_idx] = -1;
+        }
+
+        /* Save old factory's CLTV timeout for Phase E */
+        uint32_t old_cltv = lsp_p->factory.cltv_timeout;
+        printf("  Old factory CLTV timeout: block %u\n", old_cltv);
+
+        /* Build distribution TX for old factory BEFORE we free it */
+        tx_buf_t old_dist_tx;
+        tx_buf_init(&old_dist_tx, 512);
+        unsigned char old_dist_txid[32];
+        {
+            /* Populate keypairs so distribution TX can be signed */
+            secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+            all_kps[0] = lsp_kp;
+            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+            for (int ci = 0; ci < n_clients; ci++) {
+                unsigned char ds[32];
+                memset(ds, fill[ci], 32);
+                secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds);
+            }
+            /* Reorder to match pubkeys order */
+            {
+                secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                for (size_t slot = 0; slot < n_total; slot++) {
+                    unsigned char target[33];
+                    size_t tlen = 33;
+                    secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                        &lsp_p->factory.pubkeys[slot], SECP256K1_EC_COMPRESSED);
+                    for (size_t k = 0; k < n_total; k++) {
+                        secp256k1_pubkey kpub;
+                        secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                        unsigned char kser[33];
+                        size_t klen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                            &kpub, SECP256K1_EC_COMPRESSED);
+                        if (memcmp(target, kser, 33) == 0) {
+                            all_kps[slot] = ordered[k];
+                            break;
+                        }
+                    }
+                }
+            }
+            memcpy(lsp_p->factory.keypairs, all_kps,
+                   n_total * sizeof(secp256k1_keypair));
+
+            /* Build distribution outputs (equal split) */
+            tx_output_t dist_outputs[FACTORY_MAX_SIGNERS];
+            uint64_t dist_per = (lsp_p->factory.funding_amount_sats - 500) / n_total;
+            for (size_t ti = 0; ti < n_total; ti++) {
+                dist_outputs[ti].amount_sats = dist_per;
+                memcpy(dist_outputs[ti].script_pubkey, fund_spk, 34);
+                dist_outputs[ti].script_pubkey_len = 34;
+            }
+            dist_outputs[n_total - 1].amount_sats =
+                lsp_p->factory.funding_amount_sats - 500 - dist_per * (n_total - 1);
+
+            if (!factory_build_distribution_tx(&lsp_p->factory, &old_dist_tx,
+                    old_dist_txid, dist_outputs, n_total, old_cltv)) {
+                fprintf(stderr, "PARTIAL ROTATION: build distribution TX failed\n");
+                tx_buf_free(&old_dist_tx);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            printf("  Distribution TX built (nLockTime=%u)\n", old_cltv);
+        }
+
+        /* --- Phase C: Create new factory with cooperative subset --- */
+        printf("\nPhase C: Creating new factory with %d cooperative clients\n",
+               n_departed);
+
+        /* Remap client arrays to cooperative subset (skip offline) */
+        int saved_fds[LSP_MAX_CLIENTS];
+        secp256k1_pubkey saved_pks[LSP_MAX_CLIENTS];
+        memcpy(saved_fds, lsp_p->client_fds, sizeof(saved_fds));
+        memcpy(saved_pks, lsp_p->client_pubkeys, sizeof(saved_pks));
+        size_t saved_n = lsp_p->n_clients;
+
+        size_t n_coop = 0;
+        for (int ci = 0; ci < n_clients; ci++) {
+            if (ci == offline_idx) continue;
+            if (lsp_p->client_fds[ci] < 0) continue;
+            lsp_p->client_fds[n_coop] = saved_fds[ci];
+            lsp_p->client_pubkeys[n_coop] = saved_pks[ci];
+            n_coop++;
+        }
+        lsp_p->n_clients = n_coop;
+        printf("  Remapped %zu cooperative clients\n", n_coop);
+
+        /* Fund new factory */
+        double fund2_btc = (double)funding_sats / 100000000.0;
+        char fund2_txid_hex[65];
+        if (!regtest_fund_address(&rt, fund_addr, fund2_btc, fund2_txid_hex)) {
+            fprintf(stderr, "PARTIAL ROTATION: fund new factory failed\n");
+            lsp_p->n_clients = saved_n;
+            memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
+            memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        if (is_regtest) {
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        } else {
+            int conf2 = lsp_wait_for_confirmation_service(
+                (chain_backend_t *)mgr->chain_be, fund2_txid_hex,
+                confirm_timeout_secs,
+                chain_funding_confs((chain_backend_t *)mgr->chain_be,
+                    ((chain_backend_t *)mgr->chain_be)->is_regtest), mgr, lsp_p);
+            if (conf2 < 1) {
+                fprintf(stderr, "PARTIAL ROTATION: new factory funding not confirmed\n");
+                lsp_p->n_clients = saved_n;
+                memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
+                memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
+                tx_buf_free(&old_dist_tx);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+        }
+
+        unsigned char fund2_txid[32];
+        hex_decode(fund2_txid_hex, fund2_txid, 32);
+        reverse_bytes(fund2_txid, 32);
+
+        uint64_t fund2_amount = 0;
+        unsigned char fund2_spk[256];
+        size_t fund2_spk_len = 0;
+        uint32_t fund2_vout = 0;
+        if (!regtest_find_output(&rt, fund2_txid_hex, fund_spk, 34,
+                                   &fund2_amount, &fund2_vout,
+                                   fund2_spk, &fund2_spk_len)) {
+            fprintf(stderr, "PARTIAL ROTATION: find output for new factory failed\n");
+            lsp_p->n_clients = saved_n;
+            memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
+            memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        printf("  New factory funded: %s (vout=%u, %llu sats)\n",
+               fund2_txid_hex, fund2_vout, (unsigned long long)fund2_amount);
+
+        /* Free old factory, create new one with cooperative subset */
+        factory_free(&lsp_p->factory);
+
+        int cur_h2 = regtest_get_block_height(&rt);
+        uint32_t cltv2 = (uint32_t)cur_h2 + active_blocks + dying_blocks;
+        if (!lsp_run_factory_creation(lsp_p,
+                                       fund2_txid, fund2_vout,
+                                       fund2_amount,
+                                       fund_spk, 34,
+                                       step_blocks, 4, cltv2)) {
+            fprintf(stderr, "PARTIAL ROTATION: factory creation with %zu clients failed\n",
+                    n_coop);
+            lsp_p->n_clients = saved_n;
+            memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
+            memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        factory_set_lifecycle(&lsp_p->factory, (uint32_t)cur_h2,
+                              active_blocks, dying_blocks);
+        printf("  New factory created with %zu clients (CLTV=%u)\n",
+               n_coop, cltv2);
+
+        /* --- Phase D: Cooperative close of new factory --- */
+        printf("\nPhase D: Cooperative close of new factory\n");
+
+        lsp_channel_mgr_t *mgr2 = calloc(1, sizeof(lsp_channel_mgr_t));
+        if (!mgr2) {
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        if (!lsp_channels_init(mgr2, ctx, &lsp_p->factory, n_coop)) {
+            fprintf(stderr, "PARTIAL ROTATION: channels_init for new factory failed\n");
+            free(mgr2);
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        /* Send CHANNEL_READY */
+        for (size_t ci2 = 0; ci2 < n_coop; ci2++) {
+            cJSON *cr = wire_build_channel_ready(mgr2->entries[ci2].channel_id,
+                mgr2->entries[ci2].channel.local_amount,
+                mgr2->entries[ci2].channel.remote_amount);
+            wire_send(lsp_p->client_fds[ci2], MSG_CHANNEL_READY, cr);
+            cJSON_Delete(cr);
+        }
+
+        /* Build close outputs */
+        size_t n_close2 = 0;
+        tx_output_t close2_outputs[FACTORY_MAX_SIGNERS * 2];
+        lsp_channels_build_close_outputs(mgr2, &lsp_p->factory,
+            close2_outputs, &n_close2);
+
+        tx_buf_t close2_tx;
+        tx_buf_init(&close2_tx, 512);
+        if (!lsp_run_cooperative_close(lsp_p, &close2_tx, close2_outputs, n_close2,
+                                          (uint32_t)regtest_get_block_height(&rt))) {
+            fprintf(stderr, "PARTIAL ROTATION: cooperative close failed\n");
+            tx_buf_free(&close2_tx);
+            free(mgr2);
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        char *c2_hex = malloc(close2_tx.len * 2 + 1);
+        hex_encode(close2_tx.data, close2_tx.len, c2_hex);
+        char c2_txid[65];
+        int c2_sent = regtest_send_raw_tx(&rt, c2_hex, c2_txid);
+        if (g_db)
+            persist_log_broadcast(g_db, c2_sent ? c2_txid : "?",
+                "partial_rotation_close_new", c2_hex, c2_sent ? "ok" : "failed");
+        free(c2_hex);
+        tx_buf_free(&close2_tx);
+
+        if (!c2_sent) {
+            fprintf(stderr, "PARTIAL ROTATION: new factory close broadcast failed\n");
+            free(mgr2);
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        ADVANCE(1);
+        printf("  New factory closed: %s\n", c2_txid);
+
+        /* --- Phase E: Mine to old factory CLTV and broadcast distribution TX --- */
+        printf("\nPhase E: Old factory distribution TX (CLTV expiry)\n");
+
+        int cur_h3 = regtest_get_block_height(&rt);
+        int blocks_to_cltv = (int)old_cltv - cur_h3;
+        if (blocks_to_cltv > 0) {
+            printf("  Mining %d blocks to reach CLTV timeout %u...\n",
+                   blocks_to_cltv, old_cltv);
+            ADVANCE(blocks_to_cltv);
+        }
+
+        char *dt_hex = malloc(old_dist_tx.len * 2 + 1);
+        hex_encode(old_dist_tx.data, old_dist_tx.len, dt_hex);
+        char dt_txid_str[65];
+        int dt_sent = regtest_send_raw_tx(&rt, dt_hex, dt_txid_str);
+        if (g_db)
+            persist_log_broadcast(g_db, dt_sent ? dt_txid_str : "?",
+                "partial_rotation_dist_old", dt_hex, dt_sent ? "ok" : "failed");
+        free(dt_hex);
+        tx_buf_free(&old_dist_tx);
+
+        if (!dt_sent) {
+            fprintf(stderr, "PARTIAL ROTATION: distribution TX broadcast failed\n");
+            free(mgr2);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        ADVANCE(1);
+        printf("  Old factory distribution TX: %s\n", dt_txid_str);
+
+        /* === Results === */
+        printf("\n======================================================\n");
+        printf("  PARTIAL ROTATION TEST PASSED\n");
+        printf("======================================================\n");
+        printf("  Offline client:        %d (of %d)\n", offline_idx + 1, n_clients);
+        printf("  Cooperative clients:   %zu\n", n_coop);
+        printf("  New factory close TX:  %s\n", c2_txid);
+        printf("  Old factory dist TX:   %s\n", dt_txid_str);
+        printf("======================================================\n\n");
+
+        report_add_string(&rpt, "result", "partial_rotation_pass");
+        report_add_string(&rpt, "new_factory_close_txid", c2_txid);
+        report_add_string(&rpt, "old_factory_dist_txid", dt_txid_str);
+        report_close(&rpt);
+        free(mgr2);
+        jit_channels_cleanup(mgr);
+        if (use_db) persist_close(&db);
+        lsp_cleanup(lsp_p);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
     /* === Phase E-splice: LSP-initiated splice-out test === */
     if (test_splice && channels_active) {
         printf("\n=== SPLICE TEST ===\n");
