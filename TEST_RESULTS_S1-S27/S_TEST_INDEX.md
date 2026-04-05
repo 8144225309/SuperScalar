@@ -36,6 +36,7 @@ on-chain artifacts demonstrating a distinct SuperScalar capability.
 | **S27** | **Partial rotation** | `--test-partial-rotation` | **3/4 cooperative factory (smaller MuSig2 set) + old factory distribution TX** |
 | **S28** | **Multi-HTLC force-close** | `--test-multi-htlc-force-close` | **4 concurrent HTLC timeout TXs with staggered CSV/CLTV on leaf outputs** |
 | **S29** | **Mixed arity factory** | `--demo --arity 1,1,2` | **Variable-depth tree: different branching at each level** |
+| **S30** | **Full settlement** | `--test-full-settlement` | **Force-close tree + commitment TXs for ALL channels (cross-leaf balance proof)** |
 
 ## New Tests Detail
 
