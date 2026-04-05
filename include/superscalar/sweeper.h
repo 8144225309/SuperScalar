@@ -113,6 +113,15 @@ void sweeper_remove_factory(sweeper_t *sw, uint32_t factory_id);
 /* Free heap-allocated entries. */
 void sweeper_cleanup(sweeper_t *sw);
 
+/* --- Persistence (defined in sweeper.c) --- */
+
+/* Save a pending sweep entry to DB. */
+int persist_save_sweep(persist_t *p, const sweep_entry_t *e);
+
+/* Load all non-confirmed sweep entries from DB. Returns 1 on success. */
+int persist_load_sweeps(persist_t *p, sweep_entry_t *entries,
+                         size_t *n_entries, size_t max_entries);
+
 /* Build a to_local sweep TX.
    Spends the to_local output (P2TR with CSV tapscript) after CSV delay.
    ch: channel with basepoints and per-commitment secrets.

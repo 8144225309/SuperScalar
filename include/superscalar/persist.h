@@ -690,18 +690,8 @@ int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
                                 size_t blob_cap);
 
 /* --- Pending sweeps (schema v12) --- */
-
-/* Forward declaration — full definition in sweeper.h */
-#ifndef SUPERSCALAR_SWEEPER_H
-typedef struct sweep_entry sweep_entry_t;
-#endif
-
-/* Save a pending sweep entry. */
-int persist_save_sweep(persist_t *p, const sweep_entry_t *e);
-
-/* Load all non-confirmed sweep entries. Returns 1 on success. */
-int persist_load_sweeps(persist_t *p, sweep_entry_t *entries,
-                         size_t *n_entries, size_t max_entries);
+/* persist_save_sweep / persist_load_sweeps / persist_delete_sweep
+   are declared in sweeper.h (which has the sweep_entry_t struct). */
 
 /* Delete a sweep entry by ID. */
 int persist_delete_sweep(persist_t *p, uint32_t sweep_id);
