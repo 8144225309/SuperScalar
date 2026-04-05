@@ -82,16 +82,17 @@ int test_daemon_event_loop(void) {
     TEST_ASSERT(r == 0, "socketpair failed");
 
     /* Set up minimal lsp_t with one client fd */
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
-    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    lsp.clients_cap = LSP_MAX_CLIENTS;
-    lsp.client_fds[0] = sv[0];
-    lsp.client_fds[1] = sv[0];
-    lsp.client_fds[2] = sv[0];
-    lsp.client_fds[3] = sv[0];
-    lsp.n_clients = 4;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->client_fds[0] = sv[0];
+    lsp->client_fds[1] = sv[0];
+    lsp->client_fds[2] = sv[0];
+    lsp->client_fds[3] = sv[0];
+    lsp->n_clients = 4;
 
     /* Set up minimal channel manager */
     lsp_channel_mgr_t mgr;
@@ -107,14 +108,15 @@ int test_daemon_event_loop(void) {
     pthread_t tid;
     pthread_create(&tid, NULL, shutdown_thread, NULL);
 
-    int ok = lsp_channels_run_daemon_loop(&mgr, &lsp, &test_shutdown_flag);
+    int ok = lsp_channels_run_daemon_loop(&mgr, lsp, &test_shutdown_flag);
     TEST_ASSERT(ok, "daemon loop returned failure");
 
     pthread_join(tid, NULL);
     secp256k1_context_destroy(mgr.ctx);
     free(mgr.entries);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
     close(sv[0]);
     close(sv[1]);
     return 1;

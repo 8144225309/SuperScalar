@@ -788,12 +788,13 @@ int test_regtest_ladder_distribution_fallback(void) {
         if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 1, 4);
-    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(f, fund_txid, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* Build distribution tx: 5 equal outputs (1 per participant) */
     uint64_t dist_fee = 500;
@@ -819,7 +820,7 @@ int test_regtest_ladder_distribution_fallback(void) {
 
     tx_buf_t dist_tx;
     tx_buf_init(&dist_tx, 512);
-    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+    TEST_ASSERT(factory_build_distribution_tx(f, &dist_tx, NULL,
                                                dist_outputs, 5, nlocktime),
                 "build distribution tx");
     TEST_ASSERT(dist_tx.len > 0, "dist tx non-empty");
@@ -859,7 +860,8 @@ int test_regtest_ladder_distribution_fallback(void) {
     printf("  Distribution tx confirmed! Clients receive fallback funds.\n");
 
     tx_buf_free(&dist_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1001,19 +1003,20 @@ int test_rotation_context_save_restore(void) {
         if (!secp256k1_keypair_create(ctx, &all_kps[i + 1], s)) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 1, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
-    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Init mgr with rot fields set */
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "init mgr");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec_local, 4), "init mgr");
 
     /* Set rot fields */
     memset(mgr.rot_lsp_seckey, 0xAA, 32);
@@ -1047,7 +1050,7 @@ int test_rotation_context_save_restore(void) {
     uint32_t saved_attempted_mask = mgr.rot_attempted_mask;
 
     /* Re-init (memsets mgr to 0) */
-    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "reinit mgr");
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec_local, 4), "reinit mgr");
 
     /* Verify fields are zeroed */
     TEST_ASSERT_EQ(mgr.bridge_fd, -1, "bridge_fd reset to -1");
@@ -1084,7 +1087,8 @@ int test_rotation_context_save_restore(void) {
     TEST_ASSERT_EQ(mgr.rot_attempted_mask, 0x05, "attempted_mask restored");
 
     memset(saved_seckey, 0, 32);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1167,12 +1171,13 @@ int test_regtest_ptlc_no_coop_close(void) {
         if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 1, 4);
-    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(f, fund_txid, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* LSP has all client keys (PTLC turnover complete) but refuses coop close.
        Build distribution tx as fallback: 5 equal outputs (1 per participant). */
@@ -1199,7 +1204,7 @@ int test_regtest_ptlc_no_coop_close(void) {
 
     tx_buf_t dist_tx;
     tx_buf_init(&dist_tx, 512);
-    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+    TEST_ASSERT(factory_build_distribution_tx(f, &dist_tx, NULL,
                                                dist_outputs, 5, nlocktime),
                 "build distribution tx");
     printf("  Distribution tx built (nLockTime=%u, LSP refused coop close)\n", nlocktime);
@@ -1251,7 +1256,8 @@ int test_regtest_ptlc_no_coop_close(void) {
     printf("  PTLC turnover + no coop close → distribution fallback works!\n");
 
     tx_buf_free(&dist_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1332,12 +1338,13 @@ int test_regtest_all_offline_recovery(void) {
         if (!secp256k1_keypair_pub(ctx, &all_pks[i + 1], &client_kps[i])) return 0;
     }
 
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 1, 4);
-    factory_set_funding(&f, fund_txid, (uint32_t)found_vout,
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(f, fund_txid, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* "All clients go offline" — no client operations performed.
        LSP builds distribution tx with N+1 outputs. */
@@ -1364,7 +1371,7 @@ int test_regtest_all_offline_recovery(void) {
 
     tx_buf_t dist_tx;
     tx_buf_init(&dist_tx, 512);
-    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+    TEST_ASSERT(factory_build_distribution_tx(f, &dist_tx, NULL,
                                                dist_outputs, 5, nlocktime),
                 "build distribution tx");
 
@@ -1427,7 +1434,8 @@ int test_regtest_all_offline_recovery(void) {
     printf("  All offline recovery complete: 5 P2TR + 1 P2A anchor, client funds preserved.\n");
 
     tx_buf_free(&dist_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2004,17 +2012,18 @@ int test_regtest_funding_double_spend_rejected(void) {
     }
 
     /* Init factory, build tree, sign all (creates kickoff tx) */
-    factory_t f;
-    factory_init(&f, ctx, all_kps, 5, 1, 4);
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, all_kps, 5, 1, 4);
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
-    printf("  Factory tree built: %zu nodes\n", f.n_nodes);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+    printf("  Factory tree built: %zu nodes\n", f->n_nodes);
 
     /* Save kickoff tx hex before spending the UTXO away */
-    char *kickoff_hex = (char *)malloc(f.nodes[0].signed_tx.len * 2 + 1);
-    hex_encode(f.nodes[0].signed_tx.data, f.nodes[0].signed_tx.len, kickoff_hex);
+    char *kickoff_hex = (char *)malloc(f->nodes[0].signed_tx.len * 2 + 1);
+    hex_encode(f->nodes[0].signed_tx.data, f->nodes[0].signed_tx.len, kickoff_hex);
 
     /* Step 1: Spend the funding UTXO via cooperative close (double-spend) */
     uint64_t close_fee = 500;
@@ -2044,7 +2053,7 @@ int test_regtest_funding_double_spend_rejected(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+    TEST_ASSERT(factory_build_cooperative_close(f, &close_tx, NULL,
                                                   &close_output, 1, 0),
                 "build cooperative close");
 
@@ -2070,7 +2079,8 @@ int test_regtest_funding_double_spend_rejected(void) {
     printf("  Kickoff correctly rejected — Bitcoin consensus prevents double-spend\n");
 
     tx_buf_free(&close_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }

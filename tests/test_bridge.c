@@ -1234,16 +1234,17 @@ int test_regtest_bridge_payment(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], lsp_port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], lsp_port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
@@ -1254,19 +1255,19 @@ int test_regtest_bridge_payment(void) {
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
-        if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, bridge_seckeys[0], 4)) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp->factory, bridge_seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        if (!lsp_channels_send_ready(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: send channel_ready failed\n");
             lsp_ok = 0;
         }
@@ -1294,7 +1295,7 @@ int test_regtest_bridge_payment(void) {
                  → forwards to client 0, waits for REVOKE_AND_ACK (client callback handles)
                Iteration 2: client_fd[0] readable → handle_msg(FULFILL_HTLC)
                  → checks bridge origin → writes BRIDGE_FULFILL_HTLC to bridge_fd */
-            if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 2)) {
+            if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 2)) {
                 fprintf(stderr, "LSP: event loop failed\n");
                 lsp_ok = 0;
             }
@@ -1360,7 +1361,7 @@ int test_regtest_bridge_payment(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1391,7 +1392,8 @@ int test_regtest_bridge_payment(void) {
         }
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
     secp256k1_context_destroy(ctx);
     return lsp_ok;
 }
@@ -1665,16 +1667,17 @@ int test_regtest_bridge_invoice_flow(void) {
     }
 
     /* Parent: run LSP */
-    lsp_t lsp;
-    lsp_init(&lsp, ctx, &kps[0], lsp_port, 4);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], lsp_port, 4);
     int lsp_ok = 1;
 
-    if (!lsp_accept_clients(&lsp)) {
+    if (!lsp_accept_clients(lsp)) {
         fprintf(stderr, "LSP: accept clients failed\n");
         lsp_ok = 0;
     }
 
-    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
@@ -1685,19 +1688,19 @@ int test_regtest_bridge_invoice_flow(void) {
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
     if (lsp_ok) {
-        if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, bridge_seckeys[0], 4)) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp->factory, bridge_seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
     if (lsp_ok) {
-        if (!lsp_channels_send_ready(&ch_mgr, &lsp)) {
+        if (!lsp_channels_send_ready(&ch_mgr, lsp)) {
             fprintf(stderr, "LSP: send channel_ready failed\n");
             lsp_ok = 0;
         }
@@ -1714,7 +1717,7 @@ int test_regtest_bridge_invoice_flow(void) {
 
             /* Step 1: Run event loop for 1 msg — client sends MSG_REGISTER_INVOICE,
                LSP handles it and writes MSG_BRIDGE_REGISTER to bridge_fd */
-            if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 1)) {
+            if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
                 fprintf(stderr, "LSP: event loop (register) failed\n");
                 lsp_ok = 0;
             }
@@ -1755,7 +1758,7 @@ int test_regtest_bridge_invoice_flow(void) {
 
                 /* Step 4: Run event loop for 1 msg — LSP receives INVOICE_BOLT11
                    from bridge_fd, forwards to client */
-                if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 1)) {
+                if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
                     fprintf(stderr, "LSP: event loop (bolt11) failed\n");
                     lsp_ok = 0;
                 }
@@ -1769,7 +1772,7 @@ int test_regtest_bridge_invoice_flow(void) {
 
                 /* Step 6: Run event loop for 2 msgs — LSP forwards to client,
                    client fulfills, LSP writes BRIDGE_FULFILL_HTLC */
-                if (!lsp_channels_run_event_loop(&ch_mgr, &lsp, 2)) {
+                if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 2)) {
                     fprintf(stderr, "LSP: event loop (htlc) failed\n");
                     lsp_ok = 0;
                 }
@@ -1836,7 +1839,7 @@ int test_regtest_bridge_invoice_flow(void) {
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1867,7 +1870,8 @@ int test_regtest_bridge_invoice_flow(void) {
         }
     }
 
-    lsp_cleanup(&lsp);
+    lsp_cleanup(lsp);
+    free(lsp);
     secp256k1_context_destroy(ctx);
     return lsp_ok;
 }
