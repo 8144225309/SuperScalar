@@ -2025,6 +2025,59 @@
         printf("  New factory funded: %s (vout=%u, %llu sats)\n",
                fund2_txid_hex, fund2_vout, (unsigned long long)fund2_amount);
 
+        /* Disconnect cooperative clients so they reconnect fresh for new
+           factory creation.  Client daemon loops detect wire_recv failure,
+           exit, and the main() reconnect loop retries the connection. */
+        printf("  Disconnecting cooperative clients for fresh factory ceremony...\n");
+        for (size_t ci = 0; ci < n_coop; ci++) {
+            if (lsp_p->client_fds[ci] >= 0) {
+                wire_close(lsp_p->client_fds[ci]);
+                lsp_p->client_fds[ci] = -1;
+            }
+        }
+
+        /* Accept n_coop fresh connections (clients auto-reconnect) */
+        printf("  Waiting for %zu clients to reconnect...\n", n_coop);
+        {
+            size_t accepted = 0;
+            for (int attempt = 0; attempt < 60 && accepted < n_coop; attempt++) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(lsp_p->listen_fd, &rfds);
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                int sel = select(lsp_p->listen_fd + 1, &rfds, NULL, NULL, &tv);
+                if (sel <= 0) continue;
+
+                int new_fd = wire_accept(lsp_p->listen_fd);
+                if (new_fd < 0) continue;
+
+                int hs;
+                if (lsp_p->use_nk)
+                    hs = wire_noise_handshake_nk_responder(new_fd, ctx, lsp_p->nk_seckey);
+                else
+                    hs = wire_noise_handshake_responder(new_fd, ctx);
+                if (!hs) { wire_close(new_fd); continue; }
+
+                /* Drain the HELLO or RECONNECT message the client sends */
+                wire_msg_t peek;
+                if (wire_recv_timeout(new_fd, &peek, 5)) {
+                    if (peek.json) cJSON_Delete(peek.json);
+                }
+
+                lsp_p->client_fds[accepted] = new_fd;
+                accepted++;
+                printf("  Client %zu reconnected (fd=%d)\n", accepted, new_fd);
+            }
+            if (accepted < n_coop) {
+                fprintf(stderr, "PARTIAL ROTATION: only %zu/%zu clients reconnected\n",
+                        accepted, n_coop);
+                tx_buf_free(&old_dist_tx);
+                lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+        }
+        lsp_p->n_clients = n_coop;
+
         /* Free old factory, create new one with cooperative subset */
         factory_free(&lsp_p->factory);
 
@@ -2037,9 +2090,6 @@
                                        step_blocks, 4, cltv2)) {
             fprintf(stderr, "PARTIAL ROTATION: factory creation with %zu clients failed\n",
                     n_coop);
-            lsp_p->n_clients = saved_n;
-            memcpy(lsp_p->client_fds, saved_fds, sizeof(saved_fds));
-            memcpy(lsp_p->client_pubkeys, saved_pks, sizeof(saved_pks));
             tx_buf_free(&old_dist_tx);
             lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
