@@ -2053,7 +2053,7 @@
             lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
-        if (!lsp_channels_init(mgr2, ctx, &lsp_p->factory, n_coop)) {
+        if (!lsp_channels_init(mgr2, ctx, &lsp_p->factory, lsp_seckey, n_coop)) {
             fprintf(stderr, "PARTIAL ROTATION: channels_init for new factory failed\n");
             free(mgr2);
             tx_buf_free(&old_dist_tx);
