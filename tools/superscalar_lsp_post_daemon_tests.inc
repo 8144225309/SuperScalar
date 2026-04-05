@@ -2036,6 +2036,12 @@
             }
         }
         lsp_p->n_clients = n_coop;
+        lsp_p->expected_clients = n_coop;
+
+        /* Kill offline client process so it doesn't reconnect and
+           consume a slot in lsp_accept_clients. */
+        /* (handled externally — offline client's process should be
+            terminated before this point, or it'll grab a slot) */
 
         /* Accept fresh client connections via standard accept flow.
            Clients auto-reconnect and lsp_accept_clients handles the
