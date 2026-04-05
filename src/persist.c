@@ -298,6 +298,22 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS pending_cs ("
     "  channel_id INTEGER PRIMARY KEY,"
     "  commitment_number INTEGER NOT NULL"
+    ");"
+    /* Schema v12: pending sweeps for auto-settlement */
+    "CREATE TABLE IF NOT EXISTS pending_sweeps ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  sweep_type TEXT NOT NULL,"
+    "  state INTEGER NOT NULL DEFAULT 0,"
+    "  source_txid TEXT NOT NULL,"
+    "  source_vout INTEGER NOT NULL,"
+    "  amount_sats INTEGER NOT NULL,"
+    "  csv_delay INTEGER NOT NULL DEFAULT 0,"
+    "  confirmed_height INTEGER NOT NULL DEFAULT 0,"
+    "  channel_id INTEGER NOT NULL,"
+    "  factory_id INTEGER NOT NULL,"
+    "  commitment_number INTEGER NOT NULL DEFAULT 0,"
+    "  sweep_txid TEXT DEFAULT '',"
+    "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -631,6 +647,35 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_exec(p->db,
             "ALTER TABLE ladder_factories ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
+    }
+
+    /* v12: pending sweeps for auto-settlement */
+    if (db_version < 12) {
+        const char *sql_v12 =
+            "CREATE TABLE IF NOT EXISTS pending_sweeps ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  sweep_type TEXT NOT NULL,"
+            "  state INTEGER NOT NULL DEFAULT 0,"
+            "  source_txid TEXT NOT NULL,"
+            "  source_vout INTEGER NOT NULL,"
+            "  amount_sats INTEGER NOT NULL,"
+            "  csv_delay INTEGER NOT NULL DEFAULT 0,"
+            "  confirmed_height INTEGER NOT NULL DEFAULT 0,"
+            "  channel_id INTEGER NOT NULL,"
+            "  factory_id INTEGER NOT NULL,"
+            "  commitment_number INTEGER NOT NULL DEFAULT 0,"
+            "  sweep_txid TEXT DEFAULT '',"
+            "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr12 = NULL;
+        if (sqlite3_exec(p->db, sql_v12, NULL, NULL, &merr12) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v12 failed: %s\n",
+                    merr12 ? merr12 : "unknown");
+            sqlite3_free(merr12);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
     }
 
     /* Record the current version if not already present */
