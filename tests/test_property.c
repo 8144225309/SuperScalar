@@ -426,19 +426,20 @@ int test_prop_persist_factory_roundtrip(void) {
         uint16_t step = 6;
         uint32_t states = 2 + (rand_r(&seed) % 6);  /* 2-7 */
 
-        factory_t f;
-        memset(&f, 0, sizeof(f));
-        f.n_participants = n;
-        f.funding_amount_sats = amount;
-        f.step_blocks = step;
-        f.states_per_layer = states;
-        f.cltv_timeout = 1000 + (rand_r(&seed) % 9000);
-        f.fee_per_tx = 300;
-        f.leaf_arity = 2;
+        factory_t *f = calloc(1, sizeof(factory_t));
+        if (!f) return 0;
+
+        f->n_participants = n;
+        f->funding_amount_sats = amount;
+        f->step_blocks = step;
+        f->states_per_layer = states;
+        f->cltv_timeout = 1000 + (rand_r(&seed) % 9000);
+        f->fee_per_tx = 300;
+        f->leaf_arity = 2;
         /* Generate random funding txid */
         for (int i = 0; i < 32; i++)
-            f.funding_txid[i] = (unsigned char)(rand_r(&seed) & 0xff);
-        f.funding_vout = rand_r(&seed) % 4;
+            f->funding_txid[i] = (unsigned char)(rand_r(&seed) & 0xff);
+        f->funding_vout = rand_r(&seed) % 4;
 
         /* Generate participant keys (deterministic from seed) */
         unsigned char secs[3][32];
@@ -446,7 +447,7 @@ int test_prop_persist_factory_roundtrip(void) {
             memset(secs[i], 0, 32);
             secs[i][0] = (unsigned char)(trial * 3 + i + 1);
             secs[i][1] = (unsigned char)(rand_r(&seed) & 0xff);
-            if (!secp256k1_ec_pubkey_create(ctx, &f.pubkeys[i], secs[i])) {
+            if (!secp256k1_ec_pubkey_create(ctx, &f->pubkeys[i], secs[i])) {
                 persist_close(&db);
                 secp256k1_context_destroy(ctx);
                 TEST_ASSERT(0, "ec_pubkey_create failed");
@@ -455,22 +456,24 @@ int test_prop_persist_factory_roundtrip(void) {
 
         /* Save */
         uint32_t fid = (uint32_t)(trial + 1);
-        int saved = persist_save_factory(&db, &f, ctx, fid);
+        int saved = persist_save_factory(&db, f, ctx, fid);
         TEST_ASSERT(saved, "persist_save_factory failed");
 
         /* Load and compare */
-        factory_t loaded;
-        memset(&loaded, 0, sizeof(loaded));
+        factory_t *loaded = calloc(1, sizeof(factory_t));
+        if (!loaded) return 0;
 
-        int loaded_ok = persist_load_factory(&db, fid, &loaded, ctx);
+        int loaded_ok = persist_load_factory(&db, fid, loaded, ctx);
         TEST_ASSERT(loaded_ok, "persist_load_factory failed");
-        TEST_ASSERT_EQ((long)loaded.n_participants, (long)n,
+        TEST_ASSERT_EQ((long)loaded->n_participants, (long)n,
                         "n_participants mismatch");
-        TEST_ASSERT_EQ((long)loaded.funding_amount_sats, (long)amount,
+        TEST_ASSERT_EQ((long)loaded->funding_amount_sats, (long)amount,
                         "funding_amount mismatch");
-        TEST_ASSERT_EQ((long)loaded.states_per_layer, (long)states,
+        TEST_ASSERT_EQ((long)loaded->states_per_layer, (long)states,
                         "states_per_layer mismatch");
 
+        free(f);
+        free(loaded);
         persist_close(&db);
     }
 
@@ -919,13 +922,14 @@ int test_prop_cli_command_fuzzing(void) {
     mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
     mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
 
-    lsp_t lsp;
-    memset(&lsp, 0, sizeof(lsp));
-    lsp.client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
-    lsp.client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    lsp.clients_cap = LSP_MAX_CLIENTS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
     for (size_t i = 0; i < LSP_MAX_CLIENTS; i++)
-        lsp.client_fds[i] = -1;
+        lsp->client_fds[i] = -1;
 
     volatile sig_atomic_t shutdown_flag = 0;
 
@@ -940,7 +944,7 @@ int test_prop_cli_command_fuzzing(void) {
     };
     for (int i = 0; i < (int)(sizeof(known) / sizeof(known[0])); i++) {
         shutdown_flag = 0;
-        lsp_channels_handle_cli_line(&mgr, &lsp, known[i], &shutdown_flag);
+        lsp_channels_handle_cli_line(&mgr, lsp, known[i], &shutdown_flag);
         /* No crash = success */
     }
 
@@ -958,25 +962,26 @@ int test_prop_cli_command_fuzzing(void) {
             if (buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
 
         shutdown_flag = 0;
-        lsp_channels_handle_cli_line(&mgr, &lsp, buf, &shutdown_flag);
+        lsp_channels_handle_cli_line(&mgr, lsp, buf, &shutdown_flag);
         /* No crash = success */
     }
 
     /* Specific edge cases */
-    lsp_channels_handle_cli_line(&mgr, &lsp, "", &shutdown_flag);
-    lsp_channels_handle_cli_line(&mgr, &lsp, " ", &shutdown_flag);
-    lsp_channels_handle_cli_line(&mgr, &lsp,
+    lsp_channels_handle_cli_line(&mgr, lsp, "", &shutdown_flag);
+    lsp_channels_handle_cli_line(&mgr, lsp, " ", &shutdown_flag);
+    lsp_channels_handle_cli_line(&mgr, lsp,
         "pay 999999999999 999999999999 999999999999999999", &shutdown_flag);
-    lsp_channels_handle_cli_line(&mgr, &lsp,
+    lsp_channels_handle_cli_line(&mgr, lsp,
         "rebalance -1 -1 -1", &shutdown_flag);
-    lsp_channels_handle_cli_line(&mgr, &lsp,
+    lsp_channels_handle_cli_line(&mgr, lsp,
         "pay \x00hidden", &shutdown_flag);
 
     free(mgr.entries);
     free(mgr.invoices);
     free(mgr.htlc_origins);
-    free(lsp.client_fds);
-    free(lsp.client_pubkeys);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
     secp256k1_context_destroy(ctx);
     return 1;
 }

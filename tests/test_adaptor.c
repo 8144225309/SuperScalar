@@ -397,11 +397,12 @@ int test_ptlc_factory_coop_close_after_turnover(void) {
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAA, 32);
 
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 2, 4);
-    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* Simulate PTLC: extract all 4 clients' keys */
     unsigned char extracted_keys[4][32];
@@ -440,22 +441,23 @@ int test_ptlc_factory_coop_close_after_turnover(void) {
     }
 
     /* Swap keypairs in factory */
-    memcpy(f.keypairs, close_kps, 5 * sizeof(secp256k1_keypair));
+    memcpy(f->keypairs, close_kps, 5 * sizeof(secp256k1_keypair));
 
     tx_output_t outputs[1];
     outputs[0].amount_sats = 100000 - 500;
-    build_p2tr_script_pubkey(outputs[0].script_pubkey, &f.nodes[0].tweaked_pubkey);
+    build_p2tr_script_pubkey(outputs[0].script_pubkey, &f->nodes[0].tweaked_pubkey);
     outputs[0].script_pubkey_len = 34;
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+    TEST_ASSERT(factory_build_cooperative_close(f, &close_tx, NULL,
                                                   outputs, 1, 0),
                 "build coop close with extracted keys");
     TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
 
     tx_buf_free(&close_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -578,14 +580,15 @@ int test_regtest_ptlc_turnover(void) {
            funding_txid_hex, found_vout, (unsigned long)fund_amount);
 
     /* Init factory */
-    factory_t f;
-    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 1, 4);
     for (int i = 0; i < 15; i++)
-        dw_counter_advance(&f.counter);
-    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+        dw_counter_advance(&f->counter);
+    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
                          fund_amount, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(&f), "build tree");
-    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
 
     /* PTLC: extract all 4 clients' keys via adaptor signatures */
     unsigned char extracted_keys[4][32];
@@ -616,7 +619,7 @@ int test_regtest_ptlc_turnover(void) {
         if (!secp256k1_keypair_create(ctx, &close_kps[c + 1], extracted_keys[c])) return 0;
     }
 
-    memcpy(f.keypairs, close_kps, 5 * sizeof(secp256k1_keypair));
+    memcpy(f->keypairs, close_kps, 5 * sizeof(secp256k1_keypair));
 
     /* Close to LSP's address */
     tx_output_t close_output;
@@ -638,7 +641,7 @@ int test_regtest_ptlc_turnover(void) {
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
-    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+    TEST_ASSERT(factory_build_cooperative_close(f, &close_tx, NULL,
                                                   &close_output, 1, 0),
                 "build coop close");
 
@@ -658,7 +661,8 @@ int test_regtest_ptlc_turnover(void) {
     printf("  PTLC key turnover + coop close confirmed!\n");
 
     tx_buf_free(&close_tx);
-    factory_free(&f);
+    factory_free(f);
+    free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
