@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 13
+#define PERSIST_SCHEMA_VERSION 14
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -706,6 +706,19 @@ int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
                                  unsigned char *signed_tx_out,
                                  size_t *signed_tx_len_out,
                                  size_t max_tx_len);
+
+/* --- Distribution TX (schema v14) --- */
+
+/* Save the signed distribution TX for a factory (client or LSP). */
+int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  const unsigned char *signed_tx,
+                                  size_t signed_tx_len);
+
+/* Load the signed distribution TX. Returns 1 if found. */
+int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  unsigned char *signed_tx_out,
+                                  size_t *signed_tx_len_out,
+                                  size_t max_len);
 
 /* --- Pending sweeps (schema v12) --- */
 /* persist_save_sweep / persist_load_sweeps / persist_delete_sweep

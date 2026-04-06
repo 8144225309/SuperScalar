@@ -625,6 +625,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
                 persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* Save signed distribution TX if available */
+                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                    persist_save_distribution_tx(cbd->db, 0,
+                        factory->dist_unsigned_tx.data,
+                        factory->dist_unsigned_tx.len);
+                }
                 /* Save initial local PCS so they survive crash before first payment */
                 for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
                     unsigned char pcs[32];
@@ -1425,6 +1431,12 @@ handle_message:
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0)) {
+                        /* Save signed distribution TX if available */
+                        if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                            persist_save_distribution_tx(cbd->db, 0,
+                                factory->dist_unsigned_tx.data,
+                                factory->dist_unsigned_tx.len);
+                        }
                         /* Save initial PCS for the new rotated channel so they
                            survive crash before first payment on the new factory */
                         for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
@@ -2074,6 +2086,32 @@ int main(int argc, char *argv[]) {
                 }
             } else {
                 printf("Force-close: no signed commitment TX in DB\n");
+            }
+        }
+
+        /* Broadcast distribution TX as nLockTime fallback */
+        {
+            unsigned char dist_tx_data[8192];
+            size_t dist_tx_len = 0;
+            if (persist_load_distribution_tx(&db, 0,
+                                              dist_tx_data, &dist_tx_len,
+                                              sizeof(dist_tx_data)) &&
+                dist_tx_len > 0) {
+                char *tx_hex = malloc(dist_tx_len * 2 + 1);
+                if (tx_hex) {
+                    extern void hex_encode(const unsigned char *, size_t, char *);
+                    hex_encode(dist_tx_data, dist_tx_len, tx_hex);
+                    char dist_txid[65];
+                    if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
+                        printf("Force-close: distribution TX broadcast: %s\n",
+                               dist_txid);
+                    else
+                        printf("Force-close: distribution TX not yet mature "
+                               "(nLockTime not reached)\n");
+                    free(tx_hex);
+                }
+            } else {
+                printf("Force-close: no distribution TX in DB\n");
             }
         }
 

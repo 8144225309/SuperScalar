@@ -306,6 +306,11 @@ static const char *SCHEMA_SQL =
     "  sig64_hex TEXT NOT NULL,"
     "  signed_tx_hex TEXT NOT NULL"
     ");"
+    /* Schema v14: distribution TX for inverted timeout default */
+    "CREATE TABLE IF NOT EXISTS distribution_txs ("
+    "  factory_id INTEGER PRIMARY KEY,"
+    "  signed_tx_hex TEXT NOT NULL"
+    ");"
     /* Schema v12: pending sweeps for auto-settlement */
     "CREATE TABLE IF NOT EXISTS pending_sweeps ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -670,6 +675,24 @@ int persist_open(persist_t *p, const char *path) {
             fprintf(stderr, "persist_open: migration v13 failed: %s\n",
                     merr13 ? merr13 : "unknown");
             sqlite3_free(merr13);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v14: distribution TX for inverted timeout default */
+    if (db_version < 14) {
+        const char *sql_v14 =
+            "CREATE TABLE IF NOT EXISTS distribution_txs ("
+            "  factory_id INTEGER PRIMARY KEY,"
+            "  signed_tx_hex TEXT NOT NULL"
+            ");";
+        char *merr14 = NULL;
+        if (sqlite3_exec(p->db, sql_v14, NULL, NULL, &merr14) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v14 failed: %s\n",
+                    merr14 ? merr14 : "unknown");
+            sqlite3_free(merr14);
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
@@ -4172,6 +4195,70 @@ int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
         }
 
         found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Distribution TX (schema v14) --- */
+
+int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  const unsigned char *signed_tx,
+                                  size_t signed_tx_len)
+{
+    if (!p || !p->db || !signed_tx || signed_tx_len == 0) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO distribution_txs "
+        "(factory_id, signed_tx_hex) VALUES (?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    char *tx_hex = (char *)malloc(signed_tx_len * 2 + 1);
+    if (!tx_hex) { sqlite3_finalize(stmt); return 0; }
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_text(stmt, 2, tx_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  unsigned char *signed_tx_out,
+                                  size_t *signed_tx_len_out,
+                                  size_t max_len)
+{
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT signed_tx_hex FROM distribution_txs WHERE factory_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *tx_hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (tx_hex) {
+            size_t hex_len = strlen(tx_hex);
+            size_t raw_len = hex_len / 2;
+            if (signed_tx_out && raw_len <= max_len) {
+                hex_decode(tx_hex, signed_tx_out, raw_len);
+                if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+            } else if (signed_tx_len_out) {
+                *signed_tx_len_out = raw_len;
+            }
+            found = 1;
+        }
     }
     sqlite3_finalize(stmt);
     return found;
