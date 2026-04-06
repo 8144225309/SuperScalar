@@ -4334,8 +4334,10 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
 
         uint64_t sum = ch->local_amount + ch->remote_amount;
         for (size_t h = 0; h < ch->n_htlcs; h++) {
-            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
                 sum += ch->htlcs[h].amount_sats;
+                sum += ch->htlcs[h].fee_at_add;
+            }
         }
         for (size_t p = 0; p < ch->n_ptlcs; p++) {
             if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)

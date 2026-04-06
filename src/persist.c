@@ -699,6 +699,17 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v15: per-HTLC fee tracking for conservation invariant */
+    if (db_version < 15) {
+        const char *sql_v15 =
+            "ALTER TABLE htlcs ADD COLUMN fee_at_add INTEGER DEFAULT 0;";
+        char *merr15 = NULL;
+        /* ALTER TABLE fails silently if column already exists in some
+           SQLite versions; ignore errors from duplicate column. */
+        sqlite3_exec(p->db, sql_v15, NULL, NULL, &merr15);
+        sqlite3_free(merr15);
+    }
+
     /* v12: pending sweeps for auto-settlement */
     if (db_version < 12) {
         const char *sql_v12 =
@@ -1385,8 +1396,8 @@ int persist_save_htlc(persist_t *p, uint32_t channel_id,
     const char *sql =
         "INSERT OR REPLACE INTO htlcs "
         "(channel_id, htlc_id, direction, amount, payment_hash, "
-        " payment_preimage, cltv_expiry, state) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+        " payment_preimage, cltv_expiry, state, fee_at_add) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -1400,6 +1411,7 @@ int persist_save_htlc(persist_t *p, uint32_t channel_id,
     sqlite3_bind_text(stmt, 6, preimage_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 7, (int)htlc->cltv_expiry);
     sqlite3_bind_text(stmt, 8, state_str, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)htlc->fee_at_add);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1412,7 +1424,7 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
 
     const char *sql =
         "SELECT htlc_id, direction, amount, payment_hash, "
-        "payment_preimage, cltv_expiry, state "
+        "payment_preimage, cltv_expiry, state, fee_at_add "
         "FROM htlcs WHERE channel_id = ? ORDER BY htlc_id;";
 
     sqlite3_stmt *stmt;
@@ -1451,6 +1463,8 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
             h->state = HTLC_STATE_FAILED;
         else
             h->state = HTLC_STATE_ACTIVE;
+
+        h->fee_at_add = (uint64_t)sqlite3_column_int64(stmt, 7);
 
         count++;
     }

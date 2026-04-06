@@ -30,6 +30,7 @@ typedef struct {
     unsigned char payment_preimage[32];  /* filled on fulfill */
     uint32_t cltv_expiry;
     uint64_t id;
+    uint64_t fee_at_add;  /* per-HTLC fee deducted from funder at add time */
 } htlc_t;
 
 /* PTLC (Point Time-Locked Contract) — adaptor-signature based payment */
