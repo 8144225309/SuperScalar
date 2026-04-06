@@ -527,6 +527,26 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
 
     if (count > 0)
         printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
+
+    /* Parse signed distribution TX if present */
+    cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
+    if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
+        const char *dhex = dist_hex_j->valuestring;
+        size_t dlen = strlen(dhex);
+        if (dlen >= 2 && dlen % 2 == 0) {
+            size_t draw = dlen / 2;
+            tx_buf_free(&f->dist_unsigned_tx);
+            tx_buf_init(&f->dist_unsigned_tx, draw);
+            f->dist_unsigned_tx.len = draw;
+            if (hex_decode(dhex, f->dist_unsigned_tx.data, draw) == (int)draw) {
+                f->dist_tx_ready = 2;  /* 2 = signed distribution TX */
+                printf("Client: stored signed distribution TX (%zu bytes)\n", draw);
+            } else {
+                f->dist_unsigned_tx.len = 0;
+            }
+        }
+    }
+
     return count;
 }
 
@@ -667,7 +687,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     secp256k1_musig_secnonce *secnonces =
         (secp256k1_musig_secnonce *)calloc(my_node_count, sizeof(secp256k1_musig_secnonce));
     wire_bundle_entry_t *nonce_entries =
-        (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+        (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
     if (my_node_count > 0 && (!secnonces || !nonce_entries)) {
         free(secnonces); free(nonce_entries);
         memset(my_seckey, 0, 32);
@@ -1178,7 +1198,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     secp256k1_musig_secnonce *my_secnonce_ptrs[FACTORY_MAX_NODES];
     wire_bundle_entry_t *nonce_entries =
-        (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+        (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
 
     if (my_node_count > 0 && !nonce_entries) {
         fprintf(stderr, "Client: alloc failed\n");
@@ -1211,6 +1231,46 @@ int client_run_with_channels(secp256k1_context *ctx,
         memcpy(nonce_entries[nonce_count].data, nonce_ser, 66);
         nonce_entries[nonce_count].data_len = 66;
         nonce_count++;
+    }
+
+    /* Distribution TX: build unsigned TX and generate nonce.
+       The distribution TX uses the same keyagg as node 0 (root). */
+    int client_has_dist = 0;
+    uint32_t client_dist_node_idx = (uint32_t)factory->n_nodes;
+    musig_signing_session_t client_dist_session;
+    secp256k1_musig_secnonce client_dist_secnonce;
+    memset(&client_dist_session, 0, sizeof(client_dist_session));
+    {
+        int dist_slot = factory_find_signer_slot(factory, 0, my_index);
+        if (dist_slot >= 0 && factory->cltv_timeout > 0) {
+            tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+            size_t n_dist = factory_compute_distribution_outputs(factory,
+                dist_outputs, FACTORY_MAX_SIGNERS + 1, 500);
+            if (n_dist > 0 &&
+                factory_build_distribution_tx_unsigned(factory, dist_outputs,
+                    n_dist, factory->cltv_timeout)) {
+                /* Generate nonce for distribution TX */
+                secp256k1_musig_secnonce *dist_sec;
+                secp256k1_musig_pubnonce dist_pub;
+                if (musig_nonce_pool_next(&my_pool, &dist_sec, &dist_pub)) {
+                    client_dist_secnonce = *dist_sec;
+                    musig_session_init(&client_dist_session,
+                                        &factory->nodes[0].keyagg,
+                                        factory->n_participants);
+                    musig_session_set_pubnonce(&client_dist_session,
+                                                (size_t)dist_slot, &dist_pub);
+
+                    unsigned char dist_nonce_ser[66];
+                    musig_pubnonce_serialize(ctx, dist_nonce_ser, &dist_pub);
+                    nonce_entries[nonce_count].node_idx = client_dist_node_idx;
+                    nonce_entries[nonce_count].signer_slot = (uint32_t)dist_slot;
+                    memcpy(nonce_entries[nonce_count].data, dist_nonce_ser, 66);
+                    nonce_entries[nonce_count].data_len = 66;
+                    nonce_count++;
+                    client_has_dist = 1;
+                }
+            }
+        }
     }
 
     /* Send NONCE_BUNDLE */
@@ -1249,7 +1309,10 @@ int client_run_with_channels(secp256k1_context *ctx,
                 cJSON_Delete(msg.json);
                 goto fail;
             }
-            if (!factory_session_set_nonce(factory, all_entries[e].node_idx,
+            if (client_has_dist && all_entries[e].node_idx == client_dist_node_idx) {
+                musig_session_set_pubnonce(&client_dist_session,
+                    all_entries[e].signer_slot, &pn);
+            } else if (!factory_session_set_nonce(factory, all_entries[e].node_idx,
                                             all_entries[e].signer_slot, &pn)) {
                 fprintf(stderr, "Client: set nonce failed node %u slot %u\n",
                         all_entries[e].node_idx, all_entries[e].signer_slot);
@@ -1266,10 +1329,19 @@ int client_run_with_channels(secp256k1_context *ctx,
         goto fail;
     }
 
+    /* Finalize distribution TX signing session */
+    if (client_has_dist && factory->dist_tx_ready) {
+        if (!musig_session_finalize_nonces(ctx, &client_dist_session,
+                                            factory->dist_sighash, NULL, NULL)) {
+            fprintf(stderr, "Client: dist TX session finalize failed\n");
+            client_has_dist = 0;
+        }
+    }
+
     /* Create partial sigs */
     {
         wire_bundle_entry_t *psig_entries =
-            (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+            (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
         if (my_node_count > 0 && !psig_entries) {
             fprintf(stderr, "Client: alloc failed\n");
             goto fail;
@@ -1298,6 +1370,23 @@ int client_run_with_channels(secp256k1_context *ctx,
             psig_entries[psig_count].data_len = 32;
             psig_count++;
             psig_nonce_idx++;
+        }
+
+        /* Distribution TX partial sig */
+        if (client_has_dist && factory->dist_tx_ready) {
+            secp256k1_musig_partial_sig dist_psig;
+            if (musig_create_partial_sig(ctx, &dist_psig,
+                                          &client_dist_secnonce, keypair,
+                                          &client_dist_session)) {
+                unsigned char dist_psig_ser[32];
+                musig_partial_sig_serialize(ctx, dist_psig_ser, &dist_psig);
+                int dist_slot = factory_find_signer_slot(factory, 0, my_index);
+                psig_entries[psig_count].node_idx = client_dist_node_idx;
+                psig_entries[psig_count].signer_slot = (uint32_t)(dist_slot >= 0 ? dist_slot : 0);
+                memcpy(psig_entries[psig_count].data, dist_psig_ser, 32);
+                psig_entries[psig_count].data_len = 32;
+                psig_count++;
+            }
         }
 
         cJSON *bundle = wire_build_psig_bundle(psig_entries, psig_count);
