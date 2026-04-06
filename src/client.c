@@ -1253,7 +1253,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* Pre-generate nonce pool */
     musig_nonce_pool_t my_pool;
-    if (!musig_nonce_pool_generate(ctx, &my_pool, my_node_count,
+    if (!musig_nonce_pool_generate(ctx, &my_pool, my_node_count + 1,
                                     my_seckey, &my_pubkey, NULL)) {
         fprintf(stderr, "Client: nonce pool generation failed\n");
         client_send_error(fd, "nonce pool generation failed");
