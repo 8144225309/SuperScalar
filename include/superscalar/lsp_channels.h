@@ -316,6 +316,12 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
    sweeper for CSV-delayed sweep. Called from daemon loop. */
 int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr);
 
+/* Balance conservation invariant check.
+   Verifies sum(local + remote + active_htlcs + active_ptlcs) == funding_amount
+   for every channel. Returns 1 if all channels pass, 0 if any violated.
+   Logs CONSERVATION VIOLATION to stderr on failure. */
+int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
+
 /* --- Bridge support (Phase 14) --- */
 
 /* Set bridge fd in channel manager. */

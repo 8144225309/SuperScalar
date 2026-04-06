@@ -3845,6 +3845,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 else if (mgr->watchtower && (tnow - last_wt_check) >= 60) {
                     last_wt_check = tnow;
                     watchtower_check(mgr->watchtower);
+                    /* Balance conservation check */
+                    if (!lsp_channels_check_conservation(mgr))
+                        fprintf(stderr, "LSP: ALERT — balance conservation "
+                                "violated, refusing new HTLCs\n");
                     /* Detect commitment TXs on-chain and register sweeps */
                     if (mgr->sweeper)
                         lsp_channels_detect_commitment_sweeps(mgr);
@@ -4257,5 +4261,46 @@ int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr)
     }
 
     return n_registered;
+}
+
+/* ------------------------------------------------------------------ */
+/* Balance conservation invariant                                       */
+/* ------------------------------------------------------------------ */
+
+int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
+{
+    if (!mgr) return 1;
+    int ok = 1;
+
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        const channel_t *ch = &mgr->entries[c].channel;
+        if (ch->funding_amount == 0) continue;
+
+        uint64_t sum = ch->local_amount + ch->remote_amount;
+        for (size_t h = 0; h < ch->n_htlcs; h++) {
+            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+                sum += ch->htlcs[h].amount_sats;
+        }
+        for (size_t p = 0; p < ch->n_ptlcs; p++) {
+            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)
+                sum += ch->ptlcs[p].amount_sats;
+        }
+
+        if (sum != ch->funding_amount) {
+            fprintf(stderr, "CONSERVATION VIOLATION: channel %zu — "
+                    "local=%llu remote=%llu htlc_sum=%llu total=%llu "
+                    "funding=%llu (delta=%lld)\n",
+                    c,
+                    (unsigned long long)ch->local_amount,
+                    (unsigned long long)ch->remote_amount,
+                    (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
+                    (unsigned long long)sum,
+                    (unsigned long long)ch->funding_amount,
+                    (long long)(sum - ch->funding_amount));
+            ok = 0;
+        }
+    }
+
+    return ok;
 }
 
