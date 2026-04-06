@@ -1906,6 +1906,28 @@ int client_run_reconnect(secp256k1_context *ctx,
             }
         }
 
+        /* Display any persisted in-flight HTLCs for user visibility */
+        if (db) {
+            htlc_t loaded_htlcs[16];
+            size_t n_loaded = persist_load_htlcs(db, client_idx,
+                                                   loaded_htlcs, 16);
+            if (n_loaded > 0) {
+                printf("Client reconnect: %zu persisted HTLC(s) from DB:\n",
+                       n_loaded);
+                for (size_t hi = 0; hi < n_loaded; hi++) {
+                    printf("  HTLC #%llu: %llu sats (%s, %s)\n",
+                           (unsigned long long)loaded_htlcs[hi].id,
+                           (unsigned long long)loaded_htlcs[hi].amount_sats,
+                           loaded_htlcs[hi].direction == HTLC_OFFERED
+                               ? "offered" : "received",
+                           loaded_htlcs[hi].state == HTLC_STATE_ACTIVE
+                               ? "active"
+                               : loaded_htlcs[hi].state == HTLC_STATE_FULFILLED
+                                   ? "fulfilled" : "failed");
+                }
+            }
+        }
+
         /* Generate random PCS only for commitment numbers not restored from DB */
         for (uint64_t cn = channel.n_local_pcs; cn <= commitment_number + 1; cn++)
             channel_generate_local_pcs(&channel, cn);
