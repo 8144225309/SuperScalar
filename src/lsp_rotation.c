@@ -97,6 +97,35 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
     fflush(stdout);
 
+    /* Drain any in-flight HTLCs before rotation.
+       If HTLCs are mid-flight during rotation, they get stranded because
+       the old factory is freed. Fail them cleanly first. */
+    {
+        int htlcs_pending = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            channel_t *ch = &mgr->entries[c].channel;
+            for (size_t h = 0; h < ch->n_htlcs; h++) {
+                if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+                    htlcs_pending++;
+            }
+        }
+        if (htlcs_pending > 0) {
+            printf("LSP rotate: draining %d in-flight HTLCs before rotation\n",
+                   htlcs_pending);
+            for (size_t c = 0; c < mgr->n_channels; c++) {
+                channel_t *ch = &mgr->entries[c].channel;
+                for (size_t h = 0; h < ch->n_htlcs; ) {
+                    if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
+                        channel_fail_htlc(ch, ch->htlcs[h].id);
+                        /* channel_fail_htlc removes the entry, don't increment h */
+                    } else {
+                        h++;
+                    }
+                }
+            }
+        }
+    }
+
     /* Build combined keypair/pubkey arrays for adaptor protocol */
     size_t n_total = 1 + lsp->n_clients;
     secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
@@ -703,7 +732,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         lf_new->is_initialized = 1;
         lf_new->is_funded = 1;
         lf_new->cached_state = FACTORY_ACTIVE;
+        /* Copy signed distribution TX from ceremony (if available) */
         tx_buf_init(&lf_new->distribution_tx, 256);
+        if (lsp->factory.dist_tx_ready && lsp->factory.dist_unsigned_tx.len > 0) {
+            tx_buf_free(&lf_new->distribution_tx);
+            tx_buf_init(&lf_new->distribution_tx, lsp->factory.dist_unsigned_tx.len);
+            memcpy(lf_new->distribution_tx.data, lsp->factory.dist_unsigned_tx.data,
+                   lsp->factory.dist_unsigned_tx.len);
+            lf_new->distribution_tx.len = lsp->factory.dist_unsigned_tx.len;
+        }
         lad->n_factories++;
     } else {
         fprintf(stderr, "LSP rotate: no ladder slots available\n");

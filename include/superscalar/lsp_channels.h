@@ -168,6 +168,9 @@ typedef struct {
     /* Admin RPC (JSON-RPC 2.0 Unix socket — serviced in daemon loop) */
     void *admin_rpc;  /* admin_rpc_t* or NULL */
 
+    /* Sweeper: auto-sweep timelocked outputs after force-close */
+    void *sweeper;    /* sweeper_t* or NULL — avoids header dependency */
+
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
 
@@ -308,6 +311,16 @@ int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    Reads MSG_RECONNECT, matches pubkey to client slot, re-exchanges nonces,
    sends MSG_RECONNECT_ACK. Returns 1 on success. */
 int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd);
+
+/* Detect commitment TXs on-chain and register to_local outputs with the
+   sweeper for CSV-delayed sweep. Called from daemon loop. */
+int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr);
+
+/* Balance conservation invariant check.
+   Verifies sum(local + remote + active_htlcs + active_ptlcs) == funding_amount
+   for every channel. Returns 1 if all channels pass, 0 if any violated.
+   Logs CONSERVATION VIOLATION to stderr on failure. */
+int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
 
 /* --- Bridge support (Phase 14) --- */
 

@@ -3,6 +3,7 @@
 #include "superscalar/ceremony.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/factory_recovery.h"
+#include "superscalar/sweeper.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/lsps.h"
 #include "superscalar/splice.h"
@@ -1369,6 +1370,16 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (f->leaf_arity != FACTORY_ARITY_1) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    /* Capture old state txid BEFORE advancing (for watchtower).
+       If old state is later published on-chain, the watchtower responds
+       with the new state tx and burns the L-stock output. */
+    size_t pre_node_idx = f->leaf_node_indices[leaf_side];
+    unsigned char old_leaf_txid[32];
+    int had_old_signed = (f->nodes[pre_node_idx].is_signed &&
+                          f->nodes[pre_node_idx].signed_tx.len > 0);
+    if (had_old_signed)
+        memcpy(old_leaf_txid, f->nodes[pre_node_idx].txid, 32);
+
     /* Step 1: Advance DW counter + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
     if (rc == 0) {
@@ -1519,6 +1530,30 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     /* Clear signing progress after successful aggregation */
     if (mgr->persist)
         persist_clear_signing_progress((persist_t *)mgr->persist, 0);
+
+    /* Register old leaf state with watchtower for breach detection.
+       If the old state is broadcast, the watchtower responds with the
+       new (latest) signed state tx and burns the old L-stock output. */
+    if (had_old_signed && mgr->watchtower) {
+        factory_node_t *leaf_node = &f->nodes[node_idx];
+
+        /* Build burn TX for old state's L-stock output */
+        tx_buf_t burn_tx;
+        tx_buf_init(&burn_tx, 256);
+        uint32_t old_epoch = f->counter.current_epoch > 0
+                           ? f->counter.current_epoch - 1 : 0;
+        size_t l_vout = leaf_node->n_outputs - 1;
+        int burn_ok = factory_build_burn_tx(f, &burn_tx,
+            old_leaf_txid, (uint32_t)l_vout,
+            leaf_node->outputs[l_vout].amount_sats, old_epoch);
+
+        watchtower_watch_factory_node(mgr->watchtower,
+            (uint32_t)node_idx, old_leaf_txid,
+            leaf_node->signed_tx.data, leaf_node->signed_tx.len,
+            burn_ok ? burn_tx.data : NULL,
+            burn_ok ? burn_tx.len : 0);
+        tx_buf_free(&burn_tx);
+    }
 
     /* Step 10: Send LEAF_ADVANCE_DONE to all clients */
     cJSON *done = wire_build_leaf_advance_done(leaf_side);
@@ -1973,11 +2008,18 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
-    /* Persist payee balance + deactivate invoice + delete HTLC atomically */
+    /* Persist payee balance + deactivate invoice + delete HTLC.
+       Begin a transaction that stays open until the sender side is also
+       persisted (or bridge propagation completes), so the two balance
+       updates are atomic.  If the LSP crashes between payee credit and
+       sender debit, the DB rolls back both. */
+    int fulfill_txn_started = 0;
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
-        int own_txn = !persist_in_transaction(db);
-        if (own_txn) persist_begin(db);
+        if (!persist_in_transaction(db)) {
+            persist_begin(db);
+            fulfill_txn_started = 1;
+        }
 
         persist_update_channel_balance(db,
             (uint32_t)client_idx,
@@ -1985,8 +2027,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ch->commitment_number);
         persist_deactivate_invoice(db, payment_hash);
         persist_delete_htlc(db, (uint32_t)client_idx, htlc_id);
-
-        if (own_txn) persist_commit(db);
+        /* Transaction stays open — committed after sender persist below */
     }
 
     /* Check if this HTLC originated from the bridge */
@@ -1999,6 +2040,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(fulfill);
         printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
                (unsigned long long)bridge_htlc_id);
+        /* Commit the payee persist transaction (bridge = no sender debit) */
+        if (fulfill_txn_started && mgr->persist)
+            persist_commit((persist_t *)mgr->persist);
         return 1;
     }
 
@@ -2074,19 +2118,19 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             free(old_sender_htlcs);
 
-            /* Persist sender balance + delete HTLC atomically */
+            /* Persist sender balance + delete HTLC (inside the transaction
+               started at payee persist above — both sides commit atomically) */
             if (mgr->persist) {
                 persist_t *db = (persist_t *)mgr->persist;
-                int own_txn = !persist_in_transaction(db);
-                if (own_txn) persist_begin(db);
-
                 persist_update_channel_balance(db,
                     (uint32_t)s,
                     sender_ch->local_amount, sender_ch->remote_amount,
                     sender_ch->commitment_number);
                 persist_delete_htlc(db, (uint32_t)s, htlc->id);
-
-                if (own_txn) persist_commit(db);
+                /* Commit the atomic payee+sender transaction */
+                if (fulfill_txn_started)
+                    persist_commit(db);
+                fulfill_txn_started = 0;
             }
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
@@ -2095,6 +2139,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             break;
         }
     }
+
+    /* Commit if transaction still open (no sender found — shouldn't happen
+       for intra-factory payments, but defensive) */
+    if (fulfill_txn_started && mgr->persist)
+        persist_commit((persist_t *)mgr->persist);
 
     /* Per-leaf DW advance: after payment settles, advance both affected leaves.
        This is the arity-1 killer feature — only the involved clients' leaves
@@ -3830,6 +3879,38 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 else if (mgr->watchtower && (tnow - last_wt_check) >= 60) {
                     last_wt_check = tnow;
                     watchtower_check(mgr->watchtower);
+                    /* Balance conservation check */
+                    if (!lsp_channels_check_conservation(mgr))
+                        fprintf(stderr, "LSP: ALERT — balance conservation "
+                                "violated, refusing new HTLCs\n");
+                    /* Detect commitment TXs on-chain and register sweeps */
+                    if (mgr->sweeper)
+                        lsp_channels_detect_commitment_sweeps(mgr);
+                    /* Run sweeper on same cycle */
+                    if (mgr->sweeper)
+                        sweeper_check((sweeper_t *)mgr->sweeper);
+                    /* Auto-sweep CLTV-timelocked leaf outputs from expired factories.
+                       factory_sweep_run exists but was CLI-only — run it periodically. */
+                    if (mgr->persist && mgr->chain_be && mgr->ladder) {
+                        ladder_t *_lad = (ladder_t *)mgr->ladder;
+                        chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
+                        uint32_t _h = _cb->get_block_height(_cb);
+                        for (size_t fi = 0; fi < _lad->n_factories; fi++) {
+                            ladder_factory_t *_lf = &_lad->factories[fi];
+                            if (_lf->cached_state == FACTORY_EXPIRED &&
+                                _lf->factory.cltv_timeout > 0 &&
+                                _h >= _lf->factory.cltv_timeout &&
+                                mgr->rot_fund_spk_len > 0) {
+                                cJSON *res = factory_sweep_run(
+                                    (persist_t *)mgr->persist, _cb,
+                                    mgr->ctx, mgr->rot_lsp_seckey,
+                                    _lf->factory_id,
+                                    mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                    500, 0);
+                                if (res) cJSON_Delete(res);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -4156,4 +4237,126 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Demo mode + payment initiation moved to lsp_demo.c */
+
+/* ------------------------------------------------------------------ */
+/* Auto-sweep outputs after force-close                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Detect commitment TXs on-chain and register to_local outputs with the
+ * sweeper for CSV-delayed sweep.
+ *
+ * After a force-close, the client broadcasts their commitment TX (they hold
+ * the fully-signed MuSig2 version). The LSP detects the commitment TX on
+ * chain and sweeps the to_local output after the CSV delay.
+ *
+ * Called from the daemon loop alongside watchtower_check().
+ */
+int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr)
+{
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    extern void reverse_bytes(unsigned char *, size_t);
+
+    if (!mgr || !mgr->watchtower || !mgr->sweeper) return 0;
+
+    chain_backend_t *chain = mgr->watchtower->chain;
+    sweeper_t *sw = (sweeper_t *)mgr->sweeper;
+    if (!chain) return 0;
+
+    int n_registered = 0;
+
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        if (ch->funding_amount == 0) continue;
+
+        /* Build the expected commitment TX to get its txid */
+        tx_buf_t unsigned_tx;
+        tx_buf_init(&unsigned_tx, 512);
+        unsigned char commit_txid[32];
+        if (!channel_build_commitment_tx(ch, &unsigned_tx, commit_txid)) {
+            tx_buf_free(&unsigned_tx);
+            continue;
+        }
+        tx_buf_free(&unsigned_tx);
+
+        /* Check if this commitment TX is on-chain */
+        unsigned char display_txid[32];
+        memcpy(display_txid, commit_txid, 32);
+        reverse_bytes(display_txid, 32);
+        char txid_hex[65];
+        hex_encode(display_txid, 32, txid_hex);
+
+        int confs = chain->get_confirmations(chain, txid_hex);
+        if (confs < 1) continue;  /* Not confirmed yet */
+
+        /* Check if we already registered a sweep for this output */
+        int already = 0;
+        for (size_t s = 0; s < sw->n_entries; s++) {
+            if (memcmp(sw->entries[s].source_txid, commit_txid, 32) == 0 &&
+                sw->entries[s].type == SWEEP_TO_LOCAL) {
+                already = 1;
+                break;
+            }
+        }
+        if (already) continue;
+
+        /* Register to_local output (vout 0) for CSV-delayed sweep.
+           The to_local output has a CSV delay of to_self_delay blocks. */
+        if (ch->local_amount >= CHANNEL_DUST_LIMIT_SATS) {
+            sweeper_add(sw, SWEEP_TO_LOCAL,
+                        commit_txid, 0, ch->local_amount,
+                        ch->to_self_delay,
+                        (uint32_t)c, 0, ch->commitment_number);
+            printf("LSP sweeper: channel %zu — commitment confirmed, "
+                   "registered to_local sweep (%llu sats, CSV %u)\n",
+                   c, (unsigned long long)ch->local_amount,
+                   ch->to_self_delay);
+            fflush(stdout);
+            n_registered++;
+        }
+    }
+
+    return n_registered;
+}
+
+/* ------------------------------------------------------------------ */
+/* Balance conservation invariant                                       */
+/* ------------------------------------------------------------------ */
+
+int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
+{
+    if (!mgr) return 1;
+    int ok = 1;
+
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        const channel_t *ch = &mgr->entries[c].channel;
+        if (ch->funding_amount == 0) continue;
+
+        uint64_t sum = ch->local_amount + ch->remote_amount;
+        for (size_t h = 0; h < ch->n_htlcs; h++) {
+            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+                sum += ch->htlcs[h].amount_sats;
+        }
+        for (size_t p = 0; p < ch->n_ptlcs; p++) {
+            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)
+                sum += ch->ptlcs[p].amount_sats;
+        }
+
+        if (sum != ch->funding_amount) {
+            fprintf(stderr, "CONSERVATION VIOLATION: channel %zu — "
+                    "local=%llu remote=%llu htlc_sum=%llu total=%llu "
+                    "funding=%llu (delta=%lld)\n",
+                    c,
+                    (unsigned long long)ch->local_amount,
+                    (unsigned long long)ch->remote_amount,
+                    (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
+                    (unsigned long long)sum,
+                    (unsigned long long)ch->funding_amount,
+                    (long long)(sum - ch->funding_amount));
+            ok = 0;
+        }
+    }
+
+    return ok;
+}
 

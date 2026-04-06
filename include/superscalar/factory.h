@@ -194,6 +194,12 @@ typedef struct {
 
     /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
     factory_config_t config;
+
+    /* Distribution TX (signed during ceremony, timelocked to cltv_timeout).
+       The "inverted timeout default": if nobody acts, clients get money. */
+    tx_buf_t dist_unsigned_tx;     /* unsigned distribution TX */
+    unsigned char dist_sighash[32]; /* BIP-341 sighash for distributed signing */
+    int dist_tx_ready;             /* 1 = unsigned TX built + sighash computed */
 } factory_t;
 
 int factory_init(factory_t *f, secp256k1_context *ctx,
@@ -421,7 +427,8 @@ uint32_t factory_blocks_until_expired(const factory_t *f, uint32_t current_block
 
 /* Pre-sign a distribution tx at factory creation time.
    nLockTime = cltv_timeout, outputs = per-client settlement amounts.
-   This is the "inverted timelock default": if nobody acts, clients get money. */
+   This is the "inverted timelock default": if nobody acts, clients get money.
+   Requires all keypairs (single-party signing — use for tests only). */
 int factory_build_distribution_tx(
     factory_t *f,
     tx_buf_t *dist_tx_out,
@@ -429,5 +436,26 @@ int factory_build_distribution_tx(
     const tx_output_t *outputs,
     size_t n_outputs,
     uint32_t nlocktime);
+
+/* Build the unsigned distribution TX and compute its sighash.
+   Used during distributed MuSig2 ceremony — both LSP and client call this
+   to produce the identical unsigned TX for distributed signing.
+   Stores result in f->dist_unsigned_tx and f->dist_sighash.
+   Returns 1 on success. */
+int factory_build_distribution_tx_unsigned(
+    factory_t *f,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nlocktime);
+
+/* Compute distribution TX outputs: each participant gets P2TR(their_pubkey).
+   LSP (pubkeys[0]) gets funding_amount - sum(client_amounts) - fee.
+   Clients get their initial channel capacity (per_output from leaf setup).
+   Returns number of outputs written. */
+size_t factory_compute_distribution_outputs(
+    const factory_t *f,
+    tx_output_t *outputs_out,
+    size_t max_outputs,
+    uint64_t fee_sats);
 
 #endif /* SUPERSCALAR_FACTORY_H */

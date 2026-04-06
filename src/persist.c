@@ -298,6 +298,34 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS pending_cs ("
     "  channel_id INTEGER PRIMARY KEY,"
     "  commitment_number INTEGER NOT NULL"
+    ");"
+    /* Schema v13: signed commitment TX for client trustless force-close */
+    "CREATE TABLE IF NOT EXISTS signed_commitments ("
+    "  channel_id INTEGER PRIMARY KEY,"
+    "  commitment_number INTEGER NOT NULL,"
+    "  sig64_hex TEXT NOT NULL,"
+    "  signed_tx_hex TEXT NOT NULL"
+    ");"
+    /* Schema v14: distribution TX for inverted timeout default */
+    "CREATE TABLE IF NOT EXISTS distribution_txs ("
+    "  factory_id INTEGER PRIMARY KEY,"
+    "  signed_tx_hex TEXT NOT NULL"
+    ");"
+    /* Schema v12: pending sweeps for auto-settlement */
+    "CREATE TABLE IF NOT EXISTS pending_sweeps ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  sweep_type TEXT NOT NULL,"
+    "  state INTEGER NOT NULL DEFAULT 0,"
+    "  source_txid TEXT NOT NULL,"
+    "  source_vout INTEGER NOT NULL,"
+    "  amount_sats INTEGER NOT NULL,"
+    "  csv_delay INTEGER NOT NULL DEFAULT 0,"
+    "  confirmed_height INTEGER NOT NULL DEFAULT 0,"
+    "  channel_id INTEGER NOT NULL,"
+    "  factory_id INTEGER NOT NULL,"
+    "  commitment_number INTEGER NOT NULL DEFAULT 0,"
+    "  sweep_txid TEXT DEFAULT '',"
+    "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -631,6 +659,73 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_exec(p->db,
             "ALTER TABLE ladder_factories ADD COLUMN reorg_stale INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
+    }
+
+    /* v13: signed commitment TX for client trustless force-close */
+    if (db_version < 13) {
+        const char *sql_v13 =
+            "CREATE TABLE IF NOT EXISTS signed_commitments ("
+            "  channel_id INTEGER PRIMARY KEY,"
+            "  commitment_number INTEGER NOT NULL,"
+            "  sig64_hex TEXT NOT NULL,"
+            "  signed_tx_hex TEXT NOT NULL"
+            ");";
+        char *merr13 = NULL;
+        if (sqlite3_exec(p->db, sql_v13, NULL, NULL, &merr13) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v13 failed: %s\n",
+                    merr13 ? merr13 : "unknown");
+            sqlite3_free(merr13);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v14: distribution TX for inverted timeout default */
+    if (db_version < 14) {
+        const char *sql_v14 =
+            "CREATE TABLE IF NOT EXISTS distribution_txs ("
+            "  factory_id INTEGER PRIMARY KEY,"
+            "  signed_tx_hex TEXT NOT NULL"
+            ");";
+        char *merr14 = NULL;
+        if (sqlite3_exec(p->db, sql_v14, NULL, NULL, &merr14) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v14 failed: %s\n",
+                    merr14 ? merr14 : "unknown");
+            sqlite3_free(merr14);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v12: pending sweeps for auto-settlement */
+    if (db_version < 12) {
+        const char *sql_v12 =
+            "CREATE TABLE IF NOT EXISTS pending_sweeps ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  sweep_type TEXT NOT NULL,"
+            "  state INTEGER NOT NULL DEFAULT 0,"
+            "  source_txid TEXT NOT NULL,"
+            "  source_vout INTEGER NOT NULL,"
+            "  amount_sats INTEGER NOT NULL,"
+            "  csv_delay INTEGER NOT NULL DEFAULT 0,"
+            "  confirmed_height INTEGER NOT NULL DEFAULT 0,"
+            "  channel_id INTEGER NOT NULL,"
+            "  factory_id INTEGER NOT NULL,"
+            "  commitment_number INTEGER NOT NULL DEFAULT 0,"
+            "  sweep_txid TEXT DEFAULT '',"
+            "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+            ");";
+        char *merr12 = NULL;
+        if (sqlite3_exec(p->db, sql_v12, NULL, NULL, &merr12) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v12 failed: %s\n",
+                    merr12 ? merr12 : "unknown");
+            sqlite3_free(merr12);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
     }
 
     /* Record the current version if not already present */
@@ -4014,6 +4109,154 @@ int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
         if ((size_t)blen <= blob_cap) {
             memcpy(blob_out, sqlite3_column_blob(stmt, 0), (size_t)blen);
             if (blob_len_out) *blob_len_out = (uint16_t)blen;
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Signed commitment TX (schema v13) --- */
+
+int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
+                                 uint64_t commitment_number,
+                                 const unsigned char *sig64,
+                                 const unsigned char *signed_tx,
+                                 size_t signed_tx_len)
+{
+    if (!p || !p->db || !sig64 || !signed_tx) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO signed_commitments "
+        "(channel_id, commitment_number, sig64_hex, signed_tx_hex) "
+        "VALUES (?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    char sig_hex[129];
+    hex_encode(sig64, 64, sig_hex);
+
+    char *tx_hex = (char *)malloc(signed_tx_len * 2 + 1);
+    if (!tx_hex) { sqlite3_finalize(stmt); return 0; }
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commitment_number);
+    sqlite3_bind_text(stmt, 3, sig_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, tx_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
+                                 uint64_t *commitment_number_out,
+                                 unsigned char *sig64_out,
+                                 unsigned char *signed_tx_out,
+                                 size_t *signed_tx_len_out,
+                                 size_t max_tx_len)
+{
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT commitment_number, sig64_hex, signed_tx_hex "
+        "FROM signed_commitments WHERE channel_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (commitment_number_out)
+            *commitment_number_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+
+        const char *sig_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (sig64_out && sig_hex && strlen(sig_hex) == 128)
+            hex_decode(sig_hex, sig64_out, 64);
+
+        const char *tx_hex = (const char *)sqlite3_column_text(stmt, 2);
+        if (signed_tx_out && tx_hex) {
+            size_t hex_len = strlen(tx_hex);
+            size_t raw_len = hex_len / 2;
+            if (raw_len <= max_tx_len) {
+                hex_decode(tx_hex, signed_tx_out, raw_len);
+                if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+            }
+        } else if (signed_tx_len_out && !signed_tx_out) {
+            const char *txh = (const char *)sqlite3_column_text(stmt, 2);
+            if (txh) *signed_tx_len_out = strlen(txh) / 2;
+        }
+
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Distribution TX (schema v14) --- */
+
+int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  const unsigned char *signed_tx,
+                                  size_t signed_tx_len)
+{
+    if (!p || !p->db || !signed_tx || signed_tx_len == 0) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO distribution_txs "
+        "(factory_id, signed_tx_hex) VALUES (?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    char *tx_hex = (char *)malloc(signed_tx_len * 2 + 1);
+    if (!tx_hex) { sqlite3_finalize(stmt); return 0; }
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_text(stmt, 2, tx_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
+                                  unsigned char *signed_tx_out,
+                                  size_t *signed_tx_len_out,
+                                  size_t max_len)
+{
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT signed_tx_hex FROM distribution_txs WHERE factory_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *tx_hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (tx_hex) {
+            size_t hex_len = strlen(tx_hex);
+            size_t raw_len = hex_len / 2;
+            if (signed_tx_out && raw_len <= max_len) {
+                hex_decode(tx_hex, signed_tx_out, raw_len);
+                if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+            } else if (signed_tx_len_out) {
+                *signed_tx_len_out = raw_len;
+            }
             found = 1;
         }
     }
