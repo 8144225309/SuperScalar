@@ -9,6 +9,7 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/sweeper.h"
 #include "superscalar/fee.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
@@ -2200,7 +2201,7 @@ int main(int argc, char *argv[]) {
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
         factory_t *sweep_factory = calloc(1, sizeof(factory_t));
-        if (!sweep_factory || !persist_load_factory(&db, sweep_factory, sweep_ctx, 0)) {
+        if (!sweep_factory || !persist_load_factory(&db, 0, sweep_factory, sweep_ctx)) {
             fprintf(stderr, "ERROR: failed to load factory from DB\n");
             free(sweep_factory);
             secp256k1_context_destroy(sweep_ctx);
@@ -2230,15 +2231,12 @@ int main(int argc, char *argv[]) {
             persist_close(&db);
             return 1;
         }
-        {
-            extern int keyfile_load(const char *, unsigned char *, size_t);
-            if (!keyfile_load(keyfile_path, sweep_seckey, 32)) {
-                fprintf(stderr, "ERROR: failed to load keyfile\n");
-                factory_free(sweep_factory); free(sweep_factory);
-                secp256k1_context_destroy(sweep_ctx);
-                persist_close(&db);
-                return 1;
-            }
+        if (!keyfile_load(keyfile_path, sweep_seckey, passphrase)) {
+            fprintf(stderr, "ERROR: failed to load keyfile\n");
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
         }
         secp256k1_keypair sweep_kp;
         secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
