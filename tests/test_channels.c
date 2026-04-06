@@ -3451,3 +3451,80 @@ int test_conservation_with_ptlc(void) {
     return 1;
 }
 
+int test_conservation_with_real_htlc(void) {
+    /* Test conservation invariant using real channel_add_htlc() which deducts
+       per-HTLC fees.  Before the fee_at_add fix, this would false-alarm. */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.n_channels = 1;
+
+    channel_t *ch = &mgr.entries[0].channel;
+    ch->funding_amount = 100000;
+    ch->local_amount = 50000;
+    ch->remote_amount = 50000;
+    ch->fee_rate_sat_per_kvb = 1000;  /* 1 sat/vB */
+    ch->funder_is_local = 1;
+    /* channel_add_htlc needs local_pcs for commitment_number generation */
+    ch->local_pcs = calloc(16, 32);
+    ch->local_pcs_cap = 16;
+    ch->n_local_pcs = 2;
+
+    /* Pre-check: conservation holds with no HTLCs */
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
+                "conservation OK before HTLC");
+
+    /* Add HTLC via real path (deducts amount + per-HTLC fee) */
+    unsigned char hash[32];
+    memset(hash, 0xAA, 32);
+    uint64_t htlc_id;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
+                "add HTLC succeeds");
+    TEST_ASSERT(ch->n_htlcs == 1, "1 active HTLC");
+
+    /* Per-HTLC fee at 1 sat/vB = ceil(1000 * 43 / 1000) = 43 sats */
+    uint64_t expected_fee = 43;
+    TEST_ASSERT(ch->htlcs[0].fee_at_add == expected_fee,
+                "fee_at_add stored correctly");
+
+    /* Conservation MUST hold even with in-flight HTLC + fee gap */
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
+                "conservation OK during in-flight HTLC");
+
+    /* Verify exact balance: local = 50000 - 10000 (htlc) - 43 (fee) = 39957 */
+    TEST_ASSERT(ch->local_amount == 50000 - 10000 - expected_fee,
+                "local balance correct after add");
+    TEST_ASSERT(ch->remote_amount == 50000,
+                "remote balance unchanged");
+
+    /* Fulfill HTLC — fee refunded from stored value */
+    unsigned char preimage[32];
+    memset(preimage, 0, 32);
+    /* SHA256(preimage) must match hash — just use a dummy for this test.
+       Override hash to match: compute SHA256 of our preimage. */
+    extern void sha256(const unsigned char *, size_t, unsigned char *);
+    sha256(preimage, 32, hash);
+    /* Re-add with correct hash */
+    ch->n_htlcs = 0;
+    ch->local_amount = 50000;
+    ch->remote_amount = 50000;
+    ch->commitment_number = 0;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
+                "re-add HTLC with correct hash");
+    TEST_ASSERT(channel_fulfill_htlc(ch, htlc_id, preimage) == 1,
+                "fulfill HTLC succeeds");
+
+    /* After fulfill: local = 50000 - 10000 - 43 + 43 = 40000, remote = 50000 + 10000 = 60000 */
+    TEST_ASSERT(ch->local_amount == 40000,
+                "local balance correct after fulfill");
+    TEST_ASSERT(ch->remote_amount == 60000,
+                "remote balance correct after fulfill");
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
+                "conservation OK after fulfill");
+
+    free(ch->local_pcs);
+    free(ch->htlcs);
+    free(mgr.entries);
+    return 1;
+}
+
