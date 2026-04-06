@@ -19,6 +19,7 @@
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
+#include "superscalar/factory_recovery.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1768,6 +1769,7 @@ static void usage(const char *prog) {
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
+        "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
@@ -1819,6 +1821,7 @@ int main(int argc, char *argv[]) {
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
+    int force_close = 0;              /* --force-close: broadcast factory tree from DB */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1941,6 +1944,8 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--force-close") == 0) {
+            force_close = 1;
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
@@ -1965,6 +1970,51 @@ int main(int argc, char *argv[]) {
                 "default minrelaytxfee (1 sat/vB).\n"
                 "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
                 fee_rate, (double)fee_rate / 1000.0);
+    }
+
+    /* --- Client force-close (early exit — no LSP needed) --- */
+    if (force_close) {
+        if (!db_path) {
+            fprintf(stderr, "ERROR: --force-close requires --db PATH\n");
+            return 1;
+        }
+        persist_t db;
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
+            return 1;
+        }
+
+        /* Load tree nodes and broadcast the factory tree */
+        printf("=== CLIENT FORCE-CLOSE ===\n");
+        printf("Loading factory tree from %s...\n", db_path);
+
+        chain_backend_t chain;
+        int have_chain = 0;
+        regtest_t rt;
+        if (strcmp(network, "regtest") == 0) {
+            if (!regtest_init(&rt, cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+                fprintf(stderr, "ERROR: regtest init failed\n");
+                persist_close(&db);
+                return 1;
+            }
+            extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
+            chain_backend_regtest_init(&chain, &rt);
+            have_chain = 1;
+        }
+
+        if (!have_chain) {
+            fprintf(stderr, "ERROR: --force-close currently requires regtest "
+                    "(use --network regtest)\n");
+            persist_close(&db);
+            return 1;
+        }
+
+        int result = factory_recovery_scan(&db, &chain);
+        printf("Force-close scan: examined %d factories\n", result);
+
+        persist_close(&db);
+        printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+        return 0;
     }
 
     /* --- BOLT 12 Offer payment (early exit / decode + display) --- */
