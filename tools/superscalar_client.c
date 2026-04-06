@@ -2623,6 +2623,16 @@ int main(int argc, char *argv[]) {
                lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
     }
 
+    /* Require --lsp-pubkey on non-regtest to prevent MITM */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        memset(seckey, 0, 32);
+        report_close(&rpt);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
     /* NK authentication: pin LSP static pubkey if provided */
     if (lsp_pubkey_hex) {
         unsigned char pk_buf[33];
