@@ -732,7 +732,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         lf_new->is_initialized = 1;
         lf_new->is_funded = 1;
         lf_new->cached_state = FACTORY_ACTIVE;
+        /* Copy signed distribution TX from ceremony (if available) */
         tx_buf_init(&lf_new->distribution_tx, 256);
+        if (lsp->factory.dist_tx_ready && lsp->factory.dist_unsigned_tx.len > 0) {
+            tx_buf_free(&lf_new->distribution_tx);
+            tx_buf_init(&lf_new->distribution_tx, lsp->factory.dist_unsigned_tx.len);
+            memcpy(lf_new->distribution_tx.data, lsp->factory.dist_unsigned_tx.data,
+                   lsp->factory.dist_unsigned_tx.len);
+            lf_new->distribution_tx.len = lsp->factory.dist_unsigned_tx.len;
+        }
         lad->n_factories++;
     } else {
         fprintf(stderr, "LSP rotate: no ladder slots available\n");
