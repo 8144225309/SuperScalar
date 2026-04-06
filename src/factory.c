@@ -1952,6 +1952,114 @@ int factory_build_distribution_tx(
     return 1;
 }
 
+/* --- Distribution TX (unsigned, for distributed MuSig2 ceremony) --- */
+
+int factory_build_distribution_tx_unsigned(
+    factory_t *f,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nlocktime)
+{
+    if (!f || !outputs || n_outputs == 0 || n_outputs > FACTORY_MAX_OUTPUTS)
+        return 0;
+
+    /* Build augmented output array with P2A anchor appended */
+    tx_output_t aug_outputs[FACTORY_MAX_OUTPUTS + 1];
+    size_t aug_n = n_outputs;
+    for (size_t i = 0; i < n_outputs; i++)
+        aug_outputs[i] = outputs[i];
+
+    if (fee_should_use_anchor(f->fee) &&
+        aug_outputs[0].amount_sats > ANCHOR_OUTPUT_AMOUNT) {
+        aug_outputs[0].amount_sats -= ANCHOR_OUTPUT_AMOUNT;
+        memcpy(aug_outputs[aug_n].script_pubkey, P2A_SPK, P2A_SPK_LEN);
+        aug_outputs[aug_n].script_pubkey_len = P2A_SPK_LEN;
+        aug_outputs[aug_n].amount_sats = ANCHOR_OUTPUT_AMOUNT;
+        aug_n++;
+    }
+
+    /* Build unsigned TX with nLockTime */
+    tx_buf_free(&f->dist_unsigned_tx);
+    tx_buf_init(&f->dist_unsigned_tx, 256);
+
+    if (!build_unsigned_tx_with_locktime(&f->dist_unsigned_tx, NULL,
+                                          f->funding_txid, f->funding_vout,
+                                          0xFFFFFFFEu, nlocktime,
+                                          aug_outputs, aug_n)) {
+        tx_buf_free(&f->dist_unsigned_tx);
+        return 0;
+    }
+
+    /* Compute BIP-341 key-path sighash */
+    if (!compute_taproot_sighash(f->dist_sighash,
+                                  f->dist_unsigned_tx.data,
+                                  f->dist_unsigned_tx.len,
+                                  0, f->funding_spk, f->funding_spk_len,
+                                  f->funding_amount_sats, 0xFFFFFFFEu)) {
+        tx_buf_free(&f->dist_unsigned_tx);
+        return 0;
+    }
+
+    f->dist_tx_ready = 1;
+    return 1;
+}
+
+size_t factory_compute_distribution_outputs(
+    const factory_t *f,
+    tx_output_t *outputs_out,
+    size_t max_outputs,
+    uint64_t fee_sats)
+{
+    if (!f || !outputs_out || max_outputs < f->n_participants) return 0;
+
+    uint64_t total_client = 0;
+    size_t n = 0;
+
+    /* Each participant gets a P2TR output keyed to their pubkey.
+       Output 0 = LSP (gets remainder). Outputs 1..N = clients. */
+    for (size_t i = 0; i < f->n_participants && n < max_outputs; i++) {
+        secp256k1_xonly_pubkey xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &xonly, NULL,
+                                                 &f->pubkeys[i]))
+            continue;
+
+        /* Key-path-only P2TR: TapTweak(key, empty) */
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(f->ctx, ser, &xonly))
+            continue;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_full;
+        if (!secp256k1_xonly_pubkey_tweak_add(f->ctx, &tweaked_full,
+                                                &xonly, tweak))
+            continue;
+        secp256k1_xonly_pubkey tweaked;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &tweaked, NULL,
+                                                 &tweaked_full))
+            continue;
+
+        build_p2tr_script_pubkey(outputs_out[n].script_pubkey, &tweaked);
+        outputs_out[n].script_pubkey_len = 34;
+
+        if (i == 0) {
+            /* LSP gets remainder — filled in below */
+            outputs_out[n].amount_sats = 0;
+        } else {
+            /* Client gets per_output (equal share of leaf capacity) */
+            uint64_t per_output = f->funding_amount_sats / f->n_participants;
+            outputs_out[n].amount_sats = per_output;
+            total_client += per_output;
+        }
+        n++;
+    }
+
+    /* LSP gets remainder after clients and fee */
+    if (n > 0 && f->funding_amount_sats > total_client + fee_sats)
+        outputs_out[0].amount_sats = f->funding_amount_sats - total_client - fee_sats;
+
+    return n;
+}
+
 /* --- Tree navigation helpers --- */
 
 size_t factory_collect_path_to_root(const factory_t *f, int start_idx,
