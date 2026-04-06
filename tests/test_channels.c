@@ -3370,3 +3370,84 @@ int test_close_outputs_wallet_spk(void) {
     return 1;
 }
 
+/* --- Balance conservation invariant tests --- */
+
+int test_conservation_balanced(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.n_channels = 2;
+
+    /* Channel 0: balanced (50k + 50k = 100k) */
+    mgr.entries[0].channel.funding_amount = 100000;
+    mgr.entries[0].channel.local_amount = 50000;
+    mgr.entries[0].channel.remote_amount = 50000;
+
+    /* Channel 1: with HTLC (40k + 50k + 10k HTLC = 100k) */
+    mgr.entries[1].channel.funding_amount = 100000;
+    mgr.entries[1].channel.local_amount = 40000;
+    mgr.entries[1].channel.remote_amount = 50000;
+    htlc_t htlc;
+    memset(&htlc, 0, sizeof(htlc));
+    htlc.state = HTLC_STATE_ACTIVE;
+    htlc.amount_sats = 10000;
+    mgr.entries[1].channel.htlcs = &htlc;
+    mgr.entries[1].channel.n_htlcs = 1;
+
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
+                "balanced channels pass conservation");
+
+    free(mgr.entries);
+    return 1;
+}
+
+int test_conservation_violated(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.n_channels = 1;
+
+    /* Violated: 60k + 50k = 110k != 100k funding */
+    mgr.entries[0].channel.funding_amount = 100000;
+    mgr.entries[0].channel.local_amount = 60000;
+    mgr.entries[0].channel.remote_amount = 50000;
+
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 0,
+                "unbalanced channel fails conservation");
+
+    free(mgr.entries);
+    return 1;
+}
+
+int test_conservation_with_ptlc(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.n_channels = 1;
+
+    mgr.entries[0].channel.funding_amount = 100000;
+    mgr.entries[0].channel.local_amount = 30000;
+    mgr.entries[0].channel.remote_amount = 50000;
+
+    htlc_t htlc;
+    memset(&htlc, 0, sizeof(htlc));
+    htlc.state = HTLC_STATE_ACTIVE;
+    htlc.amount_sats = 5000;
+    mgr.entries[0].channel.htlcs = &htlc;
+    mgr.entries[0].channel.n_htlcs = 1;
+
+    ptlc_t ptlc;
+    memset(&ptlc, 0, sizeof(ptlc));
+    ptlc.state = PTLC_STATE_ACTIVE;
+    ptlc.amount_sats = 15000;
+    mgr.entries[0].channel.ptlcs = &ptlc;
+    mgr.entries[0].channel.n_ptlcs = 1;
+
+    /* 30k + 50k + 5k + 15k = 100k = funding */
+    TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
+                "HTLC+PTLC sum to funding");
+
+    free(mgr.entries);
+    return 1;
+}
+

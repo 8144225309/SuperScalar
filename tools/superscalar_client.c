@@ -19,6 +19,7 @@
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
+#include "superscalar/factory_recovery.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -498,6 +499,36 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
     }
 }
 
+/* Persist the latest commitment TX signature to DB.
+   Call after each client_handle_commitment_signed so the client can
+   broadcast the commitment TX independently for trustless force-close. */
+static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
+    if (!cbd || !cbd->db || !ch->has_latest_commitment_sig) return;
+
+    /* Build signed commitment TX from stored sig */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return;
+    }
+    tx_buf_t signed_tx;
+    tx_buf_init(&signed_tx, 512);
+    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
+                             ch->latest_commitment_sig)) {
+        tx_buf_free(&unsigned_tx);
+        tx_buf_free(&signed_tx);
+        return;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    persist_save_commitment_sig(cbd->db, 0, ch->commitment_number,
+                                 ch->latest_commitment_sig,
+                                 signed_tx.data, signed_tx.len);
+    tx_buf_free(&signed_tx);
+}
+
 /* Receive and process LSP's own revocation (bidirectional revocation).
    Call after each client_handle_commitment_signed in daemon mode.
    old_local/old_remote are the channel amounts at the OLD commitment being
@@ -592,7 +623,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             uint32_t client_idx = my_index - 1;
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
-                persist_save_basepoints(cbd->db, client_idx, ch)) {
+                persist_save_basepoints(cbd->db, client_idx, ch) &&
+                persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* Save signed distribution TX if available */
+                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                    persist_save_distribution_tx(cbd->db, 0,
+                        factory->dist_unsigned_tx.data,
+                        factory->dist_unsigned_tx.len);
+                }
                 /* Save initial local PCS so they survive crash before first payment */
                 for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
                     unsigned char pcs[32];
@@ -688,6 +726,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
                 if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
                     client_handle_commitment_signed(fd, ch, ctx, &imsg);
+                    client_persist_commitment_sig(ch, cbd);
                     cJSON_Delete(imsg.json);
                     if (cbd && cbd->db)
                         persist_update_channel_balance(cbd->db, my_index - 1,
@@ -761,6 +800,7 @@ handle_message:
                     cJSON_Delete(msg.json);
                     break;
                 }
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
@@ -832,6 +872,7 @@ handle_message:
                                              ctx, keypair, my_index, &cbd->inbox) &&
                         msg.msg_type == MSG_COMMITMENT_SIGNED) {
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
+                        client_persist_commitment_sig(ch, cbd);
                         if (msg.json) cJSON_Delete(msg.json);
                         /* Receive LSP's own revocation (bidirectional) */
                         client_recv_lsp_revocation(fd, ch, cbd, ctx,
@@ -854,6 +895,7 @@ handle_message:
 
         case MSG_COMMITMENT_SIGNED:
             client_handle_commitment_signed(fd, ch, ctx, &msg);
+            client_persist_commitment_sig(ch, cbd);
             cJSON_Delete(msg.json);
             /* Receive LSP's own revocation (bidirectional).
                No add/fulfill preceded this, so current state = old commitment state. */
@@ -895,6 +937,7 @@ handle_message:
                                      ctx, keypair, my_index, &cbd->inbox) &&
                 msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 if (msg.json) cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
@@ -1386,7 +1429,14 @@ handle_message:
                     uint32_t rot_client_idx = my_index - 1;
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
-                        persist_save_basepoints(cbd->db, rot_client_idx, ch)) {
+                        persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
+                        persist_save_tree_nodes(cbd->db, factory, 0)) {
+                        /* Save signed distribution TX if available */
+                        if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                            persist_save_distribution_tx(cbd->db, 0,
+                                factory->dist_unsigned_tx.data,
+                                factory->dist_unsigned_tx.len);
+                        }
                         /* Save initial PCS for the new rotated channel so they
                            survive crash before first payment on the new factory */
                         for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
@@ -1768,6 +1818,7 @@ static void usage(const char *prog) {
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
+        "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
@@ -1819,6 +1870,7 @@ int main(int argc, char *argv[]) {
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
+    int force_close = 0;              /* --force-close: broadcast factory tree from DB */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1941,6 +1993,8 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--force-close") == 0) {
+            force_close = 1;
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
@@ -1965,6 +2019,105 @@ int main(int argc, char *argv[]) {
                 "default minrelaytxfee (1 sat/vB).\n"
                 "  Anchor outputs disabled at sub-1-sat/vB rates.\n",
                 fee_rate, (double)fee_rate / 1000.0);
+    }
+
+    /* --- Client force-close (early exit — no LSP needed) --- */
+    if (force_close) {
+        if (!db_path) {
+            fprintf(stderr, "ERROR: --force-close requires --db PATH\n");
+            return 1;
+        }
+        persist_t db;
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
+            return 1;
+        }
+
+        /* Load tree nodes and broadcast the factory tree */
+        printf("=== CLIENT FORCE-CLOSE ===\n");
+        printf("Loading factory tree from %s...\n", db_path);
+
+        chain_backend_t chain;
+        int have_chain = 0;
+        regtest_t rt;
+        if (strcmp(network, "regtest") == 0) {
+            if (!regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+                fprintf(stderr, "ERROR: regtest init failed\n");
+                persist_close(&db);
+                return 1;
+            }
+            extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
+            chain_backend_regtest_init(&chain, &rt);
+            have_chain = 1;
+        }
+
+        if (!have_chain) {
+            fprintf(stderr, "ERROR: --force-close currently requires regtest "
+                    "(use --network regtest)\n");
+            persist_close(&db);
+            return 1;
+        }
+
+        int result = factory_recovery_scan(&db, &chain);
+        printf("Force-close scan: examined %d factories\n", result);
+
+        /* Broadcast signed commitment TX if available */
+        {
+            unsigned char signed_tx_data[4096];
+            size_t signed_tx_len = 0;
+            uint64_t sig_cn = 0;
+            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
+                                             signed_tx_data, &signed_tx_len,
+                                             sizeof(signed_tx_data)) &&
+                signed_tx_len > 0) {
+                char *tx_hex = malloc(signed_tx_len * 2 + 1);
+                if (tx_hex) {
+                    extern void hex_encode(const unsigned char *, size_t, char *);
+                    hex_encode(signed_tx_data, signed_tx_len, tx_hex);
+                    char commit_txid[65];
+                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+                        printf("Force-close: commitment TX broadcast: %s "
+                               "(cn=%llu)\n", commit_txid,
+                               (unsigned long long)sig_cn);
+                    else
+                        printf("Force-close: commitment TX broadcast failed "
+                               "(may need tree to confirm first)\n");
+                    free(tx_hex);
+                }
+            } else {
+                printf("Force-close: no signed commitment TX in DB\n");
+            }
+        }
+
+        /* Broadcast distribution TX as nLockTime fallback */
+        {
+            unsigned char dist_tx_data[8192];
+            size_t dist_tx_len = 0;
+            if (persist_load_distribution_tx(&db, 0,
+                                              dist_tx_data, &dist_tx_len,
+                                              sizeof(dist_tx_data)) &&
+                dist_tx_len > 0) {
+                char *tx_hex = malloc(dist_tx_len * 2 + 1);
+                if (tx_hex) {
+                    extern void hex_encode(const unsigned char *, size_t, char *);
+                    hex_encode(dist_tx_data, dist_tx_len, tx_hex);
+                    char dist_txid[65];
+                    if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
+                        printf("Force-close: distribution TX broadcast: %s\n",
+                               dist_txid);
+                    else
+                        printf("Force-close: distribution TX not yet mature "
+                               "(nLockTime not reached)\n");
+                    free(tx_hex);
+                }
+            } else {
+                printf("Force-close: no distribution TX in DB\n");
+            }
+        }
+
+        persist_close(&db);
+        printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+        return 0;
     }
 
     /* --- BOLT 12 Offer payment (early exit / decode + display) --- */
