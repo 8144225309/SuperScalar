@@ -1974,11 +1974,18 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
-    /* Persist payee balance + deactivate invoice + delete HTLC atomically */
+    /* Persist payee balance + deactivate invoice + delete HTLC.
+       Begin a transaction that stays open until the sender side is also
+       persisted (or bridge propagation completes), so the two balance
+       updates are atomic.  If the LSP crashes between payee credit and
+       sender debit, the DB rolls back both. */
+    int fulfill_txn_started = 0;
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
-        int own_txn = !persist_in_transaction(db);
-        if (own_txn) persist_begin(db);
+        if (!persist_in_transaction(db)) {
+            persist_begin(db);
+            fulfill_txn_started = 1;
+        }
 
         persist_update_channel_balance(db,
             (uint32_t)client_idx,
@@ -1986,8 +1993,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ch->commitment_number);
         persist_deactivate_invoice(db, payment_hash);
         persist_delete_htlc(db, (uint32_t)client_idx, htlc_id);
-
-        if (own_txn) persist_commit(db);
+        /* Transaction stays open — committed after sender persist below */
     }
 
     /* Check if this HTLC originated from the bridge */
@@ -2000,6 +2006,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(fulfill);
         printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
                (unsigned long long)bridge_htlc_id);
+        /* Commit the payee persist transaction (bridge = no sender debit) */
+        if (fulfill_txn_started && mgr->persist)
+            persist_commit((persist_t *)mgr->persist);
         return 1;
     }
 
@@ -2075,19 +2084,19 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             free(old_sender_htlcs);
 
-            /* Persist sender balance + delete HTLC atomically */
+            /* Persist sender balance + delete HTLC (inside the transaction
+               started at payee persist above — both sides commit atomically) */
             if (mgr->persist) {
                 persist_t *db = (persist_t *)mgr->persist;
-                int own_txn = !persist_in_transaction(db);
-                if (own_txn) persist_begin(db);
-
                 persist_update_channel_balance(db,
                     (uint32_t)s,
                     sender_ch->local_amount, sender_ch->remote_amount,
                     sender_ch->commitment_number);
                 persist_delete_htlc(db, (uint32_t)s, htlc->id);
-
-                if (own_txn) persist_commit(db);
+                /* Commit the atomic payee+sender transaction */
+                if (fulfill_txn_started)
+                    persist_commit(db);
+                fulfill_txn_started = 0;
             }
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
@@ -2096,6 +2105,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             break;
         }
     }
+
+    /* Commit if transaction still open (no sender found — shouldn't happen
+       for intra-factory payments, but defensive) */
+    if (fulfill_txn_started && mgr->persist)
+        persist_commit((persist_t *)mgr->persist);
 
     /* Per-leaf DW advance: after payment settles, advance both affected leaves.
        This is the arity-1 killer feature — only the involved clients' leaves
