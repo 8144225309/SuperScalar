@@ -240,7 +240,6 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
-                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
@@ -278,7 +277,6 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
-                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -313,7 +311,6 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
-                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -346,7 +343,6 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
-                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -724,6 +720,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
                 if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
                     client_handle_commitment_signed(fd, ch, ctx, &imsg);
+                    client_persist_commitment_sig(ch, cbd);
                     cJSON_Delete(imsg.json);
                     if (cbd && cbd->db)
                         persist_update_channel_balance(cbd->db, my_index - 1,
@@ -797,6 +794,7 @@ handle_message:
                     cJSON_Delete(msg.json);
                     break;
                 }
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
@@ -868,6 +866,7 @@ handle_message:
                                              ctx, keypair, my_index, &cbd->inbox) &&
                         msg.msg_type == MSG_COMMITMENT_SIGNED) {
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
+                        client_persist_commitment_sig(ch, cbd);
                         if (msg.json) cJSON_Delete(msg.json);
                         /* Receive LSP's own revocation (bidirectional) */
                         client_recv_lsp_revocation(fd, ch, cbd, ctx,
@@ -890,6 +889,7 @@ handle_message:
 
         case MSG_COMMITMENT_SIGNED:
             client_handle_commitment_signed(fd, ch, ctx, &msg);
+            client_persist_commitment_sig(ch, cbd);
             cJSON_Delete(msg.json);
             /* Receive LSP's own revocation (bidirectional).
                No add/fulfill preceded this, so current state = old commitment state. */
@@ -931,6 +931,7 @@ handle_message:
                                      ctx, keypair, my_index, &cbd->inbox) &&
                 msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 if (msg.json) cJSON_Delete(msg.json);
                 /* Receive LSP's own revocation (bidirectional) */
                 client_recv_lsp_revocation(fd, ch, cbd, ctx,
