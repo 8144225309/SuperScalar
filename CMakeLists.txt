@@ -90,6 +90,7 @@ add_library(superscalar
     src/musig.c
     src/regtest.c
     src/chain_backend_regtest.c
+    src/chain_backend_rpc.c
     src/bip158_backend.c
     src/p2p_bitcoin.c
     src/util.c
