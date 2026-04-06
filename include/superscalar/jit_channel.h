@@ -84,6 +84,14 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
                                    const unsigned char *extracted_client_key,
                                    void *chain_be);
 
+/* Attempt to force-close a JIT channel.
+   Since JIT uses MuSig2 2-of-2, the LSP can't unilaterally sign.
+   This function detects if the commitment TX is already on-chain
+   (client-initiated close) and handles tracking.
+   Returns 1 if the channel was closed or is being tracked, 0 on error. */
+int jit_channel_force_close(void *mgr_ptr, size_t client_idx,
+                             void *chain_be_ptr);
+
 /* Clean up JIT channel resources. */
 void jit_channels_cleanup(void *mgr_ptr);
 

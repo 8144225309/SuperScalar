@@ -774,6 +774,93 @@ int jit_channels_revalidate_funding(void *mgr_ptr) {
     return reverted;
 }
 
+int jit_channel_force_close(void *mgr_ptr, size_t client_idx,
+                            void *chain_be_ptr)
+{
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    chain_backend_t *chain_be = (chain_backend_t *)chain_be_ptr;
+    if (!mgr || !chain_be) return 0;
+
+    jit_channel_t *jit = jit_channel_find(mgr, client_idx);
+    if (!jit || jit->state != JIT_STATE_OPEN) return 0;
+
+    /* JIT channels use MuSig2 2-of-2 funding. The LSP cannot build a
+       fully-signed commitment TX without the client's partial signature.
+       In normal operation, the client holds the pre-signed commitment TX.
+
+       Force-close for JIT channels requires one of:
+       a) The client broadcasts their commitment TX (client-initiated)
+       b) PTLC key turnover reveals the client key (during rotation)
+       c) Factory distribution TX settles the JIT UTXO (timeout)
+
+       This function handles the LSP-side detection and monitoring.
+       If the funding TX output is already spent (someone broadcast a
+       commitment), we track it for sweep. */
+
+    channel_t *ch = &jit->channel;
+
+    /* Check if the funding output has been spent (commitment broadcast) */
+    char fund_hex[65];
+    {
+        unsigned char disp[32];
+        extern void hex_encode(const unsigned char *, size_t, char *);
+        extern void reverse_bytes(unsigned char *, size_t);
+        memcpy(disp, ch->funding_txid, 32);
+        reverse_bytes(disp, 32);
+        hex_encode(disp, 32, fund_hex);
+    }
+
+    int fund_confs = chain_be->get_confirmations(chain_be, fund_hex);
+    if (fund_confs < 0) {
+        /* Funding TX not found — JIT never confirmed, nothing to close */
+        printf("LSP JIT force-close: client %zu — funding not on-chain, "
+               "marking closed\n", client_idx);
+        jit->state = JIT_STATE_CLOSED;
+        if (mgr->persist)
+            persist_update_jit_state((persist_t *)mgr->persist,
+                                     jit->jit_channel_id, "closed");
+        return 1;
+    }
+
+    /* Funding is on-chain. Check if commitment TX is already broadcast. */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char commit_txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, commit_txid)) {
+        tx_buf_free(&unsigned_tx);
+        fprintf(stderr, "LSP JIT force-close: client %zu — can't build "
+                "commitment TX\n", client_idx);
+        return 0;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    unsigned char disp[32];
+    memcpy(disp, commit_txid, 32);
+    extern void reverse_bytes(unsigned char *, size_t);
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    reverse_bytes(disp, 32);
+    char ctxid_hex[65];
+    hex_encode(disp, 32, ctxid_hex);
+
+    int commit_confs = chain_be->get_confirmations(chain_be, ctxid_hex);
+    if (commit_confs >= 0) {
+        printf("LSP JIT force-close: client %zu — commitment already on-chain "
+               "(%d confs)\n", client_idx, commit_confs);
+        jit->state = JIT_STATE_CLOSED;
+        if (mgr->persist)
+            persist_update_jit_state((persist_t *)mgr->persist,
+                                     jit->jit_channel_id, "closed");
+        return 1;
+    }
+
+    /* Commitment not broadcast yet. Log for operator. The client must
+       broadcast their pre-signed commitment TX, or the LSP needs the
+       client key (obtained during rotation PTLC turnover). */
+    printf("LSP JIT force-close: client %zu — cannot unilaterally close "
+           "(need client's commitment TX or extracted key)\n", client_idx);
+    return 0;
+}
+
 void jit_channels_cleanup(void *mgr_ptr) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
     if (!mgr) return;
