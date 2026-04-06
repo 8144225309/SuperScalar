@@ -13,6 +13,7 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
+#include "superscalar/log.h"
 #ifdef __linux__
 #include <syslog.h>
 #endif
@@ -1105,6 +1106,7 @@ int main(int argc, char *argv[]) {
     uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
     const char *log_file_path = NULL;      /* --log-file PATH */
     int use_syslog = 0;                    /* --syslog */
+    int use_json_log = 0;                  /* --json-log */
 
     /* Load config file if --config provided (first pass) */
     for (int i = 1; i < argc; i++) {
@@ -1440,6 +1442,8 @@ int main(int argc, char *argv[]) {
             log_file_path = argv[++i];
         else if (strcmp(argv[i], "--syslog") == 0)
             use_syslog = 1;
+        else if (strcmp(argv[i], "--json-log") == 0)
+            use_json_log = 1;
         else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
             i++;  /* already parsed in first pass */
         else if (strcmp(argv[i], "--version") == 0) {
@@ -1469,6 +1473,8 @@ int main(int argc, char *argv[]) {
         openlog("superscalar_lsp", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 #endif
     }
+    if (use_json_log)
+        ss_log_set_json(1);
 
     /* --- Validate fee rate floor --- */
     if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
