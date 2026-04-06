@@ -1625,12 +1625,54 @@
                 reverse_bytes(ctxid, 32);
 
                 size_t hi = ch->n_htlcs - 1;
+
+                /* Rebuild the HTLC output SPK from the commitment TX.
+                   channel_rebuild_htlc_leaves is static, so we rebuild
+                   the taptree manually (same as S13 pattern). */
+                unsigned char mhfc_htlc_spk[34];
+                size_t mhfc_htlc_spk_len = 0;
+                {
+                    secp256k1_pubkey pcp;
+                    channel_get_per_commitment_point(ch, ch->commitment_number, &pcp);
+                    secp256k1_pubkey local_htlc_pub, remote_htlc_pub;
+                    channel_derive_pubkey(ch->ctx, &local_htlc_pub,
+                        &ch->local_htlc_basepoint, &pcp);
+                    channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
+                        &ch->remote_htlc_basepoint, &pcp);
+                    secp256k1_xonly_pubkey local_htlc_xo, remote_htlc_xo;
+                    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xo, NULL, &local_htlc_pub);
+                    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xo, NULL, &remote_htlc_pub);
+
+                    secp256k1_pubkey rev_pub;
+                    channel_derive_revocation_pubkey(ch->ctx, &rev_pub,
+                        &ch->remote_revocation_basepoint, &pcp);
+                    secp256k1_xonly_pubkey rev_xo;
+                    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &rev_xo, NULL, &rev_pub);
+
+                    htlc_t *h = &ch->htlcs[hi];
+                    tapscript_leaf_t sl, tl;
+                    if (h->direction == HTLC_OFFERED) {
+                        tapscript_build_htlc_offered_success(&sl, h->payment_hash, &remote_htlc_xo, ch->ctx);
+                        tapscript_build_htlc_offered_timeout(&tl, h->cltv_expiry, ch->to_self_delay, &local_htlc_xo, ch->ctx);
+                    } else {
+                        tapscript_build_htlc_received_success(&sl, h->payment_hash, ch->to_self_delay, &local_htlc_xo, ch->ctx);
+                        tapscript_build_htlc_received_timeout(&tl, h->cltv_expiry, &remote_htlc_xo, ch->ctx);
+                    }
+                    tapscript_leaf_t leaves[2] = { sl, tl };
+                    unsigned char mr[32];
+                    tapscript_merkle_root(mr, leaves, 2);
+                    secp256k1_xonly_pubkey tweaked;
+                    tapscript_tweak_pubkey(ch->ctx, &tweaked, NULL, &rev_xo, mr);
+                    build_p2tr_script_pubkey(mhfc_htlc_spk, &tweaked);
+                    mhfc_htlc_spk_len = 34;
+                }
+
                 tx_buf_t ttx;
                 tx_buf_init(&ttx, 256);
 
                 if (!channel_build_htlc_timeout_tx(ch, &ttx,
                         ctxid, 2, htlc_amounts[ci],
-                        ch->htlcs[hi].cltv_expiry, fund_spk, 34)) {
+                        mhfc_htlc_spk, mhfc_htlc_spk_len, hi)) {
                     fprintf(stderr, "MULTI-HTLC: build timeout TX %zu failed\n", ci);
                     tx_buf_free(&ttx);
                     continue;
