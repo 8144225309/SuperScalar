@@ -271,15 +271,35 @@ int lsp_run_factory_creation(lsp_t *lsp,
         return 0;
     }
 
+    /* Build unsigned distribution TX before ceremony so both sides can sign it.
+       The distribution TX is the "inverted timeout default" safety net. */
+    int has_dist_tx = 0;
+    uint32_t dist_node_idx = (uint32_t)f->n_nodes;  /* virtual node index */
+    musig_signing_session_t dist_session;
+    secp256k1_musig_secnonce dist_secnonce;
+    secp256k1_musig_partial_sig dist_partial_sigs[FACTORY_MAX_SIGNERS];
+    size_t dist_psigs_received = 0;
+    memset(&dist_session, 0, sizeof(dist_session));
+    {
+        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        size_t n_dist = factory_compute_distribution_outputs(f, dist_outputs,
+            FACTORY_MAX_SIGNERS + 1, 500);
+        if (n_dist > 0 && f->cltv_timeout > 0) {
+            has_dist_tx = factory_build_distribution_tx_unsigned(
+                f, dist_outputs, n_dist, f->cltv_timeout);
+        }
+    }
+
     /* Generate LSP's own nonces via pool (participant index 0) */
     size_t lsp_node_count = factory_count_nodes_for_participant(f, 0);
 
-    /* Pre-generate nonce pool for LSP */
+    /* Pre-generate nonce pool for LSP (+1 for distribution TX) */
     musig_nonce_pool_t lsp_pool;
     unsigned char lsp_seckey[32];
     if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
         return 0;
-    if (!musig_nonce_pool_generate(lsp->ctx, &lsp_pool, lsp_node_count,
+    if (!musig_nonce_pool_generate(lsp->ctx, &lsp_pool,
+                                    lsp_node_count + (has_dist_tx ? 1 : 0),
                                     lsp_seckey, &lsp->lsp_pubkey, NULL)) {
         fprintf(stderr, "LSP: nonce pool generation failed\n");
         memset(lsp_seckey, 0, 32);
@@ -291,10 +311,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
     secp256k1_musig_secnonce *lsp_secnonce_ptrs[FACTORY_MAX_NODES];
     size_t lsp_secnonce_count = 0;
 
-    /* Total entries for ALL_NONCES: all (node, signer) pairs across all participants */
+    /* Total entries for ALL_NONCES: all (node, signer) pairs + distribution TX */
     size_t total_slots = 0;
     for (size_t i = 0; i < f->n_nodes; i++)
         total_slots += f->nodes[i].n_signers;
+    if (has_dist_tx)
+        total_slots += f->n_participants;  /* all participants sign dist TX */
 
     wire_bundle_entry_t *all_nonce_entries =
         (wire_bundle_entry_t *)calloc(total_slots, sizeof(wire_bundle_entry_t));
@@ -327,6 +349,31 @@ int lsp_run_factory_creation(lsp_t *lsp,
         memcpy(all_nonce_entries[all_nonce_count].data, nonce_ser, 66);
         all_nonce_entries[all_nonce_count].data_len = 66;
         all_nonce_count++;
+    }
+
+    /* Distribution TX: generate LSP's nonce (slot 0 in root keyagg) */
+    if (has_dist_tx) {
+        secp256k1_musig_secnonce *dist_sec;
+        secp256k1_musig_pubnonce dist_pub;
+        if (musig_nonce_pool_next(&lsp_pool, &dist_sec, &dist_pub)) {
+            dist_secnonce = *dist_sec;
+
+            /* Initialize distribution signing session using root keyagg */
+            musig_session_init(&dist_session, &f->nodes[0].keyagg,
+                               f->n_participants);
+            int dist_slot = factory_find_signer_slot(f, 0, 0);
+            if (dist_slot >= 0)
+                musig_session_set_pubnonce(&dist_session, (size_t)dist_slot,
+                                            &dist_pub);
+
+            unsigned char dist_nonce_ser[66];
+            musig_pubnonce_serialize(lsp->ctx, dist_nonce_ser, &dist_pub);
+            all_nonce_entries[all_nonce_count].node_idx = dist_node_idx;
+            all_nonce_entries[all_nonce_count].signer_slot = (uint32_t)(dist_slot >= 0 ? dist_slot : 0);
+            memcpy(all_nonce_entries[all_nonce_count].data, dist_nonce_ser, 66);
+            all_nonce_entries[all_nonce_count].data_len = 66;
+            all_nonce_count++;
+        }
     }
 
     /* Collect NONCE_BUNDLEs from all clients (parallel select) */
@@ -396,7 +443,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
                         client_ok = 0;
                         break;
                     }
-                    if (!factory_session_set_nonce(f, client_entries[e].node_idx,
+                    if (has_dist_tx && client_entries[e].node_idx == dist_node_idx) {
+                        /* Distribution TX virtual node — store in dist_session */
+                        musig_session_set_pubnonce(&dist_session,
+                            client_entries[e].signer_slot, &pubnonce);
+                    } else if (!factory_session_set_nonce(f, client_entries[e].node_idx,
                                                     client_entries[e].signer_slot, &pubnonce)) {
                         fprintf(stderr, "LSP: set_nonce failed node %u slot %u\n",
                                 client_entries[e].node_idx, client_entries[e].signer_slot);
@@ -525,6 +576,15 @@ int lsp_run_factory_creation(lsp_t *lsp,
         goto fail;
     }
 
+    /* Finalize distribution TX signing session (separate from tree nodes) */
+    if (has_dist_tx && f->dist_tx_ready) {
+        if (!musig_session_finalize_nonces(lsp->ctx, &dist_session,
+                                            f->dist_sighash, NULL, NULL)) {
+            fprintf(stderr, "LSP: dist TX session finalize failed\n");
+            has_dist_tx = 0;  /* degrade gracefully */
+        }
+    }
+
     /* Generate LSP's partial sigs using pool-drawn secnonces */
     {
         size_t psig_nonce_idx = 0;
@@ -545,6 +605,19 @@ int lsp_run_factory_creation(lsp_t *lsp,
                 goto fail;
             }
             psig_nonce_idx++;
+        }
+
+        /* Distribution TX: LSP's partial sig */
+        if (has_dist_tx && f->dist_tx_ready) {
+            secp256k1_musig_partial_sig dist_psig;
+            if (musig_create_partial_sig(lsp->ctx, &dist_psig,
+                                          &dist_secnonce, &lsp->lsp_keypair,
+                                          &dist_session)) {
+                int dist_slot = factory_find_signer_slot(f, 0, 0);
+                if (dist_slot >= 0)
+                    dist_partial_sigs[dist_slot] = dist_psig;
+                dist_psigs_received++;
+            }
         }
     }
 
@@ -612,7 +685,13 @@ int lsp_run_factory_creation(lsp_t *lsp,
                         client_ok = 0;
                         break;
                     }
-                    if (!factory_session_set_partial_sig(f, client_entries[e].node_idx,
+                    if (has_dist_tx && client_entries[e].node_idx == dist_node_idx) {
+                        /* Distribution TX virtual node */
+                        if (client_entries[e].signer_slot < f->n_participants) {
+                            dist_partial_sigs[client_entries[e].signer_slot] = psig;
+                            dist_psigs_received++;
+                        }
+                    } else if (!factory_session_set_partial_sig(f, client_entries[e].node_idx,
                                                           client_entries[e].signer_slot, &psig)) {
                         fprintf(stderr, "LSP: set psig failed node %u slot %u\n",
                                 client_entries[e].node_idx, client_entries[e].signer_slot);
@@ -650,9 +729,38 @@ int lsp_run_factory_creation(lsp_t *lsp,
         goto fail;
     }
 
-    /* Send FACTORY_READY to all clients */
+    /* Aggregate distribution TX signature */
+    tx_buf_t dist_signed_tx;
+    tx_buf_init(&dist_signed_tx, 256);
+    if (has_dist_tx && f->dist_tx_ready &&
+        dist_psigs_received >= f->n_participants) {
+        unsigned char dist_sig[64];
+        if (musig_aggregate_partial_sigs(lsp->ctx, dist_sig, &dist_session,
+                                          dist_partial_sigs, f->n_participants) &&
+            finalize_signed_tx(&dist_signed_tx,
+                                f->dist_unsigned_tx.data,
+                                f->dist_unsigned_tx.len, dist_sig)) {
+            printf("LSP: distribution TX signed (%zu bytes)\n", dist_signed_tx.len);
+        } else {
+            fprintf(stderr, "LSP: distribution TX signing failed "
+                    "(received %zu/%zu psigs)\n",
+                    dist_psigs_received, f->n_participants);
+            has_dist_tx = 0;
+        }
+    }
+
+    /* Send FACTORY_READY to all clients (include dist TX if signed) */
     {
         cJSON *ready = wire_build_factory_ready(f);
+        if (has_dist_tx && dist_signed_tx.len > 0) {
+            char *dist_hex = malloc(dist_signed_tx.len * 2 + 1);
+            if (dist_hex) {
+                extern void hex_encode(const unsigned char *, size_t, char *);
+                hex_encode(dist_signed_tx.data, dist_signed_tx.len, dist_hex);
+                cJSON_AddStringToObject(ready, "distribution_tx_hex", dist_hex);
+                free(dist_hex);
+            }
+        }
         for (size_t i = 0; i < lsp->n_clients; i++) {
             if (!wire_send(lsp->client_fds[i], MSG_FACTORY_READY, ready)) {
                 fprintf(stderr, "LSP: failed to send FACTORY_READY to client %zu\n", i);
@@ -661,6 +769,17 @@ int lsp_run_factory_creation(lsp_t *lsp,
             }
         }
         cJSON_Delete(ready);
+    }
+
+    /* Store signed distribution TX for auto-broadcast at factory expiry.
+       The caller (tools/superscalar_lsp.c or lsp_rotation.c) copies it into
+       ladder_factory_t.distribution_tx. We store it on the factory for now. */
+    if (has_dist_tx && dist_signed_tx.len > 0) {
+        /* Attach to factory for caller to retrieve */
+        tx_buf_free(&f->dist_unsigned_tx);
+        f->dist_unsigned_tx = dist_signed_tx;  /* reuse field for signed version */
+    } else {
+        tx_buf_free(&dist_signed_tx);
     }
 
     free(all_nonce_entries);
