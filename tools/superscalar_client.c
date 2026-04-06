@@ -240,6 +240,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
@@ -277,6 +278,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -311,6 +313,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -343,6 +346,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                client_persist_commitment_sig(ch, cbd);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -497,6 +501,36 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
         }
         continue;  /* keep waiting for expected_type */
     }
+}
+
+/* Persist the latest commitment TX signature to DB.
+   Call after each client_handle_commitment_signed so the client can
+   broadcast the commitment TX independently for trustless force-close. */
+static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
+    if (!cbd || !cbd->db || !ch->has_latest_commitment_sig) return;
+
+    /* Build signed commitment TX from stored sig */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return;
+    }
+    tx_buf_t signed_tx;
+    tx_buf_init(&signed_tx, 512);
+    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
+                             ch->latest_commitment_sig)) {
+        tx_buf_free(&unsigned_tx);
+        tx_buf_free(&signed_tx);
+        return;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    persist_save_commitment_sig(cbd->db, 0, ch->commitment_number,
+                                 ch->latest_commitment_sig,
+                                 signed_tx.data, signed_tx.len);
+    tx_buf_free(&signed_tx);
 }
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -2013,6 +2047,34 @@ int main(int argc, char *argv[]) {
 
         int result = factory_recovery_scan(&db, &chain);
         printf("Force-close scan: examined %d factories\n", result);
+
+        /* Broadcast signed commitment TX if available */
+        {
+            unsigned char signed_tx_data[4096];
+            size_t signed_tx_len = 0;
+            uint64_t sig_cn = 0;
+            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
+                                             signed_tx_data, &signed_tx_len,
+                                             sizeof(signed_tx_data)) &&
+                signed_tx_len > 0) {
+                char *tx_hex = malloc(signed_tx_len * 2 + 1);
+                if (tx_hex) {
+                    extern void hex_encode(const unsigned char *, size_t, char *);
+                    hex_encode(signed_tx_data, signed_tx_len, tx_hex);
+                    char commit_txid[65];
+                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+                        printf("Force-close: commitment TX broadcast: %s "
+                               "(cn=%llu)\n", commit_txid,
+                               (unsigned long long)sig_cn);
+                    else
+                        printf("Force-close: commitment TX broadcast failed "
+                               "(may need tree to confirm first)\n");
+                    free(tx_hex);
+                }
+            } else {
+                printf("Force-close: no signed commitment TX in DB\n");
+            }
+        }
 
         persist_close(&db);
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");

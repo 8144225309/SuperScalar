@@ -167,6 +167,13 @@ typedef struct {
     unsigned char remote_bitcoin_sig[64];    /* peer's bitcoin key sig */
     int           ann_sigs_sent;             /* 1 = we sent announcement_signatures */
     int           ann_sigs_recv;             /* 1 = peer sent us announcement_signatures */
+
+    /* Latest commitment TX signature (trustless force-close).
+       After each MuSig2 aggregation, the client stores the full 64-byte
+       Schnorr sig so it can rebuild + broadcast the commitment TX
+       without the LSP's cooperation. */
+    unsigned char latest_commitment_sig[64];
+    int           has_latest_commitment_sig;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
