@@ -691,6 +691,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
+    /* Set per-client amounts for balance-aware distribution TX.
+       During rotation, use actual channel balances (remote = client's funds). */
+    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
+    for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
+        rot_dist_amounts[c] = mgr->entries[c].channel.remote_amount;
+    lsp->dist_client_amounts = rot_dist_amounts;
+    lsp->dist_n_client_amounts = mgr->n_channels;
+
     /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients) */
     if (!lsp_run_factory_creation(lsp,
                                    fund_txid, fund_vout,
@@ -706,8 +714,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
             lsp->n_clients = (size_t)mgr->n_channels;
         }
+        lsp->dist_client_amounts = NULL;
+        lsp->dist_n_client_amounts = 0;
         return 0;
     }
+    lsp->dist_client_amounts = NULL;
+    lsp->dist_n_client_amounts = 0;
 
     /* Set lifecycle for new factory */
     {
