@@ -152,11 +152,25 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
         }
 
+        /* Reject sub-satoshi fractions: on-chain amounts are whole sats */
+        if (amount_msat % 1000 != 0) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "fractional_msat_unsupported", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC rejected — fractional msat (%llu)\n",
+                   (unsigned long long)amount_msat);
+            return 1;
+        }
         uint64_t amount_sats = amount_msat / 1000;
         if (amount_sats == 0) {
-            printf("LSP: bridge HTLC zero sats (amount_msat=%llu)\n",
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "amount_too_small", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC zero sats (%llu msat)\n",
                    (unsigned long long)amount_msat);
-            return 0;
+            return 1;
         }
 
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
