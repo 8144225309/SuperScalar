@@ -816,6 +816,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int saved_cli_enabled = mgr->cli_enabled;
     int saved_confirm_timeout = mgr->confirm_timeout_secs;
 
+    /* Save channel balances so rotation preserves them (not reset to 50/50) */
+    size_t saved_n_channels = mgr->n_channels;
+    uint64_t saved_ch_local[FACTORY_MAX_SIGNERS];
+    uint64_t saved_ch_remote[FACTORY_MAX_SIGNERS];
+    for (size_t c = 0; c < saved_n_channels && c < FACTORY_MAX_SIGNERS; c++) {
+        saved_ch_local[c] = mgr->entries[c].channel.local_amount;
+        saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
+    }
+
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
@@ -853,6 +862,19 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->jit_funding_sats = saved_jit_funding;
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
+
+    /* Restore channel balances from old factory (carry across rotation).
+       Only apply if the old balance fits within the new channel capacity. */
+    for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
+        uint64_t new_usable = ch->local_amount + ch->remote_amount;
+        if (old_total > 0 && old_total <= new_usable) {
+            ch->local_amount = saved_ch_local[c];
+            ch->remote_amount = saved_ch_remote[c];
+        }
+        /* else: new factory has different capacity, keep default split */
+    }
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: basepoint exchange failed\n");
