@@ -214,6 +214,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 org->cltv_expiry = cltv_expiry;
                 org->sender_idx = dest_idx;
                 org->sender_htlc_id = dest_htlc_id;
+                /* Re-persist with updated sender/cltv fields so timeout
+                   routing works after crash (the initial persist only
+                   stored bridge_htlc_id with zeroed sender fields) */
+                if (mgr->persist)
+                    persist_save_htlc_origin((persist_t *)mgr->persist,
+                        payment_hash, htlc_id, 0,
+                        dest_idx, dest_htlc_id);
                 break;
             }
         }

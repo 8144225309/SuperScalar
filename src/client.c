@@ -1734,6 +1734,19 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
     }
 
+    /* 7b. Restore latest commitment TX signature for force-close capability */
+    if (db) {
+        uint64_t sig_cn = 0;
+        unsigned char sig64[64];
+        if (persist_load_commitment_sig(db, client_idx, &sig_cn, sig64,
+                                         NULL, NULL, 0) &&
+            sig_cn == commitment_number) {
+            memcpy(channel.latest_commitment_sig, sig64, 64);
+            channel.has_latest_commitment_sig = 1;
+        }
+        memset(sig64, 0, 64);
+    }
+
     /* 8. Nonce exchange — LSP sends CHANNEL_NONCES before RECONNECT_ACK */
     /* Receive LSP's pubnonces */
     {

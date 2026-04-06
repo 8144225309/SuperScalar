@@ -1370,6 +1370,16 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (f->leaf_arity != FACTORY_ARITY_1) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    /* Capture old state txid BEFORE advancing (for watchtower).
+       If old state is later published on-chain, the watchtower responds
+       with the new state tx and burns the L-stock output. */
+    size_t pre_node_idx = f->leaf_node_indices[leaf_side];
+    unsigned char old_leaf_txid[32];
+    int had_old_signed = (f->nodes[pre_node_idx].is_signed &&
+                          f->nodes[pre_node_idx].signed_tx.len > 0);
+    if (had_old_signed)
+        memcpy(old_leaf_txid, f->nodes[pre_node_idx].txid, 32);
+
     /* Step 1: Advance DW counter + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
     if (rc == 0) {
@@ -1520,6 +1530,30 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     /* Clear signing progress after successful aggregation */
     if (mgr->persist)
         persist_clear_signing_progress((persist_t *)mgr->persist, 0);
+
+    /* Register old leaf state with watchtower for breach detection.
+       If the old state is broadcast, the watchtower responds with the
+       new (latest) signed state tx and burns the old L-stock output. */
+    if (had_old_signed && mgr->watchtower) {
+        factory_node_t *leaf_node = &f->nodes[node_idx];
+
+        /* Build burn TX for old state's L-stock output */
+        tx_buf_t burn_tx;
+        tx_buf_init(&burn_tx, 256);
+        uint32_t old_epoch = f->counter.current_epoch > 0
+                           ? f->counter.current_epoch - 1 : 0;
+        size_t l_vout = leaf_node->n_outputs - 1;
+        int burn_ok = factory_build_burn_tx(f, &burn_tx,
+            old_leaf_txid, (uint32_t)l_vout,
+            leaf_node->outputs[l_vout].amount_sats, old_epoch);
+
+        watchtower_watch_factory_node(mgr->watchtower,
+            (uint32_t)node_idx, old_leaf_txid,
+            leaf_node->signed_tx.data, leaf_node->signed_tx.len,
+            burn_ok ? burn_tx.data : NULL,
+            burn_ok ? burn_tx.len : 0);
+        tx_buf_free(&burn_tx);
+    }
 
     /* Step 10: Send LEAF_ADVANCE_DONE to all clients */
     cJSON *done = wire_build_leaf_advance_done(leaf_side);
@@ -3855,6 +3889,28 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     /* Run sweeper on same cycle */
                     if (mgr->sweeper)
                         sweeper_check((sweeper_t *)mgr->sweeper);
+                    /* Auto-sweep CLTV-timelocked leaf outputs from expired factories.
+                       factory_sweep_run exists but was CLI-only — run it periodically. */
+                    if (mgr->persist && mgr->chain_be && mgr->ladder) {
+                        ladder_t *_lad = (ladder_t *)mgr->ladder;
+                        chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
+                        uint32_t _h = _cb->get_block_height(_cb);
+                        for (size_t fi = 0; fi < _lad->n_factories; fi++) {
+                            ladder_factory_t *_lf = &_lad->factories[fi];
+                            if (_lf->cached_state == FACTORY_EXPIRED &&
+                                _lf->factory.cltv_timeout > 0 &&
+                                _h >= _lf->factory.cltv_timeout &&
+                                mgr->rot_fund_spk_len > 0) {
+                                cJSON *res = factory_sweep_run(
+                                    (persist_t *)mgr->persist, _cb,
+                                    mgr->ctx, mgr->rot_lsp_seckey,
+                                    _lf->factory_id,
+                                    mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                    500, 0);
+                                if (res) cJSON_Delete(res);
+                            }
+                        }
+                    }
                 }
             }
 
