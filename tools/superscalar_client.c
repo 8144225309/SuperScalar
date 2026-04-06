@@ -15,6 +15,9 @@
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/tor.h"
+#ifdef __linux__
+#include <syslog.h>
+#endif
 #include "superscalar/bip39.h"
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
@@ -1876,6 +1879,8 @@ int main(int argc, char *argv[]) {
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
     int force_close = 0;              /* --force-close: broadcast factory tree from DB */
+    const char *log_file_path = NULL; /* --log-file PATH */
+    int use_syslog = 0;               /* --syslog */
     int sweep_to_local = 0;           /* --sweep-to-local: sweep to_local after CSV */
     const char *sweep_dest_addr = NULL; /* --sweep-dest: destination address for sweep */
 
@@ -2046,6 +2051,12 @@ int main(int argc, char *argv[]) {
             sweep_dest_addr = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
+        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            log_file_path = argv[++i];
+        } else if (strcmp(argv[i], "--syslog") == 0) {
+            use_syslog = 1;
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            i++;  /* already parsed in first pass */
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
             pay_offer_str = argv[++i];
         } else if (strcmp(argv[i], "--version") == 0) {
@@ -2055,6 +2066,20 @@ int main(int argc, char *argv[]) {
             usage(argv[0]);
             return 0;
         }
+    }
+
+    /* Redirect logs if requested */
+    if (log_file_path) {
+        if (!freopen(log_file_path, "a", stderr)) {
+            printf("ERROR: cannot open log file: %s\n", log_file_path);
+            return 1;
+        }
+        setvbuf(stderr, NULL, _IOLBF, 0);
+    }
+    if (use_syslog) {
+#ifdef __linux__
+        openlog("superscalar_client", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+#endif
     }
 
     /* --- Validate fee rate floor --- */

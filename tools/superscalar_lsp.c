@@ -13,6 +13,9 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
+#ifdef __linux__
+#include <syslog.h>
+#endif
 #include "superscalar/backup.h"
 #include "superscalar/bip39.h"
 #include "superscalar/hd_key.h"
@@ -1100,6 +1103,8 @@ int main(int argc, char *argv[]) {
     int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
     char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
     uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
+    const char *log_file_path = NULL;      /* --log-file PATH */
+    int use_syslog = 0;                    /* --syslog */
 
     /* Load config file if --config provided (first pass) */
     for (int i = 1; i < argc; i++) {
@@ -1431,6 +1436,12 @@ int main(int argc, char *argv[]) {
             bolt8_listen_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
             accept_risk = 1;
+        else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc)
+            log_file_path = argv[++i];
+        else if (strcmp(argv[i], "--syslog") == 0)
+            use_syslog = 1;
+        else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            i++;  /* already parsed in first pass */
         else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_lsp %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -1444,6 +1455,20 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* Redirect logs if requested */
+    if (log_file_path) {
+        if (!freopen(log_file_path, "a", stderr)) {
+            printf("ERROR: cannot open log file: %s\n", log_file_path);
+            return 1;
+        }
+        setvbuf(stderr, NULL, _IOLBF, 0); /* line-buffered */
+    }
+    if (use_syslog) {
+#ifdef __linux__
+        openlog("superscalar_lsp", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+#endif
+    }
 
     /* --- Validate fee rate floor --- */
     if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
