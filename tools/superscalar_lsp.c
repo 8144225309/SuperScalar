@@ -1101,6 +1101,43 @@ int main(int argc, char *argv[]) {
     char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
     uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
 
+    /* Load config file if --config provided (first pass) */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            FILE *cf = fopen(argv[i + 1], "r");
+            if (!cf) { fprintf(stderr, "ERROR: cannot open config: %s\n", argv[i + 1]); return 1; }
+            fseek(cf, 0, SEEK_END);
+            long cfsz = ftell(cf);
+            fseek(cf, 0, SEEK_SET);
+            char *cfdata = malloc((size_t)cfsz + 1);
+            if (cfdata) {
+                size_t cfrd = fread(cfdata, 1, (size_t)cfsz, cf);
+                cfdata[cfrd] = '\0';
+                cJSON *cfg = cJSON_Parse(cfdata);
+                free(cfdata);
+                if (cfg) {
+                    cJSON *v;
+                    if ((v = cJSON_GetObjectItem(cfg, "port")) && cJSON_IsNumber(v)) port = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "clients")) && cJSON_IsNumber(v)) n_clients = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "amount")) && cJSON_IsNumber(v)) funding_sats = (uint64_t)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "network")) && cJSON_IsString(v)) network = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "keyfile")) && cJSON_IsString(v)) keyfile_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "db")) && cJSON_IsString(v)) db_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcuser")) && cJSON_IsString(v)) rpcuser = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcpassword")) && cJSON_IsString(v)) rpcpassword = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcport")) && cJSON_IsNumber(v)) rpcport = (int)v->valuedouble;
+                    printf("Loaded config from %s\n", argv[i + 1]);
+                    cJSON_Delete(cfg);
+                } else {
+                    fprintf(stderr, "WARNING: failed to parse config JSON: %s\n", argv[i + 1]);
+                }
+            }
+            fclose(cf);
+            break;
+        }
+    }
+
+    /* Parse CLI arguments (override config file) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = atoi(argv[++i]);

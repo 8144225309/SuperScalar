@@ -1823,6 +1823,7 @@ static void usage(const char *prog) {
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
+        "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
@@ -1881,6 +1882,44 @@ int main(int argc, char *argv[]) {
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
 
+    /* Load config file if --config provided (first pass) */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            FILE *cf = fopen(argv[i + 1], "r");
+            if (!cf) { fprintf(stderr, "ERROR: cannot open config: %s\n", argv[i + 1]); return 1; }
+            fseek(cf, 0, SEEK_END);
+            long cfsz = ftell(cf);
+            fseek(cf, 0, SEEK_SET);
+            char *cfdata = malloc((size_t)cfsz + 1);
+            if (cfdata) {
+                size_t cfrd = fread(cfdata, 1, (size_t)cfsz, cf);
+                cfdata[cfrd] = '\0';
+                cJSON *cfg = cJSON_Parse(cfdata);
+                free(cfdata);
+                if (cfg) {
+                    cJSON *v;
+                    if ((v = cJSON_GetObjectItem(cfg, "host")) && cJSON_IsString(v)) host = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "port")) && cJSON_IsNumber(v)) port = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "network")) && cJSON_IsString(v)) network = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "keyfile")) && cJSON_IsString(v)) keyfile_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "db")) && cJSON_IsString(v)) db_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "passphrase")) && cJSON_IsString(v)) passphrase = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "lsp-pubkey")) && cJSON_IsString(v)) lsp_pubkey_hex = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcuser")) && cJSON_IsString(v)) rpcuser = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcpassword")) && cJSON_IsString(v)) rpcpassword = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcport")) && cJSON_IsNumber(v)) rpcport = (int)v->valuedouble;
+                    printf("Loaded config from %s\n", argv[i + 1]);
+                    cJSON_Delete(cfg);
+                } else {
+                    fprintf(stderr, "WARNING: failed to parse config JSON: %s\n", argv[i + 1]);
+                }
+            }
+            fclose(cf);
+            break;
+        }
+    }
+
+    /* Parse CLI arguments (override config file) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seckey") == 0 && i + 1 < argc)
             seckey_hex = argv[++i];
