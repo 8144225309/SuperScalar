@@ -1992,7 +1992,7 @@ int main(int argc, char *argv[]) {
         int have_chain = 0;
         regtest_t rt;
         if (strcmp(network, "regtest") == 0) {
-            if (!regtest_init(&rt, cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+            if (!regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
                 fprintf(stderr, "ERROR: regtest init failed\n");
                 persist_close(&db);
                 return 1;
