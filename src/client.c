@@ -482,6 +482,49 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* --- Apply signed tree nodes from MSG_FACTORY_READY --- */
+
+static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
+    if (!f || !json) return 0;
+    cJSON *signed_txs = cJSON_GetObjectItem(json, "signed_txs");
+    if (!signed_txs || !cJSON_IsArray(signed_txs)) return 0;
+
+    int count = 0;
+    int arr_size = cJSON_GetArraySize(signed_txs);
+    for (int i = 0; i < arr_size; i++) {
+        cJSON *item = cJSON_GetArrayItem(signed_txs, i);
+        if (!item) continue;
+        cJSON *idx_j = cJSON_GetObjectItem(item, "node_idx");
+        cJSON *hex_j = cJSON_GetObjectItem(item, "tx_hex");
+        if (!idx_j || !cJSON_IsNumber(idx_j)) continue;
+        if (!hex_j || !cJSON_IsString(hex_j)) continue;
+
+        size_t node_idx = (size_t)idx_j->valuedouble;
+        if (node_idx >= f->n_nodes) continue;
+
+        const char *hex = hex_j->valuestring;
+        size_t hex_len = strlen(hex);
+        if (hex_len < 2 || hex_len % 2 != 0) continue;
+        size_t raw_len = hex_len / 2;
+
+        /* Free existing signed_tx if any, then allocate and decode */
+        tx_buf_free(&f->nodes[node_idx].signed_tx);
+        tx_buf_init(&f->nodes[node_idx].signed_tx, raw_len);
+        f->nodes[node_idx].signed_tx.len = raw_len;
+        if (hex_decode(hex, f->nodes[node_idx].signed_tx.data, raw_len)
+                != (int)raw_len) {
+            f->nodes[node_idx].signed_tx.len = 0;
+            continue;
+        }
+        f->nodes[node_idx].is_signed = 1;
+        count++;
+    }
+
+    if (count > 0)
+        printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
+    return count;
+}
+
 /* --- Factory rotation (condensed factory creation without HELLO) --- */
 
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
@@ -713,6 +756,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (msg.json) cJSON_Delete(msg.json);
         free(secnonces); free(nonce_entries); return 0;
     }
+    client_apply_factory_ready(factory_out, msg.json);
     cJSON_Delete(msg.json);
 
     /* Basepoint exchange: receive LSP's basepoints */
@@ -1268,6 +1312,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         if (msg.json) cJSON_Delete(msg.json);
         goto fail;
     }
+    client_apply_factory_ready(factory, msg.json);
     cJSON_Delete(msg.json);
 
     printf("Client %u: factory creation complete!\n", my_index);

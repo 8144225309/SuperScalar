@@ -593,7 +593,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             uint32_t client_idx = my_index - 1;
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
-                persist_save_basepoints(cbd->db, client_idx, ch)) {
+                persist_save_basepoints(cbd->db, client_idx, ch) &&
+                persist_save_tree_nodes(cbd->db, factory, 0)) {
                 /* Save initial local PCS so they survive crash before first payment */
                 for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
                     unsigned char pcs[32];
@@ -1387,7 +1388,8 @@ handle_message:
                     uint32_t rot_client_idx = my_index - 1;
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
-                        persist_save_basepoints(cbd->db, rot_client_idx, ch)) {
+                        persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
+                        persist_save_tree_nodes(cbd->db, factory, 0)) {
                         /* Save initial PCS for the new rotated channel so they
                            survive crash before first payment on the new factory */
                         for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
