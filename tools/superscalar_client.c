@@ -10,6 +10,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/sweeper.h"
+#include "superscalar/chain_backend_rpc.h"
 #include "superscalar/fee.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
@@ -2058,11 +2059,23 @@ int main(int argc, char *argv[]) {
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             have_chain = 1;
+        } else if (rpcuser && rpcpassword) {
+            /* Direct HTTP JSON-RPC to bitcoind (any network) */
+            const char *rpchost_fc = "127.0.0.1";
+            if (chain_backend_rpc_init(&chain, rpchost_fc,
+                                        rpcport, rpcuser, rpcpassword,
+                                        NULL, network)) {
+                have_chain = 1;
+            } else {
+                fprintf(stderr, "ERROR: chain backend RPC init failed\n");
+                persist_close(&db);
+                return 1;
+            }
         }
 
         if (!have_chain) {
-            fprintf(stderr, "ERROR: --force-close currently requires regtest "
-                    "(use --network regtest)\n");
+            fprintf(stderr, "ERROR: --force-close requires either regtest or "
+                    "--rpcuser + --rpcpassword for bitcoind connection\n");
             persist_close(&db);
             return 1;
         }
@@ -2160,9 +2173,17 @@ int main(int argc, char *argv[]) {
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             have_chain = 1;
+        } else if (rpcuser && rpcpassword) {
+            const char *rpchost_sw = "127.0.0.1";
+            if (chain_backend_rpc_init(&chain, rpchost_sw,
+                                        rpcport, rpcuser, rpcpassword,
+                                        NULL, network)) {
+                have_chain = 1;
+            }
         }
         if (!have_chain) {
-            fprintf(stderr, "ERROR: --sweep-to-local currently requires regtest\n");
+            fprintf(stderr, "ERROR: --sweep-to-local requires either regtest or "
+                    "--rpcuser + --rpcpassword\n");
             persist_close(&db);
             return 1;
         }
