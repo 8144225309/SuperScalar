@@ -422,7 +422,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
                 free(old_htlcs);
 
-                /* Persist balance + commitment_number + PCS/PCP */
+                /* Persist balance + commitment_number + PCS/PCP + origin deactivation
+                   atomically (all in one transaction) */
                 if (mgr->persist) {
                     persist_t *db = (persist_t *)mgr->persist;
                     int own_txn = !persist_in_transaction(db);
@@ -443,12 +444,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             ch->commitment_number + 1, pcs);
                     memset(pcs, 0, 32);
 
+                    persist_deactivate_htlc_origin(db,
+                        mgr->htlc_origins[i].payment_hash);
+
                     if (own_txn) persist_commit(db);
                 }
-
-                if (mgr->persist)
-                    persist_deactivate_htlc_origin((persist_t *)mgr->persist,
-                        mgr->htlc_origins[i].payment_hash);
 
                 printf("LSP: bridge pay fulfilled for client %zu htlc %llu\n",
                        client_idx, (unsigned long long)htlc_id_val);
