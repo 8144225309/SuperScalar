@@ -458,4 +458,16 @@ size_t factory_compute_distribution_outputs(
     size_t max_outputs,
     uint64_t fee_sats);
 
+/* Balance-aware distribution outputs: each client gets their actual channel
+   balance (client_amounts[0..n_clients-1]) instead of equal split.
+   LSP gets funding - sum(client_amounts) - fee.
+   client_amounts may be NULL to fall back to equal split. */
+size_t factory_compute_distribution_outputs_balanced(
+    const factory_t *f,
+    tx_output_t *outputs_out,
+    size_t max_outputs,
+    uint64_t fee_sats,
+    const uint64_t *client_amounts,
+    size_t n_client_amounts);
+
 #endif /* SUPERSCALAR_FACTORY_H */
