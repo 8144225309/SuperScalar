@@ -4,7 +4,26 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Factory scaling to 64 participants + full reorg resistance + production hardening. 36/36 orchestrator, 1357 unit tests.
+Complete fund settlement, crash safety, and trustless recovery. Every settlement path now enforced. 1361 unit tests, 42 regtest integration tests.
+
+### Fund settlement (PR #53)
+
+- **Sweeper module** (`sweeper.c`, `sweeper.h`): new auto-sweep engine for CSV-delayed `to_local`, penalty, and HTLC timeout outputs. Persists pending sweeps to DB (`pending_sweeps` table, schema v12), retries each daemon cycle until confirmed.
+- **Distribution TX in MuSig2 ceremony** (`lsp.c`, `client.c`, `factory.c`): the distribution TX (nLockTime safety net) is now signed by all participants during factory creation using a virtual node (node_idx = n_nodes). Previously never built in production. Both initial and rotation ceremonies supported. Schema v14 adds `distribution_txs` table.
+- **Watchtower factory state monitoring** (`lsp_channels.c`): after each DW state advance, old state txid is registered with the watchtower via `watchtower_watch_factory_node()`. On breach detection, watchtower broadcasts the newer state TX + burn TX to destroy the attacker's L-stock.
+- **Burn TX registration** (`lsp_channels.c`): `factory_build_burn_tx()` output is now passed to the watchtower alongside state response TXs. Completes the old-state poisoning mechanism from ZmnSCPxj's design.
+- **CLTV leaf sweep automation** (`lsp_channels.c`): daemon loop now checks expired factories each cycle and calls `factory_sweep_run()` when `current_height >= cltv_timeout`. LSP recovers funds from permanently offline clients without manual intervention.
+- **Atomic HTLC fulfill persistence** (`lsp_channels.c`): payee credit and sender debit wrapped in a single DB transaction. Crash between the two rolls back both, preventing fund mis-attribution.
+- **Bridge origin field persistence** (`lsp_bridge.c`): `sender_idx`, `sender_htlc_id`, and `cltv_expiry` re-persisted after update. Prevents bridge HTLC timeout routing failure on crash recovery.
+- **HTLC drain before rotation** (`lsp_rotation.c`): all active HTLCs failed cleanly before starting rotation ceremony, preventing funds stranded mid-flight.
+- **Client commitment TX persistence** (`superscalar_client.c`, `persist.c`): signed commitment TX stored to DB (schema v13, `signed_commitments` table) at 5 sites after `client_handle_commitment_signed`. Client can independently broadcast for trustless force-close.
+- **Client tree node persistence** (`superscalar_client.c`): `persist_save_tree_nodes()` called during initial and rotation factory persist blocks. Enables client-side tree broadcast without LSP cooperation.
+- **Client distribution TX persistence** (`superscalar_client.c`): signed distribution TX saved to DB after FACTORY_READY. Client `--force-close` broadcasts it as nLockTime fallback.
+- **Commitment sig loaded on reconnect** (`client.c`): `persist_load_commitment_sig()` called in `client_run_reconnect()` so the client retains force-close ability across restarts without waiting for a new payment.
+- **JIT channel force-close** (`jit_channel.c`): new `jit_channel_force_close()` detects and handles JIT channels during force-close flow.
+- **Balance conservation invariant** (`lsp_channels.c`, `test_channels.c`): `lsp_channels_check_conservation()` verifies `sum(local + remote + htlc) == funding` after every state change. 3 new unit tests.
+
+Factory scaling to 64 participants + full reorg resistance + production hardening. 36/36 orchestrator.
 
 ### Added
 
