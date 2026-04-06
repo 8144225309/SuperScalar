@@ -15,6 +15,7 @@
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/tor.h"
+#include "superscalar/log.h"
 #ifdef __linux__
 #include <syslog.h>
 #endif
@@ -1881,6 +1882,7 @@ int main(int argc, char *argv[]) {
     int force_close = 0;              /* --force-close: broadcast factory tree from DB */
     const char *log_file_path = NULL; /* --log-file PATH */
     int use_syslog = 0;               /* --syslog */
+    int use_json_log = 0;              /* --json-log */
     int sweep_to_local = 0;           /* --sweep-to-local: sweep to_local after CSV */
     const char *sweep_dest_addr = NULL; /* --sweep-dest: destination address for sweep */
 
@@ -2055,6 +2057,8 @@ int main(int argc, char *argv[]) {
             log_file_path = argv[++i];
         } else if (strcmp(argv[i], "--syslog") == 0) {
             use_syslog = 1;
+        } else if (strcmp(argv[i], "--json-log") == 0) {
+            use_json_log = 1;
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             i++;  /* already parsed in first pass */
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
@@ -2081,6 +2085,8 @@ int main(int argc, char *argv[]) {
         openlog("superscalar_client", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 #endif
     }
+    if (use_json_log)
+        ss_log_set_json(1);
 
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {
