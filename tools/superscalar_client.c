@@ -1819,6 +1819,8 @@ static void usage(const char *prog) {
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
@@ -1871,6 +1873,8 @@ int main(int argc, char *argv[]) {
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
     int force_close = 0;              /* --force-close: broadcast factory tree from DB */
+    int sweep_to_local = 0;           /* --sweep-to-local: sweep to_local after CSV */
+    const char *sweep_dest_addr = NULL; /* --sweep-dest: destination address for sweep */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -1995,6 +1999,10 @@ int main(int argc, char *argv[]) {
             mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--force-close") == 0) {
             force_close = 1;
+        } else if (strcmp(argv[i], "--sweep-to-local") == 0) {
+            sweep_to_local = 1;
+        } else if (strcmp(argv[i], "--sweep-dest") == 0 && i + 1 < argc) {
+            sweep_dest_addr = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
@@ -2117,6 +2125,300 @@ int main(int argc, char *argv[]) {
 
         persist_close(&db);
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+        return 0;
+    }
+
+    /* --- Sweep to_local output after CSV maturity (early exit) --- */
+    if (sweep_to_local) {
+        if (!db_path) {
+            fprintf(stderr, "ERROR: --sweep-to-local requires --db PATH\n");
+            return 1;
+        }
+        if (!sweep_dest_addr) {
+            fprintf(stderr, "ERROR: --sweep-to-local requires --sweep-dest ADDRESS\n");
+            return 1;
+        }
+        persist_t db;
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
+            return 1;
+        }
+
+        printf("=== CLIENT SWEEP TO-LOCAL ===\n");
+
+        /* Initialize chain backend */
+        chain_backend_t chain;
+        int have_chain = 0;
+        regtest_t rt;
+        if (strcmp(network, "regtest") == 0) {
+            if (!regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+                fprintf(stderr, "ERROR: regtest init failed\n");
+                persist_close(&db);
+                return 1;
+            }
+            extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
+            chain_backend_regtest_init(&chain, &rt);
+            have_chain = 1;
+        }
+        if (!have_chain) {
+            fprintf(stderr, "ERROR: --sweep-to-local currently requires regtest\n");
+            persist_close(&db);
+            return 1;
+        }
+
+        /* Load commitment sig to get the signed commitment TX */
+        unsigned char commit_tx_data[4096];
+        size_t commit_tx_len = 0;
+        uint64_t sig_cn = 0;
+        if (!persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
+                                          commit_tx_data, &commit_tx_len,
+                                          sizeof(commit_tx_data)) ||
+            commit_tx_len == 0) {
+            fprintf(stderr, "ERROR: no signed commitment TX in DB\n");
+            persist_close(&db);
+            return 1;
+        }
+        printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
+               (unsigned long long)sig_cn, commit_tx_len);
+
+        /* Load channel state (balances + commitment number) */
+        uint64_t local_amt = 0, remote_amt = 0;
+        uint64_t cn = 0;
+        persist_load_channel_state(&db, 0, &local_amt, &remote_amt, &cn);
+
+        /* Load basepoints */
+        unsigned char local_secs[4][32];
+        unsigned char remote_bps_raw[4][33];
+        if (!persist_load_basepoints(&db, 0, local_secs, remote_bps_raw)) {
+            fprintf(stderr, "ERROR: no basepoints in DB\n");
+            persist_close(&db);
+            return 1;
+        }
+
+        /* Load factory (needed for funding info) */
+        secp256k1_context *sweep_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+        factory_t *sweep_factory = calloc(1, sizeof(factory_t));
+        if (!sweep_factory || !persist_load_factory(&db, sweep_factory, sweep_ctx, 0)) {
+            fprintf(stderr, "ERROR: failed to load factory from DB\n");
+            free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+
+        /* Parse remote basepoints */
+        secp256k1_pubkey r_pay, r_delay, r_revoc, r_htlc;
+        if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
+            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
+            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
+            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33)) {
+            fprintf(stderr, "ERROR: failed to parse remote basepoints\n");
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+
+        /* Load keyfile to get keypair */
+        unsigned char sweep_seckey[32];
+        if (!keyfile_path) {
+            fprintf(stderr, "ERROR: --sweep-to-local requires --keyfile\n");
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+        {
+            extern int keyfile_load(const char *, unsigned char *, size_t);
+            if (!keyfile_load(keyfile_path, sweep_seckey, 32)) {
+                fprintf(stderr, "ERROR: failed to load keyfile\n");
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+        }
+        secp256k1_keypair sweep_kp;
+        secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
+        memset(sweep_seckey, 0, 32);
+
+        /* Initialize channel using the same path as reconnect */
+        channel_t sweep_ch;
+        uint32_t sweep_my_index = 1; /* default client index */
+        if (!client_init_channel(&sweep_ch, sweep_ctx, sweep_factory, &sweep_kp,
+                                  sweep_my_index,
+                                  &r_pay, &r_delay, &r_revoc, &r_htlc,
+                                  local_secs[0], local_secs[1], local_secs[2], local_secs[3],
+                                  NULL)) {
+            fprintf(stderr, "ERROR: channel init failed\n");
+            memset(local_secs, 0, sizeof(local_secs));
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+        memset(local_secs, 0, sizeof(local_secs));
+
+        /* Restore channel state */
+        sweep_ch.local_amount = local_amt;
+        sweep_ch.remote_amount = remote_amt;
+        sweep_ch.commitment_number = cn;
+
+        /* Restore per-commitment secrets */
+        {
+            size_t pcs_max = (size_t)(cn + 2);
+            unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
+            if (pcs_arr) {
+                size_t pcs_loaded = 0;
+                persist_load_local_pcs(&db, 0, pcs_arr, pcs_max, &pcs_loaded);
+                for (uint64_t c = 0; c < pcs_max; c++) {
+                    int nonzero = 0;
+                    for (int j = 0; j < 32; j++)
+                        if (pcs_arr[c][j]) { nonzero = 1; break; }
+                    if (nonzero)
+                        channel_set_local_pcs(&sweep_ch, c, pcs_arr[c]);
+                }
+                free(pcs_arr);
+            }
+        }
+
+        /* Build commitment TX to get txid and to_local amount */
+        tx_buf_t commit_utx;
+        unsigned char commit_txid[32];
+        tx_buf_init(&commit_utx, 256);
+        if (!channel_build_commitment_tx(&sweep_ch, &commit_utx, commit_txid)) {
+            fprintf(stderr, "ERROR: failed to rebuild commitment TX\n");
+            tx_buf_free(&commit_utx);
+            channel_cleanup(&sweep_ch);
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+        tx_buf_free(&commit_utx);
+
+        uint64_t to_local_amount = sweep_ch.local_amount;
+        uint32_t to_local_vout = 0; /* to_local is always output[0] */
+
+        /* Check commitment TX confirmation */
+        {
+            extern void hex_encode(const unsigned char *, size_t, char *);
+            char txid_hex[65];
+            unsigned char display_txid[32];
+            for (int k = 0; k < 32; k++) display_txid[k] = commit_txid[31 - k];
+            hex_encode(display_txid, 32, txid_hex);
+            printf("Sweep: commitment txid = %s\n", txid_hex);
+            printf("Sweep: to_local amount = %llu sats (vout %u)\n",
+                   (unsigned long long)to_local_amount, to_local_vout);
+
+            int confs = chain.get_confirmations(&chain, txid_hex);
+            if (confs <= 0) {
+                printf("Sweep: commitment TX not confirmed yet. "
+                       "Run --force-close first.\n");
+                channel_cleanup(&sweep_ch);
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+
+            uint32_t csv_delay = CHANNEL_DEFAULT_CSV_DELAY;
+            printf("Sweep: commitment TX has %d confirmations "
+                   "(need %u for CSV)\n", confs, csv_delay);
+            if ((uint32_t)confs < csv_delay) {
+                printf("Sweep: CSV not mature yet — %u blocks remaining\n",
+                       csv_delay - (uint32_t)confs);
+                channel_cleanup(&sweep_ch);
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+        }
+
+        /* Build destination SPK from --sweep-dest.
+           Accepts either a 34-byte hex scriptPubKey (5120<32-byte-xonly>)
+           or a 32-byte hex xonly pubkey (auto-wraps as P2TR). */
+        unsigned char dest_spk[34];
+        size_t dest_spk_len = 0;
+        {
+            extern int hex_decode(const char *, unsigned char *, size_t);
+            size_t addr_len = strlen(sweep_dest_addr);
+            if (addr_len == 68) {
+                /* 34-byte hex SPK */
+                if (hex_decode(sweep_dest_addr, dest_spk, 34) != 34) {
+                    fprintf(stderr, "ERROR: invalid 34-byte hex scriptPubKey\n");
+                    channel_cleanup(&sweep_ch);
+                    factory_free(sweep_factory); free(sweep_factory);
+                    secp256k1_context_destroy(sweep_ctx);
+                    persist_close(&db);
+                    return 1;
+                }
+                dest_spk_len = 34;
+            } else if (addr_len == 64) {
+                /* 32-byte xonly pubkey → wrap as P2TR */
+                dest_spk[0] = 0x51; /* OP_1 */
+                dest_spk[1] = 0x20; /* push 32 bytes */
+                if (hex_decode(sweep_dest_addr, dest_spk + 2, 32) != 32) {
+                    fprintf(stderr, "ERROR: invalid 32-byte hex xonly pubkey\n");
+                    channel_cleanup(&sweep_ch);
+                    factory_free(sweep_factory); free(sweep_factory);
+                    secp256k1_context_destroy(sweep_ctx);
+                    persist_close(&db);
+                    return 1;
+                }
+                dest_spk_len = 34;
+            } else {
+                fprintf(stderr, "ERROR: --sweep-dest expects 64-char xonly pubkey hex "
+                        "or 68-char P2TR scriptPubKey hex\n");
+                channel_cleanup(&sweep_ch);
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+        }
+
+        /* Build sweep TX */
+        tx_buf_t sweep_tx;
+        tx_buf_init(&sweep_tx, 256);
+        if (!channel_build_to_local_sweep(&sweep_ch, &sweep_tx,
+                                            commit_txid, to_local_vout,
+                                            to_local_amount,
+                                            dest_spk, dest_spk_len)) {
+            fprintf(stderr, "ERROR: failed to build sweep TX "
+                    "(amount too small for fees?)\n");
+            tx_buf_free(&sweep_tx);
+            channel_cleanup(&sweep_ch);
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+
+        /* Broadcast sweep TX */
+        {
+            extern void hex_encode(const unsigned char *, size_t, char *);
+            char *sweep_hex = malloc(sweep_tx.len * 2 + 1);
+            if (sweep_hex) {
+                hex_encode(sweep_tx.data, sweep_tx.len, sweep_hex);
+                char sweep_txid[65];
+                if (chain.send_raw_tx(&chain, sweep_hex, sweep_txid))
+                    printf("Sweep: to_local swept! txid = %s\n", sweep_txid);
+                else
+                    fprintf(stderr, "ERROR: sweep TX broadcast failed\n");
+                free(sweep_hex);
+            }
+        }
+
+        tx_buf_free(&sweep_tx);
+        channel_cleanup(&sweep_ch);
+        factory_free(sweep_factory); free(sweep_factory);
+        secp256k1_context_destroy(sweep_ctx);
+        persist_close(&db);
+        printf("=== CLIENT SWEEP COMPLETE ===\n");
         return 0;
     }
 

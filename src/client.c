@@ -75,7 +75,7 @@ static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
    Mirrors the LSP's lsp_channels_init logic.
    remote_*_bp: remote (LSP) basepoint pubkeys received via MSG_CHANNEL_BASEPOINTS.
    local_*_sec32: 32-byte local basepoint secrets (random, not SHA256-derived). */
-static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
+int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const factory_t *factory,
                                  const secp256k1_keypair *keypair,
                                  uint32_t my_index,

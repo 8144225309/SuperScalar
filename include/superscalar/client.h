@@ -2,6 +2,8 @@
 #define SUPERSCALAR_CLIENT_H
 
 #include "channel.h"
+#include "factory.h"
+#include "fee_estimator.h"
 #include "persist.h"
 #include "wire.h"
 #include <secp256k1.h>
@@ -34,6 +36,21 @@ typedef int (*client_channel_cb_t)(int fd, channel_t *channel,
                                     factory_t *factory,
                                     size_t n_participants,
                                     void *user_data);
+
+/* Initialize a channel for a client within a factory (used by reconnect and sweep). */
+int client_init_channel(channel_t *ch, secp256k1_context *ctx,
+                         const factory_t *factory,
+                         const secp256k1_keypair *keypair,
+                         uint32_t my_index,
+                         const secp256k1_pubkey *remote_payment_bp,
+                         const secp256k1_pubkey *remote_delayed_bp,
+                         const secp256k1_pubkey *remote_revocation_bp,
+                         const secp256k1_pubkey *remote_htlc_bp,
+                         const unsigned char *local_pay_sec32,
+                         const unsigned char *local_delay_sec32,
+                         const unsigned char *local_revoc_sec32,
+                         const unsigned char *local_htlc_sec32,
+                         fee_estimator_t *fee_est);
 
 /* Run the full ceremony with optional channel operations.
    If channel_cb is NULL, behaves identically to client_run_ceremony
