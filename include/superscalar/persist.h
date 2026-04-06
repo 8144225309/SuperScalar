@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 12
+#define PERSIST_SCHEMA_VERSION 13
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -688,6 +688,24 @@ int persist_save_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
 int persist_load_peer_storage(persist_t *p, const unsigned char peer_pubkey[33],
                                 unsigned char *blob_out, uint16_t *blob_len_out,
                                 size_t blob_cap);
+
+/* --- Signed commitment TX (schema v13) --- */
+
+/* Save the latest commitment TX signature for a channel.
+   Used by clients to persist the aggregated MuSig2 sig for force-close. */
+int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
+                                 uint64_t commitment_number,
+                                 const unsigned char *sig64,
+                                 const unsigned char *signed_tx,
+                                 size_t signed_tx_len);
+
+/* Load the latest commitment TX signature. Returns 1 if found. */
+int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
+                                 uint64_t *commitment_number_out,
+                                 unsigned char *sig64_out,
+                                 unsigned char *signed_tx_out,
+                                 size_t *signed_tx_len_out,
+                                 size_t max_tx_len);
 
 /* --- Pending sweeps (schema v12) --- */
 /* persist_save_sweep / persist_load_sweeps / persist_delete_sweep

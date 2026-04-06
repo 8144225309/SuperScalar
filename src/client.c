@@ -222,6 +222,11 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
         return 0;
     }
 
+    /* Store the aggregated signature so the client can broadcast the
+       commitment TX independently (trustless force-close). */
+    memcpy(ch->latest_commitment_sig, full_sig64, 64);
+    ch->has_latest_commitment_sig = 1;
+
     /* Get revocation secret for the old commitment */
     unsigned char rev_secret[32];
     if (ch->commitment_number > 0) {
