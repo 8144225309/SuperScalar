@@ -1,4 +1,5 @@
 #include "superscalar/persist.h"
+#include "superscalar/sweeper.h"
 #include "superscalar/circuit_breaker.h"
 #include "superscalar/gossip_store.h"
 #include "superscalar/rgs.h"
@@ -3021,6 +3022,46 @@ int test_b12_po1_payoffer_missing_offer(void) {
     size_t n = admin_rpc_handle_request(&rpc, req, out, sizeof(out));
     TEST_ASSERT(n > 0, "B12_PO1: response produced");
     TEST_ASSERT(strstr(out, "missing offer") != NULL, "B12_PO1: error mentions missing offer");
+    return 1;
+}
+
+/* SWEEP1: pending_sweeps table roundtrip */
+int test_sweep_persist_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "SWEEP1: open");
+
+    sweep_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = SWEEP_TO_LOCAL;
+    e.state = SWEEP_PENDING;
+    memset(e.source_txid, 0xAB, 32);
+    e.source_vout = 0;
+    e.amount_sats = 50000;
+    e.csv_delay = 144;
+    e.confirmed_height = 100;
+    e.channel_id = 2;
+    e.factory_id = 1;
+    e.commitment_number = 5;
+
+    TEST_ASSERT(persist_save_sweep(&db, &e), "SWEEP1: save");
+
+    sweep_entry_t loaded[4];
+    size_t n = 0;
+    TEST_ASSERT(persist_load_sweeps(&db, loaded, &n, 4), "SWEEP1: load");
+    TEST_ASSERT(n == 1, "SWEEP1: 1 entry loaded");
+    TEST_ASSERT(loaded[0].type == SWEEP_TO_LOCAL, "SWEEP1: type");
+    TEST_ASSERT(loaded[0].amount_sats == 50000, "SWEEP1: amount");
+    TEST_ASSERT(loaded[0].csv_delay == 144, "SWEEP1: csv");
+    TEST_ASSERT(loaded[0].channel_id == 2, "SWEEP1: channel_id");
+    TEST_ASSERT(loaded[0].factory_id == 1, "SWEEP1: factory_id");
+
+    /* Delete by factory */
+    TEST_ASSERT(persist_delete_sweeps_for_factory(&db, 1), "SWEEP1: delete");
+    n = 0;
+    persist_load_sweeps(&db, loaded, &n, 4);
+    TEST_ASSERT(n == 0, "SWEEP1: 0 after delete");
+
+    persist_close(&db);
     return 1;
 }
 

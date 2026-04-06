@@ -1654,6 +1654,12 @@ extern int test_b12_po1_payoffer_missing_offer(void);
 extern int test_wt_ptlc1_entry_fields(void);
 extern int test_wt_ptlc2_metadata_store(void);
 
+/* Sweeper + conservation tests */
+extern int test_conservation_balanced(void);
+extern int test_conservation_violated(void);
+extern int test_conservation_with_ptlc(void);
+extern int test_sweep_persist_roundtrip(void);
+
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
 extern int test_regtest_exec_rejects_metacharacters(void);
@@ -3355,6 +3361,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_b12_po1_payoffer_missing_offer);
     RUN_TEST(test_wt_ptlc1_entry_fields);
     RUN_TEST(test_wt_ptlc2_metadata_store);
+
+    printf("\n=== Fund Settlement: Sweeper + Conservation ===\n");
+    RUN_TEST(test_conservation_balanced);
+    RUN_TEST(test_conservation_violated);
+    RUN_TEST(test_conservation_with_ptlc);
+    RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);
