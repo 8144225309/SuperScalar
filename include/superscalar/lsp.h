@@ -45,6 +45,13 @@ typedef struct {
 
     /* Per-IP connection rate limiter + concurrent handshake cap. */
     rate_limiter_t rate_limiter;
+
+    /* Optional per-client amounts for balance-aware distribution TX.
+       Set before lsp_run_factory_creation() during rotation so the
+       distribution TX reflects actual channel balances, not equal split.
+       NULL = use equal split (initial creation). */
+    const uint64_t *dist_client_amounts;
+    size_t dist_n_client_amounts;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

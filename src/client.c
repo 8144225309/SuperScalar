@@ -631,6 +631,19 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         }
     }
 
+    /* Parse per-client distribution amounts (optional, for rotation) */
+    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
+    size_t rot_n_dist_amounts = 0;
+    cJSON *rda_arr = cJSON_GetObjectItem(pj, "dist_amounts");
+    if (rda_arr && cJSON_IsArray(rda_arr)) {
+        int rda_n = cJSON_GetArraySize(rda_arr);
+        for (int rdi = 0; rdi < rda_n && rdi < FACTORY_MAX_SIGNERS; rdi++) {
+            cJSON *rda = cJSON_GetArrayItem(rda_arr, rdi);
+            if (rda && cJSON_IsNumber(rda))
+                rot_dist_amounts[rot_n_dist_amounts++] = (uint64_t)rda->valuedouble;
+        }
+    }
+
     /* Parse L-stock hashlock hashes (optional) */
     unsigned char rot_hashes[FACTORY_MAX_EPOCHS][32];
     size_t rot_n_hashes = 0;
@@ -726,8 +739,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         int dist_slot = factory_find_signer_slot(factory_out, 0, my_index);
         if (dist_slot >= 0 && factory_out->cltv_timeout > 0) {
             tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
-            size_t n_dist = factory_compute_distribution_outputs(factory_out,
-                dist_outputs, FACTORY_MAX_SIGNERS + 1, 500);
+            size_t n_dist = factory_compute_distribution_outputs_balanced(
+                factory_out, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                rot_n_dist_amounts > 0 ? rot_dist_amounts : NULL,
+                rot_n_dist_amounts);
             if (n_dist > 0 &&
                 factory_build_distribution_tx_unsigned(factory_out, dist_outputs,
                     n_dist, factory_out->cltv_timeout)) {
@@ -1190,6 +1205,21 @@ int client_run_with_channels(secp256k1_context *ctx,
             if (v && cJSON_IsNumber(v)) profiles[pi].timezone_bucket = (uint8_t)v->valuedouble;
         }
     }
+    /* Parse per-client distribution amounts (optional, for rotation) */
+    uint64_t init_dist_amounts[FACTORY_MAX_SIGNERS];
+    size_t init_n_dist_amounts = 0;
+    {
+        cJSON *ida_arr = cJSON_GetObjectItem(msg.json, "dist_amounts");
+        if (ida_arr && cJSON_IsArray(ida_arr)) {
+            int ida_n = cJSON_GetArraySize(ida_arr);
+            for (int idi = 0; idi < ida_n && idi < FACTORY_MAX_SIGNERS; idi++) {
+                cJSON *ida = cJSON_GetArrayItem(ida_arr, idi);
+                if (ida && cJSON_IsNumber(ida))
+                    init_dist_amounts[init_n_dist_amounts++] = (uint64_t)ida->valuedouble;
+            }
+        }
+    }
+
     /* Parse L-stock hashlock hashes (optional — present when LSP has
        revocation secrets for burn TX enforcement). */
     unsigned char parsed_l_stock_hashes[FACTORY_MAX_EPOCHS][32];
@@ -1313,8 +1343,10 @@ int client_run_with_channels(secp256k1_context *ctx,
         int dist_slot = factory_find_signer_slot(factory, 0, my_index);
         if (dist_slot >= 0 && factory->cltv_timeout > 0) {
             tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
-            size_t n_dist = factory_compute_distribution_outputs(factory,
-                dist_outputs, FACTORY_MAX_SIGNERS + 1, 500);
+            size_t n_dist = factory_compute_distribution_outputs_balanced(
+                factory, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                init_n_dist_amounts > 0 ? init_dist_amounts : NULL,
+                init_n_dist_amounts);
             if (n_dist > 0 &&
                 factory_build_distribution_tx_unsigned(factory, dist_outputs,
                     n_dist, factory->cltv_timeout)) {
@@ -1871,6 +1903,28 @@ int client_run_reconnect(secp256k1_context *ctx,
                 }
                 memset(pcs_arr, 0, pcs_max * 32);
                 free(pcs_arr);
+            }
+        }
+
+        /* Display any persisted in-flight HTLCs for user visibility */
+        if (db) {
+            htlc_t loaded_htlcs[16];
+            size_t n_loaded = persist_load_htlcs(db, client_idx,
+                                                   loaded_htlcs, 16);
+            if (n_loaded > 0) {
+                printf("Client reconnect: %zu persisted HTLC(s) from DB:\n",
+                       n_loaded);
+                for (size_t hi = 0; hi < n_loaded; hi++) {
+                    printf("  HTLC #%llu: %llu sats (%s, %s)\n",
+                           (unsigned long long)loaded_htlcs[hi].id,
+                           (unsigned long long)loaded_htlcs[hi].amount_sats,
+                           loaded_htlcs[hi].direction == HTLC_OFFERED
+                               ? "offered" : "received",
+                           loaded_htlcs[hi].state == HTLC_STATE_ACTIVE
+                               ? "active"
+                               : loaded_htlcs[hi].state == HTLC_STATE_FULFILLED
+                                   ? "fulfilled" : "failed");
+                }
             }
         }
 
