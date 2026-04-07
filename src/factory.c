@@ -2060,6 +2060,65 @@ size_t factory_compute_distribution_outputs(
     return n;
 }
 
+size_t factory_compute_distribution_outputs_balanced(
+    const factory_t *f,
+    tx_output_t *outputs_out,
+    size_t max_outputs,
+    uint64_t fee_sats,
+    const uint64_t *client_amounts,
+    size_t n_client_amounts)
+{
+    /* Fall back to equal split if no per-client amounts provided */
+    if (!client_amounts || n_client_amounts == 0)
+        return factory_compute_distribution_outputs(f, outputs_out, max_outputs, fee_sats);
+
+    if (!f || !outputs_out || max_outputs < f->n_participants) return 0;
+
+    uint64_t total_client = 0;
+    size_t n = 0;
+
+    for (size_t i = 0; i < f->n_participants && n < max_outputs; i++) {
+        secp256k1_xonly_pubkey xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &xonly, NULL,
+                                                 &f->pubkeys[i]))
+            continue;
+
+        unsigned char ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(f->ctx, ser, &xonly))
+            continue;
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_full;
+        if (!secp256k1_xonly_pubkey_tweak_add(f->ctx, &tweaked_full,
+                                                &xonly, tweak))
+            continue;
+        secp256k1_xonly_pubkey tweaked;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &tweaked, NULL,
+                                                 &tweaked_full))
+            continue;
+
+        build_p2tr_script_pubkey(outputs_out[n].script_pubkey, &tweaked);
+        outputs_out[n].script_pubkey_len = 34;
+
+        if (i == 0) {
+            outputs_out[n].amount_sats = 0; /* LSP remainder — filled below */
+        } else {
+            /* Client i corresponds to client_amounts[i-1] */
+            size_t ci = i - 1;
+            uint64_t amt = (ci < n_client_amounts) ? client_amounts[ci] : 0;
+            outputs_out[n].amount_sats = amt;
+            total_client += amt;
+        }
+        n++;
+    }
+
+    /* LSP gets remainder */
+    if (n > 0 && f->funding_amount_sats > total_client + fee_sats)
+        outputs_out[0].amount_sats = f->funding_amount_sats - total_client - fee_sats;
+
+    return n;
+}
+
 /* --- Tree navigation helpers --- */
 
 size_t factory_collect_path_to_root(const factory_t *f, int start_idx,

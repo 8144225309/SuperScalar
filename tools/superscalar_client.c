@@ -10,10 +10,15 @@
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/sweeper.h"
+#include "superscalar/chain_backend_rpc.h"
 #include "superscalar/fee.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/tor.h"
+#include "superscalar/log.h"
+#ifdef __linux__
+#include <syslog.h>
+#endif
 #include "superscalar/bip39.h"
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
@@ -1822,6 +1827,7 @@ static void usage(const char *prog) {
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
+        "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
@@ -1874,12 +1880,53 @@ int main(int argc, char *argv[]) {
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
     int force_close = 0;              /* --force-close: broadcast factory tree from DB */
+    const char *log_file_path = NULL; /* --log-file PATH */
+    int use_syslog = 0;               /* --syslog */
+    int use_json_log = 0;              /* --json-log */
     int sweep_to_local = 0;           /* --sweep-to-local: sweep to_local after CSV */
     const char *sweep_dest_addr = NULL; /* --sweep-dest: destination address for sweep */
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
 
+    /* Load config file if --config provided (first pass) */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            FILE *cf = fopen(argv[i + 1], "r");
+            if (!cf) { fprintf(stderr, "ERROR: cannot open config: %s\n", argv[i + 1]); return 1; }
+            fseek(cf, 0, SEEK_END);
+            long cfsz = ftell(cf);
+            fseek(cf, 0, SEEK_SET);
+            char *cfdata = malloc((size_t)cfsz + 1);
+            if (cfdata) {
+                size_t cfrd = fread(cfdata, 1, (size_t)cfsz, cf);
+                cfdata[cfrd] = '\0';
+                cJSON *cfg = cJSON_Parse(cfdata);
+                free(cfdata);
+                if (cfg) {
+                    cJSON *v;
+                    if ((v = cJSON_GetObjectItem(cfg, "host")) && cJSON_IsString(v)) host = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "port")) && cJSON_IsNumber(v)) port = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "network")) && cJSON_IsString(v)) network = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "keyfile")) && cJSON_IsString(v)) keyfile_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "db")) && cJSON_IsString(v)) db_path = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "passphrase")) && cJSON_IsString(v)) passphrase = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "lsp-pubkey")) && cJSON_IsString(v)) lsp_pubkey_hex = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcuser")) && cJSON_IsString(v)) rpcuser = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcpassword")) && cJSON_IsString(v)) rpcpassword = strdup(v->valuestring);
+                    if ((v = cJSON_GetObjectItem(cfg, "rpcport")) && cJSON_IsNumber(v)) rpcport = (int)v->valuedouble;
+                    printf("Loaded config from %s\n", argv[i + 1]);
+                    cJSON_Delete(cfg);
+                } else {
+                    fprintf(stderr, "WARNING: failed to parse config JSON: %s\n", argv[i + 1]);
+                }
+            }
+            fclose(cf);
+            break;
+        }
+    }
+
+    /* Parse CLI arguments (override config file) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seckey") == 0 && i + 1 < argc)
             seckey_hex = argv[++i];
@@ -2006,6 +2053,14 @@ int main(int argc, char *argv[]) {
             sweep_dest_addr = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
             accept_risk = 1;
+        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            log_file_path = argv[++i];
+        } else if (strcmp(argv[i], "--syslog") == 0) {
+            use_syslog = 1;
+        } else if (strcmp(argv[i], "--json-log") == 0) {
+            use_json_log = 1;
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            i++;  /* already parsed in first pass */
         } else if (strcmp(argv[i], "--pay-offer") == 0 && i + 1 < argc) {
             pay_offer_str = argv[++i];
         } else if (strcmp(argv[i], "--version") == 0) {
@@ -2016,6 +2071,22 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
+
+    /* Redirect logs if requested */
+    if (log_file_path) {
+        if (!freopen(log_file_path, "a", stderr)) {
+            printf("ERROR: cannot open log file: %s\n", log_file_path);
+            return 1;
+        }
+        setvbuf(stderr, NULL, _IOLBF, 0);
+    }
+    if (use_syslog) {
+#ifdef __linux__
+        openlog("superscalar_client", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+#endif
+    }
+    if (use_json_log)
+        ss_log_set_json(1);
 
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {
@@ -2058,11 +2129,23 @@ int main(int argc, char *argv[]) {
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             have_chain = 1;
+        } else if (rpcuser && rpcpassword) {
+            /* Direct HTTP JSON-RPC to bitcoind (any network) */
+            const char *rpchost_fc = "127.0.0.1";
+            if (chain_backend_rpc_init(&chain, rpchost_fc,
+                                        rpcport, rpcuser, rpcpassword,
+                                        NULL, network)) {
+                have_chain = 1;
+            } else {
+                fprintf(stderr, "ERROR: chain backend RPC init failed\n");
+                persist_close(&db);
+                return 1;
+            }
         }
 
         if (!have_chain) {
-            fprintf(stderr, "ERROR: --force-close currently requires regtest "
-                    "(use --network regtest)\n");
+            fprintf(stderr, "ERROR: --force-close requires either regtest or "
+                    "--rpcuser + --rpcpassword for bitcoind connection\n");
             persist_close(&db);
             return 1;
         }
@@ -2160,9 +2243,17 @@ int main(int argc, char *argv[]) {
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             have_chain = 1;
+        } else if (rpcuser && rpcpassword) {
+            const char *rpchost_sw = "127.0.0.1";
+            if (chain_backend_rpc_init(&chain, rpchost_sw,
+                                        rpcport, rpcuser, rpcpassword,
+                                        NULL, network)) {
+                have_chain = 1;
+            }
         }
         if (!have_chain) {
-            fprintf(stderr, "ERROR: --sweep-to-local currently requires regtest\n");
+            fprintf(stderr, "ERROR: --sweep-to-local requires either regtest or "
+                    "--rpcuser + --rpcpassword\n");
             persist_close(&db);
             return 1;
         }
@@ -2600,6 +2691,16 @@ int main(int argc, char *argv[]) {
             lsp_pubkey_hex = wk_pubkey_buf;
         printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
                lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
+    }
+
+    /* Require --lsp-pubkey on non-regtest to prevent MITM */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        memset(seckey, 0, 32);
+        report_close(&rpt);
+        secp256k1_context_destroy(ctx);
+        return 1;
     }
 
     /* NK authentication: pin LSP static pubkey if provided */

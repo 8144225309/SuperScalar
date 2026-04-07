@@ -256,6 +256,13 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
     /* Send FACTORY_PROPOSE to all clients */
     cJSON *propose = wire_build_factory_propose(f);
+    /* Include per-client distribution amounts if available (rotation) */
+    if (lsp->dist_client_amounts && lsp->dist_n_client_amounts > 0) {
+        cJSON *da = cJSON_CreateArray();
+        for (size_t i = 0; i < lsp->dist_n_client_amounts; i++)
+            cJSON_AddItemToArray(da, cJSON_CreateNumber((double)lsp->dist_client_amounts[i]));
+        cJSON_AddItemToObject(propose, "dist_amounts", da);
+    }
     for (size_t i = 0; i < lsp->n_clients; i++) {
         if (!wire_send(lsp->client_fds[i], MSG_FACTORY_PROPOSE, propose)) {
             fprintf(stderr, "LSP: failed to send FACTORY_PROPOSE to client %zu\n", i);
@@ -282,8 +289,9 @@ int lsp_run_factory_creation(lsp_t *lsp,
     memset(&dist_session, 0, sizeof(dist_session));
     {
         tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
-        size_t n_dist = factory_compute_distribution_outputs(f, dist_outputs,
-            FACTORY_MAX_SIGNERS + 1, 500);
+        size_t n_dist = factory_compute_distribution_outputs_balanced(f,
+            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+            lsp->dist_client_amounts, lsp->dist_n_client_amounts);
         if (n_dist > 0 && f->cltv_timeout > 0) {
             has_dist_tx = factory_build_distribution_tx_unsigned(
                 f, dist_outputs, n_dist, f->cltv_timeout);
