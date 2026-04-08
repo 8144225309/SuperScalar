@@ -998,6 +998,8 @@ int main(int argc, char *argv[]) {
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
+    int bump_budget_pct = 0;       /* --bump-budget-pct (0 = default 50%) */
+    uint64_t max_bump_fee = 0;     /* --max-bump-fee (0 = default 50000 sats) */
     const char *seckey_hex = NULL;
     const char *report_path = NULL;
     const char *db_path = NULL;
@@ -1444,6 +1446,15 @@ int main(int argc, char *argv[]) {
             use_syslog = 1;
         else if (strcmp(argv[i], "--json-log") == 0)
             use_json_log = 1;
+        else if (strcmp(argv[i], "--max-bump-fee") == 0 && i + 1 < argc)
+            max_bump_fee = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--bump-budget-pct") == 0 && i + 1 < argc) {
+            bump_budget_pct = atoi(argv[++i]);
+            if (bump_budget_pct < 1 || bump_budget_pct > 100) {
+                fprintf(stderr, "Error: --bump-budget-pct must be 1-100\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
             i++;  /* already parsed in first pass */
         else if (strcmp(argv[i], "--version") == 0) {
@@ -2159,6 +2170,9 @@ int main(int argc, char *argv[]) {
             for (size_t c = 0; c < mgr->n_channels; c++)
                 watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
             mgr->watchtower = &rec_wt;
+
+            if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
+            if (max_bump_fee > 0) rec_wt.max_bump_fee_sat = max_bump_fee;
             mgr->chain_be  = chain_be;
             mgr->wallet_src = wallet_src;
             if (light_client_arg) {
@@ -2554,6 +2568,9 @@ accept_new_factory:
 
             /* Watchtower: init and wire into dispatch */
             watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, fee_est, g_db);
+
+            if (bump_budget_pct > 0) g_watchtower.bump_budget_pct = bump_budget_pct;
+            if (max_bump_fee > 0) g_watchtower.max_bump_fee_sat = max_bump_fee;
             if (g_bip158.base.get_block_height)
                 watchtower_set_chain_backend(&g_watchtower, &g_bip158.base);
             if (g_hd_wallet)
@@ -3251,6 +3268,9 @@ accept_new_factory:
         for (size_t c = 0; c < mgr->n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
         mgr->watchtower = &wt;
+
+            if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
+            if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
         mgr->chain_be  = chain_be;
         mgr->wallet_src = wallet_src;
         if (light_client_arg) {

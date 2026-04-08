@@ -320,7 +320,7 @@ int test_watchtower_build_cpfp_no_wallet(void)
     tx_buf_init(&out, 512);
     int r = watchtower_build_cpfp_tx(&wt, &out,
                                       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                                      1, 240);
+                                      1, 240, 0);
     tx_buf_free(&out);
     watchtower_cleanup(&wt);
 
