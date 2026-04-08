@@ -38,6 +38,8 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     wt->rt = rt;
     wt->fee = fee;
     wt->db = db;
+    wt->bump_budget_pct = HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT; /* 50% default */
+    wt->max_bump_fee_sat = 50000; /* 50k sats absolute ceiling default */
 
     /* Wrap regtest_t as the default chain backend when provided. */
     if (rt) {
@@ -119,8 +121,12 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
         uint64_t pending_amounts[WATCHTOWER_MAX_PENDING];
         int pending_cycles[WATCHTOWER_MAX_PENDING];
         int pending_bumps[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_penalty_values[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_csv_delays[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_start_heights[WATCHTOWER_MAX_PENDING];
         size_t n_loaded = persist_load_pending(db, pending_txids,
             pending_vouts, pending_amounts, pending_cycles, pending_bumps,
+            pending_penalty_values, pending_csv_delays, pending_start_heights,
             WATCHTOWER_MAX_PENDING);
         for (size_t i = 0; i < n_loaded && wt->n_pending < wt->pending_cap; i++) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
@@ -131,6 +137,9 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             p->cycles_in_mempool = pending_cycles[i];
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             p->fee_bump.last_bump_block = (uint32_t)pending_bumps[i];
+            p->penalty_value = pending_penalty_values[i];
+            p->csv_delay = pending_csv_delays[i];
+            p->start_height = pending_start_heights[i];
         }
     }
 
@@ -519,6 +528,39 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
+            /* Auto-settle: broadcast commitment TXs for channels on this leaf.
+               After the leaf state TX confirms, each channel's funding output
+               exists on-chain. Broadcasting the commitment TX settles the
+               channel without requiring the client to be online. */
+            if (e->leaf_channel_ids && e->n_leaf_channels > 0 && wt->db) {
+                for (size_t lc = 0; lc < e->n_leaf_channels; lc++) {
+                    uint32_t ch_idx = e->leaf_channel_ids[lc];
+                    unsigned char commit_tx[4096];
+                    size_t commit_tx_len = 0;
+                    uint64_t commit_cn = 0;
+                    if (persist_load_commitment_sig(wt->db, ch_idx,
+                            &commit_cn, NULL, commit_tx, &commit_tx_len,
+                            sizeof(commit_tx)) &&
+                        commit_tx_len > 0) {
+                        char *ctx_hex = (char *)malloc(commit_tx_len * 2 + 1);
+                        if (ctx_hex) {
+                            hex_encode(commit_tx, commit_tx_len, ctx_hex);
+                            char ctx_txid[65];
+                            if (wt->chain->send_raw_tx(wt->chain, ctx_hex,
+                                                         ctx_txid))
+                                printf("  Auto-settle channel %u (cn=%llu): %s\n",
+                                       ch_idx, (unsigned long long)commit_cn,
+                                       ctx_txid);
+                            else
+                                printf("  Auto-settle channel %u: broadcast failed "
+                                       "(leaf may need more confirmations)\n",
+                                       ch_idx);
+                            free(ctx_hex);
+                        }
+                    }
+                }
+            }
+
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
             memcpy(e->penalty_txid, factory_resp_txid, 65);
@@ -595,6 +637,7 @@ int watchtower_check(watchtower_t *wt) {
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
            Skip CPFP tracking at sub-1-sat/vB — no anchor output was created. */
+        uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
         if (penalty_sent && use_anchor &&
             wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < wt->pending_cap) {
@@ -603,11 +646,15 @@ int watchtower_check(watchtower_t *wt) {
             p->txid[64] = '\0';
             p->anchor_vout = 1;
             p->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
+            p->penalty_value = e->to_local_amount;
+            p->csv_delay = ch->to_self_delay;
+            p->start_height = cur_height;
             p->cycles_in_mempool = 0;
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             if (wt->db && wt->db->db) {
                 persist_save_pending(wt->db, p->txid, p->anchor_vout,
-                                       p->anchor_amount, 0, 0);
+                                       p->anchor_amount, 0, 0,
+                                       p->penalty_value, p->csv_delay, p->start_height);
             }
         }
 
@@ -848,23 +895,34 @@ int watchtower_check(watchtower_t *wt) {
         p->cycles_in_mempool++;
         /* Initialize fee_bump schedule on first encounter */
         if (p->fee_bump.start_block == 0) {
-            uint32_t cur = (uint32_t)p->cycles_in_mempool; /* approx block proxy */
+            uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+            if (p->start_height == 0) p->start_height = cur_height;
+            uint32_t csv = p->csv_delay > 0 ? p->csv_delay : CHANNEL_DEFAULT_CSV_DELAY;
+            uint32_t deadline = p->start_height + csv;
+            if (deadline <= cur_height + HTLC_FEE_BUMP_URGENT_BLOCKS)
+                deadline = cur_height + HTLC_FEE_BUMP_URGENT_BLOCKS + 1;
+
             uint64_t start_fr = wt->fee ? (uint64_t)wt->fee->get_rate(wt->fee, FEE_TARGET_NORMAL) : 1000;
             if (start_fr < HTLC_FEE_BUMP_FLOOR_SAT_PER_KVB)
                 start_fr = HTLC_FEE_BUMP_FLOOR_SAT_PER_KVB;
-            htlc_fee_bump_init(&p->fee_bump, cur, cur + 144,
-                               p->anchor_amount,
-                               HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT,
-                               200, start_fr);
+
+            uint64_t budget_basis = p->penalty_value > 0 ? p->penalty_value : p->anchor_amount;
+            int budget_pct = wt->bump_budget_pct > 0 ? wt->bump_budget_pct : HTLC_FEE_BUMP_DEFAULT_BUDGET_PCT;
+
+            htlc_fee_bump_init(&p->fee_bump, cur_height, deadline,
+                               budget_basis, budget_pct,
+                               WATCHTOWER_CPFP_CHILD_VSIZE, start_fr);
+
+            if (wt->max_bump_fee_sat > 0 && p->fee_bump.budget_sat > wt->max_bump_fee_sat)
+                p->fee_bump.budget_sat = wt->max_bump_fee_sat;
         }
-        /* Use deadline-aware fee scheduler */
-        uint32_t cur_block = (uint32_t)p->cycles_in_mempool;
+        uint32_t cur_block = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
         if (htlc_fee_bump_should_bump(&p->fee_bump, cur_block)) {
             uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
             tx_buf_t cpfp;
             tx_buf_init(&cpfp, 512);
             if (watchtower_build_cpfp_tx(wt, &cpfp, p->txid,
-                                           p->anchor_vout, p->anchor_amount)) {
+                                           p->anchor_vout, p->anchor_amount, fr)) {
                 char *cpfp_hex = (char *)malloc(cpfp.len * 2 + 1);
                 if (cpfp_hex) {
                     hex_encode(cpfp.data, cpfp.len, cpfp_hex);
@@ -877,7 +935,8 @@ int watchtower_check(watchtower_t *wt) {
                             persist_save_pending(wt->db, p->txid,
                                 p->anchor_vout, p->anchor_amount,
                                 p->cycles_in_mempool,
-                                (int)p->fee_bump.last_bump_block);
+                                (int)p->fee_bump.last_bump_block,
+                                p->penalty_value, p->csv_delay, p->start_height);
                             persist_log_broadcast(wt->db, cpfp_txid,
                                                   "cpfp", cpfp_hex, "ok");
                         }
@@ -906,7 +965,8 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
                                const char *parent_txid,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount) {
+                               uint64_t anchor_amount,
+                               uint64_t target_feerate_kvb) {
     if (!wt || !cpfp_tx_out || !parent_txid) return 0;
     if (wt->anchor_spk_len != P2A_SPK_LEN) return 0;
     if (!wt->wallet) {
@@ -929,7 +989,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     unsigned char *signed_buf = NULL;
     int result = 0;
 
-    uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 200;
+    uint64_t cpfp_fee = target_feerate_kvb > 0
+        ? (target_feerate_kvb * WATCHTOWER_CPFP_CHILD_VSIZE + 999) / 1000
+        : (wt->fee ? fee_for_cpfp_child(wt->fee) : 200);
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
 
     if (!wt->wallet->get_utxo(wt->wallet, min_amount,
@@ -1016,17 +1078,22 @@ int watchtower_add_pending_tx(watchtower_t *wt,
     if (!wt || !txid_hex) return 0;
     if (wt->n_pending >= wt->pending_cap) return 0;
 
+    uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
     watchtower_pending_t *p = &wt->pending[wt->n_pending++];
     strncpy(p->txid, txid_hex, 64);
     p->txid[64] = '\0';
     p->anchor_vout       = anchor_vout;
     p->anchor_amount     = anchor_amount;
+    p->penalty_value     = 0;
+    p->csv_delay         = CHANNEL_DEFAULT_CSV_DELAY;
+    p->start_height      = cur_height;
     p->cycles_in_mempool = 0;
     memset(&p->fee_bump, 0, sizeof(p->fee_bump));
 
     if (wt->db && wt->db->db)
         persist_save_pending(wt->db, p->txid, p->anchor_vout,
-                               p->anchor_amount, 0, 0);
+                               p->anchor_amount, 0, 0,
+                               p->penalty_value, p->csv_delay, p->start_height);
     return 1;
 }
 
@@ -1066,9 +1133,33 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
     return 1;
 }
 
+int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
+    uint32_t node_idx, const unsigned char *old_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *burn_tx, size_t burn_tx_len,
+    const uint32_t *channel_ids, size_t n_channels)
+{
+    if (!watchtower_watch_factory_node(wt, node_idx, old_txid32,
+                                        response_tx, response_tx_len,
+                                        burn_tx, burn_tx_len))
+        return 0;
+
+    /* Attach channel indices to the just-added entry */
+    if (channel_ids && n_channels > 0) {
+        watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
+        e->leaf_channel_ids = (uint32_t *)malloc(n_channels * sizeof(uint32_t));
+        if (e->leaf_channel_ids) {
+            memcpy(e->leaf_channel_ids, channel_ids, n_channels * sizeof(uint32_t));
+            e->n_leaf_channels = n_channels;
+        }
+    }
+    return 1;
+}
+
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
+        free(wt->entries[i].leaf_channel_ids);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE) {

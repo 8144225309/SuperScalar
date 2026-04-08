@@ -56,6 +56,8 @@ typedef struct {
     size_t response_tx_len;
     unsigned char *burn_tx;       /* heap-allocated pre-built L-stock burn tx */
     size_t burn_tx_len;
+    uint32_t *leaf_channel_ids;   /* channel indices on this leaf (for auto-settle) */
+    size_t n_leaf_channels;       /* number of channels on this leaf */
 
     /* Reorg resistance: penalty broadcast tracking.
        After penalty broadcast, entry is KEPT (not removed) until penalty
@@ -68,12 +70,16 @@ typedef struct {
 #define WATCHTOWER_MAX_CHANNELS 32
 #define WATCHTOWER_MAX_PENDING 16
 #define WATCHTOWER_ANCHOR_AMOUNT ANCHOR_OUTPUT_AMOUNT
+#define WATCHTOWER_CPFP_CHILD_VSIZE 264  /* P2A input + wallet input + 1 P2TR output */
 
 /* Pending penalty tx awaiting confirmation (for CPFP bump) */
 typedef struct {
     char txid[65];              /* penalty tx we broadcast */
     uint32_t anchor_vout;       /* anchor output index (always 1) */
     uint64_t anchor_amount;     /* 240 sats (P2A) */
+    uint64_t penalty_value;     /* sats at stake (to_local_amount) — budget basis */
+    uint32_t csv_delay;         /* to_self_delay blocks — security deadline */
+    uint32_t start_height;      /* block height when penalty was broadcast */
     int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
     htlc_fee_bump_t fee_bump;   /* deadline-aware fee escalation (replaces bump_count) */
 } watchtower_pending_t;
@@ -101,6 +107,10 @@ typedef struct {
     watchtower_pending_t *pending;
     size_t n_pending;
     size_t pending_cap;
+
+    /* CPFP bump configuration (operator-tunable) */
+    int bump_budget_pct;           /* % of penalty value for fee budget (default 50) */
+    uint64_t max_bump_fee_sat;     /* absolute fee ceiling per bump (default 50000) */
 } watchtower_t;
 
 /* Initialize watchtower. Load old commitments from DB if available.
@@ -155,6 +165,15 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *burn_tx,
                                     size_t burn_tx_len);
 
+/* Extended: also records which channels live on this leaf node so the
+   watchtower can auto-broadcast their commitment TXs after force-close.
+   channel_ids may be NULL (same as watchtower_watch_factory_node). */
+int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
+    uint32_t node_idx, const unsigned char *old_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *burn_tx, size_t burn_tx_len,
+    const uint32_t *channel_ids, size_t n_channels);
+
 /* Register a force-closed commitment for HTLC timeout sweeping.
    After a legitimate force-close (not breach), HTLCs need to be swept
    via timeout txs once their CLTV expires. The watchtower monitors
@@ -184,7 +203,8 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
                                const char *parent_txid,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount);
+                               uint64_t anchor_amount,
+                               uint64_t target_feerate_kvb);
 
 /* Phase L: register any broadcast tx for CPFP monitoring.
    Mirrors what penalty-tx broadcast does internally. Returns 1 on success.
