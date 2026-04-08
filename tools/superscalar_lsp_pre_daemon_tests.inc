@@ -1521,7 +1521,7 @@
                    n_ch, mhfc_height);
 
             static const unsigned char hash_fills[] = { 0xAA, 0xBB, 0xCC, 0xDD };
-            static const uint64_t htlc_amounts[] = { 1000, 1500, 2000, 500 };
+            static const uint64_t htlc_amounts[] = { 1000, 1500, 2000, 1000 };
 
             for (size_t ci = 0; ci < n_ch && ci < 4; ci++) {
                 unsigned char phash[32];

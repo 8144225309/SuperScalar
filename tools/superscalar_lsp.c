@@ -2969,7 +2969,7 @@ accept_new_factory:
                                           funding_txid, funding_vout,
                                           funding_amount,
                                           fund_spk, 34,
-                                          step_blocks, 4, cltv_timeout)) {
+                                          step_blocks, states_per_layer, cltv_timeout)) {
                 creation_ok = 1;
                 break;
             }
