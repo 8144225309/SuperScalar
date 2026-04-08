@@ -70,12 +70,16 @@ typedef struct {
 #define WATCHTOWER_MAX_CHANNELS 32
 #define WATCHTOWER_MAX_PENDING 16
 #define WATCHTOWER_ANCHOR_AMOUNT ANCHOR_OUTPUT_AMOUNT
+#define WATCHTOWER_CPFP_CHILD_VSIZE 264  /* P2A input + wallet input + 1 P2TR output */
 
 /* Pending penalty tx awaiting confirmation (for CPFP bump) */
 typedef struct {
     char txid[65];              /* penalty tx we broadcast */
     uint32_t anchor_vout;       /* anchor output index (always 1) */
     uint64_t anchor_amount;     /* 240 sats (P2A) */
+    uint64_t penalty_value;     /* sats at stake (to_local_amount) — budget basis */
+    uint32_t csv_delay;         /* to_self_delay blocks — security deadline */
+    uint32_t start_height;      /* block height when penalty was broadcast */
     int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
     htlc_fee_bump_t fee_bump;   /* deadline-aware fee escalation (replaces bump_count) */
 } watchtower_pending_t;
@@ -103,6 +107,10 @@ typedef struct {
     watchtower_pending_t *pending;
     size_t n_pending;
     size_t pending_cap;
+
+    /* CPFP bump configuration (operator-tunable) */
+    int bump_budget_pct;           /* % of penalty value for fee budget (default 50) */
+    uint64_t max_bump_fee_sat;     /* absolute fee ceiling per bump (default 50000) */
 } watchtower_t;
 
 /* Initialize watchtower. Load old commitments from DB if available.
@@ -195,7 +203,8 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
                                const char *parent_txid,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount);
+                               uint64_t anchor_amount,
+                               uint64_t target_feerate_kvb);
 
 /* Phase L: register any broadcast tx for CPFP monitoring.
    Mirrors what penalty-tx broadcast does internally. Returns 1 on success.
