@@ -39,6 +39,8 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    int bump_budget_pct = 0;
+    uint64_t max_bump_fee = 0;
     const char *db_path = NULL;
     const char *network = "regtest";
     int poll_interval = 30;
@@ -65,6 +67,15 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-bump-fee") == 0 && i + 1 < argc)
+            max_bump_fee = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--bump-budget-pct") == 0 && i + 1 < argc) {
+            bump_budget_pct = atoi(argv[++i]);
+            if (bump_budget_pct < 1 || bump_budget_pct > 100) {
+                fprintf(stderr, "Error: --bump-budget-pct must be 1-100\n");
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_watchtower %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -114,6 +125,8 @@ int main(int argc, char *argv[]) {
         persist_close(&db);
         return 1;
     }
+    if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
+    if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
 
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
