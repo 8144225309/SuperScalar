@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.8 — 1351 unit tests, 36/36 orchestrator, 26/26 signet exhibition, end-to-end CLN bridge payments, MSG_PING/MSG_PONG keepalive, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
+> v0.1.9 — 1362 unit tests, 42 regtest integration tests, complete fund settlement & trustless recovery, HTTP JSON-RPC chain backend for all networks, balance-aware distribution TX, factory rotation balance carry, sweeper module, watchtower breach detection + burn TX, structured JSON logging, config file support, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
