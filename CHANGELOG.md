@@ -4,7 +4,34 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Complete fund settlement, crash safety, and trustless recovery. Every settlement path now enforced. 1361 unit tests, 42 regtest integration tests.
+## 0.1.9 — 2026-04-07
+
+Complete fund settlement, crash safety, trustless recovery, and chain backend for all networks. 132 commits since v0.1.8. 1362 unit tests, 42 regtest integration tests.
+
+### Accounting & balance fixes (PR #54)
+
+- **Conservation invariant fix** (`channel.c`, `lsp_channels.c`): per-HTLC fee now stored in `htlc_t.fee_at_add` at add time and refunded from stored value on fulfill/fail. Conservation check accounts for in-flight fee gap. Previously false-alarmed every 60s with active HTLCs. Schema v15.
+- **Rotation balance carry** (`lsp_rotation.c`): channel balances preserved across factory rotation. Previously `lsp_channels_init()` reset all channels to default split (e.g. 50/50), discarding accumulated payment state.
+- **Balance-aware distribution TX** (`factory.c`, `lsp.c`, `client.c`): new `factory_compute_distribution_outputs_balanced()` uses actual channel balances instead of equal `funding/N` split. LSP includes `dist_amounts` in `MSG_FACTORY_PROPOSE` so clients build identical unsigned TX.
+- **Bridge msat truncation** (`lsp_bridge.c`): rejects non-whole-sat HTLC amounts (`amount_msat % 1000 != 0`) with `BRIDGE_FAIL_HTLC` instead of silently truncating. Fixed zero-sats error path to properly fail back.
+
+### Chain backend (PR #54)
+
+- **HTTP JSON-RPC chain backend** (`chain_backend_rpc.c`, `chain_backend_rpc.h`): direct TCP/HTTP connection to any bitcoind instance. Implements all 7 `chain_backend_t` vtable functions. Auto-detects default RPC port per network. No new dependencies (POSIX sockets + cJSON).
+- **Force-close unlocked for all networks** (`superscalar_client.c`): `--force-close` and `--sweep-to-local` now accept `--rpcuser` + `--rpcpassword` for bitcoind connection on any network, not just regtest.
+
+### Security (PR #54)
+
+- **Require `--lsp-pubkey` on non-regtest** (`superscalar_client.c`): client refuses to connect without server pubkey pinning on mainnet/signet/testnet, preventing Noise_NN MITM fallback.
+
+### Operational tooling (PR #54)
+
+- **Config file support** (`superscalar_client.c`, `superscalar_lsp.c`): `--config PATH` loads settings from JSON file. CLI args override config values.
+- **Log file redirect** (`superscalar_client.c`, `superscalar_lsp.c`): `--log-file PATH` redirects stderr to file (line-buffered, logrotate compatible).
+- **Syslog integration** (`superscalar_client.c`, `superscalar_lsp.c`): `--syslog` opens syslog connection for system log integration (Linux).
+- **Structured JSON logging** (`log.c`, `log.h`): `--json-log` outputs `{"ts":...,"level":...,"event":...}` format compatible with ELK/Loki/CloudWatch.
+- **Client `--sweep-to-local`** (`superscalar_client.c`): sweeps CSV-delayed `to_local` output after commitment TX confirms. Reuses `channel_build_to_local_sweep()` from sweeper module.
+- **HTLC display on reconnect** (`client.c`): client loads and displays persisted in-flight HTLCs from DB after crash recovery.
 
 ### Fund settlement (PR #53)
 
