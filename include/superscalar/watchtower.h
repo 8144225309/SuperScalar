@@ -56,6 +56,8 @@ typedef struct {
     size_t response_tx_len;
     unsigned char *burn_tx;       /* heap-allocated pre-built L-stock burn tx */
     size_t burn_tx_len;
+    uint32_t *leaf_channel_ids;   /* channel indices on this leaf (for auto-settle) */
+    size_t n_leaf_channels;       /* number of channels on this leaf */
 
     /* Reorg resistance: penalty broadcast tracking.
        After penalty broadcast, entry is KEPT (not removed) until penalty
@@ -154,6 +156,15 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     size_t response_tx_len,
                                     const unsigned char *burn_tx,
                                     size_t burn_tx_len);
+
+/* Extended: also records which channels live on this leaf node so the
+   watchtower can auto-broadcast their commitment TXs after force-close.
+   channel_ids may be NULL (same as watchtower_watch_factory_node). */
+int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
+    uint32_t node_idx, const unsigned char *old_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *burn_tx, size_t burn_tx_len,
+    const uint32_t *channel_ids, size_t n_channels);
 
 /* Register a force-closed commitment for HTLC timeout sweeping.
    After a legitimate force-close (not breach), HTLCs need to be swept
