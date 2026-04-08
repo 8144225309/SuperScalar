@@ -4,6 +4,13 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Watchtower & fee bumping (PRs #55, #56)
+
+- **Watchtower auto-settlement** (`watchtower.c`, `lsp_channels.c`): after factory force-close, watchtower automatically broadcasts the latest signed commitment TX for each channel on the leaf — clients no longer need to be online for fund recovery. Channel-to-leaf mapping stored in `watchtower_entry_t.leaf_channel_ids[]`.
+- **CPFP fee budget fix** (`watchtower.c`): fee bump budget now based on actual penalty value (% of sats at stake) instead of fixed amount. Real block deadline from CSV delay replaces cycle-counting.
+- **Operator-tunable CPFP** (`superscalar_lsp.c`, `superscalar_watchtower.c`): `--bump-budget-pct N` (default 50%) and `--max-bump-fee N` (default 50000 sats) CLI flags.
+- **Pending entry persistence** (`persist.c`): penalty TX entries now store `penalty_value`, `csv_delay`, and `start_height` for budget calculation across restarts. Schema v16.
+
 ## 0.1.9 — 2026-04-07
 
 Complete fund settlement, crash safety, trustless recovery, and chain backend for all networks. 132 commits since v0.1.8. 1362 unit tests, 42 regtest integration tests.
