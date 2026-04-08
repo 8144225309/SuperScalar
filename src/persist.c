@@ -239,7 +239,10 @@ static const char *SCHEMA_SQL =
     "  anchor_vout INTEGER NOT NULL,"
     "  anchor_amount INTEGER NOT NULL,"
     "  cycles_in_mempool INTEGER NOT NULL DEFAULT 0,"
-    "  bump_count INTEGER NOT NULL DEFAULT 0"
+    "  bump_count INTEGER NOT NULL DEFAULT 0,"
+    "  penalty_value INTEGER NOT NULL DEFAULT 0,"
+    "  csv_delay INTEGER NOT NULL DEFAULT 144,"
+    "  start_height INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS jit_channels ("
     "  jit_channel_id INTEGER PRIMARY KEY,"
@@ -737,6 +740,19 @@ int persist_open(persist_t *p, const char *path) {
             p->db = NULL;
             return 0;
         }
+    }
+
+    /* v16: CPFP budget fields on watchtower_pending */
+    if (db_version < 16) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN penalty_value INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN csv_delay INTEGER NOT NULL DEFAULT 144;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN start_height INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
     }
 
     /* Record the current version if not already present */
@@ -2834,13 +2850,15 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out) {
 
 int persist_save_pending(persist_t *p, const char *txid,
                            uint32_t anchor_vout, uint64_t anchor_amount,
-                           int cycles_in_mempool, int bump_count) {
+                           int cycles_in_mempool, int bump_count,
+                           uint64_t penalty_value, uint32_t csv_delay,
+                           uint32_t start_height) {
     if (!p || !p->db || !txid) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO watchtower_pending "
-        "(txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count) "
-        "VALUES (?, ?, ?, ?, ?);";
+        "(txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, penalty_value, csv_delay, start_height) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2851,6 +2869,9 @@ int persist_save_pending(persist_t *p, const char *txid,
     sqlite3_bind_int64(stmt, 3, (sqlite3_int64)anchor_amount);
     sqlite3_bind_int(stmt, 4, cycles_in_mempool);
     sqlite3_bind_int(stmt, 5, bump_count);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)penalty_value);
+    sqlite3_bind_int(stmt, 7, (int)csv_delay);
+    sqlite3_bind_int(stmt, 8, (int)start_height);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2860,11 +2881,14 @@ int persist_save_pending(persist_t *p, const char *txid,
 size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
                               uint32_t *vouts_out, uint64_t *amounts_out,
                               int *cycles_out, int *bumps_out,
+                              uint64_t *penalty_values_out,
+                              uint32_t *csv_delays_out,
+                              uint32_t *start_heights_out,
                               size_t max_entries) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
+        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, penalty_value, csv_delay, start_height "
         "FROM watchtower_pending ORDER BY txid;";
 
     sqlite3_stmt *stmt;
@@ -2886,6 +2910,12 @@ size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
             cycles_out[count] = sqlite3_column_int(stmt, 3);
         if (bumps_out)
             bumps_out[count] = sqlite3_column_int(stmt, 4);
+        if (penalty_values_out)
+            penalty_values_out[count] = (uint64_t)sqlite3_column_int64(stmt, 5);
+        if (csv_delays_out)
+            csv_delays_out[count] = (uint32_t)sqlite3_column_int(stmt, 6);
+        if (start_heights_out)
+            start_heights_out[count] = (uint32_t)sqlite3_column_int(stmt, 7);
         count++;
     }
 

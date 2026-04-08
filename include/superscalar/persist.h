@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 15
+#define PERSIST_SCHEMA_VERSION 16
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -361,12 +361,17 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out);
 /* Save a pending penalty entry (for CPFP bump tracking across restarts). */
 int persist_save_pending(persist_t *p, const char *txid,
                            uint32_t anchor_vout, uint64_t anchor_amount,
-                           int cycles_in_mempool, int bump_count);
+                           int cycles_in_mempool, int bump_count,
+                           uint64_t penalty_value, uint32_t csv_delay,
+                           uint32_t start_height);
 
 /* Load all pending entries. Returns count loaded. */
 size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
                               uint32_t *vouts_out, uint64_t *amounts_out,
                               int *cycles_out, int *bumps_out,
+                              uint64_t *penalty_values_out,
+                              uint32_t *csv_delays_out,
+                              uint32_t *start_heights_out,
                               size_t max_entries);
 
 /* Delete a pending entry by txid (e.g., after confirmation). */

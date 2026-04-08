@@ -488,17 +488,17 @@ int test_pending_persistence(void) {
     /* Save 2 pending entries */
     TEST_ASSERT(persist_save_pending(&db,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        1, 240, 0, 0), "save pending 1");
+        1, 240, 0, 0, 50000, 144, 100), "save pending 1");
     TEST_ASSERT(persist_save_pending(&db,
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        1, 240, 5, 2), "save pending 2");
+        1, 240, 5, 2, 50000, 144, 100), "save pending 2");
 
     /* Load them back */
     char txids[16][65];
     uint32_t vouts[16];
     uint64_t amounts[16];
     int cycles[16], bumps[16];
-    size_t n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+    size_t n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, NULL, NULL, NULL, 16);
     TEST_ASSERT_EQ(n, 2, "loaded 2 pending entries");
 
     /* Verify first entry */
@@ -517,15 +517,15 @@ int test_pending_persistence(void) {
     TEST_ASSERT(persist_delete_pending(&db,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         "delete pending 1");
-    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, NULL, NULL, NULL, 16);
     TEST_ASSERT_EQ(n, 1, "1 entry after delete");
     TEST_ASSERT(strncmp(txids[0], "bbbb", 4) == 0, "remaining entry is bbbb");
 
     /* Update via upsert */
     TEST_ASSERT(persist_save_pending(&db,
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        1, 240, 10, 3), "upsert pending");
-    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+        1, 240, 10, 3, 50000, 144, 100), "upsert pending");
+    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, NULL, NULL, NULL, 16);
     TEST_ASSERT_EQ(n, 1, "still 1 entry after upsert");
     TEST_ASSERT_EQ(cycles[0], 10, "updated cycles = 10");
     TEST_ASSERT_EQ(bumps[0], 3, "updated bumps = 3");
@@ -649,7 +649,8 @@ int test_watchtower_add_pending_persists(void)
     int loaded_bumps[WATCHTOWER_MAX_PENDING];
     size_t n = persist_load_pending(&db, loaded_txids, loaded_vouts,
                                      loaded_amounts, loaded_cycles,
-                                     loaded_bumps, WATCHTOWER_MAX_PENDING);
+                                     loaded_bumps, NULL, NULL, NULL,
+                                     WATCHTOWER_MAX_PENDING);
     TEST_ASSERT_EQ((long)n, 1L, "1 entry persisted");
     TEST_ASSERT(strncmp(loaded_txids[0], "ffff", 4) == 0, "txid starts ffff");
     TEST_ASSERT_EQ((long)loaded_vouts[0],   1L,   "persisted vout = 1");
