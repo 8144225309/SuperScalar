@@ -519,6 +519,39 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
+            /* Auto-settle: broadcast commitment TXs for channels on this leaf.
+               After the leaf state TX confirms, each channel's funding output
+               exists on-chain. Broadcasting the commitment TX settles the
+               channel without requiring the client to be online. */
+            if (e->leaf_channel_ids && e->n_leaf_channels > 0 && wt->db) {
+                for (size_t lc = 0; lc < e->n_leaf_channels; lc++) {
+                    uint32_t ch_idx = e->leaf_channel_ids[lc];
+                    unsigned char commit_tx[4096];
+                    size_t commit_tx_len = 0;
+                    uint64_t commit_cn = 0;
+                    if (persist_load_commitment_sig(wt->db, ch_idx,
+                            &commit_cn, NULL, commit_tx, &commit_tx_len,
+                            sizeof(commit_tx)) &&
+                        commit_tx_len > 0) {
+                        char *ctx_hex = (char *)malloc(commit_tx_len * 2 + 1);
+                        if (ctx_hex) {
+                            hex_encode(commit_tx, commit_tx_len, ctx_hex);
+                            char ctx_txid[65];
+                            if (wt->chain->send_raw_tx(wt->chain, ctx_hex,
+                                                         ctx_txid))
+                                printf("  Auto-settle channel %u (cn=%llu): %s\n",
+                                       ch_idx, (unsigned long long)commit_cn,
+                                       ctx_txid);
+                            else
+                                printf("  Auto-settle channel %u: broadcast failed "
+                                       "(leaf may need more confirmations)\n",
+                                       ch_idx);
+                            free(ctx_hex);
+                        }
+                    }
+                }
+            }
+
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
             memcpy(e->penalty_txid, factory_resp_txid, 65);
@@ -1066,9 +1099,33 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
     return 1;
 }
 
+int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
+    uint32_t node_idx, const unsigned char *old_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *burn_tx, size_t burn_tx_len,
+    const uint32_t *channel_ids, size_t n_channels)
+{
+    if (!watchtower_watch_factory_node(wt, node_idx, old_txid32,
+                                        response_tx, response_tx_len,
+                                        burn_tx, burn_tx_len))
+        return 0;
+
+    /* Attach channel indices to the just-added entry */
+    if (channel_ids && n_channels > 0) {
+        watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
+        e->leaf_channel_ids = (uint32_t *)malloc(n_channels * sizeof(uint32_t));
+        if (e->leaf_channel_ids) {
+            memcpy(e->leaf_channel_ids, channel_ids, n_channels * sizeof(uint32_t));
+            e->n_leaf_channels = n_channels;
+        }
+    }
+    return 1;
+}
+
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
+        free(wt->entries[i].leaf_channel_ids);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE) {
