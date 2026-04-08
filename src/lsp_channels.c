@@ -1547,11 +1547,21 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
             old_leaf_txid, (uint32_t)l_vout,
             leaf_node->outputs[l_vout].amount_sats, old_epoch);
 
-        watchtower_watch_factory_node(mgr->watchtower,
+        /* Collect channel indices that live on this leaf node */
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        size_t n_leaf_ch = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node; uint32_t c_vout;
+            client_to_leaf(c, f, &c_node, &c_vout);
+            if (c_node == node_idx)
+                leaf_ch_ids[n_leaf_ch++] = (uint32_t)c;
+        }
+        watchtower_watch_factory_node_with_channels(mgr->watchtower,
             (uint32_t)node_idx, old_leaf_txid,
             leaf_node->signed_tx.data, leaf_node->signed_tx.len,
             burn_ok ? burn_tx.data : NULL,
-            burn_ok ? burn_tx.len : 0);
+            burn_ok ? burn_tx.len : 0,
+            leaf_ch_ids, n_leaf_ch);
         tx_buf_free(&burn_tx);
     }
 
