@@ -1624,11 +1624,17 @@
         /* Clients disconnect after rotation to reload cleanly from DB
            (Bug 11 fix in superscalar_client.c:1067-1072), then reconnect.
            We must accept those reconnections before cooperative close,
-           otherwise lsp_run_cooperative_close sends to stale FDs. */
+           otherwise lsp_run_cooperative_close sends to stale FDs.
+           On real networks (signet/testnet) clients may take longer to
+           reconnect due to block confirmation waits, so use a generous
+           timeout.  Also accept MSG_HELLO as fallback — clients that
+           lost their DB state or timed out may attempt a fresh handshake
+           instead of MSG_RECONNECT. */
         {
             size_t reconnected = 0;
-            printf("  Waiting for client reconnections...\n");
-            for (int attempt = 0; attempt < 30 && reconnected < (size_t)n_clients; attempt++) {
+            int max_wait = is_regtest ? 30 : 120;
+            printf("  Waiting for client reconnections (%ds timeout)...\n", max_wait);
+            for (int attempt = 0; attempt < max_wait && reconnected < (size_t)n_clients; attempt++) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
                 FD_SET(lsp_p->listen_fd, &rfds);
@@ -1647,8 +1653,95 @@
                     hs = wire_noise_handshake_responder(new_fd, ctx);
                 if (!hs) { wire_close(new_fd); continue; }
 
-                if (lsp_channels_handle_reconnect(mgr2, lsp_p, new_fd))
-                    reconnected++;
+                /* Peek at first message to determine RECONNECT vs HELLO */
+                wire_msg_t rmsg;
+                if (!wire_recv_timeout(new_fd, &rmsg, 30)) {
+                    wire_close(new_fd); continue;
+                }
+                if (rmsg.msg_type == MSG_RECONNECT) {
+                    /* Parse and handle inline (same as handle_reconnect_with_msg) */
+                    uint64_t rc_cn = 0;
+                    secp256k1_pubkey rc_pk;
+                    if (wire_parse_reconnect(rmsg.json, ctx, &rc_pk, &rc_cn)) {
+                        /* Find client by pubkey */
+                        int rc_matched = -1;
+                        for (size_t ci = 0; ci < mgr2->n_channels; ci++) {
+                            unsigned char a[33], b[33];
+                            size_t al = 33, bl = 33;
+                            secp256k1_ec_pubkey_serialize(ctx, a, &al,
+                                &rc_pk, SECP256K1_EC_COMPRESSED);
+                            secp256k1_ec_pubkey_serialize(ctx, b, &bl,
+                                &lsp_p->client_pubkeys[ci], SECP256K1_EC_COMPRESSED);
+                            if (memcmp(a, b, 33) == 0) { rc_matched = (int)ci; break; }
+                        }
+                        if (rc_matched >= 0) {
+                            if (lsp_p->client_fds[rc_matched] >= 0)
+                                wire_close(lsp_p->client_fds[rc_matched]);
+                            lsp_p->client_fds[rc_matched] = new_fd;
+                            channel_t *rch = &mgr2->entries[rc_matched].channel;
+                            cJSON *rack = wire_build_reconnect_ack(
+                                (uint32_t)rc_matched, rch->local_amount,
+                                rch->remote_amount, rch->commitment_number);
+                            wire_send(new_fd, MSG_RECONNECT_ACK, rack);
+                            cJSON_Delete(rack);
+                            reconnected++;
+                            printf("  Client %d reconnected via MSG_RECONNECT\n", rc_matched);
+                        } else {
+                            wire_close(new_fd);
+                        }
+                    } else {
+                        wire_close(new_fd);
+                    }
+                } else if (rmsg.msg_type == MSG_HELLO) {
+                    /* Client sent fresh HELLO — accept it and assign to a
+                       client slot by matching the pubkey from HELLO. */
+                    secp256k1_pubkey hello_pk;
+                    cJSON *pk_item = cJSON_GetObjectItem(rmsg.json, "pubkey");
+                    unsigned char pk_buf[33];
+                    int hello_ok = pk_item && cJSON_IsString(pk_item) &&
+                        hex_decode(pk_item->valuestring, pk_buf, 33) == 33 &&
+                        secp256k1_ec_pubkey_parse(ctx, &hello_pk, pk_buf, 33);
+                    if (hello_ok) {
+                        /* Find which client this pubkey belongs to */
+                        int matched = -1;
+                        for (size_t ci = 0; ci < mgr2->n_channels; ci++) {
+                            unsigned char h_ser[33], c_ser[33];
+                            size_t hl = 33, cl = 33;
+                            secp256k1_ec_pubkey_serialize(ctx, h_ser, &hl,
+                                &hello_pk, SECP256K1_EC_COMPRESSED);
+                            secp256k1_ec_pubkey_serialize(ctx, c_ser, &cl,
+                                &lsp_p->client_pubkeys[ci], SECP256K1_EC_COMPRESSED);
+                            if (memcmp(h_ser, c_ser, 33) == 0) {
+                                matched = (int)ci;
+                                break;
+                            }
+                        }
+                        if (matched >= 0) {
+                            /* Send HELLO_ACK so client doesn't hang */
+                            secp256k1_pubkey lsp_pk;
+                            secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+                            cJSON *ack = wire_build_hello_ack(ctx, &lsp_pk,
+                                (uint32_t)(matched + 1),
+                                lsp_p->factory.pubkeys,
+                                lsp_p->factory.n_participants);
+                            wire_send(new_fd, MSG_HELLO_ACK, ack);
+                            cJSON_Delete(ack);
+                            /* Replace stale FD */
+                            if (lsp_p->client_fds[matched] >= 0)
+                                wire_close(lsp_p->client_fds[matched]);
+                            lsp_p->client_fds[matched] = new_fd;
+                            reconnected++;
+                            printf("  Client %d reconnected via HELLO fallback\n", matched);
+                        } else {
+                            wire_close(new_fd);
+                        }
+                    } else {
+                        wire_close(new_fd);
+                    }
+                } else {
+                    wire_close(new_fd);
+                }
+                if (rmsg.json) cJSON_Delete(rmsg.json);
             }
             if (reconnected < (size_t)n_clients) {
                 fprintf(stderr, "ROTATION: only %zu/%d clients reconnected\n",
