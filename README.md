@@ -805,6 +805,16 @@ SuperScalar needs real-world testing on signet and testnet over weeks and months
 
 Join the [Discussions](https://github.com/8144225309/SuperScalar/discussions) for questions, ideas, and coordination.
 
+## Related Projects
+
+| Project | Description |
+|---------|-------------|
+| [superscalar-cln](https://github.com/8144225309/superscalar-cln) | SuperScalar channel factory plugin for Core Lightning (bLIP-56) |
+| [lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) | Core Lightning fork with pluggable channel factory support |
+| [superscalar-wallet](https://github.com/8144225309/superscalar-wallet) | Web-based wallet UI for SuperScalar factory management |
+| [superscalar-docs](https://github.com/8144225309/superscalar-docs) | Protocol documentation and visual guides |
+| [superscalar.win](https://superscalar.win) | SuperScalar explainer and documentation site |
+
 ## License
 
 MIT
