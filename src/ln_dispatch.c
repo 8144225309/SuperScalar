@@ -98,7 +98,7 @@ static void send_channel_data_cb(uint64_t scid,
     /* channel_announcement (unsigned — we relay what we have) */
     unsigned char ann[300];
     size_t ann_len = gossip_build_channel_announcement_unsigned(
-        ann, sizeof(ann), GOSSIP_CHAIN_HASH_MAINNET, scid,
+        ann, sizeof(ann), gossip_chain_hash_for_network(d->network), scid,
         node1, node2, node1, node2);
     if (ann_len > 0)
         peer_mgr_send(d->pmgr, peer_idx, ann, ann_len);
@@ -114,7 +114,7 @@ static void send_channel_data_cb(uint64_t scid,
         unsigned char upd[160];
         size_t upd_len = gossip_build_channel_update(
             upd, sizeof(upd), d->ctx, d->our_privkey,
-            GOSSIP_CHAIN_HASH_MAINNET, scid, ts,
+            gossip_chain_hash_for_network(d->network), scid, ts,
             GOSSIP_UPDATE_MSGFLAG_HTLC_MAX, (uint8_t)dir,
             cltv, 1, fee_base, fee_ppm, 0);
         if (upd_len > 0)
@@ -466,7 +466,7 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         /* reply_short_channel_ids_end: complete=1 */
         unsigned char reply[35];
         size_t rlen = gossip_build_reply_scids_end(reply, sizeof(reply),
-                                                    GOSSIP_CHAIN_HASH_MAINNET, 1);
+                                                    gossip_chain_hash_for_network(d->network), 1);
         if (rlen > 0 && d->pmgr && peer_idx >= 0)
             peer_mgr_send(d->pmgr, peer_idx, reply, rlen);
         return 261;

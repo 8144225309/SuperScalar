@@ -146,7 +146,7 @@ int peer_mgr_connect(peer_mgr_t *mgr, const char *host, uint16_t port,
                                         ? (uint32_t)time(NULL) - 14*24*3600 : 0);
         size_t ts_len = gossip_build_timestamp_filter(
             ts_filter, sizeof(ts_filter),
-            GOSSIP_CHAIN_HASH_MAINNET, first_ts, 0xFFFFFFFFu);
+            gossip_chain_hash_for_network(mgr->network), first_ts, 0xFFFFFFFFu);
         if (ts_len == 42)
             peer_mgr_send(mgr, idx, ts_filter, ts_len);
     }
@@ -360,7 +360,7 @@ int peer_mgr_reconnect_all(peer_mgr_t *mgr, channel_t **ch_table, uint32_t now)
                                             ? now - 14*24*3600 : 0);
             size_t ts_len = gossip_build_timestamp_filter(
                 ts_filter, sizeof(ts_filter),
-                GOSSIP_CHAIN_HASH_MAINNET, first_ts, 0xFFFFFFFFu);
+                gossip_chain_hash_for_network(mgr->network), first_ts, 0xFFFFFFFFu);
             if (ts_len == 42)
                 peer_mgr_send(mgr, i, ts_filter, ts_len);
         }
