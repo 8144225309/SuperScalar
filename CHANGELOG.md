@@ -2,7 +2,17 @@
 
 All notable changes to SuperScalar are documented here.
 
-## Unreleased
+## 0.1.10 — 2026-04-10
+
+Full signet exhibition suite (29/30 S-tests passed), watchtower auto-settlement, rotation reconnect fixes, and 4 bug fixes found during signet testing.
+
+### Signet exhibition tests (S1–S30)
+
+- **29 of 30 S-tests passed on signet** with real on-chain confirmation, BIP68 relative timelocks, and CLN bridge integration. S16 (epoch reset) removed due to DW security vulnerabilities.
+- **S10/S14**: End-to-end CLN bridge payments (CLN-B → CLN-A → plugin → bridge → factory → client → preimage) confirmed on signet with real Lightning Network routing.
+- **S25**: Outbound payment (factory → bridge → CLN → external invoice) confirmed on signet.
+- **S26**: Standalone watchtower binary (`superscalar_watchtower`) independently detects breaches from LSP database.
+- **S20**: 3-factory ladder (three concurrent factories demonstrating ACTIVE/DYING/EXPIRED lifecycle).
 
 ### Watchtower & fee bumping (PRs #55, #56)
 
@@ -10,6 +20,13 @@ All notable changes to SuperScalar are documented here.
 - **CPFP fee budget fix** (`watchtower.c`): fee bump budget now based on actual penalty value (% of sats at stake) instead of fixed amount. Real block deadline from CSV delay replaces cycle-counting.
 - **Operator-tunable CPFP** (`superscalar_lsp.c`, `superscalar_watchtower.c`): `--bump-budget-pct N` (default 50%) and `--max-bump-fee N` (default 50000 sats) CLI flags.
 - **Pending entry persistence** (`persist.c`): penalty TX entries now store `penalty_value`, `csv_delay`, and `start_height` for budget calculation across restarts. Schema v16.
+
+### Bug fixes found during signet testing
+
+- **`--states-per-layer` CLI flag ignored** (`superscalar_lsp.c`): factory creation hardcoded `states_per_layer=4`, ignoring the CLI flag. Caused unexpectedly large DW tree nSequence delays.
+- **S28 HTLC amount below dust** (`superscalar_lsp_pre_daemon_tests.inc`): test used 500 sats for channel 3, below `CHANNEL_DUST_LIMIT_SATS` (546). Changed to 1000.
+- **Rotation reconnect timeout** (`superscalar_lsp_post_daemon_tests.inc`): reconnect window extended from 30s to 120s on non-regtest networks.
+- **Rotation reconnect nonce exchange** (`superscalar_lsp_post_daemon_tests.inc`): replaced inline reconnect handler with production `lsp_channels_handle_reconnect()` which does full ceremony — commitment reconciliation, PCS/PCP restore, nonce pool re-init, bidirectional CHANNEL_NONCES exchange. Without this, cooperative close after rotation failed on signet.
 
 ## 0.1.9 — 2026-04-07
 
