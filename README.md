@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 
-> v0.1.9 — 1362 unit tests, 42 regtest integration tests, complete fund settlement & trustless recovery, HTTP JSON-RPC chain backend for all networks, balance-aware distribution TX, factory rotation balance carry, sweeper module, watchtower breach detection + burn TX, structured JSON logging, config file support, full BOLT 1/2/4/7/8/11/12 LN wire stack, LSPS0/1/2, MPP, AMP, PTLC, trampoline, RGS, circuit breaker, splicing, liquidity ads, onion messages, hold invoices, BIP 39/353, dynamic commitments, standalone watchtower.
+> v0.1.10 — 29/30 signet exhibition tests passed (S1–S30), watchtower auto-settlement, rotation reconnect fixes, CLN bridge end-to-end payments on signet, standalone watchtower binary. 1362 unit tests, 42 regtest integration tests.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -24,10 +24,10 @@ A Bitcoin channel factory protocol combining:
 | **Transport** | BOLT #8 Noise_XK encrypted transport (ChaCha20-Poly1305, key rotation, phase timeouts), BOLT #7 gossip (node_announcement, channel_announcement, channel_update, gossip queries), Tor hidden services + SOCKS5 |
 | **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
 | **Wire Protocol** | Full BOLT #2 commitment (update_add/fulfill/fail HTLC, commitment_signed, revoke_and_ack, update_fee), BOLT #4 multi-hop onion (Sphinx, keysend TLV), BOLT #11 invoice, BOLT #12 offers + blinded paths, LSPS0/1/2, MPP (10-part / 32-payment), AMP, Dijkstra pathfinding over gossip graph, PTLC state machine, dual-fund v2, cooperative close, factory lifecycle, reconnection |
-| **Signing** | Distributed MuSig2 signing for epoch reset (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
+| **Signing** | Distributed MuSig2 signing for factory creation (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 1351 unit + 36 orchestrator + 26 signet exhibition tests, CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 1362 unit + 42 regtest integration + 29 signet exhibition tests (S1–S30, S16 removed), CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -74,7 +74,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-1355 automated tests (unit + regtest integration + adversarial/edge-case) plus manual flag tests and orchestrator scenarios. CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer. 21/21 signet exhibition structures pass.
+1362 automated tests (unit + regtest integration) plus 29 signet exhibition tests (S1–S30, S16 removed). CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -673,7 +673,7 @@ State 3 (newest): nSequence = 0 blocks    <- confirms immediately
 
 Multi-layer counter works like an odometer: 2 layers x 4 states = 16 epochs.
 
-**Per-leaf advance**: Left and right subtrees can advance independently (only 3 signers needed per leaf instead of all 5). When a leaf exhausts its states, the root layer advances and both leaves reset. **Distributed epoch reset** reclaims all states via a 2-round MuSig2 ceremony: LSP collects nonces from all clients (round 1), then distributes the aggregate and collects partial signatures (round 2).
+**Per-leaf advance**: Left and right subtrees can advance independently (only 3 signers needed per leaf instead of all 5). When a leaf exhausts its states, the root layer advances and both leaves reset. When all DW states are exhausted, the factory is rotated (old factory cooperatively closed, new factory created with fresh states).
 
 ### Timeout-Sig-Trees
 
@@ -744,7 +744,7 @@ CLN (lightningd)
 | `musig` | musig.c | MuSig2 key aggregation, 2-round signing, split-round protocol, nonce pools |
 | `tx_builder` | tx_builder.c | Raw tx serialization, BIP-341 key-path sighash, witness finalization |
 | `tapscript` | tapscript.c | TapLeaf/TapBranch hashing, CLTV timeout scripts, control blocks |
-| `factory` | factory.c | Factory tree: build, sign, advance, epoch reset, per-leaf advance, timeout-sig-tree outputs, cooperative close |
+| `factory` | factory.c | Factory tree: build, sign, advance, per-leaf advance, timeout-sig-tree outputs, cooperative close |
 | `shachain` | shachain.c | BOLT #3 shachain, compact storage, epoch-to-index mapping |
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
@@ -752,7 +752,7 @@ CLN (lightningd)
 | `wire` | wire.c | TCP transport, JSON framing, 54 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
-| `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, distributed epoch reset, per-leaf advance |
+| `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, factory rotation, per-leaf advance |
 | `lsp_bridge` | lsp_bridge.c | Bridge invoice registry, HTLC origin tracking, bridge message handling |
 | `lsp_rotation` | lsp_rotation.c | Factory rotation: PTLC turnover, cooperative close, ladder management |
 | `lsp_demo` | lsp_demo.c | Demo payment sequences, balance printing, external invoice creation |
