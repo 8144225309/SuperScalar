@@ -956,8 +956,12 @@ int channel_build_penalty_tx(const channel_t *ch,
                                size_t anchor_spk_len) {
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret)) {
+        fprintf(stderr, "PENALTY FAILED: missing revocation secret for "
+                "commitment %llu — breach will go unpunished\n",
+                (unsigned long long)old_commitment_num);
         return 0;
+    }
 
     /* 2. Compute per_commitment_point from secret */
     secp256k1_pubkey pcp;
@@ -1137,8 +1141,12 @@ int channel_build_penalty_tx_script_path(const channel_t *ch,
 
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret)) {
+        fprintf(stderr, "PENALTY FAILED (script-path): missing revocation secret "
+                "for commitment %llu — breach will go unpunished\n",
+                (unsigned long long)old_commitment_num);
         return 0;
+    }
 
     /* 2. Compute per_commitment_point from secret */
     secp256k1_pubkey pcp;
@@ -2169,8 +2177,12 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 {
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret)) {
+        fprintf(stderr, "HTLC PENALTY FAILED: missing revocation secret for "
+                "commitment %llu htlc %zu — breach will go unpunished\n",
+                (unsigned long long)old_commitment_num, htlc_index);
         return 0;
+    }
 
     /* 2. Compute per_commitment_point from secret */
     secp256k1_pubkey pcp;
@@ -2632,8 +2644,12 @@ int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret)) {
+        fprintf(stderr, "PTLC PENALTY FAILED: missing revocation secret for "
+                "commitment %llu ptlc %zu — breach will go unpunished\n",
+                (unsigned long long)old_commitment_num, ptlc_index);
         return 0;
+    }
 
     secp256k1_pubkey pcp;
     if (!secp256k1_ec_pubkey_create(ch->ctx, &pcp, pcp_secret))
