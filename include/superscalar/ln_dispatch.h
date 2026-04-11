@@ -62,6 +62,7 @@ typedef struct {
        NULL = disabled. Updated automatically when channels change state. */
     const char *scb_path;
     circuit_breaker_t     *cb;           /* per-peer HTLC limits; NULL=disabled */
+    const char            *network;      /* "mainnet"/"signet"/"testnet"; NULL=mainnet */
 } ln_dispatch_t;
 
 /*
