@@ -2665,31 +2665,44 @@ int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 
     /* 3. Rebuild PTLC taptree from remote's perspective */
     secp256k1_pubkey remote_htlc_pub, local_htlc_pub;
-    channel_derive_pubkey(ch->ctx, &remote_htlc_pub, &ch->remote_htlc_basepoint, &pcp);
-    channel_derive_pubkey(ch->ctx, &local_htlc_pub, &ch->local_htlc_basepoint, &pcp);
+    if (!channel_derive_pubkey(ch->ctx, &remote_htlc_pub,
+                                &ch->remote_htlc_basepoint, &pcp))
+        return 0;
+    if (!channel_derive_pubkey(ch->ctx, &local_htlc_pub,
+                                &ch->local_htlc_basepoint, &pcp))
+        return 0;
 
     secp256k1_xonly_pubkey remote_htlc_xonly, local_htlc_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly, NULL, &remote_htlc_pub);
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly, NULL, &local_htlc_pub);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &remote_htlc_xonly,
+                                             NULL, &remote_htlc_pub))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_htlc_xonly,
+                                             NULL, &local_htlc_pub))
+        return 0;
 
     const ptlc_t *p = &ch->ptlcs[ptlc_index];
     unsigned char pp_hash[32];
     secp256k1_xonly_pubkey pp_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly, NULL, &p->payment_point))
         return 0;
-    secp256k1_xonly_pubkey_serialize(ch->ctx, pp_hash, &pp_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, pp_hash, &pp_xonly))
+        return 0;
 
     tapscript_leaf_t success_leaf, timeout_leaf;
     if (p->direction == PTLC_OFFERED) {
-        tapscript_build_htlc_received_success(&success_leaf, pp_hash,
-            ch->to_self_delay, &remote_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_received_timeout(&timeout_leaf,
-            p->cltv_expiry, &local_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_received_success(&success_leaf, pp_hash,
+                ch->to_self_delay, &remote_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_received_timeout(&timeout_leaf,
+                p->cltv_expiry, &local_htlc_xonly, ch->ctx))
+            return 0;
     } else {
-        tapscript_build_htlc_offered_success(&success_leaf, pp_hash,
-            &local_htlc_xonly, ch->ctx);
-        tapscript_build_htlc_offered_timeout(&timeout_leaf,
-            p->cltv_expiry, ch->to_self_delay, &remote_htlc_xonly, ch->ctx);
+        if (!tapscript_build_htlc_offered_success(&success_leaf, pp_hash,
+                &local_htlc_xonly, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_offered_timeout(&timeout_leaf,
+                p->cltv_expiry, ch->to_self_delay, &remote_htlc_xonly, ch->ctx))
+            return 0;
     }
 
     tapscript_leaf_t ptlc_leaves[2] = { success_leaf, timeout_leaf };
@@ -2698,13 +2711,17 @@ int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 
     /* 4. Derive revocation pubkey and compute tap tweak */
     secp256k1_pubkey revocation_pubkey;
-    secp256k1_ec_pubkey_create(ch->ctx, &revocation_pubkey, revocation_privkey);
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &revocation_pubkey, revocation_privkey))
+        return 0;
 
     secp256k1_xonly_pubkey revocation_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly, NULL, &revocation_pubkey);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &revocation_xonly,
+                                             NULL, &revocation_pubkey))
+        return 0;
 
     unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, internal_ser, &revocation_xonly))
+        return 0;
 
     unsigned char tweak_data[64];
     memcpy(tweak_data, internal_ser, 32);
@@ -2720,16 +2737,22 @@ int channel_build_ptlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
 
     /* 5. Build output */
     secp256k1_xonly_pubkey local_pay_xonly;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
-                                       &ch->local_payment_basepoint);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &local_pay_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
     unsigned char out_ser[32];
-    secp256k1_xonly_pubkey_serialize(ch->ctx, out_ser, &local_pay_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, out_ser, &local_pay_xonly))
+        return 0;
     unsigned char out_tweak[32];
     sha256_tagged("TapTweak", out_ser, 32, out_tweak);
     secp256k1_pubkey out_tweaked_full;
-    secp256k1_xonly_pubkey_tweak_add(ch->ctx, &out_tweaked_full, &local_pay_xonly, out_tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &out_tweaked_full,
+                                           &local_pay_xonly, out_tweak))
+        return 0;
     secp256k1_xonly_pubkey out_tweaked;
-    secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL, &out_tweaked_full);
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
+                                             &out_tweaked_full))
+        return 0;
 
     int has_anchor = (anchor_spk && anchor_spk_len == P2A_SPK_LEN);
     uint64_t vsize = has_anchor ? 165 : 152;
