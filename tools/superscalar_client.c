@@ -434,6 +434,15 @@ typedef struct {
     jit_phase_t jit_phase;
     size_t jit_offer_cidx;        /* client index from the offer */
     uint64_t jit_offer_amount;     /* funding amount from the offer */
+    /* Deferred watchtower state for inbox-drain CS → async LSP revocation */
+    uint64_t pending_wt_local;
+    uint64_t pending_wt_remote;
+    htlc_t pending_wt_htlcs[MAX_HTLCS];
+    size_t pending_wt_n_htlcs;
+    int pending_wt_valid;  /* 1 = pending old state needs watchtower registration */
+    /* Old leaf txid saved during PROPOSE for watchtower registration in DONE */
+    unsigned char old_leaf_txid[32];
+    int old_leaf_saved;
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -731,6 +740,17 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
                 if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    /* Save old state for deferred watchtower registration.
+                       LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
+                    if (cbd->wt) {
+                        cbd->pending_wt_local = ch->local_amount;
+                        cbd->pending_wt_remote = ch->remote_amount;
+                        cbd->pending_wt_n_htlcs = ch->n_htlcs;
+                        if (ch->n_htlcs > 0)
+                            memcpy(cbd->pending_wt_htlcs, ch->htlcs,
+                                   ch->n_htlcs * sizeof(htlc_t));
+                        cbd->pending_wt_valid = 1;
+                    }
                     client_handle_commitment_signed(fd, ch, ctx, &imsg);
                     client_persist_commitment_sig(ch, cbd);
                     cJSON_Delete(imsg.json);
@@ -969,9 +989,25 @@ handle_message:
             unsigned char lra_rev_secret[32], lra_next_point[33];
             if (wire_parse_revoke_and_ack(msg.json, &lra_chan_id,
                                             lra_rev_secret, lra_next_point)) {
+                uint64_t old_cn = ch->commitment_number > 0
+                                  ? ch->commitment_number - 1 : 0;
                 if (ch->commitment_number > 0)
-                    channel_receive_revocation(ch, ch->commitment_number - 1,
-                                               lra_rev_secret);
+                    channel_receive_revocation(ch, old_cn, lra_rev_secret);
+                /* Register revoked commitment with client watchtower */
+                if (cbd && cbd->wt && ch->commitment_number > 0) {
+                    uint64_t wt_local = cbd->pending_wt_valid
+                                        ? cbd->pending_wt_local : ch->local_amount;
+                    uint64_t wt_remote = cbd->pending_wt_valid
+                                         ? cbd->pending_wt_remote : ch->remote_amount;
+                    const htlc_t *wt_htlcs = (cbd->pending_wt_valid &&
+                                              cbd->pending_wt_n_htlcs > 0)
+                                             ? cbd->pending_wt_htlcs : NULL;
+                    size_t wt_n_htlcs = cbd->pending_wt_valid
+                                        ? cbd->pending_wt_n_htlcs : 0;
+                    watchtower_watch_revoked_commitment(cbd->wt, ch,
+                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs);
+                    cbd->pending_wt_valid = 0;
+                }
                 /* Persist new remote PCP */
                 if (cbd && cbd->db) {
                     secp256k1_pubkey lra_pcp;
@@ -1501,6 +1537,17 @@ handle_message:
             printf("Client %u: LEAF_ADVANCE_PROPOSE for leaf %d\n",
                    my_index, leaf_side);
 
+            /* Save old leaf txid before advance for watchtower registration.
+               The aggregate signed TX arrives in MSG_LEAF_ADVANCE_DONE. */
+            if (cbd && cbd->wt) {
+                size_t pre_idx = factory->leaf_node_indices[leaf_side];
+                factory_node_t *pre_fn = &factory->nodes[pre_idx];
+                if (pre_fn->is_signed && pre_fn->signed_tx.len > 0) {
+                    memcpy(cbd->old_leaf_txid, pre_fn->txid, 32);
+                    cbd->old_leaf_saved = 1;
+                }
+            }
+
             /* Advance DW + rebuild unsigned tx locally */
             int arc = factory_advance_leaf_unsigned(factory, leaf_side);
             if (arc <= 0) {
@@ -1607,12 +1654,40 @@ handle_message:
         }
 
         case MSG_LEAF_ADVANCE_DONE: {
-            /* LSP confirms leaf advance — the signed tx is now finalized.
-               Client's factory already has the correct unsigned tx from PROPOSE. */
+            /* LSP confirms leaf advance with the aggregate signed TX. */
             int leaf_side;
-            if (wire_parse_leaf_advance_done(msg.json, &leaf_side))
+            unsigned char done_signed_tx[4096];
+            size_t done_signed_tx_len = 0;
+            if (wire_parse_leaf_advance_done_with_tx(msg.json, &leaf_side,
+                    done_signed_tx, &done_signed_tx_len, sizeof(done_signed_tx))) {
                 printf("Client %u: leaf %d advance confirmed by LSP\n",
                        my_index, leaf_side);
+
+                /* Store signed TX in factory node */
+                if (done_signed_tx_len > 0) {
+                    size_t done_idx = factory->leaf_node_indices[leaf_side];
+                    factory_node_t *done_fn = &factory->nodes[done_idx];
+                    tx_buf_reset(&done_fn->signed_tx);
+                    tx_buf_ensure(&done_fn->signed_tx, done_signed_tx_len);
+                    if (!done_fn->signed_tx.oom) {
+                        memcpy(done_fn->signed_tx.data,
+                               done_signed_tx, done_signed_tx_len);
+                        done_fn->signed_tx.len = done_signed_tx_len;
+                    }
+                    done_fn->is_signed = 1;
+                }
+
+                /* Register old state with watchtower */
+                if (cbd && cbd->wt && cbd->old_leaf_saved &&
+                    done_signed_tx_len > 0) {
+                    size_t done_idx = factory->leaf_node_indices[leaf_side];
+                    watchtower_watch_factory_node(cbd->wt,
+                        (uint32_t)done_idx, cbd->old_leaf_txid,
+                        done_signed_tx, done_signed_tx_len,
+                        NULL, 0);
+                    cbd->old_leaf_saved = 0;
+                }
+            }
             cJSON_Delete(msg.json);
             break;
         }

@@ -1586,10 +1586,39 @@ cJSON *wire_build_leaf_advance_done(int leaf_side) {
     return j;
 }
 
+cJSON *wire_build_leaf_advance_done_with_tx(int leaf_side,
+                                              const unsigned char *signed_tx,
+                                              size_t signed_tx_len) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    if (signed_tx && signed_tx_len > 0)
+        wire_json_add_hex(j, "signed_tx", signed_tx, signed_tx_len);
+    return j;
+}
+
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
+    return 1;
+}
+
+int wire_parse_leaf_advance_done_with_tx(const cJSON *json, int *leaf_side,
+                                           unsigned char *signed_tx_out,
+                                           size_t *signed_tx_len_out,
+                                           size_t max_len) {
+    if (!wire_parse_leaf_advance_done(json, leaf_side)) return 0;
+    cJSON *tx = cJSON_GetObjectItem(json, "signed_tx");
+    if (!tx || !cJSON_IsString(tx)) {
+        *signed_tx_len_out = 0;
+        return 1;  /* valid message, just no TX included */
+    }
+    size_t hex_len = strlen(tx->valuestring);
+    size_t bin_len = hex_len / 2;
+    if (bin_len > max_len) return 0;
+    if (!wire_json_get_hex(json, "signed_tx", signed_tx_out, bin_len))
+        return 0;
+    *signed_tx_len_out = bin_len;
     return 1;
 }
 

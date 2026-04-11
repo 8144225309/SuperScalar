@@ -548,8 +548,15 @@ int wire_parse_leaf_advance_psig(const cJSON *json,
 
 /* LSP -> All: LEAF_ADVANCE_DONE {leaf_side} */
 cJSON *wire_build_leaf_advance_done(int leaf_side);
+cJSON *wire_build_leaf_advance_done_with_tx(int leaf_side,
+                                              const unsigned char *signed_tx,
+                                              size_t signed_tx_len);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
+int wire_parse_leaf_advance_done_with_tx(const cJSON *json, int *leaf_side,
+                                           unsigned char *signed_tx_out,
+                                           size_t *signed_tx_len_out,
+                                           size_t max_len);
 
 /* --- Leaf-Level Fund Reallocation message builders (Upgrade 3) --- */
 
