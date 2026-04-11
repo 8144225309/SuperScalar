@@ -211,4 +211,8 @@ int invoice_request_decode(const unsigned char *tlv, size_t tlv_len,
  */
 size_t invoice_encode(const invoice_t *inv, unsigned char *buf, size_t buf_cap);
 
+/* Decode a BOLT 12 invoice from TLV bytes (without outer 0x8000 wrapper).
+ * Returns 1 on success, 0 on error. */
+int invoice_decode(const unsigned char *tlv, size_t tlv_len, invoice_t *inv_out);
+
 #endif /* SUPERSCALAR_BOLT12_H */
