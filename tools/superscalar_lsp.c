@@ -97,6 +97,7 @@ static lsps2_pending_table_t g_lsps2_pending;
 /* Watchtower: breach detection on every block */
 static watchtower_t g_watchtower;
 static int          g_watchtower_ready = 0;
+static uint32_t     g_block_height = 0;
 
 /* Admin RPC: JSON-RPC 2.0 Unix socket operator interface */
 static admin_rpc_t   g_admin_rpc;
@@ -198,6 +199,7 @@ static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
 static void on_block_connected(uint32_t height, void *cb_ctx)
 {
     (void)cb_ctx;
+    g_block_height = height;
     if (!g_channel_mgr) return;
 
     for (size_t i = 0; i < g_channel_mgr->n_channels; i++) {
@@ -2519,6 +2521,7 @@ accept_new_factory:
         if (bolt8_listen_port > 0) {
             /* Initialise LN payment/forward/MPP tables */
             peer_mgr_init(&g_peer_mgr, ctx, lsp_p->nk_seckey);
+            g_peer_mgr.network = network;
             htlc_forward_init(&g_fwd);
             mpp_init(&g_mpp);
             payment_init(&g_payments);
@@ -2584,6 +2587,7 @@ accept_new_factory:
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
     g_ln_dispatch.jit_open_cb = on_jit_open;
     g_ln_dispatch.jit_cb_ctx  = NULL;
+    g_ln_dispatch.network     = network;
 
             pthread_t dispatch_tid;
             if (pthread_create(&dispatch_tid, NULL, ln_dispatch_thread, NULL) == 0) {
@@ -2607,7 +2611,7 @@ accept_new_factory:
             g_admin_rpc.fwd          = &g_fwd;
             g_admin_rpc.mpp          = &g_mpp;
             g_admin_rpc.shutdown_flag = (volatile int *)&g_shutdown;
-            g_admin_rpc.block_height = NULL; /* TODO: wire block height in PR#28 */
+            g_admin_rpc.block_height = &g_block_height;
             if (admin_rpc_init(&g_admin_rpc, rpc_file_arg))
                 printf("LSP: admin RPC socket at %s\n", rpc_file_arg);
             else

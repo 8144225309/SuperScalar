@@ -305,13 +305,7 @@ int gossip_peer_run_once(const gossip_peer_cfg_t *peer,
     uint32_t now = (uint32_t)time(NULL);
     uint32_t first_ts = gossip_timestamp_for_peer(peer_index, now);
 
-    const unsigned char *chain_hash = GOSSIP_CHAIN_HASH_MAINNET;
-    if (cfg->network) {
-        if (strcmp(cfg->network, "signet") == 0)
-            chain_hash = GOSSIP_CHAIN_HASH_SIGNET;
-        else if (strcmp(cfg->network, "testnet") == 0)
-            chain_hash = GOSSIP_CHAIN_HASH_TESTNET;
-    }
+    const unsigned char *chain_hash = gossip_chain_hash_for_network(cfg->network);
 
     unsigned char filter_buf[50];
     size_t filter_len = gossip_build_timestamp_filter(filter_buf, sizeof(filter_buf),
