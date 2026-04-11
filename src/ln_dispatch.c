@@ -13,6 +13,7 @@
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/onion_message.h"
+#include "superscalar/onion_msg.h"
 #include "superscalar/bolt1.h"
 #include "superscalar/lsps.h"
 #include "superscalar/onion_last_hop.h"   /* ONION_PACKET_SIZE */
@@ -364,9 +365,10 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         memset(&req, 0, sizeof(req));
         if (invoice_request_decode(payload, payload_len, &req) &&
             invoice_request_verify(&req, d->ctx)) {
-            unsigned char payment_hash[32], payment_secret[32];
-            memset(payment_hash,   0xAA, 32);
-            memset(payment_secret, 0xBB, 32);
+            unsigned char preimage[32], payment_hash[32], payment_secret[32];
+            if (!stateless_invoice_generate_l1(d->our_privkey,
+                    preimage, payment_hash, payment_secret))
+                return (int)msg_type;
             invoice_t inv;
             if (invoice_from_request(&req, d->ctx, d->our_privkey,
                                       payment_hash, payment_secret, &inv)) {
@@ -511,16 +513,34 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
                 /* Route by TLV type: invoice_request (64), invoice (66), error (68) */
                 uint8_t tlv_type = payload[0];
                 if (tlv_type == ONION_MSG_TLV_INVOICE_REQUEST) {
-                    /* Decode and process invoice_request (same as MSG_INVOICE_REQUEST) */
+                    /* Decode and process invoice_request via onion message */
                     invoice_request_t req;
                     if (invoice_request_decode(payload + 1, plen - 1, &req) &&
                         invoice_request_verify(&req, d->ctx)) {
-                        /* TODO: send invoice reply via reply_path if present */
-                        (void)req;
+                        unsigned char preimage[32], ph[32], ps[32];
+                        if (stateless_invoice_generate_l1(d->our_privkey,
+                                preimage, ph, ps)) {
+                            invoice_t inv;
+                            if (invoice_from_request(&req, d->ctx,
+                                    d->our_privkey, ph, ps, &inv)) {
+                                unsigned char inv_buf[512];
+                                size_t inv_len = invoice_encode(&inv,
+                                    inv_buf, sizeof(inv_buf));
+                                if (inv_len > 0 && d->pmgr && peer_idx >= 0)
+                                    peer_mgr_send(d->pmgr, peer_idx,
+                                                  inv_buf, inv_len);
+                            }
+                        }
                     }
                 } else if (tlv_type == ONION_MSG_TLV_INVOICE) {
-                    /* Received invoice in response to our offer request */
-                    /* TODO: decode invoice and initiate payment */
+                    /* Received BOLT 12 invoice — decode and log.
+                       Payment initiation requires routing which is
+                       handled by the payment module at a higher layer. */
+                    invoice_t inv;
+                    if (invoice_decode(payload + 1, plen - 1, &inv))
+                        fprintf(stderr, "LN dispatch: received BOLT 12 "
+                                "invoice via onion (%llu msat)\n",
+                                (unsigned long long)inv.amount_msat);
                 }
                 /* tlv_type == ONION_MSG_TLV_INVOICE_ERROR: log and ignore for now */
             }
