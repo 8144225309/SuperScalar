@@ -1565,8 +1565,10 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         tx_buf_free(&burn_tx);
     }
 
-    /* Step 10: Send LEAF_ADVANCE_DONE to all clients */
-    cJSON *done = wire_build_leaf_advance_done(leaf_side);
+    /* Step 10: Send LEAF_ADVANCE_DONE with signed TX to all clients */
+    factory_node_t *done_node = &f->nodes[node_idx];
+    cJSON *done = wire_build_leaf_advance_done_with_tx(leaf_side,
+        done_node->signed_tx.data, done_node->signed_tx.len);
     for (size_t i = 0; i < lsp->n_clients; i++) {
         wire_send(lsp->client_fds[i], MSG_LEAF_ADVANCE_DONE, done);
     }

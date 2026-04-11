@@ -440,6 +440,9 @@ typedef struct {
     htlc_t pending_wt_htlcs[MAX_HTLCS];
     size_t pending_wt_n_htlcs;
     int pending_wt_valid;  /* 1 = pending old state needs watchtower registration */
+    /* Old leaf txid saved during PROPOSE for watchtower registration in DONE */
+    unsigned char old_leaf_txid[32];
+    int old_leaf_saved;
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -1534,10 +1537,16 @@ handle_message:
             printf("Client %u: LEAF_ADVANCE_PROPOSE for leaf %d\n",
                    my_index, leaf_side);
 
-            /* TODO: factory leaf watchtower registration requires the aggregate
-               signed TX, which the client doesn't receive after leaf advance.
-               MSG_LEAF_ADVANCE_DONE should include the signed TX so clients
-               can independently respond to old factory state broadcasts. */
+            /* Save old leaf txid before advance for watchtower registration.
+               The aggregate signed TX arrives in MSG_LEAF_ADVANCE_DONE. */
+            if (cbd && cbd->wt) {
+                size_t pre_idx = factory->leaf_node_indices[leaf_side];
+                factory_node_t *pre_fn = &factory->nodes[pre_idx];
+                if (pre_fn->is_signed && pre_fn->signed_tx.len > 0) {
+                    memcpy(cbd->old_leaf_txid, pre_fn->txid, 32);
+                    cbd->old_leaf_saved = 1;
+                }
+            }
 
             /* Advance DW + rebuild unsigned tx locally */
             int arc = factory_advance_leaf_unsigned(factory, leaf_side);
@@ -1645,12 +1654,40 @@ handle_message:
         }
 
         case MSG_LEAF_ADVANCE_DONE: {
-            /* LSP confirms leaf advance — the signed tx is now finalized.
-               Client's factory already has the correct unsigned tx from PROPOSE. */
+            /* LSP confirms leaf advance with the aggregate signed TX. */
             int leaf_side;
-            if (wire_parse_leaf_advance_done(msg.json, &leaf_side))
+            unsigned char done_signed_tx[4096];
+            size_t done_signed_tx_len = 0;
+            if (wire_parse_leaf_advance_done_with_tx(msg.json, &leaf_side,
+                    done_signed_tx, &done_signed_tx_len, sizeof(done_signed_tx))) {
                 printf("Client %u: leaf %d advance confirmed by LSP\n",
                        my_index, leaf_side);
+
+                /* Store signed TX in factory node */
+                if (done_signed_tx_len > 0) {
+                    size_t done_idx = factory->leaf_node_indices[leaf_side];
+                    factory_node_t *done_fn = &factory->nodes[done_idx];
+                    tx_buf_reset(&done_fn->signed_tx);
+                    tx_buf_ensure(&done_fn->signed_tx, done_signed_tx_len);
+                    if (!done_fn->signed_tx.oom) {
+                        memcpy(done_fn->signed_tx.data,
+                               done_signed_tx, done_signed_tx_len);
+                        done_fn->signed_tx.len = done_signed_tx_len;
+                    }
+                    done_fn->is_signed = 1;
+                }
+
+                /* Register old state with watchtower */
+                if (cbd && cbd->wt && cbd->old_leaf_saved &&
+                    done_signed_tx_len > 0) {
+                    size_t done_idx = factory->leaf_node_indices[leaf_side];
+                    watchtower_watch_factory_node(cbd->wt,
+                        (uint32_t)done_idx, cbd->old_leaf_txid,
+                        done_signed_tx, done_signed_tx_len,
+                        NULL, 0);
+                    cbd->old_leaf_saved = 0;
+                }
+            }
             cJSON_Delete(msg.json);
             break;
         }
