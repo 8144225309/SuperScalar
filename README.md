@@ -4,6 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/8144225309/SuperScalar)](https://github.com/8144225309/SuperScalar/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > v0.1.10 — 29/30 signet exhibition tests passed (S1–S30), watchtower auto-settlement, rotation reconnect fixes, CLN bridge end-to-end payments on signet, standalone watchtower binary. 1362 unit tests, 42 regtest integration tests.
 

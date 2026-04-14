@@ -43,6 +43,14 @@ const unsigned char GOSSIP_CHAIN_HASH_SIGNET[32] = {
     0xe9, 0x73, 0x98, 0x81, 0x08, 0x00, 0x00, 0x00
 };
 
+const unsigned char *gossip_chain_hash_for_network(const char *network) {
+    if (network) {
+        if (strcmp(network, "signet") == 0) return GOSSIP_CHAIN_HASH_SIGNET;
+        if (strcmp(network, "testnet") == 0) return GOSSIP_CHAIN_HASH_TESTNET;
+    }
+    return GOSSIP_CHAIN_HASH_MAINNET;
+}
+
 /* --- Wire encoding helpers --- */
 
 static void write_be16(unsigned char *p, uint16_t v) {
