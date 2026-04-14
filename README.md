@@ -6,7 +6,7 @@
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-> v0.1.10 — 29/30 signet exhibition tests passed (S1–S30), watchtower auto-settlement, rotation reconnect fixes, CLN bridge end-to-end payments on signet, standalone watchtower binary. 1362 unit tests, 42 regtest integration tests.
+> v0.1.11 — LSPS2 server crash fix, chain gossip hash correction, admin RPC block height, BOLT 12 invoice flow, accumulated fee persistence (schema v17), watchtower/revocation logging gaps. 1362 unit tests, 42 regtest integration tests.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
