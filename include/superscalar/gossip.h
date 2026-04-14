@@ -29,6 +29,10 @@ extern const unsigned char GOSSIP_CHAIN_HASH_MAINNET[32];
 extern const unsigned char GOSSIP_CHAIN_HASH_TESTNET[32];
 extern const unsigned char GOSSIP_CHAIN_HASH_SIGNET[32];
 
+/* Return the chain hash for a network name ("mainnet", "signet", "testnet").
+   Returns GOSSIP_CHAIN_HASH_MAINNET for NULL or unrecognized names. */
+const unsigned char *gossip_chain_hash_for_network(const char *network);
+
 /* channel_update message_flags */
 #define GOSSIP_UPDATE_MSGFLAG_HTLC_MAX  0x01  /* htlc_maximum_msat present */
 

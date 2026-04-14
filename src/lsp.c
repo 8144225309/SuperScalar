@@ -853,6 +853,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
        don't respond before CLOSE_PROPOSE the client will receive LSPS_RESPONSE
        mid-ceremony and mistake it for CLOSE_ALL_NONCES. */
     for (size_t di = 0; di < lsp->n_clients; di++) {
+        if (lsp->client_fds[di] < 0) continue; /* skip clients that disconnected in daemon mode */
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[di], &rfds);

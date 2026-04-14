@@ -24,6 +24,7 @@ testnet4-launch-*.md
 v0.1.*-launch.md
 github-issue-drafts.md
 TODO-local.md
+*_LOCAL.md
 
 # Local-only tools and internal docs — not for release
 bitcoin-cli-wrapper.sh

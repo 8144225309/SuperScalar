@@ -614,3 +614,43 @@ size_t invoice_encode(const invoice_t *inv, unsigned char *buf, size_t buf_cap)
     memcpy(buf + 4, body, bpos);
     return 4 + bpos;
 }
+
+int invoice_decode(const unsigned char *tlv, size_t tlv_len,
+                    invoice_t *inv_out) {
+    if (!tlv || !inv_out || tlv_len < 4) return 0;
+    memset(inv_out, 0, sizeof(*inv_out));
+
+    size_t pos = 0;
+    while (pos + 4 <= tlv_len) {
+        uint16_t ttype = (uint16_t)((tlv[pos] << 8) | tlv[pos + 1]);
+        uint16_t tlen  = (uint16_t)((tlv[pos + 2] << 8) | tlv[pos + 3]);
+        pos += 4;
+        if (pos + tlen > tlv_len) return 0;
+
+        switch (ttype) {
+        case 1: /* amount_msat */
+            if (tlen == 8) {
+                inv_out->amount_msat = 0;
+                for (int i = 0; i < 8; i++)
+                    inv_out->amount_msat = (inv_out->amount_msat << 8) | tlv[pos + i];
+            }
+            break;
+        case 2: /* payment_hash */
+            if (tlen == 32) memcpy(inv_out->payment_hash, tlv + pos, 32);
+            break;
+        case 3: /* payment_secret */
+            if (tlen == 32) memcpy(inv_out->payment_secret, tlv + pos, 32);
+            break;
+        case 4: /* offer_id */
+            if (tlen == 32) memcpy(inv_out->offer_id, tlv + pos, 32);
+            break;
+        case 0xF0: /* node_sig */
+            if (tlen == 64) memcpy(inv_out->node_sig, tlv + pos, 64);
+            break;
+        default:
+            break; /* skip unknown TLVs */
+        }
+        pos += tlen;
+    }
+    return 1;
+}

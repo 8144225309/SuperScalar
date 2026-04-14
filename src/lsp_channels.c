@@ -266,14 +266,20 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
     if (n_clients == 0) return 0;
 
-    /* Preserve fee policy set before init (caller may configure these) */
+    /* Preserve fields set before init (caller may configure these) */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     void *saved_fee2 = mgr->fee;
+    economic_mode_t saved_econ = mgr->economic_mode;
+    uint16_t saved_profit_bps = mgr->default_profit_bps;
+    uint32_t saved_settle_interval = mgr->settlement_interval_blocks;
     memset(mgr, 0, sizeof(*mgr));
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
     mgr->fee = saved_fee2;
+    mgr->economic_mode = saved_econ;
+    mgr->default_profit_bps = saved_profit_bps;
+    mgr->settlement_interval_blocks = saved_settle_interval;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -295,6 +301,10 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
     htlc_inbound_init(&mgr->htlc_inbound);
+
+    /* Restore accumulated fees from DB (crash recovery) */
+    persist_load_fee_settlement(pdb, 0,
+        &mgr->accumulated_fees_sats, &mgr->last_settlement_block);
 
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
@@ -1195,6 +1205,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Track accumulated fees for profit settlement */
         uint64_t fee_sats = (fee_msat + 999) / 1000;
         mgr->accumulated_fees_sats += fee_sats;
+        if (mgr->persist)
+            persist_save_fee_settlement((persist_t *)mgr->persist, 0,
+                mgr->accumulated_fees_sats, mgr->last_settlement_block);
     }
 
     /* CLTV delta enforcement: subtract safety margin for factory close.
@@ -3630,6 +3643,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             mgr, &lsp->factory);
                         if (settled > 0) {
                             mgr->last_settlement_block = (uint32_t)height;
+                            if (mgr->persist)
+                                persist_save_fee_settlement(
+                                    (persist_t *)mgr->persist, 0,
+                                    mgr->accumulated_fees_sats,
+                                    mgr->last_settlement_block);
                             printf("LSP: settled profits to %d channels "
                                    "(height=%d)\n", settled, height);
                             fflush(stdout);
