@@ -23,6 +23,11 @@ Bug fixes and improvements surfaced during the signet exhibition suite: LSPS2 se
 - **LSPS2 crash fix** (`lsp_channels.c`): `FD_SET(-1, &rfds)` glibc fortified-abort when draining LSPS_REQUEST messages after a client disconnected mid-handshake. Fixed by skipping entries where `client_fds[i] < 0`.
 - **S15 non-regtest fix** (`superscalar_lsp_post_daemon_tests.inc`): partial-rotation test no longer waits for CLTV expiry on signet/mainnet when `blocks_to_cltv > 10`. Deferred distribution TX stored in DB and broadcast when the block arrives.
 
+### Housekeeping
+
+- **README**: added open PRs badge.
+- **`.gitignore`**: suppress `*_LOCAL.md` signet test result files.
+
 ## 0.1.10 — 2026-04-10
 
 Full signet exhibition suite (29/30 S-tests passed), watchtower auto-settlement, rotation reconnect fixes, and 4 bug fixes found during signet testing.
