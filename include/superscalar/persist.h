@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 16
+#define PERSIST_SCHEMA_VERSION 17
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -734,5 +734,18 @@ int persist_delete_sweep(persist_t *p, uint32_t sweep_id);
 
 /* Delete all sweep entries for a factory. */
 int persist_delete_sweeps_for_factory(persist_t *p, uint32_t factory_id);
+
+/* --- Fee settlement persistence (schema v17) --- */
+
+/* Save accumulated fees and last settlement block for a factory. */
+int persist_save_fee_settlement(persist_t *p, uint32_t factory_id,
+                                 uint64_t accumulated_fees_sats,
+                                 uint32_t last_settlement_block);
+
+/* Load accumulated fees and last settlement block for a factory.
+   Returns 1 if found, 0 if not found or error. */
+int persist_load_fee_settlement(persist_t *p, uint32_t factory_id,
+                                 uint64_t *accumulated_fees_sats_out,
+                                 uint32_t *last_settlement_block_out);
 
 #endif /* SUPERSCALAR_PERSIST_H */

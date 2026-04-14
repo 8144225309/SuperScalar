@@ -49,6 +49,7 @@ typedef struct {
     char              tor_proxy_host[256];
     int               tor_proxy_port; /* 0 = no proxy configured */
     gossip_store_t    *gs;             /* gossip store for timestamp filter (NULL=disabled) */
+    const char        *network;       /* "mainnet"/"signet"/"testnet"; NULL=mainnet */
 } peer_mgr_t;
 
 /*

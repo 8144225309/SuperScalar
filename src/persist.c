@@ -315,6 +315,13 @@ static const char *SCHEMA_SQL =
     "  signed_tx_hex TEXT NOT NULL"
     ");"
     /* Schema v12: pending sweeps for auto-settlement */
+    "CREATE TABLE IF NOT EXISTS fee_settlement ("
+    "  factory_id INTEGER NOT NULL DEFAULT 0,"
+    "  accumulated_fees_sats INTEGER NOT NULL DEFAULT 0,"
+    "  last_settlement_block INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (factory_id)"
+    ");"
+
     "CREATE TABLE IF NOT EXISTS pending_sweeps ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  sweep_type TEXT NOT NULL,"
@@ -752,6 +759,18 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
         sqlite3_exec(p->db,
             "ALTER TABLE watchtower_pending ADD COLUMN start_height INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
+    /* v17: fee settlement persistence for profit-shared mode */
+    if (db_version < 17) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS fee_settlement ("
+            "  factory_id INTEGER NOT NULL DEFAULT 0,"
+            "  accumulated_fees_sats INTEGER NOT NULL DEFAULT 0,"
+            "  last_settlement_block INTEGER NOT NULL DEFAULT 0,"
+            "  PRIMARY KEY (factory_id)"
+            ");",
             NULL, NULL, NULL);
     }
 
@@ -4303,6 +4322,50 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
             }
             found = 1;
         }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* --- Fee settlement persistence (schema v17) --- */
+
+int persist_save_fee_settlement(persist_t *p, uint32_t factory_id,
+                                 uint64_t accumulated_fees_sats,
+                                 uint32_t last_settlement_block) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO fee_settlement "
+        "(factory_id, accumulated_fees_sats, last_settlement_block) "
+        "VALUES (?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)accumulated_fees_sats);
+    sqlite3_bind_int(stmt, 3, (int)last_settlement_block);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_fee_settlement(persist_t *p, uint32_t factory_id,
+                                 uint64_t *accumulated_fees_sats_out,
+                                 uint32_t *last_settlement_block_out) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT accumulated_fees_sats, last_settlement_block "
+        "FROM fee_settlement WHERE factory_id = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (accumulated_fees_sats_out)
+            *accumulated_fees_sats_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+        if (last_settlement_block_out)
+            *last_settlement_block_out = (uint32_t)sqlite3_column_int(stmt, 1);
+        found = 1;
     }
     sqlite3_finalize(stmt);
     return found;

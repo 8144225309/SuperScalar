@@ -2,6 +2,27 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.11 — 2026-04-13
+
+Bug fixes and improvements surfaced during the signet exhibition suite: LSPS2 server crash fix, chain gossip hash correction, admin RPC block height, BOLT 12 invoice completion, fee persistence across crashes, and watchtower/revocation logging gaps.
+
+### Bug fixes (PR #57 — fix/client-watchtower-gaps)
+
+- **Client watchtower gaps** (`client.c`): fixed two paths where the client failed to hand revocation secrets to the watchtower — inbox-drain loop and async `MSG_REVOKE_AND_ACK` handler. Watchtower could miss breach detection for payments processed while the client was offline.
+
+### Bug fixes (PR #58 — fix/log-revocation-failures)
+
+- **Penalty TX failure logging** (`lsp_channels.c`): log an error when `channel_build_penalty_tx()` fails due to a missing revocation secret instead of silently dropping the breach. Makes watchtower gaps visible in production logs.
+
+### Bug fixes & improvements (PR #59 — fix/admin-rpc-block-height)
+
+- **Admin RPC block height** (`superscalar_lsp.c`, `admin_rpc.c`): `STATUS` response now includes `current_block_height` so operators can verify chain sync without connecting to bitcoind separately.
+- **BOLT 12 invoice flow** (`lsp_bridge.c`, `client.c`): complete end-to-end BOLT 12 invoice request/response via onion messages. Clients can now pay BOLT 12 offers through the factory bridge.
+- **Chain hash fix** (`gossip.c`): replaced hardcoded mainnet chain hash with `gossip_chain_hash_for_network()`. `channel_announcement` messages were malformed on signet/testnet, breaking CLN bridge gossip.
+- **Accumulated fee persistence** (`persist.c`, `lsp_channels.c`): accumulated LSP fees written to DB after each factory cycle (schema v17). Fees no longer lost on LSP crash between rotation cycles.
+- **LSPS2 crash fix** (`lsp_channels.c`): `FD_SET(-1, &rfds)` glibc fortified-abort when draining LSPS_REQUEST messages after a client disconnected mid-handshake. Fixed by skipping entries where `client_fds[i] < 0`.
+- **S15 non-regtest fix** (`superscalar_lsp_post_daemon_tests.inc`): partial-rotation test no longer waits for CLTV expiry on signet/mainnet when `blocks_to_cltv > 10`. Deferred distribution TX stored in DB and broadcast when the block arrives.
+
 ## 0.1.10 — 2026-04-10
 
 Full signet exhibition suite (29/30 S-tests passed), watchtower auto-settlement, rotation reconnect fixes, and 4 bug fixes found during signet testing.
