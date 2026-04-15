@@ -1,6 +1,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/fee_estimator.h"
+#include "superscalar/persist.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -552,6 +553,16 @@ int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
     if (!channel_ensure_revocations_cap(ch, (size_t)(commitment_num + 1))) return 0;
     memcpy(ch->received_revocations[commitment_num], secret32, 32);
     ch->received_revocation_valid[commitment_num] = 1;
+
+    /* Write through to disk if a persistence target is attached.  This lets
+       a standalone watchtower process hydrate a channel_t from the DB and
+       build penalty TXes after a breach.  Failure is non-fatal: the in-memory
+       state is still updated, which keeps the embedded watchtower working. */
+    if (ch->persist_db) {
+        (void)persist_save_revocation((persist_t *)ch->persist_db,
+                                       ch->persist_channel_id,
+                                       commitment_num, secret32);
+    }
     return 1;
 }
 
@@ -942,6 +953,12 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb) {
     if (!ch) return;
     ch->fee_rate_sat_per_kvb = fee_rate_sat_per_kvb;
+}
+
+void channel_set_persist(channel_t *ch, void *db, uint32_t channel_id) {
+    if (!ch) return;
+    ch->persist_db = db;
+    ch->persist_channel_id = channel_id;
 }
 
 int channel_build_penalty_tx(const channel_t *ch,
