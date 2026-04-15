@@ -633,6 +633,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
             uint32_t client_idx = my_index - 1;
+            /* Attach persistence so revocation secrets received later land in
+               the revocation_secrets table (needed for standalone watchtower). */
+            channel_set_persist(ch, cbd->db, client_idx);
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
