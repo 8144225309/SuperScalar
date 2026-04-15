@@ -1231,6 +1231,26 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+/* List channel ids currently in the channels table, in ascending order.
+   Returns the count written to *count_out (bounded by max). */
+int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
+                               size_t *count_out) {
+    if (!p || !p->db || !ids_out) return 0;
+
+    const char *sql = "SELECT id FROM channels ORDER BY id ASC;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        ids_out[count++] = (uint32_t)sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
+    return 1;
+}
+
 /* --- Revocation secrets --- */
 
 int persist_save_revocation(persist_t *p, uint32_t channel_id,
@@ -2790,7 +2810,7 @@ int persist_load_basepoints(persist_t *p, uint32_t channel_id,
 
    Success leaves *out_ch owning three heap allocations
    (htlcs, local_pcs, received_revocations, received_revocation_valid);
-   call channel_free() to release them.  Failure leaves *out_ch unowned. */
+   call channel_cleanup() to release them.  Failure leaves *out_ch unowned. */
 int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
                                          secp256k1_context *ctx,
                                          channel_t *out_ch) {
