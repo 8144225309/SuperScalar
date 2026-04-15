@@ -92,6 +92,16 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
                                      uint64_t remote_amount,
                                      uint64_t commitment_number);
 
+/* Hydrate a channel_t with enough state for channel_build_penalty_tx().
+   Zeroes *out_ch, allocates the dynamic arrays channel_init() would, and
+   fills in basepoints + revocation secrets + balances from the DB.
+   Success returns 1 and *out_ch owns heap allocations — free with channel_free().
+   Intended for the standalone superscalar_watchtower binary; does NOT set up
+   MuSig2 state, nonces, or HTLC tracking (not required for penalty signing). */
+int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
+                                         secp256k1_context *ctx,
+                                         channel_t *out_ch);
+
 /* --- Revocation secrets --- */
 
 /* Save a revocation secret for a given channel and commitment number. */
