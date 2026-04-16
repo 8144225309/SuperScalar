@@ -1226,7 +1226,8 @@ int test_regtest_bridge_payment(void) {
 
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", lsp_port,
-                                               bridge_payee_cb, cb_data);
+                                               bridge_payee_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
@@ -1659,7 +1660,8 @@ int test_regtest_bridge_invoice_flow(void) {
 
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", lsp_port,
-                                               invoice_flow_cb, cb_data);
+                                               invoice_flow_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
