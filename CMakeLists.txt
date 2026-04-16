@@ -56,8 +56,8 @@ set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(secp256k1-zkp
     GIT_REPOSITORY https://github.com/BlockstreamResearch/secp256k1-zkp.git
-    # Pinned 2026-02-24 — bump explicitly and retest when updating
-    GIT_TAG        64316eac116f1ae74111e98ab82fc7aa905b1d5a
+    # Pinned 2026-04-16 — matches CLN/wally secp256k1-zkp submodule
+    GIT_TAG        6152622613fdf1c5af6f31f74c427c4e9ee120ce
 )
 FetchContent_MakeAvailable(secp256k1-zkp)
 
