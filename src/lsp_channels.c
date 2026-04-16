@@ -1226,9 +1226,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fwd_amount_msat = amount_msat - fee_msat;
         fwd_amount_sats = fwd_amount_msat / 1000;
         if (fwd_amount_sats == 0) { free(old_dest_htlcs); return 0; }
-        /* Track accumulated fees for profit settlement */
+        /* Track accumulated fees — per-channel AND global.
+           Per-channel: used for proportional profit settlement (the client
+           whose channel routed the payment gets the share, not all clients).
+           Global: kept for backward compat + persistence. */
         uint64_t fee_sats = (fee_msat + 999) / 1000;
         mgr->accumulated_fees_sats += fee_sats;
+        mgr->entries[sender_idx].accumulated_fees_sats += fee_sats;
         if (mgr->persist)
             persist_save_fee_settlement((persist_t *)mgr->persist, 0,
                 mgr->accumulated_fees_sats, mgr->last_settlement_block);
@@ -3011,14 +3015,18 @@ int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory
 
     int settled = 0;
     for (size_t i = 0; i < mgr->n_channels; i++) {
-        /* Client participant index = i + 1 (0 = LSP) */
+        /* Per-channel settlement: each client gets their share of the fees
+           earned on THEIR channel, not a share of the global pool. */
+        uint64_t ch_fees = mgr->entries[i].accumulated_fees_sats;
+        if (ch_fees == 0) continue;
+
         uint32_t pidx = (uint32_t)(i + 1);
         if (pidx >= factory->n_participants) continue;
 
         uint16_t bps = factory->profiles[pidx].profit_share_bps;
         if (bps == 0) continue;
 
-        uint64_t share = (mgr->accumulated_fees_sats * bps) / 10000;
+        uint64_t share = (ch_fees * bps) / 10000;
         if (share == 0) continue;
 
         /* Shift balance from LSP-local to client-remote */
@@ -3026,6 +3034,7 @@ int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory
         if (ch->local_amount >= share) {
             ch->local_amount -= share;
             ch->remote_amount += share;
+            mgr->entries[i].accumulated_fees_sats = 0;
             settled++;
         }
     }
@@ -3041,13 +3050,16 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
                                        size_t client_idx) {
     if (!mgr || !factory) return 0;
     if (mgr->economic_mode != ECON_PROFIT_SHARED) return 0;
-    if (mgr->accumulated_fees_sats == 0) return 0;
+    if (client_idx >= mgr->n_channels) return 0;
+
+    uint64_t ch_fees = mgr->entries[client_idx].accumulated_fees_sats;
+    if (ch_fees == 0) return 0;
 
     uint32_t pidx = (uint32_t)(client_idx + 1);
     if (pidx >= factory->n_participants) return 0;
 
     uint16_t bps = factory->profiles[pidx].profit_share_bps;
-    return (mgr->accumulated_fees_sats * bps) / 10000;
+    return (ch_fees * bps) / 10000;
 }
 
 int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
