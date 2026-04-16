@@ -774,6 +774,18 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    if (db_version < 18) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE channels ADD COLUMN to_self_delay INTEGER NOT NULL DEFAULT 144;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE channels ADD COLUMN fee_rate_sat_per_kvb INTEGER NOT NULL DEFAULT 1000;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE channels ADD COLUMN use_revocation_leaf INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1145,8 +1157,9 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     const char *sql =
         "INSERT OR REPLACE INTO channels "
         "(id, factory_id, slot, local_amount, remote_amount, funding_amount, "
-        " commitment_number, funding_txid, funding_vout, state) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open');";
+        " commitment_number, funding_txid, funding_vout, state, "
+        " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -1161,6 +1174,9 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int64(stmt, 7, (sqlite3_int64)ch->commitment_number);
     sqlite3_bind_text(stmt, 8, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 9, (int)ch->funding_vout);
+    sqlite3_bind_int(stmt, 10, (int)ch->to_self_delay);
+    sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
+    sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2895,14 +2911,36 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
                                    out_ch->received_revocation_valid,
                                    out_ch->revocations_cap, &rev_count);
 
-    /* Balances + config.  The three non-persisted fields use the codebase
-       defaults; every existing factory uses these same values. */
+    /* Balances + config from the channels table (schema v18+). */
     out_ch->local_amount = local_amt;
     out_ch->remote_amount = remote_amt;
     out_ch->commitment_number = cn;
-    out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
-    out_ch->fee_rate_sat_per_kvb = 1000;
-    out_ch->use_revocation_leaf = 0;
+
+    /* Load per-channel config (to_self_delay, fee_rate, use_revocation_leaf).
+       Schema v18 added these columns; older DBs get the migration defaults. */
+    {
+        const char *cfg_sql =
+            "SELECT to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf "
+            "FROM channels WHERE id = ?;";
+        sqlite3_stmt *cfg_stmt;
+        if (sqlite3_prepare_v2(p->db, cfg_sql, -1, &cfg_stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(cfg_stmt, 1, (int)channel_id);
+            if (sqlite3_step(cfg_stmt) == SQLITE_ROW) {
+                out_ch->to_self_delay = (uint32_t)sqlite3_column_int(cfg_stmt, 0);
+                out_ch->fee_rate_sat_per_kvb = (uint64_t)sqlite3_column_int64(cfg_stmt, 1);
+                out_ch->use_revocation_leaf = sqlite3_column_int(cfg_stmt, 2);
+            } else {
+                out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
+                out_ch->fee_rate_sat_per_kvb = 1000;
+                out_ch->use_revocation_leaf = 0;
+            }
+            sqlite3_finalize(cfg_stmt);
+        } else {
+            out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
+            out_ch->fee_rate_sat_per_kvb = 1000;
+            out_ch->use_revocation_leaf = 0;
+        }
+    }
 
     return 1;
 }

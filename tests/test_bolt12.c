@@ -249,7 +249,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 17, "schema version is 17");
+    ASSERT(PERSIST_SCHEMA_VERSION == 18, "schema version is 18");
     persist_close(&p);
     return 1;
 }
