@@ -3273,66 +3273,120 @@ int test_fee_accumulation_and_settlement(void) {
     return 1;
 }
 
-/* ---- Test: routing fees at multiple levels with settlement verification ---- */
+/* ---- Test: routing fees × economic modes × profit splits (cross-product) ---- */
 
 int test_fee_levels_and_profit_split(void) {
-    /* Test fee deduction + profit settlement at 5 different fee levels:
-       0 ppm (free), 100 ppm, 1000 ppm, 5000 ppm, 10000 ppm (1%) */
+    /* Cross-product: 5 fee levels × 3 economic configs = 15 combinations.
+       Verifies fee accumulation, profit settlement, balance conservation,
+       and that lsp-takes-all mode never shifts sats to clients. */
+
     uint64_t fee_levels[] = { 0, 100, 1000, 5000, 10000 };
-    uint64_t payment_msat = 10000000;  /* 10,000 sats */
+    /* Config: {economic_mode, client_bps, lsp_bps} */
+    struct { int econ; uint16_t client_bps; uint16_t lsp_bps; const char *name; } configs[] = {
+        { ECON_LSP_TAKES_ALL,  0,     10000, "lsp-takes-all" },
+        { ECON_PROFIT_SHARED,  0,     10000, "shared-0%"     },
+        { ECON_PROFIT_SHARED,  2500,  5000,  "shared-25%"    },
+    };
+    uint64_t payment_amounts_msat[] = { 1000000, 5000000, 10000000, 100000000 };
 
     for (int fl = 0; fl < 5; fl++) {
-        lsp_channel_mgr_t mgr;
-        memset(&mgr, 0, sizeof(mgr));
-        mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
-        mgr.entries_cap = 2;
-        mgr.n_channels = 2;
-        mgr.economic_mode = ECON_PROFIT_SHARED;
-        mgr.routing_fee_ppm = fee_levels[fl];
+        for (int ci = 0; ci < 3; ci++) {
+            lsp_channel_mgr_t mgr;
+            memset(&mgr, 0, sizeof(mgr));
+            mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+            mgr.entries_cap = 2;
+            mgr.n_channels = 2;
+            mgr.economic_mode = (economic_mode_t)configs[ci].econ;
+            mgr.routing_fee_ppm = fee_levels[fl];
 
-        for (size_t i = 0; i < 2; i++) {
-            mgr.entries[i].channel.local_amount = 500000;
-            mgr.entries[i].channel.remote_amount = 500000;
-            mgr.entries[i].ready = 1;
-        }
+            for (size_t i = 0; i < 2; i++) {
+                mgr.entries[i].channel.local_amount = 5000000;
+                mgr.entries[i].channel.remote_amount = 5000000;
+                mgr.entries[i].channel.funding_amount = 10000000;
+                mgr.entries[i].ready = 1;
+            }
 
-        factory_t *f = calloc(1, sizeof(factory_t));
-        f->economic_mode = ECON_PROFIT_SHARED;
-        f->n_participants = 3;
-        f->profiles[0].profit_share_bps = 7000;  /* LSP: 70% */
-        f->profiles[1].profit_share_bps = 1500;  /* Client 0: 15% */
-        f->profiles[2].profit_share_bps = 1500;  /* Client 1: 15% */
+            factory_t *f = calloc(1, sizeof(factory_t));
+            f->economic_mode = (economic_mode_t)configs[ci].econ;
+            f->n_participants = 3;
+            f->profiles[0].profit_share_bps = configs[ci].lsp_bps;
+            f->profiles[1].profit_share_bps = configs[ci].client_bps;
+            f->profiles[2].profit_share_bps = configs[ci].client_bps;
 
-        /* Simulate 10 routed payments */
-        for (int p = 0; p < 10; p++) {
-            uint64_t fee_msat = (payment_msat * mgr.routing_fee_ppm + 999999) / 1000000;
-            uint64_t fee_sats = (fee_msat + 999) / 1000;
-            mgr.accumulated_fees_sats += fee_sats;
-        }
+            /* Simulate payments at 4 different amounts */
+            uint64_t total_fee_sats = 0;
+            for (int p = 0; p < 4; p++) {
+                uint64_t fee_msat = (payment_amounts_msat[p] * mgr.routing_fee_ppm
+                                      + 999999) / 1000000;
+                uint64_t fee_sats = (fee_msat + 999) / 1000;
+                mgr.accumulated_fees_sats += fee_sats;
+                total_fee_sats += fee_sats;
+            }
 
-        if (fee_levels[fl] == 0) {
-            /* Zero-fee: no fees accumulated */
-            TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0,
-                           "0 ppm: no fees accumulated");
-        } else {
-            /* Non-zero fee: verify accumulation is positive */
-            TEST_ASSERT(mgr.accumulated_fees_sats > 0,
-                        "non-zero ppm: fees accumulated");
+            /* Save pre-settlement balances */
+            uint64_t pre_local_0 = mgr.entries[0].channel.local_amount;
+            uint64_t pre_remote_0 = mgr.entries[0].channel.remote_amount;
+            uint64_t pre_local_1 = mgr.entries[1].channel.local_amount;
+            uint64_t pre_remote_1 = mgr.entries[1].channel.remote_amount;
 
-            /* Settle and verify client share */
-            uint64_t pre_remote = mgr.entries[0].channel.remote_amount;
-            uint64_t expected_share = (mgr.accumulated_fees_sats * 1500) / 10000;
+            /* Settle */
             int settled = lsp_channels_settle_profits(&mgr, f);
-            TEST_ASSERT(settled > 0, "settlement happened");
-            TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
-                           pre_remote + expected_share,
-                           "client received correct profit share");
-            TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0,
-                           "fees reset after settlement");
-        }
 
-        free(mgr.entries);
-        free(f);
+            if (fee_levels[fl] == 0) {
+                /* Zero fee: nothing to settle regardless of mode */
+                TEST_ASSERT(settled == 0, "0 ppm: no settlement");
+                TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
+                               pre_remote_0, "0 ppm: client balance unchanged");
+            } else if (configs[ci].econ == ECON_LSP_TAKES_ALL) {
+                /* LSP takes all: settle_profits returns 0, no balance change */
+                TEST_ASSERT(settled == 0, "lsp-takes-all: no settlement");
+                TEST_ASSERT_EQ(mgr.entries[0].channel.local_amount,
+                               pre_local_0, "lsp-takes-all: LSP local unchanged");
+                TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
+                               pre_remote_0, "lsp-takes-all: client remote unchanged");
+                /* Fees remain accumulated (LSP keeps them implicitly) */
+                TEST_ASSERT_EQ(mgr.accumulated_fees_sats, total_fee_sats,
+                               "lsp-takes-all: fees still accumulated");
+            } else if (configs[ci].client_bps == 0) {
+                /* Shared mode but 0% client share: no balance change */
+                TEST_ASSERT(settled == 0, "shared-0%: no settlement");
+                TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
+                               pre_remote_0, "shared-0%: client unchanged");
+            } else {
+                /* Shared mode with non-zero client share */
+                TEST_ASSERT(settled > 0, "shared: settlement happened");
+                uint64_t expected_share = (total_fee_sats * configs[ci].client_bps)
+                                            / 10000;
+                if (expected_share > 0) {
+                    /* Client 0 gets share */
+                    TEST_ASSERT_EQ(mgr.entries[0].channel.remote_amount,
+                                   pre_remote_0 + expected_share,
+                                   "client 0 got correct share");
+                    TEST_ASSERT_EQ(mgr.entries[0].channel.local_amount,
+                                   pre_local_0 - expected_share,
+                                   "LSP local decreased by share (ch 0)");
+                    /* Client 1 gets same share */
+                    TEST_ASSERT_EQ(mgr.entries[1].channel.remote_amount,
+                                   pre_remote_1 + expected_share,
+                                   "client 1 got correct share");
+                }
+                TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0,
+                               "fees reset after settlement");
+
+                /* Conservation: total sats in system unchanged */
+                uint64_t post_total = 0;
+                for (size_t ch = 0; ch < 2; ch++)
+                    post_total += mgr.entries[ch].channel.local_amount
+                                + mgr.entries[ch].channel.remote_amount;
+                uint64_t pre_total = (pre_local_0 + pre_remote_0)
+                                   + (pre_local_1 + pre_remote_1);
+                TEST_ASSERT_EQ(post_total, pre_total,
+                               "conservation: total sats unchanged after settlement");
+            }
+
+            free(mgr.entries);
+            free(f);
+        }
     }
     return 1;
 }
