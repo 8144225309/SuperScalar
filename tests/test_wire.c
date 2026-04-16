@@ -379,8 +379,10 @@ int test_wire_distributed_signing(void) {
     /* Now do it via distributed split-round signing:
        Use pubkey-only factory for each "party", share nonces via memory. */
 
-    /* All parties build identical factories from pubkeys */
-    factory_t factories[5];
+    /* All parties build identical factories from pubkeys.
+       Heap-allocate: 5 factory_t is ~1.8 MB, too large for the stack. */
+    factory_t *factories = calloc(5, sizeof(factory_t));
+    if (!factories) { factory_free(f_ref); free(f_ref); return 0; }
     for (int p = 0; p < 5; p++) {
         factory_init_from_pubkeys(&factories[p], ctx, pks, 5, 10, 4);
         factory_set_funding(&factories[p], fake_txid, 0, 10000000, fund_spk, 34);
@@ -405,7 +407,8 @@ int test_wire_distributed_signing(void) {
         secp256k1_musig_pubnonce pubnonce;
     } nonce_record_t;
 
-    nonce_record_t all_nonces[5 * FACTORY_MAX_NODES];
+    nonce_record_t *all_nonces = calloc(5 * FACTORY_MAX_NODES, sizeof(nonce_record_t));
+    if (!all_nonces) { free(factories); factory_free(f_ref); free(f_ref); return 0; }
     size_t nonce_total = 0;
 
     for (int p = 0; p < 5; p++) {
@@ -488,6 +491,8 @@ int test_wire_distributed_signing(void) {
 
     for (int p = 0; p < 5; p++)
         factory_free(&factories[p]);
+    free(factories);
+    free(all_nonces);
     factory_free(f_ref);
     free(f_ref);
     secp256k1_context_destroy(ctx);
