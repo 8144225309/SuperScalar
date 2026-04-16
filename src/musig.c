@@ -28,7 +28,7 @@ int musig_aggregate_keys(
         ptrs[i] = &pubkeys[i];
 
     int ret = secp256k1_musig_pubkey_agg(
-        ctx, &out->agg_pubkey, &out->cache, ptrs, n_pubkeys
+        ctx, NULL, &out->agg_pubkey, &out->cache, ptrs, n_pubkeys
     );
 
     free(ptrs);
