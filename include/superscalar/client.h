@@ -52,19 +52,40 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                          const unsigned char *local_htlc_sec32,
                          fee_estimator_t *fee_est);
 
+/* Set the minimum acceptable profit share in basis points.  If > 0 and
+   the LSP's FACTORY_PROPOSE offers less, the client refuses to sign.
+   0 = accept any terms (default). */
+void client_set_min_profit_bps(uint16_t bps);
+
+/* Optional callback to verify the funding TX on-chain before signing the
+   factory tree.  If provided to client_run_with_channels, called after
+   FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the
+   funding TX at txid:vout has at least expected_sats, 0 to abort.
+   ctx is the opaque pointer passed alongside the callback. */
+typedef int (*client_verify_funding_fn)(const unsigned char *txid32,
+                                         uint32_t vout,
+                                         uint64_t expected_sats,
+                                         void *ctx);
+
 /* Run the full ceremony with optional channel operations.
    If channel_cb is NULL, behaves identically to client_run_ceremony
    (creates factory then immediately closes).
-   If channel_cb is non-NULL, calls it after CHANNEL_READY and before close. */
+   If channel_cb is non-NULL, calls it after CHANNEL_READY and before close.
+   If verify_funding is non-NULL, called to verify the on-chain funding TX
+   before signing the factory tree.  Pass verify_ctx for the callback. */
 int client_run_with_channels(secp256k1_context *ctx,
                               const secp256k1_keypair *keypair,
                               const char *host, int port,
                               client_channel_cb_t channel_cb,
-                              void *user_data);
+                              void *user_data,
+                              client_verify_funding_fn verify_funding,
+                              void *verify_ctx);
 
 /* Perform the cooperative close ceremony on an already-received CLOSE_PROPOSE.
    If initial_msg is non-NULL, it is the already-received CLOSE_PROPOSE message;
    otherwise we recv it from the wire.
+   If ch is non-NULL, the client verifies its close output >= ch->local_amount
+   before signing.  Pass NULL to skip balance verification (legacy callers).
    Returns 1 on success. */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -72,7 +93,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                factory_t *factory,
                                size_t n_participants,
                                const wire_msg_t *initial_msg,
-                               uint32_t current_height);
+                               uint32_t current_height,
+                               const channel_t *ch);
 
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives
