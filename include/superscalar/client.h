@@ -52,6 +52,11 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                          const unsigned char *local_htlc_sec32,
                          fee_estimator_t *fee_est);
 
+/* Set the minimum acceptable profit share in basis points.  If > 0 and
+   the LSP's FACTORY_PROPOSE offers less, the client refuses to sign.
+   0 = accept any terms (default). */
+void client_set_min_profit_bps(uint16_t bps);
+
 /* Optional callback to verify the funding TX on-chain before signing the
    factory tree.  If provided to client_run_with_channels, called after
    FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the

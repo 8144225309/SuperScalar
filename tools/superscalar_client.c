@@ -1932,6 +1932,7 @@ static void usage(const char *prog) {
         "                                    scanning. bitcoind not required when set.\n"
         "  --light-client-fallback HOST:PORT Add a fallback peer (up to 7 total).\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
+        "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
@@ -2136,6 +2137,8 @@ int main(int argc, char *argv[]) {
 
         } else if (strcmp(argv[i], "--auto-accept-jit") == 0) {
             auto_accept_jit = 1;
+        } else if (strcmp(argv[i], "--min-profit-bps") == 0 && i + 1 < argc) {
+            client_set_min_profit_bps((uint16_t)atoi(argv[++i]));
         } else if (strcmp(argv[i], "--test-lsps2") == 0) {
             test_lsps2 = 1;
         } else if (strcmp(argv[i], "--test-lsps2-buy") == 0) {
