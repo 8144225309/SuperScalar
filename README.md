@@ -6,7 +6,7 @@
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-> v0.1.11 — 30/30 signet exhibition tests passed (S1–S30). LSPS2 server crash fix, chain gossip hash correction, admin RPC block height, BOLT 12 invoice flow, accumulated fee persistence (schema v17), standalone watchtower penalty signing (PR #61). 1362 unit tests, 42 regtest integration tests.
+> v0.1.12 — 30/30 signet exhibition tests passed (S1–S30). Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, rotation conservation fix. 1363 unit tests, 42 regtest integration tests.
 
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
@@ -28,7 +28,7 @@ A Bitcoin channel factory protocol combining:
 | **Signing** | Distributed MuSig2 signing for factory creation (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 1362 unit + 42 regtest integration + 30 signet exhibition tests (S1–S30), CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 1363 unit + 42 regtest integration + 30 signet exhibition tests (S1–S30), CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
 
 ## Quick Start
 
@@ -75,7 +75,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-1362 automated tests (unit + regtest integration) plus 30 signet exhibition tests (S1–S30). CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+1363 automated tests (unit + regtest integration) plus 30 signet exhibition tests (S1–S30). CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 

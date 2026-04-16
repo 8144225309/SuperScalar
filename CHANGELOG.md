@@ -2,6 +2,28 @@
 
 All notable changes to SuperScalar are documented here.
 
+## 0.1.12 — 2026-04-16
+
+Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, test infrastructure fix, and rotation conservation fix. 30/30 signet exhibition tests passed. 1363 unit tests.
+
+### Standalone watchtower penalty signing (PR #61)
+
+- **Revocation secret persistence** (`channel.c`, `channel.h`): new `channel_set_persist()` attaches a `persist_t*` to a `channel_t`. `channel_receive_revocation_flat()` now writes each received revocation secret to the `revocation_secrets` table via the existing (but previously uncalled) `persist_save_revocation()`. Without this, revocation secrets lived only in heap memory and died with the process.
+- **Channel hydration for watchtower** (`persist.c`, `persist.h`): new `persist_load_channel_for_watchtower()` reads `channels`, `channel_basepoints`, and `revocation_secrets` tables and populates a `channel_t` with enough state for `channel_build_penalty_tx()` to sign a penalty. No MuSig2 state needed — penalty uses plain Schnorr.
+- **Standalone binary wiring** (`superscalar_watchtower.c`): on startup, enumerates channel IDs via new `persist_list_channel_ids()`, hydrates each, and registers with `watchtower_set_channel()`. Previously `wt->channels[N]` was always NULL and every detected breach fell through to "no channel N for penalty".
+- **S26 signet exhibition test PASSED**: standalone watchtower detected revoked commitment `b764cb06...` and broadcast penalty TX on-chain at block 300310.
+- **Unit test** (`test_persist.c`): `test_persist_watchtower_hydrate_round_trip` validates the full save → hydrate → penalty construction path.
+
+### secp256k1-zkp pin update
+
+- **Pin sync** (`CMakeLists.txt`): updated from `64316eac` to `6152622613fd` to match CLN/wally's secp256k1-zkp submodule. Eliminates `--allow-multiple-definition` linker workaround for CLN plugin builds.
+- **API update** (`musig.c`): `secp256k1_musig_pubkey_agg` gained a `scratch` parameter (pass NULL). `secp256k1_musig_nonce_gen_counter` removed upstream — we never called it.
+
+### Bug fixes
+
+- **Rotation conservation violation** (`lsp_rotation.c`): after factory rotation, `ch->funding_amount` was not updated to match carried balances. HTLC settlement fees consumed during the previous factory reduced `local + remote` below `funding_amount`, causing false conservation violations every 60s (-152 sats/channel in typical 4-HTLC demo). Fixed by setting `funding_amount = local + remote` after balance carry.
+- **Test stack overflow** (`test_wire.c`): `test_wire_distributed_signing` allocated ~2.1 MB on the stack (`factory_t[5]` + `nonce_record_t[1280]`), causing a segfault that killed the test runner before ~500 remaining tests could execute. Moved to heap. Full suite now runs: 1363/1363 pass.
+
 ## 0.1.11 — 2026-04-13
 
 Bug fixes and improvements surfaced during the signet exhibition suite: LSPS2 server crash fix, chain gossip hash correction, admin RPC block height, BOLT 12 invoice completion, fee persistence across crashes, and watchtower/revocation logging gaps.
