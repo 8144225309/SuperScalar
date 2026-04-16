@@ -939,15 +939,34 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
 /* --- CLTV validation --- */
 
+uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr) {
+    const factory_t *f = (const factory_t *)factory_ptr;
+    if (!f || f->counter.n_layers == 0)
+        return FACTORY_CLTV_DELTA_DEFAULT;
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        uint16_t step = f->counter.layers[i].config.step_blocks;
+        uint32_t states = f->counter.layers[i].config.max_states;
+        if (states > 1)
+            total += (uint32_t)step * (states - 1);
+        total += 6;  /* confirmation buffer per layer */
+    }
+    total += 36;  /* flat safety margin ~6 hours */
+    return total > 0 ? total : FACTORY_CLTV_DELTA_DEFAULT;
+}
+
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
-                                   uint32_t factory_cltv_timeout) {
-    if (cltv_expiry <= FACTORY_CLTV_DELTA)
+                                   uint32_t factory_cltv_timeout,
+                                   uint32_t cltv_delta) {
+    if (cltv_delta == 0) cltv_delta = FACTORY_CLTV_DELTA_DEFAULT;
+    if (cltv_expiry <= cltv_delta)
         return 0;
     /* Reject HTLCs that expire at or past factory timeout — funds would be trapped */
     if (factory_cltv_timeout > 0 && cltv_expiry >= factory_cltv_timeout)
         return 0;
     if (fwd_cltv_out)
-        *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA;
+        *fwd_cltv_out = cltv_expiry - cltv_delta;
     return 1;
 }
 
@@ -1216,12 +1235,16 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* CLTV delta enforcement: subtract safety margin for factory close.
-       Also reject HTLCs that expire at or past the factory timeout. */
+       Also reject HTLCs that expire at or past the factory timeout.
+       The delta is computed from the DW tree depth — enough time to
+       unwind the full tree and claim HTLC outputs on-chain. */
+    uint32_t factory_delta = lsp_compute_factory_cltv_delta(&lsp->factory);
     uint32_t fwd_cltv_expiry;
     if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
-                                        lsp->factory.cltv_timeout)) {
-        fprintf(stderr, "LSP: cltv_expiry %u rejected (delta %d, factory timeout %u)\n",
-                cltv_expiry, FACTORY_CLTV_DELTA, lsp->factory.cltv_timeout);
+                                        lsp->factory.cltv_timeout,
+                                        factory_delta)) {
+        fprintf(stderr, "LSP: cltv_expiry %u rejected (delta %u, factory timeout %u)\n",
+                cltv_expiry, factory_delta, lsp->factory.cltv_timeout);
         free(old_dest_htlcs);
         return 0;
     }

@@ -11,16 +11,29 @@
 
 /* Safety margin for HTLC forwarding: outgoing cltv_expiry is reduced by this
    delta so the LSP has time to claim on-chain if the factory needs a unilateral
-   close before the upstream HTLC expires. 40 blocks ~ 6.7 hours. */
-#define FACTORY_CLTV_DELTA 40
+   close before the upstream HTLC expires.
+   Default 40 is ONLY used as a fallback when the factory counter isn't available.
+   The correct value is computed from the DW tree depth by
+   lsp_compute_factory_cltv_delta(). */
+#define FACTORY_CLTV_DELTA_DEFAULT 40
+
+/* Compute the minimum CLTV delta needed for safe HTLC forwarding through
+   a factory.  This is the worst-case DW tree unwind time: each layer must
+   be broadcast and wait for step_blocks confirmations.
+   Formula: sum(layers: step_blocks * (max_states - 1))
+            + n_layers * 6 (confirmation buffer per layer)
+            + 36 (flat safety margin ~6 hours) */
+uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr);
 
 /* Validate and adjust cltv_expiry for HTLC forwarding through a factory channel.
    Returns 1 if cltv_expiry has enough room for the delta, 0 if too low.
    Rejects HTLCs whose cltv_expiry >= factory_cltv_timeout (funds would be
    trapped past factory expiry). Pass 0 for factory_cltv_timeout to skip check.
-   On success, *fwd_cltv_out = cltv_expiry - FACTORY_CLTV_DELTA. */
+   cltv_delta is the minimum safety margin computed by lsp_compute_factory_cltv_delta.
+   On success, *fwd_cltv_out = cltv_expiry - cltv_delta. */
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
-                                   uint32_t factory_cltv_timeout);
+                                   uint32_t factory_cltv_timeout,
+                                   uint32_t cltv_delta);
 
 /* Per-client channel entry managed by the LSP */
 typedef struct {
