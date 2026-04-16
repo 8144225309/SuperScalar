@@ -307,7 +307,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                factory_t *factory,
                                size_t n_participants,
                                const wire_msg_t *initial_msg,
-                               uint32_t current_height) {
+                               uint32_t current_height,
+                               const channel_t *ch) {
     wire_msg_t msg;
     int got_propose = 0;
 
@@ -377,6 +378,28 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             item, "spk", close_outputs[i].script_pubkey, 34);
     }
     if (!initial_msg) cJSON_Delete(msg.json);
+
+    /* Verify cooperative close outputs before signing.
+       The client must receive at least its channel balance.  If the LSP
+       short-changes the close outputs, the client refuses to sign and
+       can force-close instead (using the pre-signed commitment TX). */
+    if (ch && ch->local_amount > 0) {
+        uint64_t my_balance = ch->local_amount;
+        int found = 0;
+        for (size_t i = 0; i < n_outputs; i++) {
+            if (close_outputs[i].amount_sats >= my_balance) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "Client: REFUSING cooperative close — no output "
+                    ">= channel balance %llu sats (force-close instead)\n",
+                    (unsigned long long)my_balance);
+            free(close_outputs);
+            return 0;
+        }
+    }
 
     tx_buf_t close_unsigned;
     tx_buf_init(&close_unsigned, 256);
@@ -1865,7 +1888,8 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                    factory, n_participants, NULL, 0)) {
+                                    factory, n_participants, NULL, 0,
+                                    NULL)) {
         goto fail;
     }
 
@@ -2249,7 +2273,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         /* Run close ceremony */
         int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                                   factory, n_participants,
-                                                  NULL, 0);
+                                                  NULL, 0, &channel);
         factory_free(factory); free(factory);
         wire_close(fd);
         return close_ok;

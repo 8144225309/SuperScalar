@@ -1100,7 +1100,7 @@ handle_message:
         case MSG_CLOSE_PROPOSE:
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
             client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg, 0);
+                                      factory, n_participants, &msg, 0, ch);
             cJSON_Delete(msg.json);
             return 2;  /* close already handled */
 

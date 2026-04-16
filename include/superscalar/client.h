@@ -84,6 +84,8 @@ int client_run_with_channels(secp256k1_context *ctx,
 /* Perform the cooperative close ceremony on an already-received CLOSE_PROPOSE.
    If initial_msg is non-NULL, it is the already-received CLOSE_PROPOSE message;
    otherwise we recv it from the wire.
+   If ch is non-NULL, the client verifies its close output >= ch->local_amount
+   before signing.  Pass NULL to skip balance verification (legacy callers).
    Returns 1 on success. */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -91,7 +93,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                factory_t *factory,
                                size_t n_participants,
                                const wire_msg_t *initial_msg,
-                               uint32_t current_height);
+                               uint32_t current_height,
+                               const channel_t *ch);
 
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives
