@@ -1149,6 +1149,31 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     cJSON_Delete(msg.json);
 
+    /* Verify our pubkey is at the assigned participant index.  If the LSP
+       put a different key at our index, we'd sign a tree where our slot
+       is controlled by someone else. */
+    if (my_index >= n_participants) {
+        fprintf(stderr, "Client: participant_index %u out of range (%zu)\n",
+                my_index, n_participants);
+        wire_close(fd);
+        return 0;
+    }
+    {
+        unsigned char my_ser[33], their_ser[33];
+        size_t my_len = 33, their_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, my_ser, &my_len, &my_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+        secp256k1_ec_pubkey_serialize(ctx, their_ser, &their_len,
+                                       &all_pubkeys[my_index],
+                                       SECP256K1_EC_COMPRESSED);
+        if (memcmp(my_ser, their_ser, 33) != 0) {
+            fprintf(stderr, "Client: REFUSING — pubkey at index %u does not "
+                    "match our key (identity mismatch)\n", my_index);
+            wire_close(fd);
+            return 0;
+        }
+    }
+
     /* Receive FACTORY_PROPOSE — disable timeout since LSP may be waiting for
        on-chain funding confirmation (up to ~10 min on signet/testnet) */
     if (!wire_recv_handle_ping(fd, &msg, 0) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {

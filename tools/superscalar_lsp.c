@@ -318,7 +318,7 @@ static void usage(const char *prog) {
         "  --max-handshakes N  Max concurrent handshakes (default: 4)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
-        "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 50 = fair split)\n"
+        "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 100; --demo overrides to 50)\n"
         "  --placement-mode M  Client placement: sequential, inward, outward, timezone-cluster (default: timezone-cluster)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
@@ -1047,7 +1047,8 @@ int main(int argc, char *argv[]) {
     int max_conn_rate_arg = 10;      /* max connections per IP per minute */
     int max_handshakes_arg = 4;      /* max concurrent handshakes */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
-    uint16_t lsp_balance_pct = 50;   /* 50 = fair 50-50 split */
+    uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
+    int lsp_balance_pct_explicit = 0; /* 1 if user passed --lsp-balance-pct */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
@@ -1321,6 +1322,7 @@ int main(int argc, char *argv[]) {
             routing_fee_ppm = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--lsp-balance-pct") == 0 && i + 1 < argc) {
             lsp_balance_pct = (uint16_t)atoi(argv[++i]);
+            lsp_balance_pct_explicit = 1;
             if (lsp_balance_pct > 100) {
                 fprintf(stderr, "Error: --lsp-balance-pct must be 0-100\n");
                 return 1;
@@ -1645,6 +1647,14 @@ int main(int argc, char *argv[]) {
     }
 
     /* --- BIP39 Test placeholder (moved after key init) --- */
+
+    /* Demo mode: override lsp_balance_pct to 50 if the user didn't set it
+       explicitly.  Demo payments send FROM clients which requires them to
+       have a balance.  Production default is 100 (LSP retains all capacity;
+       clients earn sats by receiving payments or buying liquidity). */
+    if (demo_mode && !lsp_balance_pct_explicit) {
+        lsp_balance_pct = 50;
+    }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
     if (strcmp(network, "mainnet") == 0 && !accept_risk) {
