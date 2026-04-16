@@ -1510,6 +1510,9 @@ extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
 extern int test_close_outputs_wallet_spk(void);
 extern int test_fee_accumulation_and_settlement(void);
+extern int test_fee_levels_and_profit_split(void);
+extern int test_client_rejects_bad_profit_terms(void);
+extern int test_cltv_delta_from_tree_depth(void);
 
 /* Property-Based Tests (Roadmap Item #5) */
 extern int test_prop_hex_roundtrip(void);
@@ -3221,6 +3224,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_on_close_includes_unsettled);
     RUN_TEST(test_close_outputs_wallet_spk);
     RUN_TEST(test_fee_accumulation_and_settlement);
+    RUN_TEST(test_fee_levels_and_profit_split);
+    RUN_TEST(test_client_rejects_bad_profit_terms);
+    RUN_TEST(test_cltv_delta_from_tree_depth);
 
     printf("\n=== Property-Based Tests ===\n");
     RUN_TEST(test_prop_hex_roundtrip);
