@@ -729,6 +729,23 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         nonce_count++;
     }
 
+    /* Verify distribution amounts: if the LSP provided per-client dist_amounts,
+       check that this client's allocation is at least its old channel balance.
+       Prevents the LSP from silently reducing the client's distribution output
+       during rotation (balance theft). */
+    if (rot_n_dist_amounts > 0 && my_index >= 1) {
+        size_t ci = my_index - 1;  /* client index in dist_amounts array */
+        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
+        uint64_t expected = channel_out->local_amount;  /* client's balance */
+        if (offered < expected) {
+            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
+                    "%llu < channel balance %llu (balance theft attempt)\n",
+                    my_index, (unsigned long long)offered,
+                    (unsigned long long)expected);
+            return 0;
+        }
+    }
+
     /* Distribution TX: build unsigned TX and generate nonce (same as initial) */
     int rot_has_dist = 0;
     uint32_t rot_dist_node_idx = (uint32_t)factory_out->n_nodes;
@@ -1533,6 +1550,19 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     client_apply_factory_ready(factory, msg.json);
     cJSON_Delete(msg.json);
+
+    /* Log expected distribution amount.  The distribution TX is a fallback
+       (used only if the factory expires without cooperative rotation), so
+       this is informational.  The hard enforcement is in
+       client_do_factory_rotation where the client REFUSES to sign if
+       dist_amounts[my_index-1] < channel balance. */
+    if (factory->dist_tx_ready && n_participants > 1 && my_index >= 1) {
+        uint64_t expected_dist_sats = funding_amount / n_participants;
+        printf("Client %u: distribution TX received — expected share "
+               "~%llu sats (equal split of %llu / %zu participants)\n",
+               my_index, (unsigned long long)expected_dist_sats,
+               (unsigned long long)funding_amount, n_participants);
+    }
 
     printf("Client %u: factory creation complete!\n", my_index);
 
