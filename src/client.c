@@ -20,6 +20,14 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 static secp256k1_pubkey g_nk_server_pubkey;
 static int g_nk_server_pubkey_set = 0;
 
+/* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
+   If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
+static uint16_t g_min_profit_bps = 0;
+
+void client_set_min_profit_bps(uint16_t bps) {
+    g_min_profit_bps = bps;
+}
+
 void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     if (pubkey) {
         g_nk_server_pubkey = *pubkey;
@@ -1341,14 +1349,24 @@ int client_run_with_channels(secp256k1_context *ctx,
                                ? econ_names[economic_mode] : "unknown";
         printf("Client %u: factory terms — economic_mode=%s",
                my_index, econ_str);
-        if (economic_mode == 1 && my_index >= 1) {
-            uint32_t pidx = my_index;
-            uint16_t bps = (pidx < FACTORY_MAX_SIGNERS)
-                           ? profiles[pidx].profit_share_bps : 0;
-            printf(", my profit_share=%u bps (%.2f%%)", bps, bps / 100.0);
-        }
+        uint16_t my_bps = 0;
+        if (my_index >= 1 && my_index < FACTORY_MAX_SIGNERS)
+            my_bps = profiles[my_index].profit_share_bps;
+        if (economic_mode == 1)
+            printf(", my profit_share=%u bps (%.2f%%)", my_bps, my_bps / 100.0);
         printf(", funding=%llu sats, %zu participants\n",
                (unsigned long long)funding_amount, n_participants);
+
+        /* Enforce minimum profit share if the client set --min-profit-bps */
+        if (g_min_profit_bps > 0 && my_bps < g_min_profit_bps) {
+            fprintf(stderr, "Client %u: REFUSING — profit_share %u bps < "
+                    "minimum %u bps (use --min-profit-bps to adjust)\n",
+                    my_index, my_bps, g_min_profit_bps);
+            free(factory);
+            client_send_error(fd, "profit_share_too_low");
+            wire_close(fd);
+            return 0;
+        }
     }
 
     if (n_level_arity > 0)
