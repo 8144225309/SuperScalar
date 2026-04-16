@@ -154,6 +154,12 @@ static cJSON *rpc_call(const chain_backend_rpc_ctx_t *rpc,
     /* Check for RPC error */
     cJSON *err = cJSON_GetObjectItem(jresp, "error");
     if (err && !cJSON_IsNull(err)) {
+        cJSON *ecode = cJSON_GetObjectItem(err, "code");
+        cJSON *emsg  = cJSON_GetObjectItem(err, "message");
+        fprintf(stderr, "HTTP RPC %s error: {\"code\":%d,\"message\":\"%s\"}\n",
+                method,
+                ecode ? ecode->valueint : 0,
+                emsg && cJSON_IsString(emsg) ? emsg->valuestring : "unknown");
         cJSON_Delete(jresp);
         return NULL;
     }
