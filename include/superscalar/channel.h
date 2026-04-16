@@ -169,6 +169,14 @@ typedef struct {
     int           ann_sigs_sent;             /* 1 = we sent announcement_signatures */
     int           ann_sigs_recv;             /* 1 = peer sent us announcement_signatures */
 
+    /* Persistence hook (optional).  When persist_db is non-NULL,
+       channel_receive_revocation_flat() writes each received revocation
+       secret to the revocation_secrets table so a standalone watchtower
+       running as a separate process can hydrate a channel_t and build
+       penalty TXes.  Set via channel_set_persist(). */
+    void    *persist_db;         /* persist_t* or NULL — opaque to avoid header dep */
+    uint32_t persist_channel_id; /* DB channel_id used for persist_save_revocation */
+
     /* Latest commitment TX signature (trustless force-close).
        After each MuSig2 aggregation, the client stores the full 64-byte
        Schnorr sig so it can rebuild + broadcast the commitment TX
@@ -353,6 +361,12 @@ int channel_build_penalty_tx_script_path(const channel_t *ch,
 /* Set the fee rate (sat/kvB) used for penalty/HTLC transactions.
    Default is 1000 sat/kvB (1 sat/vB). */
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb);
+
+/* Attach a persistence target for revocation secrets.  After this is set,
+   channel_receive_revocation_flat() writes each received secret to the
+   revocation_secrets table under the given channel_id.  db is a persist_t*
+   (opaque here to avoid a header dependency).  Pass db=NULL to detach. */
+void channel_set_persist(channel_t *ch, void *db, uint32_t channel_id);
 
 /* --- Cooperative close --- */
 

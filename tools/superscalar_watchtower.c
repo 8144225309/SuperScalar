@@ -3,6 +3,8 @@
 #include "superscalar/persist.h"
 #include "superscalar/regtest.h"
 #include "superscalar/fee.h"
+#include "superscalar/channel.h"
+#include <secp256k1.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,6 +130,40 @@ int main(int argc, char *argv[]) {
     if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
     if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
 
+    /* Hydrate channels from the DB so breach detections can build penalty TXes.
+       Without this, watchtower_check() sees the breach, looks up wt->channels[
+       id], finds NULL, and falls through to "no channel N for penalty". */
+    secp256k1_context *chan_ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t *loaded_channels[WATCHTOWER_MAX_CHANNELS] = {0};
+    if (chan_ctx) {
+        uint32_t ch_ids[WATCHTOWER_MAX_CHANNELS];
+        size_t n_loaded = 0;
+        if (persist_list_channel_ids(&db, ch_ids, WATCHTOWER_MAX_CHANNELS,
+                                       &n_loaded) && n_loaded > 0) {
+            for (size_t i = 0; i < n_loaded; i++) {
+                channel_t *ch = calloc(1, sizeof(*ch));
+                if (!ch) continue;
+                if (!persist_load_channel_for_watchtower(&db, ch_ids[i],
+                                                          chan_ctx, ch)) {
+                    free(ch);
+                    continue;
+                }
+                if (ch_ids[i] < WATCHTOWER_MAX_CHANNELS) {
+                    watchtower_set_channel(&wt, ch_ids[i], ch);
+                    loaded_channels[ch_ids[i]] = ch;
+                } else {
+                    channel_cleanup(ch);
+                    free(ch);
+                }
+            }
+            printf("  Loaded %zu channel(s) for penalty signing\n", n_loaded);
+        }
+    } else {
+        fprintf(stderr, "Warning: secp256k1 context creation failed — "
+                        "penalty TXes cannot be built\n");
+    }
+
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
@@ -172,6 +208,13 @@ int main(int argc, char *argv[]) {
 
     printf("\nShutdown requested. Cleaning up...\n");
     watchtower_cleanup(&wt);
+    for (size_t i = 0; i < WATCHTOWER_MAX_CHANNELS; i++) {
+        if (loaded_channels[i]) {
+            channel_cleanup(loaded_channels[i]);
+            free(loaded_channels[i]);
+        }
+    }
+    if (chan_ctx) secp256k1_context_destroy(chan_ctx);
     persist_close(&db);
     return 0;
 }

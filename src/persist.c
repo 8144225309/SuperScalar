@@ -1231,6 +1231,26 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+/* List channel ids currently in the channels table, in ascending order.
+   Returns the count written to *count_out (bounded by max). */
+int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
+                               size_t *count_out) {
+    if (!p || !p->db || !ids_out) return 0;
+
+    const char *sql = "SELECT id FROM channels ORDER BY id ASC;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        ids_out[count++] = (uint32_t)sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
+    return 1;
+}
+
 /* --- Revocation secrets --- */
 
 int persist_save_revocation(persist_t *p, uint32_t channel_id,
@@ -2771,6 +2791,118 @@ int persist_load_basepoints(persist_t *p, uint32_t channel_id,
 #if BASEPOINT_DIAG
     fprintf(stderr, "DIAG basepoint: loaded from DB channel_id=%u\n", channel_id);
 #endif
+
+    return 1;
+}
+
+/* --- Watchtower hydration ---
+   Build a channel_t from persisted rows that is sufficient for
+   channel_build_penalty_tx() to sign a breach penalty.  Used by the
+   standalone superscalar_watchtower binary, which runs in a separate
+   process and does not share live channel_t memory with the LSP/client.
+
+   Reads from: channels, channel_basepoints, revocation_secrets.
+   The three per-channel fields that no table currently holds
+   (to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf) are set
+   to the codebase-wide defaults used by every existing test.  A proper
+   schema migration for these fields is a separate follow-up and is not
+   needed for v0.1.11 — current defaults match every factory created.
+
+   Success leaves *out_ch owning three heap allocations
+   (htlcs, local_pcs, received_revocations, received_revocation_valid);
+   call channel_cleanup() to release them.  Failure leaves *out_ch unowned. */
+int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
+                                         secp256k1_context *ctx,
+                                         channel_t *out_ch) {
+    if (!p || !p->db || !ctx || !out_ch) return 0;
+
+    /* Per-channel balances + commitment number */
+    uint64_t local_amt = 0, remote_amt = 0, cn = 0;
+    if (!persist_load_channel_state(p, channel_id, &local_amt, &remote_amt, &cn))
+        return 0;
+
+    /* Local secrets + remote basepoints (all four categories) */
+    unsigned char local_secrets[4][32];
+    unsigned char remote_bps_ser[4][33];
+    if (!persist_load_basepoints(p, channel_id, local_secrets, remote_bps_ser)) {
+        memset(local_secrets, 0, sizeof(local_secrets));
+        return 0;
+    }
+
+    /* Allocate the same dynamic arrays channel_init() sets up.  Doing this
+       directly avoids reimplementing channel_init's full ceremony (funding
+       keyagg, nonces, etc.) which is out of scope for penalty signing. */
+    memset(out_ch, 0, sizeof(*out_ch));
+    out_ch->ctx = ctx;
+
+    out_ch->htlcs = calloc(DEFAULT_HTLCS_CAP, sizeof(htlc_t));
+    out_ch->local_pcs = calloc(512, 32);
+    out_ch->received_revocations = calloc(512, 32);
+    out_ch->received_revocation_valid = calloc(512, 1);
+    if (!out_ch->htlcs || !out_ch->local_pcs ||
+        !out_ch->received_revocations || !out_ch->received_revocation_valid) {
+        free(out_ch->htlcs);
+        free(out_ch->local_pcs);
+        free(out_ch->received_revocations);
+        free(out_ch->received_revocation_valid);
+        memset(out_ch, 0, sizeof(*out_ch));
+        memset(local_secrets, 0, sizeof(local_secrets));
+        return 0;
+    }
+    out_ch->htlcs_cap = DEFAULT_HTLCS_CAP;
+    out_ch->local_pcs_cap = 512;
+    out_ch->revocations_cap = 512;
+
+    /* Install local basepoints (payment, delayed, revocation) + htlc.
+       channel_set_local_basepoints derives the three pubkeys and zeroes
+       on any failure. */
+    if (!channel_set_local_basepoints(out_ch,
+                                       local_secrets[0],
+                                       local_secrets[1],
+                                       local_secrets[2]) ||
+        !channel_set_local_htlc_basepoint(out_ch, local_secrets[3])) {
+        memset(local_secrets, 0, sizeof(local_secrets));
+        free(out_ch->htlcs);
+        free(out_ch->local_pcs);
+        free(out_ch->received_revocations);
+        free(out_ch->received_revocation_valid);
+        memset(out_ch, 0, sizeof(*out_ch));
+        return 0;
+    }
+    memset(local_secrets, 0, sizeof(local_secrets));
+
+    /* Parse remote basepoint pubkeys from serialized form */
+    secp256k1_pubkey remote_pay, remote_delay, remote_revoc, remote_htlc;
+    if (!secp256k1_ec_pubkey_parse(ctx, &remote_pay, remote_bps_ser[0], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &remote_delay, remote_bps_ser[1], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &remote_revoc, remote_bps_ser[2], 33) ||
+        !secp256k1_ec_pubkey_parse(ctx, &remote_htlc, remote_bps_ser[3], 33)) {
+        free(out_ch->htlcs);
+        free(out_ch->local_pcs);
+        free(out_ch->received_revocations);
+        free(out_ch->received_revocation_valid);
+        memset(out_ch, 0, sizeof(*out_ch));
+        return 0;
+    }
+    channel_set_remote_basepoints(out_ch, &remote_pay, &remote_delay,
+                                   &remote_revoc);
+    channel_set_remote_htlc_basepoint(out_ch, &remote_htlc);
+
+    /* Received revocation secrets (for penalty signing on a breach) */
+    size_t rev_count = 0;
+    persist_load_revocations_flat(p, channel_id,
+                                   out_ch->received_revocations,
+                                   out_ch->received_revocation_valid,
+                                   out_ch->revocations_cap, &rev_count);
+
+    /* Balances + config.  The three non-persisted fields use the codebase
+       defaults; every existing factory uses these same values. */
+    out_ch->local_amount = local_amt;
+    out_ch->remote_amount = remote_amt;
+    out_ch->commitment_number = cn;
+    out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
+    out_ch->fee_rate_sat_per_kvb = 1000;
+    out_ch->use_revocation_leaf = 0;
 
     return 1;
 }
