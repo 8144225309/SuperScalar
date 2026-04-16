@@ -26,6 +26,7 @@ Client-side verification hardening across all factory lifecycle boundaries. Fixe
 
 ### Bug fixes (direct to main)
 
+- **HTLC CLTV safety** (`lsp_channels.c`, `lsp_channels.h`): `FACTORY_CLTV_DELTA` was hardcoded to 40 blocks (~7 hours), but the actual DW tree unwind time can be 300+ blocks (~2 days). New `lsp_compute_factory_cltv_delta()` computes the correct delta from the factory's DW counter parameters. HTLCs with insufficient CLTV headroom are now correctly rejected. Matches CLN plugin fix (superscalar-cln `a29bd85`).
 - **RPC error logging** (`chain_backend_rpc.c`): `rpc_call()` now logs the method name, error code, and error message for every bitcoind RPC failure. Previously errors were silently discarded.
 - **Test stack overflow** (`test_wire.c`): `test_wire_distributed_signing` heap-allocated ~2.1 MB of structs that were overflowing the stack. Full test suite now runs: 1363/1363 pass (was 866 before crash).
 - **Rotation conservation violation** (`lsp_rotation.c`): `ch->funding_amount` updated to match carried balances after rotation. Previously, HTLC settlement fees consumed during the old factory caused a permanent -152 sat/channel delta.
