@@ -2474,7 +2474,7 @@ int test_ps_10c_schema_v10(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "PS_10C: open");
     int ver = persist_schema_version(&db);
-    TEST_ASSERT(ver == 17, "PS_10C: schema version is 17");
+    TEST_ASSERT(ver == PERSIST_SCHEMA_VERSION, "PS_10C: schema version matches");
 
     unsigned char cid[32], ppk[33];
     memset(cid, 0xC1, 32);
