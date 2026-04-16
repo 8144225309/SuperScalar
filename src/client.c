@@ -973,6 +973,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         cJSON_Delete(msg.json);
     }
 
+    /* Save old channel balance before client_init_channel overwrites it.
+       Used below to verify the LSP carried the balance correctly. */
+    uint64_t old_local_balance = channel_out->local_amount;
+
     /* Initialize client-side channel */
     if (!client_init_channel(channel_out, ctx, factory_out, keypair, my_index,
                               &rot_lsp_pay_bp, &rot_lsp_delay_bp,
@@ -987,6 +991,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_bal_local > 0 || rot_bal_remote > 0) {
         channel_out->local_amount  = rot_bal_remote / 1000;
         channel_out->remote_amount = rot_bal_local  / 1000;
+    }
+
+    /* Verify the LSP carried the client's balance into the new factory.
+       The client's local_amount in the new channel must be >= the old
+       channel's local_amount.  A decrease without a corresponding payment
+       means the LSP is stealing sats during rotation. */
+    if (old_local_balance > 0 &&
+        channel_out->local_amount < old_local_balance) {
+        fprintf(stderr, "Client %u: REFUSING rotation — new channel balance "
+                "%llu < old balance %llu (balance not carried)\n",
+                my_index,
+                (unsigned long long)channel_out->local_amount,
+                (unsigned long long)old_local_balance);
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     /* Override local_pcs[0,1] with pre-generated secrets + store LSP PCPs */
