@@ -156,7 +156,7 @@ static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
 
     /* Query the actual output amount via getrawtransaction (verbose=true) */
     char params[256];
-    snprintf(params, sizeof(params), "\"%s\", true", txid_hex);
+    snprintf(params, sizeof(params), "\"%s\" true", txid_hex);
     char *resp = regtest_exec(rt, "getrawtransaction", params);
     if (!resp) {
         fprintf(stderr, "verify_funding: getrawtransaction failed for %s\n",
