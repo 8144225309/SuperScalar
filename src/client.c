@@ -37,6 +37,32 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     }
 }
 
+/* Client-side conservation invariant check (defense-in-depth).
+   The commitment signature already prevents exploitation, but this catches
+   bugs in the balance arithmetic itself. */
+static void client_check_conservation(const channel_t *ch, const char *context) {
+    if (!ch || ch->funding_amount == 0) return;
+    uint64_t sum = ch->local_amount + ch->remote_amount;
+    for (size_t h = 0; h < ch->n_htlcs; h++) {
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
+            sum += ch->htlcs[h].amount_sats;
+            sum += ch->htlcs[h].fee_at_add;
+        }
+    }
+    if (sum != ch->funding_amount) {
+        fprintf(stderr, "CLIENT CONSERVATION VIOLATION (%s): "
+                "local=%llu remote=%llu htlc_sum=%llu total=%llu "
+                "funding=%llu (delta=%lld)\n",
+                context,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
+                (unsigned long long)sum,
+                (unsigned long long)ch->funding_amount,
+                (long long)(sum - ch->funding_amount));
+    }
+}
+
 /* Returns 1 if message is MSG_ERROR (and prints it), 0 otherwise */
 static int check_msg_error(const wire_msg_t *msg) {
     if (msg->msg_type == MSG_ERROR) {
@@ -282,6 +308,7 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
        send FULFILL_HTLC back, we reference the LSP's ID for this HTLC. */
     ch->htlcs[ch->n_htlcs - 1].id = htlc_id;
 
+    client_check_conservation(ch, "after add_htlc");
     return 1;
 }
 
@@ -291,6 +318,8 @@ int client_fulfill_payment(int fd, channel_t *ch,
     /* Fulfill locally */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage32))
         return 0;
+
+    client_check_conservation(ch, "after fulfill_htlc");
 
     /* Send FULFILL_HTLC to LSP */
     cJSON *msg = wire_build_update_fulfill_htlc(htlc_id, preimage32);
