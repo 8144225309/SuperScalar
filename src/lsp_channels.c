@@ -221,6 +221,9 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;  /* LSP is funder and local */
+        /* Attach persistence so revocation secrets land in revocation_secrets
+           and a standalone watchtower can hydrate this channel. */
+        channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
 
@@ -366,6 +369,8 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;
+        /* Attach persistence (see lsp_channels_init for rationale). */
+        channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
 
