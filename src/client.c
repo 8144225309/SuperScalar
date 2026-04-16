@@ -20,12 +20,46 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 static secp256k1_pubkey g_nk_server_pubkey;
 static int g_nk_server_pubkey_set = 0;
 
+/* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
+   If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
+static uint16_t g_min_profit_bps = 0;
+
+void client_set_min_profit_bps(uint16_t bps) {
+    g_min_profit_bps = bps;
+}
+
 void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     if (pubkey) {
         g_nk_server_pubkey = *pubkey;
         g_nk_server_pubkey_set = 1;
     } else {
         g_nk_server_pubkey_set = 0;
+    }
+}
+
+/* Client-side conservation invariant check (defense-in-depth).
+   The commitment signature already prevents exploitation, but this catches
+   bugs in the balance arithmetic itself. */
+static void client_check_conservation(const channel_t *ch, const char *context) {
+    if (!ch || ch->funding_amount == 0) return;
+    uint64_t sum = ch->local_amount + ch->remote_amount;
+    for (size_t h = 0; h < ch->n_htlcs; h++) {
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
+            sum += ch->htlcs[h].amount_sats;
+            sum += ch->htlcs[h].fee_at_add;
+        }
+    }
+    if (sum != ch->funding_amount) {
+        fprintf(stderr, "CLIENT CONSERVATION VIOLATION (%s): "
+                "local=%llu remote=%llu htlc_sum=%llu total=%llu "
+                "funding=%llu (delta=%lld)\n",
+                context,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
+                (unsigned long long)sum,
+                (unsigned long long)ch->funding_amount,
+                (long long)(sum - ch->funding_amount));
     }
 }
 
@@ -274,6 +308,7 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
        send FULFILL_HTLC back, we reference the LSP's ID for this HTLC. */
     ch->htlcs[ch->n_htlcs - 1].id = htlc_id;
 
+    client_check_conservation(ch, "after add_htlc");
     return 1;
 }
 
@@ -283,6 +318,8 @@ int client_fulfill_payment(int fd, channel_t *ch,
     /* Fulfill locally */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage32))
         return 0;
+
+    client_check_conservation(ch, "after fulfill_htlc");
 
     /* Send FULFILL_HTLC to LSP */
     cJSON *msg = wire_build_update_fulfill_htlc(htlc_id, preimage32);
@@ -299,7 +336,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                factory_t *factory,
                                size_t n_participants,
                                const wire_msg_t *initial_msg,
-                               uint32_t current_height) {
+                               uint32_t current_height,
+                               const channel_t *ch) {
     wire_msg_t msg;
     int got_propose = 0;
 
@@ -369,6 +407,28 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             item, "spk", close_outputs[i].script_pubkey, 34);
     }
     if (!initial_msg) cJSON_Delete(msg.json);
+
+    /* Verify cooperative close outputs before signing.
+       The client must receive at least its channel balance.  If the LSP
+       short-changes the close outputs, the client refuses to sign and
+       can force-close instead (using the pre-signed commitment TX). */
+    if (ch && ch->local_amount > 0) {
+        uint64_t my_balance = ch->local_amount;
+        int found = 0;
+        for (size_t i = 0; i < n_outputs; i++) {
+            if (close_outputs[i].amount_sats >= my_balance) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "Client: REFUSING cooperative close — no output "
+                    ">= channel balance %llu sats (force-close instead)\n",
+                    (unsigned long long)my_balance);
+            free(close_outputs);
+            return 0;
+        }
+    }
 
     tx_buf_t close_unsigned;
     tx_buf_init(&close_unsigned, 256);
@@ -729,6 +789,23 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         nonce_count++;
     }
 
+    /* Verify distribution amounts: if the LSP provided per-client dist_amounts,
+       check that this client's allocation is at least its old channel balance.
+       Prevents the LSP from silently reducing the client's distribution output
+       during rotation (balance theft). */
+    if (rot_n_dist_amounts > 0 && my_index >= 1) {
+        size_t ci = my_index - 1;  /* client index in dist_amounts array */
+        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
+        uint64_t expected = channel_out->local_amount;  /* client's balance */
+        if (offered < expected) {
+            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
+                    "%llu < channel balance %llu (balance theft attempt)\n",
+                    my_index, (unsigned long long)offered,
+                    (unsigned long long)expected);
+            return 0;
+        }
+    }
+
     /* Distribution TX: build unsigned TX and generate nonce (same as initial) */
     int rot_has_dist = 0;
     uint32_t rot_dist_node_idx = (uint32_t)factory_out->n_nodes;
@@ -956,6 +1033,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         cJSON_Delete(msg.json);
     }
 
+    /* Save old channel balance before client_init_channel overwrites it.
+       Used below to verify the LSP carried the balance correctly. */
+    uint64_t old_local_balance = channel_out->local_amount;
+
     /* Initialize client-side channel */
     if (!client_init_channel(channel_out, ctx, factory_out, keypair, my_index,
                               &rot_lsp_pay_bp, &rot_lsp_delay_bp,
@@ -970,6 +1051,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_bal_local > 0 || rot_bal_remote > 0) {
         channel_out->local_amount  = rot_bal_remote / 1000;
         channel_out->remote_amount = rot_bal_local  / 1000;
+    }
+
+    /* Verify the LSP carried the client's balance into the new factory.
+       The client's local_amount in the new channel must be >= the old
+       channel's local_amount.  A decrease without a corresponding payment
+       means the LSP is stealing sats during rotation. */
+    if (old_local_balance > 0 &&
+        channel_out->local_amount < old_local_balance) {
+        fprintf(stderr, "Client %u: REFUSING rotation — new channel balance "
+                "%llu < old balance %llu (balance not carried)\n",
+                my_index,
+                (unsigned long long)channel_out->local_amount,
+                (unsigned long long)old_local_balance);
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     /* Override local_pcs[0,1] with pre-generated secrets + store LSP PCPs */
@@ -1029,7 +1124,9 @@ int client_run_with_channels(secp256k1_context *ctx,
                               const secp256k1_keypair *keypair,
                               const char *host, int port,
                               client_channel_cb_t channel_cb,
-                              void *user_data) {
+                              void *user_data,
+                              client_verify_funding_fn verify_funding,
+                              void *verify_ctx) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
@@ -1111,6 +1208,31 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
     cJSON_Delete(msg.json);
+
+    /* Verify our pubkey is at the assigned participant index.  If the LSP
+       put a different key at our index, we'd sign a tree where our slot
+       is controlled by someone else. */
+    if (my_index >= n_participants) {
+        fprintf(stderr, "Client: participant_index %u out of range (%zu)\n",
+                my_index, n_participants);
+        wire_close(fd);
+        return 0;
+    }
+    {
+        unsigned char my_ser[33], their_ser[33];
+        size_t my_len = 33, their_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, my_ser, &my_len, &my_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+        secp256k1_ec_pubkey_serialize(ctx, their_ser, &their_len,
+                                       &all_pubkeys[my_index],
+                                       SECP256K1_EC_COMPRESSED);
+        if (memcmp(my_ser, their_ser, 33) != 0) {
+            fprintf(stderr, "Client: REFUSING — pubkey at index %u does not "
+                    "match our key (identity mismatch)\n", my_index);
+            wire_close(fd);
+            return 0;
+        }
+    }
 
     /* Receive FACTORY_PROPOSE — disable timeout since LSP may be waiting for
        on-chain funding confirmation (up to ~10 min on signet/testnet) */
@@ -1237,6 +1359,28 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     cJSON_Delete(msg.json);
 
+    /* Verify funding TX on-chain before signing anything.  If the caller
+       provided a verify_funding callback (e.g. backed by RPC or BIP 158),
+       query the chain for the actual output amount.  An adversarial LSP could
+       claim a larger funding_amount than actually exists on-chain; without
+       this check the client would sign a tree against phantom funds. */
+    if (verify_funding) {
+        if (!verify_funding(funding_txid, funding_vout, funding_amount,
+                            verify_ctx)) {
+            fprintf(stderr, "Client: funding TX verification FAILED — "
+                    "on-chain output does not match claimed %llu sats. "
+                    "Refusing to sign factory tree.\n",
+                    (unsigned long long)funding_amount);
+            client_send_error(fd, "funding_tx_verification_failed");
+            wire_close(fd);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "Client: WARNING — funding TX not verified on-chain "
+                "(no --rpcuser or --light-client). Trusting LSP claim of "
+                "%llu sats.\n", (unsigned long long)funding_amount);
+    }
+
     /* Build factory locally (heap — factory_t is ~3MB) */
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
@@ -1247,6 +1391,36 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
+
+    /* Log the economic terms the client is about to sign.  The client
+       should review these before proceeding — once the tree is signed,
+       the profit split is locked for this factory's lifetime. */
+    {
+        const char *econ_names[] = {"lsp-takes-all", "profit-shared"};
+        const char *econ_str = (economic_mode >= 0 && economic_mode <= 1)
+                               ? econ_names[economic_mode] : "unknown";
+        printf("Client %u: factory terms — economic_mode=%s",
+               my_index, econ_str);
+        uint16_t my_bps = 0;
+        if (my_index >= 1 && my_index < FACTORY_MAX_SIGNERS)
+            my_bps = profiles[my_index].profit_share_bps;
+        if (economic_mode == 1)
+            printf(", my profit_share=%u bps (%.2f%%)", my_bps, my_bps / 100.0);
+        printf(", funding=%llu sats, %zu participants\n",
+               (unsigned long long)funding_amount, n_participants);
+
+        /* Enforce minimum profit share if the client set --min-profit-bps */
+        if (g_min_profit_bps > 0 && my_bps < g_min_profit_bps) {
+            fprintf(stderr, "Client %u: REFUSING — profit_share %u bps < "
+                    "minimum %u bps (use --min-profit-bps to adjust)\n",
+                    my_index, my_bps, g_min_profit_bps);
+            free(factory);
+            client_send_error(fd, "profit_share_too_low");
+            wire_close(fd);
+            return 0;
+        }
+    }
+
     if (n_level_arity > 0)
         factory_set_level_arity(factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
@@ -1510,6 +1684,19 @@ int client_run_with_channels(secp256k1_context *ctx,
     client_apply_factory_ready(factory, msg.json);
     cJSON_Delete(msg.json);
 
+    /* Log expected distribution amount.  The distribution TX is a fallback
+       (used only if the factory expires without cooperative rotation), so
+       this is informational.  The hard enforcement is in
+       client_do_factory_rotation where the client REFUSES to sign if
+       dist_amounts[my_index-1] < channel balance. */
+    if (factory->dist_tx_ready && n_participants > 1 && my_index >= 1) {
+        uint64_t expected_dist_sats = funding_amount / n_participants;
+        printf("Client %u: distribution TX received — expected share "
+               "~%llu sats (equal split of %llu / %zu participants)\n",
+               my_index, (unsigned long long)expected_dist_sats,
+               (unsigned long long)funding_amount, n_participants);
+    }
+
     printf("Client %u: factory creation complete!\n", my_index);
 
     /* === Channel Operations Phase === */
@@ -1730,7 +1917,8 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                    factory, n_participants, NULL, 0)) {
+                                    factory, n_participants, NULL, 0,
+                                    NULL)) {
         goto fail;
     }
 
@@ -2114,7 +2302,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         /* Run close ceremony */
         int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                                   factory, n_participants,
-                                                  NULL, 0);
+                                                  NULL, 0, &channel);
         factory_free(factory); free(factory);
         wire_close(fd);
         return close_ok;
@@ -2289,5 +2477,6 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
 int client_run_ceremony(secp256k1_context *ctx,
                         const secp256k1_keypair *keypair,
                         const char *host, int port) {
-    return client_run_with_channels(ctx, keypair, host, port, NULL, NULL);
+    return client_run_with_channels(ctx, keypair, host, port, NULL, NULL,
+                                     NULL, NULL);
 }

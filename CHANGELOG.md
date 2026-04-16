@@ -2,6 +2,35 @@
 
 All notable changes to SuperScalar are documented here.
 
+## Unreleased
+
+Client-side verification hardening across all factory lifecycle boundaries. Fixes the economic model default and adds defense-in-depth conservation checks.
+
+### Client verification (PR #63)
+
+- **Funding TX on-chain verification** (`client.c`, `client.h`): new `client_verify_funding_fn` callback verifies the on-chain funding TX amount matches the LSP's claim before signing the factory tree. Without this, an adversarial LSP could claim phantom funding. Implemented via RPC (`getrawtransaction`) when `--rpcuser` is provided; logs explicit WARNING when chain verification is unavailable.
+- **Distribution TX amount verification** (`client.c`): during factory rotation, the client compares the LSP's offered `dist_amounts[my_index]` to its channel balance and refuses to sign if the distribution is less than owed.
+- **Rotation balance carry verification** (`client.c`): saves old channel balance before `client_init_channel` overwrites it during rotation, then verifies the new balance >= old balance. Prevents LSP from silently dropping accumulated sats.
+- **Participant index verification** (`client.c`): after HELLO_ACK, verifies `all_pubkeys[my_index]` matches the client's own pubkey. Prevents signing a tree where the client's slot is controlled by a different key.
+- **Cooperative close verification** (`client.c`, `client.h`): `client_do_close_ceremony` now takes an optional `channel_t*` and verifies at least one close output >= the client's channel balance before signing. Previously the client signed LSP-proposed close amounts blindly.
+- **Economic terms logging + enforcement** (`client.c`, `client.h`): logs economic_mode and profit_share_bps before signing. New `--min-profit-bps N` CLI flag and `client_set_min_profit_bps()` API reject factories offering less than the client's minimum profit share.
+- **Client-side conservation invariant** (`client.c`): `client_check_conservation()` runs after every `channel_add_htlc` and `channel_fulfill_htlc`, verifying `local + remote + htlc_sum + fees == funding`. Defense-in-depth — the MuSig2 commitment signature already prevents exploitation, but this catches balance arithmetic bugs.
+
+### Economic model fix
+
+- **Default `--lsp-balance-pct` changed from 50 to 100** (`superscalar_lsp.c`): LSP now retains all initial channel capacity by default. The old default gave away 50% of the LSP's capital to clients for free, contradicting the SuperScalar design where clients earn balance by receiving payments or purchasing liquidity. `--demo` mode auto-overrides to 50 for test convenience.
+
+### Testing
+
+- **`--test-bad-terms` mode** (`superscalar_lsp.c`): LSP offers 0 bps profit share with `economic_mode=profit-shared`. Clients with `--min-profit-bps > 0` should refuse. Test PASSES on client rejection, FAILS if any client accepts. Verified end-to-end on regtest.
+
+### Bug fixes (direct to main)
+
+- **RPC error logging** (`chain_backend_rpc.c`): `rpc_call()` now logs the method name, error code, and error message for every bitcoind RPC failure. Previously errors were silently discarded.
+- **Test stack overflow** (`test_wire.c`): `test_wire_distributed_signing` heap-allocated ~2.1 MB of structs that were overflowing the stack. Full test suite now runs: 1363/1363 pass (was 866 before crash).
+- **Rotation conservation violation** (`lsp_rotation.c`): `ch->funding_amount` updated to match carried balances after rotation. Previously, HTLC settlement fees consumed during the old factory caused a permanent -152 sat/channel delta.
+- **Schema v18** (`persist.c`, `persist.h`): `to_self_delay`, `fee_rate_sat_per_kvb`, `use_revocation_leaf` columns added to `channels` table. The standalone watchtower hydrator now reads these from DB instead of hardcoding defaults.
+
 ## 0.1.12 — 2026-04-16
 
 Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, test infrastructure fix, and rotation conservation fix. 30/30 signet exhibition tests passed. 1363 unit tests.
