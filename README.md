@@ -510,7 +510,7 @@ superscalar_lsp [OPTIONS]
 | `--test-bridge` | — | off | BOLT11 Lightning ↔ factory bridge via CLN plugin |
 | `--test-htlc-force-close` | — | off | Force-close with live HTLC outputs, preimage reveal |
 | `--routing-fee-ppm` | N | 0 | Routing fee in parts-per-million (0 = free) |
-| `--lsp-balance-pct` | N | 50 | LSP's share of channel capacity (0-100) |
+| `--lsp-balance-pct` | N | 100 | LSP's share of channel capacity, 0-100 (--demo overrides to 50) |
 | `--placement-mode` | MODE | sequential | Client placement: sequential / inward / outward |
 | `--economic-mode` | MODE | lsp-takes-all | Fee model: lsp-takes-all / profit-shared |
 | `--default-profit-bps` | N | 0 | Default profit share per client (basis points) |
