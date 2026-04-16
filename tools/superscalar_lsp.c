@@ -290,6 +290,7 @@ static void usage(const char *prog) {
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-multi-htlc-force-close  After demo: add HTLCs on ALL channels, force-close, broadcast all timeout TXs\n"
         "  --test-full-settlement  After demo: force-close tree, broadcast ALL commitment TXs, verify cross-leaf balances\n"
+        "  --test-bad-terms    Offer 0 bps profit share; PASSES if client rejects (use with --min-profit-bps on client)\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1052,6 +1053,7 @@ int main(int argc, char *argv[]) {
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
+    int test_bad_terms = 0;          /* --test-bad-terms: offer 0 bps profit to verify client rejects */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
     const char *rpc_file_arg = NULL;
@@ -1279,6 +1281,8 @@ int main(int argc, char *argv[]) {
             test_multi_htlc_force_close = 1;
         else if (strcmp(argv[i], "--test-full-settlement") == 0)
             test_full_settlement = 1;
+        else if (strcmp(argv[i], "--test-bad-terms") == 0)
+            test_bad_terms = 1;
         else if (strcmp(argv[i], "--test-dw-advance") == 0)
             test_dw_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
@@ -2955,6 +2959,18 @@ accept_new_factory:
         lsp_p->factory.profiles[pi].timezone_bucket = 0;
     }
 
+    /* --test-bad-terms: force profit-shared mode with 0 bps for all clients.
+       Clients running with --min-profit-bps should refuse to sign.
+       The test PASSES if factory creation fails (client rejection). */
+    if (test_bad_terms) {
+        lsp_p->factory.economic_mode = ECON_PROFIT_SHARED;
+        for (size_t pi = 1; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++)
+            lsp_p->factory.profiles[pi].profit_share_bps = 0;
+        lsp_p->factory.profiles[0].profit_share_bps = 10000; /* LSP takes 100% */
+        printf("LSP: --test-bad-terms: offering 0 bps profit to all clients\n");
+        printf("LSP: clients with --min-profit-bps > 0 should REFUSE\n");
+    }
+
     /* If --test-burn, enable L-stock revocation before tree construction.
        Uses flat secrets (per ZmnSCPxj: no multi-party shachain method exists,
        just store all revocation keys independently).
@@ -2990,7 +3006,21 @@ accept_new_factory:
             fprintf(stderr, "LSP: factory creation attempt %d failed\n", attempt + 1);
         }
         if (!creation_ok) {
+            if (test_bad_terms) {
+                printf("\n=== BAD TERMS TEST PASSED ===\n");
+                printf("Client correctly refused factory with 0 bps profit share.\n");
+                lsp_cleanup(lsp_p);
+                secp256k1_context_destroy(ctx);
+                return 0;  /* success — client rejection is the expected outcome */
+            }
             fprintf(stderr, "LSP: factory creation failed after 3 attempts\n");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        if (test_bad_terms) {
+            fprintf(stderr, "\n=== BAD TERMS TEST FAILED ===\n");
+            fprintf(stderr, "Client accepted 0 bps profit share — should have refused!\n");
             lsp_cleanup(lsp_p);
             secp256k1_context_destroy(ctx);
             return 1;
