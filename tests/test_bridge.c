@@ -635,11 +635,11 @@ int test_bridge_htlc_timeout(void) {
     lsp_channels_track_bridge_origin(&mgr, payment_hash, 42);
     mgr.htlc_origins[mgr.n_htlc_origins - 1].cltv_expiry = 600;
 
-    /* At height 500, should NOT time out (600 - 500 = 100 > FACTORY_CLTV_DELTA=40) */
+    /* At height 500, should NOT time out (600 - 500 = 100 > FACTORY_CLTV_DELTA_DEFAULT=40) */
     lsp_channels_check_bridge_htlc_timeouts(&mgr, NULL, 500);
     TEST_ASSERT(mgr.htlc_origins[0].active == 1, "not timed out at height 500");
 
-    /* At height 565, should time out (600 - 565 = 35 < FACTORY_CLTV_DELTA=40) */
+    /* At height 565, should time out (600 - 565 = 35 < FACTORY_CLTV_DELTA_DEFAULT=40) */
     lsp_channels_check_bridge_htlc_timeouts(&mgr, NULL, 565);
     TEST_ASSERT(mgr.htlc_origins[0].active == 0, "timed out at height 565");
 

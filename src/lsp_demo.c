@@ -129,9 +129,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Compute HTLC cltv_expiry from factory timeout: must be before the factory
        expires so the HTLC can be resolved on-chain if needed.  Subtract
-       FACTORY_CLTV_DELTA as safety margin. */
-    uint32_t htlc_cltv = lsp->factory.cltv_timeout > FACTORY_CLTV_DELTA
-                        ? lsp->factory.cltv_timeout - FACTORY_CLTV_DELTA
+       FACTORY_CLTV_DELTA_DEFAULT as safety margin. */
+    uint32_t htlc_cltv = lsp->factory.cltv_timeout > FACTORY_CLTV_DELTA_DEFAULT
+                        ? lsp->factory.cltv_timeout - FACTORY_CLTV_DELTA_DEFAULT
                         : 500;  /* fallback for tests without cltv_timeout */
 
     /* 1. Send MSG_CREATE_INVOICE to receiving client */

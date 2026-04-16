@@ -552,8 +552,8 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
         if (origin->bridge_htlc_id == 0) continue;
         if (origin->cltv_expiry == 0) continue;
 
-        /* Fail back if current height is within FACTORY_CLTV_DELTA of expiry */
-        if (current_height + FACTORY_CLTV_DELTA >= origin->cltv_expiry) {
+        /* Fail back if current height is within FACTORY_CLTV_DELTA_DEFAULT of expiry */
+        if (current_height + FACTORY_CLTV_DELTA_DEFAULT >= origin->cltv_expiry) {
             printf("LSP: bridge HTLC timeout — height %u approaching expiry %u\n",
                    current_height, origin->cltv_expiry);
 
