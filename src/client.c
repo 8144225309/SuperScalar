@@ -1029,7 +1029,9 @@ int client_run_with_channels(secp256k1_context *ctx,
                               const secp256k1_keypair *keypair,
                               const char *host, int port,
                               client_channel_cb_t channel_cb,
-                              void *user_data) {
+                              void *user_data,
+                              client_verify_funding_fn verify_funding,
+                              void *verify_ctx) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
@@ -1236,6 +1238,28 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
 
     cJSON_Delete(msg.json);
+
+    /* Verify funding TX on-chain before signing anything.  If the caller
+       provided a verify_funding callback (e.g. backed by RPC or BIP 158),
+       query the chain for the actual output amount.  An adversarial LSP could
+       claim a larger funding_amount than actually exists on-chain; without
+       this check the client would sign a tree against phantom funds. */
+    if (verify_funding) {
+        if (!verify_funding(funding_txid, funding_vout, funding_amount,
+                            verify_ctx)) {
+            fprintf(stderr, "Client: funding TX verification FAILED — "
+                    "on-chain output does not match claimed %llu sats. "
+                    "Refusing to sign factory tree.\n",
+                    (unsigned long long)funding_amount);
+            client_send_error(fd, "funding_tx_verification_failed");
+            wire_close(fd);
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "Client: WARNING — funding TX not verified on-chain "
+                "(no --rpcuser or --light-client). Trusting LSP claim of "
+                "%llu sats.\n", (unsigned long long)funding_amount);
+    }
 
     /* Build factory locally (heap — factory_t is ~3MB) */
     factory_t *factory = calloc(1, sizeof(factory_t));
@@ -2289,5 +2313,6 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
 int client_run_ceremony(secp256k1_context *ctx,
                         const secp256k1_keypair *keypair,
                         const char *host, int port) {
-    return client_run_with_channels(ctx, keypair, host, port, NULL, NULL);
+    return client_run_with_channels(ctx, keypair, host, port, NULL, NULL,
+                                     NULL, NULL);
 }

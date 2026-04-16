@@ -735,7 +735,8 @@ int test_regtest_intra_factory_payment(void) {
 
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
-                                               payment_client_cb, cb_data);
+                                               payment_client_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
@@ -1118,7 +1119,8 @@ int test_regtest_multi_payment(void) {
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
                                                multi_payment_client_cb,
-                                               &mp_data[c]);
+                                               &mp_data[c],
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
@@ -1893,7 +1895,8 @@ int test_regtest_lsp_restart_recovery(void) {
             else cb_data = &idle_data;
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
-                                               payment_client_cb, cb_data);
+                                               payment_client_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
@@ -2437,7 +2440,8 @@ int test_regtest_crash_double_recovery(void) {
             else cb_data = &idle_data;
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
-                                               payment_client_cb, cb_data);
+                                               payment_client_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }
@@ -2901,7 +2905,8 @@ int test_regtest_tcp_reconnect(void) {
             else cb_data = &idle_data;
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
-                                               payment_client_cb, cb_data);
+                                               payment_client_cb, cb_data,
+                                               NULL, NULL);
             secp256k1_context_destroy(child_ctx);
             _exit(ok ? 0 : 1);
         }

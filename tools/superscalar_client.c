@@ -2959,7 +2959,8 @@ int main(int argc, char *argv[]) {
         while (!g_shutdown) {
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
-                                                daemon_channel_cb, &cbd);
+                                                daemon_channel_cb, &cbd,
+                                                NULL, NULL);
                 /* Only switch to reconnect mode once factory is persisted */
                 if (ok || cbd.saved_initial)
                     first_run = 0;
@@ -2983,7 +2984,8 @@ int main(int argc, char *argv[]) {
         }
     } else if (n_actions > 0 || expect_channels) {
         multi_payment_data_t data = { actions, n_actions, 0 };
-        ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data);
+        ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data,
+                                      NULL, NULL);
     } else {
         ok = client_run_ceremony(ctx, &kp, host, port);
     }
