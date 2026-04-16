@@ -1331,6 +1331,26 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
+
+    /* Log the economic terms the client is about to sign.  The client
+       should review these before proceeding — once the tree is signed,
+       the profit split is locked for this factory's lifetime. */
+    {
+        const char *econ_names[] = {"lsp-takes-all", "profit-shared"};
+        const char *econ_str = (economic_mode >= 0 && economic_mode <= 1)
+                               ? econ_names[economic_mode] : "unknown";
+        printf("Client %u: factory terms — economic_mode=%s",
+               my_index, econ_str);
+        if (economic_mode == 1 && my_index >= 1) {
+            uint32_t pidx = my_index;
+            uint16_t bps = (pidx < FACTORY_MAX_SIGNERS)
+                           ? profiles[pidx].profit_share_bps : 0;
+            printf(", my profit_share=%u bps (%.2f%%)", bps, bps / 100.0);
+        }
+        printf(", funding=%llu sats, %zu participants\n",
+               (unsigned long long)funding_amount, n_participants);
+    }
+
     if (n_level_arity > 0)
         factory_set_level_arity(factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
