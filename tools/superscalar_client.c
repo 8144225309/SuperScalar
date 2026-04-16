@@ -124,6 +124,78 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     return 1;
 }
 
+/* --- Funding TX on-chain verification callback ---
+ * Called by client_run_with_channels() between FACTORY_PROPOSE parsing and
+ * tree signing.  Uses the RPC chain backend to query the funding TX and
+ * confirm the output amount matches the LSP's claim.
+ * ctx is a regtest_t* (same RPC backend used for force-close and sweep). */
+static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
+                                uint64_t expected_sats, void *ctx) {
+    regtest_t *rt = (regtest_t *)ctx;
+    if (!rt) return 0;
+
+    /* Convert internal-order txid to display hex */
+    unsigned char disp[32];
+    memcpy(disp, txid32, 32);
+    extern void reverse_bytes(unsigned char *, size_t);
+    reverse_bytes(disp, 32);
+    char txid_hex[65];
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    hex_encode(disp, 32, txid_hex);
+
+    int confs = regtest_get_confirmations(rt, txid_hex);
+    if (confs < 0) {
+        fprintf(stderr, "verify_funding: TX %s not found on-chain\n", txid_hex);
+        return 0;
+    }
+    if (confs < 1) {
+        fprintf(stderr, "verify_funding: TX %s in mempool but not confirmed\n",
+                txid_hex);
+        /* Allow mempool TX — LSP may have just broadcast */
+    }
+
+    /* Query the actual output amount via getrawtransaction (verbose=true) */
+    char params[256];
+    snprintf(params, sizeof(params), "\"%s\", true", txid_hex);
+    char *resp = regtest_exec(rt, "getrawtransaction", params);
+    if (!resp) {
+        fprintf(stderr, "verify_funding: getrawtransaction failed for %s\n",
+                txid_hex);
+        return 0;
+    }
+    cJSON *jtx = cJSON_Parse(resp);
+    free(resp);
+    if (!jtx) {
+        fprintf(stderr, "verify_funding: failed to parse TX JSON\n");
+        return 0;
+    }
+    cJSON *vout_arr = cJSON_GetObjectItem(jtx, "vout");
+    cJSON *vout_obj = vout_arr ? cJSON_GetArrayItem(vout_arr, (int)vout) : NULL;
+    cJSON *val_item = vout_obj ? cJSON_GetObjectItem(vout_obj, "value") : NULL;
+    if (!val_item || !cJSON_IsNumber(val_item)) {
+        fprintf(stderr, "verify_funding: cannot read output %s:%u\n",
+                txid_hex, vout);
+        cJSON_Delete(jtx);
+        return 0;
+    }
+    /* value is in BTC (float); convert to sats */
+    uint64_t actual_sats = (uint64_t)(val_item->valuedouble * 100000000.0 + 0.5);
+    cJSON_Delete(jtx);
+    if (actual_sats < expected_sats) {
+        fprintf(stderr, "verify_funding: output %s:%u has %llu sats, "
+                "LSP claimed %llu sats\n",
+                txid_hex, vout,
+                (unsigned long long)actual_sats,
+                (unsigned long long)expected_sats);
+        return 0;
+    }
+    printf("Client: funding TX verified on-chain: %s:%u = %llu sats (>= %llu)\n",
+           txid_hex, vout,
+           (unsigned long long)actual_sats,
+           (unsigned long long)expected_sats);
+    return 1;
+}
+
 /*
  * Initialise the BIP 158 backend, connect to the peer, restore checkpoint,
  * then plug the backend into the watchtower as its chain backend.
@@ -2956,11 +3028,32 @@ int main(int argc, char *argv[]) {
         if (!first_run && cbd.wt)
             watchtower_check(cbd.wt);
 
+        /* Initialize RPC backend for funding TX verification (if credentials available) */
+        regtest_t verify_rt;
+        (void)verify_rt; /* used only when RPC credentials are available */
+        client_verify_funding_fn vfn = NULL;
+        void *vctx = NULL;
+        if (rpcuser && rpcpassword && strcmp(network, "regtest") != 0) {
+            if (regtest_init_full(&verify_rt, network, NULL,
+                                   rpcuser, rpcpassword, NULL, rpcport)) {
+                /* verify_rt initialized */
+                vfn = verify_funding_rpc;
+                vctx = &verify_rt;
+            }
+        } else if (strcmp(network, "regtest") == 0 && rpcuser && rpcpassword) {
+            if (regtest_init_full(&verify_rt, "regtest", NULL,
+                                   rpcuser, rpcpassword, NULL, rpcport)) {
+                /* verify_rt initialized */
+                vfn = verify_funding_rpc;
+                vctx = &verify_rt;
+            }
+        }
+
         while (!g_shutdown) {
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
                                                 daemon_channel_cb, &cbd,
-                                                NULL, NULL);
+                                                vfn, vctx);
                 /* Only switch to reconnect mode once factory is persisted */
                 if (ok || cbd.saved_initial)
                     first_run = 0;
@@ -2984,8 +3077,19 @@ int main(int argc, char *argv[]) {
         }
     } else if (n_actions > 0 || expect_channels) {
         multi_payment_data_t data = { actions, n_actions, 0 };
+        /* Standalone mode also gets funding verification if RPC available */
+        regtest_t sa_verify_rt;
+        client_verify_funding_fn sa_vfn = NULL;
+        void *sa_vctx = NULL;
+        if (rpcuser && rpcpassword) {
+            if (regtest_init_full(&sa_verify_rt, network, NULL,
+                                   rpcuser, rpcpassword, NULL, rpcport)) {
+                sa_vfn = verify_funding_rpc;
+                sa_vctx = &sa_verify_rt;
+            }
+        }
         ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data,
-                                      NULL, NULL);
+                                      sa_vfn, sa_vctx);
     } else {
         ok = client_run_ceremony(ctx, &kp, host, port);
     }
