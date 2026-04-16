@@ -876,7 +876,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->confirm_timeout_secs = saved_confirm_timeout;
 
     /* Restore channel balances from old factory (carry across rotation).
-       Only apply if the old balance fits within the new channel capacity. */
+       Only apply if the old balance fits within the new channel capacity.
+       Also update funding_amount to match the carried total — HTLC fees
+       consumed during the previous factory reduce local+remote below the
+       original funding_amount, and the conservation invariant checks
+       local + remote + htlc_sum == funding_amount. */
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
         uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
@@ -884,6 +888,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (old_total > 0 && old_total <= new_usable) {
             ch->local_amount = saved_ch_local[c];
             ch->remote_amount = saved_ch_remote[c];
+            ch->funding_amount = old_total;
         }
         /* else: new factory has different capacity, keep default split */
     }
