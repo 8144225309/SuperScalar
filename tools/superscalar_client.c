@@ -512,6 +512,14 @@ typedef struct {
     htlc_t pending_wt_htlcs[MAX_HTLCS];
     size_t pending_wt_n_htlcs;
     int pending_wt_valid;  /* 1 = pending old state needs watchtower registration */
+    /* Client-side fee tracking for settlement verification.
+       Tracks routing volume so the client can independently compute
+       its expected profit share and detect under-settlement. */
+    uint64_t tracked_routed_sats;   /* total sats routed (sent HTLCs) */
+    uint64_t tracked_fees_sats;     /* estimated fees earned on this channel */
+    uint64_t settled_fees_sats;     /* total share already received */
+    uint64_t routing_fee_ppm;       /* fee rate from factory terms */
+    uint16_t profit_share_bps;      /* client's share from factory terms */
 } daemon_cb_data_t;
 
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
@@ -728,6 +736,13 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 }
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
+                /* Extract fee terms for client-side settlement verification */
+                if (factory && my_index >= 1 && my_index < FACTORY_MAX_SIGNERS) {
+                    cbd->profit_share_bps = factory->profiles[my_index].profit_share_bps;
+                    /* routing_fee_ppm was captured from SCID_ASSIGN */
+                    extern uint32_t g_routing_fee_ppm;  /* defined in client.c */
+                    cbd->routing_fee_ppm = g_routing_fee_ppm;
+                }
                 printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
             } else {
                 fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
@@ -857,6 +872,27 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
+            /* Periodic fee settlement verification: compare expected share
+               (from tracked routing volume) to actual balance increase. */
+            static time_t last_fee_check = 0;
+            if (cbd && cbd->tracked_fees_sats > 0 && cbd->profit_share_bps > 0
+                && (tnow - last_fee_check) >= 60) {
+                last_fee_check = tnow;
+                uint64_t expected = (cbd->tracked_fees_sats * cbd->profit_share_bps) / 10000;
+                uint64_t received = cbd->settled_fees_sats;
+                uint64_t owed = expected > received ? expected - received : 0;
+                if (owed > 0) {
+                    printf("Client %u: fee audit — routed %llu sats, "
+                           "est. fees %llu, expected share %llu, "
+                           "received %llu, owed %llu\n",
+                           my_index,
+                           (unsigned long long)cbd->tracked_routed_sats,
+                           (unsigned long long)cbd->tracked_fees_sats,
+                           (unsigned long long)expected,
+                           (unsigned long long)received,
+                           (unsigned long long)owed);
+                }
+            }
             continue;
         }
 
@@ -876,6 +912,23 @@ handle_message:
             if (pre_add_n_htlcs > 0)
                 memcpy(pre_add_htlcs, ch->htlcs, pre_add_n_htlcs * sizeof(htlc_t));
 
+            /* Track routing volume for fee verification.
+               If this HTLC has dest_client (we're the sender), the LSP
+               deducted a routing fee. Track so we can verify settlement. */
+            {
+                cJSON *amt_j = cJSON_GetObjectItem(msg.json, "amount_msat");
+                cJSON *dest_j = cJSON_GetObjectItem(msg.json, "dest_client");
+                if (dest_j && amt_j && cJSON_IsNumber(amt_j) && cbd) {
+                    uint64_t htlc_msat = (uint64_t)amt_j->valuedouble;
+                    uint64_t htlc_sats = htlc_msat / 1000;
+                    cbd->tracked_routed_sats += htlc_sats;
+                    if (cbd->routing_fee_ppm > 0) {
+                        uint64_t fee_msat = (htlc_msat * cbd->routing_fee_ppm
+                                              + 999999) / 1000000;
+                        cbd->tracked_fees_sats += (fee_msat + 999) / 1000;
+                    }
+                }
+            }
             client_handle_add_htlc(ch, &msg);
             cJSON_Delete(msg.json);
 

@@ -28,6 +28,10 @@ void client_set_min_profit_bps(uint16_t bps) {
     g_min_profit_bps = bps;
 }
 
+/* Routing fee rate from SCID_ASSIGN — set during factory creation,
+   read by the daemon callback for fee tracking. */
+uint32_t g_routing_fee_ppm = 0;
+
 void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     if (pubkey) {
         g_nk_server_pubkey = *pubkey;
@@ -1027,9 +1031,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     {
         uint32_t scid_ch; uint64_t scid; uint32_t fb, fp; uint16_t cd;
-        if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd))
+        if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd)) {
             printf("Client %u: SCID=%016llx fee_base=%u fee_ppm=%u cltv=%u\n",
                    my_index, (unsigned long long)scid, fb, fp, cd);
+            g_routing_fee_ppm = fp;
+        }
         cJSON_Delete(msg.json);
     }
 
@@ -1804,9 +1810,11 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
         {
             uint32_t scid_ch; uint64_t scid; uint32_t fb, fp; uint16_t cd;
-            if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd))
+            if (wire_parse_scid_assign(msg.json, &scid_ch, &scid, &fb, &fp, &cd)) {
                 printf("Client %u: SCID=%016llx fee_base=%u fee_ppm=%u cltv=%u\n",
                        my_index, (unsigned long long)scid, fb, fp, cd);
+                g_routing_fee_ppm = fp;
+            }
             cJSON_Delete(msg.json);
         }
 
