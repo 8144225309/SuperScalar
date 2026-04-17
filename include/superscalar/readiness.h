@@ -20,8 +20,8 @@ typedef struct {
     readiness_entry_t clients[FACTORY_MAX_SIGNERS];
     size_t   n_clients;
     uint32_t factory_id;
-    uint32_t ready_bitmap;      /* bit i = connected AND ready */
-    uint32_t connected_bitmap;  /* bit i = connected */
+    uint64_t ready_bitmap;      /* bit i = connected AND ready */
+    uint64_t connected_bitmap;  /* bit i = connected */
     persist_t *db;              /* may be NULL */
 } readiness_tracker_t;
 
