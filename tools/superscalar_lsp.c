@@ -461,18 +461,19 @@ static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
 
         /* Poll listen socket + client fds (5s timeout) */
         {
-            struct pollfd pfds[16];
+            size_t pfds_cap = 1 + (lsp ? lsp->n_clients : 0);
+            struct pollfd *pfds = (struct pollfd *)calloc(pfds_cap, sizeof(struct pollfd));
             int nfds = 0;
             int listen_idx = -1;
-            if (lsp && lsp->listen_fd >= 0 && nfds < 16) {
+            if (pfds && lsp && lsp->listen_fd >= 0) {
                 listen_idx = nfds;
                 pfds[nfds].fd = lsp->listen_fd;
                 pfds[nfds].events = POLLIN;
                 nfds++;
             }
             /* Also poll client fds to respond to pings */
-            if (lsp) {
-                for (size_t i = 0; i < lsp->n_clients && nfds < 16; i++) {
+            if (pfds && lsp) {
+                for (size_t i = 0; i < lsp->n_clients; i++) {
                     if (lsp->client_fds[i] >= 0) {
                         pfds[nfds].fd = lsp->client_fds[i];
                         pfds[nfds].events = POLLIN;
@@ -480,7 +481,7 @@ static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
                     }
                 }
             }
-            int pret = nfds > 0 ? poll(pfds, (nfds_t)nfds, 5000) : 0;
+            int pret = (pfds && nfds > 0) ? poll(pfds, (nfds_t)nfds, 5000) : 0;
             if (!pret) { if (!nfds) sleep(5); }
             if (pret > 0) {
                 for (int fi = 0; fi < nfds; fi++) {
@@ -514,6 +515,7 @@ static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
                     }
                 }
             }
+            free(pfds);
         }
     }
 }
