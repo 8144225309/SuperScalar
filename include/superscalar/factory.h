@@ -49,10 +49,10 @@ typedef struct {
 /* Runtime-configurable limits (Mainnet Gap #6).
    Pass to factory_init_with_config(). NULL = defaults (same as #define values). */
 typedef struct {
-    uint32_t max_signers;           /* default FACTORY_MAX_SIGNERS (16) */
-    uint32_t max_nodes;             /* default FACTORY_MAX_NODES (64) */
-    uint32_t max_leaves;            /* default FACTORY_MAX_LEAVES (16) */
-    uint32_t max_outputs_per_node;  /* default FACTORY_MAX_OUTPUTS (8) */
+    uint32_t max_signers;           /* default FACTORY_MAX_SIGNERS */
+    uint32_t max_nodes;             /* default FACTORY_MAX_NODES */
+    uint32_t max_leaves;            /* default FACTORY_MAX_LEAVES */
+    uint32_t max_outputs_per_node;  /* default FACTORY_MAX_OUTPUTS — per tree node */
     uint64_t dust_limit_sats;       /* default 546 */
 } factory_config_t;
 
