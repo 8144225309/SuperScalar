@@ -164,7 +164,7 @@ static int add_node(
     int dw_layer_index,
     uint32_t node_cltv
 ) {
-    if (f->n_nodes >= FACTORY_MAX_NODES) return -1;
+    if (f->n_nodes >= f->config.max_nodes) return -1;
 
     int idx = (int)f->n_nodes++;
     factory_node_t *node = &f->nodes[idx];
@@ -1884,9 +1884,10 @@ int factory_build_distribution_tx(
 {
     /* Build augmented output array with P2A anchor appended.
        Anchor cost deducted from first output (LSP's share). */
-    tx_output_t aug_outputs[FACTORY_MAX_OUTPUTS + 1];
+    if (n_outputs == 0 || n_outputs > f->n_participants) return 0;
+    tx_output_t *aug_outputs = (tx_output_t *)calloc(n_outputs + 1, sizeof(tx_output_t));
+    if (!aug_outputs) return 0;
     size_t aug_n = n_outputs;
-    if (n_outputs == 0 || n_outputs > FACTORY_MAX_OUTPUTS) return 0;
 
     for (size_t i = 0; i < n_outputs; i++)
         aug_outputs[i] = outputs[i];
@@ -1915,6 +1916,7 @@ int factory_build_distribution_tx(
                                           0xFFFFFFFEu, nlocktime,
                                           aug_outputs, aug_n)) {
         tx_buf_free(&unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
@@ -1929,6 +1931,7 @@ int factory_build_distribution_tx(
                                   0, f->funding_spk, f->funding_spk_len,
                                   f->funding_amount_sats, 0xFFFFFFFEu)) {
         tx_buf_free(&unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
@@ -1938,6 +1941,7 @@ int factory_build_distribution_tx(
     if (!musig_sign_taproot(f->ctx, sig64, sighash, f->keypairs,
                              f->n_participants, &keyagg_copy, NULL)) {
         tx_buf_free(&unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
@@ -1945,10 +1949,12 @@ int factory_build_distribution_tx(
     if (!finalize_signed_tx(dist_tx_out, unsigned_tx.data, unsigned_tx.len,
                               sig64)) {
         tx_buf_free(&unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
     tx_buf_free(&unsigned_tx);
+    free(aug_outputs);
     return 1;
 }
 
@@ -1960,11 +1966,12 @@ int factory_build_distribution_tx_unsigned(
     size_t n_outputs,
     uint32_t nlocktime)
 {
-    if (!f || !outputs || n_outputs == 0 || n_outputs > FACTORY_MAX_OUTPUTS)
+    if (!f || !outputs || n_outputs == 0 || n_outputs > f->n_participants)
         return 0;
 
     /* Build augmented output array with P2A anchor appended */
-    tx_output_t aug_outputs[FACTORY_MAX_OUTPUTS + 1];
+    tx_output_t *aug_outputs = (tx_output_t *)calloc(n_outputs + 1, sizeof(tx_output_t));
+    if (!aug_outputs) return 0;
     size_t aug_n = n_outputs;
     for (size_t i = 0; i < n_outputs; i++)
         aug_outputs[i] = outputs[i];
@@ -1987,6 +1994,7 @@ int factory_build_distribution_tx_unsigned(
                                           0xFFFFFFFEu, nlocktime,
                                           aug_outputs, aug_n)) {
         tx_buf_free(&f->dist_unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
@@ -1997,9 +2005,11 @@ int factory_build_distribution_tx_unsigned(
                                   0, f->funding_spk, f->funding_spk_len,
                                   f->funding_amount_sats, 0xFFFFFFFEu)) {
         tx_buf_free(&f->dist_unsigned_tx);
+        free(aug_outputs);
         return 0;
     }
 
+    free(aug_outputs);
     f->dist_tx_ready = 1;
     return 1;
 }
