@@ -3045,6 +3045,194 @@ int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory
     return settled;
 }
 
+int lsp_channels_settle_via_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      const factory_t *factory) {
+    if (!mgr || !lsp || !factory) return 0;
+    if (mgr->economic_mode != ECON_PROFIT_SHARED) return 0;
+    if (mgr->accumulated_fees_sats == 0) return 0;
+
+    extern void hex_encode(const unsigned char *, size_t, char *);
+
+    int settled = 0;
+    for (size_t i = 0; i < mgr->n_channels; i++) {
+        uint64_t ch_fees = mgr->entries[i].accumulated_fees_sats;
+        if (ch_fees == 0) continue;
+
+        uint32_t pidx = (uint32_t)(i + 1);
+        if (pidx >= factory->n_participants) continue;
+        if (lsp->client_fds[i] < 0) continue;  /* client offline */
+
+        uint16_t bps = factory->profiles[pidx].profit_share_bps;
+        if (bps == 0) continue;
+
+        uint64_t share = (ch_fees * bps) / 10000;
+        if (share < CHANNEL_DUST_LIMIT_SATS) continue;  /* below dust */
+
+        /* Cheat test: offer half the correct amount */
+        if (mgr->test_bad_settlement && share > 1)
+            share /= 2;
+
+        channel_t *ch = &mgr->entries[i].channel;
+        if (ch->local_amount < share) continue;  /* insufficient balance */
+
+        /* Generate deterministic settlement preimage + hash */
+        unsigned char preimage[32], payment_hash[32];
+        {
+            unsigned char seed[40];
+            memcpy(seed, "settlement", 10);
+            seed[10] = (unsigned char)(i & 0xFF);
+            seed[11] = (unsigned char)((i >> 8) & 0xFF);
+            /* Use commitment number as nonce to avoid reuse */
+            uint64_t cn = ch->commitment_number;
+            for (int b = 0; b < 8; b++) seed[12 + b] = (unsigned char)(cn >> (b * 8));
+            memset(seed + 20, 0, 20);
+            sha256(seed, 40, preimage);
+            sha256(preimage, 32, payment_hash);
+        }
+
+        /* CLTV for settlement HTLC */
+        uint32_t htlc_cltv = factory->cltv_timeout > FACTORY_CLTV_DELTA_DEFAULT
+                            ? factory->cltv_timeout - FACTORY_CLTV_DELTA_DEFAULT
+                            : 500;
+
+        /* Add HTLC (OFFERED from LSP to client) */
+        uint64_t htlc_id;
+        if (!channel_add_htlc(ch, HTLC_OFFERED, share, payment_hash,
+                               htlc_cltv, &htlc_id))
+            continue;
+
+        /* Send UPDATE_ADD_HTLC with settlement tag + preimage */
+        cJSON *add = wire_build_update_add_htlc(htlc_id, share * 1000,
+                                                  payment_hash, htlc_cltv);
+        cJSON_AddBoolToObject(add, "is_settlement", 1);
+        wire_json_add_hex(add, "settlement_preimage", preimage, 32);
+        cJSON_AddNumberToObject(add, "accumulated_fees", (double)ch_fees);
+        cJSON_AddNumberToObject(add, "share_bps", (double)bps);
+        if (!wire_send(lsp->client_fds[i], MSG_UPDATE_ADD_HTLC, add)) {
+            cJSON_Delete(add);
+            /* Rollback: fail the HTLC we just added */
+            channel_fail_htlc(ch, htlc_id);
+            continue;
+        }
+        cJSON_Delete(add);
+
+        /* Send COMMITMENT_SIGNED */
+        unsigned char psig[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(ch, psig, &nonce_idx)) {
+            channel_fail_htlc(ch, htlc_id);
+            continue;
+        }
+        cJSON *cs = wire_build_commitment_signed(
+            mgr->entries[i].channel_id, ch->commitment_number, psig, nonce_idx);
+        if (!wire_send(lsp->client_fds[i], MSG_COMMITMENT_SIGNED, cs)) {
+            cJSON_Delete(cs);
+            continue;
+        }
+        cJSON_Delete(cs);
+
+        /* Wait for REVOKE_AND_ACK from client (5s timeout) */
+        wire_msg_t ack;
+        if (!wire_recv_timeout(lsp->client_fds[i], &ack, 5) ||
+            ack.msg_type != MSG_REVOKE_AND_ACK) {
+            if (ack.json) cJSON_Delete(ack.json);
+            continue;
+        }
+        /* Process revocation */
+        {
+            uint32_t ack_ch_id;
+            unsigned char rev_secret[32], next_point[33];
+            if (wire_parse_revoke_and_ack(ack.json, &ack_ch_id,
+                                            rev_secret, next_point)) {
+                uint64_t old_cn = ch->commitment_number - 1;
+                channel_receive_revocation(ch, old_cn, rev_secret);
+                secp256k1_pubkey next_pcp;
+                if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+                    channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+            }
+            cJSON_Delete(ack.json);
+        }
+
+        /* Send LSP's own revocation */
+        {
+            unsigned char lsp_rev[32];
+            if (ch->commitment_number > 0)
+                channel_get_revocation_secret(ch, ch->commitment_number - 1, lsp_rev);
+            else
+                memset(lsp_rev, 0, 32);
+            secp256k1_pubkey lsp_next_pcp;
+            channel_get_per_commitment_point(ch, ch->commitment_number + 1, &lsp_next_pcp);
+            cJSON *rev = wire_build_revoke_and_ack(
+                mgr->entries[i].channel_id, lsp_rev, mgr->ctx, &lsp_next_pcp);
+            wire_send(lsp->client_fds[i], MSG_REVOKE_AND_ACK, rev);
+            cJSON_Delete(rev);
+            memset(lsp_rev, 0, 32);
+        }
+
+        /* The client will auto-fulfill this HTLC with the preimage we sent.
+           Wait for FULFILL_HTLC + COMMITMENT_SIGNED from client. */
+        wire_msg_t fulfill_msg;
+        if (!wire_recv_timeout(lsp->client_fds[i], &fulfill_msg, 10) ||
+            fulfill_msg.msg_type != MSG_UPDATE_FULFILL_HTLC) {
+            if (fulfill_msg.json) cJSON_Delete(fulfill_msg.json);
+            continue;
+        }
+        /* Process fulfill */
+        {
+            uint64_t ful_htlc_id;
+            unsigned char ful_preimage[32];
+            if (wire_parse_update_fulfill_htlc(fulfill_msg.json,
+                                                &ful_htlc_id, ful_preimage))
+                channel_fulfill_htlc(ch, ful_htlc_id, ful_preimage);
+            cJSON_Delete(fulfill_msg.json);
+        }
+
+        /* Receive client's COMMITMENT_SIGNED for the fulfill */
+        wire_msg_t client_cs;
+        if (wire_recv_timeout(lsp->client_fds[i], &client_cs, 5) &&
+            client_cs.msg_type == MSG_COMMITMENT_SIGNED) {
+            unsigned char client_psig[32];
+            uint32_t client_ni;
+            uint64_t client_cn;
+            if (wire_parse_commitment_signed(client_cs.json, NULL,
+                                              &client_cn, client_psig, &client_ni)) {
+                unsigned char full_sig[64];
+                channel_verify_and_aggregate_commitment_sig(
+                    ch, client_psig, client_ni, full_sig);
+            }
+            cJSON_Delete(client_cs.json);
+
+            /* Send revocation for the fulfilled state */
+            unsigned char lsp_rev2[32];
+            if (ch->commitment_number > 0)
+                channel_get_revocation_secret(ch, ch->commitment_number - 1, lsp_rev2);
+            else
+                memset(lsp_rev2, 0, 32);
+            secp256k1_pubkey lsp_next2;
+            channel_get_per_commitment_point(ch, ch->commitment_number + 1, &lsp_next2);
+            cJSON *rev2 = wire_build_revoke_and_ack(
+                mgr->entries[i].channel_id, lsp_rev2, mgr->ctx, &lsp_next2);
+            wire_send(lsp->client_fds[i], MSG_REVOKE_AND_ACK, rev2);
+            cJSON_Delete(rev2);
+            memset(lsp_rev2, 0, 32);
+        } else {
+            if (client_cs.json) cJSON_Delete(client_cs.json);
+        }
+
+        mgr->entries[i].accumulated_fees_sats = 0;
+        settled++;
+        printf("LSP: settled %llu sats to client %zu (fees=%llu, bps=%u)\n",
+               (unsigned long long)share, i,
+               (unsigned long long)ch_fees, bps);
+        memset(preimage, 0, 32);
+    }
+
+    if (settled > 0)
+        mgr->accumulated_fees_sats = 0;
+
+    return settled;
+}
+
 uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
                                        const factory_t *factory,
                                        size_t client_idx) {
@@ -3679,8 +3867,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         mgr->settlement_interval_blocks > 0 &&
                         (uint32_t)height - mgr->last_settlement_block >=
                             mgr->settlement_interval_blocks) {
-                        int settled = lsp_channels_settle_profits(
-                            mgr, &lsp->factory);
+                        int settled = lsp_channels_settle_via_payment(
+                            mgr, lsp, &lsp->factory);
                         if (settled > 0) {
                             mgr->last_settlement_block = (uint32_t)height;
                             if (mgr->persist)

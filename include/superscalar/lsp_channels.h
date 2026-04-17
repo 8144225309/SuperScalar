@@ -133,6 +133,7 @@ typedef struct {
 
     /* Interactive CLI in daemon loop */
     int cli_enabled;               /* 1 = stdin commands (pay/status/rotate/close) */
+    int test_bad_settlement;       /* 1 = halve settlement amounts (cheat test) */
 
     /* Configurable confirmation timeout */
     int confirm_timeout_secs;      /* 0 = use default (3600 regtest, 7200 non-regtest) */
@@ -284,6 +285,14 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
    Shifts balance from LSP-local to client-remote via channel_update().
    Returns number of channels settled (0 if nothing to settle). */
 int lsp_channels_settle_profits(lsp_channel_mgr_t *mgr, const factory_t *factory);
+
+/* Settle accumulated per-channel fees via HTLC payment to each client.
+   Unlike settle_profits (which modifies balances directly and desynchronizes
+   state), this uses the standard HTLC add→commit→revoke→fulfill flow so
+   the settlement is reflected in a signed commitment TX.  If the client
+   force-closes after settlement, their commitment includes the settled fees. */
+int lsp_channels_settle_via_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      const factory_t *factory);
 
 /* Calculate unsettled profit share for a client (for cooperative close). */
 uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,

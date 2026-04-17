@@ -912,6 +912,49 @@ handle_message:
             if (pre_add_n_htlcs > 0)
                 memcpy(pre_add_htlcs, ch->htlcs, pre_add_n_htlcs * sizeof(htlc_t));
 
+            /* Check if this is a settlement HTLC from the LSP */
+            {
+                cJSON *is_sett = cJSON_GetObjectItem(msg.json, "is_settlement");
+                if (is_sett && cJSON_IsTrue(is_sett) && cbd) {
+                    cJSON *sett_amt = cJSON_GetObjectItem(msg.json, "amount_msat");
+                    cJSON *sett_fees = cJSON_GetObjectItem(msg.json, "accumulated_fees");
+                    cJSON *sett_bps = cJSON_GetObjectItem(msg.json, "share_bps");
+                    uint64_t offered_sats = sett_amt ? (uint64_t)(sett_amt->valuedouble / 1000) : 0;
+                    uint64_t claimed_fees = sett_fees ? (uint64_t)sett_fees->valuedouble : 0;
+                    uint16_t claimed_bps = sett_bps ? (uint16_t)sett_bps->valuedouble : 0;
+
+                    /* Verify: offered amount == (claimed_fees * claimed_bps) / 10000 */
+                    uint64_t expected = (claimed_fees * claimed_bps) / 10000;
+                    if (offered_sats < expected) {
+                        printf("Client %u: SETTLEMENT UNDERPAYMENT — offered %llu, "
+                               "expected %llu (fees=%llu, bps=%u)\n",
+                               my_index,
+                               (unsigned long long)offered_sats,
+                               (unsigned long long)expected,
+                               (unsigned long long)claimed_fees, claimed_bps);
+                    } else {
+                        printf("Client %u: settlement received — %llu sats "
+                               "(fees=%llu, bps=%u)\n",
+                               my_index,
+                               (unsigned long long)offered_sats,
+                               (unsigned long long)claimed_fees, claimed_bps);
+                    }
+                    /* Cross-check against our own tracked fees */
+                    if (cbd->tracked_fees_sats > 0) {
+                        uint64_t our_expected = (cbd->tracked_fees_sats * cbd->profit_share_bps) / 10000;
+                        if (offered_sats < our_expected && our_expected > 0) {
+                            fprintf(stderr, "Client %u: WARNING — settlement %llu < "
+                                    "independently tracked expected %llu\n",
+                                    my_index,
+                                    (unsigned long long)offered_sats,
+                                    (unsigned long long)our_expected);
+                        }
+                    }
+                    cbd->settled_fees_sats += offered_sats;
+                    cbd->tracked_fees_sats = 0;  /* reset for next period */
+                }
+            }
+
             /* Track routing volume for fee verification.
                If this HTLC has dest_client (we're the sender), the LSP
                deducted a routing fee. Track so we can verify settlement. */
