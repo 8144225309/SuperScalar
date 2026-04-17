@@ -1054,6 +1054,7 @@ int main(int argc, char *argv[]) {
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     int test_bad_terms = 0;          /* --test-bad-terms: offer 0 bps profit to verify client rejects */
+    int test_bad_settlement = 0;     /* --test-bad-settlement: settle half the correct amount */
     uint16_t default_profit_bps = 0; /* per-client profit share bps */
     uint32_t settlement_interval = 144; /* blocks between profit settlements */
     const char *rpc_file_arg = NULL;
@@ -1283,6 +1284,8 @@ int main(int argc, char *argv[]) {
             test_full_settlement = 1;
         else if (strcmp(argv[i], "--test-bad-terms") == 0)
             test_bad_terms = 1;
+        else if (strcmp(argv[i], "--test-bad-settlement") == 0)
+            test_bad_settlement = 1;
         else if (strcmp(argv[i], "--test-dw-advance") == 0)
             test_dw_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
@@ -3344,6 +3347,7 @@ accept_new_factory:
         mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
+        mgr->test_bad_settlement = test_bad_settlement;
         mgr->auto_rebalance = auto_rebalance;
         mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
