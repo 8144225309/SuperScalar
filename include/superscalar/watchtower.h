@@ -67,7 +67,7 @@ typedef struct {
     char penalty_txid[65];        /* hex txid of broadcast penalty */
 } watchtower_entry_t;
 
-#define WATCHTOWER_MAX_CHANNELS 32
+#define WATCHTOWER_MAX_CHANNELS 64
 #define WATCHTOWER_MAX_PENDING 16
 #define WATCHTOWER_ANCHOR_AMOUNT ANCHOR_OUTPUT_AMOUNT
 #define WATCHTOWER_CPFP_CHILD_VSIZE 264  /* P2A input + wallet input + 1 P2TR output */
