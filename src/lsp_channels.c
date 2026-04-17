@@ -3778,6 +3778,32 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         fe->update(fe);
                 }
 
+                /* Profit settlement via chain_be (works without watchtower). */
+                if (mgr->economic_mode == ECON_PROFIT_SHARED &&
+                    mgr->accumulated_fees_sats > 0 &&
+                    mgr->settlement_interval_blocks > 0 &&
+                    mgr->chain_be) {
+                    chain_backend_t *_scb = (chain_backend_t *)mgr->chain_be;
+                    uint32_t sheight = _scb->get_block_height(_scb);
+                    if (sheight > 0 &&
+                        sheight - mgr->last_settlement_block >=
+                            mgr->settlement_interval_blocks) {
+                        int settled = lsp_channels_settle_via_payment(
+                            mgr, lsp, &lsp->factory);
+                        if (settled > 0) {
+                            mgr->last_settlement_block = sheight;
+                            if (mgr->persist)
+                                persist_save_fee_settlement(
+                                    (persist_t *)mgr->persist, 0,
+                                    mgr->accumulated_fees_sats,
+                                    mgr->last_settlement_block);
+                            printf("LSP: settled profits to %d channels "
+                                   "(height=%u)\n", settled, sheight);
+                            fflush(stdout);
+                        }
+                    }
+                }
+
                 /* Check block height / factory lifecycle (fast: 1 RPC call).
                    watchtower_check is deferred to once per 60s (below). */
                 if (mgr->watchtower && mgr->watchtower->rt) {
@@ -3861,26 +3887,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                     }
 
-                    /* Profit settlement check */
-                    if (mgr->economic_mode == ECON_PROFIT_SHARED &&
-                        mgr->accumulated_fees_sats > 0 &&
-                        mgr->settlement_interval_blocks > 0 &&
-                        (uint32_t)height - mgr->last_settlement_block >=
-                            mgr->settlement_interval_blocks) {
-                        int settled = lsp_channels_settle_via_payment(
-                            mgr, lsp, &lsp->factory);
-                        if (settled > 0) {
-                            mgr->last_settlement_block = (uint32_t)height;
-                            if (mgr->persist)
-                                persist_save_fee_settlement(
-                                    (persist_t *)mgr->persist, 0,
-                                    mgr->accumulated_fees_sats,
-                                    mgr->last_settlement_block);
-                            printf("LSP: settled profits to %d channels "
-                                   "(height=%d)\n", settled, height);
-                            fflush(stdout);
-                        }
-                    }
+                    /* Profit settlement: handled above via chain_be (works
+                       without watchtower). Removed from watchtower block. */
                     /* Factory lifecycle monitoring */
                     factory_state_t fstate = factory_get_state(
                         &lsp->factory, (uint32_t)height);

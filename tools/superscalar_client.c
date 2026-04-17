@@ -955,6 +955,22 @@ handle_message:
                 }
             }
 
+            /* Extract settlement preimage for auto-fulfill after commitment */
+            unsigned char sett_preimage[32];
+            int is_settlement_htlc = 0;
+            uint64_t sett_htlc_id = 0;
+            {
+                cJSON *is_sett2 = cJSON_GetObjectItem(msg.json, "is_settlement");
+                cJSON *sett_pre = cJSON_GetObjectItem(msg.json, "settlement_preimage");
+                cJSON *sett_id = cJSON_GetObjectItem(msg.json, "htlc_id");
+                if (is_sett2 && cJSON_IsTrue(is_sett2) && sett_pre && cJSON_IsString(sett_pre)) {
+                    if (hex_decode(sett_pre->valuestring, sett_preimage, 32) == 32) {
+                        is_settlement_htlc = 1;
+                        sett_htlc_id = sett_id ? (uint64_t)sett_id->valuedouble : 0;
+                    }
+                }
+            }
+
             /* Track routing volume for fee verification.
                If this HTLC has dest_client (we're the sender), the LSP
                deducted a routing fee. Track so we can verify settlement. */
@@ -1009,6 +1025,36 @@ handle_message:
             if (cbd && cbd->db) {
                 persist_update_channel_balance(cbd->db, my_index - 1,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+
+            /* Auto-fulfill settlement HTLCs — preimage was included in the message */
+            if (is_settlement_htlc) {
+                printf("Client %u: auto-fulfilling settlement HTLC %llu\n",
+                       my_index, (unsigned long long)sett_htlc_id);
+                /* Save pre-fulfill state for watchtower */
+                uint64_t pre_ful_local = ch->local_amount;
+                uint64_t pre_ful_remote = ch->remote_amount;
+
+                client_fulfill_payment(fd, ch, sett_htlc_id, sett_preimage);
+
+                /* Handle COMMITMENT_SIGNED for the fulfill */
+                if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                         ctx, keypair, my_index, &cbd->inbox) &&
+                    msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    client_persist_commitment_sig(ch, cbd);
+                    cJSON_Delete(msg.json);
+                    client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                        pre_ful_local, pre_ful_remote, NULL, 0,
+                        keypair, my_index);
+                } else {
+                    if (msg.json) cJSON_Delete(msg.json);
+                }
+                if (cbd && cbd->db)
+                    persist_update_channel_balance(cbd->db, my_index - 1,
+                        ch->local_amount, ch->remote_amount, ch->commitment_number);
+                memset(sett_preimage, 0, 32);
+                break;
             }
 
             /* Fulfill: find the most recent active received HTLC and look up preimage */
