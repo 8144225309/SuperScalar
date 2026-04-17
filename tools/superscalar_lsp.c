@@ -3348,6 +3348,8 @@ accept_new_factory:
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;
+        mgr->economic_mode = (economic_mode_t)economic_mode_arg;
+        mgr->settlement_interval_blocks = settlement_interval;
         mgr->auto_rebalance = auto_rebalance;
         mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;
 
@@ -3481,6 +3483,19 @@ accept_new_factory:
 
             /* Accept bridge connection if available */
             /* (bridge connects asynchronously — handled in daemon loop via select) */
+
+            /* --test-bad-settlement: inject fake routing fees so settlement
+               triggers on the next block. In production, fees accumulate from
+               bridge-routed payments. */
+            if (test_bad_settlement) {
+                for (size_t ci = 0; ci < mgr->n_channels; ci++) {
+                    mgr->entries[ci].accumulated_fees_sats = 10000;
+                    mgr->accumulated_fees_sats += 10000;
+                }
+                printf("LSP: --test-bad-settlement: injected 10000 sats fees/ch "
+                       "(will settle at half the correct amount)\n");
+                fflush(stdout);
+            }
 
             /* Wire admin RPC into daemon loop if initialized */
             if (g_admin_rpc.listen_fd >= 0)
