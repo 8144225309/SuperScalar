@@ -1,0 +1,30 @@
+# OSS-Fuzz project metadata for SuperScalar.
+# When uploaded to google/oss-fuzz at projects/superscalar/, this file tells
+# OSS-Fuzz how to build + who to notify on crashes.
+#
+# Docs: https://google.github.io/oss-fuzz/getting-started/new-project-guide/#projectyaml
+
+homepage: "https://github.com/8144225309/SuperScalar"
+language: c
+primary_contact: "248271067+8144225309@users.noreply.github.com"
+auto_ccs:
+  - "248271067+8144225309@users.noreply.github.com"
+
+# libFuzzer is the primary engine; also build for AFL++ and Honggfuzz.
+fuzzing_engines:
+  - libfuzzer
+  - afl
+  - honggfuzz
+
+# Run under all three relevant sanitizers in parallel.
+sanitizers:
+  - address
+  - undefined
+  - memory
+
+# Architectures
+architectures:
+  - x86_64
+
+# Main source repo (OSS-Fuzz clones it for build)
+main_repo: "https://github.com/8144225309/SuperScalar.git"

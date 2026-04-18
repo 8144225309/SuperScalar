@@ -15,9 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  name: Linux,                sanitizers: false }
-          - { os: macos-latest,   name: macOS,                sanitizers: false }
-          - { os: ubuntu-latest,  name: "Linux (sanitizers)", sanitizers: true  }
+          - { os: ubuntu-latest,  name: Linux,                sanitizers: false, tsan: false }
+          - { os: macos-latest,   name: macOS,                sanitizers: false, tsan: false }
+          - { os: ubuntu-latest,  name: "Linux (sanitizers)", sanitizers: true,  tsan: false }
+          - { os: ubuntu-latest,  name: "Linux (TSan)",       sanitizers: false, tsan: true  }
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
     timeout-minutes: 30
@@ -36,13 +37,17 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_SANITIZERS=${{ matrix.sanitizers && 'ON' || 'OFF' }} \
+            -DENABLE_TSAN=${{ matrix.tsan && 'ON' || 'OFF' }} \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       - name: Build
         run: cmake --build build --parallel
       - name: Unit tests
         env:
+          # ASan: leaks fail the job (exitcode=23). Suppressions in test/sanitizer_suppressions/lsan.supp.
+          # TSan: data races fail the job (halt_on_error=1). Suppressions in test/sanitizer_suppressions/tsan.supp.
           ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
-          LSAN_OPTIONS: ${{ matrix.sanitizers && 'exitcode=0' || '' }}
+          LSAN_OPTIONS: ${{ matrix.sanitizers && 'exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0' || '' }}
+          TSAN_OPTIONS: ${{ matrix.tsan && 'halt_on_error=1:second_deadlock_stack=1:suppressions=test/sanitizer_suppressions/tsan.supp:print_suppressions=0' || '' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           cd build && ./test_superscalar --unit

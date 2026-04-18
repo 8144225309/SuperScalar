@@ -616,6 +616,7 @@ int test_basepoint_independence(void) {
                     "local_payment_basepoint should be populated");
     }
 
+    lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);

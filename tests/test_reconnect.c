@@ -242,6 +242,7 @@ int test_reconnect_pubkey_match(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
+    lsp_channels_cleanup(&mgr);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
     free(lsp);
@@ -554,6 +555,7 @@ int test_balance_reporting(void) {
     /* NULL should be a no-op */
     lsp_channels_print_balances(NULL);
 
+    lsp_channels_cleanup(&mgr);
     factory_free(factory);
     free(factory);
     secp256k1_context_destroy(ctx);
@@ -778,6 +780,7 @@ int test_watchtower_watch_and_check(void) {
     TEST_ASSERT_EQ(wt.n_entries, 0, "0 entries after remove");
 
     channel_cleanup(&ch);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1381,6 +1384,7 @@ int test_watchtower_wired(void) {
     TEST_ASSERT(ok == 1, "watchtower_watch accepts entry");
     TEST_ASSERT_EQ(wt.n_entries, 1, "watchtower has 1 entry");
 
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
     return 1;
@@ -1404,6 +1408,7 @@ int test_watchtower_entry_fields(void) {
     TEST_ASSERT_EQ(wt.entries[0].to_local_amount, 12345, "amount stored");
     TEST_ASSERT_MEM_EQ(wt.entries[0].txid, txid, 32, "txid stored");
 
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -1822,6 +1827,7 @@ int test_breach_detect_old_commitment(void) {
     TEST_ASSERT_MEM_EQ(wt.entries[0].txid, rebuilt_txid, 32,
                         "watchtower entry matches rebuilt txid");
 
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
     return 1;
@@ -2579,6 +2585,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     waitpid(pid, &status, 0);
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
@@ -2621,8 +2628,8 @@ int test_reconnect_commitment_mismatch_reject(void) {
     close(sv[1]);  /* close client end so LSP can detect disconnect */
 
     wire_msg_t msg;
-    if (!wire_recv_timeout(sv[0], &msg, 5)) {
-        /* If recv fails, that's fine — we'll call handle_reconnect_with_msg directly */
+    if (wire_recv_timeout(sv[0], &msg, 5)) {
+        if (msg.json) cJSON_Delete(msg.json);
     }
 
     /* Re-create socketpair for clean test */
@@ -2652,6 +2659,7 @@ int test_reconnect_commitment_mismatch_reject(void) {
     ok = lsp_channels_handle_reconnect(&mgr, lsp, sv3[0]);
     TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
@@ -2802,6 +2810,7 @@ int test_reconnect_htlc_replay(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);

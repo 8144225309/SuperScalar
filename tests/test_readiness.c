@@ -30,10 +30,10 @@ int test_readiness_set_connected(void) {
     readiness_tracker_t rt;
     readiness_init(&rt, 1, 4, NULL);
     readiness_set_connected(&rt, 2, 1);
-    TEST_ASSERT(rt.connected_bitmap == (1u << 2), "bit 2 set");
+    TEST_ASSERT(rt.connected_bitmap == (1ULL <<2), "bit 2 set");
     TEST_ASSERT(rt.clients[2].is_connected == 1, "entry connected");
     readiness_set_connected(&rt, 0, 1);
-    TEST_ASSERT(rt.connected_bitmap == ((1u << 2) | (1u << 0)), "bits 0,2 set");
+    TEST_ASSERT(rt.connected_bitmap == ((1ULL <<2) | (1ULL <<0)), "bits 0,2 set");
     return 1;
 }
 
@@ -46,7 +46,7 @@ int test_readiness_set_ready(void) {
     /* Connect then set ready */
     readiness_set_connected(&rt, 1, 1);
     readiness_set_ready(&rt, 1, QUEUE_REQ_ROTATION);
-    TEST_ASSERT(rt.ready_bitmap == (1u << 1), "bit 1 ready");
+    TEST_ASSERT(rt.ready_bitmap == (1ULL <<1), "bit 1 ready");
     TEST_ASSERT(rt.clients[1].ready_for == QUEUE_REQ_ROTATION, "ready_for type");
     return 1;
 }
@@ -80,7 +80,7 @@ int test_readiness_clear(void) {
     readiness_init(&rt, 1, 4, NULL);
     readiness_set_connected(&rt, 2, 1);
     readiness_set_ready(&rt, 2, QUEUE_REQ_ROTATION);
-    TEST_ASSERT(rt.ready_bitmap == (1u << 2), "ready before clear");
+    TEST_ASSERT(rt.ready_bitmap == (1ULL <<2), "ready before clear");
     readiness_clear(&rt, 2);
     TEST_ASSERT(rt.ready_bitmap == 0, "ready cleared");
     TEST_ASSERT(rt.connected_bitmap == 0, "connected cleared");
@@ -111,8 +111,8 @@ int test_readiness_persist_roundtrip(void) {
     TEST_ASSERT(rt2.clients[0].ready_for == QUEUE_REQ_ROTATION, "client 0 ready_for");
     TEST_ASSERT(rt2.clients[2].is_connected == 1, "client 2 connected");
     TEST_ASSERT(rt2.clients[2].is_ready == 0, "client 2 not ready");
-    TEST_ASSERT(rt2.ready_bitmap == (1u << 0), "ready bitmap restored");
-    TEST_ASSERT(rt2.connected_bitmap == ((1u << 0) | (1u << 2)),
+    TEST_ASSERT(rt2.ready_bitmap == (1ULL <<0), "ready bitmap restored");
+    TEST_ASSERT(rt2.connected_bitmap == ((1ULL <<0) | (1ULL <<2)),
                 "connected bitmap restored");
     persist_close(&db);
     return 1;

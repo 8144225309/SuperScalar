@@ -1120,6 +1120,11 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
+    /* Release any prior tree state (caller may reuse f across loads).
+       factory_init_from_pubkeys memsets f, which would leak existing tx_bufs. */
+    if (f->n_nodes > 0)
+        factory_free(f);
+
     /* Reconstruct factory */
     factory_init_from_pubkeys(f, ctx, pubkeys, n_participants,
                                step_blocks, states_per_layer);
@@ -1131,8 +1136,12 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                          fund_spk, 34);
 
-    if (!factory_build_tree(f))
+    if (!factory_build_tree(f)) {
+        /* factory_build_tree may have partially allocated tx_bufs in nodes
+           before failing validation; release them so caller doesn't leak. */
+        factory_free(f);
         return 0;
+    }
 
     return 1;
 }
