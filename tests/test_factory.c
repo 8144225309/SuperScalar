@@ -2622,15 +2622,16 @@ int test_factory_arity1_split_round_leaf_advance(void) {
 
 /* ---- Variable-N tree tests ---- */
 
-/* Secret keys for up to 16 participants */
-/* Generate deterministic secret keys for up to 64 participants.
-   Each key is 32 bytes filled with a unique byte value. */
-static unsigned char seckeys_n[64][32];
+/* Generate deterministic secret keys for up to 128 participants.
+   Each key is 32 bytes filled with a unique 2-byte pattern (i, i^0xff). */
+static unsigned char seckeys_n[128][32];
 static int seckeys_n_initialized = 0;
 static void ensure_seckeys_n(void) {
     if (seckeys_n_initialized) return;
-    for (int i = 0; i < 64; i++)
-        memset(seckeys_n[i], (unsigned char)(0x10 + i), 32);
+    for (int i = 0; i < 128; i++) {
+        for (int b = 0; b < 32; b++)
+            seckeys_n[i][b] = (unsigned char)((b & 1) ? (i ^ 0xff) : (0x10 + i));
+    }
     seckeys_n_initialized = 1;
 }
 
@@ -2902,6 +2903,33 @@ int test_factory_build_tree_n64(void) {
     for (size_t i = 0; i < f->n_nodes; i++)
         TEST_ASSERT(f->nodes[i].is_signed, "all nodes signed n64");
     TEST_ASSERT(factory_advance(f), "advance n64");
+    factory_free(f);
+
+    free(kps);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_build_tree_n128(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair *kps = calloc(128, sizeof(secp256k1_keypair));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc n128");
+
+    /* N=128, arity-2: 64 leaves, depth=6, 254 factory nodes.
+       Validates the raised compile-time limits (FACTORY_MAX_SIGNERS=128,
+       FACTORY_MAX_LEAVES=64, FACTORY_MAX_NODES=512). */
+    TEST_ASSERT(setup_n_factory(f, ctx, kps, 128, FACTORY_ARITY_2, 200000000), "setup n128 arity2");
+    TEST_ASSERT(factory_build_tree(f), "build tree n128 arity2");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 64, "64 leaves n128 arity2");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n128 arity2");
+    printf("    n128 arity-2: %zu nodes, depth=6, %d DW layers\n",
+           f->n_nodes, (int)f->counter.n_layers);
+    TEST_ASSERT(factory_sign_all(f), "sign n128 arity2");
+    for (size_t i = 0; i < f->n_nodes; i++)
+        TEST_ASSERT(f->nodes[i].is_signed, "all nodes signed n128");
+    TEST_ASSERT(factory_advance(f), "advance n128");
     factory_free(f);
 
     free(kps);
