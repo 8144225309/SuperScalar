@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions for SuperScalar.
+#
+# Format: "race:<function_substring>" or "deadlock:<function_substring>".
+# Matches any frame in the report's stack. See:
+#   https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+#
+# Add an entry only if the race is provably benign and we have a clear
+# reason to ignore it. Every entry should have a comment explaining what
+# it suppresses and why.
+#
+# (none yet)
