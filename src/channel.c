@@ -297,6 +297,11 @@ void channel_cleanup(channel_t *ch) {
     ch->htlcs_cap = 0;
     ch->n_htlcs = 0;
 
+    free(ch->ptlcs);
+    ch->ptlcs = NULL;
+    ch->ptlcs_cap = 0;
+    ch->n_ptlcs = 0;
+
     if (ch->local_pcs && ch->n_local_pcs > 0)
         secure_zero(ch->local_pcs, ch->n_local_pcs * 32);
     free(ch->local_pcs);
