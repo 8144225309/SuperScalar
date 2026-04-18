@@ -1521,6 +1521,9 @@ int test_persist_crash_stress(void) {
 
         /* Copy recovered state into mgr/f for next cycle */
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
         /* tx_buf pointers transferred to f via shallow copy — only free the
            struct itself; bufs will be freed by factory_free(f) at end. */
@@ -1640,6 +1643,9 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 0, "c2 ch3 htlc count");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
         /* tx_buf pointers transferred to f via shallow copy — only free the
            struct itself; bufs will be freed by factory_free(f) at end. */
@@ -1736,6 +1742,9 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.htlcs[1].id, 11, "c3 ch3 htlc1 id");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
         /* tx_buf pointers transferred to f via shallow copy — only free the
            struct itself; bufs will be freed by factory_free(f) at end. */
