@@ -712,6 +712,7 @@ int test_jit_watchtower_registration(void) {
                 "watchtower n_channels should be >= 7");
 
     jit_channels_cleanup(&mgr);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(mgr.ctx);
     return 1;
 }
@@ -765,6 +766,7 @@ int test_jit_watchtower_revocation(void) {
                    "entry channel_id should be JIT watchtower index");
 
     channel_cleanup(&ch);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -799,6 +801,7 @@ int test_jit_watchtower_cleanup_on_close(void) {
     TEST_ASSERT_EQ((long)wt.entries[0].channel_id, 0,
                    "remaining entry should be channel 0");
 
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -990,6 +993,7 @@ int test_jit_multiple_watchtower_indices(void) {
                 "wt[7] should be client 3 JIT");
 
     jit_channels_cleanup(&mgr);
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -1027,6 +1031,7 @@ int test_jit_funding_confirmation_transition(void) {
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "should be active after manual open");
 
     jit_channels_cleanup(&mgr);
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -1207,6 +1212,7 @@ int test_regtest_jit_daemon_trigger(void) {
 
     /* Cleanup */
     jit_channels_cleanup(&mgr);
+    watchtower_cleanup(&wt);
     free(mgr.entries);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
