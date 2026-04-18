@@ -70,9 +70,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Attempt to load — should validate and not crash */
     {
         secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
-        factory_t f;
-        memset(&f, 0, sizeof(f));
-        persist_load_factory(&p, 1, &f, ctx);
+        factory_t *f = (factory_t *)calloc(1, sizeof(factory_t));
+        if (f) {
+            persist_load_factory(&p, 1, f, ctx);
+            free(f);
+        }
         secp256k1_context_destroy(ctx);
     }
 
