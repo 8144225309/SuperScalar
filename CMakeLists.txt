@@ -16,14 +16,25 @@ target_compile_options(project_warnings INTERFACE
     $<$<C_COMPILER_ID:GNU>:-Wno-stringop-truncation>
 )
 
-# --- Sanitizers (opt-in) ---
-option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
+# --- Sanitizers (opt-in, mutually exclusive: ASan and TSan can't coexist) ---
+option(ENABLE_SANITIZERS "Enable ASan + UBSan + LSan" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ENABLE_SANITIZERS)" OFF)
+if(ENABLE_SANITIZERS AND ENABLE_TSAN)
+    message(FATAL_ERROR "ENABLE_SANITIZERS (ASan) and ENABLE_TSAN are mutually exclusive — pick one")
+endif()
 if(ENABLE_SANITIZERS)
     add_library(project_sanitizers INTERFACE)
     target_compile_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined)
+endif()
+if(ENABLE_TSAN)
+    add_library(project_sanitizers INTERFACE)
+    target_compile_options(project_sanitizers INTERFACE
+        -fsanitize=thread -fno-omit-frame-pointer -g)
+    target_link_options(project_sanitizers INTERFACE
+        -fsanitize=thread)
 endif()
 
 # --- Coverage (opt-in, mutually exclusive with sanitizers) ---
