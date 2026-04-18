@@ -6,9 +6,9 @@
 
 homepage: "https://github.com/8144225309/SuperScalar"
 language: c
-primary_contact: "disturbedjasonx@gmail.com"
+primary_contact: "248271067+8144225309@users.noreply.github.com"
 auto_ccs:
-  - "disturbedjasonx@gmail.com"
+  - "248271067+8144225309@users.noreply.github.com"
 
 # libFuzzer is the primary engine; also build for AFL++ and Honggfuzz.
 fuzzing_engines:
