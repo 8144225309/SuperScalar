@@ -709,10 +709,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
 
     /* Parse L-stock hashlock hashes (optional) */
-    unsigned char rot_hashes[FACTORY_MAX_EPOCHS][32];
+    unsigned char (*rot_hashes)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_EPOCHS, 32);
     size_t rot_n_hashes = 0;
     cJSON *rlsh_arr = cJSON_GetObjectItem(pj, "l_stock_hashes");
-    if (rlsh_arr && cJSON_IsArray(rlsh_arr)) {
+    if (rot_hashes && rlsh_arr && cJSON_IsArray(rlsh_arr)) {
         int rlsh_n = cJSON_GetArraySize(rlsh_arr);
         for (int rhi = 0; rhi < rlsh_n && rhi < FACTORY_MAX_EPOCHS; rhi++) {
             cJSON *rh = cJSON_GetArrayItem(rlsh_arr, rhi);
@@ -736,6 +736,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
+    free(rot_hashes);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
@@ -1350,10 +1351,10 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* Parse L-stock hashlock hashes (optional — present when LSP has
        revocation secrets for burn TX enforcement). */
-    unsigned char parsed_l_stock_hashes[FACTORY_MAX_EPOCHS][32];
+    unsigned char (*parsed_l_stock_hashes)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_EPOCHS, 32);
     size_t n_parsed_hashes = 0;
     cJSON *lsh_arr = cJSON_GetObjectItem(msg.json, "l_stock_hashes");
-    if (lsh_arr && cJSON_IsArray(lsh_arr)) {
+    if (parsed_l_stock_hashes && lsh_arr && cJSON_IsArray(lsh_arr)) {
         int lsh_n = cJSON_GetArraySize(lsh_arr);
         for (int hi = 0; hi < lsh_n && hi < FACTORY_MAX_EPOCHS; hi++) {
             cJSON *h = cJSON_GetArrayItem(lsh_arr, hi);
@@ -1433,6 +1434,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_arity(factory, FACTORY_ARITY_1);
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
+    free(parsed_l_stock_hashes);
     factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 

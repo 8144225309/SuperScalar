@@ -226,11 +226,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
     int saved_has_shachain = f->has_shachain;
     int saved_use_flat = f->use_flat_secrets;
     size_t saved_n_secrets = f->n_revocation_secrets;
-    unsigned char saved_secrets[FACTORY_MAX_EPOCHS][32];
+    unsigned char (*saved_secrets)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_EPOCHS, 32);
     unsigned char saved_shachain_seed[32];
-    if (saved_use_flat)
+    if (saved_use_flat && saved_secrets)
         memcpy(saved_secrets, f->revocation_secrets, saved_n_secrets * 32);
-    else
+    else if (!saved_use_flat)
         memcpy(saved_shachain_seed, f->shachain_seed, 32);
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
@@ -241,11 +241,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
     f->economic_mode = saved_econ;
     memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
     if (saved_has_shachain) {
-        if (saved_use_flat)
+        if (saved_use_flat && saved_secrets)
             factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
-        else
+        else if (!saved_use_flat)
             factory_set_shachain_seed(f, saved_shachain_seed);
     }
+    free(saved_secrets);
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);
 

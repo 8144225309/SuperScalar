@@ -566,8 +566,12 @@ int gossip_store_enumerate_channels_since(gossip_store_t *gs,
 size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t out_cap) {
     if (!gs || !gs->db || !out) return 0;
 
-    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
-    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    rgs_node_id_t *nodes = (rgs_node_id_t *)calloc(RGS_MAX_NODE_IDS, sizeof(rgs_node_id_t));
+    rgs_channel_t *channels = (rgs_channel_t *)calloc(RGS_MAX_CHANNELS, sizeof(rgs_channel_t));
+    if (!nodes || !channels) {
+        free(nodes); free(channels);
+        return 0;
+    }
     uint32_t n_nodes = 0, n_channels = 0;
 
     /* Collect unique node IDs from channels */
@@ -575,8 +579,10 @@ size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t ou
     if (sqlite3_prepare_v2(gs->db,
             "SELECT node1_hex, node2_hex, scid, capacity_sat "
             "FROM gossip_channels LIMIT ?;",
-            -1, &stmt, NULL) != SQLITE_OK)
+            -1, &stmt, NULL) != SQLITE_OK) {
+        free(nodes); free(channels);
         return 0;
+    }
     sqlite3_bind_int(stmt, 1, RGS_MAX_CHANNELS);
 
     while (sqlite3_step(stmt) == SQLITE_ROW && n_channels < RGS_MAX_CHANNELS) {
@@ -648,7 +654,10 @@ size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t ou
     snap.node_id_count = n_nodes;
     snap.channel_count = n_channels;
 
-    return rgs_build(&snap, nodes, channels, out, out_cap);
+    size_t result = rgs_build(&snap, nodes, channels, out, out_cap);
+    free(nodes);
+    free(channels);
+    return result;
 }
 
 /* === RGS client-side import (populate gossip_store from snapshot) === */
@@ -658,15 +667,21 @@ size_t gossip_store_export_rgs(gossip_store_t *gs, unsigned char *out, size_t ou
 int gossip_store_import_rgs(gossip_store_t *gs, const unsigned char *blob, size_t blob_len) {
     if (!gs || !blob || blob_len < 17) return -1;
 
-    rgs_node_id_t nodes[RGS_MAX_NODE_IDS];
-    rgs_channel_t channels[RGS_MAX_CHANNELS];
+    rgs_node_id_t *nodes = (rgs_node_id_t *)calloc(RGS_MAX_NODE_IDS, sizeof(rgs_node_id_t));
+    rgs_channel_t *channels = (rgs_channel_t *)calloc(RGS_MAX_CHANNELS, sizeof(rgs_channel_t));
+    if (!nodes || !channels) {
+        free(nodes); free(channels);
+        return -1;
+    }
     rgs_snapshot_t snap;
     snap.node_id_count = 0;
     snap.channel_count = 0;
 
     if (!rgs_parse(blob, blob_len, &snap, nodes, RGS_MAX_NODE_IDS,
-                    channels, RGS_MAX_CHANNELS))
+                    channels, RGS_MAX_CHANNELS)) {
+        free(nodes); free(channels);
         return -1;
+    }
 
     int imported = 0;
     for (uint32_t i = 0; i < snap.channel_count; i++) {
@@ -693,5 +708,7 @@ int gossip_store_import_rgs(gossip_store_t *gs, const unsigned char *blob, size_
         }
         imported++;
     }
+    free(nodes);
+    free(channels);
     return imported;
 }
