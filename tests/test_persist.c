@@ -1522,7 +1522,8 @@ int test_persist_crash_stress(void) {
         /* Copy recovered state into mgr/f for next cycle */
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
-        factory_free(rec_f);
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
@@ -1640,7 +1641,8 @@ int test_persist_crash_stress(void) {
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
-        factory_free(rec_f);
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
@@ -1735,7 +1737,8 @@ int test_persist_crash_stress(void) {
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
-        factory_free(rec_f);
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
