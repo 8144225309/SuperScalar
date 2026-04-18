@@ -1050,6 +1050,7 @@ int test_rotation_context_save_restore(void) {
     uint32_t saved_attempted_mask = mgr.rot_attempted_mask;
 
     /* Re-init (memsets mgr to 0) */
+    lsp_channels_cleanup(&mgr);
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec_local, 4), "reinit mgr");
 
     /* Verify fields are zeroed */
@@ -1087,6 +1088,7 @@ int test_rotation_context_save_restore(void) {
     TEST_ASSERT_EQ(mgr.rot_attempted_mask, 0x05, "attempted_mask restored");
 
     memset(saved_seckey, 0, 32);
+    lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);

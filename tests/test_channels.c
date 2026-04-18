@@ -234,6 +234,7 @@ int test_lsp_channel_init(void) {
                         entry->channel.funding_amount - commit_fee, "balance sum");
     }
 
+    lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
@@ -911,6 +912,7 @@ int test_regtest_intra_factory_payment(void) {
         tx_buf_free(&close_tx);
     }
 
+    lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
 
@@ -1305,6 +1307,7 @@ int test_regtest_multi_payment(void) {
         tx_buf_free(&close_tx);
     }
 
+    lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
 
@@ -1376,6 +1379,7 @@ int test_fee_policy_balance_split(void) {
             TEST_ASSERT_EQ(ch->local_amount, usable / 2, "default 50% local");
             TEST_ASSERT_EQ(ch->remote_amount, usable - usable / 2, "default 50% remote");
         }
+        lsp_channels_cleanup(&mgr);
     }
 
     /* Test 2: Revenue-focused LSP with 70% share */
@@ -1391,6 +1395,7 @@ int test_fee_policy_balance_split(void) {
             TEST_ASSERT_EQ(ch->local_amount, expected_local, "70% local");
             TEST_ASSERT_EQ(ch->remote_amount, usable - expected_local, "30% remote");
         }
+        lsp_channels_cleanup(&mgr);
     }
 
     /* Test 3: Generous LSP with 20% share */
@@ -1406,6 +1411,7 @@ int test_fee_policy_balance_split(void) {
             TEST_ASSERT_EQ(ch->local_amount, expected_local, "20% local");
             TEST_ASSERT_EQ(ch->remote_amount, usable - expected_local, "80% remote");
         }
+        lsp_channels_cleanup(&mgr);
     }
 
     /* Test 4: pct > 100 clamped to 100 */
@@ -1420,6 +1426,7 @@ int test_fee_policy_balance_split(void) {
             TEST_ASSERT_EQ(ch->local_amount, usable, "clamped 100% local");
             TEST_ASSERT_EQ(ch->remote_amount, (uint64_t)0, "clamped 0% remote");
         }
+        lsp_channels_cleanup(&mgr);
     }
 
     /* Test 5: Fee policy fields survive init */
@@ -1431,6 +1438,7 @@ int test_fee_policy_balance_split(void) {
         TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4), "init fee");
         TEST_ASSERT_EQ(mgr.routing_fee_ppm, 1000, "fee_ppm preserved");
         TEST_ASSERT_EQ(mgr.lsp_balance_pct, 60, "balance_pct preserved");
+        lsp_channels_cleanup(&mgr);
     }
 
     factory_free(f);
@@ -1543,6 +1551,7 @@ int test_fee_estimator_wiring(void) {
                        "channel uses default 1000 sat/kvB (not wired from estimator)");
     }
 
+    lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
@@ -1586,6 +1595,7 @@ int test_fee_estimator_null_fallback(void) {
                        "channel has default 1000 sat/kvB");
     }
 
+    lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
@@ -2044,6 +2054,7 @@ int test_regtest_lsp_restart_recovery(void) {
     /* Phase 5: "Crash" — zero out channel manager */
     if (lsp_ok) {
         printf("LSP: === SIMULATING CRASH ===\n");
+        lsp_channels_cleanup(&ch_mgr);
         memset(&ch_mgr, 0, sizeof(ch_mgr));
     }
 
@@ -2168,6 +2179,8 @@ int test_regtest_lsp_restart_recovery(void) {
         tx_buf_free(&close_tx);
     }
 
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_channels_cleanup(&rec_mgr);
     lsp_cleanup(lsp);
     free(lsp);
 
@@ -2597,6 +2610,7 @@ int test_regtest_crash_double_recovery(void) {
 
     if (lsp_ok) {
         printf("LSP: === CRASH #1 ===\n");
+        lsp_channels_cleanup(&ch_mgr);
         memset(&ch_mgr, 0, sizeof(ch_mgr));
     }
 
@@ -2675,6 +2689,7 @@ int test_regtest_crash_double_recovery(void) {
 
     if (lsp_ok) {
         printf("LSP: === CRASH #2 ===\n");
+        lsp_channels_cleanup(&rec_mgr);
         memset(&rec_mgr, 0, sizeof(rec_mgr));
     }
 
@@ -2769,6 +2784,9 @@ int test_regtest_crash_double_recovery(void) {
         tx_buf_free(&close_tx);
     }
 
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_channels_cleanup(&rec_mgr);
+    lsp_channels_cleanup(&rec_mgr2);
     lsp_cleanup(lsp);
     free(lsp);
 
@@ -3098,6 +3116,7 @@ int test_regtest_tcp_reconnect(void) {
         }
     }
 
+    lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
 

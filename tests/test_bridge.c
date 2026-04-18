@@ -1393,6 +1393,7 @@ int test_regtest_bridge_payment(void) {
         }
     }
 
+    lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
     secp256k1_context_destroy(ctx);
@@ -1872,6 +1873,7 @@ int test_regtest_bridge_invoice_flow(void) {
         }
     }
 
+    lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
     secp256k1_context_destroy(ctx);
