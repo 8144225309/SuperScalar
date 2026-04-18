@@ -1079,7 +1079,9 @@ int test_lsp_recovery_round_trip(void) {
 
     lsp_channels_cleanup(&mgr);
     lsp_channels_cleanup(&rec_mgr);
+    factory_free(rec_f);
     free(rec_f);
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
@@ -1520,6 +1522,7 @@ int test_persist_crash_stress(void) {
         /* Copy recovered state into mgr/f for next cycle */
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
+        factory_free(rec_f);
         free(rec_f);
         persist_close(&db);
     }
@@ -1637,6 +1640,7 @@ int test_persist_crash_stress(void) {
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
+        factory_free(rec_f);
         free(rec_f);
         persist_close(&db);
     }
@@ -1731,6 +1735,7 @@ int test_persist_crash_stress(void) {
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
         memcpy(f, rec_f, sizeof(*f));
+        factory_free(rec_f);
         free(rec_f);
         persist_close(&db);
     }
@@ -1829,11 +1834,13 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 2, "c4 ch3 2 htlcs");
 
         lsp_channels_cleanup(&rec_mgr);
+        factory_free(rec_f);
         free(rec_f);
         persist_close(&db);
     }
 
     lsp_channels_cleanup(&mgr);
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);

@@ -43,6 +43,7 @@ int test_hd_wallet_derives_p2tr(void)
     /* Two different indices must give different SPKs */
     ASSERT(memcmp(ws.spks[0], ws.spks[1], 34) != 0, "index 0 != index 1");
 
+    if (ws.base.free) ws.base.free(&ws.base);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -82,6 +83,7 @@ int test_hd_wallet_sign_verify(void)
 
     extern void secure_zero(void *p, size_t n);
     secure_zero(seckey, 32);
+    if (ws.base.free) ws.base.free(&ws.base);
     secp256k1_context_destroy(ctx);
     return 1;
 }
