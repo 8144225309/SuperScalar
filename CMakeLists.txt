@@ -16,14 +16,47 @@ target_compile_options(project_warnings INTERFACE
     $<$<C_COMPILER_ID:GNU>:-Wno-stringop-truncation>
 )
 
-# --- Sanitizers (opt-in) ---
-option(ENABLE_SANITIZERS "Enable ASan + UBSan" OFF)
+# --- Sanitizers (opt-in, mutually exclusive) ---
+option(ENABLE_SANITIZERS "Enable ASan + UBSan + LSan" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ENABLE_SANITIZERS)" OFF)
+option(ENABLE_MSAN "Enable MemorySanitizer (clang only; requires instrumented libc/libssl/libsqlite or runs with false positives)" OFF)
+set(_n_san 0)
+if(ENABLE_SANITIZERS)
+    math(EXPR _n_san "${_n_san}+1")
+endif()
+if(ENABLE_TSAN)
+    math(EXPR _n_san "${_n_san}+1")
+endif()
+if(ENABLE_MSAN)
+    math(EXPR _n_san "${_n_san}+1")
+endif()
+if(_n_san GREATER 1)
+    message(FATAL_ERROR "ENABLE_SANITIZERS, ENABLE_TSAN, and ENABLE_MSAN are mutually exclusive — pick one")
+endif()
 if(ENABLE_SANITIZERS)
     add_library(project_sanitizers INTERFACE)
     target_compile_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined)
+endif()
+if(ENABLE_TSAN)
+    add_library(project_sanitizers INTERFACE)
+    target_compile_options(project_sanitizers INTERFACE
+        -fsanitize=thread -fno-omit-frame-pointer -g)
+    target_link_options(project_sanitizers INTERFACE
+        -fsanitize=thread)
+endif()
+if(ENABLE_MSAN)
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "ENABLE_MSAN requires clang (CC=clang)")
+    endif()
+    add_library(project_sanitizers INTERFACE)
+    target_compile_options(project_sanitizers INTERFACE
+        -fsanitize=memory -fsanitize-memory-track-origins=2
+        -fno-omit-frame-pointer -g)
+    target_link_options(project_sanitizers INTERFACE
+        -fsanitize=memory)
 endif()
 
 # --- Coverage (opt-in, mutually exclusive with sanitizers) ---

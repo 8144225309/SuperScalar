@@ -181,6 +181,7 @@ int test_chan_open_v2_accept_built(void)
     chan_open_inbound_v2(&pmgr, 0, msg, sizeof(msg), ctx, &ch);
     ASSERT(ch.to_self_delay == 144, "DF1: to_self_delay parsed correctly");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -273,6 +274,7 @@ int test_chan_open_v2_with_ctx(void)
     int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
     ASSERT(r == 78, "DF5: returns 78");
 
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -328,6 +330,7 @@ int test_chan_open_v2_basepoints_nonzero(void)
     if (r == 1) {
         ASSERT(bp_set, "DF7: basepoints non-zero on success");
     }
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }

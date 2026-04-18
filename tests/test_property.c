@@ -243,6 +243,7 @@ int test_prop_channel_balance_conservation(void) {
                 htlc_sum += ch.htlcs[i].amount_sats;
         }
         uint64_t total = ch.local_amount + ch.remote_amount + htlc_sum;
+        channel_cleanup(&ch);
         TEST_ASSERT_EQ((long)total, (long)initial,
                         "balance conservation violated");
     }
@@ -472,7 +473,9 @@ int test_prop_persist_factory_roundtrip(void) {
         TEST_ASSERT_EQ((long)loaded->states_per_layer, (long)states,
                         "states_per_layer mismatch");
 
+        factory_free(f);
         free(f);
+        factory_free(loaded);
         free(loaded);
         persist_close(&db);
     }

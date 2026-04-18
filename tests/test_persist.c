@@ -986,7 +986,7 @@ int test_lsp_recovery_round_trip(void) {
 
     /* Now recover: load factory from DB, init channels from DB */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
-    if (!rec_f) return 0;
+    if (!rec_f) { lsp_channels_cleanup(&mgr); return 0; }
 
     TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "load factory");
     TEST_ASSERT_EQ(rec_f->n_participants, 5, "n_participants");
@@ -1077,7 +1077,11 @@ int test_lsp_recovery_round_trip(void) {
     /* Channel 1 should have no HTLCs */
     TEST_ASSERT_EQ(rec_mgr.entries[1].channel.n_htlcs, 0, "ch1 no htlcs");
 
+    lsp_channels_cleanup(&mgr);
+    lsp_channels_cleanup(&rec_mgr);
+    factory_free(rec_f);
     free(rec_f);
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
@@ -1480,6 +1484,7 @@ int test_persist_crash_stress(void) {
     }
 
     /* Zero everything */
+    lsp_channels_cleanup(&mgr);
     memset(&mgr, 0, sizeof(mgr));
 
     /* Recover cycle 1 */
@@ -1516,7 +1521,12 @@ int test_persist_crash_stress(void) {
 
         /* Copy recovered state into mgr/f for next cycle */
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
@@ -1586,6 +1596,7 @@ int test_persist_crash_stress(void) {
         persist_close(&db);
     }
 
+    lsp_channels_cleanup(&mgr);
     memset(&mgr, 0, sizeof(mgr));
 
     /* Recover cycle 2 */
@@ -1632,7 +1643,12 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 0, "c2 ch3 htlc count");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
@@ -1690,6 +1706,7 @@ int test_persist_crash_stress(void) {
         persist_close(&db);
     }
 
+    lsp_channels_cleanup(&mgr);
     memset(&mgr, 0, sizeof(mgr));
 
     /* Recover cycle 3 */
@@ -1725,7 +1742,12 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.htlcs[1].id, 11, "c3 ch3 htlc1 id");
 
         memcpy(&mgr, &rec_mgr, sizeof(mgr));
+        /* Release f's prior tx_bufs (from previous cycle's shallow copy)
+           before they get overwritten by this cycle's pointers. */
+        if (f->n_nodes > 0) factory_free(f);
         memcpy(f, rec_f, sizeof(*f));
+        /* tx_buf pointers transferred to f via shallow copy — only free the
+           struct itself; bufs will be freed by factory_free(f) at end. */
         free(rec_f);
         persist_close(&db);
     }
@@ -1780,6 +1802,7 @@ int test_persist_crash_stress(void) {
         persist_close(&db);
     }
 
+    lsp_channels_cleanup(&mgr);
     memset(&mgr, 0, sizeof(mgr));
 
     /* Recover cycle 4 */
@@ -1822,10 +1845,14 @@ int test_persist_crash_stress(void) {
         /* ch3 still has 2 HTLCs from cycle 3 */
         TEST_ASSERT_EQ(rec_mgr.entries[3].channel.n_htlcs, 2, "c4 ch3 2 htlcs");
 
+        lsp_channels_cleanup(&rec_mgr);
+        factory_free(rec_f);
         free(rec_f);
         persist_close(&db);
     }
 
+    lsp_channels_cleanup(&mgr);
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);

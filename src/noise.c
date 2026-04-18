@@ -47,7 +47,8 @@ void hkdf_expand(unsigned char *okm, size_t okm_len,
             ? input_stack : (unsigned char *)malloc(input_len);
         if (t_len > 0)
             memcpy(input, t, t_len);
-        memcpy(input + t_len, info, info_len);
+        if (info_len > 0)
+            memcpy(input + t_len, info, info_len);
         input[t_len + info_len] = (unsigned char)i;
 
         hmac_sha256(t, prk, 32, input, input_len);
