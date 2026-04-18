@@ -780,6 +780,7 @@ int test_watchtower_watch_and_check(void) {
     TEST_ASSERT_EQ(wt.n_entries, 0, "0 entries after remove");
 
     channel_cleanup(&ch);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -1383,6 +1384,7 @@ int test_watchtower_wired(void) {
     TEST_ASSERT(ok == 1, "watchtower_watch accepts entry");
     TEST_ASSERT_EQ(wt.n_entries, 1, "watchtower has 1 entry");
 
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
     return 1;
@@ -1406,6 +1408,7 @@ int test_watchtower_entry_fields(void) {
     TEST_ASSERT_EQ(wt.entries[0].to_local_amount, 12345, "amount stored");
     TEST_ASSERT_MEM_EQ(wt.entries[0].txid, txid, 32, "txid stored");
 
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -1824,6 +1827,7 @@ int test_breach_detect_old_commitment(void) {
     TEST_ASSERT_MEM_EQ(wt.entries[0].txid, rebuilt_txid, 32,
                         "watchtower entry matches rebuilt txid");
 
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
     return 1;

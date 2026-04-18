@@ -91,6 +91,7 @@ int test_client_watchtower_init(void) {
     TEST_ASSERT(wt.rt == NULL, "rt should be NULL");
     TEST_ASSERT(wt.n_entries == 0, "should start with 0 entries");
 
+    watchtower_cleanup(&wt);
     return 1;
 }
 
@@ -199,6 +200,7 @@ int test_client_watch_revoked_commitment(void) {
 
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -408,6 +410,7 @@ int test_htlc_penalty_watch(void) {
 
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
+    watchtower_cleanup(&wt);
     secp256k1_context_destroy(ctx);
     return 1;
 }
