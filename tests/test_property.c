@@ -473,7 +473,9 @@ int test_prop_persist_factory_roundtrip(void) {
         TEST_ASSERT_EQ((long)loaded->states_per_layer, (long)states,
                         "states_per_layer mismatch");
 
+        factory_free(f);
         free(f);
+        factory_free(loaded);
         free(loaded);
         persist_close(&db);
     }
