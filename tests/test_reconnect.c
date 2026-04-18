@@ -242,6 +242,7 @@ int test_reconnect_pubkey_match(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
+    lsp_channels_cleanup(&mgr);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
     free(lsp);
@@ -554,6 +555,7 @@ int test_balance_reporting(void) {
     /* NULL should be a no-op */
     lsp_channels_print_balances(NULL);
 
+    lsp_channels_cleanup(&mgr);
     factory_free(factory);
     free(factory);
     secp256k1_context_destroy(ctx);
@@ -2579,6 +2581,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     waitpid(pid, &status, 0);
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child failed");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
@@ -2652,6 +2655,7 @@ int test_reconnect_commitment_mismatch_reject(void) {
     ok = lsp_channels_handle_reconnect(&mgr, lsp, sv3[0]);
     TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
@@ -2802,6 +2806,7 @@ int test_reconnect_htlc_replay(void) {
     TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "child process failed");
 
+    lsp_channels_cleanup(&mgr);
     persist_close(&db);
     free(lsp->client_fds);
     free(lsp->client_pubkeys);

@@ -243,6 +243,7 @@ int test_prop_channel_balance_conservation(void) {
                 htlc_sum += ch.htlcs[i].amount_sats;
         }
         uint64_t total = ch.local_amount + ch.remote_amount + htlc_sum;
+        channel_cleanup(&ch);
         TEST_ASSERT_EQ((long)total, (long)initial,
                         "balance conservation violated");
     }
