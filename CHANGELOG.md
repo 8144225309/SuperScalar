@@ -4,33 +4,54 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Client-side verification hardening across all factory lifecycle boundaries. Fixes the economic model default and adds defense-in-depth conservation checks.
+Factory participant cap raised from 64 to 128. Per-channel fee tracking and HTLC-based profit settlement. Client-side verification at every factory lifecycle boundary. Memory-safety CI hardening (LSan leak gate, TSan job, OSS-Fuzz integration) — 1050 pre-existing leaks found and fixed. 1367 unit tests, all passing under ASan+UBSan+LSan and TSan.
 
-### Client verification (PR #63)
+### Added
 
-- **Funding TX on-chain verification** (`client.c`, `client.h`): new `client_verify_funding_fn` callback verifies the on-chain funding TX amount matches the LSP's claim before signing the factory tree. Without this, an adversarial LSP could claim phantom funding. Implemented via RPC (`getrawtransaction`) when `--rpcuser` is provided; logs explicit WARNING when chain verification is unavailable.
-- **Distribution TX amount verification** (`client.c`): during factory rotation, the client compares the LSP's offered `dist_amounts[my_index]` to its channel balance and refuses to sign if the distribution is less than owed.
-- **Rotation balance carry verification** (`client.c`): saves old channel balance before `client_init_channel` overwrites it during rotation, then verifies the new balance >= old balance. Prevents LSP from silently dropping accumulated sats.
-- **Participant index verification** (`client.c`): after HELLO_ACK, verifies `all_pubkeys[my_index]` matches the client's own pubkey. Prevents signing a tree where the client's slot is controlled by a different key.
-- **Cooperative close verification** (`client.c`, `client.h`): `client_do_close_ceremony` now takes an optional `channel_t*` and verifies at least one close output >= the client's channel balance before signing. Previously the client signed LSP-proposed close amounts blindly.
-- **Economic terms logging + enforcement** (`client.c`, `client.h`): logs economic_mode and profit_share_bps before signing. New `--min-profit-bps N` CLI flag and `client_set_min_profit_bps()` API reject factories offering less than the client's minimum profit share.
-- **Client-side conservation invariant** (`client.c`): `client_check_conservation()` runs after every `channel_add_htlc` and `channel_fulfill_htlc`, verifying `local + remote + htlc_sum + fees == funding`. Defense-in-depth — the MuSig2 commitment signature already prevents exploitation, but this catches balance arithmetic bugs.
+- **Factory scale to 128 signers**: `FACTORY_MAX_SIGNERS` 64→128, `FACTORY_MAX_NODES` 256→512, `FACTORY_MAX_LEAVES` 32→64, `LSP_MAX_CLIENTS` 64→128, `MUSIG_SESSION_MAX_SIGNERS` 64→128, `WATCHTOWER_MAX_CHANNELS` 32→64. New `test_factory_build_tree_n128` verifies 254-node tree (depth 6, 7 DW layers) builds, signs, and advances.
+- **Per-channel fee tracking** (`lsp_channels.c`, `channel.c`): routing fees attributed to the channel that carried the payment (`accumulated_fees_sats` per `lsp_channel_entry_t`). Replaces the previous global pool that distributed fees to unrelated channels.
+- **HTLC-based profit settlement** (`lsp_channels_settle_via_payment`): fee distribution now flows through the standard HTLC add → commit → revoke → fulfill pipeline, replacing the broken direct balance modification that desynced channel state.
+- **Client-side fee tracking + settlement verification** (`superscalar_client.c`): client tracks `tracked_routed_sats`, `tracked_fees_sats`, `settled_fees_sats` and logs `SETTLEMENT UNDERPAYMENT` when offered amount is below the expected share. Settlement HTLCs are auto-fulfilled with the included preimage on detection.
+- **Client verification at lifecycle boundaries** (PR #63 — `client.c`, `client.h`):
+  - Funding TX on-chain verification via `client_verify_funding_fn` (RPC `getrawtransaction`); rejects phantom-funding LSPs.
+  - Distribution TX amount verification during rotation; refuses to sign if offered amount < channel balance.
+  - Rotation balance carry verification; refuses to sign if new balance < old balance.
+  - Participant index verification after HELLO_ACK; refuses to sign if `all_pubkeys[my_index]` ≠ own pubkey.
+  - Cooperative close verification; refuses to sign unless at least one output ≥ local balance.
+  - Economic terms logging; `--min-profit-bps N` CLI flag rejects factories offering less.
+  - Conservation invariant check (`client_check_conservation`) after every HTLC add/fulfill.
+- **Memory-safety CI** (`.github/workflows/ci.yml`, `CMakeLists.txt`):
+  - `Linux (sanitizers)` job now gates on leaks (`LSAN_OPTIONS=exitcode=23`). Suppressions file at `test/sanitizer_suppressions/lsan.supp`.
+  - New `Linux (TSan)` job builds with `-fsanitize=thread`.
+  - `ENABLE_TSAN` and `ENABLE_MSAN` CMake options for local developer use.
+  - `CONTRIBUTING.md` documents how to run each sanitizer locally.
+- **OSS-Fuzz integration** (`oss-fuzz/`): `build.sh`, `Dockerfile`, `project.yaml`, and README for submitting to Google's continuous fuzzing service. All 7 in-repo fuzz harnesses run under ASan + UBSan + MSan 24/7 once onboarded.
+- **`--test-bad-terms` mode** (`superscalar_lsp.c`): LSP offers 0 bps profit share; clients with `--min-profit-bps > 0` should refuse.
+- **15-combination fee cross-product test** (`test_channels.c`).
+- **Schema v18** (`persist.c`, `persist.h`): `to_self_delay`, `fee_rate_sat_per_kvb`, `use_revocation_leaf` columns on `channels` table for standalone watchtower hydration.
 
-### Economic model fix
+### Changed
 
-- **Default `--lsp-balance-pct` changed from 50 to 100** (`superscalar_lsp.c`): LSP now retains all initial channel capacity by default. The old default gave away 50% of the LSP's capital to clients for free, contradicting the SuperScalar design where clients earn balance by receiving payments or purchasing liquidity. `--demo` mode auto-overrides to 50 for test convenience.
+- **Default `--lsp-balance-pct` 50 → 100** (`superscalar_lsp.c`): LSP retains all initial channel capacity. The old default gave away 50% of the LSP's capital; SuperScalar's design has clients earn balance by receiving or purchasing. `--demo` auto-overrides to 50.
+- **Distribution TX output limit**: validates against `f->n_participants` instead of the per-tree-node `FACTORY_MAX_OUTPUTS = 8` constant. Output array heap-allocated.
+- **Readiness bitmap** `uint32_t → uint64_t` (`readiness.h`, `readiness.c`).
+- **Large stack arrays moved to heap**: 128 KB `FACTORY_MAX_EPOCHS[32]` arrays in `client.c` and `lsp.c`; 1.5 MB RGS gossip arrays in `gossip_store.c`; 12 MB `factory_t` copies in `superscalar_lsp_post_daemon_tests.inc` and `fuzz_persist_load.c`.
 
-### Testing
+### Fixed
 
-- **`--test-bad-terms` mode** (`superscalar_lsp.c`): LSP offers 0 bps profit share with `economic_mode=profit-shared`. Clients with `--min-profit-bps > 0` should refuse. Test PASSES on client rejection, FAILS if any client accepts. Verified end-to-end on regtest.
-
-### Bug fixes (direct to main)
-
-- **HTLC CLTV safety** (`lsp_channels.c`, `lsp_channels.h`): `FACTORY_CLTV_DELTA` was hardcoded to 40 blocks (~7 hours), but the actual DW tree unwind time can be 300+ blocks (~2 days). New `lsp_compute_factory_cltv_delta()` computes the correct delta from the factory's DW counter parameters. HTLCs with insufficient CLTV headroom are now correctly rejected. Matches CLN plugin fix (superscalar-cln `a29bd85`).
-- **RPC error logging** (`chain_backend_rpc.c`): `rpc_call()` now logs the method name, error code, and error message for every bitcoind RPC failure. Previously errors were silently discarded.
-- **Test stack overflow** (`test_wire.c`): `test_wire_distributed_signing` heap-allocated ~2.1 MB of structs that were overflowing the stack. Full test suite now runs: 1363/1363 pass (was 866 before crash).
-- **Rotation conservation violation** (`lsp_rotation.c`): `ch->funding_amount` updated to match carried balances after rotation. Previously, HTLC settlement fees consumed during the old factory caused a permanent -152 sat/channel delta.
-- **Schema v18** (`persist.c`, `persist.h`): `to_self_delay`, `fee_rate_sat_per_kvb`, `use_revocation_leaf` columns added to `channels` table. The standalone watchtower hydrator now reads these from DB instead of hardcoding defaults.
+- **Readiness tracker UB at 32+ clients** (`readiness.c`): `(1u << client_idx)` was undefined for `client_idx >= 32` despite `FACTORY_MAX_SIGNERS = 64`. Tracker silently broke at 32 clients.
+- **Daemon capped at 15 clients** (`superscalar_lsp.c`): `struct pollfd pfds[16]` in funding-confirmation loop overrode `--max-connections`. Now heap-allocated from `lsp->n_clients + 1`.
+- **`add_node()` ignored runtime config** (`factory.c`): checked compile-time `FACTORY_MAX_NODES` instead of `f->config.max_nodes`.
+- **`persist_load_factory` leaked tx_bufs on validation failure** (`persist.c`): `factory_build_tree` could partially allocate node tx_bufs before failing validation; failure path now calls `factory_free`.
+- **`persist_load_factory` leaked tx_bufs on reuse** (`persist.c`): calling twice into the same `factory_t` overwrote existing pointers without freeing. Now `factory_free(f)` when `f->n_nodes > 0`.
+- **`channel_cleanup` leaked `ch->ptlcs`** (`channel.c`): forgot to free the PTLC heap array.
+- **`noise.c` HKDF NULL memcpy** (UBSan): `memcpy(input + t_len, info, 0)` triggered null-pointer-to-nonnull-arg violation; now guarded on `info_len > 0`.
+- **HTLC CLTV safety** (`lsp_channels.c`): `FACTORY_CLTV_DELTA` was hardcoded to 40 blocks (~7 hours) but DW tree unwind can need 300+ blocks (~2 days). New `lsp_compute_factory_cltv_delta()` computes from DW counter parameters.
+- **Rotation conservation violation** (`lsp_rotation.c`): `ch->funding_amount` now updated to match carried balances; HTLC settlement fees from the old factory no longer cause false -152 sat/channel deltas.
+- **Stack overflow in `test_wire_distributed_signing`** (`test_wire.c`): heap-allocated ~2.1 MB of structs that were overflowing the stack.
+- **RPC error logging** (`chain_backend_rpc.c`): `rpc_call()` now logs method, code, and message on bitcoind failures.
+- **`getrawtransaction` params format** (`superscalar_client.c`): comma-separator broke `params_to_json_array`; now space-separated.
+- **1050 memory leaks plugged** across test files (`lsp_channels_cleanup`, `watchtower_cleanup`, `channel_cleanup`, `factory_free`, `wallet_source_hd.base.free`, `cJSON_Delete`). Full suite passes under LeakSanitizer with the gate enabled.
 
 ## 0.1.12 — 2026-04-16
 
