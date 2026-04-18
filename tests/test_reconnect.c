@@ -2628,8 +2628,8 @@ int test_reconnect_commitment_mismatch_reject(void) {
     close(sv[1]);  /* close client end so LSP can detect disconnect */
 
     wire_msg_t msg;
-    if (!wire_recv_timeout(sv[0], &msg, 5)) {
-        /* If recv fails, that's fine — we'll call handle_reconnect_with_msg directly */
+    if (wire_recv_timeout(sv[0], &msg, 5)) {
+        if (msg.json) cJSON_Delete(msg.json);
     }
 
     /* Re-create socketpair for clean test */

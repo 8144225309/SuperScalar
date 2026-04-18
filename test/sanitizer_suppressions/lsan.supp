@@ -1,0 +1,11 @@
+# LeakSanitizer suppressions for SuperScalar.
+#
+# Format: "leak:<function_substring>"  — matches any frame in the leak's
+# allocation stack. See:
+#   https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer
+#
+# Add an entry only if the leak is provably in third-party code that we
+# cannot fix and cannot reasonably work around. Every entry should have a
+# comment explaining what it suppresses and why we accept it.
+#
+# (none yet)
