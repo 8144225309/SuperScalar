@@ -1675,6 +1675,11 @@ extern int test_sweep_persist_roundtrip(void);
 extern int test_regtest_param_sanitization(void);
 extern int test_regtest_exec_rejects_metacharacters(void);
 
+/* Pseudo-Spilman Leaf: On-Chain Regtest */
+extern int test_regtest_ps_basic_close(void);
+extern int test_regtest_ps_chain_close(void);
+extern int test_regtest_ps_old_state_response(void);
+
 /* Mainnet Audit: Password-Hardened KDF */
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
@@ -3393,6 +3398,11 @@ static void run_unit_tests(void) {
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);
     RUN_TEST(test_regtest_exec_rejects_metacharacters);
+
+    printf("\n=== Pseudo-Spilman Leaves: On-Chain Regtest ===\n");
+    RUN_TEST(test_regtest_ps_basic_close);
+    RUN_TEST(test_regtest_ps_chain_close);
+    RUN_TEST(test_regtest_ps_old_state_response);
 
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);
