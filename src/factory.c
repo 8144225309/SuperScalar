@@ -1518,6 +1518,16 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
+        /* Recalculate output amounts: chain[N] spends chain[N-1]'s channel
+           output (vout 0 = ps_prev_chan_amount), so outputs must be rebased. */
+        if (node->ps_prev_chan_amount > f->fee_per_tx) {
+            uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
+            uint64_t per_out   = out_total / 2;
+            uint64_t remainder = out_total - per_out * 2;
+            node->outputs[0].amount_sats = per_out;
+            if (node->n_outputs > 1)
+                node->outputs[1].amount_sats = per_out + remainder;
+        }
         if (!update_l_stock_for_leaf(f, node_idx)) return 0;
         if (!rebuild_node_tx(f, node_idx)) return 0;
         return factory_sign_node(f, node_idx);
@@ -1556,6 +1566,16 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
+        /* Rebase outputs to the new (smaller) input amount — same logic as
+           factory_advance_leaf, but without signing. */
+        if (node->ps_prev_chan_amount > f->fee_per_tx) {
+            uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
+            uint64_t per_out   = out_total / 2;
+            uint64_t remainder = out_total - per_out * 2;
+            node->outputs[0].amount_sats = per_out;
+            if (node->n_outputs > 1)
+                node->outputs[1].amount_sats = per_out + remainder;
+        }
         if (!update_l_stock_for_leaf(f, node_idx)) return 0;
         if (!rebuild_node_tx(f, node_idx)) return 0;
         return 1;
