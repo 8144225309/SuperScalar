@@ -1629,7 +1629,7 @@ int test_regtest_ps_chain_close(void) {
     TEST_ASSERT(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
 
     /* Broadcast chain[0] (initial leaf state, spends leaf KO). */
-    char c0_txid[65], c1_txid[65], c2_txid[65];
+    char c0_txid[65], c1_txid[65];
     TEST_ASSERT(regtest_send_raw_tx(&rt, chain0_hex, c0_txid), "chain[0] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[0] confirmed: %s\n", c0_txid);
