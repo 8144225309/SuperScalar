@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 18
+#define PERSIST_SCHEMA_VERSION 19
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -59,6 +59,25 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
+
+/* --- Pseudo-Spilman leaf chain persistence --- */
+
+/* Save one PS chain entry (call after each PS leaf advance).
+   chain_pos: index of this entry (0 = initial state, equals old ps_chain_len).
+   txid_display: 32-byte display-order txid.  chan_amount_sats: channel vout amount. */
+int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
+                                 uint32_t leaf_node_idx, int chain_pos,
+                                 const unsigned char *txid_display,
+                                 const unsigned char *signed_tx, size_t signed_tx_len,
+                                 uint64_t chan_amount_sats);
+
+/* Load all PS chain entries for a leaf in chain_pos order.
+   chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
+   txids_out: caller-allocated [max_chain][32] internal-order txids.
+   Returns number of entries loaded, 0 on error or no PS chain. */
+int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
+                           tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
+                           int max_chain);
 
 /* List all non-closed factory IDs from the ladder_factories table.
    Returns count written to ids_out (up to max_ids).

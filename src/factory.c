@@ -136,12 +136,15 @@ static int build_single_p2tr_spk(
 }
 
 /* Get nSequence for a node based on its type and DW layer.
-   When per-leaf mode is enabled, leaf state nodes use their independent
-   per-leaf DW layer instead of the global counter. Uses leaf_node_indices[]
-   for arity-agnostic lookup. */
+   PS leaf state nodes always use 0xFFFFFFFE (BIP-68 disabled, anti-fee-snipe
+   enabled) — their state ordering is enforced by TX chaining, not nSequence.
+   When per-leaf mode is enabled, non-PS leaf state nodes use their independent
+   per-leaf DW layer instead of the global counter. */
 static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     if (node->type == NODE_KICKOFF)
         return NSEQUENCE_DISABLE_BIP68;
+    if (node->is_ps_leaf)
+        return 0xFFFFFFFEu;
     if (f->per_leaf_enabled) {
         int node_idx = (int)(node - f->nodes);
         for (int i = 0; i < f->n_leaf_nodes; i++) {
@@ -410,14 +413,22 @@ static int build_all_unsigned_txs(factory_t *f) {
     return 1;
 }
 
-/* Compute BIP-341 sighash for a factory node's input. */
+/* Compute BIP-341 sighash for a factory node's input.
+   PS leaf chain advances (ps_chain_len > 0) spend the channel output (vout 0)
+   of the previous chain TX rather than the parent KO node's output. */
 static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
                                  unsigned char *sighash_out) {
     const unsigned char *prev_spk;
     size_t prev_spk_len;
     uint64_t prev_amount;
 
-    if (node->parent_index < 0) {
+    if (node->is_ps_leaf && node->ps_chain_len > 0) {
+        /* Spending vout 0 (channel output) of the previous chain TX.
+           Channel SPK is node->outputs[0] (unchanged between advances). */
+        prev_spk = node->outputs[0].script_pubkey;
+        prev_spk_len = node->outputs[0].script_pubkey_len;
+        prev_amount = node->ps_prev_chan_amount;
+    } else if (node->parent_index < 0) {
         prev_spk = f->funding_spk;
         prev_spk_len = f->funding_spk_len;
         prev_amount = f->funding_amount_sats;
@@ -565,12 +576,12 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
         if (nc == 0) continue;
         if (d > max_depth) max_depth = d;
         int a = arity_at_depth(f, d);
-        int is_leaf = (a == 1) ? (nc <= 1) : (nc <= 2);
+        int is_leaf = (a == 1 || a == FACTORY_ARITY_PS) ? (nc <= 1) : (nc <= 2);
         if (is_leaf) {
             leaves++;
         } else {
             size_t left_n, right_n;
-            if (a == 1) {
+            if (a == 1 || a == FACTORY_ARITY_PS) {
                 left_n = nc / 2;
                 right_n = nc - left_n;
             } else {
@@ -679,18 +690,37 @@ static int setup_single_leaf_outputs(
     return 1;
 }
 
+/* Set up pseudo-Spilman leaf outputs: identical to single-leaf (1 channel +
+   1 L-stock) but marks the node as a PS leaf so nSequence and advance logic
+   are handled by chaining rather than DW counter decrement. */
+static int setup_ps_leaf_outputs(
+    factory_t *f,
+    factory_node_t *node,
+    uint32_t client_idx,
+    uint64_t input_amount
+) {
+    if (!setup_single_leaf_outputs(f, node, client_idx, input_amount))
+        return 0;
+    node->is_ps_leaf = 1;
+    node->ps_chain_len = 0;
+    memset(node->ps_prev_txid, 0, 32);
+    node->ps_prev_chan_amount = 0;
+    return 1;
+}
+
 /* ---- Generalized N-participant tree builder ---- */
 
 #define TIMEOUT_STEP_BLOCKS 5
 
 /* Compute tree depth (number of binary splits above the leaves).
    n_clients = n_participants - 1 (excluding LSP).
-   Arity-2: each leaf holds 2 clients → ceil(log2(ceil(n_clients/2))) splits.
-   Arity-1: each leaf holds 1 client → ceil(log2(n_clients)) splits.
+   Arity-2:  each leaf holds 2 clients → ceil(log2(ceil(n_clients/2))) splits.
+   Arity-1:  each leaf holds 1 client  → ceil(log2(n_clients)) splits.
+   Arity-PS: same as arity-1 (1 client per leaf, PS chain replaces leaf DW layer).
    Returns 0 for a single leaf (1 or 2 clients depending on arity). */
 static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
     size_t n_leaves;
-    if (arity == FACTORY_ARITY_1)
+    if (arity == FACTORY_ARITY_1 || arity == FACTORY_ARITY_PS)
         n_leaves = n_clients;
     else
         n_leaves = (n_clients + 1) / 2;  /* ceil(n_clients / 2) */
@@ -703,9 +733,9 @@ static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
 }
 
 /* Compute number of leaf nodes.
-   Arity-2: ceil(n_clients / 2).  Arity-1: n_clients. */
+   Arity-2: ceil(n_clients / 2).  Arity-1 / Arity-PS: n_clients. */
 static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
-    if (arity == FACTORY_ARITY_1)
+    if (arity == FACTORY_ARITY_1 || arity == FACTORY_ARITY_PS)
         return (int)n_clients;
     return (int)((n_clients + 1) / 2);
 }
@@ -789,7 +819,7 @@ static int build_subtree(
     /* Determine if this is a leaf (using per-level arity) */
     int cur_arity = arity_at_depth(f, depth);
     int is_leaf;
-    if (cur_arity == 1)
+    if (cur_arity == 1 || cur_arity == FACTORY_ARITY_PS)
         is_leaf = (n_clients <= 1);
     else
         is_leaf = (n_clients <= 2);
@@ -798,7 +828,12 @@ static int build_subtree(
         /* Leaf node: set up channel outputs */
         f->nodes[st_idx].input_amount = ko_out_amount;
 
-        if (n_clients == 1) {
+        if (cur_arity == FACTORY_ARITY_PS) {
+            /* Pseudo-Spilman leaf: 1 client, chained TXs instead of DW nSequence */
+            if (!setup_ps_leaf_outputs(f, &f->nodes[st_idx],
+                                       client_indices[0], ko_out_amount))
+                return 0;
+        } else if (n_clients == 1) {
             if (!setup_single_leaf_outputs(f, &f->nodes[st_idx],
                                            client_indices[0], ko_out_amount))
                 return 0;
@@ -817,7 +852,7 @@ static int build_subtree(
     } else {
         /* Internal node: split clients in half, recurse */
         size_t left_n, right_n;
-        if (cur_arity == 1) {
+        if (cur_arity == 1 || cur_arity == FACTORY_ARITY_PS) {
             left_n = n_clients / 2;
             right_n = n_clients - left_n;
         } else {
@@ -1293,7 +1328,9 @@ int factory_advance(factory_t *f) {
     return factory_sign_all(f);
 }
 
-/* Rebuild unsigned tx for a single node. */
+/* Rebuild unsigned tx for a single node.
+   PS leaf chain advances (ps_chain_len > 0) spend the channel output of the
+   previous chain TX (ps_prev_txid:0) rather than the parent KO's output. */
 static int rebuild_node_tx(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;
     factory_node_t *node = &f->nodes[node_idx];
@@ -1302,7 +1339,10 @@ static int rebuild_node_tx(factory_t *f, size_t node_idx) {
     const unsigned char *input_txid;
     uint32_t input_vout;
 
-    if (node->parent_index < 0) {
+    if (node->is_ps_leaf && node->ps_chain_len > 0) {
+        input_txid = node->ps_prev_txid;
+        input_vout = 0;
+    } else if (node->parent_index < 0) {
         input_txid = f->funding_txid;
         input_vout = f->funding_vout;
     } else {
@@ -1470,9 +1510,22 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
 int factory_advance_leaf(factory_t *f, int leaf_side) {
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    /* PS leaf: append a new TX to the chain rather than decrement nSequence */
+    if (node->is_ps_leaf) {
+        memcpy(node->ps_prev_txid, node->txid, 32);
+        node->ps_prev_chan_amount = node->outputs[0].amount_sats;
+        node->ps_chain_len++;
+        if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+        if (!rebuild_node_tx(f, node_idx)) return 0;
+        return factory_sign_node(f, node_idx);
+    }
+
     f->per_leaf_enabled = 1;
 
-    /* Advance per-leaf counter */
+    /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
         if (!dw_advance(&f->counter.layers[0]))
@@ -1487,7 +1540,6 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
     }
 
     /* Only rebuild + re-sign the leaf node */
-    size_t node_idx = f->leaf_node_indices[leaf_side];
     if (!update_l_stock_for_leaf(f, node_idx)) return 0;
     if (!rebuild_node_tx(f, node_idx)) return 0;
     return factory_sign_node(f, node_idx);
@@ -1496,9 +1548,22 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    /* PS leaf: chain advance, no DW counter */
+    if (node->is_ps_leaf) {
+        memcpy(node->ps_prev_txid, node->txid, 32);
+        node->ps_prev_chan_amount = node->outputs[0].amount_sats;
+        node->ps_chain_len++;
+        if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+        if (!rebuild_node_tx(f, node_idx)) return 0;
+        return 1;
+    }
+
     f->per_leaf_enabled = 1;
 
-    /* Advance per-leaf counter */
+    /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
         if (!dw_advance(&f->counter.layers[0]))
@@ -1513,7 +1578,6 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     }
 
     /* Only rebuild the leaf node (no signing) */
-    size_t node_idx = f->leaf_node_indices[leaf_side];
     if (!update_l_stock_for_leaf(f, node_idx)) return 0;
     if (!rebuild_node_tx(f, node_idx)) return 0;
     return 1;
@@ -2252,6 +2316,35 @@ int factory_build_timeout_spend_tx(
 
     tx_buf_free(&utx);
     return 1;
+}
+
+uint32_t factory_early_warning_time(const factory_t *f) {
+    /* Worst-case blocks to fully unwind the factory from the oldest DW state.
+       For each DW layer: step_blocks * (max_states - 1).
+       PS leaves contribute 0 blocks — their ordering is enforced by TX chaining
+       (each confirmation is ~10 minutes, negligible vs. DW layer delays). */
+    uint32_t ewt = 0;
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        const dw_layer_t *layer = &f->counter.layers[i];
+        if (layer->config.max_states > 1)
+            ewt += (uint32_t)layer->config.step_blocks * (layer->config.max_states - 1);
+    }
+
+    /* If any leaf is a PS leaf, subtract one leaf-layer's worth of blocks.
+       The leaf DW layer is the innermost counter layer (index n_layers-1). */
+    int has_ps = 0;
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        const factory_node_t *node = &f->nodes[f->leaf_node_indices[i]];
+        if (node->is_ps_leaf) { has_ps = 1; break; }
+    }
+    if (has_ps && f->counter.n_layers > 0) {
+        const dw_layer_t *leaf_layer = &f->counter.layers[f->counter.n_layers - 1];
+        uint32_t leaf_cost = (uint32_t)leaf_layer->config.step_blocks *
+                             (leaf_layer->config.max_states > 1
+                              ? leaf_layer->config.max_states - 1 : 0);
+        ewt = (ewt > leaf_cost) ? ewt - leaf_cost : 0;
+    }
+    return ewt;
 }
 
 void factory_free(factory_t *f) {

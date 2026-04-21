@@ -4909,3 +4909,207 @@ int test_factory_config_default(void) {
     free(f);
     return 1;
 }
+
+/* ---- Pseudo-Spilman leaf tests ---- */
+
+/* Build a 3-participant (LSP + 2 clients) factory with FACTORY_ARITY_PS leaves.
+   Each client gets its own PS leaf. Verify structure and nSequence. */
+int test_factory_ps_leaf_build(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xAA;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tw;
+    /* funding SPK: P2TR of 3-of-3 aggregate */
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 3, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 500000, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+
+    /* 3 participants = 2 clients = 2 PS leaves
+       Tree: root KO+State + 2×(leaf KO+State) = 6 nodes */
+    TEST_ASSERT_EQ((int)f->n_nodes, 6, "6 nodes for 2 PS leaves");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 2, "2 leaf nodes");
+
+    /* Both leaf state nodes must be marked is_ps_leaf */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf");
+        TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0, "initial chain_len=0");
+        /* nSequence must be 0xFFFFFFFE (no relative timelock) */
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu, "PS leaf nseq=0xFFFFFFFE");
+        /* Outputs: 1 channel + 1 L-stock */
+        TEST_ASSERT_EQ((int)f->nodes[ni].n_outputs, 2, "PS leaf has 2 outputs");
+    }
+
+    /* Non-leaf state node (root) must NOT be ps_leaf */
+    TEST_ASSERT(!f->nodes[1].is_ps_leaf, "root state not ps_leaf");
+
+    /* Sign and verify */
+    TEST_ASSERT(factory_sign_all(f), "sign PS factory");
+    TEST_ASSERT(factory_verify_all(f), "verify PS factory");
+
+    /* EWT must be less than a pure DW factory of same depth.
+       For PS: EWT is zero (no leaf DW layer; tree is flat with 1 DW layer at root).
+       step=6, states=10 → root layer EWT = 6*(10-1)=54. Leaf PS → 0. Total=54.
+       For pure ARITY_1: 2 DW layers → 54+54=108. */
+    uint32_t ewt = factory_early_warning_time(f);
+    TEST_ASSERT(ewt < 108, "PS EWT < pure DW EWT");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Advance a PS leaf multiple times; verify chain grows and txids change. */
+int test_factory_ps_leaf_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xCC;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDD, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 6, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+
+    /* Capture initial txid */
+    unsigned char txid0[32];
+    memcpy(txid0, f->nodes[leaf0].txid, 32);
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 0, "chain_len=0 before advance");
+
+    /* First advance */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 1");
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 1, "chain_len=1 after advance 1");
+    /* ps_prev_txid must equal txid0 */
+    TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid0, 32) == 0,
+                "ps_prev_txid = original txid");
+    /* New txid must differ */
+    TEST_ASSERT(memcmp(f->nodes[leaf0].txid, txid0, 32) != 0,
+                "txid changed after advance");
+    TEST_ASSERT(f->nodes[leaf0].is_signed, "re-signed after advance");
+
+    unsigned char txid1[32];
+    memcpy(txid1, f->nodes[leaf0].txid, 32);
+
+    /* Second advance */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 2");
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 2, "chain_len=2");
+    TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid1, 32) == 0,
+                "ps_prev_txid = txid1");
+    TEST_ASSERT(memcmp(f->nodes[leaf0].txid, txid1, 32) != 0,
+                "txid changed after advance 2");
+
+    /* nSequence stays 0xFFFFFFFE throughout */
+    TEST_ASSERT(f->nodes[leaf0].nsequence == 0xFFFFFFFEu, "nseq still 0xFFFFFFFE");
+
+    /* The other leaf must be unaffected */
+    size_t leaf1 = f->leaf_node_indices[1];
+    TEST_ASSERT_EQ(f->nodes[leaf1].ps_chain_len, 0, "leaf1 chain_len unchanged");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Verify PS and DW leaves can coexist in the same factory via level_arity. */
+int test_factory_ps_mixed_arity(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tw;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tw);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xEE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 5, 6, 10);
+
+    /* Root level: arity-2 (2 children per node), leaves: arity-PS */
+    uint8_t arities[2] = {2, (uint8_t)FACTORY_ARITY_PS};
+    factory_set_level_arity(f, arities, 2);
+    factory_set_funding(f, fake_txid, 0, 2000000, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build mixed arity");
+    TEST_ASSERT(factory_sign_all(f), "sign mixed arity");
+    TEST_ASSERT(factory_verify_all(f), "verify mixed arity");
+
+    /* All leaf state nodes must be PS */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf in mixed tree");
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu, "leaf nseq=0xFFFFFFFE");
+    }
+
+    /* Root state node is NOT a PS leaf */
+    TEST_ASSERT(!f->nodes[1].is_ps_leaf, "root state not ps_leaf");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
