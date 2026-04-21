@@ -690,17 +690,46 @@ static int setup_single_leaf_outputs(
     return 1;
 }
 
-/* Set up pseudo-Spilman leaf outputs: identical to single-leaf (1 channel +
-   1 L-stock) but marks the node as a PS leaf so nSequence and advance logic
-   are handled by chaining rather than DW counter decrement. */
+/* Set up pseudo-Spilman leaf outputs.
+   vout 0 (channel): uses node->spending_spk — the factory-consensus N-party
+   MuSig P2TR already set by add_node().  This is critical: factory_sign_node()
+   signs chain[1]+ with node->keyagg (= the same N-party key), so the channel
+   output must commit to that same key for on-chain signature verification.
+   vout 1 (L-stock): standard LSP-only P2TR. */
 static int setup_ps_leaf_outputs(
     factory_t *f,
     factory_node_t *node,
     uint32_t client_idx,
     uint64_t input_amount
 ) {
-    if (!setup_single_leaf_outputs(f, node, client_idx, input_amount))
+    (void)client_idx;  /* PS leaves use the factory consensus key for vout 0 */
+
+    uint64_t output_total = input_amount > f->fee_per_tx
+                            ? input_amount - f->fee_per_tx : 0;
+    uint64_t per_output  = output_total / 2;
+    uint64_t remainder   = output_total - per_output * 2;
+
+    if (per_output < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Factory: PS leaf output %llu below dust limit\n",
+                (unsigned long long)per_output);
         return 0;
+    }
+
+    node->n_outputs = 2;
+
+    /* vout 0: channel output — factory-consensus key so chain[1]+ signatures
+       (signed with node->keyagg) verify correctly on-chain. */
+    memcpy(node->outputs[0].script_pubkey, node->spending_spk,
+           node->spending_spk_len);
+    node->outputs[0].script_pubkey_len = node->spending_spk_len;
+    node->outputs[0].amount_sats = per_output;
+
+    /* vout 1: L-stock */
+    if (!build_l_stock_spk(f, node->outputs[1].script_pubkey))
+        return 0;
+    node->outputs[1].script_pubkey_len = 34;
+    node->outputs[1].amount_sats = per_output + remainder;
+
     node->is_ps_leaf = 1;
     node->ps_chain_len = 0;
     memset(node->ps_prev_txid, 0, 32);
