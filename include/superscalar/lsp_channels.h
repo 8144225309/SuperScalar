@@ -431,4 +431,7 @@ typedef struct {
 int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    const rebalance_entry_t *entries, size_t n_entries);
 
+/* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
+   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

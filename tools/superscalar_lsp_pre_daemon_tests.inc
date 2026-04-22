@@ -1833,3 +1833,98 @@
             secp256k1_context_destroy(ctx);
             return fs_pass ? 0 : 1;
         }
+
+        /* === PS Advance Test: advance all PS leaves, verify amounts, force-close === */
+        if (test_ps_advance) {
+            printf("\n=== PS ADVANCE TEST ===\n");
+
+            factory_t *psa_f = &lsp_p->factory;
+            if (psa_f->leaf_arity != FACTORY_ARITY_PS) {
+                fprintf(stderr, "PS ADVANCE TEST: factory is not FACTORY_ARITY_PS (arity=%d)\n",
+                        (int)psa_f->leaf_arity);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            printf("PS advance: %d leaf node(s), initiating advance via wire...\n",
+                   psa_f->n_leaf_nodes);
+
+            /* Snapshot pre-advance channel amounts */
+            uint64_t pre_amounts[FACTORY_MAX_NODES];
+            int pre_chain_len[FACTORY_MAX_NODES];
+            for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
+                size_t nidx = psa_f->leaf_node_indices[li];
+                pre_amounts[li]   = psa_f->nodes[nidx].outputs[0].amount_sats;
+                pre_chain_len[li] = psa_f->nodes[nidx].ps_chain_len;
+                printf("  Leaf %d: chain_len=%u, chan_amount=%llu sats\n",
+                       li, pre_chain_len[li],
+                       (unsigned long long)pre_amounts[li]);
+            }
+
+            /* Advance every PS leaf via the production wire ceremony */
+            int psa_pass = 1;
+            for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
+                printf("PS advance: leaf %d...\n", li);
+                int arc = lsp_channels_advance_ps_leaf(mgr, lsp_p, li);
+                if (!arc) {
+                    fprintf(stderr, "PS ADVANCE TEST: lsp_advance_leaf failed for leaf %d\n", li);
+                    psa_pass = 0;
+                }
+            }
+
+            /* Verify post-advance state */
+            if (psa_pass) {
+                for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
+                    size_t nidx = psa_f->leaf_node_indices[li];
+                    factory_node_t *node = &psa_f->nodes[nidx];
+                    uint64_t expected_amt = pre_amounts[li] - psa_f->fee_per_tx;
+                    printf("  Leaf %d post-advance: chain_len=%u, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
+                           li, node->ps_chain_len, node->n_outputs,
+                           (unsigned long long)node->outputs[0].amount_sats,
+                           (unsigned long long)expected_amt);
+                    if ((uint32_t)node->ps_chain_len != pre_chain_len[li] + 1u) {
+                        fprintf(stderr, "PS ADVANCE TEST: leaf %d chain_len not incremented (%u→%u)\n",
+                                li, pre_chain_len[li], node->ps_chain_len);
+                        psa_pass = 0;
+                    }
+                    if (node->n_outputs != 1) {
+                        fprintf(stderr, "PS ADVANCE TEST: leaf %d n_outputs=%zu (expected 1)\n",
+                                li, node->n_outputs);
+                        psa_pass = 0;
+                    }
+                    if (node->outputs[0].amount_sats != expected_amt) {
+                        fprintf(stderr, "PS ADVANCE TEST: leaf %d amount %llu != expected %llu\n",
+                                li, (unsigned long long)node->outputs[0].amount_sats,
+                                (unsigned long long)expected_amt);
+                        psa_pass = 0;
+                    }
+                }
+            }
+
+            /* Force-close to prove the chain TX is valid on-chain */
+            if (psa_pass) {
+                printf("\nBroadcasting PS factory tree (%zu nodes) on regtest...\n",
+                       psa_f->n_nodes);
+                if (!broadcast_factory_tree(psa_f, &rt, mine_addr)) {
+                    fprintf(stderr, "PS ADVANCE TEST: tree broadcast failed\n");
+                    psa_pass = 0;
+                }
+            }
+
+            printf("\n=== PS ADVANCE TEST %s ===\n", psa_pass ? "PASSED" : "FAILED");
+            if (psa_pass)
+                printf("All %d PS leaf(s) advanced, amounts correct, chain TXs confirmed.\n",
+                       psa_f->n_leaf_nodes);
+
+            report_add_string(&rpt, "result",
+                              psa_pass ? "ps_advance_pass" : "ps_advance_fail");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return psa_pass ? 0 : 1;
+        }

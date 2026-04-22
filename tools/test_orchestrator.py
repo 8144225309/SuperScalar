@@ -423,6 +423,7 @@ class Orchestrator:
             "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,
             "--rpcpassword", self.rpcpassword,
+            "--rpcport", "18443",
         ]
         if self.is_regtest:
             cmd.extend(["--seckey", LSP_SECKEY])
@@ -452,6 +453,7 @@ class Orchestrator:
             "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,
             "--rpcpassword", self.rpcpassword,
+            "--rpcport", "18443",
         ]
         if self.is_regtest:
             cmd.extend(["--seckey", client_seckey(index),
@@ -1810,6 +1812,38 @@ def scenario_lstock_burn(orch):
     return success
 
 
+def scenario_ps_advance(orch):
+    """PS leaf advance: --arity 3, 1 client, wire ceremony, verify chain_pos 0->1, force-close."""
+    orch._log("=== SCENARIO: ps_advance ===")
+    orch._log("LSP uses PS arity (--arity 3) with 1 client. After demo, triggers advance "
+              "for all PS leaves via production wire ceremony (PROPOSE->PSIG->DONE), "
+              "verifies amounts, then force-closes to prove chain TX is valid on-chain.")
+
+    orch.start_lsp(["--arity", "3", "--clients", "1", "--demo", "--test-ps-advance"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_client(0)
+
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
+    orch._log(f"LSP exited with code {rc}")
+
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    client_log = orch.clients[0].read_log() if orch.clients else ""
+
+    has_propose  = "LEAF_ADVANCE_PROPOSE" in lsp_log or "LEAF_ADVANCE_PROPOSE" in client_log
+    has_psig     = "LEAF_ADVANCE_PSIG"    in lsp_log or "LEAF_ADVANCE_PSIG"    in client_log
+    has_pass     = "PS ADVANCE TEST PASSED" in lsp_log
+    has_chain    = "chain_len=1" in lsp_log
+    has_confirmed = "confirmed" in lsp_log.lower()
+
+    orch.stop_all()
+    success = rc == 0 and has_pass
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"PS advance {'passed' if success else 'failed'} "
+              f"(propose={has_propose}, psig={has_psig}, chain_len={has_chain}, "
+              f"confirmed={has_confirmed}, pass_marker={has_pass})")
+    return success
+
+
 def scenario_dw_advance(orch):
     """DW counter advance + re-sign tree + force-close."""
     orch._log("=== SCENARIO: dw_advance ===")
@@ -2218,6 +2252,7 @@ SCENARIOS = {
     "batch_rebalance": lambda o, **kw: scenario_batch_rebalance(o),
     "leaf_realloc": lambda o, **kw: scenario_leaf_realloc(o),
     "lstock_burn": lambda o, **kw: scenario_lstock_burn(o),
+    "ps_advance": lambda o, **kw: scenario_ps_advance(o),
     "dw_advance": lambda o, **kw: scenario_dw_advance(o),
     "distribution_tx": lambda o, **kw: scenario_distribution_tx(o),
     "bridge_bolt11": lambda o, **kw: scenario_bridge_bolt11(o),
@@ -2261,6 +2296,7 @@ def list_scenarios():
         "batch_rebalance": "Demo + batch rebalance; multi-transfer + conservation",
         "leaf_realloc": "Demo + leaf reallocation; arity-2 MuSig2 ceremony",
         "lstock_burn": "L-stock burn via shachain revocation",
+        "ps_advance": "PS leaf wire advance (chain_pos 0->1), amounts verified, force-close",
         "dw_advance": "DW counter advance + re-sign + force-close",
         "distribution_tx": "Distribution TX broadcast after CLTV (P2A anchor)",
         "bridge_bolt11": "Bridge inbound HTLC; BOLT11 invoice routing",

@@ -4656,3 +4656,8 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
     return ok;
 }
 
+
+/* Public wrapper: advance one PS leaf via the production wire ceremony. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+    return lsp_advance_leaf(mgr, lsp, leaf_side);
+}
