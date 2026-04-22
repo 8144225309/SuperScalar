@@ -154,33 +154,18 @@ static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
         /* Allow mempool TX — LSP may have just broadcast */
     }
 
-    /* Query the actual output amount via getrawtransaction (verbose=true) */
-    char params[256];
-    snprintf(params, sizeof(params), "\"%s\" true", txid_hex);
-    char *resp = regtest_exec(rt, "getrawtransaction", params);
-    if (!resp) {
-        fprintf(stderr, "verify_funding: getrawtransaction failed for %s\n",
-                txid_hex);
-        return 0;
-    }
-    cJSON *jtx = cJSON_Parse(resp);
-    free(resp);
-    if (!jtx) {
-        fprintf(stderr, "verify_funding: failed to parse TX JSON\n");
-        return 0;
-    }
-    cJSON *vout_arr = cJSON_GetObjectItem(jtx, "vout");
-    cJSON *vout_obj = vout_arr ? cJSON_GetArrayItem(vout_arr, (int)vout) : NULL;
-    cJSON *val_item = vout_obj ? cJSON_GetObjectItem(vout_obj, "value") : NULL;
-    if (!val_item || !cJSON_IsNumber(val_item)) {
-        fprintf(stderr, "verify_funding: cannot read output %s:%u\n",
+    /* Query the actual output amount.
+     * regtest_get_tx_output tries getrawtransaction, then gettransaction
+     * (wallet-aware, no -txindex needed), then block-scan. */
+    uint64_t actual_sats = 0;
+    unsigned char dummy_spk[256];
+    size_t dummy_spk_len = 0;
+    if (!regtest_get_tx_output(rt, txid_hex, vout, &actual_sats,
+                                dummy_spk, &dummy_spk_len)) {
+        fprintf(stderr, "verify_funding: cannot query output %s:%u\n",
                 txid_hex, vout);
-        cJSON_Delete(jtx);
         return 0;
     }
-    /* value is in BTC (float); convert to sats */
-    uint64_t actual_sats = (uint64_t)(val_item->valuedouble * 100000000.0 + 0.5);
-    cJSON_Delete(jtx);
     if (actual_sats < expected_sats) {
         fprintf(stderr, "verify_funding: output %s:%u has %llu sats, "
                 "LSP claimed %llu sats\n",

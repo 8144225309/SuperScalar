@@ -284,7 +284,7 @@ static void usage(const char *prog) {
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N|N,N,...   Leaf arity: 1 or 2 (default 2). Comma-separated for per-level.\n"
+        "  --arity N|N,N,...   Leaf arity: 1, 2, or 3=PS (default 2). Comma-separated for per-level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
@@ -292,6 +292,7 @@ static void usage(const char *prog) {
         "  --test-full-settlement  After demo: force-close tree, broadcast ALL commitment TXs, verify cross-leaf balances\n"
         "  --test-bad-terms    Offer 0 bps profit share; PASSES if client rejects (use with --min-profit-bps on client)\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
+        "  --test-ps-advance   After demo: advance all PS leaves (chain_pos 0->1), verify amounts, force-close\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
@@ -661,7 +662,8 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
         int blocks_to_mine;
         if (i + 1 < f->n_nodes) {
             uint32_t child_nseq = f->nodes[i + 1].nsequence;
-            if (child_nseq == NSEQUENCE_DISABLE_BIP68) {
+            if (child_nseq & 0x80000000u) {
+                /* BIP68 disabled (bit 31 set) — no relative delay */
                 blocks_to_mine = 1;
             } else {
                 blocks_to_mine = (int)(child_nseq & 0xFFFF) + 1;
@@ -705,7 +707,7 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
 
         /* For nodes with nSequence > 0, we may need to wait for the parent
            to reach sufficient depth before this tx is valid */
-        if (node->nsequence != NSEQUENCE_DISABLE_BIP68 && node->nsequence > 0) {
+        if (!(node->nsequence & 0x80000000u) && node->nsequence > 0) {  /* BIP68 enabled only when bit 31 clear */
             uint32_t required_depth = (node->nsequence & 0xFFFF);
             int est_mins = (int)required_depth * 10; /* ~10 min/block */
             printf("  node[%zu/%zu] requires %u-block relative timelock "
@@ -1040,6 +1042,7 @@ int main(int argc, char *argv[]) {
     int test_multi_htlc_force_close = 0;
     int test_full_settlement = 0;
     int test_dw_advance = 0;
+    int test_ps_advance = 0;
     int test_leaf_advance = 0;
     int test_dual_factory = 0;
     int test_dw_exhibition = 0;
@@ -1290,6 +1293,8 @@ int main(int argc, char *argv[]) {
             test_bad_settlement = 1;
         else if (strcmp(argv[i], "--test-dw-advance") == 0)
             test_dw_advance = 1;
+        else if (strcmp(argv[i], "--test-ps-advance") == 0)
+            test_ps_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
             test_leaf_advance = 1;
         else if (strcmp(argv[i], "--test-dual-factory") == 0)
@@ -1705,8 +1710,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
     }
-    if (leaf_arity != 1 && leaf_arity != 2) {
-        fprintf(stderr, "Error: --arity must be 1 or 2\n");
+    if (leaf_arity != 1 && leaf_arity != 2 && leaf_arity != 3) {
+        fprintf(stderr, "Error: --arity must be 1, 2, or 3 (PS)\n");
         return 1;
     }
     if (leaf_arity == 2 && n_clients < 2) {
@@ -2946,6 +2951,8 @@ accept_new_factory:
         factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
+    else if (leaf_arity == 3)
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
@@ -3167,7 +3174,7 @@ accept_new_factory:
         test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
-        test_buy_liquidity || test_large_factory) {
+        test_buy_liquidity || test_large_factory || test_ps_advance) {
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;

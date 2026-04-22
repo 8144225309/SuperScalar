@@ -734,6 +734,8 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
     else if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
+    else if (rot_leaf_arity == 3)
+        factory_set_arity(factory_out, FACTORY_ARITY_PS);
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     free(rot_hashes);
@@ -1432,6 +1434,8 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_level_arity(factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
         factory_set_arity(factory, FACTORY_ARITY_1);
+    else if (leaf_arity == 3)
+        factory_set_arity(factory, FACTORY_ARITY_PS);
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
     free(parsed_l_stock_hashes);

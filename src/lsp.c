@@ -236,6 +236,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
                               step_blocks, states_per_layer);
     if (saved_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
+    else if (saved_arity == FACTORY_ARITY_PS)
+        factory_set_arity(f, FACTORY_ARITY_PS);
     f->cltv_timeout = cltv_timeout;  /* set BEFORE build_tree for staggered taptrees */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
