@@ -1576,6 +1576,8 @@ extern int test_factory_config_default(void);
 /* Pseudo-Spilman Leaves */
 extern int test_factory_ps_leaf_build(void);
 extern int test_factory_ps_leaf_advance(void);
+extern int test_factory_ps_amount_invariant(void);
+extern int test_factory_ps_dust_limit(void);
 extern int test_factory_ps_mixed_arity(void);
 
 /* Wire TLV Foundation (Mainnet Gap #8) */
@@ -3300,6 +3302,8 @@ static void run_unit_tests(void) {
     printf("\n=== Pseudo-Spilman Leaves ===\n");
     RUN_TEST(test_factory_ps_leaf_build);
     RUN_TEST(test_factory_ps_leaf_advance);
+    RUN_TEST(test_factory_ps_amount_invariant);
+    RUN_TEST(test_factory_ps_dust_limit);
     RUN_TEST(test_factory_ps_mixed_arity);
 
     printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");

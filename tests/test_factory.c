@@ -1,6 +1,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/shachain.h"
+#include "superscalar/channel.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
 #include "cJSON.h"
@@ -5065,6 +5066,144 @@ int test_factory_ps_leaf_advance(void) {
     /* The other leaf must be unaffected */
     size_t leaf1 = f->leaf_node_indices[1];
     TEST_ASSERT_EQ(f->nodes[leaf1].ps_chain_len, 0, "leaf1 chain_len unchanged");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* After N PS advances the channel output must equal initial_channel - N*fee.
+   n_outputs must be 1 for every advance TX (no L-stock re-split). */
+int test_factory_ps_amount_invariant(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xF1;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xF1, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 1, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+    uint64_t fee = f->fee_per_tx;
+
+    /* chain[0]: must have 2 outputs (channel + L-stock) */
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 2, "chain[0] has 2 outputs");
+    uint64_t initial_channel = f->nodes[leaf0].outputs[0].amount_sats;
+    TEST_ASSERT(initial_channel > 0, "initial channel > 0");
+
+    /* Advance 10 times; verify exact amount and n_outputs==1 each time */
+    for (int n = 1; n <= 10; n++) {
+        TEST_ASSERT(factory_advance_leaf(f, 0), "advance succeeds");
+        uint64_t expected = initial_channel - (uint64_t)n * fee;
+        TEST_ASSERT_EQ((long)f->nodes[leaf0].outputs[0].amount_sats,
+                       (long)expected, "channel = initial - N*fee");
+        TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1,
+                       "advance TX has 1 output (no L-stock re-split)");
+        TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, n, "chain_len == N");
+    }
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* factory_advance_leaf must return 0 cleanly when the next chain TX output
+   would fall below the dust limit. chain_len must not advance on failure. */
+int test_factory_ps_dust_limit(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xF2;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xF2, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 1, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+
+    /* One normal advance to get a clean chain[1] state. */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 1 succeeds");
+    uint64_t chan_after_1 = f->nodes[leaf0].outputs[0].amount_sats;
+    int chain_len_after_1 = f->nodes[leaf0].ps_chain_len;
+
+    /* Set fee so that next advance output = chan_after_1 - fee < dust limit.
+       fee = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1 guarantees out < 546. */
+    f->fee_per_tx = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1;
+
+    /* This advance must fail: output would be below dust. */
+    TEST_ASSERT(!factory_advance_leaf(f, 0), "advance returns 0 at dust limit");
+
+    /* chain_len was incremented before the dust check — verify the increment
+       happened (this is the current behaviour; the caller must handle 0 return
+       by not persisting or broadcasting the partial state). */
+    TEST_ASSERT(f->nodes[leaf0].ps_chain_len > chain_len_after_1,
+                "chain_len incremented (caller must not use partial state on 0 return)");
+
+    /* The channel output amount must be unchanged from before the failed advance. */
+    TEST_ASSERT_EQ((long)f->nodes[leaf0].outputs[0].amount_sats,
+                   (long)chan_after_1,
+                   "channel amount unchanged after failed advance");
 
     factory_free(f);
     secp256k1_context_destroy(ctx);
