@@ -223,6 +223,15 @@ def run_scenario(args: argparse.Namespace) -> int:
         lsp_argv += ["--states-per-layer", str(args.states_per_layer)]
     if args.no_jit:
         lsp_argv.append("--no-jit")
+    if args.lsp_balance_pct is not None:
+        lsp_argv += ["--lsp-balance-pct", str(args.lsp_balance_pct)]
+    if args.demo:
+        # --demo sets lsp_balance_pct=50 and runs a demo payment sequence.
+        # We still drive payments manually via CLI after; --demo ensures
+        # clients have outbound balance so later `pay` commands succeed.
+        lsp_argv.append("--demo")
+    if args.lsp_seckey:
+        lsp_argv += ["--seckey", args.lsp_seckey]
 
     # Advance / force-close flags are set LATER via CLI, not at LSP start,
     # so we can record state between payments and the advance.
@@ -240,6 +249,28 @@ def run_scenario(args: argparse.Namespace) -> int:
         pg.shutdown_all()
         return 3
 
+    # Parse LSP's NK static pubkey from its log — clients need this for auth
+    lsp_pubkey = None
+    lsp_log = run_dir / "lsp.log"
+    for _ in range(30):
+        try:
+            content = lsp_log.read_text(errors="ignore")
+        except FileNotFoundError:
+            content = ""
+        for line in content.splitlines():
+            # Matches: "LSP: NK static pubkey: <hex>"
+            if "NK static pubkey:" in line:
+                lsp_pubkey = line.split(":")[-1].strip()
+                break
+        if lsp_pubkey:
+            break
+        time.sleep(0.5)
+    if not lsp_pubkey:
+        print("ERROR: could not parse LSP pubkey from log", file=sys.stderr)
+        pg.shutdown_all()
+        return 3
+    print(f"LSP pubkey: {lsp_pubkey}", flush=True)
+
     # -- Launch clients -------------------------------------------------------
     for i in range(args.clients):
         cargv = [
@@ -249,11 +280,13 @@ def run_scenario(args: argparse.Namespace) -> int:
             "--port", str(args.port),
             "--daemon",
             "--db", str(client_dbs[i]),
+            "--lsp-pubkey", lsp_pubkey,
             "--rpcuser", btc_cli[2].split("=", 1)[1] if "=" in btc_cli[2] else "",
             "--rpcpassword", btc_cli[3].split("=", 1)[1] if "=" in btc_cli[3] else "",
             "--rpcport", btc_cli[4].split("=", 1)[1] if "=" in btc_cli[4] else "",
             "--cli-path", btc_cli[0],
         ]
+        print(f"launching client{i+1}: {' '.join(cargv)}", flush=True)
         pg.launch(f"client{i+1}", cargv)
         time.sleep(0.3)
 
@@ -337,6 +370,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--run-dir", required=True, help="Directory for logs/db/timeline")
     p.add_argument("--label", default="run")
     p.add_argument("--factory-timeout", type=float, default=600.0)
+    p.add_argument("--demo", action="store_true",
+                   help="Enable LSP --demo (sets lsp_balance_pct=50 so clients can pay)")
+    p.add_argument("--lsp-balance-pct", type=int, default=None,
+                   help="LSP's share of factory capacity (0-100, default 100)")
+    p.add_argument("--lsp-seckey", default=None,
+                   help="LSP seckey hex (required on signet/mainnet)")
     return p
 
 
