@@ -1542,22 +1542,21 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
 
-    /* PS leaf: append a new TX to the chain rather than decrement nSequence */
+    /* PS leaf: append a new TX to the chain rather than decrement nSequence.
+       chain[1]+: single channel output (full input minus fee). The L-stock was
+       committed once at chain[0] and already exists as a separate on-chain UTXO;
+       we must not re-split it here or call update_l_stock_for_leaf (which would
+       overwrite outputs[0].script_pubkey when n_outputs==1). */
     if (node->is_ps_leaf) {
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
-        /* Recalculate output amounts: chain[N] spends chain[N-1]'s channel
-           output (vout 0 = ps_prev_chan_amount), so outputs must be rebased. */
-        if (node->ps_prev_chan_amount > f->fee_per_tx) {
-            uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
-            uint64_t per_out   = out_total / 2;
-            uint64_t remainder = out_total - per_out * 2;
-            node->outputs[0].amount_sats = per_out;
-            if (node->n_outputs > 1)
-                node->outputs[1].amount_sats = per_out + remainder;
-        }
-        if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+        if (node->ps_prev_chan_amount <= f->fee_per_tx) return 0;
+        uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
+        if (out_total < CHANNEL_DUST_LIMIT_SATS) return 0;
+        node->n_outputs = 1;
+        node->outputs[0].amount_sats = out_total;
+        /* outputs[0].script_pubkey unchanged — still node->spending_spk */
         if (!rebuild_node_tx(f, node_idx)) return 0;
         return factory_sign_node(f, node_idx);
     }
@@ -1590,22 +1589,17 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
 
-    /* PS leaf: chain advance, no DW counter */
+    /* PS leaf: chain advance, no DW counter. Same passthrough logic as the
+       signed variant — single channel output, no L-stock re-split. */
     if (node->is_ps_leaf) {
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
-        /* Rebase outputs to the new (smaller) input amount — same logic as
-           factory_advance_leaf, but without signing. */
-        if (node->ps_prev_chan_amount > f->fee_per_tx) {
-            uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
-            uint64_t per_out   = out_total / 2;
-            uint64_t remainder = out_total - per_out * 2;
-            node->outputs[0].amount_sats = per_out;
-            if (node->n_outputs > 1)
-                node->outputs[1].amount_sats = per_out + remainder;
-        }
-        if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+        if (node->ps_prev_chan_amount <= f->fee_per_tx) return 0;
+        uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
+        if (out_total < CHANNEL_DUST_LIMIT_SATS) return 0;
+        node->n_outputs = 1;
+        node->outputs[0].amount_sats = out_total;
         if (!rebuild_node_tx(f, node_idx)) return 0;
         return 1;
     }
