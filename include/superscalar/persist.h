@@ -74,10 +74,11 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
 /* Load all PS chain entries for a leaf in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
    txids_out: caller-allocated [max_chain][32] internal-order txids.
+   amounts_out: caller-allocated uint64_t[max_chain] channel amounts; may be NULL.
    Returns number of entries loaded, 0 on error or no PS chain. */
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
-                           int max_chain);
+                           uint64_t *amounts_out, int max_chain);
 
 /* List all non-closed factory IDs from the ladder_factories table.
    Returns count written to ids_out (up to max_ids).
