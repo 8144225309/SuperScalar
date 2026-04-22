@@ -2484,6 +2484,119 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
+                                 const secp256k1_keypair *keypair,
+                                 factory_t *factory, uint32_t my_index,
+                                 const wire_msg_t *propose_msg) {
+    int leaf_side;
+    unsigned char lsp_pubnonce_ser[66];
+    if (!wire_parse_leaf_advance_propose(propose_msg->json, &leaf_side, lsp_pubnonce_ser)) {
+        fprintf(stderr, "Client %u: failed to parse LEAF_ADVANCE_PROPOSE\n", my_index);
+        return 0;
+    }
+
+    int rc = factory_advance_leaf_unsigned(factory, leaf_side);
+    if (rc <= 0) {
+        fprintf(stderr, "Client %u: leaf %d advance_unsigned failed (rc=%d)\n",
+                my_index, leaf_side, rc);
+        return 0;
+    }
+
+    size_t node_idx = factory->leaf_node_indices[leaf_side];
+
+    if (!factory_session_init_node(factory, node_idx)) {
+        fprintf(stderr, "Client %u: leaf %d session_init failed\n", my_index, leaf_side);
+        return 0;
+    }
+
+    /* Set LSP nonce (participant 0) — received in PROPOSE */
+    int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
+    if (lsp_slot < 0) {
+        fprintf(stderr, "Client %u: LSP not signer on leaf node %zu\n", my_index, node_idx);
+        return 0;
+    }
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser)) {
+        fprintf(stderr, "Client %u: parse LSP pubnonce failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
+        fprintf(stderr, "Client %u: set LSP nonce failed\n", my_index);
+        return 0;
+    }
+
+    /* Generate own nonce */
+    int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
+    if (my_slot < 0) {
+        fprintf(stderr, "Client %u: self not signer on leaf node %zu\n", my_index, node_idx);
+        return 0;
+    }
+
+    unsigned char my_seckey[32];
+    secp256k1_pubkey my_pubkey;
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        fprintf(stderr, "Client %u: keypair_sec failed\n", my_index);
+        return 0;
+    }
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    secp256k1_musig_secnonce my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+                               my_seckey, &my_pubkey,
+                               &factory->nodes[node_idx].keyagg.cache)) {
+        fprintf(stderr, "Client %u: nonce gen failed\n", my_index);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    if (!factory_session_set_nonce(factory, node_idx, (size_t)my_slot, &my_pubnonce)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    if (!factory_session_finalize_node(factory, node_idx)) {
+        fprintf(stderr, "Client %u: session finalize failed\n", my_index);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Create partial sig */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+                                    &factory->nodes[node_idx].signing_session)) {
+        fprintf(stderr, "Client %u: partial sig failed\n", my_index);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send LEAF_ADVANCE_PSIG (own pubnonce + partial sig) */
+    unsigned char my_pubnonce_ser[66], my_psig_ser[32];
+    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
+    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+    cJSON *psig_json = wire_build_leaf_advance_psig(my_pubnonce_ser, my_psig_ser);
+    if (!wire_send(fd, MSG_LEAF_ADVANCE_PSIG, psig_json)) {
+        fprintf(stderr, "Client %u: send LEAF_ADVANCE_PSIG failed\n", my_index);
+        cJSON_Delete(psig_json);
+        return 0;
+    }
+    cJSON_Delete(psig_json);
+
+    /* Wait for LEAF_ADVANCE_DONE */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_ADVANCE_DONE) {
+        fprintf(stderr, "Client %u: expected LEAF_ADVANCE_DONE, got 0x%02x\n",
+                my_index, done_msg.json ? done_msg.msg_type : 0);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        return 0;
+    }
+    if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    printf("Client %u: leaf %d advance complete\n", my_index, leaf_side);
+    return 1;
+}
+
 int client_run_ceremony(secp256k1_context *ctx,
                         const secp256k1_keypair *keypair,
                         const char *host, int port) {
