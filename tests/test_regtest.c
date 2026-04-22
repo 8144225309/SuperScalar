@@ -1615,6 +1615,10 @@ int test_regtest_ps_chain_close(void) {
     char *chain0_hex = ps_snap_leaf(f, 0);
     TEST_ASSERT(chain0_hex, "snapshot chain[0]");
 
+    /* Capture initial channel amount before any advance. */
+    size_t leaf_st0 = f->leaf_node_indices[0];
+    uint64_t initial_channel = f->nodes[leaf_st0].outputs[0].amount_sats;
+
     /* Advance once → chain_pos=1. */
     TEST_ASSERT(factory_advance_leaf(f, 0), "advance to chain[1]");
     char *chain1_hex = ps_snap_leaf(f, 0);
@@ -1654,10 +1658,11 @@ int test_regtest_ps_chain_close(void) {
     TEST_ASSERT(regtest_get_tx_output(&rt, c2_bcast_txid, 0,
                                       &final_amt, final_spk, &fsl),
                 "chain[2] channel output exists");
-    printf("  Final channel output: %lu sats  P2TR=%d\n",
-           (unsigned long)final_amt, fsl == 34);
+    uint64_t expected_amt = initial_channel - 2 * f->fee_per_tx;
+    printf("  Final channel output: %lu sats  expected=%lu  P2TR=%d\n",
+           (unsigned long)final_amt, (unsigned long)expected_amt, fsl == 34);
     TEST_ASSERT(fsl == 34, "final output is P2TR");
-    TEST_ASSERT(final_amt > 0, "channel output non-empty");
+    TEST_ASSERT(final_amt == expected_amt, "chain[2] amount = initial_channel - 2*fee");
 
     free(chain0_hex); free(chain1_hex);
     factory_free(f); free(f);
