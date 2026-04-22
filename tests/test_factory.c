@@ -4978,12 +4978,10 @@ int test_factory_ps_leaf_build(void) {
     TEST_ASSERT(factory_sign_all(f), "sign PS factory");
     TEST_ASSERT(factory_verify_all(f), "verify PS factory");
 
-    /* EWT must be less than a pure DW factory of same depth.
-       For PS: EWT is zero (no leaf DW layer; tree is flat with 1 DW layer at root).
-       step=6, states=10 → root layer EWT = 6*(10-1)=54. Leaf PS → 0. Total=54.
-       For pure ARITY_1: 2 DW layers → 54+54=108. */
+    /* PS EWT = root layer only = step*(states-1) = 6*9 = 54.
+       Pure ARITY_1 would be 2 layers = 108. Assert exact value. */
     uint32_t ewt = factory_early_warning_time(f);
-    TEST_ASSERT(ewt < 108, "PS EWT < pure DW EWT");
+    TEST_ASSERT_EQ(ewt, 6 * (10 - 1), "PS EWT == step*(states-1) == 54");
 
     factory_free(f);
     secp256k1_context_destroy(ctx);
@@ -5037,10 +5035,12 @@ int test_factory_ps_leaf_advance(void) {
     unsigned char txid0[32];
     memcpy(txid0, f->nodes[leaf0].txid, 32);
     TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 0, "chain_len=0 before advance");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 2, "chain[0] has 2 outputs");
 
     /* First advance */
     TEST_ASSERT(factory_advance_leaf(f, 0), "advance 1");
     TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 1, "chain_len=1 after advance 1");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1, "chain[1] has 1 output");
     /* ps_prev_txid must equal txid0 */
     TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid0, 32) == 0,
                 "ps_prev_txid = original txid");
@@ -5055,6 +5055,7 @@ int test_factory_ps_leaf_advance(void) {
     /* Second advance */
     TEST_ASSERT(factory_advance_leaf(f, 0), "advance 2");
     TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 2, "chain_len=2");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1, "chain[2] has 1 output");
     TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid1, 32) == 0,
                 "ps_prev_txid = txid1");
     TEST_ASSERT(memcmp(f->nodes[leaf0].txid, txid1, 32) != 0,
