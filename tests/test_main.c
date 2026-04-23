@@ -1109,6 +1109,7 @@ extern int test_regtest_force_close_to_remote(void);
 extern int test_regtest_force_close_to_local(void);
 extern int test_regtest_breach_penalty_spendability(void);
 extern int test_regtest_ps_chain_close_spendability(void);
+extern int test_regtest_htlc_in_flight_spendability(void);
 extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
@@ -3588,6 +3589,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_force_close_to_local);
     RUN_TEST(test_regtest_breach_penalty_spendability);
     RUN_TEST(test_regtest_ps_chain_close_spendability);
+    RUN_TEST(test_regtest_htlc_in_flight_spendability);
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);
