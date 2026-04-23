@@ -8,6 +8,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
+#include "spend_helpers.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -1298,6 +1299,82 @@ int test_regtest_multi_payment(void) {
                     }
                     if (lsp_ok)
                         printf("LSP: all close output amounts verified on-chain!\n");
+
+                    /* Spendability gauntlet: each party sweeps its own close
+                       output using only its own seckey. Proves the SPKs the
+                       close TX commits to are actually unilaterally spendable,
+                       not just amount-correct. (Post PR #1 this includes the
+                       LSP's output at vout[0] — previously stuck in N-of-N.) */
+                    if (lsp_ok) {
+                        /* party_idx 0 = LSP (seckeys[0], mgr.lsp_close_spk);
+                           party_idx c+1 = client c (seckeys[c+1], entries[c].close_spk) */
+                        for (size_t party = 0; party < 5 && lsp_ok; party++) {
+                            const unsigned char *sk = seckeys[party];
+                            const unsigned char *expect_spk;
+                            size_t expect_spk_len;
+                            if (party == 0) {
+                                expect_spk = ch_mgr.lsp_close_spk;
+                                expect_spk_len = ch_mgr.lsp_close_spk_len;
+                            } else {
+                                expect_spk = ch_mgr.entries[party - 1].close_spk;
+                                expect_spk_len = ch_mgr.entries[party - 1].close_spk_len;
+                            }
+                            if (expect_spk_len == 0) {
+                                fprintf(stderr,
+                                        "spendability: party %zu missing close_spk\n", party);
+                                lsp_ok = 0;
+                                break;
+                            }
+                            uint64_t in_amt = 0;
+                            int vout = spend_find_vout_by_spk(&rt, close_txid,
+                                                               expect_spk, expect_spk_len,
+                                                               &in_amt);
+                            if (vout < 0) {
+                                fprintf(stderr,
+                                        "spendability: party %zu SPK not in close tx\n", party);
+                                lsp_ok = 0;
+                                break;
+                            }
+                            char dest_addr[128];
+                            if (!regtest_get_new_address(&rt, dest_addr, sizeof(dest_addr))) {
+                                lsp_ok = 0; break;
+                            }
+                            unsigned char dest_spk[64];
+                            size_t dest_spk_len = 0;
+                            if (!regtest_get_address_scriptpubkey(&rt, dest_addr,
+                                                                    dest_spk,
+                                                                    &dest_spk_len)) {
+                                lsp_ok = 0; break;
+                            }
+                            tx_buf_t sweep;
+                            if (!spend_build_p2tr_raw_keypath(ctx, sk,
+                                                                close_txid, (uint32_t)vout,
+                                                                in_amt,
+                                                                expect_spk, expect_spk_len,
+                                                                dest_spk, dest_spk_len,
+                                                                500, &sweep)) {
+                                fprintf(stderr,
+                                        "spendability: party %zu build sweep failed\n", party);
+                                lsp_ok = 0; break;
+                            }
+                            char sweep_hex[sweep.len * 2 + 1];
+                            hex_encode(sweep.data, sweep.len, sweep_hex);
+                            char sweep_txid[65];
+                            int ok = spend_broadcast_and_mine(&rt, sweep_hex, 1,
+                                                                sweep_txid);
+                            tx_buf_free(&sweep);
+                            if (!ok) {
+                                fprintf(stderr,
+                                        "spendability: party %zu broadcast/confirm failed\n",
+                                        party);
+                                lsp_ok = 0; break;
+                            }
+                            printf("  spendability: party %zu swept %llu sats via %s (confirmed)\n",
+                                   party, (unsigned long long)in_amt, sweep_txid);
+                        }
+                        if (lsp_ok)
+                            printf("LSP: all 5 close outputs swept by their rightful owners!\n");
+                    }
                 }
             } else {
                 fprintf(stderr, "LSP: broadcast close tx failed\n");
