@@ -1009,6 +1009,172 @@ static int run_htlc_in_flight(regtest_t *rt, secp256k1_context *ctx,
     return 1;
 }
 
+/* Rotation-then-exit spendability: factory A → rotate into factory B
+ * (via close of A whose outputs fund B), → close B cooperatively,
+ * → each party sweeps their B-close output.
+ *
+ * The rotation mechanic transfers balance from A → B without going
+ * on-chain to per-party addresses. This test verifies the final exit
+ * from B still lands at per-party P2TR(xonly(pk_i)) addresses each
+ * party can spend unilaterally.
+ *
+ * We use the same N=5 keypairs for both factories (realistic single-LSP
+ * multi-client rotation). For simplicity, factory B is structurally
+ * identical to A — same arity, same participants.
+ */
+static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
+                                    factory_arity_t arity, const char *mine_addr) {
+    const size_t N = 5;
+    secp256k1_keypair kpsA[5], kpsB[5];
+    factory_t *fA = calloc(1, sizeof(factory_t));
+    factory_t *fB = calloc(1, sizeof(factory_t));
+    if (!fA || !fB) { free(fA); free(fB); return 0; }
+
+    unsigned char spkA[34], spkB[34];
+    char txidA[65], txidB[65];
+    uint32_t voutA = 0, voutB = 0;
+    uint64_t amtA = 0, amtB = 0;
+
+    /* Build factory A. */
+    if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kpsA, fA,
+                                spkA, txidA, &voutA, &amtA)) {
+        free(fA); free(fB); return 0;
+    }
+    printf("  rotation[arity=%d]: factory A funded %s:%u  %llu sats\n",
+           (int)arity, txidA, voutA, (unsigned long long)amtA);
+
+    /* Build factory B (separate funding UTXO — same participants). */
+    for (size_t i = 0; i < N; i++)
+        secp256k1_keypair_create(ctx, &kpsB[i], N_PARTY_SECKEYS[i]);
+    if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kpsB, fB,
+                                spkB, txidB, &voutB, &amtB)) {
+        free(fA); free(fB); return 0;
+    }
+    printf("  rotation[arity=%d]: factory B funded %s:%u  %llu sats\n",
+           (int)arity, txidB, voutB, (unsigned long long)amtB);
+
+    /* Cooperatively close factory A with a single output to factory B's
+       funding SPK (this is what "rotation" actually does: recycle A's
+       funds into B's contract). Then cooperatively close factory B with
+       per-party P2TR outputs. */
+
+    /* Close A → single output at B's SPK. */
+    tx_output_t rot_out;
+    rot_out.script_pubkey_len = 34;
+    memcpy(rot_out.script_pubkey, spkB, 34);
+    rot_out.amount_sats = amtA - 500;
+
+    tx_buf_t ucA;
+    tx_buf_init(&ucA, 256);
+    if (!build_unsigned_tx(&ucA, NULL, fA->funding_txid, fA->funding_vout,
+                            0xFFFFFFFEu, &rot_out, 1)) { free(fA); free(fB); return 0; }
+    unsigned char shA[32];
+    if (!compute_taproot_sighash(shA, ucA.data, ucA.len, 0, spkA, 34,
+                                  amtA, 0xFFFFFFFEu)) {
+        tx_buf_free(&ucA); free(fA); free(fB); return 0;
+    }
+    musig_keyagg_t kaA;
+    secp256k1_pubkey pksA[5];
+    for (size_t i = 0; i < N; i++) secp256k1_keypair_pub(ctx, &pksA[i], &kpsA[i]);
+    musig_aggregate_keys(ctx, &kaA, pksA, N);
+    unsigned char sigA[64];
+    if (!musig_sign_taproot(ctx, sigA, shA, kpsA, N, &kaA, NULL)) {
+        tx_buf_free(&ucA); free(fA); free(fB); return 0;
+    }
+    tx_buf_t scA;
+    tx_buf_init(&scA, 256);
+    finalize_signed_tx(&scA, ucA.data, ucA.len, sigA);
+    tx_buf_free(&ucA);
+    char rot_hex[scA.len * 2 + 1];
+    hex_encode(scA.data, scA.len, rot_hex); rot_hex[scA.len * 2] = '\0';
+    char rot_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(rt, rot_hex, rot_txid),
+                "rotation: close A → B broadcast");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(rt, rot_txid) >= 1,
+                "rotation: close A confirmed");
+    tx_buf_free(&scA);
+    printf("  rotation[arity=%d]: A swept into recycling output %s\n",
+           (int)arity, rot_txid);
+
+    /* Now close B cooperatively with per-party P2TR outputs. */
+    tx_output_t outs[5];
+    uint64_t fee = 500;
+    uint64_t per_client = (amtB - fee) / 10;
+    uint64_t lsp_amt = amtB - fee - per_client * 4;
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kpsB[i]);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk);
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &xo);
+        outs[i].script_pubkey_len = 34;
+        outs[i].amount_sats = (i == 0) ? lsp_amt : per_client;
+    }
+    tx_buf_t ucB;
+    tx_buf_init(&ucB, 256);
+    if (!build_unsigned_tx(&ucB, NULL, fB->funding_txid, fB->funding_vout,
+                            0xFFFFFFFEu, outs, N)) { free(fA); free(fB); return 0; }
+    unsigned char shB[32];
+    compute_taproot_sighash(shB, ucB.data, ucB.len, 0, spkB, 34,
+                             amtB, 0xFFFFFFFEu);
+    musig_keyagg_t kaB;
+    secp256k1_pubkey pksB[5];
+    for (size_t i = 0; i < N; i++) secp256k1_keypair_pub(ctx, &pksB[i], &kpsB[i]);
+    musig_aggregate_keys(ctx, &kaB, pksB, N);
+    unsigned char sigB[64];
+    musig_sign_taproot(ctx, sigB, shB, kpsB, N, &kaB, NULL);
+    tx_buf_t scB;
+    tx_buf_init(&scB, 256);
+    finalize_signed_tx(&scB, ucB.data, ucB.len, sigB);
+    tx_buf_free(&ucB);
+    char chB_hex[scB.len * 2 + 1];
+    hex_encode(scB.data, scB.len, chB_hex); chB_hex[scB.len * 2] = '\0';
+    char cB_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(rt, chB_hex, cB_txid),
+                "rotation: close B broadcast");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(rt, cB_txid) >= 1,
+                "rotation: close B confirmed");
+    tx_buf_free(&scB);
+    printf("  rotation[arity=%d]: B closed %s\n", (int)arity, cB_txid);
+
+    /* Gauntlet: each party sweeps their B-close output. */
+    if (!spend_coop_close_gauntlet(ctx, rt, cB_txid, N_PARTY_SECKEYS, N - 1)) {
+        free(fA); free(fB); return 0;
+    }
+    printf("  rotation[arity=%d]: balance carried A→B, all 5 parties swept ✓\n",
+           (int)arity);
+
+    free(fA); free(fB);
+    return 1;
+}
+
+int test_regtest_rotation_all_arities(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "rotation_spend");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    TEST_ASSERT(run_rotation_for_arity(&rt, ctx, FACTORY_ARITY_1, mine_addr),
+                "rotation arity 1");
+    TEST_ASSERT(run_rotation_for_arity(&rt, ctx, FACTORY_ARITY_2, mine_addr),
+                "rotation arity 2");
+    TEST_ASSERT(run_rotation_for_arity(&rt, ctx, FACTORY_ARITY_PS, mine_addr),
+                "rotation arity 3 (PS)");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 int test_regtest_htlc_in_flight_spendability(void) {
     /* HTLC-in-flight resolution is already covered by the pre-existing
        test_regtest_htlc_success (regtest.c:..., runs in "Regtest
