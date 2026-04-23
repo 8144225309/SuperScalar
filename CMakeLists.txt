@@ -253,6 +253,7 @@ add_executable(test_superscalar
     tests/test_ladder.c
     tests/test_wire.c
     tests/test_channels.c
+    tests/spend_helpers.c
     tests/test_persist.c
     tests/test_bridge.c
     tests/test_daemon.c
