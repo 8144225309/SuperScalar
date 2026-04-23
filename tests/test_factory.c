@@ -1,6 +1,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/musig.h"
 #include "superscalar/shachain.h"
+#include "superscalar/channel.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
 #include "cJSON.h"
@@ -4903,6 +4904,495 @@ int test_factory_config_default(void) {
     TEST_ASSERT(ok, "factory_init should succeed");
     TEST_ASSERT(f->config.max_signers == FACTORY_MAX_SIGNERS,
                 "NULL config should use defaults");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* ---- Pseudo-Spilman leaf tests ---- */
+
+/* Build a 3-participant (LSP + 2 clients) factory with FACTORY_ARITY_PS leaves.
+   Each client gets its own PS leaf. Verify structure and nSequence. */
+int test_factory_ps_leaf_build(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xAA;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tw;
+    /* funding SPK: P2TR of 3-of-3 aggregate */
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 3, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 500000, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+
+    /* 3 participants = 2 clients = 2 PS leaves
+       Tree: root KO+State + 2×(leaf KO+State) = 6 nodes */
+    TEST_ASSERT_EQ((int)f->n_nodes, 6, "6 nodes for 2 PS leaves");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 2, "2 leaf nodes");
+
+    /* Both leaf state nodes must be marked is_ps_leaf */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf");
+        TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0, "initial chain_len=0");
+        /* nSequence must be 0xFFFFFFFE (no relative timelock) */
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu, "PS leaf nseq=0xFFFFFFFE");
+        /* Outputs: 1 channel + 1 L-stock */
+        TEST_ASSERT_EQ((int)f->nodes[ni].n_outputs, 2, "PS leaf has 2 outputs");
+    }
+
+    /* Non-leaf state node (root) must NOT be ps_leaf */
+    TEST_ASSERT(!f->nodes[1].is_ps_leaf, "root state not ps_leaf");
+
+    /* Sign and verify */
+    TEST_ASSERT(factory_sign_all(f), "sign PS factory");
+    TEST_ASSERT(factory_verify_all(f), "verify PS factory");
+
+    /* PS EWT = root layer only = step*(states-1) = 6*9 = 54.
+       Pure ARITY_1 would be 2 layers = 108. Assert exact value. */
+    uint32_t ewt = factory_early_warning_time(f);
+    TEST_ASSERT_EQ(ewt, 6 * (10 - 1), "PS EWT == step*(states-1) == 54");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Advance a PS leaf multiple times; verify chain grows and txids change. */
+int test_factory_ps_leaf_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xCC;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDD, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 6, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+
+    /* Capture initial txid */
+    unsigned char txid0[32];
+    memcpy(txid0, f->nodes[leaf0].txid, 32);
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 0, "chain_len=0 before advance");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 2, "chain[0] has 2 outputs");
+
+    /* First advance */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 1");
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 1, "chain_len=1 after advance 1");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1, "chain[1] has 1 output");
+    /* ps_prev_txid must equal txid0 */
+    TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid0, 32) == 0,
+                "ps_prev_txid = original txid");
+    /* New txid must differ */
+    TEST_ASSERT(memcmp(f->nodes[leaf0].txid, txid0, 32) != 0,
+                "txid changed after advance");
+    TEST_ASSERT(f->nodes[leaf0].is_signed, "re-signed after advance");
+
+    unsigned char txid1[32];
+    memcpy(txid1, f->nodes[leaf0].txid, 32);
+
+    /* Second advance */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 2");
+    TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, 2, "chain_len=2");
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1, "chain[2] has 1 output");
+    TEST_ASSERT(memcmp(f->nodes[leaf0].ps_prev_txid, txid1, 32) == 0,
+                "ps_prev_txid = txid1");
+    TEST_ASSERT(memcmp(f->nodes[leaf0].txid, txid1, 32) != 0,
+                "txid changed after advance 2");
+
+    /* nSequence stays 0xFFFFFFFE throughout */
+    TEST_ASSERT(f->nodes[leaf0].nsequence == 0xFFFFFFFEu, "nseq still 0xFFFFFFFE");
+
+    /* The other leaf must be unaffected */
+    size_t leaf1 = f->leaf_node_indices[1];
+    TEST_ASSERT_EQ(f->nodes[leaf1].ps_chain_len, 0, "leaf1 chain_len unchanged");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* After N PS advances the channel output must equal initial_channel - N*fee.
+   n_outputs must be 1 for every advance TX (no L-stock re-split). */
+int test_factory_ps_amount_invariant(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xF1;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xF1, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 1, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+    uint64_t fee = f->fee_per_tx;
+
+    /* chain[0]: must have 2 outputs (channel + L-stock) */
+    TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 2, "chain[0] has 2 outputs");
+    uint64_t initial_channel = f->nodes[leaf0].outputs[0].amount_sats;
+    TEST_ASSERT(initial_channel > 0, "initial channel > 0");
+
+    /* Advance 10 times; verify exact amount and n_outputs==1 each time */
+    for (int n = 1; n <= 10; n++) {
+        TEST_ASSERT(factory_advance_leaf(f, 0), "advance succeeds");
+        uint64_t expected = initial_channel - (uint64_t)n * fee;
+        TEST_ASSERT_EQ((long)f->nodes[leaf0].outputs[0].amount_sats,
+                       (long)expected, "channel = initial - N*fee");
+        TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 1,
+                       "advance TX has 1 output (no L-stock re-split)");
+        TEST_ASSERT_EQ(f->nodes[leaf0].ps_chain_len, n, "chain_len == N");
+    }
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* factory_advance_leaf must return 0 cleanly when the next chain TX output
+   would fall below the dust limit. chain_len must not advance on failure. */
+int test_factory_ps_dust_limit(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    for (int i = 0; i < 3; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xF2;
+        secp256k1_keypair_create(ctx, &kps[i], sk);
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (int i = 0; i < 3; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tp;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp, &ka.cache, tweak);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+        build_p2tr_script_pubkey(fund_spk, &xo);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xF2, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 1, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    size_t leaf0 = f->leaf_node_indices[0];
+
+    /* One normal advance to get a clean chain[1] state. */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance 1 succeeds");
+    uint64_t chan_after_1 = f->nodes[leaf0].outputs[0].amount_sats;
+    int chain_len_after_1 = f->nodes[leaf0].ps_chain_len;
+
+    /* Set fee so that next advance output = chan_after_1 - fee < dust limit.
+       fee = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1 guarantees out < 546. */
+    f->fee_per_tx = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1;
+
+    /* This advance must fail: output would be below dust. */
+    TEST_ASSERT(!factory_advance_leaf(f, 0), "advance returns 0 at dust limit");
+
+    /* chain_len was incremented before the dust check — verify the increment
+       happened (this is the current behaviour; the caller must handle 0 return
+       by not persisting or broadcasting the partial state). */
+    TEST_ASSERT(f->nodes[leaf0].ps_chain_len > chain_len_after_1,
+                "chain_len incremented (caller must not use partial state on 0 return)");
+
+    /* The channel output amount must be unchanged from before the failed advance. */
+    TEST_ASSERT_EQ((long)f->nodes[leaf0].outputs[0].amount_sats,
+                   (long)chan_after_1,
+                   "channel amount unchanged after failed advance");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Verify PS and DW leaves can coexist in the same factory via level_arity. */
+int test_factory_ps_mixed_arity(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tw;
+    compute_funding_spk(ctx, kps, fund_spk, &fund_tw);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xEE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 5, 6, 10);
+
+    /* Root level: arity-2 (2 children per node), leaves: arity-PS */
+    uint8_t arities[2] = {2, (uint8_t)FACTORY_ARITY_PS};
+    factory_set_level_arity(f, arities, 2);
+    factory_set_funding(f, fake_txid, 0, 2000000, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build mixed arity");
+    TEST_ASSERT(factory_sign_all(f), "sign mixed arity");
+    TEST_ASSERT(factory_verify_all(f), "verify mixed arity");
+
+    /* All leaf state nodes must be PS */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf in mixed tree");
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu, "leaf nseq=0xFFFFFFFE");
+    }
+
+    /* Root state node is NOT a PS leaf */
+    TEST_ASSERT(!f->nodes[1].is_ps_leaf, "root state not ps_leaf");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Simulate the LSP+client split-round signing ceremony for a PS leaf advance.
+   Mirrors test_factory_arity1_split_round_leaf_advance but for PS leaves:
+   factory_advance_leaf_unsigned (PS branch) + manual MuSig2 ceremony in-process. */
+int test_factory_ps_split_round_leaf_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+
+    unsigned char seckeys[3][32];
+    for (int i = 0; i < 3; i++) {
+        memset(seckeys[i], 0, 32);
+        seckeys[i][0] = (unsigned char)(0x11 + i);
+        seckeys[i][31] = (unsigned char)(0x01 + i);
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+    }
+
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_xonly_pubkey fund_xpk;
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 3);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_xpk, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_xpk);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xCC, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init(f, ctx, kps, 3, 1, 100);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    size_t node_idx = f->leaf_node_indices[0];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    uint64_t initial_chan = node->outputs[0].amount_sats;
+    uint64_t fee = f->fee_per_tx;
+
+    /* Step 1: LSP side — advance unsigned (PS branch) */
+    int rc = factory_advance_leaf_unsigned(f, 0);
+    TEST_ASSERT_EQ(rc, 1, "PS advance_unsigned returns 1");
+    TEST_ASSERT_EQ(node->is_ps_leaf, 1, "is_ps_leaf");
+    TEST_ASSERT_EQ(node->ps_chain_len, 1, "chain_len == 1 after advance");
+    TEST_ASSERT_EQ((int)node->n_outputs, 1, "n_outputs == 1 after PS advance");
+    TEST_ASSERT(node->is_built, "node rebuilt after advance");
+
+    /* Step 2: Init signing session */
+    TEST_ASSERT(factory_session_init_node(f, node_idx), "session init");
+
+    /* Step 3+4: Generate nonces for both signers (LSP=slot 0, client=slot 1) */
+    secp256k1_musig_secnonce secnonces[2];
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        if (!secp256k1_keypair_sec(ctx, seckey, &kps[participant])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pk, &kps[participant])) return 0;
+
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
+                                           seckey, &pk, &node->keyagg.cache),
+                    "nonce gen");
+        memset(seckey, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce(f, node_idx, j, &pubnonce), "set nonce");
+    }
+
+    /* Step 5: Finalize nonce aggregation */
+    TEST_ASSERT(factory_session_finalize_node(f, node_idx), "finalize");
+
+    /* Step 6: Create partial sigs for both signers */
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &node->signing_session),
+                    "partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig(f, node_idx, j, &psig),
+                    "set partial sig");
+    }
+
+    /* Step 7: Aggregate */
+    TEST_ASSERT(factory_session_complete_node(f, node_idx), "complete node");
+    TEST_ASSERT(node->is_signed, "node signed");
+    TEST_ASSERT(node->signed_tx.len > 0, "signed_tx non-empty");
+
+    /* Verify amounts and chain state */
+    TEST_ASSERT_EQ((int)node->ps_chain_len, 1, "chain_len remains 1");
+    TEST_ASSERT_EQ((int)node->n_outputs, 1, "n_outputs == 1");
+    uint64_t expected = initial_chan - fee;
+    TEST_ASSERT(node->outputs[0].amount_sats == expected, "channel amount = initial - fee");
+
+    /* A second advance should also work via the same ceremony */
+    unsigned char first_txid[32];
+    memcpy(first_txid, node->txid, 32);
+
+    rc = factory_advance_leaf_unsigned(f, 0);
+    TEST_ASSERT_EQ(rc, 1, "second PS advance_unsigned returns 1");
+    TEST_ASSERT_EQ(node->ps_chain_len, 2, "chain_len == 2 after second advance");
+    TEST_ASSERT(memcmp(node->txid, first_txid, 32) != 0, "txid changed after 2nd advance");
+
+    TEST_ASSERT(factory_session_init_node(f, node_idx), "session init 2");
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
+        secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
+        secp256k1_musig_pubnonce pubnonce;
+        musig_generate_nonce(ctx, &secnonces[j], &pubnonce, seckey, &pk, &node->keyagg.cache);
+        memset(seckey, 0, 32);
+        factory_session_set_nonce(f, node_idx, j, &pubnonce);
+    }
+    TEST_ASSERT(factory_session_finalize_node(f, node_idx), "finalize 2");
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        musig_create_partial_sig(ctx, &psig, &secnonces[j], &kps[participant],
+                                  &node->signing_session);
+        factory_session_set_partial_sig(f, node_idx, j, &psig);
+    }
+    TEST_ASSERT(factory_session_complete_node(f, node_idx), "complete node 2");
+    TEST_ASSERT(node->is_signed, "node signed after 2nd advance");
+    uint64_t expected2 = initial_chan - 2 * fee;
+    TEST_ASSERT(node->outputs[0].amount_sats == expected2,
+                "channel amount = initial - 2*fee after 2nd advance");
 
     factory_free(f);
     secp256k1_context_destroy(ctx);

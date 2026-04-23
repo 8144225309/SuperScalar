@@ -336,6 +336,16 @@ static const char *SCHEMA_SQL =
     "  commitment_number INTEGER NOT NULL DEFAULT 0,"
     "  sweep_txid TEXT DEFAULT '',"
     "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
+    ");"
+    /* v19: pseudo-Spilman leaf chain history for ordered force-close TX publication */
+    "CREATE TABLE IF NOT EXISTS ps_leaf_chains ("
+    "  factory_id INTEGER NOT NULL,"
+    "  leaf_node_idx INTEGER NOT NULL,"
+    "  chain_pos INTEGER NOT NULL,"
+    "  txid TEXT NOT NULL,"
+    "  signed_tx_hex TEXT NOT NULL,"
+    "  chan_amount_sats INTEGER NOT NULL,"
+    "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -786,6 +796,20 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    if (db_version < 19) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS ps_leaf_chains ("
+            "  factory_id INTEGER NOT NULL,"
+            "  leaf_node_idx INTEGER NOT NULL,"
+            "  chain_pos INTEGER NOT NULL,"
+            "  txid TEXT NOT NULL,"
+            "  signed_tx_hex TEXT NOT NULL,"
+            "  chan_amount_sats INTEGER NOT NULL,"
+            "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
+            ");",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -969,6 +993,99 @@ int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
     return rc == SQLITE_DONE ? 1 : 0;
 }
 
+/* Save one PS leaf chain entry (called on each PS leaf advance).
+   chain_pos: 0-based position in the chain (equal to old ps_chain_len before advance).
+   signed_tx / signed_tx_len: the signed TX being stored.
+   txid_display: 32-byte display-order txid.
+   chan_amount_sats: channel output amount for this chain position. */
+int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
+                                 uint32_t leaf_node_idx, int chain_pos,
+                                 const unsigned char *txid_display,
+                                 const unsigned char *signed_tx, size_t signed_tx_len,
+                                 uint64_t chan_amount_sats) {
+    if (!p || !p->db) return 0;
+
+    char txid_hex[65];
+    hex_encode(txid_display, 32, txid_hex);
+
+    size_t hex_len = signed_tx_len * 2 + 1;
+    char *tx_hex = malloc(hex_len);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO ps_leaf_chains "
+        "(factory_id, leaf_node_idx, chain_pos, txid, signed_tx_hex, chan_amount_sats) "
+        "VALUES (?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(tx_hex);
+        return 0;
+    }
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)leaf_node_idx);
+    sqlite3_bind_int(stmt, 3, chain_pos);
+    sqlite3_bind_text(stmt, 4, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, tx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)chan_amount_sats);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+/* Load PS leaf chain for a given leaf node.
+   Fills chain_txs_out (caller-allocated array of tx_buf_t, size max_chain).
+   txids_out: caller-allocated [max_chain][32] for internal-order txids.
+   Returns number of chain entries loaded (0 = no PS chain or error). */
+int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
+                           tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
+                           uint64_t *amounts_out, int max_chain) {
+    if (!p || !p->db || !chain_txs_out || !txids_out || max_chain <= 0) return 0;
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT chain_pos, txid, signed_tx_hex, chan_amount_sats FROM ps_leaf_chains "
+        "WHERE factory_id=? AND leaf_node_idx=? ORDER BY chain_pos ASC;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)leaf_node_idx);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_chain) {
+        int pos = sqlite3_column_int(stmt, 0);
+        if (pos != count) break;  /* gap — corrupt data */
+
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *tx_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        if (!txid_hex || !tx_hex) break;
+
+        /* Decode txid (display → internal) */
+        unsigned char txid_display[32];
+        if (!hex_decode(txid_hex, txid_display, 32)) break;
+        memcpy(txids_out[count], txid_display, 32);
+        reverse_bytes(txids_out[count], 32);
+
+        /* Decode signed tx */
+        size_t tx_hex_len = strlen(tx_hex);
+        size_t tx_len = tx_hex_len / 2;
+        tx_buf_init(&chain_txs_out[count], (int)tx_len);
+        if (!hex_decode(tx_hex, chain_txs_out[count].data, tx_len)) {
+            tx_buf_free(&chain_txs_out[count]);
+            break;
+        }
+        chain_txs_out[count].len = tx_len;
+
+        if (amounts_out)
+            amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
+
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -1027,8 +1144,11 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint32_t states_per_layer = (uint32_t)sqlite3_column_int(stmt, 5);
     uint32_t cltv_timeout = (uint32_t)sqlite3_column_int(stmt, 6);
     uint64_t fee_per_tx = (uint64_t)sqlite3_column_int64(stmt, 7);
-    int leaf_arity = sqlite3_column_int(stmt, 8);
-    if (leaf_arity != 1) leaf_arity = 2;  /* default to arity-2 */
+    int leaf_arity_raw = sqlite3_column_int(stmt, 8);
+    factory_arity_t leaf_arity =
+        (leaf_arity_raw == (int)FACTORY_ARITY_1)  ? FACTORY_ARITY_1  :
+        (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
+                                                     FACTORY_ARITY_2;
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -1130,17 +1250,82 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
     f->fee_per_tx = fee_per_tx;
-    if (leaf_arity == 1)
+    if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
+    else if (leaf_arity == FACTORY_ARITY_PS)
+        factory_set_arity(f, FACTORY_ARITY_PS);
+    /* FACTORY_ARITY_2 is the default from factory_init_from_pubkeys */
 
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                          fund_spk, 34);
 
     if (!factory_build_tree(f)) {
-        /* factory_build_tree may have partially allocated tx_bufs in nodes
-           before failing validation; release them so caller doesn't leak. */
         factory_free(f);
         return 0;
+    }
+
+    /* For PS factories: restore per-leaf chain state from ps_leaf_chains table.
+       factory_build_tree produces chain[0] (unsigned). If any advances were
+       persisted, replay them so ps_chain_len / ps_prev_txid / signed_tx are
+       current. Without this a restart would try to spend the already-spent
+       chain[0] output on the next advance. */
+    if (leaf_arity == FACTORY_ARITY_PS) {
+        #define PS_RESTORE_MAX 4096
+        tx_buf_t       *chain_txs  = calloc(PS_RESTORE_MAX, sizeof(tx_buf_t));
+        unsigned char (*chain_ids)[32] = calloc(PS_RESTORE_MAX, 32);
+        uint64_t       *chain_amts = calloc(PS_RESTORE_MAX, sizeof(uint64_t));
+
+        if (chain_txs && chain_ids && chain_amts) {
+            for (int li = 0; li < f->n_leaf_nodes; li++) {
+                size_t node_idx = f->leaf_node_indices[li];
+                factory_node_t *node = &f->nodes[node_idx];
+                if (!node->is_ps_leaf) continue;
+
+                int count = persist_load_ps_chain(p, factory_id,
+                    (uint32_t)node_idx, chain_txs, chain_ids, chain_amts,
+                    PS_RESTORE_MAX);
+
+                if (count <= 0) continue;
+
+                /* chain[0] txid is node->txid as set by factory_build_tree
+                   (segwit txid excludes witness, so unsigned == signed txid). */
+                unsigned char chain0_txid[32];
+                memcpy(chain0_txid, node->txid, 32);
+                uint64_t chain0_amount = node->outputs[0].amount_sats;
+
+                node->ps_chain_len = count;
+                node->n_outputs    = 1;
+
+                if (count == 1) {
+                    memcpy(node->ps_prev_txid, chain0_txid, 32);
+                    node->ps_prev_chan_amount = chain0_amount;
+                } else {
+                    memcpy(node->ps_prev_txid, chain_ids[count - 2], 32);
+                    node->ps_prev_chan_amount = chain_amts[count - 2];
+                }
+
+                memcpy(node->txid, chain_ids[count - 1], 32);
+                node->outputs[0].amount_sats = chain_amts[count - 1];
+
+                /* Restore latest signed TX */
+                tx_buf_free(&node->signed_tx);
+                tx_buf_t *last = &chain_txs[count - 1];
+                tx_buf_init(&node->signed_tx, (int)last->len);
+                memcpy(node->signed_tx.data, last->data, last->len);
+                node->signed_tx.len = last->len;
+                node->is_signed = 1;
+
+                for (int j = 0; j < count; j++) tx_buf_free(&chain_txs[j]);
+
+                printf("persist: PS leaf %d restored to chain_len=%d "
+                       "(%lu sats)\n", li, count,
+                       (unsigned long)node->outputs[0].amount_sats);
+            }
+        }
+        free(chain_txs);
+        free(chain_ids);
+        free(chain_amts);
+        #undef PS_RESTORE_MAX
     }
 
     return 1;

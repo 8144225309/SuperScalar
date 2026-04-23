@@ -672,28 +672,32 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
 int regtest_create_wallet(regtest_t *rt, const char *name) {
     char params[256];
     snprintf(params, sizeof(params), "\"%s\"", name);
+
+    /* Try createwallet, then loadwallet.  Both may return non-NULL with an
+       error message (CLI fork+exec captures stderr as output).  Rather than
+       string-match for error patterns — which is fragile and varies between
+       HTTP and CLI paths — just verify via listwallets at the end. */
     char *result = regtest_exec(rt, "createwallet", params);
-    if (!result) {
-        /* createwallet failed — wallet may already exist (HTTP path returns NULL for
-           all errors, including the benign "already exists" case).
-           Try loadwallet; if that also fails the wallet is likely already loaded. */
-        result = regtest_exec(rt, "loadwallet", params);
-        if (result) {
-            free(result);
-        }
-        /* Fall through: set wallet name regardless — it either was created, loaded,
-           or is already active.  Subsequent RPC calls will confirm. */
-    } else {
-        if (strstr(result, "error") != NULL && strstr(result, "already exists") == NULL) {
-            free(result);
-            result = regtest_exec(rt, "loadwallet", params);
-            if (!result) return 0;
-        }
+    if (result) free(result);
+
+    result = regtest_exec(rt, "loadwallet", params);
+    if (result) free(result);
+
+    /* Verify the wallet is actually loaded.  This is the single source of
+       truth: createwallet/loadwallet may have succeeded, failed silently, or
+       failed with "already loaded" — but if listwallets contains the name,
+       subsequent wallet RPCs will succeed. */
+    result = regtest_exec(rt, "listwallets", "");
+    if (result) {
+        int found = (strstr(result, name) != NULL);
         free(result);
+        if (found) {
+            strncpy(rt->wallet, name, sizeof(rt->wallet) - 1);
+            return 1;
+        }
     }
 
-    strncpy(rt->wallet, name, sizeof(rt->wallet) - 1);
-    return 1;
+    return 0;
 }
 
 int regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len) {

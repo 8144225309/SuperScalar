@@ -1573,6 +1573,14 @@ extern int test_persist_open_readonly(void);
 extern int test_factory_config_custom(void);
 extern int test_factory_config_default(void);
 
+/* Pseudo-Spilman Leaves */
+extern int test_factory_ps_leaf_build(void);
+extern int test_factory_ps_leaf_advance(void);
+extern int test_factory_ps_amount_invariant(void);
+extern int test_factory_ps_dust_limit(void);
+extern int test_factory_ps_mixed_arity(void);
+extern int test_factory_ps_split_round_leaf_advance(void);
+
 /* Wire TLV Foundation (Mainnet Gap #8) */
 extern int test_tlv_encode_decode(void);
 extern int test_tlv_decode_truncated(void);
@@ -1669,6 +1677,11 @@ extern int test_sweep_persist_roundtrip(void);
 /* Mainnet Audit: Shell Injection Fix */
 extern int test_regtest_param_sanitization(void);
 extern int test_regtest_exec_rejects_metacharacters(void);
+
+/* Pseudo-Spilman Leaf: On-Chain Regtest */
+extern int test_regtest_ps_basic_close(void);
+extern int test_regtest_ps_chain_close(void);
+extern int test_regtest_ps_old_state_response(void);
 
 /* Mainnet Audit: Password-Hardened KDF */
 extern int test_keyfile_v2_roundtrip(void);
@@ -3287,6 +3300,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_config_custom);
     RUN_TEST(test_factory_config_default);
 
+    printf("\n=== Pseudo-Spilman Leaves ===\n");
+    RUN_TEST(test_factory_ps_leaf_build);
+    RUN_TEST(test_factory_ps_leaf_advance);
+    RUN_TEST(test_factory_ps_amount_invariant);
+    RUN_TEST(test_factory_ps_dust_limit);
+    RUN_TEST(test_factory_ps_mixed_arity);
+    RUN_TEST(test_factory_ps_split_round_leaf_advance);
+
     printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");
     RUN_TEST(test_tlv_encode_decode);
     RUN_TEST(test_tlv_decode_truncated);
@@ -3383,6 +3404,11 @@ static void run_unit_tests(void) {
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);
     RUN_TEST(test_regtest_exec_rejects_metacharacters);
+
+    printf("\n=== Pseudo-Spilman Leaves: On-Chain Regtest ===\n");
+    RUN_TEST(test_regtest_ps_basic_close);
+    RUN_TEST(test_regtest_ps_chain_close);
+    RUN_TEST(test_regtest_ps_old_state_response);
 
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);

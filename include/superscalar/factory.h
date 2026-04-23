@@ -19,8 +19,9 @@
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
 typedef enum {
-    FACTORY_ARITY_2 = 2,    /* 2 clients per leaf (3-of-3), 6 nodes, 2 DW layers */
-    FACTORY_ARITY_1 = 1,    /* 1 client per leaf (2-of-2), 14 nodes, 3 DW layers */
+    FACTORY_ARITY_2  = 2,   /* 2 clients per leaf (3-of-3), 2 DW layers */
+    FACTORY_ARITY_1  = 1,   /* 1 client per leaf (2-of-2), 3 DW layers */
+    FACTORY_ARITY_PS = 3,   /* pseudo-Spilman: 1 client per leaf, chained TXs replace leaf DW layer */
 } factory_arity_t;
 
 /* Client placement strategies for tree construction */
@@ -116,6 +117,12 @@ typedef struct {
     musig_signing_session_t signing_session;
     secp256k1_musig_partial_sig partial_sigs[FACTORY_MAX_SIGNERS];
     int partial_sigs_received;
+
+    /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
+    int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
+    int ps_chain_len;            /* number of state advances (0 = initial state) */
+    unsigned char ps_prev_txid[32];    /* txid (internal byte order) of the prior chain TX */
+    uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX */
 } factory_node_t;
 
 typedef struct {
@@ -249,6 +256,11 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Returns 0 if fully exhausted (need factory rotation).
    Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
+
+/* Compute the factory_early_warning_time (blocks) per BLIP-56.
+   This is the worst-case blocks needed for full unilateral close from
+   the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
+uint32_t factory_early_warning_time(const factory_t *f);
 
 /* Sign a single node (local-only, all keypairs available). */
 int factory_sign_node(factory_t *f, size_t node_idx);

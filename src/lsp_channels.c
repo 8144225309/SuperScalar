@@ -1402,38 +1402,40 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
-/* --- Per-leaf DW advance (arity-1 split-round signing) --- */
+/* --- Per-leaf advance (arity-1 DW and arity-PS chained-TX, split-round signing) --- */
 
-/* Advance one leaf's DW counter, do split-round signing with the affected
-   client, and notify all clients. Only operates in arity-1 mode.
-   leaf_side: 0..n_leaf_nodes-1 (same as client index for arity-1).
+/* Advance one leaf, do split-round 2-of-2 signing with the affected client,
+   and notify all clients. Supports FACTORY_ARITY_1 (DW) and FACTORY_ARITY_PS.
+   leaf_side: 0..n_leaf_nodes-1 (same as client index for these arities).
    Returns 1 on success, 0 on failure or skip. */
 static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     factory_t *f = &lsp->factory;
 
-    /* Only advance for arity-1 (each leaf = 1 client, 2-of-2 signing) */
-    if (f->leaf_arity != FACTORY_ARITY_1) return 1;
+    if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
-    /* Capture old state txid BEFORE advancing (for watchtower).
-       If old state is later published on-chain, the watchtower responds
-       with the new state tx and burns the L-stock output. */
+    /* Capture old state BEFORE advancing (for watchtower burn-tx and PS persist).
+       For PS: n_outputs flips 2→1 after the first advance so we must record the
+       old L-stock vout and amount here, not after. */
     size_t pre_node_idx = f->leaf_node_indices[leaf_side];
     unsigned char old_leaf_txid[32];
     int had_old_signed = (f->nodes[pre_node_idx].is_signed &&
                           f->nodes[pre_node_idx].signed_tx.len > 0);
     if (had_old_signed)
         memcpy(old_leaf_txid, f->nodes[pre_node_idx].txid, 32);
+    int old_n_outputs = f->nodes[pre_node_idx].n_outputs;
+    uint64_t old_l_amount = (old_n_outputs >= 2)
+                            ? f->nodes[pre_node_idx].outputs[old_n_outputs - 1].amount_sats
+                            : 0;
 
-    /* Step 1: Advance DW counter + rebuild unsigned tx */
+    /* Step 1: Advance leaf state + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
     if (rc == 0) {
-        fprintf(stderr, "LSP: leaf %d DW fully exhausted\n", leaf_side);
+        fprintf(stderr, "LSP: leaf %d advance exhausted\n", leaf_side);
         return 0;
     }
     if (rc == -1) {
-        /* Root advanced + full rebuild needed — too complex for per-leaf flow.
-           This is rare and should trigger a factory rotation instead. */
+        /* DW only: root advanced + full rebuild needed — trigger factory rotation. */
         printf("LSP: leaf %d exhausted, root advanced — skipping per-leaf signing\n",
                leaf_side);
         return 1;
@@ -1578,19 +1580,24 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
     /* Register old leaf state with watchtower for breach detection.
        If the old state is broadcast, the watchtower responds with the
-       new (latest) signed state tx and burns the old L-stock output. */
+       new (latest) signed state tx and burns the old L-stock output.
+       Use old_n_outputs/old_l_amount captured before the advance: for PS the
+       node's n_outputs flips from 2→1 on the first advance, so post-advance
+       values would incorrectly point to the channel output instead of L-stock. */
     if (had_old_signed && mgr->watchtower) {
         factory_node_t *leaf_node = &f->nodes[node_idx];
 
-        /* Build burn TX for old state's L-stock output */
         tx_buf_t burn_tx;
         tx_buf_init(&burn_tx, 256);
         uint32_t old_epoch = f->counter.current_epoch > 0
                            ? f->counter.current_epoch - 1 : 0;
-        size_t l_vout = leaf_node->n_outputs - 1;
-        int burn_ok = factory_build_burn_tx(f, &burn_tx,
-            old_leaf_txid, (uint32_t)l_vout,
-            leaf_node->outputs[l_vout].amount_sats, old_epoch);
+        int burn_ok = 0;
+        if (old_n_outputs >= 2) {
+            size_t l_vout = (size_t)(old_n_outputs - 1);
+            burn_ok = factory_build_burn_tx(f, &burn_tx,
+                old_leaf_txid, (uint32_t)l_vout,
+                old_l_amount, old_epoch);
+        }
 
         /* Collect channel indices that live on this leaf node */
         uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
@@ -1617,22 +1624,44 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     }
     cJSON_Delete(done);
 
-    /* Step 11: Persist per-leaf DW state */
+    /* Step 11: Persist leaf state */
     if (mgr->persist) {
-        uint32_t leaf_states[8];
-        for (int i = 0; i < f->n_leaf_nodes; i++)
-            leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS];
-        for (uint32_t i = 0; i < f->counter.n_layers; i++)
-            layer_states[i] = f->counter.layers[i].config.max_states;
-        persist_save_dw_counter_with_leaves(
-            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-            f->counter.n_layers, layer_states,
-            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        factory_node_t *leaf_node = &f->nodes[node_idx];
+        if (leaf_node->is_ps_leaf) {
+            /* PS: save this chain entry; chain_pos = ps_chain_len-1 (0-based) */
+            extern void reverse_bytes(unsigned char *, size_t);
+            unsigned char txid_display[32];
+            memcpy(txid_display, leaf_node->txid, 32);
+            reverse_bytes(txid_display, 32);
+            persist_save_ps_chain_entry(
+                (persist_t *)mgr->persist, 0,
+                (uint32_t)node_idx,
+                leaf_node->ps_chain_len - 1,
+                txid_display,
+                leaf_node->signed_tx.data, leaf_node->signed_tx.len,
+                leaf_node->outputs[0].amount_sats);
+        } else {
+            /* DW: save counter state */
+            uint32_t leaf_states[8];
+            for (int i = 0; i < f->n_leaf_nodes; i++)
+                leaf_states[i] = f->leaf_layers[i].current_state;
+            uint32_t layer_states[DW_MAX_LAYERS];
+            for (uint32_t i = 0; i < f->counter.n_layers; i++)
+                layer_states[i] = f->counter.layers[i].config.max_states;
+            persist_save_dw_counter_with_leaves(
+                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                f->counter.n_layers, layer_states,
+                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        }
     }
 
-    printf("LSP: leaf %d advanced (node %zu), DW state %u\n",
-           leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
+    factory_node_t *leaf_node = &f->nodes[node_idx];
+    if (leaf_node->is_ps_leaf)
+        printf("LSP: PS leaf %d advanced (node %zu), chain_len %d\n",
+               leaf_side, node_idx, leaf_node->ps_chain_len);
+    else
+        printf("LSP: DW leaf %d advanced (node %zu), DW state %u\n",
+               leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
     return 1;
 }
 
@@ -2200,10 +2229,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (fulfill_txn_started && mgr->persist)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Per-leaf DW advance: after payment settles, advance both affected leaves.
-       This is the arity-1 killer feature — only the involved clients' leaves
-       need to be re-signed, not the entire tree. */
-    if (lsp->factory.leaf_arity == FACTORY_ARITY_1) {
+    /* Per-leaf advance: after payment settles, advance both affected leaves.
+       Arity-1 (DW) and Arity-PS both use per-leaf 2-of-2 signing, so only
+       the involved clients' leaves need to be re-signed, not the entire tree. */
+    if (lsp->factory.leaf_arity == FACTORY_ARITY_1 ||
+        lsp->factory.leaf_arity == FACTORY_ARITY_PS) {
         /* Advance payee's leaf */
         lsp_advance_leaf(mgr, lsp, (int)client_idx);
         /* Advance sender's leaf (if found via intra-factory routing) */
@@ -4626,3 +4656,8 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
     return ok;
 }
 
+
+/* Public wrapper: advance one PS leaf via the production wire ceremony. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+    return lsp_advance_leaf(mgr, lsp, leaf_side);
+}
