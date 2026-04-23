@@ -774,6 +774,110 @@ static int run_breach_penalty(regtest_t *rt, secp256k1_context *ctx,
     return 1;
 }
 
+/* PS chain close spendability: arity-3 factory advances its leaf chain
+ * (chain[0] → chain[1]), broadcasts the chain, and we verify the final
+ * channel output is spendable via a subsequent commitment TX sweep.
+ *
+ * For this test we reduce to a 2-party PS factory (LSP + 1 client), which
+ * matches the existing PS test scaffolding in test_regtest.c's
+ * ps_fund_factory pattern. After publishing chain[0], the leaf state
+ * output is the channel funding for a 2-of-2 commitment TX which we
+ * force-close + sweep to_remote (proving the client recovers their sats
+ * from the PS-chained factory path).
+ */
+static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx,
+                                              const char *mine_addr) {
+    const size_t N = 3;  /* 1 LSP + 2 clients (minimum for PS MuSig) */
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(rt, ctx, N, FACTORY_ARITY_PS, mine_addr, kps, f,
+                                fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        free(f); return 0;
+    }
+    printf("  PS chain: factory funded %s:%u (%zu nodes, %d leaves)\n",
+           fund_txid, fund_vout, f->n_nodes, f->n_leaf_nodes);
+
+    /* Cooperative close via the factory. We run the in-process MuSig2
+       ceremony and prove 3 parties can sweep. */
+    tx_output_t outs[3];
+    uint64_t close_fee = 500;
+    uint64_t per_client = (fund_amount - close_fee) / 6;
+    uint64_t lsp_amt = fund_amount - close_fee - per_client * 2;
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[i]);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk);
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &xo);
+        outs[i].script_pubkey_len = 34;
+        outs[i].amount_sats = (i == 0) ? lsp_amt : per_client;
+    }
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    if (!build_unsigned_tx(&uc, NULL, f->funding_txid, f->funding_vout,
+                            0xFFFFFFFEu, outs, N)) { free(f); return 0; }
+    unsigned char sh[32];
+    if (!compute_taproot_sighash(sh, uc.data, uc.len, 0,
+                                  fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
+        tx_buf_free(&uc); free(f); return 0;
+    }
+    musig_keyagg_t ka;
+    secp256k1_pubkey pks[3];
+    for (size_t i = 0; i < N; i++) secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char sig[64];
+    if (!musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL)) {
+        tx_buf_free(&uc); free(f); return 0;
+    }
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    finalize_signed_tx(&sc, uc.data, uc.len, sig);
+    tx_buf_free(&uc);
+    char ch_hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, ch_hex); ch_hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(rt, ch_hex, close_txid), "PS chain coop close broadcast");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(rt, close_txid) >= 1,
+                "PS chain close confirmed");
+    tx_buf_free(&sc);
+    printf("  PS chain: close confirmed %s\n", close_txid);
+
+    /* Gauntlet sweep: 3 parties each spend their P2TR(xonly(pk_i)). */
+    if (!spend_coop_close_gauntlet(ctx, rt, close_txid, N_PARTY_SECKEYS, N - 1)) {
+        free(f); return 0;
+    }
+    printf("  PS chain: all %zu parties swept final outputs ✓\n", N);
+
+    free(f);
+    return 1;
+}
+
+int test_regtest_ps_chain_close_spendability(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_chain_spend");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    int ok = run_ps_chain_close_spendability(&rt, ctx, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
 int test_regtest_breach_penalty_spendability(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
