@@ -160,6 +160,20 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     mgr->leaf_arity = factory->leaf_arity;
     htlc_inbound_init(&mgr->htlc_inbound);
 
+    /* Derive LSP cooperative-close SPK: P2TR of the LSP's own factory pubkey.
+       Symmetric with per-client close_spk below. This lets the LSP alone
+       spend its recovered share (L-stock + sum(local_amounts) + accumulated
+       fees) with just its own seckey, instead of locking those sats in the
+       N-of-N factory funding SPK. */
+    if (factory->n_participants > 0) {
+        secp256k1_xonly_pubkey lsp_xonly_for_close;
+        if (secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly_for_close, NULL,
+                                                &factory->pubkeys[0])) {
+            build_p2tr_script_pubkey(mgr->lsp_close_spk, &lsp_xonly_for_close);
+            mgr->lsp_close_spk_len = 34;
+        }
+    }
+
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
         entry->channel_id = (uint32_t)c;
@@ -304,6 +318,16 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->next_request_id = 1;
     mgr->leaf_arity = factory->leaf_arity;
     htlc_inbound_init(&mgr->htlc_inbound);
+
+    /* Derive LSP cooperative-close SPK (see init() for rationale). */
+    if (factory->n_participants > 0) {
+        secp256k1_xonly_pubkey lsp_xonly_for_close;
+        if (secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly_for_close, NULL,
+                                                &factory->pubkeys[0])) {
+            build_p2tr_script_pubkey(mgr->lsp_close_spk, &lsp_xonly_for_close);
+            mgr->lsp_close_spk_len = 34;
+        }
+    }
 
     /* Restore accumulated fees from DB (crash recovery) */
     persist_load_fee_settlement(pdb, 0,
@@ -2981,9 +3005,30 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
                                          size_t close_spk_len) {
     if (!mgr || !factory || !outputs) return 0;
 
-    /* Use override SPK if provided, otherwise fall back to factory funding SPK */
+    /* Clients: rotation override SPK wins; otherwise per-client close_spk;
+       otherwise fall back to factory funding SPK (legacy path). */
     const unsigned char *spk = close_spk ? close_spk : factory->funding_spk;
     size_t spk_len = close_spk ? close_spk_len : factory->funding_spk_len;
+
+    /* LSP (output 0): rotation override wins (recycles funds into the new
+       factory's SPK); otherwise use mgr->lsp_close_spk (P2TR of the LSP's own
+       factory pubkey — LSP-alone spendable); otherwise fall back to factory
+       funding SPK (legacy path kept for tests that don't populate
+       lsp_close_spk). This keeps the LSP's recovered share unilaterally
+       spendable by the LSP with its own seckey, instead of locking it back
+       in the N-of-N funding MuSig. */
+    const unsigned char *lsp_spk;
+    size_t lsp_spk_len;
+    if (close_spk) {
+        lsp_spk = close_spk;
+        lsp_spk_len = close_spk_len;
+    } else if (mgr->lsp_close_spk_len > 0) {
+        lsp_spk = mgr->lsp_close_spk;
+        lsp_spk_len = mgr->lsp_close_spk_len;
+    } else {
+        lsp_spk = factory->funding_spk;
+        lsp_spk_len = factory->funding_spk_len;
+    }
 
     /* Output 0: LSP gets factory_funding - sum(client_remotes) - close_fee.
        In a cooperative close that bypasses the tree, the LSP recovers the
@@ -2996,8 +3041,8 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
     uint64_t lsp_total = factory->funding_amount_sats - client_total - close_fee;
 
     outputs[0].amount_sats = lsp_total;
-    memcpy(outputs[0].script_pubkey, spk, spk_len);
-    outputs[0].script_pubkey_len = spk_len;
+    memcpy(outputs[0].script_pubkey, lsp_spk, lsp_spk_len);
+    outputs[0].script_pubkey_len = lsp_spk_len;
 
     /* Outputs 1..N: each client gets their remote_amount.
        When close_spk override is active, all outputs use it (rotation/recycling).
