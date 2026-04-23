@@ -620,6 +620,179 @@ int test_regtest_force_close_to_local(void) {
     return ok;
 }
 
+/* Breach penalty sweep: LSP publishes an OLD (revoked) commitment. Client
+ * holds the revocation secret for that old state, so they construct a
+ * penalty TX that sweeps the ENTIRE to_local output (not just their own
+ * to_remote) via channel_build_penalty_tx (src/channel.c:969), which uses
+ * the revocation key-path spend.
+ */
+static int run_breach_penalty(regtest_t *rt, secp256k1_context *ctx,
+                                const char *mine_addr) {
+    secp256k1_keypair lsp_kp, client_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, N_PARTY_SECKEYS[0]);
+    secp256k1_keypair_create(ctx, &client_kp, N_PARTY_SECKEYS[1]);
+    secp256k1_pubkey lsp_pk, client_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+    secp256k1_keypair_pub(ctx, &client_pk, &client_kp);
+
+    /* 2-party MuSig funding. */
+    secp256k1_pubkey pks2[2] = { lsp_pk, client_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks2, 2);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tweak);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tpx_ser, fund_addr, sizeof(fund_addr))) return 0;
+    char fund_txid_hex[65];
+    if (!regtest_fund_address(rt, fund_addr, 0.001, fund_txid_hex)) return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+    uint32_t fund_vout = UINT32_MAX; uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(rt, fund_txid_hex, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "breach: find funding vout");
+    unsigned char fund_txid_bytes[32];
+    hex_decode(fund_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t old_local = 70000, old_remote = 29500;
+    uint32_t csv = 10;
+
+    channel_t lsp_ch, client_ch;
+    channel_init(&lsp_ch, ctx, N_PARTY_SECKEYS[0], &lsp_pk, &client_pk,
+                 fund_txid_bytes, fund_vout, fund_amount,
+                 fund_spk, 34, old_local, old_remote, csv);
+    channel_init(&client_ch, ctx, N_PARTY_SECKEYS[1], &client_pk, &lsp_pk,
+                 fund_txid_bytes, fund_vout, fund_amount,
+                 fund_spk, 34, old_remote, old_local, csv);
+    channel_generate_random_basepoints(&lsp_ch);
+    channel_generate_random_basepoints(&client_ch);
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    secp256k1_pubkey lsp_pcp0, client_pcp0, lsp_pcp1, client_pcp1;
+    channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
+    channel_get_per_commitment_point(&client_ch, 0, &client_pcp0);
+    channel_get_per_commitment_point(&lsp_ch, 1, &lsp_pcp1);
+    channel_get_per_commitment_point(&client_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&lsp_ch, 0, &client_pcp0);
+    channel_set_remote_pcp(&lsp_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
+    channel_set_remote_pcp(&client_ch, 1, &lsp_pcp1);
+
+    /* Build + sign OLD commitment (#0). */
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 512); tx_buf_init(&sc, 1024);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &uc, ct), "breach: build old commit");
+    TEST_ASSERT(channel_sign_commitment(&lsp_ch, &sc, &uc, &client_kp),
+                "breach: sign old commit");
+
+    /* Capture to_local spk BEFORE revocation. */
+    unsigned char old_to_local_spk[34];
+    memcpy(old_to_local_spk, uc.data + 47 + 8 + 1, 34);
+
+    /* Advance to commit #1, revoke #0 — client receives LSP's secret0. */
+    channel_generate_local_pcs(&lsp_ch, 2);
+    channel_generate_local_pcs(&client_ch, 2);
+    secp256k1_pubkey lsp_pcp2, client_pcp2;
+    channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
+    channel_get_per_commitment_point(&client_ch, 2, &client_pcp2);
+    channel_set_remote_pcp(&lsp_ch, 2, &client_pcp2);
+    channel_set_remote_pcp(&client_ch, 2, &lsp_pcp2);
+    lsp_ch.commitment_number = 1;
+    client_ch.commitment_number = 1;
+    unsigned char lsp_secret0[32];
+    channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
+    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+
+    /* LSP (attacker) broadcasts OLD commitment. */
+    char commit_hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, commit_hex); commit_hex[sc.len * 2] = '\0';
+    char commit_txid_hex[65];
+    TEST_ASSERT(regtest_send_raw_tx(rt, commit_hex, commit_txid_hex),
+                "breach: broadcast stale commitment");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    tx_buf_free(&uc); tx_buf_free(&sc);
+    printf("  breach: attacker broadcast stale commit %s\n", commit_txid_hex);
+
+    /* Client constructs penalty TX using revocation secret. The to_local
+       amount may have been adjusted for fees inside commitment_tx, read back. */
+    uint64_t tl_amt = 0;
+    unsigned char tl_spk[64]; size_t tl_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, commit_txid_hex, 0, &tl_amt, tl_spk, &tl_spk_len),
+                "breach: read to_local");
+    TEST_ASSERT(tl_spk_len == 34 &&
+                memcmp(tl_spk, old_to_local_spk, 34) == 0,
+                "breach: on-chain to_local matches old commit spk");
+
+    unsigned char ct_internal[32];
+    memcpy(ct_internal, ct, 32);
+    tx_buf_t penalty;
+    tx_buf_init(&penalty, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty,
+                                           ct_internal, 0, tl_amt,
+                                           tl_spk, 34,
+                                           0,  /* old_commitment_num */
+                                           NULL, 0),
+                "breach: build penalty tx");
+
+    char pen_hex[penalty.len * 2 + 1];
+    hex_encode(penalty.data, penalty.len, pen_hex); pen_hex[penalty.len * 2] = '\0';
+    char pen_txid[65];
+    int ok = spend_broadcast_and_mine(rt, pen_hex, 1, pen_txid);
+    tx_buf_free(&penalty);
+    TEST_ASSERT(ok, "breach: penalty broadcast + confirm");
+    printf("  breach: client swept %llu sats via penalty %s ✓\n",
+           (unsigned long long)tl_amt, pen_txid);
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    return 1;
+}
+
+int test_regtest_breach_penalty_spendability(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "breach_spendability");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    int ok = run_breach_penalty(&rt, ctx, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
 int test_regtest_coop_close_all_arities(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
