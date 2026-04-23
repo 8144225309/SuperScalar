@@ -1105,6 +1105,7 @@ extern int test_regtest_multi_payment(void);
 extern int test_regtest_multi_payment_arity1(void);
 extern int test_regtest_multi_payment_arity_ps(void);
 extern int test_regtest_coop_close_all_arities(void);
+extern int test_regtest_force_close_to_remote(void);
 extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
@@ -3580,6 +3581,7 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Spendability Gauntlet (All Close Paths × All Arities) ===\n");
     RUN_TEST(test_regtest_coop_close_all_arities);
+    RUN_TEST(test_regtest_force_close_to_remote);
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);
