@@ -938,17 +938,20 @@ int test_regtest_intra_factory_payment(void) {
 
 /* ---- Test 5: Multi-payment with balance-aware cooperative close ---- */
 
-int test_regtest_multi_payment(void) {
+static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
+                                        int port_bias) {
     /* Initialize regtest */
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  FAIL: regtest not available\n");
         return 0;
     }
-    if (!regtest_create_wallet(&rt, "test_multi_pay")) {
-        char *lr = regtest_exec(&rt, "loadwallet", "\"test_multi_pay\"");
+    if (!regtest_create_wallet(&rt, wallet_label)) {
+        char loadparam[128];
+        snprintf(loadparam, sizeof(loadparam), "\"%s\"", wallet_label);
+        char *lr = regtest_exec(&rt, "loadwallet", loadparam);
         if (lr) free(lr);
-        strncpy(rt.wallet, "test_multi_pay", sizeof(rt.wallet) - 1);
+        strncpy(rt.wallet, wallet_label, sizeof(rt.wallet) - 1);
     }
 
     secp256k1_context *ctx = test_ctx();
@@ -1106,8 +1109,10 @@ int test_regtest_multi_payment(void) {
     mp_data[2].actions = actions_c; mp_data[2].n_actions = 2; mp_data[2].current = 0;
     mp_data[3].actions = actions_d; mp_data[3].n_actions = 2; mp_data[3].current = 0;
 
-    /* Use a fixed port with PID offset */
-    int port = 19900 + (getpid() % 1000);
+    /* Use a fixed port with PID offset. port_bias separates sequential
+       arity-parameterized runs so child processes from a prior run don't
+       collide with the new LSP's listen socket. */
+    int port = 19900 + (getpid() % 1000) + port_bias;
 
     /* Fork 4 client processes */
     pid_t child_pids[4];
@@ -1141,12 +1146,24 @@ int test_regtest_multi_payment(void) {
         lsp_ok = 0;
     }
 
+    /* Seed requested arity on the factory so lsp_run_factory_creation
+       preserves it across the factory_init_from_pubkeys call (src/lsp.c:221). */
+    if (arity_code == FACTORY_ARITY_1 || arity_code == FACTORY_ARITY_PS ||
+        arity_code == FACTORY_ARITY_2) {
+        lsp->factory.leaf_arity = (factory_arity_t)arity_code;
+    }
+
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
+    }
+
+    if (lsp_ok) {
+        printf("  [arity] factory.leaf_arity = %d (requested=%d)\n",
+               (int)lsp->factory.leaf_arity, arity_code);
     }
 
     /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
@@ -1342,6 +1359,23 @@ int test_regtest_multi_payment(void) {
     TEST_ASSERT(lsp_ok, "LSP multi-payment operations");
     TEST_ASSERT(all_children_ok, "all clients completed");
     return 1;
+}
+
+/* ---- Thin arity wrappers: cover FACTORY_ARITY_1, _2 (default), _PS ----
+   Each drives the full wire ceremony (factory creation, payments, coop
+   close) and the spendability gauntlet at its chosen arity. Separate
+   wallets + port offsets prevent sequential collision. */
+
+int test_regtest_multi_payment(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_2, "test_multi_pay", 0);
+}
+
+int test_regtest_multi_payment_arity1(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_1, "test_multi_pay_a1", 100);
+}
+
+int test_regtest_multi_payment_arity_ps(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_PS, "test_multi_pay_aps", 200);
 }
 
 /* ---- Test: Fee policy balance split ---- */
