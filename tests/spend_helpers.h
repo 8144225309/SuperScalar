@@ -58,4 +58,44 @@ int spend_broadcast_and_mine(regtest_t *rt,
                               int n_blocks,
                               char *txid_out);
 
+/*
+ * Build + sign a single-input, single-output spending tx for a P2TR output
+ * with BIP-341 taptweak applied to the output key (no merkle root — the
+ * "key-path-only" variant used by channel to_remote outputs).
+ *
+ * Same arguments as spend_build_p2tr_raw_keypath, but the signer derives
+ * the tweaked seckey before signing:
+ *   tweaked_seckey = seckey + H_taptweak(xonly(pubkey))*G
+ *
+ * Use this for sweeping BIP-341-tweaked outputs (e.g. channel to_remote
+ * from src/channel.c:696-714).
+ */
+int spend_build_p2tr_bip341_keypath(secp256k1_context *ctx,
+                                     const unsigned char *seckey32,
+                                     const char *in_txid_hex,
+                                     uint32_t in_vout,
+                                     uint64_t in_amount_sats,
+                                     const unsigned char *in_spk, size_t in_spk_len,
+                                     const unsigned char *dest_spk, size_t dest_spk_len,
+                                     uint64_t fee_sats,
+                                     tx_buf_t *tx_out);
+
+/*
+ * Re-usable cooperative-close spendability gauntlet. Given a confirmed
+ * close tx and the seckeys of all participants (seckeys[0]=LSP,
+ * seckeys[1..n_clients]=clients), for each party:
+ *   1. Re-derive the expected close_spk from their pubkey.
+ *   2. Find the matching vout in the confirmed close tx.
+ *   3. Build a sweep using spend_build_p2tr_raw_keypath.
+ *   4. Broadcast + mine + confirm.
+ *
+ * Returns 1 if all n_clients+1 parties successfully sweep, 0 otherwise.
+ * Prints per-party progress.
+ */
+int spend_coop_close_gauntlet(secp256k1_context *ctx,
+                               regtest_t *rt,
+                               const char *close_txid,
+                               const unsigned char seckeys[][32],
+                               size_t n_clients);
+
 #endif /* SUPERSCALAR_TESTS_SPEND_HELPERS_H */
