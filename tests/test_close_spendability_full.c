@@ -28,6 +28,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/sha256.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/sweeper.h"
 #include "spend_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -456,6 +457,165 @@ int test_regtest_force_close_to_remote(void) {
         regtest_mine_blocks(&rt, 101, mine_addr);
 
     int ok = run_force_close_to_remote(&rt, ctx, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+/* Force-close to_local sweep: LSP's side of its own commitment, spendable
+ * after CSV delay via script-path spend of csv_leaf. Uses the existing
+ * channel_build_to_local_sweep helper in src/sweeper.c, which handles all
+ * the tapscript key derivation, sighash (tapscript SIGHASH_DEFAULT), and
+ * control-block construction.
+ */
+static int run_force_close_to_local(regtest_t *rt, secp256k1_context *ctx,
+                                     const char *mine_addr) {
+    secp256k1_keypair lsp_kp, client_kp;
+    if (!secp256k1_keypair_create(ctx, &lsp_kp, N_PARTY_SECKEYS[0])) return 0;
+    if (!secp256k1_keypair_create(ctx, &client_kp, N_PARTY_SECKEYS[1])) return 0;
+    secp256k1_pubkey lsp_pk, client_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+    secp256k1_keypair_pub(ctx, &client_pk, &client_kp);
+
+    /* 2-party MuSig funding — same as to_remote test. */
+    secp256k1_pubkey pks2[2] = { lsp_pk, client_pk };
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks2, 2)) return 0;
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tweak);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tpx_ser, fund_addr, sizeof(fund_addr))) return 0;
+    char fund_txid_hex[65];
+    if (!regtest_fund_address(rt, fund_addr, 0.001, fund_txid_hex)) return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+    uint32_t fund_vout = UINT32_MAX;
+    uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(rt, fund_txid_hex, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "find funding vout (to_local)");
+    unsigned char fund_txid_bytes[32];
+    hex_decode(fund_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t local_amt = 60000, remote_amt = 39500;
+    uint32_t csv = 10;
+
+    channel_t lsp_ch, client_ch;
+    TEST_ASSERT(channel_init(&lsp_ch, ctx, N_PARTY_SECKEYS[0], &lsp_pk, &client_pk,
+                              fund_txid_bytes, fund_vout, fund_amount,
+                              fund_spk, 34, local_amt, remote_amt, csv), "init LSP ch");
+    TEST_ASSERT(channel_init(&client_ch, ctx, N_PARTY_SECKEYS[1], &client_pk, &lsp_pk,
+                              fund_txid_bytes, fund_vout, fund_amount,
+                              fund_spk, 34, remote_amt, local_amt, csv), "init cli ch");
+    channel_generate_random_basepoints(&lsp_ch);
+    channel_generate_random_basepoints(&client_ch);
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    secp256k1_pubkey lsp_pcp0, client_pcp0, lsp_pcp1, client_pcp1;
+    channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
+    channel_get_per_commitment_point(&client_ch, 0, &client_pcp0);
+    channel_get_per_commitment_point(&lsp_ch, 1, &lsp_pcp1);
+    channel_get_per_commitment_point(&client_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&lsp_ch, 0, &client_pcp0);
+    channel_set_remote_pcp(&lsp_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
+    channel_set_remote_pcp(&client_ch, 1, &lsp_pcp1);
+
+    /* Build + sign + broadcast LSP's commitment. */
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 512); tx_buf_init(&sc, 1024);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &uc, ct), "build commit");
+    TEST_ASSERT(channel_sign_commitment(&lsp_ch, &sc, &uc, &client_kp), "sign commit");
+    char commit_hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, commit_hex); commit_hex[sc.len * 2] = '\0';
+    char commit_txid_hex[65];
+    TEST_ASSERT(regtest_send_raw_tx(rt, commit_hex, commit_txid_hex), "broadcast commit");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(rt, commit_txid_hex) >= 1, "commit confirmed");
+    tx_buf_free(&uc); tx_buf_free(&sc);
+    printf("  to_local: commitment confirmed %s\n", commit_txid_hex);
+
+    /* Read to_local output. */
+    uint64_t tl_amt = 0;
+    unsigned char tl_spk[64]; size_t tl_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, commit_txid_hex, 0, &tl_amt, tl_spk, &tl_spk_len),
+                "read to_local");
+    TEST_ASSERT(tl_amt == local_amt, "to_local amount matches channel local");
+
+    /* Wait CSV delay. */
+    regtest_mine_blocks(rt, (int)csv, mine_addr);
+
+    /* Build to_local sweep via script path. */
+    char dest_addr[128];
+    TEST_ASSERT(regtest_get_new_address(rt, dest_addr, sizeof(dest_addr)), "dest");
+    unsigned char dest_spk[64]; size_t dest_spk_len = 0;
+    TEST_ASSERT(regtest_get_address_scriptpubkey(rt, dest_addr, dest_spk, &dest_spk_len),
+                "dest spk");
+
+    unsigned char ct_internal[32];
+    memcpy(ct_internal, ct, 32);  /* channel_build_to_local_sweep wants internal order */
+
+    tx_buf_t sweep;
+    tx_buf_init(&sweep, 512);
+    TEST_ASSERT(channel_build_to_local_sweep(&lsp_ch, &sweep,
+                                              ct_internal, 0, tl_amt,
+                                              dest_spk, dest_spk_len),
+                "build to_local sweep (script path)");
+
+    char sweep_hex[sweep.len * 2 + 1];
+    hex_encode(sweep.data, sweep.len, sweep_hex); sweep_hex[sweep.len * 2] = '\0';
+    char sweep_txid[65];
+    int ok = spend_broadcast_and_mine(rt, sweep_hex, 1, sweep_txid);
+    tx_buf_free(&sweep);
+    TEST_ASSERT(ok, "to_local sweep broadcast + confirm");
+    printf("  to_local: LSP swept %llu sats after CSV(%u) via %s ✓\n",
+           (unsigned long long)tl_amt, csv, sweep_txid);
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    return 1;
+}
+
+int test_regtest_force_close_to_local(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "force_close_to_local");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    int ok = run_force_close_to_local(&rt, ctx, mine_addr);
     secp256k1_context_destroy(ctx);
     return ok;
 }
