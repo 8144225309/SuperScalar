@@ -1693,6 +1693,9 @@ extern int test_b12_po1_payoffer_missing_offer(void);
 extern int test_wt_ptlc1_entry_fields(void);
 extern int test_wt_ptlc2_metadata_store(void);
 extern int test_persist_ps_signed_input_roundtrip(void);
+extern int test_persist_ps_defense_persists_across_reopen(void);
+extern int test_persist_ps_defense_distinct_parent_txids(void);
+extern int test_persist_ps_defense_independent_inputs(void);
 
 /* Sweeper + conservation tests */
 extern int test_conservation_balanced(void);
@@ -3424,6 +3427,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wt_ptlc1_entry_fields);
     RUN_TEST(test_wt_ptlc2_metadata_store);
     RUN_TEST(test_persist_ps_signed_input_roundtrip);
+    RUN_TEST(test_persist_ps_defense_persists_across_reopen);
+    RUN_TEST(test_persist_ps_defense_distinct_parent_txids);
+    RUN_TEST(test_persist_ps_defense_independent_inputs);
 
     printf("\n=== Fund Settlement: Sweeper + Conservation ===\n");
     RUN_TEST(test_conservation_balanced);
