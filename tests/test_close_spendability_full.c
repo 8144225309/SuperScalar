@@ -30,6 +30,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/sweeper.h"
 #include "spend_helpers.h"
+#include "econ_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1882,30 +1883,36 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
     return 1;
 }
 
-/* ---- Full force-close + per-party sweep (item #4 from v0.1.14 audit).
+/* ---- Full force-close + per-party sweep WITH ACCOUNTING (item #4).
  *
- * After broadcasting the entire factory tree, this test proves the headline
- * fund-recovery property: each leaf's on-chain outputs can be swept back
- * to a regtest wallet by the correct parties, using only their respective
- * keys or cooperative 2-of-2 signing.
+ * After broadcasting the entire factory tree, this test proves both
+ * spendability AND proper accounting: each leaf's on-chain outputs are
+ * swept by the correct parties AND the final wallet deltas match the
+ * expected economic formula.
  *
- * Arity-1 baseline: each leaf has 2 outputs — channel (MuSig(client, LSP),
- * 2-of-2 P2TR with BIP-341 taptweak-empty) and L-stock (LSP-only P2TR,
- * taptweak-empty). Both are swept:
- *   - L-stock: LSP alone via spend_build_p2tr_bip341_keypath.
- *   - Channel: offline 2-of-2 MuSig2 ceremony (both keypairs present in-test).
+ * Arity-1 baseline: leaf has 2 outputs — channel (MuSig(client, LSP)
+ * 2-of-2 P2TR) and L-stock (LSP-only P2TR). Both are swept to
+ * per-party P2TR(xonly(pk)) destinations so econ_helpers can verify
+ * deltas against the on-chain UTXO set:
+ *   - Channel: offline 2-of-2 MuSig2 ceremony produces a TX with 2
+ *     outputs: half of (channel − fee) to client's P2TR, half to LSP's.
+ *   - L-stock: LSP alone sweeps to LSP's P2TR via
+ *     spend_build_p2tr_bip341_keypath.
  *
- * This is a weaker variant of the full "broadcast commitment TX + sweep
- * to_remote + sweep to_local after CSV" flow. The commitment-level sweep
- * is exercised by the pre-existing test_regtest_force_close_to_remote
- * and test_regtest_force_close_to_local tests on standalone 2-of-2
- * channels; what those omit is the "after full factory tree broadcast"
- * precondition that this test adds. Chained, they constitute the full
- * factory-tree-force-close-and-sweep claim.
+ * Then econ_snap_pre / econ_snap_post + econ_assert_wallet_deltas:
+ *   client_delta ≈ n_leaves × (channel_amount − fee)/2
+ *   LSP_delta    ≈ n_leaves × [(channel_amount − fee)/2 + (L_stock − fee)]
+ *   Σ(deltas) + Σ(all tx fees) ≈ funding
  *
- * Arity-2 and arity-PS are structurally identical at the per-leaf sweep
- * step and are acknowledged as cross-references rather than re-implemented
- * (same pattern as test_regtest_jit_recovery_close_spendability). */
+ * This is the static / no-payment-flow version — balances at close time
+ * equal balances at factory creation. The HTLC-payment-driven variant
+ * (where fees and balances shift before force-close) is a larger test
+ * that extends this template with channel_init + commitment_tx + sweep_
+ * to_remote + sweep_to_local_csv; acknowledged as a follow-up.
+ *
+ * Arity-2 and arity-PS: structurally identical at the per-leaf sweep
+ * step. Acknowledged as cross-references (same pattern as
+ * test_regtest_jit_recovery_close_spendability). */
 int test_regtest_full_force_close_and_sweep_arity1(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -1966,24 +1973,42 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
     printf("  full tree broadcast OK — %zu nodes, %d leaves confirmed\n",
            f->n_nodes, n_leaves);
 
-    /* Per-leaf sweep loop. */
-    char dest_addr[128];
-    TEST_ASSERT(regtest_get_new_address(&rt, dest_addr, sizeof(dest_addr)),
-                "dest addr");
-    unsigned char dest_spk[64];
-    size_t dest_spk_len = 0;
-    TEST_ASSERT(regtest_get_address_scriptpubkey(&rt, dest_addr, dest_spk,
-                                                   &dest_spk_len),
-                "dest spk");
+    /* Build per-party P2TR destinations so econ_helpers can scan the
+       UTXO set and verify deltas. Each party's expected SPK is
+       P2TR(xonly(pk(seckey))) — same derivation econ_register_party
+       uses internally. We compute them here to use as sweep destinations. */
+    unsigned char party_spk[2][34];  /* [0]=LSP, [1]=client */
+    for (int p = 0; p < 2; p++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[p]);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
 
-    uint64_t total_swept = 0;
+    /* Wire econ harness: snapshot each party's pre-sweep balance. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
+                "register LSP");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
+                "register client");
+    econ.factory_funding_amount = fund_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Per-leaf sweep loop. Each sweep's fee is tracked so we can
+       reconstruct expected deltas exactly. */
+    const uint64_t LSTOCK_SWEEP_FEE = 300;
+    const uint64_t CHAN_SWEEP_FEE   = 400;  /* 2 outputs in channel sweep */
+    uint64_t total_lsp_recv = 0;
+    uint64_t total_client_recv = 0;
 
     for (int li = 0; li < n_leaves; li++) {
         size_t nidx = f->leaf_node_indices[li];
         factory_node_t *leaf = &f->nodes[nidx];
         const char *leaf_txid = txids[nidx];
 
-        /* (A) Sweep L-stock (vout 1) with LSP alone, BIP-341 keypath. */
+        /* (A) Sweep L-stock (vout 1) LSP-alone to LSP's P2TR(xonly(LSP)). */
         uint64_t lstock_amt = leaf->outputs[1].amount_sats;
         unsigned char lstock_spk[34];
         memcpy(lstock_spk, leaf->outputs[1].script_pubkey, 34);
@@ -1994,8 +2019,8 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
                         N_PARTY_SECKEYS[0],
                         leaf_txid, 1, lstock_amt,
                         lstock_spk, 34,
-                        dest_spk, dest_spk_len,
-                        /* fee */ 300, &lstock_sweep),
+                        party_spk[0], 34,
+                        LSTOCK_SWEEP_FEE, &lstock_sweep),
                     "build L-stock sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
@@ -2005,12 +2030,17 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
         int lok = spend_broadcast_and_mine(&rt, lh, 1, lstock_sweep_txid);
         free(lh); tx_buf_free(&lstock_sweep);
         TEST_ASSERT(lok, "L-stock sweep confirmed");
-        total_swept += lstock_amt - 300;
-        printf("  leaf %d: LSP swept L-stock %llu sats via %.16s...\n",
-               li, (unsigned long long)(lstock_amt - 300), lstock_sweep_txid);
+        total_lsp_recv += lstock_amt - LSTOCK_SWEEP_FEE;
+        printf("  leaf %d: LSP swept L-stock %llu sats → P2TR(LSP)\n",
+               li, (unsigned long long)(lstock_amt - LSTOCK_SWEEP_FEE));
 
-        /* (B) Sweep channel (vout 0) via offline 2-of-2 MuSig2. */
+        /* (B) Sweep channel (vout 0) via offline 2-of-2 MuSig2.
+           TX has 2 outputs: half to client's P2TR, half to LSP's P2TR.
+           This models "each party takes their fair share of the channel". */
         uint64_t chan_amt = leaf->outputs[0].amount_sats;
+        uint64_t half = (chan_amt - CHAN_SWEEP_FEE) / 2;
+        uint64_t client_share = half;
+        uint64_t lsp_share = (chan_amt - CHAN_SWEEP_FEE) - client_share;
         unsigned char chan_spk[34];
         memcpy(chan_spk, leaf->outputs[0].script_pubkey, 34);
 
@@ -2019,15 +2049,19 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
                     "decode leaf txid");
         reverse_bytes(leaf_txid_bytes, 32);
 
-        tx_output_t out;
-        memcpy(out.script_pubkey, dest_spk, dest_spk_len);
-        out.script_pubkey_len = dest_spk_len;
-        out.amount_sats = chan_amt - 300;
+        tx_output_t outs[2];
+        memcpy(outs[0].script_pubkey, party_spk[1], 34);  /* client */
+        outs[0].script_pubkey_len = 34;
+        outs[0].amount_sats = client_share;
+        memcpy(outs[1].script_pubkey, party_spk[0], 34);  /* LSP */
+        outs[1].script_pubkey_len = 34;
+        outs[1].amount_sats = lsp_share;
+
         tx_buf_t chan_unsigned;
         tx_buf_init(&chan_unsigned, 256);
         TEST_ASSERT(build_unsigned_tx(&chan_unsigned, NULL,
                                         leaf_txid_bytes, 0, 0xFFFFFFFEu,
-                                        &out, 1),
+                                        outs, 2),
                     "build unsigned channel sweep");
         unsigned char sighash[32];
         TEST_ASSERT(compute_taproot_sighash(sighash,
@@ -2035,12 +2069,9 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
                         0, chan_spk, 34, chan_amt, 0xFFFFFFFEu),
                     "compute channel sighash");
 
-        /* MuSig key aggregation is order-sensitive. Factory built the
-           leaf SPK as MuSig(client, LSP) — see setup_single_leaf_outputs
-           in src/factory.c:674: `pks[2] = { pubkeys[client_idx], pubkeys[0] }`.
-           Match that order here or the aggregate key differs and the
-           signature fails on chain. */
-        secp256k1_keypair signers[2] = { kps[1], kps[0] };  /* client, LSP */
+        /* MuSig2 pubkey order matches factory (client, LSP) — see
+           setup_single_leaf_outputs in src/factory.c:674. */
+        secp256k1_keypair signers[2] = { kps[1], kps[0] };
         secp256k1_pubkey pks[2];
         secp256k1_keypair_pub(ctx, &pks[0], &signers[0]);
         secp256k1_keypair_pub(ctx, &pks[1], &signers[1]);
@@ -2066,14 +2097,43 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
         int cok = spend_broadcast_and_mine(&rt, ch_hex, 1, chan_sweep_txid);
         free(ch_hex); tx_buf_free(&chan_signed);
         TEST_ASSERT(cok, "channel 2-of-2 sweep confirmed");
-        total_swept += chan_amt - 300;
-        printf("  leaf %d: 2-of-2 swept channel %llu sats via %.16s...\n",
-               li, (unsigned long long)(chan_amt - 300), chan_sweep_txid);
+        total_client_recv += client_share;
+        total_lsp_recv += lsp_share;
+        printf("  leaf %d: 2-of-2 swept channel → client=%llu, LSP=%llu\n",
+               li, (unsigned long long)client_share,
+               (unsigned long long)lsp_share);
     }
 
-    printf("  arity-1 full force-close + per-party sweep: %llu sats recovered "
-           "across %d leaves ✓\n",
-           (unsigned long long)total_swept, n_leaves);
+    /* Accounting: snapshot post-sweep balances and assert per-party deltas
+       match the expected amounts computed from the on-chain allocations. */
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    uint64_t expected_deltas[2];
+    expected_deltas[0] = total_lsp_recv;    /* LSP */
+    expected_deltas[1] = total_client_recv; /* client */
+
+    /* Conservation sanity: Σ(expected_deltas) + Σ(tx_fees) ≤ funding.
+       tree fees are implicit in leaf allocations (already netted);
+       sweep fees are the ones we added above. */
+    uint64_t sweep_fees = (uint64_t)n_leaves * (LSTOCK_SWEEP_FEE + CHAN_SWEEP_FEE);
+    uint64_t swept_sum = total_lsp_recv + total_client_recv;
+    uint64_t allocated_sum = 0;
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        allocated_sum += f->nodes[nidx].outputs[0].amount_sats;
+        allocated_sum += f->nodes[nidx].outputs[1].amount_sats;
+    }
+    /* swept_sum exactly = allocated_sum − sweep_fees */
+    TEST_ASSERT(swept_sum + sweep_fees == allocated_sum,
+                "conservation: Σswept + Σsweep_fees == Σleaf_allocations");
+    printf("  conservation OK: swept=%llu + sweep_fees=%llu == allocations=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)sweep_fees,
+           (unsigned long long)allocated_sum);
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match expected");
+    econ_print_summary(&econ);
 
     factory_free(f);
     free(f);
