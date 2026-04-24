@@ -1418,3 +1418,181 @@ int test_regtest_jit_recovery_close_spendability(void) {
     printf("  (2-of-2 P2TR between LSP and JIT client; not in factory tree).\n");
     return 1;
 }
+
+/* ---- Inversion-of-timeout-default (ZmnSCPxj safety invariant).
+ *
+ * At the factory CLTV timeout, if the LSP has not rotated, cooperatively
+ * closed, or force-closed its clients, the pre-signed distribution TX
+ * (nLockTime = cltv_timeout) becomes valid. It spends the funding UTXO
+ * directly and pays every cent to clients — LSP gets nothing, not even
+ * dust. This is the hard-money disincentive that backs the LSP's uptime
+ * obligation: go dark past the CLTV, lose everything.
+ *
+ * The test builds a factory, derives the distribution outputs via the
+ * production helper (factory_compute_distribution_outputs_balanced),
+ * runs an offline N-party MuSig2 signing ceremony against the funding
+ * SPK, mines past the CLTV, broadcasts, and asserts:
+ *   - The TX confirmed
+ *   - N_clients outputs (no LSP output)
+ *   - None of the outputs match LSP's P2TR(xonly(pk_0))
+ *   - Each client's output ≈ (funding - fee) / N_clients
+ *   - No sat is silently retained by the LSP
+ *
+ * Runs against the current funding_amount regardless of channel balances,
+ * so the property holds "the LSP cannot protect its fees by going dark."
+ */
+int test_regtest_inversion_of_timeout_default(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "inversion_timeout");
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 5;  /* LSP + 4 clients */
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { secp256k1_context_destroy(ctx); return 0; }
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(&rt, ctx, N, FACTORY_ARITY_2, mine_addr, kps, f,
+                               fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+
+    /* Set CLTV timeout ~6 blocks out so we can mine past it. */
+    int cur_h = regtest_get_block_height(&rt);
+    if (cur_h <= 0) { factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0; }
+    uint32_t cltv = (uint32_t)cur_h + 6;
+    f->cltv_timeout = cltv;
+    printf("  factory funded: %llu sats, cltv_timeout=%u (current h=%d)\n",
+           (unsigned long long)fund_amount, cltv, cur_h);
+
+    /* Compute distribution outputs via the production helper. Pass NULL for
+       client_amounts → equal-split inversion path. */
+    const uint64_t dist_fee = 500;
+    tx_output_t dist_outs[FACTORY_MAX_SIGNERS + 1];
+    size_t n_dist = factory_compute_distribution_outputs_balanced(
+        f, dist_outs, FACTORY_MAX_SIGNERS + 1, dist_fee, NULL, 0);
+
+    /* Assert (A): exactly (N_participants - 1) outputs — no LSP output. */
+    TEST_ASSERT(n_dist == N - 1, "dist TX has exactly N_clients outputs");
+
+    /* Assert (B): no output's SPK matches LSP's P2TR(xonly(pk_0)).  */
+    secp256k1_pubkey lsp_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    secp256k1_xonly_pubkey lsp_xo;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xo, NULL, &lsp_pk);
+    unsigned char lsp_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, lsp_ser, &lsp_xo);
+    unsigned char lsp_tweak[32];
+    sha256_tagged("TapTweak", lsp_ser, 32, lsp_tweak);
+    secp256k1_pubkey lsp_tw_full;
+    secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xo, lsp_tweak);
+    secp256k1_xonly_pubkey lsp_tw;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tw, NULL, &lsp_tw_full);
+    unsigned char lsp_spk[34];
+    build_p2tr_script_pubkey(lsp_spk, &lsp_tw);
+
+    for (size_t i = 0; i < n_dist; i++) {
+        TEST_ASSERT(memcmp(dist_outs[i].script_pubkey, lsp_spk, 34) != 0,
+                    "no dist output pays the LSP's P2TR");
+    }
+
+    /* Assert (C): each client's output is within 2 sats of (funding-fee)/N_clients.
+       (Remainder from integer division folds into output[0], up to N_clients-1.) */
+    uint64_t budget = fund_amount - dist_fee;
+    uint64_t per_expected = budget / (N - 1);
+    uint64_t total_out = 0;
+    for (size_t i = 0; i < n_dist; i++) {
+        uint64_t diff = (dist_outs[i].amount_sats > per_expected)
+            ? (dist_outs[i].amount_sats - per_expected)
+            : (per_expected - dist_outs[i].amount_sats);
+        TEST_ASSERT(diff <= (N - 1),
+                    "client output within rounding of per_expected");
+        total_out += dist_outs[i].amount_sats;
+    }
+
+    /* Assert (D): outputs sum to exactly budget. No silent LSP retention. */
+    TEST_ASSERT(total_out == budget,
+                "Σ(client_outputs) == funding - fee; LSP keeps nothing");
+    printf("  distribution outputs: n=%zu  per_expected=%llu  total=%llu budget=%llu ✓\n",
+           n_dist, (unsigned long long)per_expected,
+           (unsigned long long)total_out, (unsigned long long)budget);
+
+    /* Build the unsigned distribution TX with nLockTime = cltv_timeout. */
+    tx_buf_t unsigned_dist;
+    tx_buf_init(&unsigned_dist, 512);
+    if (!build_unsigned_tx_with_locktime(&unsigned_dist, NULL,
+                                          f->funding_txid, f->funding_vout,
+                                          0xFFFFFFFEu, cltv,
+                                          dist_outs, n_dist)) {
+        tx_buf_free(&unsigned_dist);
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+
+    /* Compute BIP-341 key-path sighash, run offline N-party MuSig2 ceremony. */
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_dist.data, unsigned_dist.len,
+                                   0, fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
+        tx_buf_free(&unsigned_dist);
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    musig_keyagg_t ka;
+    secp256k1_pubkey pks[5];
+    for (size_t i = 0; i < N; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    if (!musig_aggregate_keys(ctx, &ka, pks, N)) {
+        tx_buf_free(&unsigned_dist);
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    unsigned char sig64[64];
+    if (!musig_sign_taproot(ctx, sig64, sighash, kps, N, &ka, NULL)) {
+        tx_buf_free(&unsigned_dist);
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    tx_buf_t signed_dist;
+    tx_buf_init(&signed_dist, 512);
+    if (!finalize_signed_tx(&signed_dist, unsigned_dist.data, unsigned_dist.len, sig64)) {
+        tx_buf_free(&unsigned_dist); tx_buf_free(&signed_dist);
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    tx_buf_free(&unsigned_dist);
+
+    /* Mine past cltv_timeout and broadcast. */
+    while (regtest_get_block_height(&rt) < (int)cltv)
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+    char *dist_hex = malloc(signed_dist.len * 2 + 1);
+    hex_encode(signed_dist.data, signed_dist.len, dist_hex);
+    dist_hex[signed_dist.len * 2] = '\0';
+    char dist_txid[65];
+    int bcast_ok = regtest_send_raw_tx(&rt, dist_hex, dist_txid);
+    free(dist_hex);
+    tx_buf_free(&signed_dist);
+    if (!bcast_ok) {
+        fprintf(stderr, "  distribution TX broadcast failed\n");
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, dist_txid) >= 1,
+                "dist TX confirmed on chain");
+    printf("  distribution TX confirmed post-CLTV: %s\n", dist_txid);
+    printf("  invariant holds: LSP output=0, Σclients=funding-fee ✓\n");
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
