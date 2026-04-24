@@ -5,6 +5,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/persist.h"
 #include "superscalar/shachain.h"
+#include "superscalar/tx_builder.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,15 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 /* Optional NK server authentication pubkey (set via client_set_lsp_pubkey) */
 static secp256k1_pubkey g_nk_server_pubkey;
 static int g_nk_server_pubkey_set = 0;
+
+/* Optional persistence handle for PS double-spend defense (set via
+   client_set_persist). NULL disables the check — only acceptable for
+   in-process tests that don't exercise the attack. */
+static persist_t *g_client_persist = NULL;
+
+void client_set_persist(persist_t *p) {
+    g_client_persist = p;
+}
 
 /* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
    If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
@@ -2581,6 +2591,7 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory, uint32_t my_index,
                                  const wire_msg_t *propose_msg) {
+    persist_t *persist = g_client_persist;
     int leaf_side;
     unsigned char lsp_pubnonce_ser[66];
     if (!wire_parse_leaf_advance_propose(propose_msg->json, &leaf_side, lsp_pubnonce_ser)) {
@@ -2596,6 +2607,35 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     }
 
     size_t node_idx = factory->leaf_node_indices[leaf_side];
+
+    /* PS double-spend defense (ZmnSCPxj, "SuperScalar" Delving post §PS).
+       For PS leaves, ps_prev_txid is now the txid of the chain element
+       whose vout 0 the new TX will spend. If this client has already
+       co-signed ANY TX spending that (parent_txid, 0) — whether a retry
+       or a genuine attack — we refuse. Refusing network retries is the
+       conservative choice; alternative replay-based idempotency risks
+       MuSig nonce-reuse footguns. (DW leaves, arity_1, are protected by
+       decrementing nSequence and do not need this check.) */
+    factory_node_t *ps_node = &factory->nodes[node_idx];
+    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
+        unsigned char prev_sighash[32];
+        int already = persist_check_ps_signed_input(
+            persist,
+            /* factory_id = */ 0,   /* single-factory PoC convention */
+            ps_node->ps_prev_txid,
+            /* parent_vout = */ 0,
+            prev_sighash);
+        if (already) {
+            char hex[65];
+            for (int i = 0; i < 32; i++)
+                snprintf(hex + 2 * i, 3, "%02x", ps_node->ps_prev_txid[i]);
+            fprintf(stderr,
+                    "Client %u: REFUSING PS double-spend — already signed "
+                    "a TX spending (%s:0); not signing a second one.\n",
+                    my_index, hex);
+            return 0;
+        }
+    }
 
     if (!factory_session_init_node(factory, node_idx)) {
         fprintf(stderr, "Client %u: leaf %d session_init failed\n", my_index, leaf_side);
@@ -2664,10 +2704,35 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     }
     memset(my_seckey, 0, 32);
 
-    /* Send LEAF_ADVANCE_PSIG (own pubnonce + partial sig) */
+    /* Serialize now so we can record + send. */
     unsigned char my_pubnonce_ser[66], my_psig_ser[32];
     musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+
+    /* PS defense: record what we just signed BEFORE releasing the partial
+       sig over the wire. A crash after record + before send is safe —
+       any retry will see the row and refuse to sign anew. */
+    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
+        unsigned char sighash[32];
+        if (compute_taproot_sighash(sighash,
+                ps_node->unsigned_tx.data, ps_node->unsigned_tx.len,
+                0,
+                ps_node->outputs[0].script_pubkey,
+                ps_node->outputs[0].script_pubkey_len,
+                ps_node->ps_prev_chan_amount,
+                ps_node->nsequence)) {
+            /* partial_sig is 32 bytes on the wire (as serialized by
+               musig_partial_sig_serialize) — pad to 36 to match our
+               schema's fixed BLOB length. */
+            unsigned char psig_buf[36];
+            memset(psig_buf, 0, 36);
+            memcpy(psig_buf, my_psig_ser, 32);
+            persist_save_ps_signed_input(persist, /* factory_id = */ 0,
+                (int)node_idx, ps_node->ps_prev_txid, 0,
+                sighash, psig_buf);
+        }
+    }
+
     cJSON *psig_json = wire_build_leaf_advance_psig(my_pubnonce_ser, my_psig_ser);
     if (!wire_send(fd, MSG_LEAF_ADVANCE_PSIG, psig_json)) {
         fprintf(stderr, "Client %u: send LEAF_ADVANCE_PSIG failed\n", my_index);

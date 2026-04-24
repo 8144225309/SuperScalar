@@ -1690,6 +1690,7 @@ extern int test_trp_w3_hop_struct(void);
 extern int test_b12_po1_payoffer_missing_offer(void);
 extern int test_wt_ptlc1_entry_fields(void);
 extern int test_wt_ptlc2_metadata_store(void);
+extern int test_persist_ps_signed_input_roundtrip(void);
 
 /* Sweeper + conservation tests */
 extern int test_conservation_balanced(void);
@@ -3418,6 +3419,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_b12_po1_payoffer_missing_offer);
     RUN_TEST(test_wt_ptlc1_entry_fields);
     RUN_TEST(test_wt_ptlc2_metadata_store);
+    RUN_TEST(test_persist_ps_signed_input_roundtrip);
 
     printf("\n=== Fund Settlement: Sweeper + Conservation ===\n");
     RUN_TEST(test_conservation_balanced);

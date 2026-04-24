@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 19
+#define PERSIST_SCHEMA_VERSION 20
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -79,6 +79,41 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
                            uint64_t *amounts_out, int max_chain);
+
+/* --- Client-side PS double-spend defense --- */
+
+/* Check whether this client has already co-signed a PS advance spending
+   (parent_txid, parent_vout). PS has no revocation: once a client signs
+   any TX spending a PS stock UTXO, signing ANOTHER TX spending the same
+   UTXO would enable the LSP to double-spend. So we refuse to sign twice
+   against the same parent input, even if it looks like a legitimate
+   network retry — forcing the LSP to resync state is safer than any
+   replay-based idempotency (which risks subtle nonce-reuse footguns).
+
+   parent_txid: 32 bytes, internal byte order.
+   out_sighash (optional): if non-NULL and a prior row exists, filled with
+     the sighash we previously signed. Lets the caller log match-vs-conflict
+     for observability (match = likely retry, conflict = likely attack).
+
+   Returns:
+      0 = no prior signing on this parent — proceed to sign.
+      1 = already signed — REFUSE. */
+int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                    const unsigned char parent_txid[32],
+                                    uint32_t parent_vout,
+                                    unsigned char out_sighash[32]);
+
+/* Record a freshly-generated partial signature for a PS advance input.
+   Call AFTER signing, BEFORE sending the PSIG to the LSP, so a crash
+   between sign and send still locks us in on that parent. Future
+   PROPOSEs against the same parent will be refused.
+   Returns 1 on success. */
+int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                   int leaf_node_idx,
+                                   const unsigned char parent_txid[32],
+                                   uint32_t parent_vout,
+                                   const unsigned char sighash[32],
+                                   const unsigned char partial_sig[36]);
 
 /* List all non-closed factory IDs from the ladder_factories table.
    Returns count written to ids_out (up to max_ids).
