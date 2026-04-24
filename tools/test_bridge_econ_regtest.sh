@@ -107,10 +107,12 @@ mkfifo "$LSP_FIFO"
 sleep infinity > "$LSP_FIFO" &
 FIFO_HOLDER_PID=$!
 
+SS_ARITY="${SS_ARITY:-2}"  # 1=FACTORY_ARITY_1, 2=FACTORY_ARITY_2, 3=FACTORY_ARITY_PS
+echo "  (using factory arity: $SS_ARITY)"
 stdbuf -oL $LSP_BIN --daemon --cli --network regtest --port "$LSP_PORT" \
     --seckey "$LSP_SECKEY" --clients 4 --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" --rpcuser rpcuser --rpcpassword rpcpass \
-    --amount 100000 --active-blocks 500 \
+    --amount 100000 --active-blocks 500 --arity "$SS_ARITY" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
