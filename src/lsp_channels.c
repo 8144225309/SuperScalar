@@ -4509,7 +4509,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Handle stdin CLI commands */
         if (stdin_slot >= 0 && (pfds[stdin_slot].revents & POLLIN)) {
-            char line[256];
+            /* 2048 is enough for any CLI command including a BOLT11
+               invoice (typically 300-700 chars) passed to pay_external.
+               Was 256, which silently truncated long invoices and caused
+               the tail of the BOLT11 to be re-read as a bogus next
+               command ('CLI: unknown command'). */
+            char line[2048];
             /* Use read() instead of fgets() — fgets permanently marks
                stdio EOF on FIFOs even when new writers connect later. */
             ssize_t nr = read(STDIN_FILENO, line, sizeof(line) - 1);
@@ -4683,17 +4688,30 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
                 sum += ch->ptlcs[p].amount_sats;
         }
 
-        if (sum != ch->funding_amount) {
+        /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)
+           was deducted from usable balance at init time, so the invariant
+           compares against (funding − base_commit_fee), not funding. See
+           fee_for_commitment_tx(fe, 0) in src/fee.c and the symmetric fix
+           in client_check_conservation (src/client.c). */
+        uint64_t base_commit_fee =
+            (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+        uint64_t expected = ch->funding_amount > base_commit_fee
+                            ? ch->funding_amount - base_commit_fee : 0;
+
+        if (sum != expected) {
             fprintf(stderr, "CONSERVATION VIOLATION: channel %zu — "
                     "local=%llu remote=%llu htlc_sum=%llu total=%llu "
-                    "funding=%llu (delta=%lld)\n",
+                    "expected=%llu funding=%llu base_commit_fee=%llu "
+                    "(delta=%lld)\n",
                     c,
                     (unsigned long long)ch->local_amount,
                     (unsigned long long)ch->remote_amount,
                     (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
                     (unsigned long long)sum,
+                    (unsigned long long)expected,
                     (unsigned long long)ch->funding_amount,
-                    (long long)(sum - ch->funding_amount));
+                    (unsigned long long)base_commit_fee,
+                    (long long)(sum - expected));
             ok = 0;
         }
     }

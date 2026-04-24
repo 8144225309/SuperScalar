@@ -253,6 +253,10 @@ add_executable(test_superscalar
     tests/test_ladder.c
     tests/test_wire.c
     tests/test_channels.c
+    tests/spend_helpers.c
+    tests/test_close_spendability_full.c
+    tests/econ_helpers.c
+    tests/test_economic_correctness.c
     tests/test_persist.c
     tests/test_bridge.c
     tests/test_daemon.c
@@ -380,6 +384,13 @@ target_include_directories(superscalar_watchtower PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_watchtower PRIVATE superscalar project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_watchtower PRIVATE project_sanitizers)
+endif()
+
+add_executable(recover_stranded_coop_output tools/recover_stranded_coop_output.c)
+target_include_directories(recover_stranded_coop_output PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(recover_stranded_coop_output PRIVATE superscalar project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(recover_stranded_coop_output PRIVATE project_sanitizers)
 endif()
 
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---

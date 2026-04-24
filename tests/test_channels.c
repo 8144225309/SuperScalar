@@ -8,6 +8,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
+#include "spend_helpers.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -302,16 +303,52 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
-/* Helper: receive next non-revocation message, consuming any
-   MSG_LSP_REVOKE_AND_ACK (0x50) along the way.  The LSP sends
-   bidirectional revocations at 9 sites; test clients don't track
-   watchtower state, so we simply skip them. */
-static int recv_skip_revocations(int fd, wire_msg_t *out) {
+/* Helper: receive next non-bookkeeping message.
+   Transparently consumes:
+     - MSG_LSP_REVOKE_AND_ACK (0x50): bidirectional revocations, 9 sites per payment.
+     - MSG_LEAF_ADVANCE_PROPOSE (0x58) + MSG_LEAF_ADVANCE_DONE (0x5A): the
+       post-HTLC-fulfill per-leaf advance ceremony that FACTORY_ARITY_1 and
+       FACTORY_ARITY_PS trigger in lsp_channels.c:2259. The client must
+       participate (send LEAF_ADVANCE_PSIG) or the LSP hangs waiting.
+       We delegate to client_handle_leaf_advance which handles the full
+       PROPOSE → PSIG → DONE sub-ceremony.
+   Returns 1 on success with out populated with the next payment-flow msg. */
+static int recv_skip_revocations_ex(int fd, wire_msg_t *out,
+                                      secp256k1_context *ctx,
+                                      const secp256k1_keypair *keypair,
+                                      factory_t *factory,
+                                      uint32_t my_index) {
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
-        if (out->msg_type != 0x50) return 1;  /* MSG_LSP_REVOKE_AND_ACK */
-        cJSON_Delete(out->json);
+        if (out->msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
+            cJSON_Delete(out->json);
+            continue;
+        }
+        if (out->msg_type == 0x58) {  /* MSG_LEAF_ADVANCE_PROPOSE */
+            /* Handle the leaf advance in-line. client_handle_leaf_advance
+               consumes PROPOSE, sends PSIG, waits for DONE. */
+            if (ctx && keypair && factory) {
+                if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                  my_index, out)) {
+                    cJSON_Delete(out->json);
+                    return 0;
+                }
+            }
+            cJSON_Delete(out->json);
+            continue;
+        }
+        if (out->msg_type == 0x5A) {  /* MSG_LEAF_ADVANCE_DONE — stray */
+            cJSON_Delete(out->json);
+            continue;
+        }
+        return 1;
     }
+}
+/* Back-compat wrapper: callers without ctx/keypair/factory fall through
+   to the old revocation-only behavior. Leaf-advance will then be
+   unhandled (original pre-fix behavior). */
+static int recv_skip_revocations(int fd, wire_msg_t *out) {
+    return recv_skip_revocations_ex(fd, out, NULL, NULL, NULL, 0);
 }
 
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -338,7 +375,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for COMMITMENT_SIGNED (acknowledging HTLC) */
             wire_msg_t msg;
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv failed after send\n", my_index);
                 return 0;
             }
@@ -353,7 +390,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Wait for FULFILL_HTLC */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
             }
@@ -375,7 +412,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -391,7 +428,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for ADD_HTLC from LSP */
             wire_msg_t msg;
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv ADD_HTLC failed\n", my_index);
                 return 0;
             }
@@ -406,7 +443,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit failed\n", my_index);
                 return 0;
             }
@@ -438,7 +475,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             client_fulfill_payment(fd, ch, htlc_id, act->preimage);
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -447,6 +484,50 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
+            }
+        }
+
+        /* Drain any pending LEAF_ADVANCE_PROPOSE that the LSP sent for this
+           client after the HTLC fulfill committed (src/lsp_channels.c:2259 —
+           FACTORY_ARITY_1 and FACTORY_ARITY_PS trigger a per-leaf MuSig
+           advance after every fulfill). Without this, the next action's
+           ADD_HTLC races the LSP's advance ceremony and the LSP drops our
+           ADD_HTLC with 'expected LEAF_ADVANCE_PSIG from client N, got 0x31'.
+
+           Only drain BETWEEN actions, not after the last action — otherwise
+           we'd consume MSG_CLOSE_PROPOSE or similar post-payment traffic the
+           caller expects. */
+        if (i + 1 < data->n_actions) {
+            wire_msg_t drain_msg;
+            while (1) {
+                wire_set_timeout(fd, 2);
+                int got = wire_recv(fd, &drain_msg);
+                wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+                if (!got) break;  /* timeout / no more drainable messages */
+                if (drain_msg.msg_type == 0x58) {  /* LEAF_ADVANCE_PROPOSE */
+                    if (ctx && keypair && factory &&
+                        !client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                       my_index, &drain_msg)) {
+                        cJSON_Delete(drain_msg.json);
+                        fprintf(stderr, "Client %u: leaf_advance drain failed\n",
+                                my_index);
+                        return 0;
+                    }
+                    cJSON_Delete(drain_msg.json);
+                    continue;
+                }
+                cJSON_Delete(drain_msg.json);
+                if (drain_msg.msg_type == 0x50 ||       /* REVOKE_AND_ACK */
+                    drain_msg.msg_type == 0x5A)          /* LEAF_ADVANCE_DONE */
+                    continue;
+                /* Not a drainable noise message — stop draining. This
+                   message is now consumed; the next action will expect to
+                   see it and may stall. That's a test-ordering issue, not a
+                   drain bug. Do not drain anything the next action expects. */
+                fprintf(stderr,
+                    "Client %u: drain consumed unexpected msg 0x%02x — "
+                    "test may stall\n", my_index, drain_msg.msg_type);
+                break;
             }
         }
     }
@@ -937,17 +1018,20 @@ int test_regtest_intra_factory_payment(void) {
 
 /* ---- Test 5: Multi-payment with balance-aware cooperative close ---- */
 
-int test_regtest_multi_payment(void) {
+static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
+                                        int port_bias) {
     /* Initialize regtest */
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  FAIL: regtest not available\n");
         return 0;
     }
-    if (!regtest_create_wallet(&rt, "test_multi_pay")) {
-        char *lr = regtest_exec(&rt, "loadwallet", "\"test_multi_pay\"");
+    if (!regtest_create_wallet(&rt, wallet_label)) {
+        char loadparam[128];
+        snprintf(loadparam, sizeof(loadparam), "\"%s\"", wallet_label);
+        char *lr = regtest_exec(&rt, "loadwallet", loadparam);
         if (lr) free(lr);
-        strncpy(rt.wallet, "test_multi_pay", sizeof(rt.wallet) - 1);
+        strncpy(rt.wallet, wallet_label, sizeof(rt.wallet) - 1);
     }
 
     secp256k1_context *ctx = test_ctx();
@@ -1105,8 +1189,10 @@ int test_regtest_multi_payment(void) {
     mp_data[2].actions = actions_c; mp_data[2].n_actions = 2; mp_data[2].current = 0;
     mp_data[3].actions = actions_d; mp_data[3].n_actions = 2; mp_data[3].current = 0;
 
-    /* Use a fixed port with PID offset */
-    int port = 19900 + (getpid() % 1000);
+    /* Use a fixed port with PID offset. port_bias separates sequential
+       arity-parameterized runs so child processes from a prior run don't
+       collide with the new LSP's listen socket. */
+    int port = 19900 + (getpid() % 1000) + port_bias;
 
     /* Fork 4 client processes */
     pid_t child_pids[4];
@@ -1140,12 +1226,24 @@ int test_regtest_multi_payment(void) {
         lsp_ok = 0;
     }
 
+    /* Seed requested arity on the factory so lsp_run_factory_creation
+       preserves it across the factory_init_from_pubkeys call (src/lsp.c:221). */
+    if (arity_code == FACTORY_ARITY_1 || arity_code == FACTORY_ARITY_PS ||
+        arity_code == FACTORY_ARITY_2) {
+        lsp->factory.leaf_arity = (factory_arity_t)arity_code;
+    }
+
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34, 10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
+    }
+
+    if (lsp_ok) {
+        printf("  [arity] factory.leaf_arity = %d (requested=%d)\n",
+               (int)lsp->factory.leaf_arity, arity_code);
     }
 
     /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
@@ -1298,6 +1396,19 @@ int test_regtest_multi_payment(void) {
                     }
                     if (lsp_ok)
                         printf("LSP: all close output amounts verified on-chain!\n");
+
+                    /* Spendability gauntlet: each party sweeps its own close
+                       output using only its own seckey. Proves the SPKs the
+                       close TX commits to are actually unilaterally spendable,
+                       not just amount-correct. Reusable helper — same loop
+                       works for arity 1, 2, or 3. */
+                    if (lsp_ok) {
+                        if (!spend_coop_close_gauntlet(ctx, &rt, close_txid,
+                                                        seckeys, 4))
+                            lsp_ok = 0;
+                        else
+                            printf("LSP: all 5 close outputs swept by their rightful owners!\n");
+                    }
                 }
             } else {
                 fprintf(stderr, "LSP: broadcast close tx failed\n");
@@ -1328,6 +1439,23 @@ int test_regtest_multi_payment(void) {
     TEST_ASSERT(lsp_ok, "LSP multi-payment operations");
     TEST_ASSERT(all_children_ok, "all clients completed");
     return 1;
+}
+
+/* ---- Thin arity wrappers: cover FACTORY_ARITY_1, _2 (default), _PS ----
+   Each drives the full wire ceremony (factory creation, payments, coop
+   close) and the spendability gauntlet at its chosen arity. Separate
+   wallets + port offsets prevent sequential collision. */
+
+int test_regtest_multi_payment(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_2, "test_multi_pay", 0);
+}
+
+int test_regtest_multi_payment_arity1(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_1, "test_multi_pay_a1", 100);
+}
+
+int test_regtest_multi_payment_arity_ps(void) {
+    return run_multi_payment_for_arity(FACTORY_ARITY_PS, "test_multi_pay_aps", 200);
 }
 
 /* ---- Test: Fee policy balance split ---- */
@@ -3824,7 +3952,10 @@ int test_conservation_with_real_htlc(void) {
 
     channel_t *ch = &mgr.entries[0].channel;
     ch->funding_amount = 100000;
-    ch->local_amount = 50000;
+    /* Conservation invariant is local+remote+Σhtlc == funding - base_commit_fee.
+       base_commit_fee at 1 sat/vB is 154 sats (154 vB * 1000/1000 rounded up),
+       which lsp_channels_init deducts from the funder side before splitting. */
+    ch->local_amount = 49846;
     ch->remote_amount = 50000;
     ch->fee_rate_sat_per_kvb = 1000;  /* 1 sat/vB */
     ch->funder_is_local = 1;
@@ -3854,8 +3985,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
                 "conservation OK during in-flight HTLC");
 
-    /* Verify exact balance: local = 50000 - 10000 (htlc) - 43 (fee) = 39957 */
-    TEST_ASSERT(ch->local_amount == 50000 - 10000 - expected_fee,
+    /* Verify exact balance: local = 49846 - 10000 (htlc) - 43 (fee) = 39803 */
+    TEST_ASSERT(ch->local_amount == 49846 - 10000 - expected_fee,
                 "local balance correct after add");
     TEST_ASSERT(ch->remote_amount == 50000,
                 "remote balance unchanged");
@@ -3869,7 +4000,7 @@ int test_conservation_with_real_htlc(void) {
     sha256(preimage, 32, hash);
     /* Re-add with correct hash */
     ch->n_htlcs = 0;
-    ch->local_amount = 50000;
+    ch->local_amount = 49846;
     ch->remote_amount = 50000;
     ch->commitment_number = 0;
     TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
@@ -3877,8 +4008,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(channel_fulfill_htlc(ch, htlc_id, preimage) == 1,
                 "fulfill HTLC succeeds");
 
-    /* After fulfill: local = 50000 - 10000 - 43 + 43 = 40000, remote = 50000 + 10000 = 60000 */
-    TEST_ASSERT(ch->local_amount == 40000,
+    /* After fulfill: local = 49846 - 10000 - 43 + 43 = 39846, remote = 50000 + 10000 = 60000 */
+    TEST_ASSERT(ch->local_amount == 39846,
                 "local balance correct after fulfill");
     TEST_ASSERT(ch->remote_amount == 60000,
                 "remote balance correct after fulfill");

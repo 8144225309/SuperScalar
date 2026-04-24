@@ -1102,6 +1102,24 @@ extern int test_fee_policy_balance_split(void);
 extern int test_channel_wire_framing(void);
 extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
+extern int test_regtest_multi_payment_arity1(void);
+extern int test_regtest_multi_payment_arity_ps(void);
+extern int test_regtest_coop_close_all_arities(void);
+extern int test_regtest_force_close_to_remote(void);
+extern int test_regtest_force_close_to_local(void);
+extern int test_regtest_breach_penalty_spendability(void);
+extern int test_regtest_ps_chain_close_spendability(void);
+extern int test_regtest_htlc_in_flight_spendability(void);
+extern int test_regtest_rotation_all_arities(void);
+extern int test_regtest_econ_arity2_baseline(void);
+extern int test_regtest_econ_arity1_baseline(void);
+extern int test_regtest_econ_arity_ps_baseline(void);
+extern int test_regtest_econ_rotation_arity1(void);
+extern int test_regtest_econ_rotation_arity2(void);
+extern int test_regtest_econ_rotation_arity_ps(void);
+extern int test_regtest_econ_buy_liquidity_arity2(void);
+extern int test_regtest_econ_jit_cooperative_close(void);
+extern int test_regtest_econ_ps_advance(void);
 extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
@@ -3572,6 +3590,28 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
     RUN_TEST(test_regtest_intra_factory_payment);
     RUN_TEST(test_regtest_multi_payment);
+    RUN_TEST(test_regtest_multi_payment_arity1);
+    RUN_TEST(test_regtest_multi_payment_arity_ps);
+
+    printf("\n=== Spendability Gauntlet (All Close Paths × All Arities) ===\n");
+    RUN_TEST(test_regtest_coop_close_all_arities);
+    RUN_TEST(test_regtest_force_close_to_remote);
+    RUN_TEST(test_regtest_force_close_to_local);
+    RUN_TEST(test_regtest_breach_penalty_spendability);
+    RUN_TEST(test_regtest_ps_chain_close_spendability);
+    RUN_TEST(test_regtest_htlc_in_flight_spendability);
+    RUN_TEST(test_regtest_rotation_all_arities);
+
+    printf("\n=== Economic Correctness (Chart B) ===\n");
+    RUN_TEST(test_regtest_econ_arity2_baseline);
+    RUN_TEST(test_regtest_econ_arity1_baseline);
+    RUN_TEST(test_regtest_econ_arity_ps_baseline);
+    RUN_TEST(test_regtest_econ_rotation_arity1);
+    RUN_TEST(test_regtest_econ_rotation_arity2);
+    RUN_TEST(test_regtest_econ_rotation_arity_ps);
+    RUN_TEST(test_regtest_econ_buy_liquidity_arity2);
+    RUN_TEST(test_regtest_econ_jit_cooperative_close);
+    RUN_TEST(test_regtest_econ_ps_advance);
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);

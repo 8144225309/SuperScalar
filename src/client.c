@@ -366,7 +366,10 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         msg = *initial_msg;
         got_propose = 1;
     } else {
-        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages */
+        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages
+           and trailing leaf-advance traffic (per-leaf advance ceremonies
+           trigger after HTLC fulfill in lsp_channels.c:2259; their
+           PROPOSE/DONE messages may arrive just before CLOSE_PROPOSE). */
         for (;;) {
             if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
                 fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
@@ -374,6 +377,37 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                 return 0;
             }
             if (msg.msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
+                cJSON_Delete(msg.json);
+                continue;
+            }
+            if (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE) {
+                /* Participate in the advance ceremony inline.
+                   Derive my_index from the factory's pubkey list. */
+                uint32_t my_idx = UINT32_MAX;
+                for (size_t p = 0; p < factory->n_participants; p++) {
+                    unsigned char a[33], b[33]; size_t la = 33, lb = 33;
+                    if (secp256k1_ec_pubkey_serialize(ctx, a, &la,
+                                                        &factory->pubkeys[p],
+                                                        SECP256K1_EC_COMPRESSED) &&
+                        secp256k1_ec_pubkey_serialize(ctx, b, &lb,
+                                                        my_pubkey,
+                                                        SECP256K1_EC_COMPRESSED) &&
+                        la == lb && memcmp(a, b, la) == 0) {
+                        my_idx = (uint32_t)p;
+                        break;
+                    }
+                }
+                if (my_idx == UINT32_MAX ||
+                    !client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                  my_idx, &msg)) {
+                    cJSON_Delete(msg.json);
+                    return 0;
+                }
+                cJSON_Delete(msg.json);
+                continue;
+            }
+            if (msg.msg_type == MSG_LEAF_ADVANCE_DONE) {
+                /* Stray DONE after an advance we already processed; skip. */
                 cJSON_Delete(msg.json);
                 continue;
             }
@@ -494,14 +528,53 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     }
     cJSON_Delete(nonce_msg);
 
-    /* Receive CLOSE_ALL_NONCES */
+    /* Receive CLOSE_ALL_NONCES, skipping stray leaf-advance / revoke noise. */
     wire_msg_t all_nonces_msg;
-    if (!wire_recv(fd, &all_nonces_msg) || check_msg_error(&all_nonces_msg) ||
-        all_nonces_msg.msg_type != MSG_CLOSE_ALL_NONCES) {
-        fprintf(stderr, "Client: expected CLOSE_ALL_NONCES\n");
-        if (all_nonces_msg.json) cJSON_Delete(all_nonces_msg.json);
-        tx_buf_free(&close_unsigned);
-        return 0;
+    for (;;) {
+        if (!wire_recv(fd, &all_nonces_msg) || check_msg_error(&all_nonces_msg)) {
+            fprintf(stderr, "Client: expected CLOSE_ALL_NONCES\n");
+            if (all_nonces_msg.json) cJSON_Delete(all_nonces_msg.json);
+            tx_buf_free(&close_unsigned);
+            return 0;
+        }
+        if (all_nonces_msg.msg_type == 0x50 ||          /* REVOKE_AND_ACK */
+            all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_DONE) {
+            cJSON_Delete(all_nonces_msg.json);
+            continue;
+        }
+        if (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE) {
+            uint32_t my_idx = UINT32_MAX;
+            for (size_t p = 0; p < factory->n_participants; p++) {
+                unsigned char a[33], b[33]; size_t la = 33, lb = 33;
+                if (secp256k1_ec_pubkey_serialize(ctx, a, &la,
+                                                    &factory->pubkeys[p],
+                                                    SECP256K1_EC_COMPRESSED) &&
+                    secp256k1_ec_pubkey_serialize(ctx, b, &lb,
+                                                    my_pubkey,
+                                                    SECP256K1_EC_COMPRESSED) &&
+                    la == lb && memcmp(a, b, la) == 0) {
+                    my_idx = (uint32_t)p;
+                    break;
+                }
+            }
+            if (my_idx == UINT32_MAX ||
+                !client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                              my_idx, &all_nonces_msg)) {
+                cJSON_Delete(all_nonces_msg.json);
+                tx_buf_free(&close_unsigned);
+                return 0;
+            }
+            cJSON_Delete(all_nonces_msg.json);
+            continue;
+        }
+        if (all_nonces_msg.msg_type != MSG_CLOSE_ALL_NONCES) {
+            fprintf(stderr, "Client: expected CLOSE_ALL_NONCES, got 0x%02x\n",
+                    all_nonces_msg.msg_type);
+            cJSON_Delete(all_nonces_msg.json);
+            tx_buf_free(&close_unsigned);
+            return 0;
+        }
+        break;
     }
 
     {
