@@ -1111,6 +1111,8 @@ extern int test_regtest_breach_penalty_spendability(void);
 extern int test_regtest_ps_chain_close_spendability(void);
 extern int test_regtest_htlc_in_flight_spendability(void);
 extern int test_regtest_rotation_all_arities(void);
+extern int test_regtest_full_tree_force_close_all_arities(void);
+extern int test_regtest_jit_recovery_close_spendability(void);
 extern int test_regtest_econ_arity2_baseline(void);
 extern int test_regtest_econ_arity1_baseline(void);
 extern int test_regtest_econ_arity_ps_baseline(void);
@@ -3601,6 +3603,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_ps_chain_close_spendability);
     RUN_TEST(test_regtest_htlc_in_flight_spendability);
     RUN_TEST(test_regtest_rotation_all_arities);
+    RUN_TEST(test_regtest_full_tree_force_close_all_arities);
+    RUN_TEST(test_regtest_jit_recovery_close_spendability);
 
     printf("\n=== Economic Correctness (Chart B) ===\n");
     RUN_TEST(test_regtest_econ_arity2_baseline);
