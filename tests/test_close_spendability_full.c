@@ -1881,3 +1881,202 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Full force-close + per-party sweep (item #4 from v0.1.14 audit).
+ *
+ * After broadcasting the entire factory tree, this test proves the headline
+ * fund-recovery property: each leaf's on-chain outputs can be swept back
+ * to a regtest wallet by the correct parties, using only their respective
+ * keys or cooperative 2-of-2 signing.
+ *
+ * Arity-1 baseline: each leaf has 2 outputs — channel (MuSig(client, LSP),
+ * 2-of-2 P2TR with BIP-341 taptweak-empty) and L-stock (LSP-only P2TR,
+ * taptweak-empty). Both are swept:
+ *   - L-stock: LSP alone via spend_build_p2tr_bip341_keypath.
+ *   - Channel: offline 2-of-2 MuSig2 ceremony (both keypairs present in-test).
+ *
+ * This is a weaker variant of the full "broadcast commitment TX + sweep
+ * to_remote + sweep to_local after CSV" flow. The commitment-level sweep
+ * is exercised by the pre-existing test_regtest_force_close_to_remote
+ * and test_regtest_force_close_to_local tests on standalone 2-of-2
+ * channels; what those omit is the "after full factory tree broadcast"
+ * precondition that this test adds. Chained, they constitute the full
+ * factory-tree-force-close-and-sweep claim.
+ *
+ * Arity-2 and arity-PS are structurally identical at the per-leaf sweep
+ * step and are acknowledged as cross-references rather than re-implemented
+ * (same pattern as test_regtest_jit_recovery_close_spendability). */
+int test_regtest_full_force_close_and_sweep_arity1(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "full_fc_sweep_a1");
+    rt.scan_depth = 200;  /* tree deep → leaves > default scan_depth */
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 2;  /* LSP + 1 client (smallest arity-1 factory) */
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { secp256k1_context_destroy(ctx); return 0; }
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(&rt, ctx, N, FACTORY_ARITY_1, mine_addr, kps, f,
+                               fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    printf("  [arity=1] factory funded: %llu sats, %zu nodes, %d leaves\n",
+           (unsigned long long)fund_amount, f->n_nodes, f->n_leaf_nodes);
+
+    /* Broadcast every signed tree node in order with correct BIP-68 spacing. */
+    char txids[FACTORY_MAX_NODES][65];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        TEST_ASSERT(nd->is_signed && nd->signed_tx.len > 0, "node signed");
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        TEST_ASSERT(tx_hex != NULL, "tx_hex malloc");
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(&rt, tx_hex, txids[i]);
+        free(tx_hex);
+        TEST_ASSERT(ok, "broadcast tree node");
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t cns = f->nodes[i + 1].nsequence;
+            if (!(cns & 0x80000000u)) blocks_to_mine = (int)(cns & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(&rt, blocks_to_mine, mine_addr);
+    }
+    int n_leaves = f->n_leaf_nodes;
+    for (int li = 0; li < n_leaves; li++) {
+        int conf = regtest_get_confirmations(&rt,
+            txids[f->leaf_node_indices[li]]);
+        TEST_ASSERT(conf >= 1, "leaf on chain");
+    }
+    printf("  full tree broadcast OK — %zu nodes, %d leaves confirmed\n",
+           f->n_nodes, n_leaves);
+
+    /* Per-leaf sweep loop. */
+    char dest_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, dest_addr, sizeof(dest_addr)),
+                "dest addr");
+    unsigned char dest_spk[64];
+    size_t dest_spk_len = 0;
+    TEST_ASSERT(regtest_get_address_scriptpubkey(&rt, dest_addr, dest_spk,
+                                                   &dest_spk_len),
+                "dest spk");
+
+    uint64_t total_swept = 0;
+
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        const char *leaf_txid = txids[nidx];
+
+        /* (A) Sweep L-stock (vout 1) with LSP alone, BIP-341 keypath. */
+        uint64_t lstock_amt = leaf->outputs[1].amount_sats;
+        unsigned char lstock_spk[34];
+        memcpy(lstock_spk, leaf->outputs[1].script_pubkey, 34);
+
+        tx_buf_t lstock_sweep;
+        tx_buf_init(&lstock_sweep, 256);
+        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                        N_PARTY_SECKEYS[0],
+                        leaf_txid, 1, lstock_amt,
+                        lstock_spk, 34,
+                        dest_spk, dest_spk_len,
+                        /* fee */ 300, &lstock_sweep),
+                    "build L-stock sweep");
+        char *lh = malloc(lstock_sweep.len * 2 + 1);
+        TEST_ASSERT(lh != NULL, "lh malloc");
+        hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
+        lh[lstock_sweep.len * 2] = '\0';
+        char lstock_sweep_txid[65];
+        int lok = spend_broadcast_and_mine(&rt, lh, 1, lstock_sweep_txid);
+        free(lh); tx_buf_free(&lstock_sweep);
+        TEST_ASSERT(lok, "L-stock sweep confirmed");
+        total_swept += lstock_amt - 300;
+        printf("  leaf %d: LSP swept L-stock %llu sats via %.16s...\n",
+               li, (unsigned long long)(lstock_amt - 300), lstock_sweep_txid);
+
+        /* (B) Sweep channel (vout 0) via offline 2-of-2 MuSig2. */
+        uint64_t chan_amt = leaf->outputs[0].amount_sats;
+        unsigned char chan_spk[34];
+        memcpy(chan_spk, leaf->outputs[0].script_pubkey, 34);
+
+        unsigned char leaf_txid_bytes[32];
+        TEST_ASSERT(hex_decode(leaf_txid, leaf_txid_bytes, 32),
+                    "decode leaf txid");
+        reverse_bytes(leaf_txid_bytes, 32);
+
+        tx_output_t out;
+        memcpy(out.script_pubkey, dest_spk, dest_spk_len);
+        out.script_pubkey_len = dest_spk_len;
+        out.amount_sats = chan_amt - 300;
+        tx_buf_t chan_unsigned;
+        tx_buf_init(&chan_unsigned, 256);
+        TEST_ASSERT(build_unsigned_tx(&chan_unsigned, NULL,
+                                        leaf_txid_bytes, 0, 0xFFFFFFFEu,
+                                        &out, 1),
+                    "build unsigned channel sweep");
+        unsigned char sighash[32];
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+                        chan_unsigned.data, chan_unsigned.len,
+                        0, chan_spk, 34, chan_amt, 0xFFFFFFFEu),
+                    "compute channel sighash");
+
+        /* MuSig key aggregation is order-sensitive. Factory built the
+           leaf SPK as MuSig(client, LSP) — see setup_single_leaf_outputs
+           in src/factory.c:674: `pks[2] = { pubkeys[client_idx], pubkeys[0] }`.
+           Match that order here or the aggregate key differs and the
+           signature fails on chain. */
+        secp256k1_keypair signers[2] = { kps[1], kps[0] };  /* client, LSP */
+        secp256k1_pubkey pks[2];
+        secp256k1_keypair_pub(ctx, &pks[0], &signers[0]);
+        secp256k1_keypair_pub(ctx, &pks[1], &signers[1]);
+        musig_keyagg_t ka;
+        TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 2),
+                    "aggregate channel keys (client, LSP)");
+        unsigned char sig64[64];
+        TEST_ASSERT(musig_sign_taproot(ctx, sig64, sighash, signers, 2,
+                                         &ka, NULL),
+                    "offline 2-of-2 MuSig2 sign channel sweep");
+        tx_buf_t chan_signed;
+        tx_buf_init(&chan_signed, 256);
+        TEST_ASSERT(finalize_signed_tx(&chan_signed,
+                        chan_unsigned.data, chan_unsigned.len, sig64),
+                    "finalize channel sweep tx");
+        tx_buf_free(&chan_unsigned);
+
+        char *ch_hex = malloc(chan_signed.len * 2 + 1);
+        TEST_ASSERT(ch_hex != NULL, "ch_hex malloc");
+        hex_encode(chan_signed.data, chan_signed.len, ch_hex);
+        ch_hex[chan_signed.len * 2] = '\0';
+        char chan_sweep_txid[65];
+        int cok = spend_broadcast_and_mine(&rt, ch_hex, 1, chan_sweep_txid);
+        free(ch_hex); tx_buf_free(&chan_signed);
+        TEST_ASSERT(cok, "channel 2-of-2 sweep confirmed");
+        total_swept += chan_amt - 300;
+        printf("  leaf %d: 2-of-2 swept channel %llu sats via %.16s...\n",
+               li, (unsigned long long)(chan_amt - 300), chan_sweep_txid);
+    }
+
+    printf("  arity-1 full force-close + per-party sweep: %llu sats recovered "
+           "across %d leaves ✓\n",
+           (unsigned long long)total_swept, n_leaves);
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
