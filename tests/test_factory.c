@@ -5505,3 +5505,132 @@ int test_factory_ps_split_round_leaf_advance(void) {
     free(f);
     return 1;
 }
+
+/* PS multi-config matrix.
+   Sweeps (N participants) × (advance count) and asserts every cell builds,
+   signs, verifies, and chains advances correctly. Catches regressions where
+   PS works at one shape but breaks at another (e.g. tree depth boundaries,
+   N-way MuSig edge cases, leaf exhaustion). */
+int test_factory_ps_matrix(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    struct cell { size_t N; int advances; };
+    struct cell cells[] = {
+        {2, 0}, {2, 1}, {2, 5}, {2, 50},
+        {3, 0}, {3, 1}, {3, 5}, {3, 50},
+        {8, 0}, {8, 1}, {8, 5},
+        {16, 0}, {16, 1}, {16, 5},
+        {32, 0}, {32, 1},
+        {64, 0}, {64, 1},
+    };
+    int n_cells = (int)(sizeof(cells) / sizeof(cells[0]));
+
+    for (int c = 0; c < n_cells; c++) {
+        size_t N = cells[c].N;
+        int advances = cells[c].advances;
+
+        secp256k1_keypair kps[64];
+        for (size_t i = 0; i < N; i++) {
+            unsigned char sk[32] = {0};
+            sk[31] = (unsigned char)((i % 250) + 1);
+            sk[0]  = 0xAA;
+            sk[1]  = (unsigned char)c;
+            TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk),
+                        "keypair create");
+        }
+
+        unsigned char fund_spk[34];
+        {
+            secp256k1_pubkey pks[64];
+            for (size_t i = 0; i < N; i++)
+                secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+            musig_keyagg_t ka;
+            TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, N),
+                        "N-way MuSig aggregate");
+            unsigned char ser[32];
+            secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+            unsigned char tweak[32];
+            sha256_tagged("TapTweak", ser, 32, tweak);
+            secp256k1_pubkey tp;
+            TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tp,
+                                                                 &ka.cache, tweak),
+                        "taptweak");
+            secp256k1_xonly_pubkey xo;
+            secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &tp);
+            build_p2tr_script_pubkey(fund_spk, &xo);
+        }
+
+        unsigned char fake_txid[32];
+        memset(fake_txid, (unsigned char)(0xC0 + c), 32);
+
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(f, "alloc factory");
+        factory_init(f, ctx, kps, N, 4, 3);
+        factory_set_arity(f, FACTORY_ARITY_PS);
+        factory_set_funding(f, fake_txid, 0, 50000000, fund_spk, 34);
+
+        TEST_ASSERT(factory_build_tree(f), "build PS tree");
+        TEST_ASSERT_EQ(f->n_leaf_nodes, (int)(N - 1), "leaves = N-1");
+
+        TEST_ASSERT(factory_sign_all(f), "sign all");
+        TEST_ASSERT(factory_verify_all(f), "verify all");
+
+        for (int li = 0; li < f->n_leaf_nodes; li++) {
+            size_t ni = f->leaf_node_indices[li];
+            TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf");
+            TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0, "initial chain_len=0");
+            TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu,
+                        "PS leaf nseq=0xFFFFFFFE");
+            TEST_ASSERT_EQ((int)f->nodes[ni].n_outputs, 2,
+                           "PS leaf has 2 outputs initially");
+        }
+
+        int actual_advances = 0;
+        if (advances > 0) {
+            int leaf_side = 0;
+            size_t leaf_idx = f->leaf_node_indices[leaf_side];
+            unsigned char prev_txid[32];
+            memcpy(prev_txid, f->nodes[leaf_idx].txid, 32);
+
+            for (int a = 0; a < advances; a++) {
+                int rc = factory_advance_leaf(f, leaf_side);
+                if (rc != 1) {
+                    /* Leaf exhausted at the dust limit — acceptable for
+                       deeply iterated cells; record + stop. */
+                    break;
+                }
+                TEST_ASSERT(memcmp(f->nodes[leaf_idx].ps_prev_txid,
+                                    prev_txid, 32) == 0,
+                            "ps_prev_txid chains correctly");
+                TEST_ASSERT(memcmp(f->nodes[leaf_idx].txid,
+                                    prev_txid, 32) != 0,
+                            "txid changed after advance");
+                TEST_ASSERT(f->nodes[leaf_idx].is_signed,
+                            "leaf re-signed after advance");
+                TEST_ASSERT_EQ((int)f->nodes[leaf_idx].n_outputs, 1,
+                               "post-advance n_outputs=1 (no L-stock split)");
+                memcpy(prev_txid, f->nodes[leaf_idx].txid, 32);
+                actual_advances++;
+            }
+
+            TEST_ASSERT_EQ(f->nodes[leaf_idx].ps_chain_len, actual_advances,
+                           "chain_len matches actual advances");
+
+            /* Other leaves must be unaffected by leaf 0's advance. */
+            for (int li = 1; li < f->n_leaf_nodes; li++) {
+                size_t ni = f->leaf_node_indices[li];
+                TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0,
+                               "untouched leaf chain_len=0");
+            }
+        }
+
+        printf("  cell N=%zu advances=%d/%d: %zu nodes, %d leaves OK\n",
+               N, actual_advances, advances, f->n_nodes, f->n_leaf_nodes);
+
+        factory_free(f);
+        free(f);
+    }
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

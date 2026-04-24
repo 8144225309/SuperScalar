@@ -1606,6 +1606,7 @@ extern int test_factory_ps_amount_invariant(void);
 extern int test_factory_ps_dust_limit(void);
 extern int test_factory_ps_mixed_arity(void);
 extern int test_factory_ps_split_round_leaf_advance(void);
+extern int test_factory_ps_matrix(void);
 
 /* Wire TLV Foundation (Mainnet Gap #8) */
 extern int test_tlv_encode_decode(void);
@@ -3337,6 +3338,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_ps_dust_limit);
     RUN_TEST(test_factory_ps_mixed_arity);
     RUN_TEST(test_factory_ps_split_round_leaf_advance);
+    RUN_TEST(test_factory_ps_matrix);
 
     printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");
     RUN_TEST(test_tlv_encode_decode);
