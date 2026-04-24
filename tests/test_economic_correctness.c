@@ -445,3 +445,204 @@ int test_regtest_econ_arity2_baseline(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* =====================================================================
+ * Rotation econ: build factory A, rotate to B, close B cooperatively.
+ * Asserts B's close output amounts match lsp_channels_build_close_outputs
+ * applied to B's funding (= A's funding − rotation_fee).
+ * ===================================================================== */
+
+static int run_rotation_econ_for_arity(secp256k1_context *ctx, regtest_t *rt,
+                                         const char *mine_addr,
+                                         factory_arity_t arity,
+                                         const char *label) {
+    const size_t N = 5;
+    secp256k1_keypair kpsA[5], kpsB[5];
+    secp256k1_pubkey  pks[5];
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_keypair_create(ctx, &kpsA[i], ECON_SECKEYS[i]);
+        secp256k1_keypair_create(ctx, &kpsB[i], ECON_SECKEYS[i]);
+        secp256k1_keypair_pub(ctx, &pks[i], &kpsA[i]);
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    /* Fund A. */
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tpx_ser, fund_addr, sizeof(fund_addr))) return 0;
+    char fund_txidA[65];
+    if (!regtest_fund_address(rt, fund_addr, 0.005, fund_txidA)) return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+    uint32_t voutA = UINT32_MAX; uint64_t amtA = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(rt, fund_txidA, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            voutA = v; amtA = a; break;
+        }
+    }
+    if (voutA == UINT32_MAX) return 0;
+    printf("  [%s] factory A funded: %s:%u (%llu sats)\n",
+           label, fund_txidA, voutA, (unsigned long long)amtA);
+
+    /* Rotate A → B: single output to same MuSig SPK. */
+    tx_output_t rot;
+    rot.script_pubkey_len = 34;
+    memcpy(rot.script_pubkey, fund_spk, 34);
+    uint64_t rot_fee = 500;
+    rot.amount_sats = amtA - rot_fee;
+    unsigned char tA[32];
+    hex_decode(fund_txidA, tA, 32);
+    reverse_bytes(tA, 32);
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    build_unsigned_tx(&uc, NULL, tA, voutA, 0xFFFFFFFEu, &rot, 1);
+    unsigned char sh[32];
+    compute_taproot_sighash(sh, uc.data, uc.len, 0, fund_spk, 34, amtA, 0xFFFFFFFEu);
+    unsigned char sig[64];
+    musig_sign_taproot(ctx, sig, sh, kpsA, N, &ka, NULL);
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    finalize_signed_tx(&sc, uc.data, uc.len, sig);
+    tx_buf_free(&uc);
+    char hex1[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, hex1); hex1[sc.len * 2] = '\0';
+    char rot_txid[65];
+    int rsent = regtest_send_raw_tx(rt, hex1, rot_txid);
+    tx_buf_free(&sc);
+    if (!rsent) return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+    if (regtest_get_confirmations(rt, rot_txid) < 1) return 0;
+    uint64_t amtB = rot.amount_sats;
+    printf("  [%s] rotation A→B: %s (%llu sats carried)\n",
+           label, rot_txid, (unsigned long long)amtB);
+
+    /* Build B's tree, close B cooperatively. */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kpsB, N, 2, 4);
+    factory_set_arity(f, arity);
+    unsigned char tB[32];
+    hex_decode(rot_txid, tB, 32);
+    reverse_bytes(tB, 32);
+    factory_set_funding(f, tB, 0, amtB, fund_spk, 34);
+    if (!factory_build_tree(f)) { free(f); return 0; }
+    if (!factory_sign_all(f))   { free(f); return 0; }
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.lsp_balance_pct = 50;
+    if (!lsp_channels_init(&mgr, ctx, f, ECON_SECKEYS[0], N - 1)) { free(f); return 0; }
+
+    uint64_t close_fee = 500;
+    tx_output_t outs[FACTORY_MAX_SIGNERS];
+    size_t n_outs = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee, NULL, 0);
+    if (n_outs == 0) { free(f); lsp_channels_cleanup(&mgr); return 0; }
+
+    econ_ctx_t ectx;
+    econ_ctx_init(&ectx, rt, ctx);
+    for (size_t i = 0; i < N; i++)
+        econ_register_party(&ectx, i, ECON_NAMES[i], ECON_SECKEYS[i]);
+    uint64_t expected[5] = {0};
+    for (size_t i = 0; i < n_outs && i < N; i++) expected[i] = outs[i].amount_sats;
+
+    tx_buf_t uc2;
+    tx_buf_init(&uc2, 256);
+    build_unsigned_tx(&uc2, NULL, f->funding_txid, f->funding_vout,
+                       0xFFFFFFFEu, outs, n_outs);
+    unsigned char sh2[32];
+    compute_taproot_sighash(sh2, uc2.data, uc2.len, 0, fund_spk, 34, amtB, 0xFFFFFFFEu);
+    unsigned char sig2[64];
+    musig_sign_taproot(ctx, sig2, sh2, kpsB, N, &ka, NULL);
+    tx_buf_t sc2;
+    tx_buf_init(&sc2, 256);
+    finalize_signed_tx(&sc2, uc2.data, uc2.len, sig2);
+    tx_buf_free(&uc2);
+    char hex2[sc2.len * 2 + 1];
+    hex_encode(sc2.data, sc2.len, hex2); hex2[sc2.len * 2] = '\0';
+    char closeB_txid[65];
+    int sb = regtest_send_raw_tx(rt, hex2, closeB_txid);
+    tx_buf_free(&sc2);
+    if (!sb) { free(f); lsp_channels_cleanup(&mgr); return 0; }
+    regtest_mine_blocks(rt, 1, mine_addr);
+    if (regtest_get_confirmations(rt, closeB_txid) < 1) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    printf("  [%s] close B confirmed: %s\n", label, closeB_txid);
+
+    econ_snap_pre(&ectx);
+    if (!econ_assert_close_amounts(&ectx, closeB_txid, close_fee, amtB, expected)) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    if (!spend_coop_close_gauntlet(ctx, rt, closeB_txid, ECON_SECKEYS, N - 1)) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    econ_snap_post(&ectx);
+    econ_print_summary(&ectx);
+    printf("  [%s] rotation econ ✓  (A→B fee=%llu, B exit amounts match formula)\n",
+           label, (unsigned long long)rot_fee);
+    free(f);
+    lsp_channels_cleanup(&mgr);
+    return 1;
+}
+
+int test_regtest_econ_rotation_arity1(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_rot_a1");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(run_rotation_econ_for_arity(ctx, &rt, mine_addr, FACTORY_ARITY_1, "rot a1"),
+                "rotation econ arity 1");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_regtest_econ_rotation_arity2(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_rot_a2");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(run_rotation_econ_for_arity(ctx, &rt, mine_addr, FACTORY_ARITY_2, "rot a2"),
+                "rotation econ arity 2");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_regtest_econ_rotation_arity_ps(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_rot_aps");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(run_rotation_econ_for_arity(ctx, &rt, mine_addr, FACTORY_ARITY_PS, "rot aps"),
+                "rotation econ arity PS");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
