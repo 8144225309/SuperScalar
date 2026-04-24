@@ -1872,7 +1872,7 @@
                         pre_signed_tx_len[li] = n->signed_tx.len;
                     }
                 }
-                printf("  Leaf %d: chain_len=%u, chan_amount=%llu sats\n",
+                printf("  Leaf %d: chain_len=%d, chan_amount=%llu sats\n",
                        li, pre_chain_len[li],
                        (unsigned long long)pre_amounts[li]);
             }
@@ -1894,12 +1894,12 @@
                     size_t nidx = psa_f->leaf_node_indices[li];
                     factory_node_t *node = &psa_f->nodes[nidx];
                     uint64_t expected_amt = pre_amounts[li] - psa_f->fee_per_tx;
-                    printf("  Leaf %d post-advance: chain_len=%u, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
+                    printf("  Leaf %d post-advance: chain_len=%d, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
                            li, node->ps_chain_len, node->n_outputs,
                            (unsigned long long)node->outputs[0].amount_sats,
                            (unsigned long long)expected_amt);
                     if ((uint32_t)node->ps_chain_len != pre_chain_len[li] + 1u) {
-                        fprintf(stderr, "PS ADVANCE TEST: leaf %d chain_len not incremented (%u→%u)\n",
+                        fprintf(stderr, "PS ADVANCE TEST: leaf %d chain_len not incremented (%d→%d)\n",
                                 li, pre_chain_len[li], node->ps_chain_len);
                         psa_pass = 0;
                     }
