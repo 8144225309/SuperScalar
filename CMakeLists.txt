@@ -389,6 +389,9 @@ endif()
 add_executable(recover_stranded_coop_output tools/recover_stranded_coop_output.c)
 target_include_directories(recover_stranded_coop_output PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_link_libraries(recover_stranded_coop_output PRIVATE superscalar project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(recover_stranded_coop_output PRIVATE project_sanitizers)
+endif()
 
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---
 if(ENABLE_FUZZING)
