@@ -3243,3 +3243,62 @@ int test_wt_ptlc2_metadata_store(void) {
     TEST_ASSERT_EQ((long long)wh.htlc_amount, 25000LL, "WT_PTLC2: amount");
     return 1;
 }
+
+/* PS double-spend defense (invariant #5): persist_save_ps_signed_input +
+   persist_check_ps_signed_input round-trip. The defense hinges on
+   "second time we're asked to sign a TX spending the same parent UTXO,
+   refuse." This test exercises the persistence API directly. */
+int test_persist_ps_signed_input_roundtrip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    unsigned char parent_txid[32], sighash_a[32], sighash_b[32];
+    unsigned char psig_a[36], psig_b[36], out_sighash[32];
+    memset(parent_txid, 0xAA, 32);
+    memset(sighash_a, 0xA1, 32);
+    memset(sighash_b, 0xB2, 32);  /* different content → would be attack */
+    memset(psig_a, 0x01, 36);
+    memset(psig_b, 0x02, 36);
+
+    /* Initial state: no row → check returns 0 (proceed to sign). */
+    TEST_ASSERT_EQ(
+        persist_check_ps_signed_input(&db, /*factory_id=*/0,
+                                       parent_txid, /*parent_vout=*/0,
+                                       NULL),
+        0, "fresh parent: check returns 0 (not_found)");
+
+    /* Record a signing for this parent. */
+    TEST_ASSERT(
+        persist_save_ps_signed_input(&db, /*factory_id=*/0, /*leaf_idx=*/3,
+                                      parent_txid, /*parent_vout=*/0,
+                                      sighash_a, psig_a),
+        "save first sig");
+
+    /* Second check: same parent → returns 1 (REFUSE). Out_sighash echoes
+       the previously-recorded sighash for observability. */
+    TEST_ASSERT_EQ(
+        persist_check_ps_signed_input(&db, 0, parent_txid, 0, out_sighash),
+        1, "already signed → returns 1 (refuse)");
+    TEST_ASSERT(memcmp(out_sighash, sighash_a, 32) == 0,
+                "out_sighash echoes the previously-stored sighash");
+
+    /* Different parent_vout on the same txid is a DIFFERENT UTXO —
+       should return 0 (not_found, OK to sign). */
+    TEST_ASSERT_EQ(
+        persist_check_ps_signed_input(&db, 0, parent_txid, /*vout=*/1, NULL),
+        0, "different vout is a different input: proceed");
+
+    /* Different factory_id, same parent: separate namespace → 0. */
+    TEST_ASSERT_EQ(
+        persist_check_ps_signed_input(&db, /*factory_id=*/1,
+                                       parent_txid, 0, NULL),
+        0, "different factory_id: separate namespace");
+
+    /* The attack-shaped second-save with DIFFERENT sighash is allowed
+       at the persist layer (INSERT OR REPLACE), but the check step
+       prevents reaching it — callers MUST consult the check first. */
+    (void)psig_b; (void)sighash_b;
+
+    persist_close(&db);
+    return 1;
+}
