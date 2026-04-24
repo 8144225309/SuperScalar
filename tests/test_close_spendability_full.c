@@ -1361,6 +1361,12 @@ int test_regtest_full_tree_force_close_all_arities(void) {
         return 1;
     }
     regtest_create_wallet(&rt, "full_tree_force");
+    /* Arity-1 tree is 14 nodes with BIP-68 delays between siblings — by the
+       time we check the last leaf's confs, it's buried > 20 blocks deep,
+       beyond the default scan_depth. regtest_get_confirmations's fallback
+       path iterates getblockhash + getrawtransaction, so bumping the depth
+       covers CI hosts that don't have -txindex set. */
+    rt.scan_depth = 200;
 
     char mine_addr[128];
     if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
