@@ -691,11 +691,16 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Set per-client amounts for balance-aware distribution TX.
-       During rotation, use actual channel balances (remote = client's funds). */
+    /* Per-client account_limit (channel capacity) for the new factory's
+       distribution TX. Inversion-of-timeout-default pays each client their
+       contracted capacity on CLTV expiry — not their current balance, which
+       would let the LSP protect accumulated fees simply by going dark.
+       For the current homogeneous-capacity design, funding_amount is the
+       same across all channels; kept as a per-client array to prepare for
+       heterogeneous-capacity factories. */
     uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
     for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
-        rot_dist_amounts[c] = mgr->entries[c].channel.remote_amount;
+        rot_dist_amounts[c] = mgr->entries[c].channel.funding_amount;
     lsp->dist_client_amounts = rot_dist_amounts;
     lsp->dist_n_client_amounts = mgr->n_channels;
 
