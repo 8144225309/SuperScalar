@@ -21,7 +21,7 @@ Factory participant cap raised from 64 to 128. Per-channel fee tracking and HTLC
 ### Planned follow-ups (in-flight PRs)
 
 - **Signet bridge-econ port** (PR #73, `tools/test_bridge_econ_signet.sh`): runs the hybrid-CLN flow against the persistent signet environment to flip the three external_out 🟡 cells to ✓ on a real network with announced channels. Manual; blocks are ~10 min so per-run latency is ~60 min.
-- **Factory recovery scan must not auto-broadcast** (PR #74, `src/factory_recovery.c`): `factory_recovery_scan` (startup/reorg) force-published the tree whenever funding confirmed, causing `bad-txns-inputs-missingorspent` on subsequent coop close. Fix gates tree broadcast on an explicit operator force-close.
+- **Factory recovery scan must not auto-broadcast** (PR #74, `src/factory_recovery.c`): `factory_recovery_scan` (startup/reorg) force-published the tree whenever funding confirmed, causing `bad-txns-inputs-missingorspent` on subsequent coop close. Fix gates tree broadcast on an explicit operator force-close via a new `allow_root_broadcast` parameter to `do_factory_recovery`. Verified end-to-end: hybrid CLN bridge econ regtest now passes full flow (external_in + external_out + coop close after payments, 5-conf close TX decoded and client output matched to invoice amount).
 
 ### Added
 
