@@ -1116,6 +1116,7 @@ extern int test_regtest_jit_recovery_close_spendability(void);
 extern int test_regtest_inversion_of_timeout_default(void);
 extern int test_regtest_old_state_poisoning(void);
 extern int test_regtest_kickoff_paired_with_latest_state(void);
+extern int test_regtest_full_force_close_and_sweep_arity1(void);
 extern int test_regtest_econ_arity2_baseline(void);
 extern int test_regtest_econ_arity1_baseline(void);
 extern int test_regtest_econ_arity_ps_baseline(void);
@@ -3617,6 +3618,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_inversion_of_timeout_default);
     RUN_TEST(test_regtest_old_state_poisoning);
     RUN_TEST(test_regtest_kickoff_paired_with_latest_state);
+    RUN_TEST(test_regtest_full_force_close_and_sweep_arity1);
 
     printf("\n=== Economic Correctness (Chart B) ===\n");
     RUN_TEST(test_regtest_econ_arity2_baseline);

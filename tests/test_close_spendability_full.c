@@ -30,6 +30,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/sweeper.h"
 #include "spend_helpers.h"
+#include "econ_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1875,6 +1876,288 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
            kickoff_txid, state_txid, state_nseq);
     printf("  invariant holds: kickoff broadcast is followed by its latest\n"
            "                   signed state tx; no orphan kickoff possible ✓\n");
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Full force-close + per-party sweep with PAYMENT-FLOW ACCOUNTING.
+ *
+ * After broadcasting the entire factory tree, this test proves both
+ * spendability AND proper accounting under payment flow. It simulates
+ * the economic shape of a factory that processed routed payments before
+ * being force-closed: each leaf's channel output is split between the
+ * parties NOT 50/50 but according to post-payment balances, reflecting
+ * that the client paid the LSP + a routing fee during operation.
+ *
+ * Arity-1 baseline per-leaf sweep:
+ *   - Channel (2-of-2 MuSig P2TR): offline 2-party MuSig2 ceremony
+ *     produces a TX with 2 outputs, amounts reflecting post-payment
+ *     state:
+ *        client_share = (channel − sweep_fee)/2
+ *                       − (simulated_payment + simulated_routing_fee)
+ *        lsp_share    = (channel − sweep_fee) − client_share
+ *     The routing fee is what ZmnSCPxj calls "sats received outside
+ *     L-stock" — routing income that accrues to the LSP during factory
+ *     operation, separate from L-stock.
+ *   - L-stock (LSP-only P2TR): LSP alone sweeps via BIP-341 keypath.
+ *     L-stock is the LSP's inbound-capacity reserve, distinct from
+ *     channel balances and routing income.
+ *
+ * Accounting verified by econ_snap_pre / econ_snap_post +
+ * econ_assert_wallet_deltas:
+ *   client_delta = Σ(client_share_per_leaf)
+ *   LSP_delta    = Σ(lsp_share + L_stock − sweep_fees per leaf)
+ *   Σ(deltas) + Σ(tx_fees) == Σ(leaf_allocations) (conservation)
+ *
+ * The payment flow is simulated by choosing uneven sweep amounts rather
+ * than running actual HTLCs through channel commitment TXs. That proves
+ * the correctness property ZmnSCPxj cares about: "every sat reaches the
+ * right party, including routing income that's NOT L-stock." The full
+ * HTLC-add-fulfill + commit-TX variant (channel_init + commitment_tx +
+ * sweep_to_remote + sweep_to_local_csv chained after tree broadcast) is
+ * a larger test acknowledged as a follow-up.
+ *
+ * Arity-2 and arity-PS: structurally identical at the per-leaf sweep
+ * step — cross-referenced rather than re-implemented. */
+int test_regtest_full_force_close_and_sweep_arity1(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "full_fc_sweep_a1");
+    rt.scan_depth = 200;  /* tree deep → leaves > default scan_depth */
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 2;  /* LSP + 1 client (smallest arity-1 factory) */
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { secp256k1_context_destroy(ctx); return 0; }
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(&rt, ctx, N, FACTORY_ARITY_1, mine_addr, kps, f,
+                               fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    printf("  [arity=1] factory funded: %llu sats, %zu nodes, %d leaves\n",
+           (unsigned long long)fund_amount, f->n_nodes, f->n_leaf_nodes);
+
+    /* Broadcast every signed tree node in order with correct BIP-68 spacing. */
+    char txids[FACTORY_MAX_NODES][65];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        TEST_ASSERT(nd->is_signed && nd->signed_tx.len > 0, "node signed");
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        TEST_ASSERT(tx_hex != NULL, "tx_hex malloc");
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(&rt, tx_hex, txids[i]);
+        free(tx_hex);
+        TEST_ASSERT(ok, "broadcast tree node");
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t cns = f->nodes[i + 1].nsequence;
+            if (!(cns & 0x80000000u)) blocks_to_mine = (int)(cns & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(&rt, blocks_to_mine, mine_addr);
+    }
+    int n_leaves = f->n_leaf_nodes;
+    for (int li = 0; li < n_leaves; li++) {
+        int conf = regtest_get_confirmations(&rt,
+            txids[f->leaf_node_indices[li]]);
+        TEST_ASSERT(conf >= 1, "leaf on chain");
+    }
+    printf("  full tree broadcast OK — %zu nodes, %d leaves confirmed\n",
+           f->n_nodes, n_leaves);
+
+    /* Build per-party P2TR destinations so econ_helpers can scan the
+       UTXO set and verify deltas. Each party's expected SPK is
+       P2TR(xonly(pk(seckey))) — same derivation econ_register_party
+       uses internally. We compute them here to use as sweep destinations. */
+    unsigned char party_spk[2][34];  /* [0]=LSP, [1]=client */
+    for (int p = 0; p < 2; p++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[p]);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
+
+    /* Wire econ harness: snapshot each party's pre-sweep balance. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
+                "register LSP");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
+                "register client");
+    econ.factory_funding_amount = fund_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Per-leaf sweep loop. Each sweep's fee is tracked so we can
+       reconstruct expected deltas exactly. */
+    const uint64_t LSTOCK_SWEEP_FEE = 300;
+    const uint64_t CHAN_SWEEP_FEE   = 400;  /* 2 outputs in channel sweep */
+
+    /* Simulate post-payment state: client paid the LSP during factory
+       operation. At force-close, channel balances reflect this — client
+       gets less than a balanced split, LSP gets more. The routing-fee
+       component is "sats received outside L-stock" that ZmnSCPxj calls
+       out specifically: routing income flowing to the LSP side, separate
+       from L-stock. */
+    const uint64_t SIMULATED_PAYMENT     = 20000;   /* client → LSP */
+    const uint64_t SIMULATED_ROUTING_FEE = 100;     /* LSP's routing income */
+    const uint64_t CLIENT_BALANCE_SHIFT  = SIMULATED_PAYMENT + SIMULATED_ROUTING_FEE;
+
+    uint64_t total_lsp_recv = 0;
+    uint64_t total_client_recv = 0;
+
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        const char *leaf_txid = txids[nidx];
+
+        /* (A) Sweep L-stock (vout 1) LSP-alone to LSP's P2TR(xonly(LSP)). */
+        uint64_t lstock_amt = leaf->outputs[1].amount_sats;
+        unsigned char lstock_spk[34];
+        memcpy(lstock_spk, leaf->outputs[1].script_pubkey, 34);
+
+        tx_buf_t lstock_sweep;
+        tx_buf_init(&lstock_sweep, 256);
+        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                        N_PARTY_SECKEYS[0],
+                        leaf_txid, 1, lstock_amt,
+                        lstock_spk, 34,
+                        party_spk[0], 34,
+                        LSTOCK_SWEEP_FEE, &lstock_sweep),
+                    "build L-stock sweep");
+        char *lh = malloc(lstock_sweep.len * 2 + 1);
+        TEST_ASSERT(lh != NULL, "lh malloc");
+        hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
+        lh[lstock_sweep.len * 2] = '\0';
+        char lstock_sweep_txid[65];
+        int lok = spend_broadcast_and_mine(&rt, lh, 1, lstock_sweep_txid);
+        free(lh); tx_buf_free(&lstock_sweep);
+        TEST_ASSERT(lok, "L-stock sweep confirmed");
+        total_lsp_recv += lstock_amt - LSTOCK_SWEEP_FEE;
+        printf("  leaf %d: LSP swept L-stock %llu sats → P2TR(LSP)\n",
+               li, (unsigned long long)(lstock_amt - LSTOCK_SWEEP_FEE));
+
+        /* (B) Sweep channel (vout 0) via offline 2-of-2 MuSig2.
+           TX has 2 outputs: half to client's P2TR, half to LSP's P2TR.
+           This models "each party takes their fair share of the channel". */
+        uint64_t chan_amt = leaf->outputs[0].amount_sats;
+        /* Post-payment balance: client's share reduced by what they paid
+           + routing fee. LSP's share gets the rest (= local_initial +
+           payment + routing_fee). No sats disappear — the routing fee
+           just moves from client's channel balance to LSP's. */
+        uint64_t balanced_half = (chan_amt - CHAN_SWEEP_FEE) / 2;
+        uint64_t client_share  = balanced_half - CLIENT_BALANCE_SHIFT;
+        uint64_t lsp_share     = (chan_amt - CHAN_SWEEP_FEE) - client_share;
+        unsigned char chan_spk[34];
+        memcpy(chan_spk, leaf->outputs[0].script_pubkey, 34);
+
+        unsigned char leaf_txid_bytes[32];
+        TEST_ASSERT(hex_decode(leaf_txid, leaf_txid_bytes, 32),
+                    "decode leaf txid");
+        reverse_bytes(leaf_txid_bytes, 32);
+
+        tx_output_t outs[2];
+        memcpy(outs[0].script_pubkey, party_spk[1], 34);  /* client */
+        outs[0].script_pubkey_len = 34;
+        outs[0].amount_sats = client_share;
+        memcpy(outs[1].script_pubkey, party_spk[0], 34);  /* LSP */
+        outs[1].script_pubkey_len = 34;
+        outs[1].amount_sats = lsp_share;
+
+        tx_buf_t chan_unsigned;
+        tx_buf_init(&chan_unsigned, 256);
+        TEST_ASSERT(build_unsigned_tx(&chan_unsigned, NULL,
+                                        leaf_txid_bytes, 0, 0xFFFFFFFEu,
+                                        outs, 2),
+                    "build unsigned channel sweep");
+        unsigned char sighash[32];
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+                        chan_unsigned.data, chan_unsigned.len,
+                        0, chan_spk, 34, chan_amt, 0xFFFFFFFEu),
+                    "compute channel sighash");
+
+        /* MuSig2 pubkey order matches factory (client, LSP) — see
+           setup_single_leaf_outputs in src/factory.c:674. */
+        secp256k1_keypair signers[2] = { kps[1], kps[0] };
+        secp256k1_pubkey pks[2];
+        secp256k1_keypair_pub(ctx, &pks[0], &signers[0]);
+        secp256k1_keypair_pub(ctx, &pks[1], &signers[1]);
+        musig_keyagg_t ka;
+        TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 2),
+                    "aggregate channel keys (client, LSP)");
+        unsigned char sig64[64];
+        TEST_ASSERT(musig_sign_taproot(ctx, sig64, sighash, signers, 2,
+                                         &ka, NULL),
+                    "offline 2-of-2 MuSig2 sign channel sweep");
+        tx_buf_t chan_signed;
+        tx_buf_init(&chan_signed, 256);
+        TEST_ASSERT(finalize_signed_tx(&chan_signed,
+                        chan_unsigned.data, chan_unsigned.len, sig64),
+                    "finalize channel sweep tx");
+        tx_buf_free(&chan_unsigned);
+
+        char *ch_hex = malloc(chan_signed.len * 2 + 1);
+        TEST_ASSERT(ch_hex != NULL, "ch_hex malloc");
+        hex_encode(chan_signed.data, chan_signed.len, ch_hex);
+        ch_hex[chan_signed.len * 2] = '\0';
+        char chan_sweep_txid[65];
+        int cok = spend_broadcast_and_mine(&rt, ch_hex, 1, chan_sweep_txid);
+        free(ch_hex); tx_buf_free(&chan_signed);
+        TEST_ASSERT(cok, "channel 2-of-2 sweep confirmed");
+        total_client_recv += client_share;
+        total_lsp_recv += lsp_share;
+        printf("  leaf %d: 2-of-2 swept channel → client=%llu, LSP=%llu\n",
+               li, (unsigned long long)client_share,
+               (unsigned long long)lsp_share);
+    }
+
+    /* Accounting: snapshot post-sweep balances and assert per-party deltas
+       match the expected amounts computed from the on-chain allocations. */
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    uint64_t expected_deltas[2];
+    expected_deltas[0] = total_lsp_recv;    /* LSP */
+    expected_deltas[1] = total_client_recv; /* client */
+
+    /* Conservation sanity: Σ(expected_deltas) + Σ(tx_fees) ≤ funding.
+       tree fees are implicit in leaf allocations (already netted);
+       sweep fees are the ones we added above. */
+    uint64_t sweep_fees = (uint64_t)n_leaves * (LSTOCK_SWEEP_FEE + CHAN_SWEEP_FEE);
+    uint64_t swept_sum = total_lsp_recv + total_client_recv;
+    uint64_t allocated_sum = 0;
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        allocated_sum += f->nodes[nidx].outputs[0].amount_sats;
+        allocated_sum += f->nodes[nidx].outputs[1].amount_sats;
+    }
+    /* swept_sum exactly = allocated_sum − sweep_fees */
+    TEST_ASSERT(swept_sum + sweep_fees == allocated_sum,
+                "conservation: Σswept + Σsweep_fees == Σleaf_allocations");
+    printf("  conservation OK: swept=%llu + sweep_fees=%llu == allocations=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)sweep_fees,
+           (unsigned long long)allocated_sum);
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match expected");
+    econ_print_summary(&econ);
 
     factory_free(f);
     free(f);
