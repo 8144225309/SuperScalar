@@ -1599,6 +1599,7 @@ extern int test_factory_config_default(void);
 
 /* Pseudo-Spilman Leaves */
 extern int test_factory_ps_leaf_build(void);
+extern int test_factory_ps_leaf_build_n64(void);
 extern int test_factory_ps_leaf_advance(void);
 extern int test_factory_ps_amount_invariant(void);
 extern int test_factory_ps_dust_limit(void);
@@ -1697,6 +1698,7 @@ extern int test_conservation_balanced(void);
 extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
+extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -3328,6 +3330,7 @@ static void run_unit_tests(void) {
 
     printf("\n=== Pseudo-Spilman Leaves ===\n");
     RUN_TEST(test_factory_ps_leaf_build);
+    RUN_TEST(test_factory_ps_leaf_build_n64);
     RUN_TEST(test_factory_ps_leaf_advance);
     RUN_TEST(test_factory_ps_amount_invariant);
     RUN_TEST(test_factory_ps_dust_limit);
@@ -3426,6 +3429,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_violated);
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
+    RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
