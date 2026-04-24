@@ -4509,7 +4509,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Handle stdin CLI commands */
         if (stdin_slot >= 0 && (pfds[stdin_slot].revents & POLLIN)) {
-            char line[256];
+            /* 2048 is enough for any CLI command including a BOLT11
+               invoice (typically 300-700 chars) passed to pay_external.
+               Was 256, which silently truncated long invoices and caused
+               the tail of the BOLT11 to be re-read as a bogus next
+               command ('CLI: unknown command'). */
+            char line[2048];
             /* Use read() instead of fgets() — fgets permanently marks
                stdio EOF on FIFOs even when new writers connect later. */
             ssize_t nr = read(STDIN_FILENO, line, sizeof(line) - 1);

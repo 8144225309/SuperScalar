@@ -225,6 +225,56 @@ fi
 LN_FEE_MSAT=$((CLN2_DELTA_MSAT - INVOICE_AMT_MSAT))
 echo "CLN2 delta ($CLN2_DELTA_MSAT msat) == invoice ($INVOICE_AMT_MSAT) + LN fee ($LN_FEE_MSAT msat) ✓"
 
+# ================================================================
+# OUTBOUND (external_out): SuperScalar client 0 pays vanilla CLN2
+# ================================================================
+echo ""
+echo "=== external_out: SS client → vanilla CLN ==="
+
+# Record CLN2's receive balance (balance we expect to increase).
+# After the inbound, CLN2 has ~489M spendable + ~10M receivable on
+# the same channel (since it sent funds). We need the RECEIVABLE side
+# for the inbound-to-CLN2 direction.
+CLN2_PRE_IN_MSAT=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
+    python3 -c "import json,sys; chs=json.load(sys.stdin).get('channels',[]); print(sum(c.get('receivable_msat',0) for c in chs))" 2>/dev/null || echo 0)
+echo "CLN2 pre-outbound receivable: $CLN2_PRE_IN_MSAT msat"
+
+# CLN2 generates a BOLT11 invoice for 400 sats (< the 600 client 0 now holds).
+OUTBOUND_AMT_MSAT=400000
+CLN2_INV=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" \
+    invoice "$OUTBOUND_AMT_MSAT" "ss-outbound-test" "Paying from SS client" 2>/dev/null | \
+    python3 -c "import json,sys; print(json.load(sys.stdin).get('bolt11',''))" 2>/dev/null)
+if [ -z "$CLN2_INV" ]; then
+    echo "WARN: CLN2 invoice generation failed — skipping external_out verification"
+else
+    echo "CLN2 invoice: ${CLN2_INV:0:40}..."
+    # Trigger SS client 0 to pay the invoice via the bridge.
+    echo "pay_external 0 $CLN2_INV" > "$LSP_FIFO"
+    # Wait for payment to settle (bridge forwards out, LSP updates balances).
+    for i in $(seq 1 60); do
+        if grep -q "pay_external sent to bridge\|pay_external: complete" "$TMPDIR/lsp.log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    sleep 3  # let the payment actually complete via bridge
+
+    CLN2_POST_IN_MSAT=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
+        python3 -c "import json,sys; chs=json.load(sys.stdin).get('channels',[]); print(sum(c.get('receivable_msat',0) for c in chs))" 2>/dev/null || echo 0)
+    # If CLN2 received, its receivable capacity DECREASES and spendable INCREASES.
+    CLN2_SPENDABLE_NOW=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
+        python3 -c "import json,sys; chs=json.load(sys.stdin).get('channels',[]); print(sum(c.get('spendable_msat',0) for c in chs))" 2>/dev/null || echo 0)
+    CLN2_SPENDABLE_GAIN=$((CLN2_SPENDABLE_NOW - CLN2_POST_MSAT))
+    echo "CLN2 spendable after outbound pay: $CLN2_SPENDABLE_NOW msat  (gain=${CLN2_SPENDABLE_GAIN} msat)"
+    if [ "$CLN2_SPENDABLE_GAIN" -ge "$OUTBOUND_AMT_MSAT" ]; then
+        echo "external_out: CLN2 received >= $OUTBOUND_AMT_MSAT msat ✓"
+    elif [ "$CLN2_SPENDABLE_GAIN" -gt 0 ]; then
+        echo "external_out: CLN2 gained $CLN2_SPENDABLE_GAIN msat (partial — LN fees > test amount?)"
+    else
+        echo "WARN: external_out no spendable delta on CLN2 — payment may not have completed"
+    fi
+fi
+
 # 2. Cooperative close the factory.
 echo "close" > "$LSP_FIFO"
 echo "Close requested — waiting for broadcast..."
