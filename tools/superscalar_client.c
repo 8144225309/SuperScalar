@@ -3010,6 +3010,11 @@ int main(int argc, char *argv[]) {
 
         /* Wire message logging (Phase 22) */
         wire_set_log_callback(client_wire_log_cb, &db);
+
+        /* PS double-spend defense: client_handle_leaf_advance will
+           consult client_ps_signed_inputs and refuse to sign a second
+           TX spending the same parent UTXO. ZmnSCPxj §PS wide leaves. */
+        client_set_persist(&db);
     }
 
     signal(SIGINT, sigint_handler);

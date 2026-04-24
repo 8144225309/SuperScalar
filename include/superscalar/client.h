@@ -158,12 +158,26 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
 
 /* Handle a LEAF_ADVANCE_PROPOSE from the LSP (DW or PS leaf advance).
    Advances local leaf state, generates partial sig, sends LEAF_ADVANCE_PSIG,
-   waits for LEAF_ADVANCE_DONE. Returns 1 on success. */
+   waits for LEAF_ADVANCE_DONE. Returns 1 on success.
+
+   PS double-spend defense: if client_set_persist() has been called with
+   a non-NULL handle, the PS advance path consults client_ps_signed_inputs
+   before signing and REFUSES if this client has already co-signed a TX
+   spending the same (parent_txid, parent_vout). See ZmnSCPxj §"Pseudo-
+   Spilman wide leaves" — PS has no revocation, so the client's refusal
+   is the only thing preventing an LSP double-spend. When no persist is
+   set, the defense is skipped (tests / in-process usage only — real
+   clients must call client_set_persist at startup). */
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,
                                  uint32_t my_index,
                                  const wire_msg_t *propose_msg);
+
+/* Set (or clear) the persistence handle used for the PS double-spend
+   defense. Pass NULL to disable. Must be called before any PS advance
+   happens; safe to call once at startup. */
+void client_set_persist(persist_t *persist);
 
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
    If set (non-NULL), all future connections use Noise NK instead of NN.

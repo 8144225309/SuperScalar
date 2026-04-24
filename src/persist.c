@@ -810,6 +810,28 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v20 migration: client-side PS double-spend defense tracker.
+       Records every (parent_txid, parent_vout) pair a client has already
+       co-signed on a PS leaf, along with the sighash and partial sig.
+       The PROPOSE handler consults this table on every incoming PS advance:
+         - no row → fresh signing, store result
+         - row with matching sighash → idempotent retry, replay stored sig
+         - row with conflicting sighash → refuse (double-spend attempt) */
+    if (db_version < 20) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS client_ps_signed_inputs ("
+            "  factory_id INTEGER NOT NULL,"
+            "  leaf_node_idx INTEGER NOT NULL,"
+            "  parent_txid BLOB NOT NULL,"     /* 32 bytes, internal byte order */
+            "  parent_vout INTEGER NOT NULL,"
+            "  sighash BLOB NOT NULL,"         /* 32 bytes, BIP-341 sighash */
+            "  partial_sig BLOB NOT NULL,"     /* 36 bytes, musig partial sig */
+            "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+            "  PRIMARY KEY (factory_id, parent_txid, parent_vout)"
+            ");",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1084,6 +1106,66 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- Client-side PS double-spend defense (v20) --- */
+
+int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                    const unsigned char parent_txid[32],
+                                    uint32_t parent_vout,
+                                    unsigned char out_sighash[32])
+{
+    if (!p || !p->db || !parent_txid) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT sighash FROM client_ps_signed_inputs "
+        "WHERE factory_id = ? AND parent_txid = ? AND parent_vout = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_blob(stmt, 2, parent_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, (int)parent_vout);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;  /* not found — fresh parent, proceed to sign */
+    }
+
+    if (out_sighash) {
+        const void *stored_sighash_blob = sqlite3_column_blob(stmt, 0);
+        int stored_sighash_len = sqlite3_column_bytes(stmt, 0);
+        if (stored_sighash_len == 32)
+            memcpy(out_sighash, stored_sighash_blob, 32);
+        else
+            memset(out_sighash, 0, 32);
+    }
+    sqlite3_finalize(stmt);
+    return 1;  /* already signed — refuse */
+}
+
+int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                   int leaf_node_idx,
+                                   const unsigned char parent_txid[32],
+                                   uint32_t parent_vout,
+                                   const unsigned char sighash[32],
+                                   const unsigned char partial_sig[36])
+{
+    if (!p || !p->db || !parent_txid || !sighash || !partial_sig) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO client_ps_signed_inputs "
+        "(factory_id, leaf_node_idx, parent_txid, parent_vout, "
+        " sighash, partial_sig) VALUES (?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, leaf_node_idx);
+    sqlite3_bind_blob(stmt, 3, parent_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 4, (int)parent_vout);
+    sqlite3_bind_blob(stmt, 5, sighash, 32, SQLITE_STATIC);
+    sqlite3_bind_blob(stmt, 6, partial_sig, 36, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : 0;
 }
 
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
