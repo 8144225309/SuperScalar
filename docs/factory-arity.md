@@ -9,6 +9,11 @@ routed through the factory then refuse to accept forwards because the
 worst-case exit time exceeds what they consider safe. This doc explains
 the tradeoff and recommends shapes.
 
+**See also:** [docs/pseudo-spilman.md](pseudo-spilman.md) — design and
+non-revocability contract for PS (`FACTORY_ARITY_PS`) leaves: why they
+have no revocation keys, and how the `client_ps_signed_inputs` persist
+table prevents double-signing.
+
 ## The three arity types
 
 | Value | Meaning | Primary use |
