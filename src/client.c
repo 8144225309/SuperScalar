@@ -43,7 +43,14 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
 
 /* Client-side conservation invariant check (defense-in-depth).
    The commitment signature already prevents exploitation, but this catches
-   bugs in the balance arithmetic itself. */
+   bugs in the balance arithmetic itself.
+
+   Conservation: local + remote + Σ(htlc.amount + htlc.fee_at_add)
+                 == funding − base_commit_fee
+   The base commit-tx fee (154 vB × fee_rate) is deducted from the channel's
+   usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
+   so the invariant must account for it — otherwise the check trips by
+   exactly base_commit_fee on every balanced channel. */
 static void client_check_conservation(const channel_t *ch, const char *context) {
     if (!ch || ch->funding_amount == 0) return;
     uint64_t sum = ch->local_amount + ch->remote_amount;
@@ -53,17 +60,26 @@ static void client_check_conservation(const channel_t *ch, const char *context) 
             sum += ch->htlcs[h].fee_at_add;
         }
     }
-    if (sum != ch->funding_amount) {
+    /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
+       (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
+    uint64_t base_commit_fee =
+        (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+    uint64_t expected = ch->funding_amount > base_commit_fee
+                        ? ch->funding_amount - base_commit_fee : 0;
+    if (sum != expected) {
         fprintf(stderr, "CLIENT CONSERVATION VIOLATION (%s): "
                 "local=%llu remote=%llu htlc_sum=%llu total=%llu "
-                "funding=%llu (delta=%lld)\n",
+                "expected=%llu funding=%llu base_commit_fee=%llu "
+                "(delta=%lld)\n",
                 context,
                 (unsigned long long)ch->local_amount,
                 (unsigned long long)ch->remote_amount,
                 (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
                 (unsigned long long)sum,
+                (unsigned long long)expected,
                 (unsigned long long)ch->funding_amount,
-                (long long)(sum - ch->funding_amount));
+                (unsigned long long)base_commit_fee,
+                (long long)(sum - expected));
     }
 }
 
