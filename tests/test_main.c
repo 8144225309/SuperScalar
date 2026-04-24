@@ -1118,6 +1118,8 @@ extern int test_regtest_econ_rotation_arity1(void);
 extern int test_regtest_econ_rotation_arity2(void);
 extern int test_regtest_econ_rotation_arity_ps(void);
 extern int test_regtest_econ_buy_liquidity_arity2(void);
+extern int test_regtest_econ_jit_cooperative_close(void);
+extern int test_regtest_econ_ps_advance(void);
 extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
@@ -3608,6 +3610,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_econ_rotation_arity2);
     RUN_TEST(test_regtest_econ_rotation_arity_ps);
     RUN_TEST(test_regtest_econ_buy_liquidity_arity2);
+    RUN_TEST(test_regtest_econ_jit_cooperative_close);
+    RUN_TEST(test_regtest_econ_ps_advance);
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);

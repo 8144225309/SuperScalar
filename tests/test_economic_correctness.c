@@ -666,6 +666,343 @@ int test_regtest_econ_rotation_arity_ps(void) {
  * LSP output absorbs the L-stock decrease." The wire ceremony itself is
  * tested separately by the DW advance / realloc integration tests.
  * ================================================================ */
+/* ================================================================
+ * JIT channel recovery close econ (arity-independent).
+ *
+ * JIT channels are auxiliary 2-of-2 MuSig channels between the LSP and
+ * a single client — they exist outside the factory (hence "JIT",
+ * created on-demand when a factory channel is unavailable). A JIT
+ * cooperative close happens during rotation after PTLC turnover has
+ * already moved the client's funds out; the close sweeps the full
+ * remaining JIT funding to the LSP wallet.
+ *
+ * Economic formula for JIT coop close:
+ *   LSP output = JIT_funding − close_fee
+ *   (no client output — client's share already left via PTLC earlier)
+ *
+ * The same test covers arity 1, 2, and PS because the JIT channel
+ * structure is identical regardless of the associated factory.
+ * ================================================================ */
+/* ================================================================
+ * ps_advance econ (arity-PS only).
+ *
+ * Arity-PS factory leaves use a chain of pre-signed TXs; each advance
+ * produces a new state node whose output preserves the channel amount
+ * minus per-advance fee. PR #67 established:
+ *   chain[n+1].channel_output = chain[n].channel_output − fee_per_tx
+ *
+ * This test exercises the advance on an in-process factory:
+ *   1. Build arity-PS factory, lsp_channels_init.
+ *   2. Record initial channel amounts.
+ *   3. factory_advance_leaf(leaf=0) to produce chain[1].
+ *   4. Close cooperatively.
+ *   5. Assert the post-advance close outputs reflect the new channel
+ *      amount (=initial - fee_per_tx).
+ *
+ * Note: in-process factory_advance_leaf does the full MuSig round,
+ * and works because we hold all keypairs. No wire traffic needed.
+ * ================================================================ */
+int test_regtest_econ_ps_advance(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_ps_adv");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* PS requires N ≥ 3 (1 LSP + 2+ clients) per earlier test pattern. */
+    const size_t N = 5;
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey  pks[5];
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_keypair_create(ctx, &kps[i], ECON_SECKEYS[i]);
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(&rt, tpx_ser, fund_addr, sizeof(fund_addr)))
+        return 0;
+    char fund_txid[65];
+    if (!regtest_fund_address(&rt, fund_addr, 0.005, fund_txid)) return 0;
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    uint32_t fund_vout = UINT32_MAX; uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(&rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "locate vout");
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, N, 2, 4);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    unsigned char tb[32];
+    hex_decode(fund_txid, tb, 32);
+    reverse_bytes(tb, 32);
+    factory_set_funding(f, tb, fund_vout, fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    /* Init channel manager BEFORE advance — lsp_channels_init reads the
+       initial tree state. The advance changes tree node amounts but does
+       NOT mutate the channel balances in mgr. */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.lsp_balance_pct = 50;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, ECON_SECKEYS[0], N - 1),
+                "init mgr before advance");
+
+    /* Record leaf 0's channel_output amount BEFORE advance. */
+    size_t leaf0_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf0 = &f->nodes[leaf0_idx];
+    uint64_t pre_channel_amt = leaf0->outputs[0].amount_sats;
+    uint64_t fee_per_tx = f->fee_per_tx;
+    printf("  [PS advance] pre-advance: leaf[0] channel_out=%llu sats, fee_per_tx=%llu\n",
+           (unsigned long long)pre_channel_amt, (unsigned long long)fee_per_tx);
+
+    /* Advance leaf 0 once. This is the in-process MuSig-N round; returns
+       >0 on success. */
+    int adv_rc = factory_advance_leaf(f, 0);
+    TEST_ASSERT(adv_rc > 0, "factory_advance_leaf(0) should succeed (>0)");
+    printf("  [PS advance] factory_advance_leaf(0) returned %d\n", adv_rc);
+
+    /* Verify the PS chain invariant: chain[1].channel_output = chain[0] - fee. */
+    uint64_t post_channel_amt = leaf0->outputs[0].amount_sats;
+    printf("  [PS advance] post-advance: leaf[0] channel_out=%llu sats\n",
+           (unsigned long long)post_channel_amt);
+    TEST_ASSERT(post_channel_amt == pre_channel_amt - fee_per_tx,
+                "PS chain invariant: post_channel == pre_channel - fee_per_tx");
+    printf("  [PS advance] chain invariant verified: %llu - %llu = %llu ✓\n",
+           (unsigned long long)pre_channel_amt,
+           (unsigned long long)fee_per_tx,
+           (unsigned long long)post_channel_amt);
+
+    uint64_t close_fee = 500;
+    tx_output_t outs[FACTORY_MAX_SIGNERS];
+    size_t n_outs = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee, NULL, 0);
+    TEST_ASSERT(n_outs > 0, "build close outputs");
+
+    econ_ctx_t ectx;
+    econ_ctx_init(&ectx, &rt, ctx);
+    for (size_t i = 0; i < N; i++)
+        econ_register_party(&ectx, i, ECON_NAMES[i], ECON_SECKEYS[i]);
+
+    uint64_t expected[5] = {0};
+    for (size_t i = 0; i < n_outs && i < N; i++) expected[i] = outs[i].amount_sats;
+
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    build_unsigned_tx(&uc, NULL, f->funding_txid, f->funding_vout,
+                       0xFFFFFFFEu, outs, n_outs);
+    unsigned char sh[32];
+    compute_taproot_sighash(sh, uc.data, uc.len, 0, fund_spk, 34,
+                             fund_amount, 0xFFFFFFFEu);
+    unsigned char sig[64];
+    TEST_ASSERT(musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL), "sign close");
+
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    finalize_signed_tx(&sc, uc.data, uc.len, sig);
+    tx_buf_free(&uc);
+    char hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, hex); hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, hex, close_txid), "broadcast close");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, close_txid) >= 1, "close confirmed");
+    tx_buf_free(&sc);
+    printf("  [PS advance] coop close confirmed: %s\n", close_txid);
+
+    econ_snap_pre(&ectx);
+    TEST_ASSERT(econ_assert_close_amounts(&ectx, close_txid, close_fee,
+                                            fund_amount, expected),
+                "close amounts match formula");
+    TEST_ASSERT(spend_coop_close_gauntlet(ctx, &rt, close_txid, ECON_SECKEYS, N - 1),
+                "gauntlet");
+    econ_snap_post(&ectx);
+    econ_print_summary(&ectx);
+
+    free(f);
+    lsp_channels_cleanup(&mgr);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_regtest_econ_jit_cooperative_close(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_jit");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* JIT is a 2-party MuSig channel: LSP + one client. */
+    secp256k1_keypair lsp_kp, cli_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, ECON_SECKEYS[0]);
+    secp256k1_keypair_create(ctx, &cli_kp, ECON_SECKEYS[1]);
+    secp256k1_pubkey lsp_pk, cli_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &lsp_kp);
+    secp256k1_keypair_pub(ctx, &cli_pk, &cli_kp);
+
+    /* 2-of-2 MuSig + BIP-341 taptweak — the JIT funding SPK. */
+    secp256k1_pubkey pks2[2] = { lsp_pk, cli_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks2, 2);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char jit_spk[34];
+    build_p2tr_script_pubkey(jit_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    /* Fund the JIT UTXO on regtest. */
+    char jit_addr[128];
+    TEST_ASSERT(regtest_derive_p2tr_address(&rt, tpx_ser, jit_addr, sizeof(jit_addr)),
+                "derive JIT addr");
+    char jit_txid[65];
+    uint64_t jit_funding_btc = 100000;  /* 100k sats */
+    TEST_ASSERT(regtest_fund_address(&rt, jit_addr, (double)jit_funding_btc/1e8, jit_txid),
+                "fund JIT");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    uint32_t jit_vout = UINT32_MAX; uint64_t jit_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(&rt, jit_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, jit_spk, 34) == 0) {
+            jit_vout = v; jit_amount = a; break;
+        }
+    }
+    TEST_ASSERT(jit_vout != UINT32_MAX, "locate JIT vout");
+    printf("  [JIT coop] funded %s:%u  %llu sats\n",
+           jit_txid, jit_vout, (unsigned long long)jit_amount);
+
+    /* LSP gets a fresh wallet address for the recovery output. In the
+       production flow, this is mgr->lsp_close_spk (from PR #68) — here
+       we use P2TR(xonly(lsp_pk)) directly, which is the same thing. */
+    secp256k1_xonly_pubkey lsp_xonly;
+    secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &lsp_kp);
+    unsigned char lsp_close_spk[34];
+    build_p2tr_script_pubkey(lsp_close_spk, &lsp_xonly);
+
+    /* Economic formula: single output = funding − fee, to LSP. */
+    uint64_t close_fee = 500;
+    tx_output_t out;
+    out.script_pubkey_len = 34;
+    memcpy(out.script_pubkey, lsp_close_spk, 34);
+    out.amount_sats = jit_amount - close_fee;
+
+    unsigned char txid_bytes[32];
+    hex_decode(jit_txid, txid_bytes, 32);
+    reverse_bytes(txid_bytes, 32);
+
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    TEST_ASSERT(build_unsigned_tx(&uc, NULL, txid_bytes, jit_vout,
+                                    0xFFFFFFFEu, &out, 1),
+                "build unsigned JIT close");
+    unsigned char sh[32];
+    TEST_ASSERT(compute_taproot_sighash(sh, uc.data, uc.len, 0, jit_spk, 34,
+                                         jit_amount, 0xFFFFFFFEu),
+                "sighash");
+
+    /* 2-party MuSig2 ceremony offline — we hold both keys. */
+    secp256k1_keypair kps[2] = { lsp_kp, cli_kp };
+    unsigned char sig[64];
+    TEST_ASSERT(musig_sign_taproot(ctx, sig, sh, kps, 2, &ka, NULL),
+                "musig sign (2-party)");
+
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    TEST_ASSERT(finalize_signed_tx(&sc, uc.data, uc.len, sig),
+                "finalize JIT close");
+    tx_buf_free(&uc);
+
+    char hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, hex); hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, hex, close_txid),
+                "broadcast JIT close");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, close_txid) >= 1,
+                "JIT close confirmed");
+    tx_buf_free(&sc);
+    printf("  [JIT coop] close confirmed: %s\n", close_txid);
+
+    /* Verify on-chain amount. */
+    uint64_t onchain = 0;
+    unsigned char spk[64]; size_t sl = 0;
+    TEST_ASSERT(regtest_get_tx_output(&rt, close_txid, 0, &onchain, spk, &sl),
+                "read close output");
+    TEST_ASSERT(sl == 34 && memcmp(spk, lsp_close_spk, 34) == 0,
+                "close output SPK is LSP P2TR");
+    TEST_ASSERT(onchain == jit_amount - close_fee,
+                "close amount == funding - fee");
+    printf("  [JIT coop] LSP recovered %llu sats (= %llu funding - %llu fee) ✓\n",
+           (unsigned long long)onchain,
+           (unsigned long long)jit_amount,
+           (unsigned long long)close_fee);
+
+    /* Gauntlet: LSP sweeps the output using its own seckey. */
+    char dest_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, dest_addr, sizeof(dest_addr)),
+                "dest");
+    unsigned char dest_spk[64]; size_t dest_spk_len = 0;
+    TEST_ASSERT(regtest_get_address_scriptpubkey(&rt, dest_addr, dest_spk, &dest_spk_len),
+                "dest spk");
+    tx_buf_t sweep;
+    TEST_ASSERT(spend_build_p2tr_raw_keypath(ctx, ECON_SECKEYS[0],
+                                                close_txid, 0, onchain,
+                                                lsp_close_spk, 34,
+                                                dest_spk, dest_spk_len,
+                                                500, &sweep),
+                "build LSP JIT-recovery sweep");
+    char sweep_hex[sweep.len * 2 + 1];
+    hex_encode(sweep.data, sweep.len, sweep_hex); sweep_hex[sweep.len * 2] = '\0';
+    char sweep_txid[65];
+    int ok = spend_broadcast_and_mine(&rt, sweep_hex, 1, sweep_txid);
+    tx_buf_free(&sweep);
+    TEST_ASSERT(ok, "LSP sweeps JIT close output");
+    printf("  [JIT coop] LSP swept %llu sats via %s ✓\n",
+           (unsigned long long)(onchain - 500), sweep_txid);
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 int test_regtest_econ_buy_liquidity_arity2(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
