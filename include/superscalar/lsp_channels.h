@@ -200,6 +200,14 @@ typedef struct {
         int valid;
     } pending_reconnects[8];
     size_t n_pending_reconnects;
+
+    /* P2TR scriptPubKey for the LSP's cooperative-close output.
+       Symmetric with per-entry close_spk (each client's own P2TR). Derived
+       from factory->pubkeys[0] at init so that the LSP alone can spend its
+       recovered share (L-stock + sum(local_amounts) + accumulated_fees)
+       with its own seckey, instead of the N-of-N factory funding SPK. */
+    unsigned char lsp_close_spk[34];
+    size_t lsp_close_spk_len;       /* 34 when populated, 0 if unset */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

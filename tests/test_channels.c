@@ -3622,8 +3622,114 @@ int test_close_outputs_wallet_spk(void) {
     TEST_ASSERT(memcmp(outputs[2].script_pubkey, wallet_spk, 34) == 0,
                 "override+per-client: client 1 uses override (rotation mode)");
 
+    /* Test 5: Production path — mgr->lsp_close_spk populated (P2TR of LSP
+       pubkey) plus per-client close_spks. LSP output must use its own SPK,
+       NOT the N-of-N factory funding SPK. Clients keep their own SPKs. */
+    unsigned char lsp_spk[34];
+    memset(lsp_spk, 0xD0, 34);
+    memcpy(mgr.lsp_close_spk, lsp_spk, 34);
+    mgr.lsp_close_spk_len = 34;
+
+    n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
+                                           NULL, 0);
+    TEST_ASSERT_EQ(n, 3, "lsp_close_spk: 3 outputs");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, lsp_spk, 34) == 0,
+                "lsp_close_spk: LSP uses its own SPK (not factory SPK)");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, expected_factory_spk, 34) != 0,
+                "lsp_close_spk: LSP SPK differs from factory funding SPK");
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, client0_spk, 34) == 0,
+                "lsp_close_spk: client 0 still uses its own close address");
+    TEST_ASSERT(memcmp(outputs[2].script_pubkey, client1_spk, 34) == 0,
+                "lsp_close_spk: client 1 still uses its own close address");
+
+    /* Test 6: Rotation override still wins over lsp_close_spk (recycling) */
+    n = lsp_channels_build_close_outputs(&mgr, f, outputs, close_fee,
+                                           wallet_spk, 34);
+    TEST_ASSERT_EQ(n, 3, "override beats lsp_close_spk: 3 outputs");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, wallet_spk, 34) == 0,
+                "override beats lsp_close_spk: LSP uses override");
+    TEST_ASSERT(memcmp(outputs[1].script_pubkey, wallet_spk, 34) == 0,
+                "override beats lsp_close_spk: client 0 uses override");
+
     free(mgr.entries);
     free(f);
+    return 1;
+}
+
+/* ---- Test: mgr->lsp_close_spk derived symmetric with client close_spk ---- */
+
+int test_lsp_close_spk_derived(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+
+    /* Build the N-of-N funding SPK the factory uses. */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xEE;
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+
+    /* Expected LSP close SPK = P2TR(xonly(pubkeys[0])) — LSP-alone spendable. */
+    secp256k1_xonly_pubkey lsp_xonly_expected;
+    TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly_expected, NULL, &pks[0]),
+                "derive LSP xonly");
+    unsigned char expected_lsp_spk[34];
+    build_p2tr_script_pubkey(expected_lsp_spk, &lsp_xonly_expected);
+
+    /* Init mgr — this is what should populate lsp_close_spk. */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, seckeys[0], 4),
+                "lsp_channels_init");
+
+    TEST_ASSERT_EQ(mgr.lsp_close_spk_len, 34, "lsp_close_spk populated");
+    TEST_ASSERT(memcmp(mgr.lsp_close_spk, expected_lsp_spk, 34) == 0,
+                "mgr.lsp_close_spk == P2TR(xonly(factory.pubkeys[0]))");
+    TEST_ASSERT(memcmp(mgr.lsp_close_spk, fund_spk, 34) != 0,
+                "mgr.lsp_close_spk differs from factory funding SPK (N-of-N MuSig)");
+
+    /* build_close_outputs with NULL override must put outputs[0] at lsp_close_spk. */
+    tx_output_t outputs[6];
+    memset(outputs, 0, sizeof(outputs));
+    /* Give clients a little remote_amount so outputs[1..] are non-dust. */
+    for (size_t c = 0; c < 4; c++)
+        mgr.entries[c].channel.remote_amount = 2000;
+    /* Make funding_amount big enough to cover sum(remotes) + close_fee + LSP residual. */
+    f->funding_amount_sats = 100000;
+
+    size_t n = lsp_channels_build_close_outputs(&mgr, f, outputs, 500, NULL, 0);
+    TEST_ASSERT_EQ(n, 5, "build_close_outputs: 1 LSP + 4 clients");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, mgr.lsp_close_spk, 34) == 0,
+                "cooperative close: LSP output uses mgr.lsp_close_spk");
+    TEST_ASSERT(memcmp(outputs[0].script_pubkey, fund_spk, 34) != 0,
+                "cooperative close: LSP output is NOT factory funding SPK");
+
+    lsp_channels_cleanup(&mgr);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 

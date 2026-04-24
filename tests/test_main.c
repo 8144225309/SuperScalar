@@ -1510,6 +1510,7 @@ extern int test_profit_settlement_calculation(void);
 extern int test_settlement_trigger_at_interval(void);
 extern int test_on_close_includes_unsettled(void);
 extern int test_close_outputs_wallet_spk(void);
+extern int test_lsp_close_spk_derived(void);
 extern int test_fee_accumulation_and_settlement(void);
 extern int test_fee_levels_and_profit_split(void);
 extern int test_client_rejects_bad_profit_terms(void);
@@ -3238,6 +3239,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_settlement_trigger_at_interval);
     RUN_TEST(test_on_close_includes_unsettled);
     RUN_TEST(test_close_outputs_wallet_spk);
+    RUN_TEST(test_lsp_close_spk_derived);
     RUN_TEST(test_fee_accumulation_and_settlement);
     RUN_TEST(test_fee_levels_and_profit_split);
     RUN_TEST(test_client_rejects_bad_profit_terms);
