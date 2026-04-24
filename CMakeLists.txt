@@ -255,6 +255,8 @@ add_executable(test_superscalar
     tests/test_channels.c
     tests/spend_helpers.c
     tests/test_close_spendability_full.c
+    tests/econ_helpers.c
+    tests/test_economic_correctness.c
     tests/test_persist.c
     tests/test_bridge.c
     tests/test_daemon.c
