@@ -1596,3 +1596,156 @@ int test_regtest_inversion_of_timeout_default(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Old-state poisoning via DW nSequence decrement (invariant #2).
+ *
+ * Decker-Wattenhofer state ordering works because newer states are signed
+ * with STRICTLY SMALLER nSequence (CSV delay) than older states. After a
+ * factory_advance(), the same tree node is re-signed with a smaller
+ * nSequence; the previously-signed TX (which still exists if the caller
+ * captured it) remains broadcast-valid only until enough blocks pass.
+ *
+ * The invariant this test proves on chain: if the LSP captures an OLD
+ * state TX and tries to broadcast it after a newer state exists, the
+ * old TX is rejected (non-BIP68-final) at a block height where the newer
+ * state is already valid. A vigilant defender can always beat the LSP
+ * to confirmation using the newer (smaller-nSequence) TX.
+ *
+ * Design reference: ZmnSCPxj's "old-state poisoning" in the Delving post.
+ * Our implementation relies on DW decrementing nSequence rather than an
+ * explicit pre-signed poison TX, but the safety property is the same:
+ * broadcasting stale state is economically hopeless because miners enforce
+ * BIP-68 on sequence numbers. */
+int test_regtest_old_state_poisoning(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "old_state_poison");
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 5;
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { secp256k1_context_destroy(ctx); return 0; }
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(&rt, ctx, N, FACTORY_ARITY_2, mine_addr, kps, f,
+                               fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    printf("  factory funded: %llu sats, %zu nodes\n",
+           (unsigned long long)fund_amount, f->n_nodes);
+
+    /* Pick a leaf state node — it has the largest decrementable nSequence
+       and its parent (kickoff) is broadcastable independently. Tree layout
+       for arity-2 / 5 participants / step=2 / states=4:
+         0 = kickoff_root (nseq=0xFFFFFFFE, spends funding)
+         1 = state_root   (nseq=6, spends kickoff_root)
+         2 = kickoff_left (nseq=0xFFFFFFFE, spends state_root vout 0)
+         3 = state_left (leaf, nseq=6, spends kickoff_left vout 0)
+         ...
+       The PARENT we broadcast is kickoff_root (node 0). The STATE whose
+       nSequence we'll race is state_root (node 1). */
+    size_t kickoff_idx = 0;
+    size_t state_idx = 1;
+    TEST_ASSERT(state_idx < f->n_nodes, "state node exists");
+
+    /* Capture OLD state's signed TX (before advance). */
+    factory_node_t *state_node = &f->nodes[state_idx];
+    TEST_ASSERT(state_node->is_signed && state_node->signed_tx.len > 0,
+                "state node signed pre-advance");
+    uint32_t old_nseq = state_node->nsequence;
+    size_t old_len = state_node->signed_tx.len;
+    unsigned char *old_signed = malloc(old_len);
+    TEST_ASSERT(old_signed != NULL, "old_signed malloc");
+    memcpy(old_signed, state_node->signed_tx.data, old_len);
+    printf("  pre-advance state nSequence = %u\n", old_nseq);
+
+    /* Advance the factory → global counter decrements → state's nSequence
+       drops. factory_advance re-signs all nodes; the new signed_tx now
+       holds the post-advance version. */
+    TEST_ASSERT(factory_advance(f), "factory_advance");
+
+    uint32_t new_nseq = state_node->nsequence;
+    size_t new_len = state_node->signed_tx.len;
+    unsigned char *new_signed = malloc(new_len);
+    TEST_ASSERT(new_signed != NULL, "new_signed malloc");
+    memcpy(new_signed, state_node->signed_tx.data, new_len);
+    printf("  post-advance state nSequence = %u\n", new_nseq);
+
+    /* Structural invariant: new nSequence strictly less than old. */
+    TEST_ASSERT(new_nseq < old_nseq, "new nSequence < old nSequence");
+    TEST_ASSERT(old_nseq < 0x80000000u, "old nseq is a BIP-68 relative-time delay");
+    TEST_ASSERT(new_nseq < 0x80000000u, "new nseq is a BIP-68 relative-time delay");
+
+    /* Broadcast the kickoff (parent). No BIP-68 constraint on kickoff (it
+       spends the factory funding UTXO which has ≥1 confirmation). */
+    char *kickoff_hex = malloc(f->nodes[kickoff_idx].signed_tx.len * 2 + 1);
+    TEST_ASSERT(kickoff_hex != NULL, "kickoff_hex malloc");
+    hex_encode(f->nodes[kickoff_idx].signed_tx.data,
+               f->nodes[kickoff_idx].signed_tx.len, kickoff_hex);
+    kickoff_hex[f->nodes[kickoff_idx].signed_tx.len * 2] = '\0';
+    char kickoff_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, kickoff_hex, kickoff_txid),
+                "kickoff broadcast");
+    free(kickoff_hex);
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    printf("  kickoff confirmed: %.16s...\n", kickoff_txid);
+
+    /* Mine exactly enough blocks to satisfy NEW state's CSV but NOT old
+       state's. BIP-68 relative depth: child valid when (confirmations of
+       parent) >= nSequence. We already mined 1 block (the kickoff
+       confirmation). Mine (new_nseq - 1) more → confirmations = new_nseq
+       exactly, which satisfies >= new_nseq but fails >= old_nseq (since
+       new_nseq < old_nseq). */
+    if (new_nseq > 1)
+        regtest_mine_blocks(&rt, (int)(new_nseq - 1), mine_addr);
+    printf("  mined to kickoff+%u confirmations (new=%u passes, old=%u fails)\n",
+           new_nseq, new_nseq, old_nseq);
+
+    /* Attempt (A): broadcast OLD state → expect BIP-68 rejection. */
+    char *old_hex = malloc(old_len * 2 + 1);
+    TEST_ASSERT(old_hex != NULL, "old_hex malloc");
+    hex_encode(old_signed, old_len, old_hex);
+    old_hex[old_len * 2] = '\0';
+    char old_txid[65];
+    int old_ok = regtest_send_raw_tx(&rt, old_hex, old_txid);
+    free(old_hex);
+    TEST_ASSERT(!old_ok,
+                "old state broadcast REJECTED (BIP-68 not satisfied)");
+    printf("  ✓ old state broadcast correctly rejected (non-BIP68-final)\n");
+
+    /* Attempt (B): broadcast NEW state → expect acceptance. */
+    char *new_hex = malloc(new_len * 2 + 1);
+    TEST_ASSERT(new_hex != NULL, "new_hex malloc");
+    hex_encode(new_signed, new_len, new_hex);
+    new_hex[new_len * 2] = '\0';
+    char new_txid[65];
+    int new_ok = regtest_send_raw_tx(&rt, new_hex, new_txid);
+    free(new_hex);
+    TEST_ASSERT(new_ok, "new state broadcast accepted");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, new_txid) >= 1,
+                "new state confirmed on chain");
+    printf("  ✓ new state (smaller nSequence) confirmed: %.16s...\n", new_txid);
+    printf("  invariant holds: DW nSequence decrement beats stale state ✓\n");
+
+    free(old_signed);
+    free(new_signed);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
