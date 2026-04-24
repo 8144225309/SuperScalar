@@ -3727,7 +3727,9 @@ int test_lsp_close_spk_derived(void) {
                 "cooperative close: LSP output is NOT factory funding SPK");
 
     lsp_channels_cleanup(&mgr);
+    factory_free(f);
     free(f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
