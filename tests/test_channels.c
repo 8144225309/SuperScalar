@@ -3952,7 +3952,10 @@ int test_conservation_with_real_htlc(void) {
 
     channel_t *ch = &mgr.entries[0].channel;
     ch->funding_amount = 100000;
-    ch->local_amount = 50000;
+    /* Conservation invariant is local+remote+Σhtlc == funding - base_commit_fee.
+       base_commit_fee at 1 sat/vB is 154 sats (154 vB * 1000/1000 rounded up),
+       which lsp_channels_init deducts from the funder side before splitting. */
+    ch->local_amount = 49846;
     ch->remote_amount = 50000;
     ch->fee_rate_sat_per_kvb = 1000;  /* 1 sat/vB */
     ch->funder_is_local = 1;
@@ -3982,8 +3985,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
                 "conservation OK during in-flight HTLC");
 
-    /* Verify exact balance: local = 50000 - 10000 (htlc) - 43 (fee) = 39957 */
-    TEST_ASSERT(ch->local_amount == 50000 - 10000 - expected_fee,
+    /* Verify exact balance: local = 49846 - 10000 (htlc) - 43 (fee) = 39803 */
+    TEST_ASSERT(ch->local_amount == 49846 - 10000 - expected_fee,
                 "local balance correct after add");
     TEST_ASSERT(ch->remote_amount == 50000,
                 "remote balance unchanged");
@@ -3997,7 +4000,7 @@ int test_conservation_with_real_htlc(void) {
     sha256(preimage, 32, hash);
     /* Re-add with correct hash */
     ch->n_htlcs = 0;
-    ch->local_amount = 50000;
+    ch->local_amount = 49846;
     ch->remote_amount = 50000;
     ch->commitment_number = 0;
     TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
@@ -4005,8 +4008,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(channel_fulfill_htlc(ch, htlc_id, preimage) == 1,
                 "fulfill HTLC succeeds");
 
-    /* After fulfill: local = 50000 - 10000 - 43 + 43 = 40000, remote = 50000 + 10000 = 60000 */
-    TEST_ASSERT(ch->local_amount == 40000,
+    /* After fulfill: local = 49846 - 10000 - 43 + 43 = 39846, remote = 50000 + 10000 = 60000 */
+    TEST_ASSERT(ch->local_amount == 39846,
                 "local balance correct after fulfill");
     TEST_ASSERT(ch->remote_amount == 60000,
                 "remote balance correct after fulfill");
