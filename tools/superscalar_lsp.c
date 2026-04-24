@@ -1260,7 +1260,14 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc) {
             const char *arity_str = argv[++i];
-            /* Comma-separated: --arity 1,1,2,2  or single: --arity 2 */
+            /* Comma-separated: --arity 2,4,8 for per-level mixed arity, or
+               single: --arity 2 for uniform. Per ZmnSCPxj's SuperScalar
+               design (Delving t/1242 §"Graduated arity"), mixed shapes with
+               low arity at leaves and higher arity toward the root are
+               safer at scale: uniform arity-2 with 127 clients and mainnet
+               step_blocks=144 stacks ~3024 blocks of BIP-68 CSV along the
+               exit path, exceeding BOLT's 2016-block final_cltv_expiry
+               ceiling. See docs/factory-arity.md for recommended shapes. */
             if (strchr(arity_str, ',')) {
                 char buf[128];
                 strncpy(buf, arity_str, sizeof(buf) - 1);
@@ -1268,7 +1275,14 @@ int main(int argc, char *argv[]) {
                 char *tok = strtok(buf, ",");
                 while (tok && n_level_arity < FACTORY_MAX_LEVELS) {
                     int v = atoi(tok);
-                    if (v != 1 && v != 2) { fprintf(stderr, "Error: each arity must be 1 or 2\n"); return 1; }
+                    /* 1 = single-client DW leaf, 2 = two-client DW leaf,
+                       3 = pseudo-Spilman chained leaf, >= 4 = wide fan-out
+                       for interior/root levels. Capped at 16 to keep MuSig
+                       cohorts manageable. */
+                    if (v < 1 || v > 16) {
+                        fprintf(stderr, "Error: each arity must be in [1, 16]\n");
+                        return 1;
+                    }
                     level_arities[n_level_arity++] = (uint8_t)v;
                     tok = strtok(NULL, ",");
                 }
