@@ -303,16 +303,52 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
-/* Helper: receive next non-revocation message, consuming any
-   MSG_LSP_REVOKE_AND_ACK (0x50) along the way.  The LSP sends
-   bidirectional revocations at 9 sites; test clients don't track
-   watchtower state, so we simply skip them. */
-static int recv_skip_revocations(int fd, wire_msg_t *out) {
+/* Helper: receive next non-bookkeeping message.
+   Transparently consumes:
+     - MSG_LSP_REVOKE_AND_ACK (0x50): bidirectional revocations, 9 sites per payment.
+     - MSG_LEAF_ADVANCE_PROPOSE (0x58) + MSG_LEAF_ADVANCE_DONE (0x5A): the
+       post-HTLC-fulfill per-leaf advance ceremony that FACTORY_ARITY_1 and
+       FACTORY_ARITY_PS trigger in lsp_channels.c:2259. The client must
+       participate (send LEAF_ADVANCE_PSIG) or the LSP hangs waiting.
+       We delegate to client_handle_leaf_advance which handles the full
+       PROPOSE → PSIG → DONE sub-ceremony.
+   Returns 1 on success with out populated with the next payment-flow msg. */
+static int recv_skip_revocations_ex(int fd, wire_msg_t *out,
+                                      secp256k1_context *ctx,
+                                      const secp256k1_keypair *keypair,
+                                      factory_t *factory,
+                                      uint32_t my_index) {
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
-        if (out->msg_type != 0x50) return 1;  /* MSG_LSP_REVOKE_AND_ACK */
-        cJSON_Delete(out->json);
+        if (out->msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
+            cJSON_Delete(out->json);
+            continue;
+        }
+        if (out->msg_type == 0x58) {  /* MSG_LEAF_ADVANCE_PROPOSE */
+            /* Handle the leaf advance in-line. client_handle_leaf_advance
+               consumes PROPOSE, sends PSIG, waits for DONE. */
+            if (ctx && keypair && factory) {
+                if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                  my_index, out)) {
+                    cJSON_Delete(out->json);
+                    return 0;
+                }
+            }
+            cJSON_Delete(out->json);
+            continue;
+        }
+        if (out->msg_type == 0x5A) {  /* MSG_LEAF_ADVANCE_DONE — stray */
+            cJSON_Delete(out->json);
+            continue;
+        }
+        return 1;
     }
+}
+/* Back-compat wrapper: callers without ctx/keypair/factory fall through
+   to the old revocation-only behavior. Leaf-advance will then be
+   unhandled (original pre-fix behavior). */
+static int recv_skip_revocations(int fd, wire_msg_t *out) {
+    return recv_skip_revocations_ex(fd, out, NULL, NULL, NULL, 0);
 }
 
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -339,7 +375,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for COMMITMENT_SIGNED (acknowledging HTLC) */
             wire_msg_t msg;
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv failed after send\n", my_index);
                 return 0;
             }
@@ -354,7 +390,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Wait for FULFILL_HTLC */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
             }
@@ -376,7 +412,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -392,7 +428,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for ADD_HTLC from LSP */
             wire_msg_t msg;
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv ADD_HTLC failed\n", my_index);
                 return 0;
             }
@@ -407,7 +443,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit failed\n", my_index);
                 return 0;
             }
@@ -439,7 +475,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             client_fulfill_payment(fd, ch, htlc_id, act->preimage);
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations(fd, &msg)) {
+            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -448,6 +484,50 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
+            }
+        }
+
+        /* Drain any pending LEAF_ADVANCE_PROPOSE that the LSP sent for this
+           client after the HTLC fulfill committed (src/lsp_channels.c:2259 —
+           FACTORY_ARITY_1 and FACTORY_ARITY_PS trigger a per-leaf MuSig
+           advance after every fulfill). Without this, the next action's
+           ADD_HTLC races the LSP's advance ceremony and the LSP drops our
+           ADD_HTLC with 'expected LEAF_ADVANCE_PSIG from client N, got 0x31'.
+
+           Only drain BETWEEN actions, not after the last action — otherwise
+           we'd consume MSG_CLOSE_PROPOSE or similar post-payment traffic the
+           caller expects. */
+        if (i + 1 < data->n_actions) {
+            wire_msg_t drain_msg;
+            while (1) {
+                wire_set_timeout(fd, 2);
+                int got = wire_recv(fd, &drain_msg);
+                wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+                if (!got) break;  /* timeout / no more drainable messages */
+                if (drain_msg.msg_type == 0x58) {  /* LEAF_ADVANCE_PROPOSE */
+                    if (ctx && keypair && factory &&
+                        !client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                       my_index, &drain_msg)) {
+                        cJSON_Delete(drain_msg.json);
+                        fprintf(stderr, "Client %u: leaf_advance drain failed\n",
+                                my_index);
+                        return 0;
+                    }
+                    cJSON_Delete(drain_msg.json);
+                    continue;
+                }
+                cJSON_Delete(drain_msg.json);
+                if (drain_msg.msg_type == 0x50 ||       /* REVOKE_AND_ACK */
+                    drain_msg.msg_type == 0x5A)          /* LEAF_ADVANCE_DONE */
+                    continue;
+                /* Not a drainable noise message — stop draining. This
+                   message is now consumed; the next action will expect to
+                   see it and may stall. That's a test-ordering issue, not a
+                   drain bug. Do not drain anything the next action expects. */
+                fprintf(stderr,
+                    "Client %u: drain consumed unexpected msg 0x%02x — "
+                    "test may stall\n", my_index, drain_msg.msg_type);
+                break;
             }
         }
     }
