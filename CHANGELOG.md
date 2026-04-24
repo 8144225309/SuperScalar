@@ -4,7 +4,9 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
-Factory participant cap raised from 64 to 128. Per-channel fee tracking and HTLC-based profit settlement. Client-side verification at every factory lifecycle boundary. Memory-safety CI hardening (LSan leak gate, TSan job, OSS-Fuzz integration) — 1050 pre-existing leaks found and fixed. End-to-end spendability + economic-correctness verification across all three factory arities (Chart A 22/28, Chart B 28/29 regtest + 3/3 bridge econ). On-chain stranded-funds recovery tool. 1377 unit tests, all passing under ASan+UBSan+LSan and TSan.
+## 0.1.13 — 2026-04-24
+
+Factory participant cap raised from 64 to 128. Per-channel fee tracking and HTLC-based profit settlement. Client-side verification at every factory lifecycle boundary. Memory-safety CI hardening (LSan leak gate, TSan job, OSS-Fuzz integration) — 1050 pre-existing leaks found and fixed. End-to-end spendability + economic-correctness verification across all three factory arities (**Chart A 28/28**, Chart B 28/29 regtest + 3/3 bridge external_in; 3 external_out cells remain 🟡 pending signet infrastructure — see `tools/test_bridge_econ_signet.sh`). Production-blocking cooperative-close-after-payments bug fixed (`factory_recovery_scan` no longer force-publishes the tree at startup). On-chain stranded-funds recovery tool. 1377 unit tests, all passing under ASan+UBSan+LSan and TSan.
 
 ### Spendability + economic-correctness verification (PRs #68–#72)
 
