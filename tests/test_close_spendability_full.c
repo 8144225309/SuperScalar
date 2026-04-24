@@ -1648,18 +1648,13 @@ int test_regtest_old_state_poisoning(void) {
     printf("  factory funded: %llu sats, %zu nodes\n",
            (unsigned long long)fund_amount, f->n_nodes);
 
-    /* Pick a leaf state node — it has the largest decrementable nSequence
-       and its parent (kickoff) is broadcastable independently. Tree layout
-       for arity-2 / 5 participants / step=2 / states=4:
-         0 = kickoff_root (nseq=0xFFFFFFFE, spends funding)
-         1 = state_root   (nseq=6, spends kickoff_root)
-         2 = kickoff_left (nseq=0xFFFFFFFE, spends state_root vout 0)
-         3 = state_left (leaf, nseq=6, spends kickoff_left vout 0)
-         ...
-       The PARENT we broadcast is kickoff_root (node 0). The STATE whose
-       nSequence we'll race is state_root (node 1). */
-    size_t kickoff_idx = 0;
-    size_t state_idx = 1;
+    /* Test the state_root → kickoff_root pair. Advance enough times for
+       state_root's nSequence to decrement (in arity-2 with states=4 this
+       happens on the 4th advance when the leaf counter wraps and the
+       root layer ticks). This keeps the on-chain broadcast chain short
+       (kickoff_root → state_root). */
+    size_t state_idx = 1;       /* state_root */
+    size_t kickoff_idx = 0;     /* kickoff_root, spends funding directly */
     TEST_ASSERT(state_idx < f->n_nodes, "state node exists");
 
     /* Capture OLD state's signed TX (before advance). */
@@ -1671,19 +1666,27 @@ int test_regtest_old_state_poisoning(void) {
     unsigned char *old_signed = malloc(old_len);
     TEST_ASSERT(old_signed != NULL, "old_signed malloc");
     memcpy(old_signed, state_node->signed_tx.data, old_len);
-    printf("  pre-advance state nSequence = %u\n", old_nseq);
+    printf("  pre-advance leaf state nSequence = %u\n", old_nseq);
 
-    /* Advance the factory → global counter decrements → state's nSequence
-       drops. factory_advance re-signs all nodes; the new signed_tx now
-       holds the post-advance version. */
-    TEST_ASSERT(factory_advance(f), "factory_advance");
+    /* Advance until the leaf state's nSequence strictly decreases. For a
+       fresh factory this happens on advance 1 — but keep looping to be
+       robust to factory params where the first advance doesn't tick the
+       chosen layer. */
+    uint32_t new_nseq = old_nseq;
+    int advances = 0;
+    while (new_nseq >= old_nseq && advances < 16) {
+        TEST_ASSERT(factory_advance(f), "factory_advance");
+        new_nseq = state_node->nsequence;
+        advances++;
+    }
+    TEST_ASSERT(new_nseq < old_nseq,
+                "leaf nSequence strictly decreased after advances");
 
-    uint32_t new_nseq = state_node->nsequence;
     size_t new_len = state_node->signed_tx.len;
     unsigned char *new_signed = malloc(new_len);
     TEST_ASSERT(new_signed != NULL, "new_signed malloc");
     memcpy(new_signed, state_node->signed_tx.data, new_len);
-    printf("  post-advance state nSequence = %u\n", new_nseq);
+    printf("  post-advance(%d) leaf state nSequence = %u\n", advances, new_nseq);
 
     /* Structural invariant: new nSequence strictly less than old. */
     TEST_ASSERT(new_nseq < old_nseq, "new nSequence < old nSequence");
