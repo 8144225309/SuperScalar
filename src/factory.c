@@ -2121,26 +2121,41 @@ int factory_build_distribution_tx_unsigned(
     return 1;
 }
 
+/* Inversion-of-timeout-default: the distribution TX spends the factory
+   funding UTXO directly and pays everything to the clients, with nLockTime
+   set to the factory's CLTV timeout. The LSP gets NOTHING — no output,
+   not even dust. This is the load-bearing security property that makes
+   LSP uptime a hard financial obligation (ZmnSCPxj, "SuperScalar" Delving
+   post, §"Inversion of Timeout Default"). If the LSP fails to cooperatively
+   close or rotate its clients before the CLTV expires, the clients can
+   broadcast the distribution TX and recover the full factory funding,
+   punishing the LSP for going dark.
+
+   Emits exactly (n_participants - 1) client outputs. Output index 0
+   corresponds to participant 1 (first client), index 1 → participant 2,
+   etc. The LSP (participant 0) is deliberately skipped. */
 size_t factory_compute_distribution_outputs(
     const factory_t *f,
     tx_output_t *outputs_out,
     size_t max_outputs,
     uint64_t fee_sats)
 {
-    if (!f || !outputs_out || max_outputs < f->n_participants) return 0;
+    if (!f || !outputs_out || f->n_participants < 2) return 0;
+    size_t n_clients = f->n_participants - 1;
+    if (max_outputs < n_clients) return 0;
+    if (f->funding_amount_sats <= fee_sats) return 0;
 
-    uint64_t total_client = 0;
+    uint64_t budget = f->funding_amount_sats - fee_sats;
+    uint64_t per_client = budget / n_clients;
+    uint64_t remainder = budget - per_client * n_clients;
+
     size_t n = 0;
-
-    /* Each participant gets a P2TR output keyed to their pubkey.
-       Output 0 = LSP (gets remainder). Outputs 1..N = clients. */
-    for (size_t i = 0; i < f->n_participants && n < max_outputs; i++) {
+    for (size_t i = 1; i < f->n_participants && n < n_clients; i++) {
+        /* Key-path-only P2TR: TapTweak(key, empty) */
         secp256k1_xonly_pubkey xonly;
         if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &xonly, NULL,
                                                  &f->pubkeys[i]))
             continue;
-
-        /* Key-path-only P2TR: TapTweak(key, empty) */
         unsigned char ser[32];
         if (!secp256k1_xonly_pubkey_serialize(f->ctx, ser, &xonly))
             continue;
@@ -2157,26 +2172,26 @@ size_t factory_compute_distribution_outputs(
 
         build_p2tr_script_pubkey(outputs_out[n].script_pubkey, &tweaked);
         outputs_out[n].script_pubkey_len = 34;
-
-        if (i == 0) {
-            /* LSP gets remainder — filled in below */
-            outputs_out[n].amount_sats = 0;
-        } else {
-            /* Client gets per_output (equal share of leaf capacity) */
-            uint64_t per_output = f->funding_amount_sats / f->n_participants;
-            outputs_out[n].amount_sats = per_output;
-            total_client += per_output;
-        }
+        outputs_out[n].amount_sats = per_client;
         n++;
     }
 
-    /* LSP gets remainder after clients and fee */
-    if (n > 0 && f->funding_amount_sats > total_client + fee_sats)
-        outputs_out[0].amount_sats = f->funding_amount_sats - total_client - fee_sats;
+    /* Fold integer-division remainder into the first client's output so
+       the total never underpays — if any sats would be left stranded by
+       the division, the first client eats the surplus. */
+    if (n > 0 && remainder > 0)
+        outputs_out[0].amount_sats += remainder;
 
     return n;
 }
 
+/* client_amounts are interpreted as per-client account_limits (channel
+   capacity), not current balances. On inversion, clients get their
+   contracted capacity regardless of how much of it they're holding in
+   their local_amount at the time — that's the whole point of the
+   property. For homogeneous capacity this is equivalent to the equal-
+   split path; the API is kept separate to prepare for heterogeneous-
+   capacity factories later. The LSP still gets nothing. */
 size_t factory_compute_distribution_outputs_balanced(
     const factory_t *f,
     tx_output_t *outputs_out,
@@ -2185,21 +2200,32 @@ size_t factory_compute_distribution_outputs_balanced(
     const uint64_t *client_amounts,
     size_t n_client_amounts)
 {
-    /* Fall back to equal split if no per-client amounts provided */
+    /* No per-client amounts → equal-split inversion. */
     if (!client_amounts || n_client_amounts == 0)
         return factory_compute_distribution_outputs(f, outputs_out, max_outputs, fee_sats);
 
-    if (!f || !outputs_out || max_outputs < f->n_participants) return 0;
+    if (!f || !outputs_out || f->n_participants < 2) return 0;
+    size_t n_clients = f->n_participants - 1;
+    if (max_outputs < n_clients) return 0;
+    if (f->funding_amount_sats <= fee_sats) return 0;
 
-    uint64_t total_client = 0;
+    /* Sum requested client amounts; if they add up to less than the
+       budget, split the surplus equally across clients (this absorbs the
+       leaf L-stock shares that the account_limits don't account for).
+       If they add up to MORE than the budget (over-commit bug at factory
+       creation), scale proportionally so nothing overflows the funding. */
+    uint64_t requested = 0;
+    for (size_t ci = 0; ci < n_client_amounts && ci < n_clients; ci++)
+        requested += client_amounts[ci];
+
+    uint64_t budget = f->funding_amount_sats - fee_sats;
+
     size_t n = 0;
-
-    for (size_t i = 0; i < f->n_participants && n < max_outputs; i++) {
+    for (size_t i = 1; i < f->n_participants && n < n_clients; i++) {
         secp256k1_xonly_pubkey xonly;
         if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &xonly, NULL,
                                                  &f->pubkeys[i]))
             continue;
-
         unsigned char ser[32];
         if (!secp256k1_xonly_pubkey_serialize(f->ctx, ser, &xonly))
             continue;
@@ -2217,21 +2243,26 @@ size_t factory_compute_distribution_outputs_balanced(
         build_p2tr_script_pubkey(outputs_out[n].script_pubkey, &tweaked);
         outputs_out[n].script_pubkey_len = 34;
 
-        if (i == 0) {
-            outputs_out[n].amount_sats = 0; /* LSP remainder — filled below */
-        } else {
-            /* Client i corresponds to client_amounts[i-1] */
-            size_t ci = i - 1;
-            uint64_t amt = (ci < n_client_amounts) ? client_amounts[ci] : 0;
-            outputs_out[n].amount_sats = amt;
-            total_client += amt;
+        size_t ci = i - 1;
+        uint64_t amt = (ci < n_client_amounts) ? client_amounts[ci] : 0;
+        if (requested > budget && requested > 0) {
+            amt = (amt * budget) / requested;  /* proportional scale-down */
         }
+        outputs_out[n].amount_sats = amt;
         n++;
     }
 
-    /* LSP gets remainder */
-    if (n > 0 && f->funding_amount_sats > total_client + fee_sats)
-        outputs_out[0].amount_sats = f->funding_amount_sats - total_client - fee_sats;
+    /* Spread any surplus (budget > Σ client_amounts — the L-stock share)
+       equally across clients. Remainder of that division goes to first. */
+    if (n > 0 && requested <= budget) {
+        uint64_t surplus = budget - requested;
+        uint64_t per = surplus / n;
+        uint64_t rem = surplus - per * n;
+        for (size_t j = 0; j < n; j++)
+            outputs_out[j].amount_sats += per;
+        if (rem > 0)
+            outputs_out[0].amount_sats += rem;
+    }
 
     return n;
 }
