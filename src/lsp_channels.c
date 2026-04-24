@@ -4683,17 +4683,30 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
                 sum += ch->ptlcs[p].amount_sats;
         }
 
-        if (sum != ch->funding_amount) {
+        /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)
+           was deducted from usable balance at init time, so the invariant
+           compares against (funding − base_commit_fee), not funding. See
+           fee_for_commitment_tx(fe, 0) in src/fee.c and the symmetric fix
+           in client_check_conservation (src/client.c). */
+        uint64_t base_commit_fee =
+            (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+        uint64_t expected = ch->funding_amount > base_commit_fee
+                            ? ch->funding_amount - base_commit_fee : 0;
+
+        if (sum != expected) {
             fprintf(stderr, "CONSERVATION VIOLATION: channel %zu — "
                     "local=%llu remote=%llu htlc_sum=%llu total=%llu "
-                    "funding=%llu (delta=%lld)\n",
+                    "expected=%llu funding=%llu base_commit_fee=%llu "
+                    "(delta=%lld)\n",
                     c,
                     (unsigned long long)ch->local_amount,
                     (unsigned long long)ch->remote_amount,
                     (unsigned long long)(sum - ch->local_amount - ch->remote_amount),
                     (unsigned long long)sum,
+                    (unsigned long long)expected,
                     (unsigned long long)ch->funding_amount,
-                    (long long)(sum - ch->funding_amount));
+                    (unsigned long long)base_commit_fee,
+                    (long long)(sum - expected));
             ok = 0;
         }
     }
