@@ -4989,6 +4989,112 @@ int test_factory_ps_leaf_build(void) {
     return 1;
 }
 
+/* Build, sign, verify, and advance a PS factory at N=64 (1 LSP + 63 clients).
+ * This is the scale test — the existing PS tests use N=3 (2 clients), which
+ * doesn't exercise the interior-tree layers or the 64-way MuSig ceremony.
+ * Proves the PS construction is structurally correct at half of our
+ * FACTORY_MAX_SIGNERS=128 cap and that advances still work.
+ *
+ * What this does:
+ *   - build_tree + sign_all with 64 keypairs (64-way MuSig at every node)
+ *   - verify_all confirms every signature validates
+ *   - advance one leaf and verify chain_len incremented + ps_prev_txid set
+ *
+ * What this does NOT do:
+ *   - broadcast on chain (unit test, no regtest)
+ *   - advance all 63 leaves (one is sufficient to prove the ceremony scales)
+ *   - measure performance (accept whatever runtime; correctness is the bar)
+ */
+int test_factory_ps_leaf_build_n64(void) {
+    secp256k1_context *ctx = test_ctx();
+    const size_t N = 64;
+    secp256k1_keypair kps[64];
+    for (size_t i = 0; i < N; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xDD;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    /* Funding SPK: 64-of-64 MuSig aggregate, BIP-341 taptweaked. */
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[64];
+        for (size_t i = 0; i < N; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, N),
+                    "64-way MuSig aggregate");
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
+                                                             &ka.cache, tweak),
+                    "taptweak 64-way key");
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xEE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    /* step=4, states_per_layer=3 — modest values so tree depth with 63
+       clients stays within DW_MAX_LAYERS=8. */
+    factory_init(f, ctx, kps, N, 4, 3);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 10000000, fund_spk, 34); /* 10M sats */
+
+    TEST_ASSERT(factory_build_tree(f), "build PS tree at N=64");
+    printf("  N=64 PS factory built: %zu nodes, %d leaves\n",
+           f->n_nodes, f->n_leaf_nodes);
+
+    /* Each of 63 clients should have their own PS leaf. */
+    TEST_ASSERT_EQ(f->n_leaf_nodes, (int)(N - 1), "63 PS leaves (1 per client)");
+
+    /* Every leaf must be is_ps_leaf with chain_len=0 and nseq=0xFFFFFFFE. */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf");
+        TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0, "initial chain_len=0");
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu,
+                    "PS leaf nseq=0xFFFFFFFE");
+        TEST_ASSERT_EQ((int)f->nodes[ni].n_outputs, 2, "PS leaf has 2 outputs");
+    }
+
+    /* Sign + verify every node — this is the 64-way MuSig ceremony. */
+    TEST_ASSERT(factory_sign_all(f), "sign N=64 PS factory (64-way MuSig)");
+    TEST_ASSERT(factory_verify_all(f), "verify every signature");
+    printf("  64-way MuSig ceremony complete; every node signed + verified\n");
+
+    /* Advance one leaf via the production API; verify chain_len++ and
+       ps_prev_txid becomes the pre-advance leaf txid. */
+    int leaf_side = 0;
+    size_t leaf_idx = f->leaf_node_indices[leaf_side];
+    unsigned char pre_txid[32];
+    memcpy(pre_txid, f->nodes[leaf_idx].txid, 32);
+
+    int rc = factory_advance_leaf(f, leaf_side);
+    TEST_ASSERT(rc == 1, "advance leaf 0 succeeds at N=64");
+    TEST_ASSERT_EQ(f->nodes[leaf_idx].ps_chain_len, 1,
+                   "post-advance chain_len=1");
+    TEST_ASSERT(memcmp(f->nodes[leaf_idx].ps_prev_txid, pre_txid, 32) == 0,
+                "ps_prev_txid points at pre-advance leaf txid");
+    TEST_ASSERT_EQ((int)f->nodes[leaf_idx].n_outputs, 1,
+                   "post-advance leaf has 1 output (L-stock gone)");
+    TEST_ASSERT(f->nodes[leaf_idx].is_signed, "post-advance leaf re-signed");
+    printf("  advance OK: leaf 0 chain_len 0→1, L-stock collapsed into channel\n");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Advance a PS leaf multiple times; verify chain grows and txids change. */
 int test_factory_ps_leaf_advance(void) {
     secp256k1_context *ctx = test_ctx();
