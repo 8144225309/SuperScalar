@@ -1112,6 +1112,8 @@ extern int test_regtest_ps_chain_close_spendability(void);
 extern int test_regtest_htlc_in_flight_spendability(void);
 extern int test_regtest_rotation_all_arities(void);
 extern int test_regtest_econ_arity2_baseline(void);
+extern int test_regtest_econ_arity1_baseline(void);
+extern int test_regtest_econ_arity_ps_baseline(void);
 extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
@@ -3596,6 +3598,8 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Economic Correctness (Chart B) ===\n");
     RUN_TEST(test_regtest_econ_arity2_baseline);
+    RUN_TEST(test_regtest_econ_arity1_baseline);
+    RUN_TEST(test_regtest_econ_arity_ps_baseline);
 
     printf("\n=== Regtest LSP Recovery ===\n");
     RUN_TEST(test_regtest_lsp_restart_recovery);

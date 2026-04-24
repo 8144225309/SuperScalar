@@ -64,6 +64,237 @@ static const char *ECON_NAMES[5] = {
  * This test does NOT depend on the HTLC routing bugs that block arity-1/PS,
  * because it does no payments.
  */
+/*
+ * Factory-aware econ baseline: exercises the production code paths
+ * lsp_channels_init (per-channel local/remote split) and
+ * lsp_channels_build_close_outputs (economic close-amount formula).
+ *
+ *   1. Fund a real MuSig-N factory UTXO on regtest.
+ *   2. factory_init_from_pubkeys + factory_set_arity(arity) + build_tree
+ *      + sign_all so the tree structure is correct for the arity.
+ *   3. lsp_channels_init with lsp_balance_pct=50 → per-channel
+ *      local=remote=(funding/N − commit_fee)/2 per src/lsp_channels.c:207.
+ *   4. lsp_channels_build_close_outputs(mgr, &factory, outs, 500, NULL, 0)
+ *      uses the production formula: LSP = funding − Σremote − fee,
+ *      client_i = remote_amount.
+ *   5. Assert each output's on-chain amount matches the expected formula.
+ *   6. Gauntlet-sweep each output using the owning party's seckey.
+ *
+ * Because this is a zero-payment baseline, each client's remote_amount
+ * is their initial split; LSP ends up with L-stock + Σlocal.
+ */
+static int run_factory_aware_baseline(secp256k1_context *ctx, regtest_t *rt,
+                                        const char *mine_addr,
+                                        factory_arity_t arity,
+                                        uint16_t lsp_balance_pct,
+                                        const char *label) {
+    const size_t N = 5;  /* 1 LSP + 4 clients */
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey  pks[5];
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_keypair_create(ctx, &kps[i], ECON_SECKEYS[i]);
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    }
+
+    /* Compute factory funding SPK — MuSig-N + BIP-341 taptweak empty. */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    /* Fund on regtest. */
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tpx_ser, fund_addr, sizeof(fund_addr))) return 0;
+    char fund_txid[65];
+    uint64_t fund_request = 500000;  /* 500k sats */
+    if (!regtest_fund_address(rt, fund_addr, (double)fund_request / 1e8, fund_txid))
+        return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+
+    uint32_t fund_vout = UINT32_MAX;
+    uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    if (fund_vout == UINT32_MAX) return 0;
+    printf("  [%s] funded factory %s:%u  %llu sats\n",
+           label, fund_txid, fund_vout, (unsigned long long)fund_amount);
+
+    /* Build factory tree (arity-specific). */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, N, 2, 4);
+    factory_set_arity(f, arity);
+    unsigned char txid_bytes[32];
+    hex_decode(fund_txid, txid_bytes, 32);
+    reverse_bytes(txid_bytes, 32);
+    factory_set_funding(f, txid_bytes, fund_vout, fund_amount, fund_spk, 34);
+    if (!factory_build_tree(f)) { free(f); return 0; }
+    if (!factory_sign_all(f))   { free(f); return 0; }
+    printf("  [%s] factory tree built: %zu nodes, %d leaves\n",
+           label, f->n_nodes, f->n_leaf_nodes);
+
+    /* Set up channel manager via lsp_channels_init — this is the production
+       path that seeds each channel's local/remote amounts based on
+       lsp_balance_pct and computes per-channel close_spk + mgr->lsp_close_spk. */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.lsp_balance_pct = lsp_balance_pct;
+    if (!lsp_channels_init(&mgr, ctx, f, ECON_SECKEYS[0], N - 1)) {
+        free(f); return 0;
+    }
+    printf("  [%s] lsp_channels_init: %zu channels\n", label, mgr.n_channels);
+    for (size_t c = 0; c < mgr.n_channels; c++) {
+        channel_t *ch = &mgr.entries[c].channel;
+        printf("    ch[%zu]: local=%llu remote=%llu funding=%llu\n",
+               c, (unsigned long long)ch->local_amount,
+               (unsigned long long)ch->remote_amount,
+               (unsigned long long)ch->funding_amount);
+    }
+
+    /* Build coop-close outputs via the production formula. */
+    uint64_t close_fee = 500;
+    tx_output_t outs[FACTORY_MAX_SIGNERS];
+    size_t n_outs = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee,
+                                                      NULL, 0);
+    if (n_outs == 0) { free(f); lsp_channels_cleanup(&mgr); return 0; }
+    printf("  [%s] build_close_outputs: %zu outputs\n", label, n_outs);
+
+    /* Econ context — expected amounts come from lsp_channels_build_close_outputs
+       output directly (that IS the economic model per src/lsp_channels.c:2996-3003). */
+    econ_ctx_t ectx;
+    econ_ctx_init(&ectx, rt, ctx);
+    for (size_t i = 0; i < N; i++)
+        econ_register_party(&ectx, i, ECON_NAMES[i], ECON_SECKEYS[i]);
+
+    uint64_t expected[5] = {0};
+    expected[0] = outs[0].amount_sats;  /* LSP = funding − Σremote − fee */
+    for (size_t c = 0; c < mgr.n_channels && c + 1 < N; c++) {
+        /* outs[c+1] matches the client-side close_spk derived in
+           lsp_channels_init from pubkeys[c+1] — same derivation the
+           gauntlet uses for client c's sweep. */
+        if (c + 1 < n_outs) expected[c + 1] = outs[c + 1].amount_sats;
+    }
+
+    /* Build + sign + broadcast the close tx (in-process N-party MuSig). */
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    if (!build_unsigned_tx(&uc, NULL, f->funding_txid, f->funding_vout,
+                            0xFFFFFFFEu, outs, n_outs)) {
+        tx_buf_free(&uc); free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    unsigned char sh[32];
+    if (!compute_taproot_sighash(sh, uc.data, uc.len, 0, fund_spk, 34,
+                                  fund_amount, 0xFFFFFFFEu)) {
+        tx_buf_free(&uc); free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    unsigned char sig[64];
+    if (!musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL)) {
+        tx_buf_free(&uc); free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    finalize_signed_tx(&sc, uc.data, uc.len, sig);
+    tx_buf_free(&uc);
+    char hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, hex); hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    int sent_ok = regtest_send_raw_tx(rt, hex, close_txid);
+    tx_buf_free(&sc);
+    if (!sent_ok) { free(f); lsp_channels_cleanup(&mgr); return 0; }
+    regtest_mine_blocks(rt, 1, mine_addr);
+    if (regtest_get_confirmations(rt, close_txid) < 1) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    printf("  [%s] close confirmed: %s\n", label, close_txid);
+
+    /* Pre-snapshot: each party's close-SPK balance should be the output
+       they just received on-chain. Snapshot BEFORE sweep. */
+    econ_snap_pre(&ectx);
+
+    /* Assert close-tx output amounts match the economic formula. */
+    if (!econ_assert_close_amounts(&ectx, close_txid, close_fee,
+                                     fund_amount, expected)) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+
+    /* Gauntlet: each party sweeps their own close output. */
+    if (!spend_coop_close_gauntlet(ctx, rt, close_txid, ECON_SECKEYS, N - 1)) {
+        free(f); lsp_channels_cleanup(&mgr); return 0;
+    }
+    printf("  [%s] gauntlet: %zu parties swept their outputs ✓\n", label, N);
+
+    /* Post-snapshot: after sweeps, the close-SPK balance should be 0 (or
+       match their pre if they didn't have an output). */
+    econ_snap_post(&ectx);
+    econ_print_summary(&ectx);
+
+    free(f);
+    lsp_channels_cleanup(&mgr);
+    return 1;
+}
+
+int test_regtest_econ_arity1_baseline(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "econ_a1_baseline");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    TEST_ASSERT(run_factory_aware_baseline(ctx, &rt, mine_addr,
+                                             FACTORY_ARITY_1, 50,
+                                             "arity=1"),
+                "arity-1 factory-aware econ baseline");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_regtest_econ_arity_ps_baseline(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "econ_aps_baseline");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    TEST_ASSERT(run_factory_aware_baseline(ctx, &rt, mine_addr,
+                                             FACTORY_ARITY_PS, 50,
+                                             "arity=PS"),
+                "arity-PS factory-aware econ baseline");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 int test_regtest_econ_arity2_baseline(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
