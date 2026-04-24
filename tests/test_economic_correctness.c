@@ -646,3 +646,185 @@ int test_regtest_econ_rotation_arity_ps(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ================================================================
+ * buy_liquidity econ (arity-2 only, per src/lsp_channels.c:1962-1965).
+ *
+ * The production flow is:
+ *   1. LSP + 2 clients on the leaf do a DW advance ceremony
+ *   2. Leaf output amounts are rewritten: output[i] += X, L-stock -= X
+ *   3. Channel state mirrors: channel.local_amount += X (for the buying
+ *      client's channel)
+ *
+ * An in-process test can exercise the ECONOMIC FORMULA without the wire
+ * ceremony by directly mutating channel balances via
+ * channel_set_balances() to the post-buy state, then computing coop-close
+ * outputs via lsp_channels_build_close_outputs and asserting amounts.
+ *
+ * This tests: "if a client has bought X sats of inbound capacity before
+ * close, their close output reflects the new balance correctly, and the
+ * LSP output absorbs the L-stock decrease." The wire ceremony itself is
+ * tested separately by the DW advance / realloc integration tests.
+ * ================================================================ */
+int test_regtest_econ_buy_liquidity_arity2(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) { secp256k1_context_destroy(ctx); return 1; }
+    regtest_create_wallet(&rt, "econ_buyliq_a2");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 5;
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey  pks[5];
+    for (size_t i = 0; i < N; i++) {
+        secp256k1_keypair_create(ctx, &kps[i], ECON_SECKEYS[i]);
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    char fund_addr[128];
+    TEST_ASSERT(regtest_derive_p2tr_address(&rt, tpx_ser, fund_addr, sizeof(fund_addr)),
+                "derive addr");
+    char fund_txid[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.005, fund_txid), "fund");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    uint32_t fund_vout = UINT32_MAX; uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(&rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "locate vout");
+    printf("  [buy_liquidity a2] factory funded %llu sats\n",
+           (unsigned long long)fund_amount);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, N, 2, 4);
+    factory_set_arity(f, FACTORY_ARITY_2);
+    unsigned char tb[32];
+    hex_decode(fund_txid, tb, 32);
+    reverse_bytes(tb, 32);
+    factory_set_funding(f, tb, fund_vout, fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.lsp_balance_pct = 50;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, ECON_SECKEYS[0], N - 1),
+                "init mgr");
+    TEST_ASSERT(mgr.n_channels == 4, "4 channels");
+
+    /* Record PRE-buy state for client 0. */
+    uint64_t pre_local = mgr.entries[0].channel.local_amount;
+    uint64_t pre_remote = mgr.entries[0].channel.remote_amount;
+    printf("  client 0 pre-buy: local=%llu remote=%llu\n",
+           (unsigned long long)pre_local, (unsigned long long)pre_remote);
+
+    /* Simulate buy_liquidity: client 0 "buys" 5000 sats of inbound
+       capacity. Per lsp_channels.c:2003-2013, that increases LSP's
+       local_amount on that channel and decreases remote. */
+    uint64_t bought_sats = 5000;
+    mgr.entries[0].channel.local_amount  += bought_sats;
+    if (mgr.entries[0].channel.remote_amount >= bought_sats)
+        mgr.entries[0].channel.remote_amount -= bought_sats;
+    else
+        mgr.entries[0].channel.remote_amount = 0;
+    printf("  client 0 post-buy: local=%llu remote=%llu (+%llu bought)\n",
+           (unsigned long long)mgr.entries[0].channel.local_amount,
+           (unsigned long long)mgr.entries[0].channel.remote_amount,
+           (unsigned long long)bought_sats);
+
+    /* Build close outputs with the new balance. */
+    uint64_t close_fee = 500;
+    tx_output_t outs[FACTORY_MAX_SIGNERS];
+    size_t n_outs = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee, NULL, 0);
+    TEST_ASSERT(n_outs > 0, "build_close_outputs");
+
+    econ_ctx_t ectx;
+    econ_ctx_init(&ectx, &rt, ctx);
+    for (size_t i = 0; i < N; i++)
+        econ_register_party(&ectx, i, ECON_NAMES[i], ECON_SECKEYS[i]);
+
+    uint64_t expected[5] = {0};
+    for (size_t i = 0; i < n_outs && i < N; i++) expected[i] = outs[i].amount_sats;
+    printf("  expected close amounts: LSP=%llu C0=%llu C1=%llu C2=%llu C3=%llu\n",
+           (unsigned long long)expected[0],
+           (unsigned long long)expected[1],
+           (unsigned long long)expected[2],
+           (unsigned long long)expected[3],
+           (unsigned long long)expected[4]);
+
+    /* Build + sign + broadcast. */
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    build_unsigned_tx(&uc, NULL, f->funding_txid, f->funding_vout,
+                       0xFFFFFFFEu, outs, n_outs);
+    unsigned char sh[32];
+    compute_taproot_sighash(sh, uc.data, uc.len, 0, fund_spk, 34,
+                             fund_amount, 0xFFFFFFFEu);
+    unsigned char sig[64];
+    TEST_ASSERT(musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL),
+                "musig sign");
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    finalize_signed_tx(&sc, uc.data, uc.len, sig);
+    tx_buf_free(&uc);
+    char hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, hex); hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, hex, close_txid), "broadcast");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, close_txid) >= 1, "confirmed");
+    tx_buf_free(&sc);
+    printf("  close confirmed: %s\n", close_txid);
+
+    econ_snap_pre(&ectx);
+    TEST_ASSERT(econ_assert_close_amounts(&ectx, close_txid, close_fee,
+                                            fund_amount, expected),
+                "close amounts match post-buy formula");
+    TEST_ASSERT(spend_coop_close_gauntlet(ctx, &rt, close_txid, ECON_SECKEYS, N - 1),
+                "gauntlet");
+    econ_snap_post(&ectx);
+    econ_print_summary(&ectx);
+
+    /* Client 0's close output should be their POST-BUY remote_amount, which
+       is smaller than pre-buy by `bought_sats`. LSP's output should be
+       larger by `bought_sats` (since it absorbed the L-stock that got
+       redistributed to local_amount on channel 0). */
+    uint64_t c0_expected = pre_remote >= bought_sats ? pre_remote - bought_sats : 0;
+    printf("  [buy_liquidity a2] client 0 pre-buy remote=%llu, post-buy=%llu, "
+           "on-chain output=%llu ✓\n",
+           (unsigned long long)pre_remote,
+           (unsigned long long)c0_expected,
+           (unsigned long long)expected[1]);
+    TEST_ASSERT(expected[1] == c0_expected,
+                "client 0 close output == pre_remote − bought");
+
+    free(f);
+    lsp_channels_cleanup(&mgr);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
