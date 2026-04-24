@@ -1698,6 +1698,7 @@ extern int test_conservation_balanced(void);
 extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
+extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -3428,6 +3429,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_violated);
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
+    RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");

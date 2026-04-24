@@ -4022,3 +4022,138 @@ int test_conservation_with_real_htlc(void) {
     return 1;
 }
 
+/* ---- PS double-spend defense: integration test (Gap 2).
+ *
+ * PR #79 added client-side tracking of previously-signed PS parent inputs
+ * (client_ps_signed_inputs table + persist_check/save API + wiring into
+ * client_handle_leaf_advance). test_persist_ps_signed_input_roundtrip
+ * covers the persist API. THIS test covers the wire-up: given a persist
+ * pre-seeded with a signed_input row for a would-be-parent, does
+ * client_handle_leaf_advance actually call the check and refuse?
+ *
+ * Mechanism:
+ *   1. Build a 3-party PS factory; capture leaf[0]'s pre-advance txid T0.
+ *      After factory_advance_leaf_unsigned, ps_prev_txid becomes T0 — so
+ *      (T0, 0) is the parent UTXO the client is about to co-sign spending.
+ *   2. Seed persist with client_ps_signed_inputs row for (factory_id=0,
+ *      parent_txid=T0, parent_vout=0). This simulates "client has already
+ *      co-signed one TX spending T0:0."
+ *   3. client_set_persist(&db) wires the defense.
+ *   4. Build a wire_msg_t PROPOSE for leaf_side=0 with any valid LSP
+ *      pubnonce, invoke client_handle_leaf_advance on a writable fd that
+ *      nothing reads from.
+ *   5. Assert return value == 0 (refuse). The function bails before any
+ *      PSIG is written to fd, so the fd side is moot.
+ */
+int test_client_ps_double_spend_defense_refuses(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* 3-party PS factory: LSP (idx 0) + 2 clients (idx 1, 2). We play the
+       client at idx 1 below (leaf 0's client). */
+    const size_t N = 3;
+    secp256k1_keypair kps[3];
+    for (size_t i = 0; i < N; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0x99;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    /* Funding SPK: 3-of-3 MuSig taptweaked. */
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[3];
+        for (size_t i = 0; i < N; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, N);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey tw_xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_pk);
+        build_p2tr_script_pubkey(fund_spk, &tw_xo);
+    }
+    unsigned char fake_fund_txid[32];
+    memset(fake_fund_txid, 0x7A, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, N, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_fund_txid, 0, 500000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign PS tree");
+
+    /* Capture leaf[0]'s txid BEFORE advance — this becomes ps_prev_txid
+       after factory_advance_leaf_unsigned runs inside the handler. */
+    size_t leaf_idx = f->leaf_node_indices[0];
+    unsigned char expected_parent_txid[32];
+    memcpy(expected_parent_txid, f->nodes[leaf_idx].txid, 32);
+
+    /* Open an in-memory persist and pre-seed a signed_input row for
+       (parent_txid=expected_parent_txid, parent_vout=0). Dummy sighash /
+       partial_sig — the check only uses the (parent_txid, parent_vout)
+       key, not the stored sighash. */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory persist");
+    unsigned char dummy_sighash[32], dummy_psig[36];
+    memset(dummy_sighash, 0x55, 32);
+    memset(dummy_psig, 0x66, 36);
+    TEST_ASSERT(persist_save_ps_signed_input(&db, /*factory_id=*/0,
+                    /*leaf_idx=*/(int)leaf_idx,
+                    expected_parent_txid, /*parent_vout=*/0,
+                    dummy_sighash, dummy_psig),
+                "pre-seed signed_input row");
+
+    /* Wire the defense into client_handle_leaf_advance. */
+    client_set_persist(&db);
+
+    /* Build a valid LEAF_ADVANCE_PROPOSE from the LSP (index 0) so the
+       handler can parse it and proceed far enough to hit our check. */
+    unsigned char lsp_seckey[32];
+    TEST_ASSERT(secp256k1_keypair_sec(ctx, lsp_seckey, &kps[0]), "lsp seckey");
+    secp256k1_pubkey lsp_pub;
+    secp256k1_keypair_pub(ctx, &lsp_pub, &kps[0]);
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    TEST_ASSERT(musig_generate_nonce(ctx, &lsp_secnonce, &lsp_pubnonce,
+                                       lsp_seckey, &lsp_pub, NULL),
+                "lsp nonce");
+    memset(lsp_seckey, 0, 32);
+    unsigned char lsp_pubnonce_ser[66];
+    musig_pubnonce_serialize(ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+    cJSON *propose_json = wire_build_leaf_advance_propose(0, lsp_pubnonce_ser);
+    TEST_ASSERT(propose_json != NULL, "build PROPOSE json");
+    wire_msg_t propose = {0};
+    propose.msg_type = 0x58;  /* MSG_LEAF_ADVANCE_PROPOSE — unused after
+                                  wire_parse consumes the json */
+    propose.json = propose_json;
+
+    /* Pipe as the output fd — nothing will be written on the refuse path,
+       but we pass a valid fd in case the function starts to. */
+    int pipefd[2];
+    TEST_ASSERT(pipe(pipefd) == 0, "pipe");
+
+    /* Invoke the handler. The check should trigger early and return 0. */
+    int rc = client_handle_leaf_advance(pipefd[1], ctx, &kps[1], f,
+                                          /*my_index=*/1, &propose);
+
+    TEST_ASSERT(rc == 0, "handler REFUSES when parent already signed");
+
+    /* Cleanup — reset the global persist hook. */
+    client_set_persist(NULL);
+    cJSON_Delete(propose_json);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
