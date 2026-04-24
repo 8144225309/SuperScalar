@@ -196,8 +196,16 @@ static int all_leaves_confirmed(fr_node_t *nodes, int n)
 /* ------------------------------------------------------------------ */
 
 /* Returns number of TXs broadcast. */
+/* allow_root_broadcast: 0 = do NOT broadcast ANY tree node during this
+   pass. This is the safe mode for startup / reorg scans: an active
+   factory's tree should never be force-published just because the
+   funding confirmed. Crash recovery of an in-progress force-close must
+   be re-triggered explicitly by the operator via factory_recovery_run.
+   1 = explicit operator-requested force-close; OK to broadcast from
+   the root down. */
 static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
-                                uint32_t factory_id, const char *funding_txid)
+                                uint32_t factory_id, const char *funding_txid,
+                                int allow_root_broadcast)
 {
     fr_node_t nodes[FR_MAX_NODES];
     int n = load_nodes_for_factory(p->db, factory_id, nodes, FR_MAX_NODES);
@@ -225,10 +233,15 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
 
             /* Determine whether parent is confirmed (or just broadcast
              * this call — in-mempool parent is sufficient for child). */
+            /* Gate on explicit force-close request. Scan mode (startup /
+               reorg) just refreshes confs and never broadcasts — otherwise
+               a fresh, healthy factory gets its tree force-published the
+               moment the funding TX confirms. */
+            if (!allow_root_broadcast) continue;
+
             int parent_ok = 0;
             if (nd->parent_index < 0) {
-                /* Root node: depends on the factory funding TX.
-                   Use safe threshold to avoid acting on reorgable txs. */
+                /* Root node (kickoff): depends on the factory funding TX. */
                 parent_ok = (funding_confs >= chain_funding_confs(chain, chain->is_regtest));
             } else {
                 fr_node_t *par = find_node(nodes, n, nd->parent_index);
@@ -287,7 +300,8 @@ int factory_recovery_scan(persist_t *p, chain_backend_t *chain)
         fflush(stdout);
 
         if (ftxid && ftxid[0])
-            do_factory_recovery(p, chain, fid, ftxid);
+            do_factory_recovery(p, chain, fid, ftxid,
+                                /* allow_root_broadcast = */ 0);
 
         count++;
     }
@@ -396,7 +410,8 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
         return 0;
     }
 
-    int n = do_factory_recovery(p, chain, factory_id, funding_txid);
+    int n = do_factory_recovery(p, chain, factory_id, funding_txid,
+                                /* allow_root_broadcast = */ 1);
     if (status_out && cap) {
         snprintf(status_out, cap, "factory %u (state=%s): broadcast %d TX%s",
                  factory_id, state[0] ? state : "?", n, n == 1 ? "" : "s");
