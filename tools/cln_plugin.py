@@ -321,32 +321,77 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
 
 
 def _do_pay(bolt11, request_id):
-    """Execute lightning-cli pay in a subprocess and report result to bridge."""
+    """Execute lightning-cli pay in a subprocess and report result to bridge.
+
+    Logs verbose details so bridge-accounting races can be diagnosed.
+    See commit history for the root-cause of the 'pay succeeded on LN but
+    LSP reports success=0' class of bug. """
+    log(f"Pay start: request_id={request_id}, bolt11_len={len(bolt11)}, "
+        f"bolt11_prefix={bolt11[:20]}...")
     try:
         result = subprocess.run(
             cli_cmd("pay", bolt11),
             capture_output=True, text=True, timeout=600
         )
+        log(f"Pay lightning-cli returncode={result.returncode}, "
+            f"stdout_len={len(result.stdout)}, stderr_len={len(result.stderr)}")
         if result.returncode == 0:
-            pay_result = json.loads(result.stdout)
+            try:
+                pay_result = json.loads(result.stdout)
+            except json.JSONDecodeError as je:
+                log(f"Pay stdout NOT JSON (parse error: {je}); "
+                    f"stdout_head={result.stdout[:200]!r}")
+                send_to_bridge({
+                    "method": "pay_result",
+                    "request_id": request_id,
+                    "success": False,
+                    "preimage": "00" * 32
+                })
+                return
+            status = pay_result.get("status", "?")
             preimage = pay_result.get("payment_preimage", "00" * 32)
-            send_to_bridge({
-                "method": "pay_result",
-                "request_id": request_id,
-                "success": True,
-                "preimage": preimage
-            })
-            log(f"Pay succeeded: {preimage[:16]}...")
+            log(f"Pay JSON parsed: status={status}, preimage_prefix={preimage[:16]}")
+            # CLN 'pay' returncode=0 can include status='pending' (not complete).
+            # Only report success when CLN explicitly reports status='complete'
+            # AND a real preimage (not all-zero placeholder).
+            if status == "complete" and preimage != "00" * 32:
+                send_to_bridge({
+                    "method": "pay_result",
+                    "request_id": request_id,
+                    "success": True,
+                    "preimage": preimage
+                })
+                log(f"Pay succeeded: {preimage[:16]}...")
+            else:
+                log(f"Pay returncode=0 but status!={status} or preimage empty "
+                    f"— reporting failure to bridge")
+                send_to_bridge({
+                    "method": "pay_result",
+                    "request_id": request_id,
+                    "success": False,
+                    "preimage": "00" * 32
+                })
         else:
-            log(f"Pay failed: {result.stderr[:100]}")
+            log(f"Pay failed rc={result.returncode}: "
+                f"stderr={result.stderr[:300]!r} "
+                f"stdout={result.stdout[:300]!r}")
             send_to_bridge({
                 "method": "pay_result",
                 "request_id": request_id,
                 "success": False,
                 "preimage": "00" * 32
             })
+    except subprocess.TimeoutExpired:
+        log(f"Pay timeout (>600s) for request_id={request_id} — "
+            f"CLN still processing; result uncertain")
+        send_to_bridge({
+            "method": "pay_result",
+            "request_id": request_id,
+            "success": False,
+            "preimage": "00" * 32
+        })
     except Exception as e:
-        log(f"Pay exception: {e}")
+        log(f"Pay exception: {type(e).__name__}: {e}")
         send_to_bridge({
             "method": "pay_result",
             "request_id": request_id,

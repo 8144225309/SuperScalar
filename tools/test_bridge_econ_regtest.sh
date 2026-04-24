@@ -52,11 +52,22 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    # Preserve key logs at /tmp before rm -rf nukes TMPDIR.
+    if [ -d "$CLN_DIR" ]; then
+        cp "$CLN_DIR/cln.log" /tmp/bridge_last_cln.log 2>/dev/null || true
+    fi
+    if [ -f "$TMPDIR/lsp.log" ]; then
+        cp "$TMPDIR/lsp.log" /tmp/bridge_last_lsp.log 2>/dev/null || true
+    fi
+    if [ -f "$TMPDIR/bridge.log" ]; then
+        cp "$TMPDIR/bridge.log" /tmp/bridge_last_bridge.log 2>/dev/null || true
+    fi
     lightning-cli --network=regtest --lightning-dir="$CLN_DIR" stop 2>/dev/null || true
     [ -d "$CLN2_DIR" ] && lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
     $BCLI stop 2>/dev/null || true
     sleep 2
     rm -rf "$TMPDIR"
+    echo "  Preserved logs: /tmp/bridge_last_{cln,lsp,bridge}.log"
 }
 trap cleanup EXIT
 
@@ -174,6 +185,15 @@ for i in $(seq 1 60); do
     sleep 1
 done
 echo "LN channel CLN2→CLN1: NORMAL"
+
+# Mine enough blocks for the channel to be announced in gossip. Without
+# this, 'lightning-cli pay' fails with 'destination not reachable
+# directly and all routehints were unusable' for outbound-from-SS cases
+# where CLN1 is the routing peer and the invoice's routehint SCID isn't
+# yet known to CLN1's gossip view.
+echo "Mining extra confirmations for channel gossip propagation..."
+$BCLI generatetoaddress 8 "$MINE_ADDR" > /dev/null
+sleep 3  # let gossipd catch up
 
 # --- Record pre-payment CLN2 balance ---
 CLN2_PRE_MSAT=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listpeerchannels 2>/dev/null | \
