@@ -3,7 +3,7 @@
 Phase 2 (PRs #89-#95) closed the accounting matrix and production-shape gaps.
 Phase 3 closes the **scale + coordination** gap: every test we ran in phase 2
 either was unit-only at scale (N=64, N=128) or was at small N on real chain
-(N=2-3 PS on regtest, N=3 PS on signet). The middle ground — **PS at N>=8 on a
+(N=2-3 PS on regtest, N=3 PS on signet). The middle ground — **PS at N≥8 on a
 real chain with full accounting** — is untested.
 
 **Release status:** SUSPENDED. v0.1.14 stays held until the user explicitly
@@ -17,13 +17,13 @@ Every TX broadcast on a real chain. No skip flags, no stubs.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete
 
-### 1. PS at N=8 and N=16 on regtest with full accounting  `[~]`
+### 1. PS at N=8 and N=16 on regtest with full accounting  `[ ]`
 
 Five new tests in `tests/test_close_spendability_full.c`:
 
 - `test_regtest_ps_full_lifecycle_n8` — N=8 (LSP + 7 clients), all leaves
-  at chain_len=0, build -> broadcast tree -> sweep all 7 channels + L-stocks
-  -> assert per-party deltas for **all 8 parties** + conservation
+  at chain_len=0, build → broadcast tree → sweep all 7 channels + L-stocks
+  → assert per-party deltas for **all 8 parties** + conservation
 - `test_regtest_ps_heterogeneous_chains_n8` — N=8, chain_lens
   {5, 3, 1, 0, 0, 2, 4} across 7 leaves, full sweep + accounting
 - `test_regtest_ps_full_lifecycle_n16` — N=16, all leaves chain_len=0
@@ -72,7 +72,7 @@ mainnet."
 
 | # | PR | Status | Notes |
 |---|----|--------|-------|
-| 1 | TBD | `[~]` | branch `test/phase3-ps-regtest-scale` — 5 cells implemented |
+| 1 | TBD | `[ ]` | not started |
 | 2 | TBD | `[ ]` | not started — gated on #1 |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
