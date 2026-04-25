@@ -84,10 +84,17 @@ has at least spendability coverage; most have full accounting. The pending
 
 ### Out of scope for Chart C
 
-- **JIT channel close** — separate flow, covered by
-  `test_regtest_econ_jit_cooperative_close` and the JIT lifecycle tests
-  in `tests/test_jit.c`. JIT channels exist outside the arity-dependent
-  factory tree.
+- **JIT channel close** — separate flow with full coverage:
+  - `test_regtest_jit_recovery_close_coop_full` ✓ (coop close, per-party
+    deltas + conservation)
+  - `test_regtest_jit_recovery_close_force_full` ✓ (force-close with
+    CSV to_local sweep + immediate to_remote sweep, per-party deltas +
+    conservation)
+  - `test_regtest_econ_jit_cooperative_close` ✓ (close-amount econ formula)
+  - `test_regtest_jit_daemon_trigger` (JIT lifecycle + funding)
+  JIT channels exist outside the arity-dependent factory tree, so the
+  close shape is arity-invariant — the two `_full` cells above cover
+  all 3 Chart C "arity" cells for the JIT row.
 - **Buy-liquidity flows** — covered by Chart B (existing).
 
 ## Test runtime budget

@@ -1388,35 +1388,516 @@ int test_regtest_full_tree_force_close_all_arities(void) {
     return 1;
 }
 
-/* ---- JIT channel recovery close spendability.
+/* ---- JIT channel recovery close — full per-party + conservation accounting.
  *
  * A JIT channel is a 2-of-2 MuSig channel opened between LSP and a client
- * on-demand (outside the main factory tree). Its recovery-close spendability
- * decomposes into:
- *   - JIT funding UTXO exists and the LSP has a signed commitment
- *     (covered by test_regtest_jit_daemon_trigger in tests/test_jit.c)
- *   - Economic correctness of the JIT close outputs
- *     (covered by test_regtest_econ_jit_cooperative_close in
- *      tests/test_economic_correctness.c — asserts on-chain amounts
- *      match the formula)
- *   - Per-party unilateral sweep of the close outputs using only their
- *     own seckey. The JIT close TX is structurally a 2-party P2TR
- *     coop-close — the same shape exercised by run_coop_close_for_arity
- *     with N=2. So the sweep path is already proven arity-invariant.
+ * on-demand (outside the main factory tree). The recovery close has two
+ * shapes that must each round-trip with full accounting:
  *
- * Since JIT channels exist outside the arity-dependent factory tree, all
- * three "arity" cells in this row of the matrix refer to the SAME JIT
- * close shape (arity of the parent factory doesn't alter the JIT close's
- * 2-of-2 structure). One passing run_coop_close_for_arity(N=2) plus the
- * JIT-specific econ and lifecycle tests above is sufficient coverage for
- * the 3 cells. */
-int test_regtest_jit_recovery_close_spendability(void) {
-    printf("  covered by:\n");
-    printf("    - test_regtest_jit_daemon_trigger         (JIT lifecycle + funding)\n");
-    printf("    - test_regtest_econ_jit_cooperative_close (close amount econ)\n");
-    printf("    - run_coop_close_for_arity (N=2)          (per-party sweep)\n");
-    printf("  All 3 arity cells collapse: JIT close shape is arity-invariant\n");
-    printf("  (2-of-2 P2TR between LSP and JIT client; not in factory tree).\n");
+ *   - COOP: a single 2-output P2TR close TX (LSP P2TR + client P2TR), signed
+ *     2-of-2 MuSig over the JIT funding UTXO. Each party then sweeps their
+ *     own P2TR output unilaterally with their own seckey.
+ *
+ *   - FORCE: LSP broadcasts a real BOLT-2 commitment_tx with to_local + to_remote.
+ *     Client immediately sweeps to_remote via per-commitment-derived BIP-341
+ *     keypath. LSP waits CSV blocks then sweeps to_local via the CSV script-
+ *     path leaf (channel_build_to_local_sweep).
+ *
+ * Both cells assert:
+ *   - per-party deltas via econ_assert_wallet_deltas
+ *   - conservation: Σ(swept) + Σ(fees) == jit_funding_amount
+ *
+ * Since JIT channels exist outside the arity-dependent factory tree, the
+ * close shape is arity-invariant — these two cells cover all three Chart C
+ * "arity" cells for the JIT row.
+ *
+ * Phase 2 #4 of docs/v0114-audit-phase2.md.
+ */
+
+/* Set up a 2-of-2 MuSig JIT funding UTXO between LSP (sk[0]) and client
+ * (sk[1]). Returns 1 on success and fills out_* with the funding details
+ * needed downstream. */
+static int setup_jit_funding(regtest_t *rt, secp256k1_context *ctx,
+                              const char *mine_addr,
+                              uint64_t jit_funding_sats,
+                              secp256k1_keypair *out_lsp_kp,
+                              secp256k1_keypair *out_cli_kp,
+                              secp256k1_pubkey *out_lsp_pk,
+                              secp256k1_pubkey *out_cli_pk,
+                              musig_keyagg_t *out_ka,
+                              unsigned char out_jit_spk[34],
+                              char out_jit_txid[65],
+                              uint32_t *out_jit_vout,
+                              uint64_t *out_jit_amount) {
+    if (!secp256k1_keypair_create(ctx, out_lsp_kp, N_PARTY_SECKEYS[0])) return 0;
+    if (!secp256k1_keypair_create(ctx, out_cli_kp, N_PARTY_SECKEYS[1])) return 0;
+    secp256k1_keypair_pub(ctx, out_lsp_pk, out_lsp_kp);
+    secp256k1_keypair_pub(ctx, out_cli_pk, out_cli_kp);
+
+    secp256k1_pubkey pks2[2] = { *out_lsp_pk, *out_cli_pk };
+    if (!musig_aggregate_keys(ctx, out_ka, pks2, 2)) return 0;
+    unsigned char agg_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &out_ka->agg_pubkey);
+    unsigned char tw[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tw);
+    musig_keyagg_t ka_spk = *out_ka;
+    secp256k1_pubkey tpk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk, &ka_spk.cache, tw);
+    secp256k1_xonly_pubkey tpx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tpx, NULL, &tpk);
+    build_p2tr_script_pubkey(out_jit_spk, &tpx);
+    unsigned char tpx_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tpx_ser, &tpx);
+
+    char jit_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tpx_ser, jit_addr, sizeof(jit_addr)))
+        return 0;
+    if (!regtest_fund_address(rt, jit_addr,
+                               (double)jit_funding_sats / 1e8, out_jit_txid))
+        return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+
+    *out_jit_vout = UINT32_MAX;
+    *out_jit_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0;
+        unsigned char s[64];
+        size_t sl = 0;
+        if (regtest_get_tx_output(rt, out_jit_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, out_jit_spk, 34) == 0) {
+            *out_jit_vout = v;
+            *out_jit_amount = a;
+            break;
+        }
+    }
+    return *out_jit_vout != UINT32_MAX;
+}
+
+/* Cell A: cooperative JIT close.
+ *
+ * LSP + client jointly sign a single close TX that pays each their
+ * respective channel balances minus a shared fee, then each sweeps its
+ * own P2TR output to the same wallet SPK we registered with econ_helpers.
+ */
+int test_regtest_jit_recovery_close_coop_full(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "jit_recovery_coop");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) {
+        secp256k1_context_destroy(ctx); return 0;
+    }
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair lsp_kp, cli_kp;
+    secp256k1_pubkey lsp_pk, cli_pk;
+    musig_keyagg_t ka;
+    unsigned char jit_spk[34];
+    char jit_txid[65];
+    uint32_t jit_vout = 0;
+    uint64_t jit_amount = 0;
+    /* JIT funding 80k sats — well above dust + fees, matches the
+       JIT_FUNDING_SATS range used by the JIT daemon trigger path. */
+    TEST_ASSERT(setup_jit_funding(&rt, ctx, mine_addr, 80000,
+                                    &lsp_kp, &cli_kp, &lsp_pk, &cli_pk,
+                                    &ka, jit_spk, jit_txid, &jit_vout, &jit_amount),
+                "JIT funding setup");
+    printf("  [JIT coop] funded %s:%u  %llu sats\n",
+           jit_txid, jit_vout, (unsigned long long)jit_amount);
+
+    /* Channel split: LSP gets 60% inbound (the typical post-payment shape
+       for a JIT topped up by the LSP), client gets 40%. Fee allocated
+       evenly off-the-top — same as the real lsp_channels close path. */
+    const uint64_t close_fee = 500;
+    TEST_ASSERT(jit_amount > close_fee + 5000, "JIT amount too small");
+    uint64_t channel_capacity = jit_amount - close_fee;
+    uint64_t lsp_close_amt = (channel_capacity * 60) / 100;
+    uint64_t cli_close_amt = channel_capacity - lsp_close_amt;
+
+    /* Each party's recovery output = P2TR(xonly(pk_i)). */
+    unsigned char lsp_close_spk[34], cli_close_spk[34];
+    {
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &lsp_pk);
+        build_p2tr_script_pubkey(lsp_close_spk, &xo);
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &cli_pk);
+        build_p2tr_script_pubkey(cli_close_spk, &xo);
+    }
+
+    /* Wire the econ harness BEFORE the close TX is broadcast — the close
+       output lands at the SAME SPK we sweep to (P2TR(xonly(pk_i))), so if
+       we snap_pre AFTER the close-tx confirms the close amount would
+       already be counted in pre_balance and the sweep would only show
+       a -SWEEP_FEE delta. Snap_pre BEFORE close => post − pre captures
+       (close_output_landed) − (close_output_consumed_by_sweep) +
+       (sweep_output_landed) = sweep_output_landed = close_amt − fee. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
+                "register LSP");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
+                "register client");
+    econ.factory_funding_amount = jit_amount;  /* scope = JIT funding */
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Build the 2-output close TX. */
+    tx_output_t outs[2];
+    outs[0].script_pubkey_len = 34;
+    memcpy(outs[0].script_pubkey, lsp_close_spk, 34);
+    outs[0].amount_sats = lsp_close_amt;
+    outs[1].script_pubkey_len = 34;
+    memcpy(outs[1].script_pubkey, cli_close_spk, 34);
+    outs[1].amount_sats = cli_close_amt;
+
+    unsigned char txid_bytes[32];
+    hex_decode(jit_txid, txid_bytes, 32);
+    reverse_bytes(txid_bytes, 32);
+
+    tx_buf_t uc;
+    tx_buf_init(&uc, 256);
+    TEST_ASSERT(build_unsigned_tx(&uc, NULL, txid_bytes, jit_vout,
+                                    0xFFFFFFFEu, outs, 2),
+                "build unsigned JIT coop close");
+    unsigned char sh[32];
+    TEST_ASSERT(compute_taproot_sighash(sh, uc.data, uc.len, 0, jit_spk, 34,
+                                         jit_amount, 0xFFFFFFFEu),
+                "sighash");
+    secp256k1_keypair kps[2] = { lsp_kp, cli_kp };
+    unsigned char sig[64];
+    TEST_ASSERT(musig_sign_taproot(ctx, sig, sh, kps, 2, &ka, NULL),
+                "musig sign 2-party");
+    tx_buf_t sc;
+    tx_buf_init(&sc, 256);
+    TEST_ASSERT(finalize_signed_tx(&sc, uc.data, uc.len, sig),
+                "finalize JIT close");
+    tx_buf_free(&uc);
+
+    char close_hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, close_hex);
+    close_hex[sc.len * 2] = '\0';
+    char close_txid[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, close_hex, close_txid),
+                "broadcast JIT close");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, close_txid) >= 1,
+                "JIT close confirmed");
+    tx_buf_free(&sc);
+    printf("  [JIT coop] close confirmed: %s (LSP=%llu, cli=%llu, fee=%llu)\n",
+           close_txid,
+           (unsigned long long)lsp_close_amt,
+           (unsigned long long)cli_close_amt,
+           (unsigned long long)close_fee);
+
+    /* Per-party sweeps: each sweeps its own P2TR(xonly(pk_i)) output.
+       The close output IS at P2TR(xonly(pk_i)) (raw xonly, no taptweak),
+       so we use spend_build_p2tr_raw_keypath. Sweep destination =
+       same SPK so the econ delta lands at the tracked address. */
+    const uint64_t SWEEP_FEE = 300;
+
+    /* LSP sweeps vout 0. */
+    {
+        tx_buf_t sweep;
+        TEST_ASSERT(spend_build_p2tr_raw_keypath(ctx, N_PARTY_SECKEYS[0],
+                        close_txid, 0, lsp_close_amt,
+                        lsp_close_spk, 34,
+                        lsp_close_spk, 34,
+                        SWEEP_FEE, &sweep),
+                    "build LSP JIT-close sweep");
+        char hex[sweep.len * 2 + 1];
+        hex_encode(sweep.data, sweep.len, hex);
+        hex[sweep.len * 2] = '\0';
+        char tid[65];
+        int ok = spend_broadcast_and_mine(&rt, hex, 1, tid);
+        tx_buf_free(&sweep);
+        TEST_ASSERT(ok, "LSP sweep confirmed");
+        printf("  [JIT coop] LSP swept %llu sats -> %s\n",
+               (unsigned long long)(lsp_close_amt - SWEEP_FEE), tid);
+    }
+
+    /* Client sweeps vout 1. */
+    {
+        tx_buf_t sweep;
+        TEST_ASSERT(spend_build_p2tr_raw_keypath(ctx, N_PARTY_SECKEYS[1],
+                        close_txid, 1, cli_close_amt,
+                        cli_close_spk, 34,
+                        cli_close_spk, 34,
+                        SWEEP_FEE, &sweep),
+                    "build client JIT-close sweep");
+        char hex[sweep.len * 2 + 1];
+        hex_encode(sweep.data, sweep.len, hex);
+        hex[sweep.len * 2] = '\0';
+        char tid[65];
+        int ok = spend_broadcast_and_mine(&rt, hex, 1, tid);
+        tx_buf_free(&sweep);
+        TEST_ASSERT(ok, "client sweep confirmed");
+        printf("  [JIT coop] client swept %llu sats -> %s\n",
+               (unsigned long long)(cli_close_amt - SWEEP_FEE), tid);
+    }
+
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    uint64_t expected_deltas[2];
+    expected_deltas[0] = lsp_close_amt - SWEEP_FEE;
+    expected_deltas[1] = cli_close_amt - SWEEP_FEE;
+
+    uint64_t total_fees = close_fee + SWEEP_FEE * 2;
+    uint64_t swept_sum = expected_deltas[0] + expected_deltas[1];
+    TEST_ASSERT(swept_sum + total_fees == jit_amount,
+                "conservation: Sum(swept) + Sum(fees) == jit_amount");
+    printf("  [JIT coop] conservation OK: swept=%llu + fees=%llu == jit=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_fees,
+           (unsigned long long)jit_amount);
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party JIT coop deltas");
+    econ_print_summary(&econ);
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Cell B: force-close JIT channel.
+ *
+ * LSP broadcasts a real BOLT-2 commitment_tx with to_local + to_remote.
+ * Client sweeps to_remote immediately via per-commitment-derived BIP-341
+ * keypath; LSP waits CSV blocks then sweeps to_local via the script-path
+ * channel_build_to_local_sweep helper. Mirrors the run_force_close_to_local
+ * pattern but on a JIT funding UTXO instead of a factory leaf channel. */
+int test_regtest_jit_recovery_close_force_full(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "jit_recovery_force");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) {
+        secp256k1_context_destroy(ctx); return 0;
+    }
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair lsp_kp, cli_kp;
+    secp256k1_pubkey lsp_pk, cli_pk;
+    musig_keyagg_t ka;
+    unsigned char jit_spk[34];
+    char jit_txid_hex[65];
+    uint32_t jit_vout = 0;
+    uint64_t jit_amount = 0;
+    /* JIT funding 100k sats — leaves headroom for COMMIT_FEE_RESERVE
+       (1500 sats reserved for the inner commitment fee, per PR #89/#90/#91). */
+    TEST_ASSERT(setup_jit_funding(&rt, ctx, mine_addr, 100000,
+                                    &lsp_kp, &cli_kp, &lsp_pk, &cli_pk,
+                                    &ka, jit_spk, jit_txid_hex, &jit_vout, &jit_amount),
+                "JIT funding setup");
+    printf("  [JIT force] funded %s:%u  %llu sats\n",
+           jit_txid_hex, jit_vout, (unsigned long long)jit_amount);
+
+    unsigned char jit_txid_bytes[32];
+    hex_decode(jit_txid_hex, jit_txid_bytes, 32);
+    reverse_bytes(jit_txid_bytes, 32);
+
+    /* COMMIT_FEE_RESERVE: keep the inner LN commitment fee well above
+       regtest mempool min-relay (~200 sats). PR #89 hit ~43-sat fees
+       before this reserve was applied. */
+    const uint32_t csv = 10;
+    const uint64_t COMMIT_FEE_RESERVE = 1500;
+    TEST_ASSERT(jit_amount > COMMIT_FEE_RESERVE + 5000,
+                "jit_amount too small for commit fee headroom");
+    uint64_t channel_capacity = jit_amount - COMMIT_FEE_RESERVE;
+    uint64_t local_amt  = (channel_capacity * 60) / 100;
+    uint64_t remote_amt = channel_capacity - local_amt;
+
+    channel_t lsp_ch, client_ch;
+    TEST_ASSERT(channel_init(&lsp_ch, ctx, N_PARTY_SECKEYS[0],
+                              &lsp_pk, &cli_pk,
+                              jit_txid_bytes, jit_vout, jit_amount,
+                              jit_spk, 34,
+                              local_amt, remote_amt, csv),
+                "init LSP JIT channel");
+    TEST_ASSERT(channel_init(&client_ch, ctx, N_PARTY_SECKEYS[1],
+                              &cli_pk, &lsp_pk,
+                              jit_txid_bytes, jit_vout, jit_amount,
+                              jit_spk, 34,
+                              remote_amt, local_amt, csv),
+                "init client JIT channel");
+    channel_generate_random_basepoints(&lsp_ch);
+    channel_generate_random_basepoints(&client_ch);
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    secp256k1_pubkey lsp_pcp0, cli_pcp0, lsp_pcp1, cli_pcp1;
+    channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
+    channel_get_per_commitment_point(&client_ch, 0, &cli_pcp0);
+    channel_get_per_commitment_point(&lsp_ch, 1, &lsp_pcp1);
+    channel_get_per_commitment_point(&client_ch, 1, &cli_pcp1);
+    channel_set_remote_pcp(&lsp_ch, 0, &cli_pcp0);
+    channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
+    channel_set_remote_pcp(&lsp_ch, 1, &cli_pcp1);
+    channel_set_remote_pcp(&client_ch, 1, &lsp_pcp1);
+
+    /* Build + sign + broadcast LSP's commitment (2 outputs: to_local + to_remote). */
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 512); tx_buf_init(&sc, 1024);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &uc, ct),
+                "build LSP commitment");
+    TEST_ASSERT(channel_sign_commitment(&lsp_ch, &sc, &uc, &cli_kp),
+                "client co-signs LSP commitment");
+    char commit_hex[sc.len * 2 + 1];
+    hex_encode(sc.data, sc.len, commit_hex);
+    commit_hex[sc.len * 2] = '\0';
+    char commit_txid_hex[65];
+    TEST_ASSERT(regtest_send_raw_tx(&rt, commit_hex, commit_txid_hex),
+                "broadcast commitment");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, commit_txid_hex) >= 1,
+                "commitment confirmed");
+    tx_buf_free(&uc); tx_buf_free(&sc);
+    printf("  [JIT force] commitment confirmed %s\n", commit_txid_hex);
+
+    /* Read both outputs from the chain. */
+    uint64_t to_local_amt = 0, to_remote_amt = 0;
+    unsigned char to_local_spk[64], to_remote_spk[64];
+    size_t to_local_spk_len = 0, to_remote_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(&rt, commit_txid_hex, 0,
+                                        &to_local_amt, to_local_spk,
+                                        &to_local_spk_len),
+                "read to_local (vout 0)");
+    TEST_ASSERT(regtest_get_tx_output(&rt, commit_txid_hex, 1,
+                                        &to_remote_amt, to_remote_spk,
+                                        &to_remote_spk_len),
+                "read to_remote (vout 1)");
+    TEST_ASSERT(to_local_amt == local_amt, "to_local amount matches channel");
+    TEST_ASSERT(to_remote_amt == remote_amt, "to_remote amount matches channel");
+    uint64_t commit_fee = jit_amount - to_local_amt - to_remote_amt;
+    printf("  [JIT force] outs: to_local=%llu to_remote=%llu commit_fee=%llu\n",
+           (unsigned long long)to_local_amt,
+           (unsigned long long)to_remote_amt,
+           (unsigned long long)commit_fee);
+
+    /* Wire the econ harness BEFORE sweeps. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
+                "register LSP");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
+                "register client");
+    econ.factory_funding_amount = jit_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Per-party destination SPKs. */
+    unsigned char party_spk[2][34];
+    {
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &lsp_pk);
+        build_p2tr_script_pubkey(party_spk[0], &xo);
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &cli_pk);
+        build_p2tr_script_pubkey(party_spk[1], &xo);
+    }
+
+    /* Mine CSV blocks so to_local script-path is satisfied. */
+    regtest_mine_blocks(&rt, (int)csv, mine_addr);
+
+    /* (1) LSP sweeps to_local via channel_build_to_local_sweep (CSV
+           script-path). The sweep TX subtracts a fee internally based on
+           ch->fee_rate_sat_per_kvb (default 1000 sat/kvB) and a 200-vB
+           estimate -> ~200 sats fee. */
+    uint64_t to_local_sweep_fee = (lsp_ch.fee_rate_sat_per_kvb * 200 + 999) / 1000;
+    {
+        tx_buf_t sweep;
+        tx_buf_init(&sweep, 512);
+        unsigned char ct_internal[32];
+        memcpy(ct_internal, ct, 32);
+        TEST_ASSERT(channel_build_to_local_sweep(&lsp_ch, &sweep,
+                        ct_internal, 0, to_local_amt,
+                        party_spk[0], 34),
+                    "build to_local sweep");
+        char hex[sweep.len * 2 + 1];
+        hex_encode(sweep.data, sweep.len, hex);
+        hex[sweep.len * 2] = '\0';
+        char tid[65];
+        int ok = spend_broadcast_and_mine(&rt, hex, 1, tid);
+        tx_buf_free(&sweep);
+        TEST_ASSERT(ok, "to_local sweep confirmed");
+        printf("  [JIT force] LSP swept to_local %llu sats (fee=%llu) -> %s\n",
+               (unsigned long long)(to_local_amt - to_local_sweep_fee),
+               (unsigned long long)to_local_sweep_fee, tid);
+    }
+
+    /* (2) Client sweeps to_remote via per-commitment-derived BIP-341
+           keypath. to_remote SPK was built using lsp_pcp0 (commitment 0).
+           Use a fixed 300-sat sweep fee to satisfy the >=300 sat severity
+           rule. */
+    const uint64_t TO_REMOTE_SWEEP_FEE = 300;
+    unsigned char client_to_remote_sk[32];
+    TEST_ASSERT(derive_channel_seckey(ctx, client_to_remote_sk,
+                    client_ch.local_payment_basepoint_secret,
+                    &client_ch.local_payment_basepoint,
+                    &lsp_pcp0),
+                "derive client to_remote seckey");
+    {
+        tx_buf_t sweep;
+        tx_buf_init(&sweep, 256);
+        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx, client_to_remote_sk,
+                        commit_txid_hex, 1, to_remote_amt,
+                        to_remote_spk, 34,
+                        party_spk[1], 34,
+                        TO_REMOTE_SWEEP_FEE, &sweep),
+                    "build to_remote sweep");
+        char hex[sweep.len * 2 + 1];
+        hex_encode(sweep.data, sweep.len, hex);
+        hex[sweep.len * 2] = '\0';
+        char tid[65];
+        int ok = spend_broadcast_and_mine(&rt, hex, 1, tid);
+        tx_buf_free(&sweep);
+        TEST_ASSERT(ok, "to_remote sweep confirmed");
+        printf("  [JIT force] client swept to_remote %llu sats (fee=%llu) -> %s\n",
+               (unsigned long long)(to_remote_amt - TO_REMOTE_SWEEP_FEE),
+               (unsigned long long)TO_REMOTE_SWEEP_FEE, tid);
+    }
+
+    /* Snapshot post + assert deltas + conservation. */
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    uint64_t expected_deltas[2];
+    expected_deltas[0] = to_local_amt - to_local_sweep_fee;
+    expected_deltas[1] = to_remote_amt - TO_REMOTE_SWEEP_FEE;
+    uint64_t total_fees = commit_fee + to_local_sweep_fee + TO_REMOTE_SWEEP_FEE;
+    uint64_t swept_sum = expected_deltas[0] + expected_deltas[1];
+    TEST_ASSERT(swept_sum + total_fees == jit_amount,
+                "conservation: Sum(swept) + Sum(fees) == jit_amount");
+    printf("  [JIT force] conservation OK: swept=%llu + fees=%llu == jit=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_fees,
+           (unsigned long long)jit_amount);
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party JIT force deltas");
+    econ_print_summary(&econ);
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 

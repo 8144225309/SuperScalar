@@ -77,14 +77,22 @@ For each:
 - Verify accounting: each advance subtracted `fee_per_tx` from channel,
   ending channel sweep equals `initial_chan - N*fee - sweep_fee`
 
-### 4. JIT recovery close spendability (#107)  `[ ]`
+### 4. JIT recovery close spendability (#107)  `[~]`
 
-Last open spendability cell from Chart C. JIT close shape == 2-party
-coop close which is structurally proven by `run_coop_close_for_arity(N=2)`.
-This item adds an explicit JIT-specific test:
+Last open spendability cell from Chart C. JIT close shape is arity-invariant
+(2-of-2 between LSP + JIT client, outside the factory tree), so a single
+pair of cells covers all 3 Chart C "arity" cells for the JIT row:
 
-- `test_regtest_jit_recovery_close_full` — open JIT channel via the
-  daemon, force-close, sweep, verify accounting
+- `test_regtest_jit_recovery_close_coop_full` — 2-of-2 MuSig coop close TX
+  with LSP P2TR + client P2TR outputs; each party sweeps its own output.
+- `test_regtest_jit_recovery_close_force_full` — LSP broadcasts a real
+  BOLT-2 commitment_tx with to_local + to_remote; client sweeps to_remote
+  immediately via per-commit BIP-341 keypath; LSP waits CSV(10) blocks
+  then sweeps to_local via channel_build_to_local_sweep.
+
+Both cells assert per-party deltas via `econ_assert_wallet_deltas` AND
+conservation `Σ(swept) + Σ(fees) == jit_funding_amount`. The force cell
+applies COMMIT_FEE_RESERVE = 1500 sats from PR #89/#90/#91.
 
 ### 5. Hybrid CLN test (#73)  `[ ]`
 
@@ -122,8 +130,8 @@ ceiling and surface it to the user as a hard limit.
 |---|----|--------|-------|
 | 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
 | 2 | #90 | `[x]` | 3 HTLC×breach cells merged; commit-fee reserve applied |
-| 3 | #91 | `[~]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; PR open |
-| 4 | TBD | `[ ]` | not started |
+| 3 | #91 | `[x]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; merged |
+| 4 | #92 | `[~]` | 2 cells (coop, force) PASS on VPS with full conservation + per-party deltas; PR open |
 | 5 | TBD | `[ ]` | not started |
 | 6 | TBD | `[ ]` | not started |
 | 7 | TBD | `[ ]` | not started |
