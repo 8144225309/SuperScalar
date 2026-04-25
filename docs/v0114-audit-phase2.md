@@ -120,7 +120,7 @@ ceiling and surface it to the user as a hard limit.
 
 | # | PR | Status | Notes |
 |---|----|--------|-------|
-| 1 | TBD-PR (test/phase2-htlc-force-to-local) | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
+| 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
 | 2 | TBD | `[ ]` | not started |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
