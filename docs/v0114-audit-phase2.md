@@ -132,8 +132,8 @@ ceiling and surface it to the user as a hard limit.
 | 2 | #90 | `[x]` | 3 HTLC×breach cells merged; commit-fee reserve applied |
 | 3 | #91 | `[x]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; merged |
 | 4 | #92 | `[x]` | 2 cells (coop, force) PASS on VPS; merged |
-| 5 | #93 | `[~]` | Real CLN+LSP+SS topology; payment routed across boundary; PR open (CI gap: no CLN in GitHub Actions, VPS is source of truth) |
-| 6 | TBD | `[ ]` | not started |
+| 5 | #93 | `[x]` | Real CLN+LSP+SS topology; payment routed across boundary; merged (CI gap: no CLN in GitHub Actions, VPS is source of truth) |
+| 6 | #94 | `[~]` | Mixed `{2,4,8}` factory at N=12 (1 LSP + 11 clients) → 6 leaves (5 arity-2 + 1 arity-1, 11 client channels). Tree broadcast on regtest VPS, all 6 leaves swept with conservation + per-party `econ_assert_wallet_deltas` for all 12 parties; PR open |
 | 7 | TBD | `[ ]` | not started |
 
 ## Done means

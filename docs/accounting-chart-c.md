@@ -40,7 +40,13 @@ on `ARITY_1` and `ARITY_2` makes no sense), leaving 33 meaningful cells.
 | breach | S `test_regtest_breach_penalty_spendability` | S | S |
 | rotation | ✓ `run_rotation_for_arity(ARITY_1)` + `test_regtest_econ_rotation_arity1` | ✓ `run_rotation_for_arity(ARITY_2)` + `test_regtest_econ_rotation_arity2` | ✓ `run_rotation_for_arity(ARITY_PS)` + `test_regtest_econ_rotation_arity_ps` |
 | PS-advance | — | — | ✓ `test_regtest_econ_ps_advance` (in-process); on-chain chain advance + sweep covered by `test_regtest_full_force_close_and_sweep_arity_ps_chain_len2` and `..._chain_len5` (Phase 2 #3) |
-| full-tree | ✓ `test_regtest_full_force_close_and_sweep_arity1` | (pending PR by #137 agent) | (pending PR by #137 agent) |
+| full-tree | ✓ `test_regtest_full_force_close_and_sweep_arity1` | ✓ `test_regtest_full_force_close_and_sweep_arity2` | ✓ `test_regtest_full_force_close_and_sweep_arityPS` |
+
+### Cross-cell: mixed-arity production lifecycle
+
+| Shape | Coverage |
+|---|---|
+| `{2,4,8}` (N=12, 5 arity-2 + 1 arity-1 leaves, 11 client channels) | ✓ `test_regtest_mixed_arity_2_4_8_lifecycle` (Phase 2 #6) — first end-to-end proof that the mixed-arity CLI shape from PR #81 + `docs/factory-arity.md` builds, broadcasts, sweeps, and balances under regtest. Conservation + per-party `econ_assert_wallet_deltas` for all 12 parties. |
 
 ## Chart C: HTLC-mid-flight slice
 
