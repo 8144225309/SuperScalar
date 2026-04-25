@@ -2793,11 +2793,19 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
     secp256k1_keypair_pub(ctx, &client_pk, &kps[client_idx]);
 
-    /* Channel balances: 70/30 split of leaf_chan_amt.
-       to_self_delay = 10 (CSV sweep delay). */
+    /* Channel balances: reserve enough for the commitment TX fee, then
+       split the remainder 70/30. The channel_init balances become the
+       to_local/to_remote amounts on the commitment, so leaf_chan_amt -
+       (local + remote) is the commit fee paid to miners.
+       Regtest mempool min-relay is ~200 sats for a ~200 vB TX; we reserve
+       1500 to stay well clear of mempool floor across all leaf sizes. */
     const uint32_t csv = 10;
-    uint64_t local_amt  = (leaf_chan_amt * 70) / 100;  /* LSP local */
-    uint64_t remote_amt = leaf_chan_amt - local_amt;   /* client */
+    const uint64_t COMMIT_FEE_RESERVE = 1500;
+    TEST_ASSERT(leaf_chan_amt > COMMIT_FEE_RESERVE + 20000,
+                "leaf_chan_amt too small for HTLC + commit fee");
+    uint64_t channel_capacity = leaf_chan_amt - COMMIT_FEE_RESERVE;
+    uint64_t local_amt  = (channel_capacity * 70) / 100;  /* LSP local */
+    uint64_t remote_amt = channel_capacity - local_amt;   /* client */
 
     channel_t lsp_ch, client_ch;
     TEST_ASSERT(channel_init(&lsp_ch, ctx, N_PARTY_SECKEYS[0],
