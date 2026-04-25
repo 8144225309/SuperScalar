@@ -131,7 +131,7 @@ ceiling and surface it to the user as a hard limit.
 | 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
 | 2 | #90 | `[x]` | 3 HTLC×breach cells merged; commit-fee reserve applied |
 | 3 | #91 | `[x]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; merged |
-| 4 | TBD | `[~]` | 2 cells (coop, force) PASS on VPS with full conservation + per-party deltas; PR open |
+| 4 | #92 | `[~]` | 2 cells (coop, force) PASS on VPS with full conservation + per-party deltas; PR open |
 | 5 | TBD | `[ ]` | not started |
 | 6 | TBD | `[ ]` | not started |
 | 7 | TBD | `[ ]` | not started |
