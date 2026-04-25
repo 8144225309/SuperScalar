@@ -61,7 +61,7 @@ For each cell:
   including HTLC value; the breacher gets zero
 - Conservation: `Σ(swept) + Σ(fees) == fund_amount`
 
-### 3. PS chain-advance sweep with accounting  `[ ]`
+### 3. PS chain-advance sweep with accounting  `[x]`
 
 #137 covered PS at `chain_len=0`. Extend to `chain_len >= 2`:
 
@@ -121,8 +121,8 @@ ceiling and surface it to the user as a hard limit.
 | # | PR | Status | Notes |
 |---|----|--------|-------|
 | 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
-| 2 | TBD | `[~]` | tests written; verifying via CI (commit-fee reserve applied) |
-| 3 | TBD | `[ ]` | not started |
+| 2 | #90 | `[x]` | 3 HTLC×breach cells merged; commit-fee reserve applied |
+| 3 | #91 | `[~]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; PR open |
 | 4 | TBD | `[ ]` | not started |
 | 5 | TBD | `[ ]` | not started |
 | 6 | TBD | `[ ]` | not started |
