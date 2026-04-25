@@ -36,7 +36,7 @@ Five new tests in `tests/test_close_spendability_full.c`:
   `bad-txns-inputs-missingorspent`. Proves PS non-revocability at the
   chain level (not just persist defense)
 
-### 2. PS at N=32 on regtest with full accounting  `[ ]`
+### 2. PS at N=32 on regtest with full accounting  `[~]`
 
 Two new tests:
 
@@ -73,7 +73,7 @@ mainnet."
 | # | PR | Status | Notes |
 |---|----|--------|-------|
 | 1 | #97 | `[x]` | 5 cells PASS on VPS (N=8/N=16 lifecycle + heterogeneous chains + adversarial old-state-broadcast). All N parties' deltas exact. Adversarial returns `bad-txns-inputs-missingorspent` — chain-level non-revocability proven. |
-| 2 | TBD | `[ ]` | not started — gated on #1 |
+| 2 | TBD | `[~]` | 2 cells PASS on VPS (N=32 lifecycle + heterogeneous chains). Lifecycle: 122 nodes broadcast, 31 leaves swept + 31 L-stocks swept, 32-way MuSig at root, conservation 19,953,900 + 21,700 == 19,975,600. Heterogeneous: chain_lens cycling {0..5} across 31 leaves, all 32 parties' deltas exact, conservation 19,938,900 + 21,700 + 15,000 advance fees == 19,975,600. |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
 

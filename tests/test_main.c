@@ -1131,6 +1131,8 @@ extern int test_regtest_ps_full_lifecycle_n8(void);
 extern int test_regtest_ps_heterogeneous_chains_n8(void);
 extern int test_regtest_ps_full_lifecycle_n16(void);
 extern int test_regtest_ps_heterogeneous_chains_n16(void);
+extern int test_regtest_ps_full_lifecycle_n32(void);
+extern int test_regtest_ps_heterogeneous_chains_n32(void);
 extern int test_regtest_ps_old_state_broadcast_fails_n8(void);
 extern int test_regtest_htlc_force_to_local_arity1(void);
 extern int test_regtest_htlc_force_to_local_arity2(void);
@@ -3661,6 +3663,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_ps_heterogeneous_chains_n8);
     RUN_TEST(test_regtest_ps_full_lifecycle_n16);
     RUN_TEST(test_regtest_ps_heterogeneous_chains_n16);
+    RUN_TEST(test_regtest_ps_full_lifecycle_n32);
+    RUN_TEST(test_regtest_ps_heterogeneous_chains_n32);
     RUN_TEST(test_regtest_ps_old_state_broadcast_fails_n8);
     RUN_TEST(test_regtest_htlc_force_to_local_arity1);
     RUN_TEST(test_regtest_htlc_force_to_local_arity2);

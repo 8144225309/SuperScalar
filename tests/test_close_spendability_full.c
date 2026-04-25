@@ -5190,6 +5190,45 @@ static const unsigned char N16_PARTY_SECKEYS[16][32] = {
     { [0 ... 30] = 0, [31] = 0x10 },  /* client 15 */
 };
 
+/* N=32 seckeys for Phase 3 #2 (PS at N=32 on regtest).
+   First byte 0xFE distinguishes from N16_PARTY_SECKEYS so the derived
+   wallet addresses do not collide with concurrent N=8/N=16 cells.
+   Last byte (i+1) keeps each party's seckey unique. */
+static const unsigned char N32_PARTY_SECKEYS[32][32] = {
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x01 },  /* LSP */
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x02 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x03 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x04 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x05 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x06 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x07 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x08 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x09 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0A },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0B },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0C },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0D },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0E },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x0F },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x10 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x11 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x12 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x13 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x14 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x15 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x16 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x17 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x18 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x19 },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1A },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1B },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1C },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1D },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1E },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x1F },
+    { [0] = 0xFE, [1 ... 30] = 0, [31] = 0x20 },
+};
+
 /* Build N-way MuSig + BIP-341 taptweak P2TR funding SPK for N parties.
    Caller provides keypairs + pubkeys arrays sized for N. */
 static int build_n_party_funding_spk(secp256k1_context *ctx,
@@ -5457,8 +5496,9 @@ static int run_ps_full_lifecycle(regtest_t *rt,
                                    double fund_btc,
                                    const unsigned char (*seckeys)[32],
                                    const char *mine_addr) {
-    secp256k1_keypair kps[16];
-    secp256k1_pubkey  pks[16];
+    /* Sized for N up to 32 (Phase 3 #2 raised N from 16 to 32). */
+    secp256k1_keypair kps[32];
+    secp256k1_pubkey  pks[32];
     factory_t *f = calloc(1, sizeof(factory_t));
     if (!f) return 0;
 
@@ -5487,8 +5527,9 @@ static int run_ps_full_lifecycle(regtest_t *rt,
     printf("  full tree broadcast OK -- %zu nodes, %d leaves chain[0] confirmed\n",
            f->n_nodes, n_leaves);
 
-    /* Per-leaf chain advance + broadcast. Stash bytes + txids for sweep step. */
-    ps_leaf_chain_t leaf_chains[16] = {0};
+    /* Per-leaf chain advance + broadcast. Stash bytes + txids for sweep step.
+       Sized for N=32 (31 leaves max). */
+    ps_leaf_chain_t leaf_chains[32] = {0};
     uint64_t total_advance_fees = 0;
     uint64_t fee_per_tx = f->fee_per_tx;
     for (int li = 0; li < n_leaves; li++) {
@@ -5506,8 +5547,8 @@ static int run_ps_full_lifecycle(regtest_t *rt,
         total_advance_fees += (uint64_t)n_adv * fee_per_tx;
     }
 
-    /* Build per-party P2TR(xonly(pk_i)) destinations. */
-    unsigned char party_spk[16][34];
+    /* Build per-party P2TR(xonly(pk_i)) destinations. Sized for N=32. */
+    unsigned char party_spk[32][34];
     for (size_t p = 0; p < N; p++) {
         secp256k1_xonly_pubkey xo;
         secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pks[p]);
@@ -5517,7 +5558,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
     /* Wire econ harness for all N parties BEFORE any sweeps. */
     econ_ctx_t econ;
     econ_ctx_init(&econ, rt, ctx);
-    char party_name_buf[16][32];
+    char party_name_buf[32][32];
     snprintf(party_name_buf[0], 32, "LSP");
     for (size_t p = 1; p < N; p++)
         snprintf(party_name_buf[p], 32, "client%02zu", p);
@@ -5535,7 +5576,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
     const uint64_t SIMULATED_ROUTING_FEE = 100;
     const uint64_t CLIENT_BALANCE_SHIFT  = SIMULATED_PAYMENT + SIMULATED_ROUTING_FEE;
 
-    uint64_t per_party_recv[16] = {0};
+    uint64_t per_party_recv[32] = {0};
     uint64_t total_sweep_fees   = 0;
     uint64_t total_allocated    = 0;
 
@@ -5625,7 +5666,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
            (unsigned long long)total_advance_fees,
            (unsigned long long)total_allocated);
 
-    uint64_t expected_deltas[16];
+    uint64_t expected_deltas[32];
     for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
     TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
                 "per-party wallet deltas match expected");
@@ -5732,6 +5773,87 @@ int test_regtest_ps_heterogeneous_chains_n16(void) {
     int chain_lens[15] = {0, 1, 2, 0, 5, 0, 3, 0, 1, 4, 0, 2, 0, 1, 5};
     int ok = run_ps_full_lifecycle(&rt, ctx, 16, chain_lens, 0.10,
                                      N16_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+/* ============================================================================
+ *  Phase 3 #2: PS at N=32 on regtest with full accounting.
+ *
+ *  Reuses the helpers added by PR #97 (build_ps_factory_n,
+ *  broadcast_factory_tree, advance_and_broadcast_leaf_chain,
+ *  sweep_ps_channel_n_party, run_ps_full_lifecycle). Two cells:
+ *
+ *  - test_regtest_ps_full_lifecycle_n32: LSP + 31 clients, all leaves
+ *    chain_len=0. Exercises the 32-way MuSig at the root and 31 channel
+ *    sweeps + 31 L-stock sweeps. ~62 nodes broadcast on real chain.
+ *
+ *  - test_regtest_ps_heterogeneous_chains_n32: same N but mixed chain
+ *    depths across the 31 leaves (alternating 0..5), so each client pays
+ *    a different number of advance fees and the conservation equation
+ *    has to balance over a richer ledger.
+ *
+ *  Both assert per-party deltas for ALL 32 parties via
+ *  econ_assert_wallet_deltas + conservation including all advance fees.
+ *  ========================================================================== */
+
+int test_regtest_ps_full_lifecycle_n32(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_full_lc_n32");
+    rt.scan_depth = 2400;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=32, all leaves chain_len=0. fund 0.20 BTC = 20,000,000 sats so
+       each of 31 leaves gets ~600k sats channel allocation after the
+       ~62 internal-tree fees (62 * 200 = 12,400 sats) are paid. */
+    int ok = run_ps_full_lifecycle(&rt, ctx, 32, NULL, 0.20,
+                                     N32_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_ps_heterogeneous_chains_n32(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_het_chains_n32");
+    rt.scan_depth = 2400;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=32 -> 31 leaves with alternating chain depths {0..5} cycling.
+       The cycle ensures every depth in {0,1,2,3,4,5} is exercised at
+       multiple positions, and every client pays a different number of
+       advance fees so per-party deltas all differ. */
+    int chain_lens[31] = {
+        0, 1, 2, 3, 4, 5,
+        0, 1, 2, 3, 4, 5,
+        0, 1, 2, 3, 4, 5,
+        0, 1, 2, 3, 4, 5,
+        0, 1, 2, 3, 4, 5,
+        0
+    };
+    int ok = run_ps_full_lifecycle(&rt, ctx, 32, chain_lens, 0.20,
+                                     N32_PARTY_SECKEYS, mine_addr);
     secp256k1_context_destroy(ctx);
     return ok;
 }

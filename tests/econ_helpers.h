@@ -29,7 +29,7 @@
  *   econ_assert_wallet_deltas(&ctx, expected_deltas[]);
  */
 
-#define ECON_MAX_PARTIES 16
+#define ECON_MAX_PARTIES 32
 
 typedef struct {
     char     name[32];
