@@ -2992,7 +2992,9 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     /* htlc-timeout fee from channel.c:2103: rate * 180 + 999 / 1000.
        Lands at P2TR(taptweak(local_payment_basepoint)) -- NOT at LSP's
        P2TR(LSP-pk). It's a 1-output sweep that is itself further spendable
-       only by the LSP via the BIP-341-tweaked local_payment seckey. */
+       only by the LSP via the BIP-341-tweaked local_payment basepoint
+       secret (the basepoint, NOT a per-commitment-derived key). The exact
+       fee is recomputed below from on-chain truth. */
     uint64_t htlc_sweep_fee = (lsp_ch.fee_rate_sat_per_kvb * 180 + 999) / 1000;
     uint64_t htlc_intermediate = htlc_out_amt - htlc_sweep_fee;
     tx_buf_free(&htlc_sweep);
@@ -3006,26 +3008,15 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
        To make the accounting land at LSP's wallet (P2TR(xonly(LSP-pk))) we
        sweep again with the BIP-341 keypath using the per-commitment-derived
        local_payment seckey -- same primitive the to_remote sweep uses. */
-    /* IMPORTANT: channel_add_htlc() bumped ch->commitment_number from 0 to 1,
-       so the broadcast commitment was built at commitment_number=1 — its
-       per-commitment-derived keys all use lsp_pcp1, not lsp_pcp0. The LSP's
-       own PCP at index 1 is what derives the HTLC-timeout output's
-       local_payment key. */
-    unsigned char lsp_payment_sk[32];
-    TEST_ASSERT(derive_channel_seckey(ctx, lsp_payment_sk,
-                                        lsp_ch.local_payment_basepoint_secret,
-                                        &lsp_ch.local_payment_basepoint,
-                                        &lsp_pcp1),
-                "derive LSP local_payment seckey");
-    /* HTLC-timeout output SPK = P2TR(BIP-341-tweaked(LSP local_payment)). */
-    secp256k1_pubkey lsp_payment_derived;
-    TEST_ASSERT(channel_derive_pubkey(ctx, &lsp_payment_derived,
-                                        &lsp_ch.local_payment_basepoint,
-                                        &lsp_pcp1),
-                "derive LSP local_payment pubkey");
+    /* The HTLC-timeout TX's single output is P2TR(BIP-341-tweaked(
+       local_payment_BASEPOINT)) -- per src/channel.c:2083, it taproots the
+       basepoint xonly pubkey directly, NOT a per-commitment-derived key.
+       So we sign with the basepoint secret + BIP-341 taptweak, NOT a
+       per-commitment derived seckey. Recompute the SPK from the basepoint
+       and confirm match by reading vout[0] from the chain. */
     secp256k1_xonly_pubkey lsp_payment_xo;
     secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_payment_xo, NULL,
-                                        &lsp_payment_derived);
+                                        &lsp_ch.local_payment_basepoint);
     unsigned char lsp_payment_ser[32];
     secp256k1_xonly_pubkey_serialize(ctx, lsp_payment_ser, &lsp_payment_xo);
     unsigned char lsp_payment_taptweak[32];
@@ -3039,10 +3030,29 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     unsigned char htlc_2nd_in_spk[34];
     build_p2tr_script_pubkey(htlc_2nd_in_spk, &lsp_payment_tw);
 
+    /* Verify the on-chain HTLC-timeout output matches our computed SPK and
+       use the actual on-chain amount (avoids any drift if channel.c changes
+       its fee model). */
+    uint64_t htlc_2nd_in_amt = 0;
+    unsigned char htlc_2nd_chain_spk[64];
+    size_t htlc_2nd_chain_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, htlc_sweep_txid, 0,
+                    &htlc_2nd_in_amt, htlc_2nd_chain_spk,
+                    &htlc_2nd_chain_spk_len),
+                "read HTLC-timeout output from chain");
+    TEST_ASSERT(htlc_2nd_chain_spk_len == 34 &&
+                memcmp(htlc_2nd_chain_spk, htlc_2nd_in_spk, 34) == 0,
+                "computed HTLC-timeout SPK matches on-chain SPK");
+    /* Reconcile our local accounting with on-chain truth — the actual
+       htlc-timeout fee is whatever the chain consumed. */
+    htlc_sweep_fee = htlc_out_amt - htlc_2nd_in_amt;
+    htlc_intermediate = htlc_2nd_in_amt;
+
     tx_buf_t htlc_2nd;
     tx_buf_init(&htlc_2nd, 256);
     const uint64_t SECOND_STAGE_FEE = 300;
-    TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx, lsp_payment_sk,
+    TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                    lsp_ch.local_payment_basepoint_secret,
                     htlc_sweep_txid, 0, htlc_intermediate,
                     htlc_2nd_in_spk, 34,
                     party_spk[0], 34,
