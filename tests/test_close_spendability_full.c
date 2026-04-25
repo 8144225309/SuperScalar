@@ -3006,17 +3006,22 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
        To make the accounting land at LSP's wallet (P2TR(xonly(LSP-pk))) we
        sweep again with the BIP-341 keypath using the per-commitment-derived
        local_payment seckey -- same primitive the to_remote sweep uses. */
+    /* IMPORTANT: channel_add_htlc() bumped ch->commitment_number from 0 to 1,
+       so the broadcast commitment was built at commitment_number=1 — its
+       per-commitment-derived keys all use lsp_pcp1, not lsp_pcp0. The LSP's
+       own PCP at index 1 is what derives the HTLC-timeout output's
+       local_payment key. */
     unsigned char lsp_payment_sk[32];
     TEST_ASSERT(derive_channel_seckey(ctx, lsp_payment_sk,
                                         lsp_ch.local_payment_basepoint_secret,
                                         &lsp_ch.local_payment_basepoint,
-                                        &lsp_pcp0),
+                                        &lsp_pcp1),
                 "derive LSP local_payment seckey");
     /* HTLC-timeout output SPK = P2TR(BIP-341-tweaked(LSP local_payment)). */
     secp256k1_pubkey lsp_payment_derived;
     TEST_ASSERT(channel_derive_pubkey(ctx, &lsp_payment_derived,
                                         &lsp_ch.local_payment_basepoint,
-                                        &lsp_pcp0),
+                                        &lsp_pcp1),
                 "derive LSP local_payment pubkey");
     secp256k1_xonly_pubkey lsp_payment_xo;
     secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_payment_xo, NULL,
@@ -3057,13 +3062,14 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
            (unsigned long long)htlc_to_lsp);
 
     /* (6) Client sweeps to_remote so per-party accounting is symmetric. The
-       to_remote SPK = P2TR(BIP-341-tweaked(client remote_payment derived
-       from lsp_pcp0)) -- derive via the channel's basepoint + counterparty PCP. */
+       to_remote SPK at commitment_number=1 uses lsp_pcp1 (LSP's PCP at the
+       commitment that was actually broadcast — see note above the 2nd-stage
+       sweep about the HTLC-add bumping commitment_number). */
     unsigned char client_to_remote_sk[32];
     TEST_ASSERT(derive_channel_seckey(ctx, client_to_remote_sk,
                                         client_ch.local_payment_basepoint_secret,
                                         &client_ch.local_payment_basepoint,
-                                        &lsp_pcp0),
+                                        &lsp_pcp1),
                 "derive client to_remote seckey");
     const uint64_t TO_REMOTE_SWEEP_FEE = 300;
     tx_buf_t tr_sweep;
