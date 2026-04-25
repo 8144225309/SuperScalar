@@ -1119,6 +1119,8 @@ extern int test_regtest_kickoff_paired_with_latest_state(void);
 extern int test_regtest_full_force_close_and_sweep_arity1(void);
 extern int test_regtest_full_force_close_and_sweep_arity2(void);
 extern int test_regtest_full_force_close_and_sweep_arityPS(void);
+extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len2(void);
+extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len5(void);
 extern int test_regtest_htlc_force_to_local_arity1(void);
 extern int test_regtest_htlc_force_to_local_arity2(void);
 extern int test_regtest_htlc_force_to_local_arity_ps(void);
@@ -3637,6 +3639,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity1);
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity2);
     RUN_TEST(test_regtest_full_force_close_and_sweep_arityPS);
+    RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len2);
+    RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len5);
     RUN_TEST(test_regtest_htlc_force_to_local_arity1);
     RUN_TEST(test_regtest_htlc_force_to_local_arity2);
     RUN_TEST(test_regtest_htlc_force_to_local_arity_ps);
