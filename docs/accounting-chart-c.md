@@ -49,7 +49,7 @@ on `ARITY_1` and `ARITY_2` makes no sense), leaving 33 meaningful cells.
 | coop | ✗ | ✗ | ✗ |
 | force-to_remote | S `test_regtest_htlc_in_flight_spendability` (arity-1 only) | ✗ | ✗ |
 | force-to_local | ✓ `test_regtest_htlc_force_to_local_arity1` | ✓ `test_regtest_htlc_force_to_local_arity2` | ✓ `test_regtest_htlc_force_to_local_arity_ps` |
-| breach | ✗ | ✗ | ✗ |
+| breach | ✓ `test_regtest_htlc_breach_arity1` | ✓ `test_regtest_htlc_breach_arity2` | ✓ `test_regtest_htlc_breach_arity_ps` |
 | rotation | ✗ | ✗ | ✗ |
 | PS-advance | — | — | ✗ |
 

@@ -3150,6 +3150,583 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     return 1;
 }
 
+/* HTLC × breach × {arity-1, arity-2, arity-PS}.
+ *
+ * Mirrors run_htlc_force_to_local_for_arity but instead of a force-close
+ * with CSV+CLTV waits, the LSP becomes a cheater: builds commitment #1 (with
+ * an unresolved HTLC OFFERED by LSP), then both sides advance to commitment
+ * #2 — at which point each side reveals their per-commitment-secret for
+ * commit #1 to the other. Now state 1 is REVOKED. The cheater (LSP) then
+ * re-broadcasts the OLD state-1 commitment. The honest party (client) holds
+ * the revocation secret for commit #1 and uses it to:
+ *   - build a to_local penalty TX (channel_build_penalty_tx) sweeping LSP's
+ *     supposed delayed_payment output via the revocation key path, AND
+ *   - build an HTLC penalty TX (channel_build_htlc_penalty_tx) sweeping the
+ *     HTLC output via its revocation branch.
+ * Both penalty outputs land at P2TR(taptweak(client.local_payment_basepoint))
+ * (per src/channel.c:1059-1107 and :2304-2351), so we add a 2nd-stage
+ * BIP-341-keypath sweep to land the funds in the client's wallet for
+ * econ_assert_wallet_deltas. The client also sweeps their own to_remote
+ * (un-revoked, via per-commitment-derived payment seckey).
+ *
+ * Conservation: leaf_chan_amt == swept_to_punisher + Σ(commit_fee +
+ * to_local_penalty_fee + to_local_2nd_fee + htlc_penalty_fee +
+ * htlc_2nd_fee + to_remote_sweep_fee). The breacher's wallet delta is
+ * exactly 0.
+ */
+static int run_htlc_breach_for_arity(regtest_t *rt,
+                                       secp256k1_context *ctx,
+                                       factory_arity_t arity,
+                                       size_t n_participants,
+                                       const char *mine_addr) {
+    const size_t N = n_participants;
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kps, f,
+                               fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        free(f); return 0;
+    }
+    printf("  [arity=%d N=%zu] factory funded: %llu sats, %zu nodes, %d leaves\n",
+           (int)arity, N, (unsigned long long)fund_amount, f->n_nodes,
+           f->n_leaf_nodes);
+
+    /* Broadcast every signed tree node in order with BIP-68 spacing -- same
+       pattern as run_htlc_force_to_local_for_arity. */
+    char txids[FACTORY_MAX_NODES][65];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        TEST_ASSERT(nd->is_signed && nd->signed_tx.len > 0,
+                    "tree node signed before broadcast");
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        TEST_ASSERT(tx_hex != NULL, "tx_hex malloc");
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(rt, tx_hex, txids[i]);
+        free(tx_hex);
+        TEST_ASSERT(ok, "broadcast tree node");
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t cns = f->nodes[i + 1].nsequence;
+            if (!(cns & 0x80000000u)) blocks_to_mine = (int)(cns & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(rt, blocks_to_mine, mine_addr);
+    }
+    int n_leaves = f->n_leaf_nodes;
+    for (int li = 0; li < n_leaves; li++) {
+        TEST_ASSERT(regtest_get_confirmations(rt,
+            txids[f->leaf_node_indices[li]]) >= 1,
+            "leaf confirmed on chain");
+    }
+    printf("  full tree broadcast OK -- %zu nodes, %d leaves on chain\n",
+           f->n_nodes, n_leaves);
+
+    /* Pick leaf 0; recover client_idx from signer_indices[1]. */
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    const char *leaf_txid = txids[leaf_idx];
+    TEST_ASSERT(leaf->signer_indices[0] == 0,
+                "signer_indices[0] is LSP");
+    uint32_t client_idx = leaf->signer_indices[1];
+    TEST_ASSERT(client_idx >= 1 && client_idx < N,
+                "client_idx in range");
+
+    /* Inner LN channel funding = leaf->outputs[0]. */
+    uint64_t leaf_chan_amt = leaf->outputs[0].amount_sats;
+    unsigned char leaf_chan_spk[34];
+    memcpy(leaf_chan_spk, leaf->outputs[0].script_pubkey, 34);
+
+    unsigned char leaf_txid_bytes[32];
+    TEST_ASSERT(hex_decode(leaf_txid, leaf_txid_bytes, 32),
+                "decode leaf txid");
+    reverse_bytes(leaf_txid_bytes, 32);
+
+    secp256k1_pubkey lsp_pk, client_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    secp256k1_keypair_pub(ctx, &client_pk, &kps[client_idx]);
+
+    /* Reserve >> regtest min-relay (~200 sats). 1500 sat fee on a 3-output
+       commit = ~7 sat/vB which clears all currently-known regtest mempool
+       floors (CI included). */
+    const uint32_t csv = 10;
+    const uint64_t COMMIT_FEE_RESERVE = 1500;
+    TEST_ASSERT(leaf_chan_amt > COMMIT_FEE_RESERVE + 20000,
+                "leaf_chan_amt too small for HTLC + commit fee");
+    uint64_t channel_capacity = leaf_chan_amt - COMMIT_FEE_RESERVE;
+    uint64_t local_amt  = (channel_capacity * 70) / 100;  /* LSP local */
+    uint64_t remote_amt = channel_capacity - local_amt;   /* client */
+
+    channel_t lsp_ch, client_ch;
+    TEST_ASSERT(channel_init(&lsp_ch, ctx, N_PARTY_SECKEYS[0],
+                              &lsp_pk, &client_pk,
+                              leaf_txid_bytes, 0, leaf_chan_amt,
+                              leaf_chan_spk, 34,
+                              local_amt, remote_amt, csv),
+                "init LSP inner channel");
+    TEST_ASSERT(channel_init(&client_ch, ctx, N_PARTY_SECKEYS[client_idx],
+                              &client_pk, &lsp_pk,
+                              leaf_txid_bytes, 0, leaf_chan_amt,
+                              leaf_chan_spk, 34,
+                              remote_amt, local_amt, csv),
+                "init client inner channel");
+    channel_generate_random_basepoints(&lsp_ch);
+    channel_generate_random_basepoints(&client_ch);
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    /* Pre-generate PCPs for commitments 0, 1, AND 2 -- we need 2 because we
+       advance state past the breach commit so revocation secret for #1 is
+       exchanged. channel_add_htlc auto-extends local PCS to current+1 = 2,
+       but channel_set_remote_pcp must be called explicitly for each. */
+    secp256k1_pubkey lsp_pcp0, client_pcp0;
+    secp256k1_pubkey lsp_pcp1, client_pcp1;
+    secp256k1_pubkey lsp_pcp2, client_pcp2;
+    channel_get_per_commitment_point(&lsp_ch,    0, &lsp_pcp0);
+    channel_get_per_commitment_point(&client_ch, 0, &client_pcp0);
+    channel_get_per_commitment_point(&lsp_ch,    1, &lsp_pcp1);
+    channel_get_per_commitment_point(&client_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&lsp_ch,    0, &client_pcp0);
+    channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
+    channel_set_remote_pcp(&lsp_ch,    1, &client_pcp1);
+    channel_set_remote_pcp(&client_ch, 1, &lsp_pcp1);
+
+    /* HTLC OFFERED by LSP (HTLC_RECEIVED on client). Same shape as the
+       force_to_local test. We never resolve; the HTLC is mid-flight at
+       breach time. */
+    int cur_h = regtest_get_block_height(rt);
+    TEST_ASSERT(cur_h > 0, "have block height");
+    uint64_t htlc_amt = 5000;
+    uint32_t htlc_cltv = (uint32_t)cur_h + 80;
+
+    unsigned char preimage[32];
+    memset(preimage, 0xCD, 32);
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    uint64_t lsp_htlc_id = 0, client_htlc_id = 0;
+    TEST_ASSERT(channel_add_htlc(&lsp_ch, HTLC_OFFERED, htlc_amt,
+                                   payment_hash, htlc_cltv, &lsp_htlc_id),
+                "LSP adds OFFERED htlc");
+    TEST_ASSERT(channel_add_htlc(&client_ch, HTLC_RECEIVED, htlc_amt,
+                                   payment_hash, htlc_cltv, &client_htlc_id),
+                "client mirrors RECEIVED htlc");
+    /* Both sides now have commitment_number = 1. */
+
+    /* Build + sign LSP's commitment #1 (the soon-to-be-breached state). */
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 1024); tx_buf_init(&sc, 2048);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &uc, ct),
+                "build LSP commitment #1");
+    TEST_ASSERT(channel_sign_commitment(&lsp_ch, &sc, &uc, &kps[client_idx]),
+                "client co-signs LSP commitment #1");
+
+    /* Stash signed bytes -- we will advance state and THEN broadcast (the
+       breach is publishing this stale tx). */
+    size_t breach_len = sc.len;
+    unsigned char *breach_bytes = malloc(breach_len);
+    TEST_ASSERT(breach_bytes != NULL, "breach_bytes malloc");
+    memcpy(breach_bytes, sc.data, breach_len);
+
+    /* Advance to commitment #2 so each side's PCS for #1 becomes revealable.
+       Mirrors the run_breach_penalty pattern: extend local PCS pool to 2,
+       set remote PCP for #2, bump commitment_number to 2, then exchange
+       revocation secrets for #1. */
+    channel_generate_local_pcs(&lsp_ch,    2);
+    channel_generate_local_pcs(&client_ch, 2);
+    channel_get_per_commitment_point(&lsp_ch,    2, &lsp_pcp2);
+    channel_get_per_commitment_point(&client_ch, 2, &client_pcp2);
+    channel_set_remote_pcp(&lsp_ch,    2, &client_pcp2);
+    channel_set_remote_pcp(&client_ch, 2, &lsp_pcp2);
+    lsp_ch.commitment_number    = 2;
+    client_ch.commitment_number = 2;
+
+    /* LSP reveals secret#1 to client; client reveals secret#1 to LSP. After
+       this exchange, state #1 is REVOKED on both sides. */
+    unsigned char lsp_secret1[32], client_secret1[32];
+    TEST_ASSERT(channel_get_revocation_secret(&lsp_ch, 1, lsp_secret1),
+                "LSP get revocation secret #1");
+    TEST_ASSERT(channel_get_revocation_secret(&client_ch, 1, client_secret1),
+                "client get revocation secret #1");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 1, lsp_secret1),
+                "client receives LSP revocation #1");
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 1, client_secret1),
+                "LSP receives client revocation #1");
+    secure_zero(lsp_secret1, sizeof(lsp_secret1));
+    secure_zero(client_secret1, sizeof(client_secret1));
+
+    /* Set up econ harness BEFORE the breach so we capture pre-balances. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP_breacher",
+                                       N_PARTY_SECKEYS[0]),
+                "register LSP (breacher)");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client_punisher",
+                                       N_PARTY_SECKEYS[client_idx]),
+                "register client (punisher)");
+    econ.factory_funding_amount = leaf_chan_amt;  /* scope = inner channel */
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Compute each party's P2TR(xonly(pk_i)) wallet SPK. */
+    unsigned char party_spk[2][34];
+    for (int p = 0; p < 2; p++) {
+        secp256k1_keypair *kp = (p == 0) ? &kps[0] : &kps[client_idx];
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, kp);
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
+
+    /* === SIMULATE BREACH === */
+    /* LSP re-broadcasts the OLD (revoked) commitment #1. */
+    char *commit_hex = malloc(breach_len * 2 + 1);
+    TEST_ASSERT(commit_hex != NULL, "commit_hex malloc");
+    hex_encode(breach_bytes, breach_len, commit_hex);
+    commit_hex[breach_len * 2] = '\0';
+    char commit_txid_hex[65];
+    int br_ok = regtest_send_raw_tx(rt, commit_hex, commit_txid_hex);
+    free(commit_hex);
+    free(breach_bytes);
+    tx_buf_free(&uc); tx_buf_free(&sc);
+    TEST_ASSERT(br_ok, "broadcast revoked commitment (the breach)");
+    regtest_mine_blocks(rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(rt, commit_txid_hex) >= 1,
+                "breach commitment confirmed");
+    printf("  BREACH: LSP re-broadcast revoked commit %s (3 outputs)\n",
+           commit_txid_hex);
+
+    /* Read all 3 outputs of the breached commit. */
+    uint64_t to_local_amt = 0, to_remote_amt = 0, htlc_out_amt = 0;
+    unsigned char to_local_spk[64], to_remote_spk[64], htlc_spk[64];
+    size_t to_local_spk_len = 0, to_remote_spk_len = 0, htlc_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, commit_txid_hex, 0,
+                                        &to_local_amt, to_local_spk,
+                                        &to_local_spk_len),
+                "read to_local (vout 0)");
+    TEST_ASSERT(regtest_get_tx_output(rt, commit_txid_hex, 1,
+                                        &to_remote_amt, to_remote_spk,
+                                        &to_remote_spk_len),
+                "read to_remote (vout 1)");
+    TEST_ASSERT(regtest_get_tx_output(rt, commit_txid_hex, 2,
+                                        &htlc_out_amt, htlc_spk,
+                                        &htlc_spk_len),
+                "read htlc output (vout 2)");
+    TEST_ASSERT(htlc_out_amt == htlc_amt, "htlc output amount matches");
+    uint64_t commit_fee = leaf_chan_amt - to_local_amt - to_remote_amt - htlc_out_amt;
+    printf("  breached outs: to_local=%llu, to_remote=%llu, htlc=%llu, "
+           "commit_fee=%llu\n",
+           (unsigned long long)to_local_amt,
+           (unsigned long long)to_remote_amt,
+           (unsigned long long)htlc_out_amt,
+           (unsigned long long)commit_fee);
+
+    /* === PUNISHMENT PHASE === */
+    /* Set client's commitment_number back to 1 so channel_build_penalty_tx
+       and channel_build_htlc_penalty_tx rebuild the SAME taptree as the
+       breached commit. The htlc[] is still at index 0 with the same shape
+       since neither side fulfilled or failed it -- channel_compact_htlcs
+       wasn't invoked. */
+    uint64_t saved_commitment_number = client_ch.commitment_number;
+    client_ch.commitment_number = 1;
+    unsigned char ct_internal[32];
+    memcpy(ct_internal, ct, 32);
+
+    /* (1) to_local penalty: client (punisher) sweeps LSP's revoked
+       delayed_payment output via the revocation key path. The single output
+       lands at P2TR(taptweak(client.local_payment_basepoint)) -- same SPK
+       primitive as the HTLC-timeout sweep used in run_htlc_force_to_local. */
+    tx_buf_t tl_pen;
+    tx_buf_init(&tl_pen, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &tl_pen,
+                                           ct_internal, 0, to_local_amt,
+                                           to_local_spk, 34,
+                                           1, NULL, 0),
+                "build to_local penalty tx (revocation key-path)");
+    char *tl_pen_hex = malloc(tl_pen.len * 2 + 1);
+    TEST_ASSERT(tl_pen_hex != NULL, "tl_pen_hex malloc");
+    hex_encode(tl_pen.data, tl_pen.len, tl_pen_hex);
+    tl_pen_hex[tl_pen.len * 2] = '\0';
+    char tl_pen_txid[65];
+    int tl_pen_ok = spend_broadcast_and_mine(rt, tl_pen_hex, 1, tl_pen_txid);
+    free(tl_pen_hex);
+    tx_buf_free(&tl_pen);
+    TEST_ASSERT(tl_pen_ok, "to_local penalty broadcast + confirmed");
+    /* Penalty tx fee from src/channel.c:1086: rate * 152 + 999 / 1000
+       (no anchor variant). */
+    uint64_t tl_pen_fee_expected =
+        (client_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    printf("  PENALTY: client swept to_local-revoked %llu sats (fee=%llu)\n",
+           (unsigned long long)(to_local_amt - tl_pen_fee_expected),
+           (unsigned long long)tl_pen_fee_expected);
+
+    /* (2) HTLC penalty: client sweeps the HTLC output via the revocation
+       branch of its taptree. This is the key Phase-2 #2 cell — a breach
+       with an UNRESOLVED HTLC must be fully recoverable by the punisher. */
+    tx_buf_t htlc_pen;
+    tx_buf_init(&htlc_pen, 512);
+    TEST_ASSERT(channel_build_htlc_penalty_tx(&client_ch, &htlc_pen,
+                                                ct_internal, 2,
+                                                htlc_out_amt, htlc_spk,
+                                                htlc_spk_len,
+                                                1, 0, NULL, 0),
+                "build HTLC penalty tx (revocation branch)");
+    char *htlc_pen_hex = malloc(htlc_pen.len * 2 + 1);
+    TEST_ASSERT(htlc_pen_hex != NULL, "htlc_pen_hex malloc");
+    hex_encode(htlc_pen.data, htlc_pen.len, htlc_pen_hex);
+    htlc_pen_hex[htlc_pen.len * 2] = '\0';
+    char htlc_pen_txid[65];
+    int htlc_pen_ok = spend_broadcast_and_mine(rt, htlc_pen_hex, 1,
+                                                htlc_pen_txid);
+    free(htlc_pen_hex);
+    tx_buf_free(&htlc_pen);
+    TEST_ASSERT(htlc_pen_ok, "HTLC penalty broadcast + confirmed");
+    /* HTLC penalty fee from src/channel.c:2329: rate * 152 + 999 / 1000. */
+    uint64_t htlc_pen_fee_expected =
+        (client_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    printf("  PENALTY: client swept HTLC-revoked %llu sats (fee=%llu)\n",
+           (unsigned long long)(htlc_out_amt - htlc_pen_fee_expected),
+           (unsigned long long)htlc_pen_fee_expected);
+
+    /* Restore commitment_number now that we no longer need to rebuild the
+       state-1 taptree. */
+    client_ch.commitment_number = saved_commitment_number;
+
+    /* (3) The to_local + HTLC penalty outputs both landed at
+       P2TR(taptweak(client.local_payment_basepoint)) -- a BIP-341 keypath
+       output, NOT P2TR(client_pk). Add a 2nd-stage sweep of each so funds
+       end up in the client's wallet for econ_assert_wallet_deltas. Use the
+       same primitive as the HTLC-timeout 2nd-stage in
+       run_htlc_force_to_local_for_arity. */
+    secp256k1_xonly_pubkey client_pay_xo;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &client_pay_xo, NULL,
+                                        &client_ch.local_payment_basepoint);
+    unsigned char client_pay_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, client_pay_ser, &client_pay_xo);
+    unsigned char client_pay_taptweak[32];
+    sha256_tagged("TapTweak", client_pay_ser, 32, client_pay_taptweak);
+    secp256k1_pubkey client_pay_tw_full;
+    secp256k1_xonly_pubkey_tweak_add(ctx, &client_pay_tw_full,
+                                      &client_pay_xo, client_pay_taptweak);
+    secp256k1_xonly_pubkey client_pay_tw;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &client_pay_tw, NULL,
+                                        &client_pay_tw_full);
+    unsigned char penalty_out_spk[34];
+    build_p2tr_script_pubkey(penalty_out_spk, &client_pay_tw);
+
+    /* (3a) 2nd-stage sweep of to_local penalty output. */
+    uint64_t tl_pen_out_amt = 0;
+    unsigned char tl_pen_chain_spk[64];
+    size_t tl_pen_chain_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, tl_pen_txid, 0,
+                    &tl_pen_out_amt, tl_pen_chain_spk, &tl_pen_chain_spk_len),
+                "read to_local penalty output amount");
+    TEST_ASSERT(tl_pen_chain_spk_len == 34 &&
+                memcmp(tl_pen_chain_spk, penalty_out_spk, 34) == 0,
+                "computed penalty SPK matches on-chain SPK (to_local pen)");
+    uint64_t tl_pen_actual_fee = to_local_amt - tl_pen_out_amt;
+
+    const uint64_t SECOND_STAGE_FEE = 300;
+    tx_buf_t tl_2nd;
+    tx_buf_init(&tl_2nd, 256);
+    TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                    client_ch.local_payment_basepoint_secret,
+                    tl_pen_txid, 0, tl_pen_out_amt,
+                    penalty_out_spk, 34,
+                    party_spk[1], 34,
+                    SECOND_STAGE_FEE, &tl_2nd),
+                "build 2nd-stage to_local-penalty sweep to client P2TR");
+    char *tl_2nd_hex = malloc(tl_2nd.len * 2 + 1);
+    TEST_ASSERT(tl_2nd_hex != NULL, "tl_2nd_hex malloc");
+    hex_encode(tl_2nd.data, tl_2nd.len, tl_2nd_hex);
+    tl_2nd_hex[tl_2nd.len * 2] = '\0';
+    char tl_2nd_txid[65];
+    int tl_2nd_ok = spend_broadcast_and_mine(rt, tl_2nd_hex, 1, tl_2nd_txid);
+    free(tl_2nd_hex);
+    tx_buf_free(&tl_2nd);
+    TEST_ASSERT(tl_2nd_ok, "2nd-stage to_local-penalty sweep confirmed");
+    uint64_t tl_to_client = tl_pen_out_amt - SECOND_STAGE_FEE;
+    printf("  client 2nd-stage swept %llu sats from to_local-penalty -> P2TR(client)\n",
+           (unsigned long long)tl_to_client);
+
+    /* (3b) 2nd-stage sweep of HTLC penalty output. */
+    uint64_t htlc_pen_out_amt = 0;
+    unsigned char htlc_pen_chain_spk[64];
+    size_t htlc_pen_chain_spk_len = 0;
+    TEST_ASSERT(regtest_get_tx_output(rt, htlc_pen_txid, 0,
+                    &htlc_pen_out_amt, htlc_pen_chain_spk,
+                    &htlc_pen_chain_spk_len),
+                "read HTLC penalty output amount");
+    TEST_ASSERT(htlc_pen_chain_spk_len == 34 &&
+                memcmp(htlc_pen_chain_spk, penalty_out_spk, 34) == 0,
+                "computed penalty SPK matches on-chain SPK (htlc pen)");
+    uint64_t htlc_pen_actual_fee = htlc_out_amt - htlc_pen_out_amt;
+
+    tx_buf_t htlc_2nd;
+    tx_buf_init(&htlc_2nd, 256);
+    TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                    client_ch.local_payment_basepoint_secret,
+                    htlc_pen_txid, 0, htlc_pen_out_amt,
+                    penalty_out_spk, 34,
+                    party_spk[1], 34,
+                    SECOND_STAGE_FEE, &htlc_2nd),
+                "build 2nd-stage HTLC-penalty sweep to client P2TR");
+    char *htlc_2nd_hex = malloc(htlc_2nd.len * 2 + 1);
+    TEST_ASSERT(htlc_2nd_hex != NULL, "htlc_2nd_hex malloc");
+    hex_encode(htlc_2nd.data, htlc_2nd.len, htlc_2nd_hex);
+    htlc_2nd_hex[htlc_2nd.len * 2] = '\0';
+    char htlc_2nd_txid[65];
+    int htlc_2nd_ok = spend_broadcast_and_mine(rt, htlc_2nd_hex, 1,
+                                                htlc_2nd_txid);
+    free(htlc_2nd_hex);
+    tx_buf_free(&htlc_2nd);
+    TEST_ASSERT(htlc_2nd_ok, "2nd-stage HTLC-penalty sweep confirmed");
+    uint64_t htlc_to_client = htlc_pen_out_amt - SECOND_STAGE_FEE;
+    printf("  client 2nd-stage swept %llu sats from HTLC-penalty -> P2TR(client)\n",
+           (unsigned long long)htlc_to_client);
+
+    /* (4) Client sweeps their own to_remote (un-revoked, normal payment).
+       to_remote spk at commitment_number=1 uses lsp_pcp1 (the LSP's PCP at
+       the BREACHED state). */
+    unsigned char client_to_remote_sk[32];
+    TEST_ASSERT(derive_channel_seckey(ctx, client_to_remote_sk,
+                                        client_ch.local_payment_basepoint_secret,
+                                        &client_ch.local_payment_basepoint,
+                                        &lsp_pcp1),
+                "derive client to_remote seckey");
+    const uint64_t TO_REMOTE_SWEEP_FEE = 300;
+    tx_buf_t tr_sweep;
+    tx_buf_init(&tr_sweep, 256);
+    TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx, client_to_remote_sk,
+                    commit_txid_hex, 1, to_remote_amt,
+                    to_remote_spk, 34,
+                    party_spk[1], 34,
+                    TO_REMOTE_SWEEP_FEE, &tr_sweep),
+                "build to_remote sweep");
+    char *tr_hex = malloc(tr_sweep.len * 2 + 1);
+    TEST_ASSERT(tr_hex != NULL, "tr_hex malloc");
+    hex_encode(tr_sweep.data, tr_sweep.len, tr_hex);
+    tr_hex[tr_sweep.len * 2] = '\0';
+    char tr_txid[65];
+    int tr_ok = spend_broadcast_and_mine(rt, tr_hex, 1, tr_txid);
+    free(tr_hex);
+    tx_buf_free(&tr_sweep);
+    TEST_ASSERT(tr_ok, "to_remote sweep confirmed");
+    uint64_t to_remote_to_client = to_remote_amt - TO_REMOTE_SWEEP_FEE;
+    printf("  client swept own to_remote %llu sats -> P2TR(client)\n",
+           (unsigned long long)to_remote_to_client);
+
+    /* === ACCOUNTING === */
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    /* Punisher gets EVERYTHING (to_local + HTLC + to_remote, less fees).
+       Breacher gets ZERO. */
+    uint64_t expected_deltas[2];
+    expected_deltas[0] = 0;  /* LSP (breacher) */
+    expected_deltas[1] = tl_to_client + htlc_to_client + to_remote_to_client;
+
+    uint64_t total_fees = commit_fee
+                          + tl_pen_actual_fee
+                          + htlc_pen_actual_fee
+                          + 2 * SECOND_STAGE_FEE
+                          + TO_REMOTE_SWEEP_FEE;
+    uint64_t swept_sum = expected_deltas[0] + expected_deltas[1];
+    TEST_ASSERT(swept_sum + total_fees == leaf_chan_amt,
+                "conservation: Sum(swept) + Sum(fees) == leaf_chan_amt");
+    printf("  conservation OK: swept=%llu + fees=%llu == leaf_chan_amt=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_fees,
+           (unsigned long long)leaf_chan_amt);
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match (breacher=0, punisher gets all)");
+    econ_print_summary(&econ);
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    factory_free(f);
+    free(f);
+    return 1;
+}
+
+int test_regtest_htlc_breach_arity1(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "htlc_breach_a1");
+    rt.scan_depth = 200;
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    int ok = run_htlc_breach_for_arity(&rt, ctx, FACTORY_ARITY_1, 2, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_htlc_breach_arity2(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "htlc_breach_a2");
+    rt.scan_depth = 200;
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    /* arity-2 requires 4 participants -> 2 leaves of 2 clients each. We test
+       leaf 0's first client; the 3 other clients are uninvolved in the HTLC
+       breach, exactly as the audit plan specifies. */
+    int ok = run_htlc_breach_for_arity(&rt, ctx, FACTORY_ARITY_2, 4, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_htlc_breach_arity_ps(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "htlc_breach_aps");
+    rt.scan_depth = 200;
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    /* PS at chain_len=0 with N=2 (LSP + 1 client). The PS leaf channel SPK
+       is factory consensus (all-N MuSig); for N=2 that is mathematically a
+       2-of-2 (LSP, client) and channel_init's keyagg auto-detector finds it. */
+    int ok = run_htlc_breach_for_arity(&rt, ctx, FACTORY_ARITY_PS, 2, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
 int test_regtest_htlc_force_to_local_arity1(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);

@@ -42,7 +42,7 @@ For each cell:
   and the originator gets back nothing (timeout, not preimage)
 - Conservation: `Σ(swept) + Σ(fees) == fund_amount`
 
-### 2. HTLC × breach × {arity-1, arity-2, arity-PS}  `[ ]`
+### 2. HTLC × breach × {arity-1, arity-2, arity-PS}  `[x]`
 
 Breach a state that has an unresolved HTLC. Penalty TX must sweep BOTH
 `to_local` (revoked) AND the HTLC output. Tests:
@@ -121,7 +121,7 @@ ceiling and surface it to the user as a hard limit.
 | # | PR | Status | Notes |
 |---|----|--------|-------|
 | 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
-| 2 | TBD | `[ ]` | not started |
+| 2 | TBD | `[~]` | tests written; verifying via CI (commit-fee reserve applied) |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
 | 5 | TBD | `[ ]` | not started |
