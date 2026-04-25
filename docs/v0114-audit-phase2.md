@@ -19,7 +19,7 @@ sighash verification.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete
 
-### 1. HTLC × force-to_local × {arity-1, arity-2, arity-PS}  `[ ]`
+### 1. HTLC × force-to_local × {arity-1, arity-2, arity-PS}  `[x]`
 
 Force-close while an HTLC is unresolved and the closer must wait out
 the CSV delay on `to_local`. Tests:
@@ -120,7 +120,7 @@ ceiling and surface it to the user as a hard limit.
 
 | # | PR | Status | Notes |
 |---|----|--------|-------|
-| 1 | TBD | `[ ]` | not started |
+| 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
 | 2 | TBD | `[ ]` | not started |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
