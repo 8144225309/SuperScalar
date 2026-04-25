@@ -96,6 +96,12 @@ has at least spendability coverage; most have full accounting. The pending
   close shape is arity-invariant — the two `_full` cells above cover
   all 3 Chart C "arity" cells for the JIT row.
 - **Buy-liquidity flows** — covered by Chart B (existing).
+- **Hybrid CLN boundary** — `test_regtest_hybrid_cln_arity2_payment` ✓
+  exercises a real BOLT11 payment routed across the
+  `[CLN-2] → [CLN-1+SS-plugin] → [LSP daemon] → [SS arity-2 leaf] → [Client_0]`
+  topology with conservation + per-party `econ_assert_wallet_deltas`. CLN
+  not present in GitHub Actions; VPS regtest is the source of truth for
+  this cell.
 
 ## Test runtime budget
 

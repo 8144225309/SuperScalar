@@ -94,7 +94,7 @@ Both cells assert per-party deltas via `econ_assert_wallet_deltas` AND
 conservation `Σ(swept) + Σ(fees) == jit_funding_amount`. The force cell
 applies COMMIT_FEE_RESERVE = 1500 sats from PR #89/#90/#91.
 
-### 5. Hybrid CLN test (#73)  `[ ]`
+### 5. Hybrid CLN test (#73)  `[~]`
 
 One side SuperScalar factory, other side vanilla CLN channel:
 
@@ -131,8 +131,8 @@ ceiling and surface it to the user as a hard limit.
 | 1 | #89 | `[x]` | 3 cells PASS on VPS regtest with full conservation + per-party econ deltas |
 | 2 | #90 | `[x]` | 3 HTLC×breach cells merged; commit-fee reserve applied |
 | 3 | #91 | `[x]` | 2 cells (chain_len=2, chain_len=5) PASS on VPS; merged |
-| 4 | #92 | `[~]` | 2 cells (coop, force) PASS on VPS with full conservation + per-party deltas; PR open |
-| 5 | TBD | `[ ]` | not started |
+| 4 | #92 | `[x]` | 2 cells (coop, force) PASS on VPS; merged |
+| 5 | #93 | `[~]` | Real CLN+LSP+SS topology; payment routed across boundary; PR open (CI gap: no CLN in GitHub Actions, VPS is source of truth) |
 | 6 | TBD | `[ ]` | not started |
 | 7 | TBD | `[ ]` | not started |
 
