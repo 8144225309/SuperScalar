@@ -2920,7 +2920,7 @@ int test_factory_build_tree_n128(void) {
 
     /* N=128, arity-2: 64 leaves, depth=6, 254 factory nodes.
        Validates the raised compile-time limits (FACTORY_MAX_SIGNERS=128,
-       FACTORY_MAX_LEAVES=64, FACTORY_MAX_NODES=512). */
+       FACTORY_MAX_LEAVES=128, FACTORY_MAX_NODES=512). */
     TEST_ASSERT(setup_n_factory(f, ctx, kps, 128, FACTORY_ARITY_2, 200000000), "setup n128 arity2");
     TEST_ASSERT(factory_build_tree(f), "build tree n128 arity2");
     TEST_ASSERT_EQ(f->n_leaf_nodes, 64, "64 leaves n128 arity2");
@@ -5092,6 +5092,105 @@ int test_factory_ps_leaf_build_n64(void) {
     factory_free(f);
     secp256k1_context_destroy(ctx);
     free(f);
+    return 1;
+}
+
+/* Phase 2 #7: PS factory build/sign/verify at N=128 (1 LSP + 127 clients).
+   This stresses the 128-way MuSig aggregation path AND every per-node MuSig
+   ceremony in a 506-node tree (depth 7, 8 DW layers — exactly DW_MAX_LAYERS).
+   No advance is exercised here (advance is already validated at N=64 in
+   test_factory_ps_leaf_build_n64); this test is build + sign + verify only.
+
+   Memory note: heap-allocate the keypair / pubkey arrays. 128 secp256k1_keypair
+   on the stack would be ~12 KB which is fine, but the factory_t (~MB scale due
+   to 4096 epochs of 32-byte revocation secrets) MUST be on the heap regardless.
+
+   Ceiling note: this test sits at the edge of three caps:
+     FACTORY_MAX_SIGNERS=128 (exactly N)
+     FACTORY_MAX_LEAVES=128  (exactly N-1=127 leaves; was raised from 64 to
+                              support PS at this scale)
+     DW_MAX_LAYERS=8         (exactly tree_depth+1 for 127 leaves)
+     FACTORY_MAX_NODES=512   (506 nodes, room to spare)
+   Any further bump in N requires lifting at least DW_MAX_LAYERS. */
+int test_factory_ps_build_n128(void) {
+    secp256k1_context *ctx = test_ctx();
+    const size_t N = 128;
+
+    secp256k1_keypair *kps = calloc(N, sizeof(secp256k1_keypair));
+    TEST_ASSERT(kps, "kps alloc");
+
+    for (size_t i = 0; i < N; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)((i % 250) + 1);
+        sk[0]  = 0x80;
+        sk[1]  = (unsigned char)(i / 250);  /* distinguish keys for i >= 250 */
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk),
+                    "keypair create");
+    }
+
+    /* Funding SPK: 128-way MuSig aggregate, BIP-341 taptweaked. */
+    secp256k1_pubkey *pks = calloc(N, sizeof(secp256k1_pubkey));
+    TEST_ASSERT(pks, "pks alloc");
+    for (size_t i = 0; i < N; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    musig_keyagg_t ka;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, N),
+                "128-way MuSig aggregate");
+    free(pks);
+
+    unsigned char ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    secp256k1_pubkey tweaked_pk;
+    TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
+                                                         &ka.cache, tweak),
+                "taptweak 128-way key");
+    secp256k1_xonly_pubkey fund_tw;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &fund_tw);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xCC, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "factory alloc");
+    /* step=4, states_per_layer=3 keeps DW total states modest; the layer count
+       (8) is the binding constraint at N=128, not the per-layer state count. */
+    factory_init(f, ctx, kps, N, 4, 3);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fake_txid, 0, 50000000, fund_spk, 34); /* 50M sats */
+
+    TEST_ASSERT(factory_build_tree(f), "build PS tree at N=128");
+    printf("  N=128 PS factory built: %zu nodes, %d leaves, %u DW layers\n",
+           f->n_nodes, f->n_leaf_nodes, f->counter.n_layers);
+
+    /* Each of 127 clients should have their own PS leaf. */
+    TEST_ASSERT_EQ(f->n_leaf_nodes, (int)(N - 1),
+                   "127 PS leaves (1 per client)");
+
+    /* Every leaf must be is_ps_leaf with chain_len=0 and nseq=0xFFFFFFFE. */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t ni = f->leaf_node_indices[i];
+        TEST_ASSERT(f->nodes[ni].is_ps_leaf, "leaf is_ps_leaf");
+        TEST_ASSERT_EQ(f->nodes[ni].ps_chain_len, 0, "initial chain_len=0");
+        TEST_ASSERT(f->nodes[ni].nsequence == 0xFFFFFFFEu,
+                    "PS leaf nseq=0xFFFFFFFE");
+        TEST_ASSERT_EQ((int)f->nodes[ni].n_outputs, 2,
+                       "PS leaf has 2 outputs initially");
+    }
+
+    /* Sign + verify the entire 128-way ceremony — every node, every signer. */
+    TEST_ASSERT(factory_sign_all(f),
+                "sign N=128 PS factory (128-way MuSig at root)");
+    TEST_ASSERT(factory_verify_all(f), "verify every signature");
+    printf("  128-way MuSig ceremony complete; every node signed + verified\n");
+
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
