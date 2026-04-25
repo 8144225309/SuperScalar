@@ -114,7 +114,7 @@ end-to-end test runs a `2,4,8` mixed-arity factory through a full lifecycle:
   route 1 payment through each, force-close, sweep all leaves, verify
   conservation across the entire mixed-arity tree
 
-### 7. PS at N=128 stress  `[ ]`
+### 7. PS at N=128 stress  `[x]`
 
 Matrix in #136 only goes to N=64. Add a build-only N=128 cell:
 
@@ -134,7 +134,7 @@ ceiling and surface it to the user as a hard limit.
 | 4 | #92 | `[x]` | 2 cells (coop, force) PASS on VPS; merged |
 | 5 | #93 | `[x]` | Real CLN+LSP+SS topology; payment routed across boundary; merged (CI gap: no CLN in GitHub Actions, VPS is source of truth) |
 | 6 | #94 | `[x]` | Mixed `{2,4,8}` factory at N=12 (1 LSP + 11 clients) → 6 leaves (5 arity-2 + 1 arity-1, 11 client channels). Tree broadcast on regtest VPS, all 6 leaves swept with conservation + per-party `econ_assert_wallet_deltas` for all 12 parties; merged |
-| 7 | #95 | `[~]` | `test_factory_ps_build_n128` builds + 128-way MuSig signs + verifies a 506-node PS tree at N=128 (1 LSP + 127 clients → 127 PS leaves, depth 7, 8 DW layers — exactly DW_MAX_LAYERS). Required raising `FACTORY_MAX_LEAVES` 64→128 (one-line, ~1.5KB struct growth) so the static `leaf_layers[]` / `leaf_node_indices[]` arrays in `factory_t` accommodate 127 PS leaves. The unilateral-close ceiling is now `DW_MAX_LAYERS=8` → tree of up to 128 PS leaves (= N=129 PS, but FACTORY_MAX_SIGNERS=128 binds first). |
+| 7 | #95 | `[x]` | `test_factory_ps_build_n128` builds + 128-way MuSig signs + verifies a 506-node PS tree at N=128 (1 LSP + 127 clients → 127 PS leaves, depth 7, 8 DW layers — exactly DW_MAX_LAYERS). Required raising `FACTORY_MAX_LEAVES` 64→128 (one-line, ~1.5KB struct growth) so the static `leaf_layers[]` / `leaf_node_indices[]` arrays in `factory_t` accommodate 127 PS leaves. The unilateral-close ceiling is now `DW_MAX_LAYERS=8` → tree of up to 128 PS leaves (= N=129 PS, but FACTORY_MAX_SIGNERS=128 binds first). Merged. |
 
 ## Done means
 
