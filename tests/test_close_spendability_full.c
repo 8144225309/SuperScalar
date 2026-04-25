@@ -4738,3 +4738,407 @@ int test_regtest_htlc_force_to_local_arity_ps(void) {
     secp256k1_context_destroy(ctx);
     return ok;
 }
+
+/* ============================================================================
+ *  Phase 2 Item #6: Mixed-arity production lifecycle
+ *
+ *  Builds a SuperScalar factory configured with the canonical mixed level-arity
+ *  shape `{2, 4, 8}` (root=arity-2 split, mid=arity-4 fan-out, leaves=arity-8
+ *  fan-out — effectively wide branching at every interior level), broadcasts
+ *  the entire tree on regtest, force-closes by treating each leaf's published
+ *  state as final, sweeps every leaf output (channels + L-stock), and verifies
+ *  conservation + per-party wallet deltas across the entire mixed tree.
+ *
+ *  Why N = 12 (LSP + 11 clients):
+ *    PR #81 + docs/factory-arity.md spell out `{2,4,8}` as the recommended
+ *    shape for the 33-64 client range. We pick 11 clients because it produces
+ *    a tree that exercises BOTH leaf shapes simultaneously without exceeding
+ *    DW_MAX_LAYERS=8:
+ *      - depth 0  (arity 2): 11 → split 6 | 5
+ *      - depth 1L (arity 4): 6 → 2 | 4
+ *      - depth 1R (arity 4): 5 → 2 | 3
+ *      - depth 2  (arity 8, n>2): 4 → 2 | 2 ; 3 → 2 | 1
+ *      - depth 2/3 leaves: 5 arity-2 (2 clients each, 3 outputs)
+ *                          + 1 arity-1 (1 client, 2 outputs)
+ *    Total: 6 leaves, 11 client channels, 6 L-stock outputs, max depth 3
+ *    (n_layers = 4 ≤ DW_MAX_LAYERS).
+ *
+ *  This is the first end-to-end proof that the production CLI shape we
+ *  documented after PR #81 ("--arity 2,4,8") actually broadcasts, sweeps,
+ *  and balances under a real regtest.
+ *
+ *  Severity: every TX broadcast + confirmed; conservation across the entire
+ *  mixed tree; per-party econ_assert_wallet_deltas for ALL 12 parties.
+ *  ========================================================================== */
+
+/* Deterministic seckeys for 12 parties (extends N_PARTY_SECKEYS).
+   Same construction: byte 31 = (i+1). */
+static const unsigned char N12_PARTY_SECKEYS[12][32] = {
+    { [0 ... 30] = 0, [31] = 0x01 },  /* LSP */
+    { [0 ... 30] = 0, [31] = 0x02 },  /* client 1  (participant idx 1) */
+    { [0 ... 30] = 0, [31] = 0x03 },  /* client 2 */
+    { [0 ... 30] = 0, [31] = 0x04 },  /* client 3 */
+    { [0 ... 30] = 0, [31] = 0x05 },  /* client 4 */
+    { [0 ... 30] = 0, [31] = 0x06 },  /* client 5 */
+    { [0 ... 30] = 0, [31] = 0x07 },  /* client 6 */
+    { [0 ... 30] = 0, [31] = 0x08 },  /* client 7 */
+    { [0 ... 30] = 0, [31] = 0x09 },  /* client 8 */
+    { [0 ... 30] = 0, [31] = 0x0A },  /* client 9 */
+    { [0 ... 30] = 0, [31] = 0x0B },  /* client 10 */
+    { [0 ... 30] = 0, [31] = 0x0C },  /* client 11 */
+};
+
+int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "mixed_arity_248");
+    /* Tree is deeper than the per-arity tests (max depth 3 vs 1-2) and
+       each child waits step_blocks*(states_per_layer-1) blocks for BIP-68
+       between siblings. With step_blocks=4 / states_per_layer=4 and ~22
+       nodes, the last leaves may be buried 200+ blocks deep — bump scan
+       depth so regtest_get_confirmations can find them on hosts without
+       -txindex. */
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 12;  /* 1 LSP + 11 clients */
+    secp256k1_keypair kps[12];
+    secp256k1_pubkey  pks[12];
+    for (size_t i = 0; i < N; i++) {
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], N12_PARTY_SECKEYS[i]),
+                    "keypair_create");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]),
+                    "keypair_pub");
+    }
+
+    /* N-way MuSig + BIP-341 taptweak → P2TR funding SPK (same construction
+       as fund_n_party_factory). */
+    musig_keyagg_t ka;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, N), "musig agg N=12");
+    unsigned char agg_ser[32];
+    TEST_ASSERT(secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey),
+                "serialize agg");
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tw_pk;
+    TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk,
+                                                        &ka_spk.cache, tweak),
+                "taptweak");
+    secp256k1_xonly_pubkey tw_xonly;
+    TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw_pk),
+                "tw xonly");
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tw_xonly);
+
+    /* Fund the factory: 0.01 BTC = 1,000,000 sats. Bigger than the per-arity
+       tests (500k) because this tree has 22 nodes consuming ~4400 sats in
+       fees and 6 leaves to share the remainder — we want each output well
+       above dust + sweep fees. */
+    unsigned char tw_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &tw_xonly);
+    char fund_addr[128];
+    TEST_ASSERT(regtest_derive_p2tr_address(&rt, tw_ser, fund_addr,
+                                              sizeof(fund_addr)),
+                "derive fund addr");
+    char fund_txid[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, fund_txid),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    uint32_t fund_vout = UINT32_MAX;
+    uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0;
+        unsigned char s[64];
+        size_t sl = 0;
+        if (regtest_get_tx_output(&rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v;
+            fund_amount = a;
+            break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "find fund vout");
+    printf("  [mixed{2,4,8}] funded %s:%u  %llu sats\n",
+           fund_txid, fund_vout, (unsigned long long)fund_amount);
+
+    /* Build factory with mixed level arity {2, 4, 8}. */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc factory");
+    factory_init(f, ctx, kps, N, 4, 4);  /* step_blocks=4, states_per_layer=4 */
+
+    uint8_t arities[3] = { 2, 4, 8 };
+    factory_set_level_arity(f, arities, 3);
+
+    unsigned char fund_txid_bytes[32];
+    TEST_ASSERT(hex_decode(fund_txid, fund_txid_bytes, 32), "decode fund txid");
+    reverse_bytes(fund_txid_bytes, 32);
+    factory_set_funding(f, fund_txid_bytes, fund_vout, fund_amount, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build_tree mixed {2,4,8}");
+    TEST_ASSERT(factory_sign_all(f), "sign_all mixed {2,4,8}");
+
+    /* Verify the predicted tree shape: 6 leaves total. 5 arity-2 leaves
+       (3 outputs each, n_signers==3) + 1 arity-1 leaf (2 outputs, n_signers==2).
+       The arity-1 leaf is for the lone client at the end of the right subtree
+       (clients 1..6 split as 2|4 → 2|2|2; clients 7..11 split as 2|3 → 2|2|1). */
+    int n_leaves = f->n_leaf_nodes;
+    printf("  [mixed{2,4,8}] tree built: %zu nodes, %d leaves\n",
+           f->n_nodes, n_leaves);
+    TEST_ASSERT(n_leaves == 6, "expect 6 leaves for N=12 with {2,4,8}");
+
+    int n_arity2_leaves = 0, n_arity1_leaves = 0;
+    int total_client_channels = 0;
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        TEST_ASSERT(!leaf->is_ps_leaf, "no PS leaves in {2,4,8} tree");
+        if (leaf->n_signers == 3 && leaf->n_outputs == 3) {
+            n_arity2_leaves++;
+            total_client_channels += 2;
+        } else if (leaf->n_signers == 2 && leaf->n_outputs == 2) {
+            n_arity1_leaves++;
+            total_client_channels += 1;
+        } else {
+            printf("  unexpected leaf shape: signers=%zu outputs=%zu\n",
+                   leaf->n_signers, leaf->n_outputs);
+            TEST_ASSERT(0, "unexpected leaf shape");
+        }
+    }
+    printf("  [mixed{2,4,8}] leaf shapes: %d arity-2, %d arity-1, "
+           "%d client channels total\n",
+           n_arity2_leaves, n_arity1_leaves, total_client_channels);
+    TEST_ASSERT(n_arity2_leaves == 5, "expect 5 arity-2 leaves");
+    TEST_ASSERT(n_arity1_leaves == 1, "expect 1 arity-1 leaf");
+    TEST_ASSERT(total_client_channels == 11, "expect 11 client channels");
+
+    /* Broadcast every signed tree node in order with correct BIP-68 spacing. */
+    char txids[FACTORY_MAX_NODES][65];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        TEST_ASSERT(nd->is_signed && nd->signed_tx.len > 0, "node signed");
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        TEST_ASSERT(tx_hex != NULL, "tx_hex malloc");
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(&rt, tx_hex, txids[i]);
+        free(tx_hex);
+        TEST_ASSERT(ok, "broadcast tree node");
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t cns = f->nodes[i + 1].nsequence;
+            if (!(cns & 0x80000000u)) blocks_to_mine = (int)(cns & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(&rt, blocks_to_mine, mine_addr);
+    }
+    for (int li = 0; li < n_leaves; li++) {
+        int conf = regtest_get_confirmations(&rt,
+            txids[f->leaf_node_indices[li]]);
+        TEST_ASSERT(conf >= 1, "leaf on chain");
+    }
+    printf("  [mixed{2,4,8}] full tree broadcast OK — %zu nodes, "
+           "%d leaves confirmed\n", f->n_nodes, n_leaves);
+
+    /* Build per-party P2TR(xonly(pk_i)) destinations for all 12 parties. */
+    unsigned char party_spk[12][34];
+    for (size_t p = 0; p < N; p++) {
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pks[p]);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
+
+    /* Wire econ harness for all 12 parties. CRITICAL: snap_pre BEFORE any
+       sweep TX broadcasts, per feedback_econ_snap_pre_timing.md. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    static const char *party_names[12] = {
+        "LSP", "client01", "client02", "client03", "client04", "client05",
+        "client06", "client07", "client08", "client09", "client10", "client11"
+    };
+    for (size_t p = 0; p < N; p++) {
+        TEST_ASSERT(econ_register_party(&econ, p, party_names[p],
+                                         N12_PARTY_SECKEYS[p]),
+                    "register party");
+    }
+    econ.factory_funding_amount = fund_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    /* Per-leaf sweep loop. Each leaf has either:
+         arity-2: outputs[0]=channel(client_a,LSP) + outputs[1]=channel(client_b,LSP)
+                  + outputs[2]=L-stock
+         arity-1: outputs[0]=channel(client,LSP) + outputs[1]=L-stock
+       For each channel: 50/50 split between client and LSP via offline 2-of-2
+       MuSig (pks order = {client, LSP}, matching setup_leaf_outputs +
+       setup_single_leaf_outputs in src/factory.c).
+       For each L-stock: LSP solo BIP-341 keypath sweep. */
+    const uint64_t LSTOCK_SWEEP_FEE = 300;
+    const uint64_t CHAN_SWEEP_FEE   = 400;
+    /* Small simulated payment shift to prove per-channel asymmetric splits
+       work — client paid LSP a small amount during operation. */
+    const uint64_t PAYMENT_SHIFT    = 1000;
+
+    uint64_t per_party_recv[12] = {0};
+    uint64_t total_sweep_fees = 0;
+    uint64_t total_allocated  = 0;
+
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        const char *leaf_txid = txids[nidx];
+
+        unsigned char leaf_txid_bytes[32];
+        TEST_ASSERT(hex_decode(leaf_txid, leaf_txid_bytes, 32),
+                    "decode leaf txid");
+        reverse_bytes(leaf_txid_bytes, 32);
+
+        TEST_ASSERT(leaf->signer_indices[0] == 0,
+                    "signer[0] is LSP for every leaf");
+
+        /* L-stock is the LAST output: vout n_outputs-1. */
+        uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
+        int n_channels       = (int)leaf->n_outputs - 1;
+
+        /* (A) Sweep L-stock LSP-alone to LSP's P2TR(xonly(LSP)). */
+        uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
+        unsigned char lstock_spk[34];
+        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
+
+        tx_buf_t lstock_sweep;
+        tx_buf_init(&lstock_sweep, 256);
+        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                        N12_PARTY_SECKEYS[0],
+                        leaf_txid, lstock_vout, lstock_amt,
+                        lstock_spk, 34,
+                        party_spk[0], 34,
+                        LSTOCK_SWEEP_FEE, &lstock_sweep),
+                    "build L-stock sweep");
+        char *lh = malloc(lstock_sweep.len * 2 + 1);
+        TEST_ASSERT(lh != NULL, "lh malloc");
+        hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
+        lh[lstock_sweep.len * 2] = '\0';
+        char lstock_sweep_txid[65];
+        int lok = spend_broadcast_and_mine(&rt, lh, 1, lstock_sweep_txid);
+        free(lh); tx_buf_free(&lstock_sweep);
+        TEST_ASSERT(lok, "L-stock sweep confirmed");
+        per_party_recv[0] += lstock_amt - LSTOCK_SWEEP_FEE;
+        total_sweep_fees  += LSTOCK_SWEEP_FEE;
+        total_allocated   += lstock_amt;
+        printf("  leaf %d: LSP swept L-stock %llu sats (vout=%u)\n",
+               li, (unsigned long long)(lstock_amt - LSTOCK_SWEEP_FEE),
+               lstock_vout);
+
+        /* (B) Sweep each channel via offline 2-of-2 MuSig {client_X, LSP}. */
+        for (int ch = 0; ch < n_channels; ch++) {
+            /* signer_indices layout: [0]=LSP, [1..]=clients in this leaf.
+               outputs[ch] (ch=0..n_channels-1) corresponds to client at
+               signer_indices[1+ch] — same convention as
+               test_regtest_full_force_close_and_sweep_arity2. */
+            uint32_t client_idx = leaf->signer_indices[1 + ch];
+            TEST_ASSERT(client_idx >= 1 && client_idx < N,
+                        "client_idx in range");
+
+            uint64_t chan_amt = leaf->outputs[ch].amount_sats;
+            uint64_t after_fee = chan_amt - CHAN_SWEEP_FEE;
+            uint64_t balanced  = after_fee / 2;
+            uint64_t client_share = balanced - PAYMENT_SHIFT;
+            uint64_t lsp_share    = after_fee - client_share;
+            unsigned char chan_spk[34];
+            memcpy(chan_spk, leaf->outputs[ch].script_pubkey, 34);
+
+            tx_output_t outs[2];
+            memcpy(outs[0].script_pubkey, party_spk[client_idx], 34);
+            outs[0].script_pubkey_len = 34;
+            outs[0].amount_sats = client_share;
+            memcpy(outs[1].script_pubkey, party_spk[0], 34);
+            outs[1].script_pubkey_len = 34;
+            outs[1].amount_sats = lsp_share;
+
+            tx_buf_t chan_unsigned;
+            tx_buf_init(&chan_unsigned, 256);
+            TEST_ASSERT(build_unsigned_tx(&chan_unsigned, NULL,
+                                            leaf_txid_bytes,
+                                            (uint32_t)ch, 0xFFFFFFFEu,
+                                            outs, 2),
+                        "build unsigned channel sweep");
+            unsigned char sighash[32];
+            TEST_ASSERT(compute_taproot_sighash(sighash,
+                            chan_unsigned.data, chan_unsigned.len,
+                            0, chan_spk, 34, chan_amt, 0xFFFFFFFEu),
+                        "channel sighash");
+
+            /* MuSig2 pubkey order matches factory: {client, LSP}. */
+            secp256k1_keypair signers[2] = { kps[client_idx], kps[0] };
+            secp256k1_pubkey  ckpks[2];
+            secp256k1_keypair_pub(ctx, &ckpks[0], &signers[0]);
+            secp256k1_keypair_pub(ctx, &ckpks[1], &signers[1]);
+            musig_keyagg_t cka;
+            TEST_ASSERT(musig_aggregate_keys(ctx, &cka, ckpks, 2),
+                        "agg channel keys (client, LSP)");
+            unsigned char sig64[64];
+            TEST_ASSERT(musig_sign_taproot(ctx, sig64, sighash, signers, 2,
+                                             &cka, NULL),
+                        "2-of-2 MuSig2 sign channel sweep");
+            tx_buf_t chan_signed;
+            tx_buf_init(&chan_signed, 256);
+            TEST_ASSERT(finalize_signed_tx(&chan_signed,
+                            chan_unsigned.data, chan_unsigned.len, sig64),
+                        "finalize channel sweep tx");
+            tx_buf_free(&chan_unsigned);
+
+            char *ch_hex = malloc(chan_signed.len * 2 + 1);
+            TEST_ASSERT(ch_hex != NULL, "ch_hex malloc");
+            hex_encode(chan_signed.data, chan_signed.len, ch_hex);
+            ch_hex[chan_signed.len * 2] = '\0';
+            char chan_sweep_txid[65];
+            int cok = spend_broadcast_and_mine(&rt, ch_hex, 1, chan_sweep_txid);
+            free(ch_hex); tx_buf_free(&chan_signed);
+            TEST_ASSERT(cok, "channel 2-of-2 sweep confirmed");
+            per_party_recv[client_idx] += client_share;
+            per_party_recv[0]          += lsp_share;
+            total_sweep_fees           += CHAN_SWEEP_FEE;
+            total_allocated            += chan_amt;
+            printf("  leaf %d ch%d (client%u,LSP): client=%llu, LSP=%llu\n",
+                   li, ch, (unsigned)client_idx,
+                   (unsigned long long)client_share,
+                   (unsigned long long)lsp_share);
+        }
+    }
+
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    /* Conservation across the entire mixed-arity tree:
+       Σ(swept) + Σ(sweep_fees) == Σ(leaf_allocations).
+       Tree-internal fees are baked into the leaf allocations already. */
+    uint64_t swept_sum = 0;
+    for (size_t p = 0; p < N; p++) swept_sum += per_party_recv[p];
+    TEST_ASSERT(swept_sum + total_sweep_fees == total_allocated,
+                "conservation: Σswept + Σsweep_fees == Σleaf_allocations");
+    printf("  [mixed{2,4,8}] conservation OK: swept=%llu + sweep_fees=%llu "
+           "== allocations=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_sweep_fees,
+           (unsigned long long)total_allocated);
+
+    /* Per-party expected deltas. */
+    uint64_t expected_deltas[12];
+    for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
+
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match expected (12 parties)");
+    econ_print_summary(&econ);
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
