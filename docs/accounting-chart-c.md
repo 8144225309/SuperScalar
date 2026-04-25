@@ -39,7 +39,7 @@ on `ARITY_1` and `ARITY_2` makes no sense), leaving 33 meaningful cells.
 | force-to_local | S `test_regtest_force_close_to_local` | S | S |
 | breach | S `test_regtest_breach_penalty_spendability` | S | S |
 | rotation | ✓ `run_rotation_for_arity(ARITY_1)` + `test_regtest_econ_rotation_arity1` | ✓ `run_rotation_for_arity(ARITY_2)` + `test_regtest_econ_rotation_arity2` | ✓ `run_rotation_for_arity(ARITY_PS)` + `test_regtest_econ_rotation_arity_ps` |
-| PS-advance | — | — | ✓ `test_regtest_econ_ps_advance` |
+| PS-advance | — | — | ✓ `test_regtest_econ_ps_advance` (in-process); on-chain chain advance + sweep covered by `test_regtest_full_force_close_and_sweep_arity_ps_chain_len2` and `..._chain_len5` (Phase 2 #3) |
 | full-tree | ✓ `test_regtest_full_force_close_and_sweep_arity1` | (pending PR by #137 agent) | (pending PR by #137 agent) |
 
 ## Chart C: HTLC-mid-flight slice
