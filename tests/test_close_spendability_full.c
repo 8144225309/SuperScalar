@@ -1531,6 +1531,22 @@ int test_regtest_jit_recovery_close_coop_full(void) {
         build_p2tr_script_pubkey(cli_close_spk, &xo);
     }
 
+    /* Wire the econ harness BEFORE the close TX is broadcast — the close
+       output lands at the SAME SPK we sweep to (P2TR(xonly(pk_i))), so if
+       we snap_pre AFTER the close-tx confirms the close amount would
+       already be counted in pre_balance and the sweep would only show
+       a -SWEEP_FEE delta. Snap_pre BEFORE close => post − pre captures
+       (close_output_landed) − (close_output_consumed_by_sweep) +
+       (sweep_output_landed) = sweep_output_landed = close_amt − fee. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
+                "register LSP");
+    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
+                "register client");
+    econ.factory_funding_amount = jit_amount;  /* scope = JIT funding */
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
     /* Build the 2-output close TX. */
     tx_output_t outs[2];
     outs[0].script_pubkey_len = 34;
@@ -1578,19 +1594,6 @@ int test_regtest_jit_recovery_close_coop_full(void) {
            (unsigned long long)lsp_close_amt,
            (unsigned long long)cli_close_amt,
            (unsigned long long)close_fee);
-
-    /* Wire the econ harness AFTER funding but BEFORE sweeps so deltas
-       capture the close output AND the sweep landing. Each party's
-       expect_close_spk == P2TR(xonly(pk_i)), and the sweep destination
-       below targets that same SPK. */
-    econ_ctx_t econ;
-    econ_ctx_init(&econ, &rt, ctx);
-    TEST_ASSERT(econ_register_party(&econ, 0, "LSP", N_PARTY_SECKEYS[0]),
-                "register LSP");
-    TEST_ASSERT(econ_register_party(&econ, 1, "client", N_PARTY_SECKEYS[1]),
-                "register client");
-    econ.factory_funding_amount = jit_amount;  /* scope = JIT funding */
-    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
 
     /* Per-party sweeps: each sweeps its own P2TR(xonly(pk_i)) output.
        The close output IS at P2TR(xonly(pk_i)) (raw xonly, no taptweak),
