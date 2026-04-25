@@ -4,6 +4,14 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+- **`FACTORY_MAX_LEAVES` raised 64→128** (`include/superscalar/factory.h`): the
+  static `leaf_layers[]` and `leaf_node_indices[]` arrays in `factory_t` now
+  size for 128 leaves, unblocking PS factories at N=128 (1 LSP + 127 clients
+  → 127 PS leaves). One-line bump, ~1.5KB struct growth. New unit test
+  `test_factory_ps_build_n128` exercises the 128-way MuSig aggregation at the
+  root + every per-node MuSig ceremony in the resulting 506-node tree (depth 7,
+  8 DW layers — exactly `DW_MAX_LAYERS`). Phase 2 #7.
+
 ## 0.1.13 — 2026-04-24
 
 Factory participant cap raised from 64 to 128. Per-channel fee tracking and HTLC-based profit settlement. Client-side verification at every factory lifecycle boundary. Memory-safety CI hardening (LSan leak gate, TSan job, OSS-Fuzz integration) — 1050 pre-existing leaks found and fixed. End-to-end spendability + economic-correctness verification across all three factory arities (**Chart A 28/28**, Chart B 28/29 regtest + 3/3 bridge external_in; 3 external_out cells remain 🟡 pending signet infrastructure — see `tools/test_bridge_econ_signet.sh`). Production-blocking cooperative-close-after-payments bug fixed (`factory_recovery_scan` no longer force-publishes the tree at startup). On-chain stranded-funds recovery tool. 1377 unit tests, all passing under ASan+UBSan+LSan and TSan.
