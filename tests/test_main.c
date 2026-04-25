@@ -1122,6 +1122,9 @@ extern int test_regtest_full_force_close_and_sweep_arityPS(void);
 extern int test_regtest_htlc_force_to_local_arity1(void);
 extern int test_regtest_htlc_force_to_local_arity2(void);
 extern int test_regtest_htlc_force_to_local_arity_ps(void);
+extern int test_regtest_htlc_breach_arity1(void);
+extern int test_regtest_htlc_breach_arity2(void);
+extern int test_regtest_htlc_breach_arity_ps(void);
 extern int test_regtest_econ_arity2_baseline(void);
 extern int test_regtest_econ_arity1_baseline(void);
 extern int test_regtest_econ_arity_ps_baseline(void);
@@ -3637,6 +3640,9 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_htlc_force_to_local_arity1);
     RUN_TEST(test_regtest_htlc_force_to_local_arity2);
     RUN_TEST(test_regtest_htlc_force_to_local_arity_ps);
+    RUN_TEST(test_regtest_htlc_breach_arity1);
+    RUN_TEST(test_regtest_htlc_breach_arity2);
+    RUN_TEST(test_regtest_htlc_breach_arity_ps);
 
     printf("\n=== Economic Correctness (Chart B) ===\n");
     RUN_TEST(test_regtest_econ_arity2_baseline);
