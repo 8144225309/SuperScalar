@@ -155,7 +155,7 @@ static int run_shell_driver(char *close_txid_out, size_t close_txid_max) {
     if (rc != 0) {
         printf("  FAIL: shell driver exited rc=%d "
                "(WIFEXITED=%d WEXITSTATUS=%d)\n",
-               rc, WIFEXITED(rc), WIFEXITSTATUS(rc));
+               rc, WIFEXITED(rc), WEXITSTATUS(rc));
         return 0;
     }
     if (!saw_pass) {
