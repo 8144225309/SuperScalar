@@ -5142,3 +5142,821 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ============================================================================
+ *  Phase 3 Item #1: PS at N=8 / N=16 on regtest with full per-party accounting.
+ *
+ *  Phase 2 #3 covered PS chain-advance at N=3 on real chain; Phase 2 #7
+ *  covered PS at N=64/128 in unit tests with fake txids. The middle ground —
+ *  N>=8 on real chain with full per-party accounting — is filled here.
+ *
+ *  Five cells:
+ *    A. test_regtest_ps_full_lifecycle_n8           — N=8, all 7 leaves
+ *                                                      chain_len=0
+ *    B. test_regtest_ps_heterogeneous_chains_n8     — N=8, mixed chain_lens
+ *                                                      {5,3,1,0,0,2,4}
+ *    C. test_regtest_ps_full_lifecycle_n16          — N=16, all 15 leaves
+ *                                                      chain_len=0
+ *    D. test_regtest_ps_heterogeneous_chains_n16    — N=16, mixed chain_lens
+ *                                                      {0,1,2,0,5,0,3,0,1,4,
+ *                                                       0,2,0,1,5}
+ *    E. test_regtest_ps_old_state_broadcast_fails_n8 — adversarial: prove
+ *                                                       that an old chain[i]
+ *                                                       cannot be re-broadcast
+ *                                                       once chain[i+1] confirms.
+ *
+ *  Severity: every TX broadcast + confirmed; conservation across the entire
+ *  factory; per-party econ_assert_wallet_deltas for ALL N parties.
+ *  ========================================================================== */
+
+/* Deterministic seckeys for up to 16 parties (extends N12_PARTY_SECKEYS).
+   Same construction: byte 31 = (i+1). */
+static const unsigned char N16_PARTY_SECKEYS[16][32] = {
+    { [0 ... 30] = 0, [31] = 0x01 },  /* LSP */
+    { [0 ... 30] = 0, [31] = 0x02 },  /* client 1 */
+    { [0 ... 30] = 0, [31] = 0x03 },  /* client 2 */
+    { [0 ... 30] = 0, [31] = 0x04 },  /* client 3 */
+    { [0 ... 30] = 0, [31] = 0x05 },  /* client 4 */
+    { [0 ... 30] = 0, [31] = 0x06 },  /* client 5 */
+    { [0 ... 30] = 0, [31] = 0x07 },  /* client 6 */
+    { [0 ... 30] = 0, [31] = 0x08 },  /* client 7 */
+    { [0 ... 30] = 0, [31] = 0x09 },  /* client 8 */
+    { [0 ... 30] = 0, [31] = 0x0A },  /* client 9 */
+    { [0 ... 30] = 0, [31] = 0x0B },  /* client 10 */
+    { [0 ... 30] = 0, [31] = 0x0C },  /* client 11 */
+    { [0 ... 30] = 0, [31] = 0x0D },  /* client 12 */
+    { [0 ... 30] = 0, [31] = 0x0E },  /* client 13 */
+    { [0 ... 30] = 0, [31] = 0x0F },  /* client 14 */
+    { [0 ... 30] = 0, [31] = 0x10 },  /* client 15 */
+};
+
+/* Build N-way MuSig + BIP-341 taptweak P2TR funding SPK for N parties.
+   Caller provides keypairs + pubkeys arrays sized for N. */
+static int build_n_party_funding_spk(secp256k1_context *ctx,
+                                       const secp256k1_pubkey *pks,
+                                       size_t N,
+                                       unsigned char out_fund_spk[34],
+                                       unsigned char out_tw_ser[32]) {
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, N)) return 0;
+    unsigned char agg_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tw_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka_spk.cache, tweak))
+        return 0;
+    secp256k1_xonly_pubkey tw_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw_pk)) return 0;
+    build_p2tr_script_pubkey(out_fund_spk, &tw_xonly);
+    if (!secp256k1_xonly_pubkey_serialize(ctx, out_tw_ser, &tw_xonly)) return 0;
+    return 1;
+}
+
+/* Build + fund + sign a PS factory at N participants with given funding amount.
+   Stores keypairs/pubkeys + fund txid/vout/amount in out parameters.
+   Returns 1 on success. f is allocated by caller. */
+static int build_ps_factory_n(regtest_t *rt,
+                                secp256k1_context *ctx,
+                                size_t N,
+                                double fund_btc,
+                                const char *mine_addr,
+                                const unsigned char (*seckeys)[32],
+                                secp256k1_keypair *out_kps,   /* sized N */
+                                secp256k1_pubkey  *out_pks,   /* sized N */
+                                factory_t *f,
+                                unsigned char out_fund_spk[34],
+                                char out_fund_txid[65],
+                                uint32_t *out_fund_vout,
+                                uint64_t *out_fund_amount) {
+    for (size_t i = 0; i < N; i++) {
+        if (!secp256k1_keypair_create(ctx, &out_kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &out_pks[i], &out_kps[i])) return 0;
+    }
+    unsigned char tw_ser[32];
+    if (!build_n_party_funding_spk(ctx, out_pks, N, out_fund_spk, tw_ser))
+        return 0;
+
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tw_ser, fund_addr, sizeof(fund_addr)))
+        return 0;
+    if (!regtest_fund_address(rt, fund_addr, fund_btc, out_fund_txid)) return 0;
+    regtest_mine_blocks(rt, 1, mine_addr);
+
+    *out_fund_vout = UINT32_MAX;
+    *out_fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t amt = 0;
+        unsigned char spk[64];
+        size_t spk_len = 0;
+        if (regtest_get_tx_output(rt, out_fund_txid, v, &amt, spk, &spk_len) &&
+            spk_len == 34 && memcmp(spk, out_fund_spk, 34) == 0) {
+            *out_fund_vout = v;
+            *out_fund_amount = amt;
+            break;
+        }
+    }
+    if (*out_fund_vout == UINT32_MAX) return 0;
+
+    unsigned char txid_bytes[32];
+    if (!hex_decode(out_fund_txid, txid_bytes, 32)) return 0;
+    reverse_bytes(txid_bytes, 32);
+    factory_init(f, ctx, out_kps, N, 2, 4);  /* step_blocks=2, states_per_layer=4 */
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, txid_bytes, *out_fund_vout, *out_fund_amount,
+                        out_fund_spk, 34);
+    if (!factory_build_tree(f)) return 0;
+    if (!factory_sign_all(f))   return 0;
+    return 1;
+}
+
+/* Broadcast every signed tree node (chain[0] for every PS leaf) in DFS order
+   with BIP-68 spacing. Stores resulting txids in out_txids[].
+   Returns 1 on success. */
+static int broadcast_factory_tree(regtest_t *rt, factory_t *f,
+                                    const char *mine_addr,
+                                    char out_txids[FACTORY_MAX_NODES][65]) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        if (!nd->is_signed || nd->signed_tx.len == 0) return 0;
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        if (!tx_hex) return 0;
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(rt, tx_hex, out_txids[i]);
+        free(tx_hex);
+        if (!ok) return 0;
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t cns = f->nodes[i + 1].nsequence;
+            if (!(cns & 0x80000000u)) blocks_to_mine = (int)(cns & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(rt, blocks_to_mine, mine_addr);
+    }
+    return 1;
+}
+
+/* Per-leaf bookkeeping of chain advances. Stashes chain[i] tx bytes + the
+   txid of each chain[i] (i=0 is the leaf state node from the tree broadcast).
+   Used by tests B/D/E to track chain[i] for sweep + adversarial broadcast. */
+typedef struct {
+    int n_advances;                     /* >= 0; chain has n_advances+1 TXs */
+    /* chain[0..n_advances] each */
+    unsigned char *chain_tx[16];        /* malloc'd raw bytes */
+    size_t chain_tx_len[16];
+    char chain_txid[16][65];            /* hex */
+    /* Final state (chain[n_advances]) channel SPK + amount for sweep */
+    unsigned char chan_spk[34];
+    uint64_t chain0_chan_amt;
+    uint64_t chain0_lstock_amt;
+    unsigned char lstock_spk[34];
+    uint32_t client_idx;                /* 1..N-1 */
+} ps_leaf_chain_t;
+
+static void ps_leaf_chain_free(ps_leaf_chain_t *c) {
+    for (int i = 0; i <= c->n_advances && i < 16; i++) {
+        free(c->chain_tx[i]);
+        c->chain_tx[i] = NULL;
+    }
+}
+
+/* Run a per-leaf chain-advance loop: starting from a built+broadcast leaf
+   (chain[0] already on chain), call factory_advance_leaf n_advances times,
+   stash every chain[i] bytes + txid, broadcast chain[1..n_advances] in order
+   and confirm. */
+static int advance_and_broadcast_leaf_chain(regtest_t *rt, factory_t *f,
+                                              int leaf_side,
+                                              const char *leaf_chain0_txid,
+                                              int n_advances,
+                                              const char *mine_addr,
+                                              ps_leaf_chain_t *out) {
+    if (n_advances < 0 || n_advances >= 16) return 0;
+    size_t nidx = f->leaf_node_indices[leaf_side];
+    factory_node_t *leaf = &f->nodes[nidx];
+
+    out->n_advances = n_advances;
+    out->client_idx = leaf->signer_indices[1];
+    memcpy(out->chan_spk, leaf->outputs[0].script_pubkey, 34);
+    out->chain0_chan_amt = leaf->outputs[0].amount_sats;
+    out->chain0_lstock_amt = leaf->outputs[1].amount_sats;
+    memcpy(out->lstock_spk, leaf->outputs[1].script_pubkey, 34);
+
+    /* Stash chain[0] (already on chain — copy bytes from leaf->signed_tx). */
+    out->chain_tx_len[0] = leaf->signed_tx.len;
+    out->chain_tx[0] = malloc(out->chain_tx_len[0]);
+    if (!out->chain_tx[0]) return 0;
+    memcpy(out->chain_tx[0], leaf->signed_tx.data, out->chain_tx_len[0]);
+    memcpy(out->chain_txid[0], leaf_chain0_txid, 65);
+
+    for (int adv = 1; adv <= n_advances; adv++) {
+        if (!factory_advance_leaf(f, leaf_side)) return 0;
+        if (leaf->ps_chain_len != adv) return 0;
+        if (leaf->n_outputs != 1) return 0;
+        if (!leaf->is_signed || leaf->signed_tx.len == 0) return 0;
+
+        /* Stash chain[adv] bytes BEFORE next advance overwrites signed_tx. */
+        out->chain_tx_len[adv] = leaf->signed_tx.len;
+        out->chain_tx[adv] = malloc(out->chain_tx_len[adv]);
+        if (!out->chain_tx[adv]) return 0;
+        memcpy(out->chain_tx[adv], leaf->signed_tx.data, out->chain_tx_len[adv]);
+
+        /* Broadcast chain[adv]. */
+        char *adv_hex = malloc(out->chain_tx_len[adv] * 2 + 1);
+        if (!adv_hex) return 0;
+        hex_encode(out->chain_tx[adv], out->chain_tx_len[adv], adv_hex);
+        adv_hex[out->chain_tx_len[adv] * 2] = '\0';
+        int ok = regtest_send_raw_tx(rt, adv_hex, out->chain_txid[adv]);
+        free(adv_hex);
+        if (!ok) return 0;
+        regtest_mine_blocks(rt, 1, mine_addr);
+        if (regtest_get_confirmations(rt, out->chain_txid[adv]) < 1) return 0;
+    }
+    return 1;
+}
+
+/* Build a PS-channel sweep tx: spends chain[N] vout 0 (the channel) of the
+   given leaf, splits the channel amount into client_share + lsp_share.
+   leaf is the current factory_node_t (used for n_signers / signer_indices /
+   keyagg). Returns 1 on success, fills out_txid. */
+static int sweep_ps_channel_n_party(regtest_t *rt,
+                                      secp256k1_context *ctx,
+                                      const secp256k1_keypair *kps,
+                                      size_t N,
+                                      const factory_node_t *leaf,
+                                      const char *spend_txid_hex,
+                                      const unsigned char chan_spk[34],
+                                      uint64_t chan_amt,
+                                      uint64_t client_share,
+                                      uint64_t lsp_share,
+                                      const unsigned char client_p2tr_spk[34],
+                                      const unsigned char lsp_p2tr_spk[34],
+                                      char out_txid[65]) {
+    (void)N; /* N param kept for future verification */
+
+    unsigned char tb[32];
+    if (!hex_decode(spend_txid_hex, tb, 32)) return 0;
+    reverse_bytes(tb, 32);
+
+    tx_output_t outs[2];
+    memcpy(outs[0].script_pubkey, client_p2tr_spk, 34);
+    outs[0].script_pubkey_len = 34;
+    outs[0].amount_sats = client_share;
+    memcpy(outs[1].script_pubkey, lsp_p2tr_spk, 34);
+    outs[1].script_pubkey_len = 34;
+    outs[1].amount_sats = lsp_share;
+
+    tx_buf_t cu;
+    tx_buf_init(&cu, 256);
+    if (!build_unsigned_tx(&cu, NULL, tb, 0, 0xFFFFFFFEu, outs, 2)) {
+        tx_buf_free(&cu); return 0;
+    }
+    unsigned char sh[32];
+    if (!compute_taproot_sighash(sh, cu.data, cu.len, 0, chan_spk, 34,
+                                  chan_amt, 0xFFFFFFFEu)) {
+        tx_buf_free(&cu); return 0;
+    }
+    secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey  signer_pks[FACTORY_MAX_SIGNERS];
+    for (size_t s = 0; s < leaf->n_signers; s++) {
+        uint32_t sidx = leaf->signer_indices[s];
+        signers[s] = kps[sidx];
+        secp256k1_keypair_pub(ctx, &signer_pks[s], &signers[s]);
+    }
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, signer_pks, leaf->n_signers)) {
+        tx_buf_free(&cu); return 0;
+    }
+    unsigned char sig64[64];
+    if (!musig_sign_taproot(ctx, sig64, sh, signers, leaf->n_signers, &ka, NULL)) {
+        tx_buf_free(&cu); return 0;
+    }
+    tx_buf_t cs;
+    tx_buf_init(&cs, 256);
+    if (!finalize_signed_tx(&cs, cu.data, cu.len, sig64)) {
+        tx_buf_free(&cu); tx_buf_free(&cs); return 0;
+    }
+    tx_buf_free(&cu);
+
+    char *ch = malloc(cs.len * 2 + 1);
+    if (!ch) { tx_buf_free(&cs); return 0; }
+    hex_encode(cs.data, cs.len, ch);
+    ch[cs.len * 2] = '\0';
+    int ok = spend_broadcast_and_mine(rt, ch, 1, out_txid);
+    free(ch); tx_buf_free(&cs);
+    return ok;
+}
+
+/* Run a full PS lifecycle test at the given N with optional per-leaf chain
+   advances. chain_lens[i] is the number of advances for leaf i (must be
+   >= 0 and < 16). If chain_lens is NULL, all leaves stay at chain_len=0.
+   Returns 1 on success. */
+static int run_ps_full_lifecycle(regtest_t *rt,
+                                   secp256k1_context *ctx,
+                                   size_t N,
+                                   const int *chain_lens,
+                                   double fund_btc,
+                                   const unsigned char (*seckeys)[32],
+                                   const char *mine_addr) {
+    secp256k1_keypair kps[16];
+    secp256k1_pubkey  pks[16];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!build_ps_factory_n(rt, ctx, N, fund_btc, mine_addr, seckeys, kps, pks,
+                              f, fund_spk, fund_txid, &fund_vout, &fund_amount)) {
+        factory_free(f); free(f); return 0;
+    }
+    int n_leaves = f->n_leaf_nodes;
+    printf("  [PS N=%zu] factory funded: %llu sats, %zu nodes, %d leaves\n",
+           N, (unsigned long long)fund_amount, f->n_nodes, n_leaves);
+    TEST_ASSERT(n_leaves == (int)(N - 1), "PS leaves = N-1");
+
+    /* Broadcast every signed tree node (chain[0] for each leaf). */
+    char txids[FACTORY_MAX_NODES][65];
+    TEST_ASSERT(broadcast_factory_tree(rt, f, mine_addr, txids),
+                "broadcast factory tree");
+    for (int li = 0; li < n_leaves; li++) {
+        TEST_ASSERT(regtest_get_confirmations(rt,
+                        txids[f->leaf_node_indices[li]]) >= 1,
+                    "leaf chain[0] on chain");
+    }
+    printf("  full tree broadcast OK -- %zu nodes, %d leaves chain[0] confirmed\n",
+           f->n_nodes, n_leaves);
+
+    /* Per-leaf chain advance + broadcast. Stash bytes + txids for sweep step. */
+    ps_leaf_chain_t leaf_chains[16] = {0};
+    uint64_t total_advance_fees = 0;
+    uint64_t fee_per_tx = f->fee_per_tx;
+    for (int li = 0; li < n_leaves; li++) {
+        int n_adv = (chain_lens != NULL) ? chain_lens[li] : 0;
+        TEST_ASSERT(advance_and_broadcast_leaf_chain(rt, f, li,
+                        txids[f->leaf_node_indices[li]],
+                        n_adv, mine_addr, &leaf_chains[li]),
+                    "advance + broadcast leaf chain");
+        if (n_adv > 0) {
+            printf("  leaf %d: chain advanced to len=%d (chan now %llu sats)\n",
+                   li, n_adv,
+                   (unsigned long long)(leaf_chains[li].chain0_chan_amt
+                                         - (uint64_t)n_adv * fee_per_tx));
+        }
+        total_advance_fees += (uint64_t)n_adv * fee_per_tx;
+    }
+
+    /* Build per-party P2TR(xonly(pk_i)) destinations. */
+    unsigned char party_spk[16][34];
+    for (size_t p = 0; p < N; p++) {
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pks[p]);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
+
+    /* Wire econ harness for all N parties BEFORE any sweeps. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, rt, ctx);
+    char party_name_buf[16][32];
+    snprintf(party_name_buf[0], 32, "LSP");
+    for (size_t p = 1; p < N; p++)
+        snprintf(party_name_buf[p], 32, "client%02zu", p);
+    for (size_t p = 0; p < N; p++) {
+        TEST_ASSERT(econ_register_party(&econ, p, party_name_buf[p],
+                                         seckeys[p]),
+                    "register party");
+    }
+    econ.factory_funding_amount = fund_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre");
+
+    const uint64_t LSTOCK_SWEEP_FEE = 300;
+    const uint64_t CHAN_SWEEP_FEE   = 400;
+    const uint64_t SIMULATED_PAYMENT     = 5000;
+    const uint64_t SIMULATED_ROUTING_FEE = 100;
+    const uint64_t CLIENT_BALANCE_SHIFT  = SIMULATED_PAYMENT + SIMULATED_ROUTING_FEE;
+
+    uint64_t per_party_recv[16] = {0};
+    uint64_t total_sweep_fees   = 0;
+    uint64_t total_allocated    = 0;
+
+    /* Per-leaf sweep loop. */
+    for (int li = 0; li < n_leaves; li++) {
+        ps_leaf_chain_t *lc = &leaf_chains[li];
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        const char *chain0_txid = lc->chain_txid[0];
+        const char *chainN_txid = lc->chain_txid[lc->n_advances];
+
+        TEST_ASSERT(leaf->is_ps_leaf, "leaf is PS");
+        TEST_ASSERT(leaf->signer_indices[0] == 0, "signer[0] is LSP");
+        uint32_t client_idx = lc->client_idx;
+        TEST_ASSERT(client_idx >= 1 && client_idx < N, "client_idx in range");
+
+        /* (A) LSP solo-sweeps L-stock from chain[0] vout 1. The chain[0] TX
+              still has vout 1 untouched even when chain advances spent vout 0. */
+        {
+            tx_buf_t ls;
+            tx_buf_init(&ls, 256);
+            TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                            seckeys[0],
+                            chain0_txid, 1, lc->chain0_lstock_amt,
+                            lc->lstock_spk, 34,
+                            party_spk[0], 34,
+                            LSTOCK_SWEEP_FEE, &ls),
+                        "build L-stock sweep");
+            char *lh = malloc(ls.len * 2 + 1);
+            TEST_ASSERT(lh != NULL, "lh malloc");
+            hex_encode(ls.data, ls.len, lh);
+            lh[ls.len * 2] = '\0';
+            char ls_txid[65];
+            int lok = spend_broadcast_and_mine(rt, lh, 1, ls_txid);
+            free(lh); tx_buf_free(&ls);
+            TEST_ASSERT(lok, "L-stock sweep confirmed");
+            per_party_recv[0] += lc->chain0_lstock_amt - LSTOCK_SWEEP_FEE;
+            total_sweep_fees  += LSTOCK_SWEEP_FEE;
+            total_allocated   += lc->chain0_lstock_amt;
+        }
+
+        /* (B) Channel sweep: chain[N] vout 0, 2-of-2 MuSig {LSP, client}. */
+        uint64_t chan_amt = lc->chain0_chan_amt
+                          - (uint64_t)lc->n_advances * fee_per_tx;
+        uint64_t after_fee = chan_amt - CHAN_SWEEP_FEE;
+        uint64_t balanced  = after_fee / 2;
+        uint64_t client_share = balanced - CLIENT_BALANCE_SHIFT;
+        uint64_t lsp_share    = after_fee - client_share;
+
+        char swept[65];
+        TEST_ASSERT(sweep_ps_channel_n_party(rt, ctx, kps, N, leaf,
+                        chainN_txid, lc->chan_spk, chan_amt,
+                        client_share, lsp_share,
+                        party_spk[client_idx], party_spk[0], swept),
+                    "sweep PS channel");
+
+        per_party_recv[client_idx] += client_share;
+        per_party_recv[0]          += lsp_share;
+        total_sweep_fees           += CHAN_SWEEP_FEE;
+        total_allocated            += lc->chain0_chan_amt; /* original alloc */
+
+        printf("  leaf %d: client%u=%llu, LSP=%llu (chain_len=%d, "
+               "chan_now=%llu)\n",
+               li, (unsigned)client_idx,
+               (unsigned long long)client_share,
+               (unsigned long long)lsp_share,
+               lc->n_advances, (unsigned long long)chan_amt);
+    }
+
+    /* econ snap post + assertions. */
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post");
+
+    uint64_t swept_sum = 0;
+    for (size_t p = 0; p < N; p++) swept_sum += per_party_recv[p];
+
+    /* Conservation: swept + sweep_fees + advance_fees == allocated.
+       allocated_sum is sum of leaf chain[0] outputs (channel + L-stock)
+       BEFORE per-advance fee subtractions. */
+    TEST_ASSERT(swept_sum + total_sweep_fees + total_advance_fees
+                == total_allocated,
+                "conservation: swept + sweep_fees + advance_fees == allocations");
+    printf("  [PS N=%zu] conservation OK: swept=%llu + sweep_fees=%llu "
+           "+ advance_fees=%llu == allocations=%llu\n",
+           N,
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_sweep_fees,
+           (unsigned long long)total_advance_fees,
+           (unsigned long long)total_allocated);
+
+    uint64_t expected_deltas[16];
+    for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match expected");
+    econ_print_summary(&econ);
+
+    for (int li = 0; li < n_leaves; li++) ps_leaf_chain_free(&leaf_chains[li]);
+    factory_free(f);
+    free(f);
+    return 1;
+}
+
+int test_regtest_ps_full_lifecycle_n8(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_full_lc_n8");
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=8, all leaves chain_len=0. fund 0.05 BTC = 5,000,000 sats. */
+    int ok = run_ps_full_lifecycle(&rt, ctx, 8, NULL, 0.05,
+                                     N16_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_ps_heterogeneous_chains_n8(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_het_chains_n8");
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=8 -> 7 leaves with chain_lens {5,3,1,0,0,2,4}. */
+    int chain_lens[7] = {5, 3, 1, 0, 0, 2, 4};
+    int ok = run_ps_full_lifecycle(&rt, ctx, 8, chain_lens, 0.05,
+                                     N16_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_ps_full_lifecycle_n16(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_full_lc_n16");
+    rt.scan_depth = 1200;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=16, all leaves chain_len=0. fund 0.10 BTC = 10,000,000 sats so
+       each leaf gets a healthy share after tree-internal fees. */
+    int ok = run_ps_full_lifecycle(&rt, ctx, 16, NULL, 0.10,
+                                     N16_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+int test_regtest_ps_heterogeneous_chains_n16(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_het_chains_n16");
+    rt.scan_depth = 1200;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* N=16 -> 15 leaves with mixed chain_lens. */
+    int chain_lens[15] = {0, 1, 2, 0, 5, 0, 3, 0, 1, 4, 0, 2, 0, 1, 5};
+    int ok = run_ps_full_lifecycle(&rt, ctx, 16, chain_lens, 0.10,
+                                     N16_PARTY_SECKEYS, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+/* ============================================================================
+ *  Test E (adversarial): prove PS non-revocability AT THE CHAIN LEVEL.
+ *
+ *  Setup:
+ *    - N=8 PS factory, fund + build_tree + sign_all (same as test A).
+ *    - Pick leaf 0. Stash chain[0] bytes (already in leaf->signed_tx after
+ *      sign_all). Advance leaf 0 once -> stash chain[1] bytes. Advance once
+ *      more -> stash chain[2] bytes.
+ *
+ *  Broadcast script:
+ *    1. Broadcast every other tree node + chain[0] of leaf 0 (the standard
+ *       tree broadcast). Confirm.
+ *    2. Try to broadcast chain[2] BEFORE chain[1] -- expected to FAIL because
+ *       chain[2] spends chain[1]'s vout 0, which doesn't exist yet.
+ *    3. Broadcast chain[1] from stashed bytes. It spends chain[0] vout 0
+ *       which IS on chain. Confirm.
+ *    4. Broadcast chain[2] again -- succeeds now. Confirm.
+ *    5. CRITICAL: Try to broadcast the stashed chain[1] AGAIN. Must FAIL
+ *       with `bad-txns-inputs-missingorspent` because chain[1]'s vout 0
+ *       was already spent by chain[2] in step 4.
+ *
+ *  This proves the chain itself enforces PS non-revocability: once chain[i+1]
+ *  confirms, the signed bytes for chain[i] become unbroadcastable. The persist
+ *  defense (PR #79) prevents the LSP/client from ever signing two TXs for the
+ *  same parent UTXO; this test proves the chain itself enforces the same
+ *  invariant even if the persist defense were bypassed.
+ *  ========================================================================== */
+
+/* Capture-output broadcast helper: returns 0/1 like regtest_send_raw_tx but
+   also captures the raw bitcoind error string into out_err (size out_err_len).
+   Direct regtest_exec call so we see the JSON error body even on failure. */
+static int try_broadcast_capture_error(regtest_t *rt,
+                                        const unsigned char *tx_bytes,
+                                        size_t tx_len,
+                                        char *out_err, size_t out_err_len) {
+    char *tx_hex = malloc(tx_len * 2 + 1);
+    if (!tx_hex) return -1;
+    hex_encode(tx_bytes, tx_len, tx_hex);
+    tx_hex[tx_len * 2] = '\0';
+
+    char *params = malloc(strlen(tx_hex) + 4);
+    if (!params) { free(tx_hex); return -1; }
+    snprintf(params, strlen(tx_hex) + 4, "\"%s\"", tx_hex);
+    free(tx_hex);
+
+    char *result = regtest_exec(rt, "sendrawtransaction", params);
+    free(params);
+    if (!result) {
+        if (out_err && out_err_len > 0)
+            snprintf(out_err, out_err_len, "(no result from regtest_exec)");
+        return 0;
+    }
+    if (strstr(result, "error") != NULL) {
+        if (out_err && out_err_len > 0) {
+            strncpy(out_err, result, out_err_len - 1);
+            out_err[out_err_len - 1] = '\0';
+        }
+        free(result);
+        return 0;
+    }
+    /* Success — strip quotes/whitespace from result (txid). */
+    if (out_err && out_err_len > 0) out_err[0] = '\0';
+    free(result);
+    return 1;
+}
+
+int test_regtest_ps_old_state_broadcast_fails_n8(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "ps_adversarial_n8");
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 8;
+    secp256k1_keypair kps[16];
+    secp256k1_pubkey  pks[16];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { secp256k1_context_destroy(ctx); return 0; }
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    if (!build_ps_factory_n(&rt, ctx, N, 0.05, mine_addr, N16_PARTY_SECKEYS,
+                              kps, pks, f, fund_spk, fund_txid, &fund_vout,
+                              &fund_amount)) {
+        factory_free(f); free(f); secp256k1_context_destroy(ctx); return 0;
+    }
+    int n_leaves = f->n_leaf_nodes;
+    printf("  [PS N=8 adversarial] factory funded: %llu sats, %zu nodes, "
+           "%d leaves\n",
+           (unsigned long long)fund_amount, f->n_nodes, n_leaves);
+    TEST_ASSERT(n_leaves == 7, "PS N=8 should have 7 leaves");
+
+    /* Step 1: broadcast every signed tree node (chain[0] for every leaf). */
+    char txids[FACTORY_MAX_NODES][65];
+    TEST_ASSERT(broadcast_factory_tree(&rt, f, mine_addr, txids),
+                "broadcast factory tree");
+    for (int li = 0; li < n_leaves; li++) {
+        TEST_ASSERT(regtest_get_confirmations(&rt,
+                        txids[f->leaf_node_indices[li]]) >= 1,
+                    "leaf chain[0] on chain");
+    }
+    printf("  full tree broadcast OK -- %zu nodes, %d leaves chain[0] confirmed\n",
+           f->n_nodes, n_leaves);
+
+    /* Step 2: stash chain[1] and chain[2] bytes for leaf 0 by advancing twice
+       WITHOUT broadcasting. We want the bytes only. */
+    int leaf_side = 0;
+    size_t leaf0_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *leaf0 = &f->nodes[leaf0_idx];
+    TEST_ASSERT(leaf0->is_ps_leaf, "leaf0 is PS");
+
+    /* Stash chain[0] bytes (just for symmetry; we don't rebroadcast it). */
+    size_t chain0_len = leaf0->signed_tx.len;
+    unsigned char *chain0_bytes = malloc(chain0_len);
+    TEST_ASSERT(chain0_bytes != NULL, "alloc chain0_bytes");
+    memcpy(chain0_bytes, leaf0->signed_tx.data, chain0_len);
+
+    /* Advance once -> chain[1] in leaf->signed_tx. Stash. */
+    TEST_ASSERT(factory_advance_leaf(f, leaf_side), "advance to chain[1]");
+    TEST_ASSERT(leaf0->ps_chain_len == 1, "ps_chain_len == 1");
+    size_t chain1_len = leaf0->signed_tx.len;
+    unsigned char *chain1_bytes = malloc(chain1_len);
+    TEST_ASSERT(chain1_bytes != NULL, "alloc chain1_bytes");
+    memcpy(chain1_bytes, leaf0->signed_tx.data, chain1_len);
+
+    /* Advance again -> chain[2]. Stash. */
+    TEST_ASSERT(factory_advance_leaf(f, leaf_side), "advance to chain[2]");
+    TEST_ASSERT(leaf0->ps_chain_len == 2, "ps_chain_len == 2");
+    size_t chain2_len = leaf0->signed_tx.len;
+    unsigned char *chain2_bytes = malloc(chain2_len);
+    TEST_ASSERT(chain2_bytes != NULL, "alloc chain2_bytes");
+    memcpy(chain2_bytes, leaf0->signed_tx.data, chain2_len);
+
+    printf("  stashed chain[0..2] bytes for leaf 0 (lengths %zu, %zu, %zu)\n",
+           chain0_len, chain1_len, chain2_len);
+
+    /* Step 3: try to broadcast chain[2] BEFORE chain[1]. Must FAIL because
+       chain[2] spends chain[1]'s vout 0 which doesn't exist on chain yet. */
+    char err_premature[1024];
+    int rc_prem = try_broadcast_capture_error(&rt, chain2_bytes, chain2_len,
+                                                err_premature, sizeof(err_premature));
+    TEST_ASSERT(rc_prem == 0, "chain[2] broadcast BEFORE chain[1] must fail");
+    printf("  EXPECTED FAIL #1 (chain[2] before chain[1]): %s\n", err_premature);
+
+    /* Step 4: broadcast chain[1] from stashed bytes -- spends chain[0] vout 0
+       which IS on chain. Must succeed. Mine 1 block. */
+    char chain1_txid[65];
+    {
+        char *h = malloc(chain1_len * 2 + 1);
+        TEST_ASSERT(h != NULL, "alloc chain1 hex");
+        hex_encode(chain1_bytes, chain1_len, h);
+        h[chain1_len * 2] = '\0';
+        int ok = regtest_send_raw_tx(&rt, h, chain1_txid);
+        free(h);
+        TEST_ASSERT(ok, "broadcast chain[1] from stash");
+    }
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, chain1_txid) >= 1,
+                "chain[1] confirmed");
+    printf("  chain[1] broadcast OK (txid=%s)\n", chain1_txid);
+
+    /* Step 5: broadcast chain[2] again -- now succeeds because chain[1] vout 0
+       exists on chain. */
+    char chain2_txid[65];
+    {
+        char *h = malloc(chain2_len * 2 + 1);
+        TEST_ASSERT(h != NULL, "alloc chain2 hex");
+        hex_encode(chain2_bytes, chain2_len, h);
+        h[chain2_len * 2] = '\0';
+        int ok = regtest_send_raw_tx(&rt, h, chain2_txid);
+        free(h);
+        TEST_ASSERT(ok, "broadcast chain[2] after chain[1]");
+    }
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&rt, chain2_txid) >= 1,
+                "chain[2] confirmed");
+    printf("  chain[2] broadcast OK (txid=%s)\n", chain2_txid);
+
+    /* Step 6: CRITICAL -- try to broadcast the stashed chain[1] AGAIN.
+       Must FAIL with `bad-txns-inputs-missingorspent` because chain[1]'s
+       vout 0 was already spent by chain[2] in the previous step. (Or
+       equivalently `txn-already-known` / `txn-already-in-mempool` if the
+       node still has the chain[1] in its recently-confirmed cache, but
+       since we mined chain[1] into a block and then chain[2] spent it,
+       resubmitting chain[1] is a double-broadcast attempt for an input
+       that's now spent.) */
+    char err_replay[1024];
+    int rc_replay = try_broadcast_capture_error(&rt, chain1_bytes, chain1_len,
+                                                  err_replay, sizeof(err_replay));
+    TEST_ASSERT(rc_replay == 0,
+                "stashed chain[1] re-broadcast AFTER chain[2] confirms must fail");
+    printf("  EXPECTED FAIL #2 (re-broadcast chain[1] after chain[2] spent its "
+           "vout): %s\n", err_replay);
+
+    /* Tighten the assertion: the error string should mention either the
+       missingorspent condition (input already spent) or txn-already-known
+       (node remembers the TX). Both prove the on-chain invariant. */
+    int matched = (strstr(err_replay, "missingorspent") != NULL)
+               || (strstr(err_replay, "already") != NULL)
+               || (strstr(err_replay, "spent") != NULL)
+               || (strstr(err_replay, "conflict") != NULL);
+    TEST_ASSERT(matched,
+        "error string should mention missingorspent/already/spent/conflict");
+
+    printf("  PS non-revocability invariant proven at chain level (N=8, leaf 0)\n");
+
+    free(chain0_bytes); free(chain1_bytes); free(chain2_bytes);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

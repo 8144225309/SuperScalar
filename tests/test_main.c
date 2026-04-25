@@ -6,6 +6,8 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
 static int tests_skipped = 0;
+static const char *test_filter = NULL;  /* if non-NULL, only run tests whose
+                                            name CONTAINS this substring */
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -32,19 +34,21 @@ static int tests_skipped = 0;
 #define TEST_SKIP_CODE 2
 
 #define RUN_TEST(fn) do { \
-    tests_run++; \
-    printf("  %s...", #fn); \
-    fflush(stdout); \
-    int _rc = fn(); \
-    if (_rc == TEST_SKIP_CODE) { \
-        tests_skipped++; \
-        tests_run--; \
-        printf(" SKIP\n"); \
-    } else if (_rc) { \
-        tests_passed++; \
-        printf(" OK\n"); \
-    } else { \
-        tests_failed++; \
+    if (test_filter == NULL || strstr(#fn, test_filter) != NULL) { \
+        tests_run++; \
+        printf("  %s...", #fn); \
+        fflush(stdout); \
+        int _rc = fn(); \
+        if (_rc == TEST_SKIP_CODE) { \
+            tests_skipped++; \
+            tests_run--; \
+            printf(" SKIP\n"); \
+        } else if (_rc) { \
+            tests_passed++; \
+            printf(" OK\n"); \
+        } else { \
+            tests_failed++; \
+        } \
     } \
 } while(0)
 
@@ -1123,6 +1127,11 @@ extern int test_regtest_full_force_close_and_sweep_arityPS(void);
 extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len2(void);
 extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len5(void);
 extern int test_regtest_mixed_arity_2_4_8_lifecycle(void);
+extern int test_regtest_ps_full_lifecycle_n8(void);
+extern int test_regtest_ps_heterogeneous_chains_n8(void);
+extern int test_regtest_ps_full_lifecycle_n16(void);
+extern int test_regtest_ps_heterogeneous_chains_n16(void);
+extern int test_regtest_ps_old_state_broadcast_fails_n8(void);
 extern int test_regtest_htlc_force_to_local_arity1(void);
 extern int test_regtest_htlc_force_to_local_arity2(void);
 extern int test_regtest_htlc_force_to_local_arity_ps(void);
@@ -3648,6 +3657,11 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len2);
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len5);
     RUN_TEST(test_regtest_mixed_arity_2_4_8_lifecycle);
+    RUN_TEST(test_regtest_ps_full_lifecycle_n8);
+    RUN_TEST(test_regtest_ps_heterogeneous_chains_n8);
+    RUN_TEST(test_regtest_ps_full_lifecycle_n16);
+    RUN_TEST(test_regtest_ps_heterogeneous_chains_n16);
+    RUN_TEST(test_regtest_ps_old_state_broadcast_fails_n8);
     RUN_TEST(test_regtest_htlc_force_to_local_arity1);
     RUN_TEST(test_regtest_htlc_force_to_local_arity2);
     RUN_TEST(test_regtest_htlc_force_to_local_arity_ps);
@@ -3719,6 +3733,12 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--unit") == 0) run_unit = 1;
         if (strcmp(argv[i], "--regtest") == 0) run_regtest = 1;
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
+        if (strncmp(argv[i], "--filter=", 9) == 0) {
+            test_filter = argv[i] + 9;
+            /* If no run_X chosen yet, run both so the filter can match
+               either category. */
+            if (!run_unit && !run_regtest) { run_unit = 1; run_regtest = 1; }
+        }
     }
 
     printf("SuperScalar Test Suite\n");

@@ -17,7 +17,7 @@ Every TX broadcast on a real chain. No skip flags, no stubs.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete
 
-### 1. PS at N=8 and N=16 on regtest with full accounting  `[ ]`
+### 1. PS at N=8 and N=16 on regtest with full accounting  `[x]`
 
 Five new tests in `tests/test_close_spendability_full.c`:
 
@@ -72,7 +72,7 @@ mainnet."
 
 | # | PR | Status | Notes |
 |---|----|--------|-------|
-| 1 | TBD | `[ ]` | not started |
+| 1 | #97 | `[x]` | 5 cells PASS on VPS (N=8/N=16 lifecycle + heterogeneous chains + adversarial old-state-broadcast). All N parties' deltas exact. Adversarial returns `bad-txns-inputs-missingorspent` — chain-level non-revocability proven. |
 | 2 | TBD | `[ ]` | not started — gated on #1 |
 | 3 | TBD | `[ ]` | not started |
 | 4 | TBD | `[ ]` | not started |
