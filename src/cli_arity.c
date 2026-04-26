@@ -154,15 +154,19 @@ int cli_validate_shape_for_bolt2016(
     } else {
         snprintf(shape, sizeof(shape), "%d", (int)leaf_arity);
     }
+    char static_clause[64];
+    if (static_threshold > 0)
+        snprintf(static_clause, sizeof(static_clause),
+                 " --static-near-root %u", (unsigned)static_threshold);
+    else
+        static_clause[0] = '\0';
     cli_set_err(err_buf, err_buf_len,
-        "Error: --arity %s --clients %zu%s%u produces ewt %u blocks "
+        "Error: --arity %s --clients %zu%s produces ewt %u blocks "
         "(~%u days at 144 blk/day), exceeds BOLT 2016-block ceiling. "
         "See docs/factory-arity.md for canonical shapes. "
         "Try mixed arity with wider mid-tree branching (e.g. --arity 2,4,8) "
         "or add --static-near-root 1 or 2 to remove DW state from near-root layers.",
-        shape, n_clients,
-        (static_threshold > 0 ? " --static-near-root " : ""),
-        (unsigned)static_threshold,
+        shape, n_clients, static_clause,
         ewt, ewt / 144);
     return 0;
 }
