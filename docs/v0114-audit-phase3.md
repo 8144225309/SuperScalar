@@ -73,9 +73,9 @@ mainnet."
 | # | PR | Status | Notes |
 |---|----|--------|-------|
 | 1 | #97 | `[x]` | 5 cells PASS on VPS (N=8/N=16 lifecycle + heterogeneous chains + adversarial old-state-broadcast). All N parties' deltas exact. Adversarial returns `bad-txns-inputs-missingorspent` — chain-level non-revocability proven. |
-| 2 | TBD | `[~]` | 2 cells PASS on VPS (N=32 lifecycle + heterogeneous chains). Lifecycle: 122 nodes broadcast, 31 leaves swept + 31 L-stocks swept, 32-way MuSig at root, conservation 19,953,900 + 21,700 == 19,975,600. Heterogeneous: chain_lens cycling {0..5} across 31 leaves, all 32 parties' deltas exact, conservation 19,938,900 + 21,700 + 15,000 advance fees == 19,975,600. |
-| 3 | TBD | `[ ]` | not started |
-| 4 | TBD | `[~]` | `tools/test_multiprocess_musig_n8.sh` PASS on VPS regtest: 1 LSP daemon + 7 `superscalar_client` daemons (8 distinct OS processes) signed an arity-3 (PS) factory tree of 26 nodes via real wire-protocol MuSig and broadcast every node on-chain. All 7 clients participated (each persisted factory + channel + basepoints to its own DB at indices 1..7). Root-level conservation: 799,800 sats outputs <= 800,000 sats funding, delta=200 sats miner fee. ~70s end-to-end. |
+| 2 | #98 | `[x]` | 2 cells PASS on VPS (N=32 lifecycle + heterogeneous chains). Lifecycle: 122 nodes broadcast, 31 leaves swept + 31 L-stocks swept, 32-way MuSig at root, conservation 19,953,900 + 21,700 == 19,975,600. Heterogeneous: chain_lens cycling {0..5} across 31 leaves, all 32 parties' deltas exact, conservation 19,938,900 + 21,700 + 15,000 advance fees == 19,975,600. Merged. |
+| 3 | #99 + manual | `[~]` | Infrastructure shipped (PR #99): `signet_setup.sh` parameterized by `N_CLIENTS`/`ARITY` env vars + `docs/signet-ps-n8-procedure.md` for the multi-hour campaign. Smoke test on VPS confirmed env vars accepted, LSP binary supports `--clients` (max 128) and `--arity 3` (PS). Full lifecycle deferred to operator-run manual campaign (task #151) — signet block times make this a 4-8 hour wall-clock test that doesn't fit in any agent or CI session. |
+| 4 | #100 | `[x]` | `tools/test_multiprocess_musig_n8.sh` PASS on VPS regtest: 1 LSP daemon + 7 `superscalar_client` daemons (8 distinct OS processes) signed an arity-3 (PS) factory tree of 26 nodes via real wire-protocol MuSig and broadcast every node on-chain. All 7 clients participated. Root-level conservation: 799,800 sats outputs + 200 sats miner fee == 800,000 sats funding. ~70s end-to-end. Merged. |
 
 ## Done means
 
