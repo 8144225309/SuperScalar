@@ -2679,6 +2679,121 @@ uint32_t factory_early_warning_time(const factory_t *f) {
     return ewt;
 }
 
+/* Phase 4 (mixed-arity plan): pure-math ewt simulator for a hypothetical
+   shape, used by CLI validation BEFORE we commit to building anything.
+   Mirrors arity_at_depth + subtree_is_leaf + split_clients_for_arity +
+   dw_n_layers_for + factory_early_warning_time, but operates on raw
+   inputs (no factory_t needed). */
+static int arity_at_depth_raw(const uint8_t *level_arities,
+                              size_t n_level_arity,
+                              factory_arity_t leaf_arity,
+                              int depth) {
+    if (n_level_arity == 0)
+        return (int)leaf_arity;
+    if (depth < (int)n_level_arity)
+        return (int)level_arities[depth];
+    return (int)level_arities[n_level_arity - 1];
+}
+
+uint32_t factory_compute_ewt_for_shape(
+    const uint8_t *level_arities, size_t n_level_arity,
+    factory_arity_t leaf_arity,
+    size_t n_clients,
+    uint32_t static_threshold,
+    uint16_t step_blocks,
+    uint32_t states_per_layer)
+{
+    if (n_clients == 0) return 0;
+
+    /* Walk the tree to find max depth. Same algorithm as simulate_tree
+       but without needing a factory_t. Stack-based DFS. */
+    typedef struct { size_t nc; int depth; } frame_t;
+    frame_t stack[FACTORY_MAX_NODES];
+    int sp = 0;
+    int max_depth = 0;
+    int has_ps_leaf = 0;
+    stack[sp].nc = n_clients;
+    stack[sp].depth = 0;
+    sp++;
+    while (sp > 0) {
+        size_t nc = stack[sp - 1].nc;
+        int d = stack[sp - 1].depth;
+        sp--;
+        if (nc == 0) continue;
+        if (d > max_depth) max_depth = d;
+        int a = arity_at_depth_raw(level_arities, n_level_arity, leaf_arity, d);
+        /* subtree_is_leaf logic */
+        int is_leaf;
+        if (a == 1 || a == FACTORY_ARITY_PS) is_leaf = (nc <= 1);
+        else                                  is_leaf = (nc <= (size_t)a);
+        if (is_leaf) {
+            if (a == FACTORY_ARITY_PS) has_ps_leaf = 1;
+            continue;
+        }
+        /* split_clients_for_arity logic — distribute */
+        size_t parts[FACTORY_MAX_OUTPUTS];
+        size_t n_parts;
+        if (a == 1 || a == FACTORY_ARITY_PS) {
+            parts[0] = nc / 2;
+            parts[1] = nc - parts[0];
+            n_parts = 2;
+        } else if (a == 2) {
+            size_t total_leaves_est = (nc + 1) / 2;
+            size_t left_leaves = total_leaves_est / 2;
+            size_t left_n = left_leaves * 2;
+            if (left_n > nc) left_n = nc;
+            size_t right_n = nc - left_n;
+            parts[0] = left_n;
+            parts[1] = right_n;
+            n_parts = 2;
+        } else {
+            size_t children = 0;
+            size_t remaining = nc;
+            while (remaining > 0 && children < (size_t)a) {
+                size_t children_left = (size_t)a - children;
+                size_t this_child = (remaining + children_left - 1) / children_left;
+                if (this_child > remaining) this_child = remaining;
+                parts[children++] = this_child;
+                remaining -= this_child;
+            }
+            if (remaining > 0 && children > 0)
+                parts[children - 1] += remaining;
+            n_parts = children;
+        }
+        for (size_t k = 0; k < n_parts; k++) {
+            if (sp + 1 > FACTORY_MAX_NODES) break;
+            stack[sp].nc = parts[k];
+            stack[sp].depth = d + 1;
+            sp++;
+        }
+    }
+
+    /* dw_n_layers_for logic */
+    int t = (int)static_threshold;
+    if (t < 0) t = 0;
+    if (t > max_depth + 1) t = max_depth + 1;
+    int n_layers = max_depth - t + 1;
+    if (n_layers < 1) n_layers = 1;
+    if (n_layers > (int)DW_MAX_LAYERS) n_layers = (int)DW_MAX_LAYERS;
+
+    /* factory_early_warning_time logic: each layer contributes
+       step_blocks * (states_per_layer - 1). */
+    uint32_t per_layer = 0;
+    if (states_per_layer > 1)
+        per_layer = (uint32_t)step_blocks * (states_per_layer - 1);
+    uint32_t ewt = (uint32_t)n_layers * per_layer;
+
+    /* PS leaves contribute 0 blocks (TX chaining, not nSequence) — subtract
+       one leaf-layer's worth if any leaf is PS.  When leaf_arity is uniform,
+       check leaf_arity itself; for mixed arity, has_ps_leaf is set during
+       the walk above. */
+    int leaf_is_ps = has_ps_leaf || (n_level_arity == 0 && leaf_arity == FACTORY_ARITY_PS);
+    if (leaf_is_ps && n_layers > 0) {
+        ewt = (ewt > per_layer) ? ewt - per_layer : 0;
+    }
+    return ewt;
+}
+
 void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);

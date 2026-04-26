@@ -4,6 +4,80 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Mixed-Arity Interior + Static-Near-Root (canonical SuperScalar design)
+
+The factory builder now implements zmn's full canonical SuperScalar design:
+TRUE N-way interior branching with optional static-near-root variant for
+further depth reduction. PS leaves remain the canonical leaf mechanism
+(`--arity 3` default).
+
+- TRUE N-way interior fan-out per level: `--arity 2,4,8` produces an
+  authentic 3-level tree with arity-2 root → arity-4 mid → arity-8 leaves
+  (PR #104)
+- N-way leaves: arity-N leaves now produce N+1 outputs (N channels +
+  L-stock); per-channel MuSig SPK (PR #104)
+- Static-near-root variant: `--static-near-root N` makes the N shallowest
+  tree levels kickoff-only with no DW counter, eliminating CSV
+  contribution from those layers (PR #105)
+- N=128 with `--arity 2,4,8 --static-near-root 2` reduces worst-path CSV
+  from binary's 3456 blocks (exceeds BOLT 2016) to 864 blocks (generous
+  slack) — matches zmn's canonical design target
+- `FACTORY_MAX_OUTPUTS` bumped 8 → 16 to support arity-15 leaves with
+  L-stock (PR #103)
+- Default `--arity` changed from 2 (DW arity-2 legacy) to 3 (PS canonical)
+  (PR #102)
+- New design doc `docs/pseudo-spilman.md` and rewritten
+  `docs/factory-arity.md` with PS-first canonical positioning and worked
+  CSV budget examples computed by `factory_compute_ewt_for_shape()`
+- New CLI flag `--static-near-root <N>` for the static variant (PR #105)
+- New API `factory_set_static_near_root(factory_t *f, uint32_t threshold)`
+  (PR #105)
+- New `factory_node_t::is_static_only` and
+  `factory_t::static_threshold_depth` fields (PR #105)
+- **CLI hardening + BOLT-2016 ceiling check (this PR, Phase 4 of the
+  mixed-arity plan):**
+  - `--arity` parser now rejects values outside [1, 15] with a clear
+    error citing `FACTORY_MAX_OUTPUTS = 16`
+  - `--static-near-root` parser rejects values outside `[0, FACTORY_MAX_LEVELS)`
+  - At LSP startup, the configured `(level_arity, static_threshold,
+    n_clients, step_blocks, states_per_layer)` tuple is validated
+    against BOLT's 2016-block `final_cltv_expiry` ceiling. Shapes whose
+    worst-path ewt exceeds the ceiling are rejected with an error
+    pointing at `docs/factory-arity.md` and suggesting safer mixed-arity
+    or static-near-root configurations.
+  - New helper module `include/superscalar/cli_arity.h` +
+    `src/cli_arity.c` exposes `cli_parse_arity_spec()`,
+    `cli_parse_static_near_root()`, and
+    `cli_validate_shape_for_bolt2016()` for direct unit testing.
+  - New API `factory_compute_ewt_for_shape()` returns the worst-path
+    ewt for any candidate shape without building or signing anything —
+    pure-math simulator the CLI calls once per startup.
+  - New unit test file `tests/test_cli_arity.c` with 18 tests covering
+    each parser path (uniform/mixed/empty/non-numeric/oversize/zero/
+    negative) and BOLT-2016 ceiling check (uniform PS @ N=8 passes,
+    binary @ N=128 rejected with substring assertion, mixed `2,4,8` @
+    N=64 passes, design-target `2,4,8 --static-near-root 2` @ N=128
+    asserts ewt == 864).
+  - `--arity` and `--static-near-root` help text updated to reference
+    canonical shapes from `docs/factory-arity.md`.
+- Backward compatibility: uniform `--arity 2` (legacy DW) is bit-identical
+  to pre-Phase-2 binary builder; default `--static-near-root 0` is
+  bit-identical to pre-Phase-3 N-way builder
+- DW arity-1 and arity-2 leaves remain implemented for migration but are
+  no longer the recommended default
+
+Tested at full severity:
+- Unit tests assert per-level n_outputs, depth, leaf count, ewt budget
+- Backward-compat tests prove zero regression for uniform-arity-2 and for
+  static_threshold=0
+- Regtest tests run full lifecycle with per-party
+  `econ_assert_wallet_deltas` for all 12-64 parties
+- N=128 with `{2,4,8}` + `static_threshold=2`: ewt = 864 blocks (under
+  BOLT 2016, vs binary baseline 3456)
+- CLI parser tests assert SPECIFIC error substrings for invalid inputs
+  (`"1-15"`, `"FACTORY_MAX_OUTPUTS"`, `"exceeds BOLT 2016"`,
+  `"factory-arity.md"`, `"[0, 8)"`)
+
 - **`FACTORY_MAX_LEAVES` raised 64→128** (`include/superscalar/factory.h`): the
   static `leaf_layers[]` and `leaf_node_indices[]` arrays in `factory_t` now
   size for 128 leaves, unblocking PS factories at N=128 (1 LSP + 127 clients
