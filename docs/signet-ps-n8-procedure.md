@@ -16,6 +16,24 @@ one-shot automated test we ship the infrastructure (`tools/signet_setup.sh`
 now accepts `N_CLIENTS`, `ARITY`, and `STATIC_NEAR_ROOT` env vars) plus this
 procedure for a human operator to drive the campaign at their pace.
 
+## Smoke-test status
+
+Pre-campaign smoke tests have validated the infrastructure end-to-end up
+to the broadcast threshold (without burning multi-hour wall-clock):
+
+- `signet_setup.sh` parses cleanly with all canonical env-var combinations
+  (`N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1`, `N_CLIENTS=64 ARITY=2,4,8 STATIC_NEAR_ROOT=1`,
+  `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2`)
+- `superscalar_lsp` binary recognizes `--arity 3,4` and `--static-near-root 1`
+  on `--network signet`
+- Signet bitcoind reachable at `/var/lib/bitcoind-signet`; `superscalar_lsp`
+  wallet has ≥1M sats (verify before launch)
+- `bitcoin-cli ... -rpcwallet=superscalar_lsp loadwallet superscalar_lsp`
+  may need to be run if the wallet shows as unloaded
+
+The full lifecycle is the operator's call to launch when a multi-hour
+window is available.
+
 ## Prerequisites
 
 - VPS at `root@68.168.216.243` reachable via SSH

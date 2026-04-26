@@ -52,11 +52,11 @@ You should see zero warnings — the project compiles with `-Wall -Wextra -Werro
 
 | Category | Count | Needs bitcoind? | What it covers |
 |----------|-------|-----------------|----------------|
-| Unit tests | 553 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, LSPS0/1/2, BIP 39, PoW validation, splicing, BOLT 12 offers, property-based tests |
-| Regtest integration | 42 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, bridge payment, bridge invoice flow, NK handshake over TCP, LSP crash recovery, TCP reconnection |
+| Unit tests | 1412 | No | Every module in isolation: crypto, state machines, channels, wire protocol, persistence, bridge, Tor SOCKS5, placement, ceremonies, profit settlement, JIT channels, backup/restore, UTXO coin selection, TLV codec, LSPS0/1/2, BIP 39, PoW validation, splicing, BOLT 12 offers, property-based tests, mixed-arity N-way + static-near-root, CLI parsing + BOLT-2016 ceiling check |
+| Regtest integration | ~85 | Yes | Real Bitcoin transactions: factory funding, tree broadcast, payments, cooperative close, force-close + sweep + accounting (3 arities × all close methods), HTLC × force-to_local + breach × 3 arities, PS chain-advance accounting, JIT recovery, hybrid CLN, mixed-arity {2,4,8} lifecycle, PS at N=8/16/32 with per-party deltas, multi-process MuSig at N=8 |
 | Orchestrator scenarios | 36 | Yes | Multi-process end-to-end: breach detection, cooperative close, JIT lifecycle, factory rotation, rebalance, leaf reallocation, DW exhibition, dual factory, BOLT11 bridge, splice, async rotation, BOLT 12 offer, BIP 39 restore, LSPS2 wire |
 | Manual flag tests | 25 | Yes | Every LSP flag and subcommand: demo modes, client counts, funding amounts, placement modes, economics, DW config, backup/restore, BIP39 mnemonic, JSON report |
-| **Total** | **656 (631 automated + 25 manual)** | | |
+| **Total** | **~1545 (1520 automated + 25 manual). Run `./test_superscalar` for current numbers.** | | |
 
 ---
 
@@ -69,7 +69,9 @@ cd build
 ./test_superscalar --unit
 ```
 
-Expected output: `Results: 553/553 passed`
+Expected output: `Results: 1412/1412 passed` (count as of v0.1.x; grows
+as new test suites are added — the load-bearing assertion is that ALL
+tests pass, not the exact number).
 
 These run in ~2 seconds and test every core module: DW state machines,
 MuSig2 signing, transaction building, tapscript (including 2-leaf taptree
@@ -445,7 +447,10 @@ python3 tools/manual_tests.py help
 | `distrib` | --test-distrib: broadcast pre-signed distribution TX |
 | `turnover` | --test-turnover: PTLC key turnover for all clients |
 | `breach` | --breach-test: broadcast revoked commitment + watchtower |
-| `arity1` | --arity 1: per-client leaves (200k funding) |
+| `arity1` | --arity 1: per-client leaves, legacy DW (200k funding) |
+| `arity3` | --arity 3: Pseudo-Spilman canonical (chained TXs, default per `docs/factory-arity.md`) |
+| `mixed_2_4_8` | --arity 2,4,8: TRUE N-way mixed-arity (Phase 2 of mixed-arity initiative) |
+| `static_near_root` | --static-near-root N: kickoff-only nodes at N near-root depths (Phase 3) |
 | `1client` | 1-client factory creation (no payment targets) |
 | `2clients` | 2-client factory |
 | `3clients` | 3-client factory |
