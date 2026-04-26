@@ -65,6 +65,31 @@ further depth reduction. PS leaves remain the canonical leaf mechanism
   bit-identical to pre-Phase-3 N-way builder
 - DW arity-1 and arity-2 leaves remain implemented for migration but are
   no longer the recommended default
+- **Multi-process MuSig coordination at N=8 with mixed arity verified on
+  regtest** (1 LSP + 7 distinct client processes signing a real factory
+  tree built with `--arity 3,4 --static-near-root 1`) — `tools/test_multiprocess_musig_n8.sh`
+  now selects between uniform PS (default, original Phase 3 #4) and the
+  Phase 5 mixed-arity shape via `MIXED_ARITY=1`; per-party leaf-output
+  enumeration confirms the on-chain footprint covers all 8 parties' shares
+  (PR #X)
+- **Signet tooling extended for canonical mixed-arity campaigns:**
+  `tools/signet_setup.sh` now accepts the `STATIC_NEAR_ROOT` env var
+  (default 0) and forwards it to every `superscalar_lsp` invocation; the
+  stale `--arity 1` / `--clients 4` hardcodes in `start-lsp` are replaced
+  with the env-driven values, so a single `N_CLIENTS=8 ARITY=3,4
+  STATIC_NEAR_ROOT=1 bash tools/signet_setup.sh demo-force-close` drives
+  the whole canonical lifecycle (PR #X)
+- **Signet procedure doc rewritten for canonical shapes:**
+  `docs/signet-ps-n8-procedure.md` documents the four canonical campaigns
+  (N=8 uniform PS / N=8 mixed / N=64 mixed / N=128 mixed-with-static)
+  with REAL ewt numbers from `factory_compute_ewt_for_shape()` for both
+  mainnet (`step_blocks=144`) and signet demo (`step_blocks=1`), tree
+  depth, DW layer count, and lifecycle wall-clock estimates (PR #X)
+- After this PR, ALL six phases of the mixed-arity initiative
+  (PRs #102-#106 + this) are shipped; the canonical SuperScalar design
+  (TRUE N-way interior + static-near-root + PS-first leaves + BOLT-2016
+  ceiling enforcement) is fully implemented, tested end-to-end on
+  regtest at N=8/12/64/128, and production-ready
 
 Tested at full severity:
 - Unit tests assert per-level n_outputs, depth, leaf count, ewt budget

@@ -41,11 +41,26 @@ CLIENT2DB="$DATADIR/client2.db"
 CLIENT3DB="$DATADIR/client3.db"
 CLIENT4DB="$DATADIR/client4.db"
 
-# Per-run parameters. Override via env: N_CLIENTS=8 ARITY=3 ./signet_setup.sh ...
-# Default 4 clients + arity-1 keeps backward compatibility with existing recipes.
+# Per-run parameters.  Override via env, e.g.:
+#   N_CLIENTS=8 ARITY=3 STATIC_NEAR_ROOT=0 bash tools/signet_setup.sh demo-coop
+#   N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1 bash tools/signet_setup.sh demo-force-close
+#   N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2 bash tools/signet_setup.sh demo-force-close
+#
+# Defaults follow PS-first canonical positioning (PR #102): arity-3 (PS leaves)
+# at 4 clients with no static-near-root.  See docs/factory-arity.md and
+# docs/signet-ps-n8-procedure.md for the recommended canonical shapes.
 N_CLIENTS="${N_CLIENTS:-4}"
-ARITY="${ARITY:-1}"
+ARITY="${ARITY:-3}"
+STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-0}"
 SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+
+# Build the optional --static-near-root LSP CLI fragment.  Empty when 0 so
+# legacy invocations remain bit-identical to pre-Phase-5 behavior.
+lsp_static_args() {
+    if [ "${STATIC_NEAR_ROOT:-0}" -gt 0 ] 2>/dev/null; then
+        printf -- "--static-near-root %s" "$STATIC_NEAR_ROOT"
+    fi
+}
 
 # ==========================================================================
 # Helper commands
@@ -518,17 +533,19 @@ cmd_start_lsp() {
     if pgrep -f "superscalar_lsp" &>/dev/null; then
         info "LSP is already running"
     else
-        step "Starting LSP ($N_CLIENTS clients, 200k sats, arity-$ARITY, signet)..."
-        # step-blocks=1 for fast demo, arity-1 for per-client leaves
+        step "Starting LSP ($N_CLIENTS clients, 200k sats, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, signet)..."
+        # step-blocks=1 for fast demo; --arity / --static-near-root come from
+        # the env-var block at the top of this script (PS-first defaults).
         "$SCBIN/superscalar_lsp" \
                 --network signet \
                 --cli-path "$BTCBIN/bitcoin-cli" \
                 --rpcuser "$RPCUSER" \
                 --rpcpassword "$RPCPASS" \
                 --port 9735 \
-                --clients 4 \
+                --clients "$N_CLIENTS" \
                 --amount 200000 \
-                --arity 1 \
+                --arity "$ARITY" \
+                $(lsp_static_args) \
                 --step-blocks 1 \
                 --daemon \
                 --db "$LSPDB" \
@@ -671,7 +688,7 @@ cmd_demo_coop() {
     # Clean DBs for fresh demo
     rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting cooperative close demo ($N_CLIENTS clients, arity-$ARITY)..."
+    step "Starting cooperative close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT)..."
     detail "This will: connect $N_CLIENTS clients → create factory → run payments → cooperative close"
     detail "On signet, factory creation waits for funding tx confirmation (~10 min)."
 
@@ -685,6 +702,7 @@ cmd_demo_coop() {
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
+            $(lsp_static_args) \
             --step-blocks 1 \
             --demo \
             --db "$LSPDB" \
@@ -732,10 +750,10 @@ cmd_demo_force_close() {
     # Clean DBs for fresh demo
     rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY)..."
+    step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT)..."
     detail "This will: connect $N_CLIENTS clients → create factory → run payments → broadcast tree → wait for confirmations"
     detail "On signet with step-blocks=1, each node needs ~10 min per block of relative timelock."
-    detail "Arity-1 tree has 14 nodes with 3 DW layers. Most nSequence values are 0-3 blocks."
+    detail "Tree shape and ewt depend on \$ARITY and \$STATIC_NEAR_ROOT — see docs/signet-ps-n8-procedure.md."
 
     # Start LSP in background first
     "$SCBIN/superscalar_lsp" \
@@ -747,6 +765,7 @@ cmd_demo_force_close() {
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
+            $(lsp_static_args) \
             --step-blocks 1 \
             --demo \
             --force-close \
@@ -819,6 +838,7 @@ cmd_demo_breach() {
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
+            $(lsp_static_args) \
             --step-blocks 1 \
             --demo \
             --cheat-daemon \
