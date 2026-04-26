@@ -320,10 +320,10 @@ echo "  Total processes: 8 (1 LSP daemon + $N_CLIENTS client daemons)"
 echo ""
 echo "=== Verifying factory tree broadcast (LSP DB) ==="
 TREE_NODE_COUNT=$(sqlite3 "$LSP_DB" \
-    "SELECT COUNT(DISTINCT source) FROM broadcast_log WHERE source LIKE 'tree_node_%' AND status='ok';" \
+    "SELECT COUNT(DISTINCT source) FROM broadcast_log WHERE source LIKE 'tree_node_%' AND result='ok';" \
     2>/dev/null || echo 0)
 TREE_NODE_TXIDS=$(sqlite3 "$LSP_DB" \
-    "SELECT source, txid FROM broadcast_log WHERE source LIKE 'tree_node_%' AND status='ok' ORDER BY id;" \
+    "SELECT source, txid FROM broadcast_log WHERE source LIKE 'tree_node_%' AND result='ok' ORDER BY id;" \
     2>/dev/null || echo "")
 echo "  tree nodes broadcast successfully: $TREE_NODE_COUNT"
 echo "$TREE_NODE_TXIDS" | head -8 | while IFS='|' read -r src txid; do
@@ -351,7 +351,7 @@ echo "  $ALL_CONFIRMED"
 echo ""
 echo "=== On-chain conservation ==="
 ROOT_TXID=$(sqlite3 "$LSP_DB" \
-    "SELECT txid FROM broadcast_log WHERE source='tree_node_0' AND status='ok' ORDER BY id LIMIT 1;" \
+    "SELECT txid FROM broadcast_log WHERE source='tree_node_0' AND result='ok' ORDER BY id LIMIT 1;" \
     2>/dev/null || echo "")
 if [ -n "$ROOT_TXID" ]; then
     ROOT_OUT_SUM=$($BCLI getrawtransaction "$ROOT_TXID" 1 2>/dev/null | \
