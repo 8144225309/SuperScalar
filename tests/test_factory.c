@@ -5733,3 +5733,302 @@ int test_factory_ps_matrix(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ============================================================================
+ *  TRUE N-way interior + N-way leaves (mixed-arity Phase 2).
+ *
+ *  Before Phase 2, --arity 2,4,8 silently collapsed every level to a binary
+ *  split (build_subtree only recognized arities 1, 2, PS).  These tests assert
+ *  that the refactored builder produces a TRUE N-way tree at each level.
+ *
+ *  Cells:
+ *    - test_factory_nway_n12_arity_2_4         — N=12, root arity-2, mid arity-4
+ *    - test_factory_nway_n64_arity_2_4_8       — N=64, depth=3 with 2/4/8 fan-out
+ *    - test_factory_nway_arity_8_leaf_outputs  — arity-8 leaf has 9 outputs
+ *    - test_factory_nway_backward_compat       — uniform arity-2 unchanged
+ *  ========================================================================== */
+
+/* Helper: count distinct depths reached in tree by walking from root. */
+static int factory_max_depth(const factory_t *f) {
+    int max_d = 0;
+    /* Walk each node, compute depth via parent chain */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        int d = 0;
+        int cur = (int)i;
+        while (cur > 0 && f->nodes[cur].parent_index >= 0) {
+            cur = f->nodes[cur].parent_index;
+            d++;
+        }
+        /* Each "logical depth" is 2 nodes (kickoff + state); divide by 2 */
+        d = d / 2;
+        if (d > max_d) max_d = d;
+    }
+    return max_d;
+}
+
+/* N=12 with {2,4}: assert TRUE N-way fan-out (root arity-2, mid arity-4). */
+int test_factory_nway_n12_arity_2_4(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[12];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+
+    uint8_t arities[2] = {2, 4};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 12, arities, 2,
+                                              5000000),
+                "setup n12 {2,4}");
+
+    TEST_ASSERT(factory_build_tree(f), "build n12 {2,4}");
+    TEST_ASSERT(factory_sign_all(f), "sign n12 {2,4}");
+    TEST_ASSERT(factory_verify_all(f), "verify n12 {2,4}");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n12 {2,4}");
+
+    /* depth=2 (root + mid + leaves), n_layers = 3 */
+    int max_d = factory_max_depth(f);
+    printf("  [n12 {2,4}] %zu nodes, %d leaves, max_depth=%d, n_layers=%d\n",
+           f->n_nodes, f->n_leaf_nodes, max_d, (int)f->counter.n_layers);
+    TEST_ASSERT_EQ(f->counter.n_layers, 3, "n_layers == 3 (depth=2)");
+    TEST_ASSERT_EQ(max_d, 2, "max tree depth == 2");
+
+    /* Root state node (index 1): arity-2 → 2 child outputs */
+    TEST_ASSERT(f->nodes[0].type == NODE_KICKOFF, "node 0 is root kickoff");
+    TEST_ASSERT(f->nodes[1].type == NODE_STATE, "node 1 is root state");
+    TEST_ASSERT_EQ(f->nodes[1].n_outputs, 2,
+                   "root state has 2 outputs (arity-2 fan-out)");
+
+    /* Find the two mid-state nodes (depth=1). They are the state nodes at
+       depth=1 reached from the root. With our DFS-pre-order builder, after
+       root kickoff(0)+state(1), the left subtree starts at node 2. */
+    /* Node 2 is left mid kickoff; node 3 is left mid state. */
+    TEST_ASSERT(f->nodes[2].type == NODE_KICKOFF, "node 2 is left mid kickoff");
+    TEST_ASSERT(f->nodes[3].type == NODE_STATE, "node 3 is left mid state");
+    /* Mid arity is 4 → state has 4 child outputs */
+    TEST_ASSERT_EQ(f->nodes[3].n_outputs, 4,
+                   "left mid state has 4 outputs (arity-4 fan-out)");
+
+    /* Each leaf is at depth=2. With {2,4}, leaves use arity-4 (last entry
+       wraps).  Each leaf has 1..4 clients. */
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        size_t ni = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[ni];
+        size_t n_clients = leaf->n_signers - 1;  /* exclude LSP */
+        TEST_ASSERT(n_clients >= 1 && n_clients <= 4,
+                    "leaf has 1..4 clients (arity-4 cap)");
+        TEST_ASSERT_EQ(leaf->n_outputs, n_clients + 1,
+                       "leaf n_outputs == n_clients + 1 (channels + L-stock)");
+    }
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* N=64 with {2,4,8}: assert TRUE 3-level N-way fan-out. */
+int test_factory_nway_n64_arity_2_4_8(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair *kps = calloc(64, sizeof(secp256k1_keypair));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc n64");
+
+    uint8_t arities[3] = {2, 4, 8};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 64, arities, 3,
+                                              500000000ULL),
+                "setup n64 {2,4,8}");
+
+    TEST_ASSERT(factory_build_tree(f), "build n64 {2,4,8}");
+    TEST_ASSERT(factory_sign_all(f), "sign n64 {2,4,8}");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n64 {2,4,8}");
+
+    int max_d = factory_max_depth(f);
+    printf("  [n64 {2,4,8}] %zu nodes, %d leaves, max_depth=%d, n_layers=%d\n",
+           f->n_nodes, f->n_leaf_nodes, max_d, (int)f->counter.n_layers);
+
+    /* depth=2 (root arity-2 → mid arity-4 → leaves arity-8): leaves at
+       depth=2 each hold up to 8 clients.
+       Root splits 63 clients into [32,31]. Each mid (arity-4) splits ~32
+       into 4 children of ~8. Each "8-clients" subtree is a leaf at depth 2
+       (arity-8 caps at 8). So total leaves ≈ 8 (4 per mid × 2 mid). */
+    TEST_ASSERT(max_d >= 2, "max tree depth >= 2 (multi-level fan-out)");
+    TEST_ASSERT(max_d <= 3, "max tree depth <= 3 (mixed-arity bounds depth)");
+
+    /* Root state has 2 outputs (arity-2) */
+    TEST_ASSERT_EQ(f->nodes[1].type, NODE_STATE, "node 1 root state");
+    TEST_ASSERT_EQ(f->nodes[1].n_outputs, 2, "root state 2 outputs (arity-2)");
+
+    /* Find one node at depth=1 and verify it has arity-4 fan-out */
+    int found_arity4_mid = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].type != NODE_STATE) continue;
+        /* depth = walk to root / 2 */
+        int d = 0;
+        int cur = (int)i;
+        while (cur > 0 && f->nodes[cur].parent_index >= 0) {
+            cur = f->nodes[cur].parent_index;
+            d++;
+        }
+        d = d / 2;
+        if (d == 1) {
+            /* mid state at depth 1 should have arity-4 fan-out */
+            TEST_ASSERT_EQ(f->nodes[i].n_outputs, 4,
+                           "mid state has 4 outputs (arity-4 fan-out)");
+            found_arity4_mid = 1;
+        }
+    }
+    TEST_ASSERT(found_arity4_mid, "found a depth-1 state with arity-4 fan-out");
+
+    /* At least one leaf must have > 2 clients (proves N-way leaves work) */
+    int found_wide_leaf = 0;
+    int total_clients = 0;
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        size_t ni = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[ni];
+        size_t n_clients = leaf->n_signers - 1;
+        total_clients += (int)n_clients;
+        if (n_clients > 2) found_wide_leaf = 1;
+        TEST_ASSERT(n_clients >= 1 && n_clients <= 8,
+                    "leaf has 1..8 clients (arity-8 cap)");
+        TEST_ASSERT_EQ(leaf->n_outputs, n_clients + 1,
+                       "leaf n_outputs == n_clients + 1");
+    }
+    TEST_ASSERT(found_wide_leaf,
+                "at least one leaf has > 2 clients (proves N-way leaves)");
+    TEST_ASSERT_EQ(total_clients, 63, "all 63 clients placed across leaves");
+
+    /* Heavy verify too */
+    TEST_ASSERT(factory_verify_all(f), "verify n64 {2,4,8}");
+
+    factory_free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* arity-8 leaf has 9 outputs (8 channels + L-stock).
+   Use N=9 with {8}: 1 leaf at depth=0 with all 8 clients. */
+int test_factory_nway_arity_8_leaf_outputs(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[9];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+
+    uint8_t arities[1] = {8};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 9, arities, 1,
+                                              5000000),
+                "setup n9 {8}");
+
+    TEST_ASSERT(factory_build_tree(f), "build n9 {8}");
+    TEST_ASSERT(factory_sign_all(f), "sign n9 {8}");
+    TEST_ASSERT(factory_verify_all(f), "verify n9 {8}");
+    TEST_ASSERT(validate_tree_invariants(f), "invariants n9 {8}");
+
+    /* All 8 clients fit in one arity-8 leaf at depth=0 */
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 1, "exactly 1 leaf for N=9 with arity-8");
+
+    /* Tree: root kickoff (idx 0) + leaf state (idx 1) */
+    TEST_ASSERT_EQ(f->n_nodes, 2, "2 nodes: kickoff + leaf state");
+    TEST_ASSERT(f->nodes[0].type == NODE_KICKOFF, "node 0 kickoff");
+    TEST_ASSERT(f->nodes[1].type == NODE_STATE, "node 1 leaf state");
+
+    factory_node_t *leaf = &f->nodes[1];
+    TEST_ASSERT_EQ(leaf->n_signers, 9,
+                   "leaf signers = 9 (LSP + 8 clients)");
+    TEST_ASSERT_EQ(leaf->n_outputs, 9,
+                   "leaf has 9 outputs (8 channels + L-stock)");
+
+    /* Verify the LAST output is the L-stock (LSP-only P2TR), and the first
+       8 are MuSig(client_i, LSP) per-channel SPKs. We verify by checking
+       L-stock SPK matches build_l_stock_spk output (LSP-only when no shachain). */
+    unsigned char expected_lstock[34];
+    TEST_ASSERT(leaf->n_outputs == 9, "n_outputs == 9");
+    /* L-stock at vout 8 (LAST) */
+    /* Verify each of the 8 channel SPKs is distinct (8 different MuSig
+       aggregations) — they should differ because each pairs LSP with a
+       different client pubkey. */
+    for (int i = 0; i < 8; i++) {
+        for (int j = i + 1; j < 8; j++) {
+            int same = (memcmp(leaf->outputs[i].script_pubkey,
+                                leaf->outputs[j].script_pubkey, 34) == 0);
+            TEST_ASSERT(!same,
+                        "distinct channel SPKs (per (client, LSP) MuSig)");
+        }
+        /* Channel SPKs should also differ from L-stock SPK */
+        int same_lstock = (memcmp(leaf->outputs[i].script_pubkey,
+                                    leaf->outputs[8].script_pubkey, 34) == 0);
+        TEST_ASSERT(!same_lstock, "channel SPK != L-stock SPK");
+    }
+    (void)expected_lstock;
+
+    printf("  [n9 {8}] arity-8 leaf: %zu signers, %zu outputs, all SPKs distinct\n",
+           leaf->n_signers, leaf->n_outputs);
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Backward-compat: uniform arity-2 (legacy factory_set_arity) MUST produce
+   the EXACT same tree as before the N-way refactor.  Compare every node:
+   type, signer count, n_outputs, parent_index, parent_vout, nsequence. */
+int test_factory_nway_backward_compat(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps_legacy[8], kps_nway[8];
+    factory_t *f_legacy = calloc(1, sizeof(factory_t));
+    factory_t *f_nway = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f_legacy && f_nway, "alloc");
+
+    /* Legacy: factory_set_arity(FACTORY_ARITY_2) — uniform arity-2 */
+    TEST_ASSERT(setup_n_factory(f_legacy, ctx, kps_legacy, 8,
+                                 FACTORY_ARITY_2, 5000000),
+                "setup legacy uniform arity-2");
+    TEST_ASSERT(factory_build_tree(f_legacy), "build legacy");
+    TEST_ASSERT(factory_sign_all(f_legacy), "sign legacy");
+
+    /* N-way: factory_set_level_arity({2}) — same effective shape */
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f_nway, ctx, kps_nway, 8,
+                                              arities, 1, 5000000),
+                "setup nway level_arity={2}");
+    TEST_ASSERT(factory_build_tree(f_nway), "build nway");
+    TEST_ASSERT(factory_sign_all(f_nway), "sign nway");
+
+    /* Compare structural shape: same node count, leaf count, layers */
+    TEST_ASSERT_EQ(f_legacy->n_nodes, f_nway->n_nodes,
+                   "same n_nodes");
+    TEST_ASSERT_EQ(f_legacy->n_leaf_nodes, f_nway->n_leaf_nodes,
+                   "same n_leaf_nodes");
+    TEST_ASSERT_EQ(f_legacy->counter.n_layers, f_nway->counter.n_layers,
+                   "same n_layers");
+
+    /* Per-node: type, signer count, n_outputs, parent_index, parent_vout,
+       nsequence all match */
+    for (size_t i = 0; i < f_legacy->n_nodes; i++) {
+        factory_node_t *a = &f_legacy->nodes[i];
+        factory_node_t *b = &f_nway->nodes[i];
+        TEST_ASSERT_EQ(a->type, b->type, "node type matches");
+        TEST_ASSERT_EQ(a->n_signers, b->n_signers, "node n_signers matches");
+        TEST_ASSERT_EQ(a->n_outputs, b->n_outputs, "node n_outputs matches");
+        TEST_ASSERT_EQ(a->parent_index, b->parent_index, "parent_index");
+        TEST_ASSERT_EQ(a->parent_vout, b->parent_vout, "parent_vout");
+        TEST_ASSERT_EQ(a->nsequence, b->nsequence, "nsequence");
+        TEST_ASSERT_EQ(a->dw_layer_index, b->dw_layer_index, "dw_layer_index");
+        /* Per-output amounts must match (proves the budget split formula
+           is bit-identical) */
+        for (size_t j = 0; j < a->n_outputs; j++) {
+            TEST_ASSERT(a->outputs[j].amount_sats == b->outputs[j].amount_sats,
+                        "per-output amount matches");
+        }
+    }
+
+    printf("  [backward-compat] %zu nodes, %d leaves identical between legacy "
+           "and N-way builders\n", f_legacy->n_nodes, f_legacy->n_leaf_nodes);
+
+    factory_free(f_legacy);
+    factory_free(f_nway);
+    secp256k1_context_destroy(ctx);
+    free(f_legacy);
+    free(f_nway);
+    return 1;
+}

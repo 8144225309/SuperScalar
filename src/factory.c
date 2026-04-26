@@ -559,6 +559,69 @@ static int arity_at_depth(const factory_t *f, int depth) {
     return (int)f->level_arity[f->n_level_arity - 1];
 }
 
+/* Determine if a subtree of `nc` clients is a leaf at a level whose arity is `a`. */
+static int subtree_is_leaf(int a, size_t nc) {
+    /* arity-1 / PS: 1 client per leaf */
+    if (a == 1 || a == FACTORY_ARITY_PS) return (nc <= 1);
+    /* arity-A (A >= 2): up to A clients per leaf */
+    return (nc <= (size_t)a);
+}
+
+/* Split `nc` clients into N children at a level whose arity is `a`.
+   Writes the per-child client counts into out[] (length n_children) and
+   returns the number of children produced (1..a).
+
+   Backwards-compat invariant: when `a == 2`, this MUST produce the SAME
+   shape as the legacy binary `build_subtree` algorithm so that
+   uniform arity-2 deployments are bit-identical to today's tree.
+
+   For arity A > 2: distribute clients into A children, each child getting
+   roughly the same number of leaves' worth of clients. We compute how many
+   leaves at the next level will fit per child (target_leaves_per_child) and
+   pack clients greedily. */
+static size_t split_clients_for_arity(int a, size_t nc, size_t out[]) {
+    if (a == 1 || a == FACTORY_ARITY_PS) {
+        /* Binary split (matches legacy arity-1/PS behavior) */
+        out[0] = nc / 2;
+        out[1] = nc - out[0];
+        return 2;
+    }
+    if (a == 2) {
+        /* EXACT legacy arity-2 binary split — preserves backwards compat */
+        size_t total_leaves_est = (nc + 1) / 2;
+        size_t left_leaves = total_leaves_est / 2;
+        size_t left_n = left_leaves * 2;
+        if (left_n > nc) left_n = nc;
+        size_t right_n = nc - left_n;
+        out[0] = left_n;
+        out[1] = right_n;
+        return 2;
+    }
+    /* arity A >= 3 (true N-way): split into up to A children, each getting up
+       to A clients (the next level's leaf capacity). For simplicity we use
+       the SAME arity for the next level when computing capacity — which is
+       true for uniform arity but may slightly mis-estimate for mixed-arity.
+       The estimator is only used to bound the split; the actual leaf shape
+       is determined by recursion. */
+    size_t children = 0;
+    size_t remaining = nc;
+    /* Distribute as: pack `a` clients into each child until <=a remain;
+       then everything goes into the last child. */
+    while (remaining > 0 && children < (size_t)a) {
+        size_t this_child;
+        size_t children_left = (size_t)a - children;
+        /* Spread remaining evenly: ceil(remaining / children_left) */
+        this_child = (remaining + children_left - 1) / children_left;
+        if (this_child > remaining) this_child = remaining;
+        out[children++] = this_child;
+        remaining -= this_child;
+    }
+    /* Any remaining (shouldn't happen if a covers nc) — append to last */
+    if (remaining > 0 && children > 0)
+        out[children - 1] += remaining;
+    return children;
+}
+
 /* Simulate the variable-arity tree to compute leaf count and max depth.
    Returns leaf count via *leaves_out and max depth via *depth_out. */
 static void simulate_tree(const factory_t *f, size_t n_clients,
@@ -566,9 +629,9 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
     /* Recursive simulation via stack */
     int leaves = 0;
     int max_depth = 0;
-    struct { size_t nc; int depth; } stack[128];
+    struct { size_t nc; int depth; } stack[FACTORY_MAX_NODES];
     int sp = 0;
-    stack[sp++] = (typeof(stack[0])){n_clients, 0};
+    stack[sp++] = (struct { size_t nc; int depth; }){n_clients, 0};
     while (sp > 0) {
         size_t nc = stack[sp - 1].nc;
         int d = stack[sp - 1].depth;
@@ -576,27 +639,18 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
         if (nc == 0) continue;
         if (d > max_depth) max_depth = d;
         int a = arity_at_depth(f, d);
-        int is_leaf = (a == 1 || a == FACTORY_ARITY_PS) ? (nc <= 1) : (nc <= 2);
-        if (is_leaf) {
+        if (subtree_is_leaf(a, nc)) {
             leaves++;
         } else {
-            size_t left_n, right_n;
-            if (a == 1 || a == FACTORY_ARITY_PS) {
-                left_n = nc / 2;
-                right_n = nc - left_n;
-            } else {
-                size_t total_leaves_est = (nc + 1) / 2;
-                size_t left_leaves = total_leaves_est / 2;
-                left_n = left_leaves * 2;
-                if (left_n > nc) left_n = nc;
-                right_n = nc - left_n;
+            size_t parts[FACTORY_MAX_OUTPUTS];
+            size_t n_parts = split_clients_for_arity(a, nc, parts);
+            for (size_t k = 0; k < n_parts; k++) {
+                if (sp + 1 > FACTORY_MAX_NODES) {
+                    fprintf(stderr, "simulate_tree: stack overflow (sp=%d)\n", sp);
+                    break;
+                }
+                stack[sp++] = (struct { size_t nc; int depth; }){parts[k], d + 1};
             }
-            if (sp + 2 > 128) {
-                fprintf(stderr, "simulate_tree: stack overflow (sp=%d)\n", sp);
-                break;
-            }
-            stack[sp++] = (typeof(stack[0])){left_n, d + 1};
-            stack[sp++] = (typeof(stack[0])){right_n, d + 1};
         }
     }
     *depth_out = max_depth;
@@ -769,6 +823,74 @@ static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
     return (int)((n_clients + 1) / 2);
 }
 
+/* Set up N-way leaf outputs for arity A >= 2.
+   Produces n_outputs = n_client + 1: one MuSig(client_i, LSP) channel per
+   client, plus one L-stock output at the LAST index.  Each channel output
+   may include the CLTV recovery script-path leaf (when f->cltv_timeout > 0). */
+static int setup_nway_leaf_outputs(
+    factory_t *f,
+    factory_node_t *node,
+    const uint32_t *client_indices,
+    size_t n_client,
+    uint64_t input_amount
+) {
+    /* Need n_client + 1 outputs (channels + L-stock); +1 division slot for fee */
+    size_t n_outputs = n_client + 1;
+    if (n_outputs > f->config.max_outputs_per_node) {
+        fprintf(stderr, "Factory: n-way leaf needs %zu outputs > max %u\n",
+                n_outputs, f->config.max_outputs_per_node);
+        return 0;
+    }
+
+    if (input_amount <= f->fee_per_tx) return 0;
+    uint64_t output_total = input_amount - f->fee_per_tx;
+    uint64_t per_output = output_total / n_outputs;
+    uint64_t remainder = output_total - per_output * n_outputs;
+
+    if (per_output < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Factory: n-way leaf output %llu below dust limit\n",
+                (unsigned long long)per_output);
+        return 0;
+    }
+
+    node->n_outputs = n_outputs;
+
+    /* Build CLTV recovery merkle root for channel outputs (reused across all
+       channels on this leaf). */
+    unsigned char chan_cltv_merkle[32];
+    tapscript_leaf_t chan_cltv_leaf;
+    const unsigned char *chan_merkle_root = NULL;
+    if (f->cltv_timeout > 0) {
+        secp256k1_xonly_pubkey lsp_xonly;
+        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
+            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
+                                         &lsp_xonly, f->ctx)) {
+            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
+            chan_merkle_root = chan_cltv_merkle;
+        }
+    }
+
+    /* One channel per client: vout 0..n_client-1 = MuSig(client_i, LSP). */
+    for (size_t i = 0; i < n_client; i++) {
+        secp256k1_pubkey pks[2] = { f->pubkeys[client_indices[i]], f->pubkeys[0] };
+        musig_keyagg_t ka;
+        secp256k1_xonly_pubkey tw;
+        if (!build_musig_p2tr_spk(f->ctx, node->outputs[i].script_pubkey,
+                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
+            return 0;
+        node->outputs[i].script_pubkey_len = 34;
+        node->outputs[i].amount_sats = per_output;
+    }
+
+    /* L-stock at LAST output (vout n_client) */
+    if (!build_l_stock_spk(f, node->outputs[n_client].script_pubkey))
+        return 0;
+    node->outputs[n_client].script_pubkey_len = 34;
+    node->outputs[n_client].amount_sats = per_output + remainder;
+
+    return 1;
+}
+
 /* Recursive subtree builder.
    client_indices: array of 1-based participant indices for clients in this subtree.
    n_clients: number of clients in this subtree.
@@ -847,11 +969,7 @@ static int build_subtree(
 
     /* Determine if this is a leaf (using per-level arity) */
     int cur_arity = arity_at_depth(f, depth);
-    int is_leaf;
-    if (cur_arity == 1 || cur_arity == FACTORY_ARITY_PS)
-        is_leaf = (n_clients <= 1);
-    else
-        is_leaf = (n_clients <= 2);
+    int is_leaf = subtree_is_leaf(cur_arity, n_clients);
 
     if (is_leaf) {
         /* Leaf node: set up channel outputs */
@@ -866,11 +984,19 @@ static int build_subtree(
             if (!setup_single_leaf_outputs(f, &f->nodes[st_idx],
                                            client_indices[0], ko_out_amount))
                 return 0;
-        } else {
-            /* n_clients == 2 (arity-2 leaf) */
+        } else if (cur_arity == 2 && n_clients == 2) {
+            /* Arity-2 leaf: keep legacy code path (bit-identical for backwards compat) */
             if (!setup_leaf_outputs(f, &f->nodes[st_idx],
                                     client_indices[0], client_indices[1],
                                     ko_out_amount))
+                return 0;
+        } else {
+            /* True N-way leaf (arity >= 2 with N >= 2 clients).  Used when
+               cur_arity > 2 OR when cur_arity == 2 but with the generalized
+               builder.  Produces n_clients channels + 1 L-stock output. */
+            if (!setup_nway_leaf_outputs(f, &f->nodes[st_idx],
+                                         client_indices, n_clients,
+                                         ko_out_amount))
                 return 0;
         }
 
@@ -879,60 +1005,57 @@ static int build_subtree(
         f->leaf_node_indices[*leaf_counter] = (size_t)st_idx;
         (*leaf_counter)++;
     } else {
-        /* Internal node: split clients in half, recurse */
-        size_t left_n, right_n;
-        if (cur_arity == 1 || cur_arity == FACTORY_ARITY_PS) {
-            left_n = n_clients / 2;
-            right_n = n_clients - left_n;
-        } else {
-            /* Arity-2 at this level: split in pairs. Each leaf holds 2 clients,
-               so split to balance leaf count. */
-            size_t total_leaves_est = (n_clients + 1) / 2;
-            size_t left_leaves = total_leaves_est / 2;
-            left_n = left_leaves * 2;
-            if (left_n > n_clients) left_n = n_clients;
-            right_n = n_clients - left_n;
+        /* Internal node: split clients into N children per arity */
+        size_t parts[FACTORY_MAX_OUTPUTS];
+        size_t n_parts = split_clients_for_arity(cur_arity, n_clients, parts);
+        if (n_parts < 2 || n_parts > f->config.max_outputs_per_node) {
+            fprintf(stderr, "build_subtree: invalid n_parts %zu (max %u) at depth %d arity %d\n",
+                    n_parts, f->config.max_outputs_per_node, depth, cur_arity);
+            return 0;
         }
 
-        /* State node gets 2 outputs for left and right children */
+        /* State node has n_parts outputs, one per child */
         if (ko_out_amount <= fee) return 0;
         uint64_t state_budget = ko_out_amount - fee;
-        uint64_t left_budget = state_budget / 2;
-        uint64_t right_budget = state_budget - left_budget;
+        /* Distribute state budget evenly among children, with remainder to last */
+        uint64_t per_child_budget = state_budget / n_parts;
+        uint64_t budget_remainder = state_budget - per_child_budget * n_parts;
 
         f->nodes[st_idx].input_amount = ko_out_amount;
-        f->nodes[st_idx].n_outputs = 2;
+        f->nodes[st_idx].n_outputs = n_parts;
         /* Outputs will be filled after children are created (need their spk) */
 
-        /* Recurse left */
-        size_t saved_n_nodes = f->n_nodes;
-        if (!build_subtree(f, client_indices, left_n,
-                           st_idx, 0, depth + 1, max_depth,
-                           left_budget, leaf_counter))
-            return 0;
+        /* Recurse into each child, remembering its kickoff node index */
+        int child_ko_indices[FACTORY_MAX_OUTPUTS];
+        size_t client_offset = 0;
+        for (size_t k = 0; k < n_parts; k++) {
+            uint64_t child_budget = per_child_budget;
+            if (k == n_parts - 1) child_budget += budget_remainder;
 
-        /* The left child's kickoff is the first node added */
-        int left_ko_idx = (int)saved_n_nodes;
+            size_t saved_n_nodes = f->n_nodes;
+            if (parts[k] == 0) {
+                /* Empty child: shouldn't happen with split_clients_for_arity,
+                   but guard against it. Drop the slot. */
+                f->nodes[st_idx].n_outputs--;
+                continue;
+            }
+            if (!build_subtree(f, client_indices + client_offset, parts[k],
+                               st_idx, (uint32_t)k, depth + 1, max_depth,
+                               child_budget, leaf_counter))
+                return 0;
+            child_ko_indices[k] = (int)saved_n_nodes;
+            client_offset += parts[k];
+        }
 
-        /* Recurse right */
-        saved_n_nodes = f->n_nodes;
-        if (!build_subtree(f, client_indices + left_n, right_n,
-                           st_idx, 1, depth + 1, max_depth,
-                           right_budget, leaf_counter))
-            return 0;
-
-        int right_ko_idx = (int)saved_n_nodes;
-
-        /* Now wire state outputs to children's spending_spks */
-        f->nodes[st_idx].outputs[0].amount_sats = left_budget;
-        memcpy(f->nodes[st_idx].outputs[0].script_pubkey,
-               f->nodes[left_ko_idx].spending_spk, 34);
-        f->nodes[st_idx].outputs[0].script_pubkey_len = 34;
-
-        f->nodes[st_idx].outputs[1].amount_sats = right_budget;
-        memcpy(f->nodes[st_idx].outputs[1].script_pubkey,
-               f->nodes[right_ko_idx].spending_spk, 34);
-        f->nodes[st_idx].outputs[1].script_pubkey_len = 34;
+        /* Wire state outputs to each child's kickoff spending_spk */
+        for (size_t k = 0; k < f->nodes[st_idx].n_outputs; k++) {
+            uint64_t child_budget = per_child_budget;
+            if (k == f->nodes[st_idx].n_outputs - 1) child_budget += budget_remainder;
+            f->nodes[st_idx].outputs[k].amount_sats = child_budget;
+            memcpy(f->nodes[st_idx].outputs[k].script_pubkey,
+                   f->nodes[child_ko_indices[k]].spending_spk, 34);
+            f->nodes[st_idx].outputs[k].script_pubkey_len = 34;
+        }
     }
 
     return 1;

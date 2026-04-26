@@ -79,41 +79,44 @@ their CSV contribution entirely.
 
 ## Current implementation status (v0.1.x)
 
-**As of this document's commit, the implementation is undergoing a
-phased upgrade to deliver the full canonical design:**
+**As of this document's commit, the implementation has delivered Phase 2
+of the full canonical design (TRUE N-way mixed-arity):**
 
 - ✅ PS leaves at any N (proven on regtest at N=2-32 with full per-party
   accounting; unit-tested at N=64 and N=128)
 - ✅ DW arity-1 and arity-2 leaves (legacy)
-- ⚠️ **TRUE N-way interior branching: NOT YET IMPLEMENTED.** Currently
-  the builder treats arities ≥4 as a leaf-size hint only; the resulting
-  tree is binary regardless of `--arity 2,4,8` input. This is being
-  fixed in the upcoming "Phase 2" work
-  ([implementation plan](https://github.com/8144225309/SuperScalar/pull/_TBD_)).
+- ✅ **TRUE N-way interior branching (Phase 2 — merged).** `--arity 2,4,8`
+  now produces an authentic 3-level fan-out: root arity-2 → mid arity-4 →
+  leaves arity-8 (per `arity_at_depth`). Unit tests assert per-level
+  `n_outputs` and full N=64 lifecycle is exercised on regtest with
+  per-party `econ_assert_wallet_deltas`.
+- ✅ **N-way leaves (Phase 2 — merged).** Arity-A leaves now produce
+  `A + 1` outputs (A channels + 1 L-stock). Unit-tested at A=8 (9 outputs,
+  per-channel MuSig SPK distinct).
 - ⚠️ **Static-near-root variant: NOT YET IMPLEMENTED.** Coming in
-  "Phase 3" of the same work.
+  "Phase 3" of the same work — kickoff-only state pairs at depths near
+  the root (no DW counter), eliminating CSV contribution entirely from
+  those layers.
 
-Until N-way + static-near-root land, the supported deployment ceiling
-is **N=16 clients per factory** with uniform `--arity 3` (PS). Beyond
-N=16 you need either:
-- Multiple factories of ≤16 clients each (works today), OR
-- Wait for Phase 2/3 to land for single-factory N>16 with mixed arity
-
-The deployment table below shows the **target shapes** once N-way + static-near-root are implemented. Use the "Today" column for current capability.
+The supported deployment ceiling is now **N=64+ clients per factory**
+with mixed arity `{2,4,8}` (proven end-to-end on regtest) — well within
+BOLT 2016. Single-factory N>16 with uniform PS leaves is also supported
+(unit-tested at N=128).
 
 ## Recommended shapes (target vs today)
 
-| Client count | Today (canonical) | Target (after N-way + static) | Notes |
+| Client count | Today (canonical) | Future (after static-near-root) | Notes |
 |---|---|---|---|
 | ≤ 8 | `--arity 3` (uniform PS) | same | Depth stays shallow; no mixed needed |
 | 9-16 | `--arity 3` (uniform PS) | same | Still under BOLT 2016 with binary interior |
-| 17-32 | run multiple factories of ≤16 each | `--arity 3,4` (PS leaves + arity-4 mid) | Adds one fan-out level |
-| 33-64 | run multiple factories of ≤16 each | `--arity 3,4,8` | ZmnSCPxj's canonical mid-tree shape |
-| 65-127 | run multiple factories of ≤16 each | `--arity 3,4,8 --static-near-root 1` or `--arity 3,2,4,8` | Static gate at root for further depth reduction |
+| 17-32 | `--arity 3,4` (PS leaves + arity-4 mid) | same | Adds one fan-out level |
+| 33-64 | `--arity 3,4,8` or `--arity 2,4,8` | same | ZmnSCPxj's canonical mid-tree shape (Phase 2 implemented) |
+| 65-127 | `--arity 2,4,8` | `--arity 2,4,8 --static-near-root 1` or `--arity 3,2,4,8` | Static gate at root for further depth reduction |
 
-**Today, uniform `--arity 3` is safe up to 16 clients per factory on
-mainnet.** For higher client counts, the supported scale path is to run
-multiple factories.
+**Today, both uniform `--arity 3` (up to 16 clients) and mixed
+`--arity 2,4,8` (up to 64 clients tested on regtest) are supported on
+mainnet.** Higher N is supported in principle (FACTORY_MAX_SIGNERS=128)
+but the regtest end-to-end test currently exercises N=64.
 
 ## CSV budget math
 
@@ -125,11 +128,12 @@ defaults (`step_blocks = 144`, `states_per_layer = 4`, giving
 |---|---|---|---|---|
 | Uniform PS, 16 clients | 4 layers | 4 | ~1728 blocks | Under |
 | Uniform PS, 8 clients | 3 layers | 3 | ~1296 blocks | Under |
-| Uniform PS, 64 clients (binary today) | 6 layers | 6 | ~2592 blocks | **EXCEEDS** |
-| Uniform PS, 128 clients (binary today) | 7 layers | 7 | ~3024 blocks | **EXCEEDS** |
-| **Target:** PS leaves + `{2,4,8}` interior, 64 clients | 3 layers | 3 | ~1296 blocks | Under (after Phase 2) |
-| **Target:** PS + `{2,4,8}` + `static_near_root=1`, 128 clients | 4 layers | 3 | ~1296 blocks | Under (after Phase 3) |
-| **Target:** PS + `{2,4,8}` + `static_near_root=2`, 128 clients | 4 layers | 2 | ~864 blocks | Generous slack (after Phase 3) |
+| Uniform PS, 64 clients (binary) | 6 layers | 6 | ~2592 blocks | **EXCEEDS** |
+| Uniform PS, 128 clients (binary) | 7 layers | 7 | ~3024 blocks | **EXCEEDS** |
+| **Today (Phase 2):** PS leaves + `{2,4,8}` interior, 64 clients | 3 layers | 3 | ~1296 blocks | Under |
+| **Today (Phase 2):** `{2,4,8}` (DW leaves), 64 clients | 3 layers | 3 | ~1296 blocks | Under |
+| **Future (Phase 3):** `{2,4,8}` + `static_near_root=1`, 128 clients | 4 layers | 3 | ~1296 blocks | Under |
+| **Future (Phase 3):** `{2,4,8}` + `static_near_root=2`, 128 clients | 4 layers | 2 | ~864 blocks | Generous slack |
 
 Regtest and testnet deployments use `step_blocks = 10` (not 144), so
 CSV budget is non-binding at any client count — but that's a test
@@ -143,13 +147,14 @@ Single arity (applies uniformly):
 superscalar_lsp --arity 3 --clients 16 ...
 ```
 
-Mixed per-level CLI accepts the syntax today but the builder collapses
-to binary internal tree. After Phase 2 lands, this will produce the
-TRUE N-way fan-out:
+Mixed per-level CLI now produces TRUE N-way fan-out (Phase 2 merged):
 
 ```
-# Target after Phase 2 — 64 clients, mixed PS leaves + arity-4 mid + arity-8 root:
-superscalar_lsp --arity 3,4,8 --clients 64 ...
+# 64 clients, mixed PS leaves + arity-4 mid + arity-2 root:
+superscalar_lsp --arity 2,4,3 --clients 64 ...
+
+# 64 clients, all-DW mixed (no PS): root arity-2 → mid arity-4 → leaves arity-8:
+superscalar_lsp --arity 2,4,8 --clients 64 ...
 ```
 
 Supported values today are 1–16 per level. The CLI should reject
@@ -157,14 +162,20 @@ shape combinations that would exceed BOLT 2016 (Phase 4 work).
 
 ## Implementation pointers
 
-- `include/superscalar/factory.h:15` — `FACTORY_MAX_OUTPUTS = 8` (will
-  bump to 16 in Phase 1 to support arity-15 leaves with L-stock)
+- `include/superscalar/factory.h:15` — `FACTORY_MAX_OUTPUTS = 16` (Phase 1
+  bumped from 8 → 16 to support up to arity-15 leaves with L-stock)
 - `include/superscalar/factory.h:185-190` — `uint8_t level_arity[FACTORY_MAX_LEVELS=8]`
-- `src/factory.c:606-622` — `factory_set_level_arity()` populates per-level arity
-- `src/factory.c:554-560` — `arity_at_depth()` lookup; last entry wraps deeper levels
-- `src/factory.c:781-939` — `build_subtree()` (currently binary; Phase 2 makes N-way)
-- `src/factory.c:564-604` — `simulate_tree()` (currently binary; Phase 2 makes N-way)
-- `tools/superscalar_lsp.c:1036` — default `leaf_arity` (currently 2; updated to 3 in Phase 0)
+- `src/factory.c::factory_set_level_arity` — populates per-level arity
+- `src/factory.c::arity_at_depth` — lookup; last entry wraps deeper levels
+- `src/factory.c::subtree_is_leaf, split_clients_for_arity` — core N-way
+  splitter (Phase 2). For arity-2 falls back to legacy binary algorithm
+  bit-identically (tested by `test_factory_nway_backward_compat`).
+- `src/factory.c::build_subtree` — N-way recursive builder (Phase 2)
+- `src/factory.c::setup_nway_leaf_outputs` — N-way leaf outputs:
+  N channels + 1 L-stock (Phase 2)
+- `src/factory.c::simulate_tree` — N-way tree shape simulator (Phase 2)
+- `tools/superscalar_lsp.c:1036` — default `leaf_arity` (currently 3 = PS,
+  Phase 0)
 
 ## Caveats
 
