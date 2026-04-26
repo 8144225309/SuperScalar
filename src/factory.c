@@ -624,14 +624,18 @@ static size_t split_clients_for_arity(int a, size_t nc, size_t out[]) {
 
 /* Simulate the variable-arity tree to compute leaf count and max depth.
    Returns leaf count via *leaves_out and max depth via *depth_out. */
+typedef struct { size_t nc; int depth; } simulate_frame_t;
+
 static void simulate_tree(const factory_t *f, size_t n_clients,
                            int *depth_out, int *leaves_out) {
     /* Recursive simulation via stack */
     int leaves = 0;
     int max_depth = 0;
-    struct { size_t nc; int depth; } stack[FACTORY_MAX_NODES];
+    simulate_frame_t stack[FACTORY_MAX_NODES];
     int sp = 0;
-    stack[sp++] = (struct { size_t nc; int depth; }){n_clients, 0};
+    stack[sp].nc = n_clients;
+    stack[sp].depth = 0;
+    sp++;
     while (sp > 0) {
         size_t nc = stack[sp - 1].nc;
         int d = stack[sp - 1].depth;
@@ -649,7 +653,9 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
                     fprintf(stderr, "simulate_tree: stack overflow (sp=%d)\n", sp);
                     break;
                 }
-                stack[sp++] = (struct { size_t nc; int depth; }){parts[k], d + 1};
+                stack[sp].nc = parts[k];
+                stack[sp].depth = d + 1;
+                sp++;
             }
         }
     }
