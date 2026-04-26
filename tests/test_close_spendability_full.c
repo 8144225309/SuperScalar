@@ -46,6 +46,14 @@ extern void reverse_bytes(unsigned char *data, size_t len);
     } \
 } while(0)
 
+#define TEST_ASSERT_EQ(a, b, msg) do { \
+    if ((long)(a) != (long)(b)) { \
+        printf("  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
+               __func__, __LINE__, msg, (long)(a), (long)(b)); \
+        return 0; \
+    } \
+} while(0)
+
 /* Deterministic seckeys: 0 = LSP (0x00..01), clients = (0x00..02+i) */
 static const unsigned char N_PARTY_SECKEYS[5][32] = {
     { [0 ... 30] = 0, [31] = 0x01 },  /* LSP      */
