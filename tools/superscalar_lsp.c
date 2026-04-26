@@ -284,7 +284,8 @@ static void usage(const char *prog) {
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N|N,N,...   Leaf arity: 1, 2, or 3=PS (default 2). Comma-separated for per-level.\n"
+        "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
+        "                       Comma-separated for per-level mixed arity (e.g. 3,4,8).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
@@ -1033,7 +1034,8 @@ int main(int argc, char *argv[]) {
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int no_jit = 0;
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
-    int leaf_arity = 2;              /* 1 or 2, default arity-2 */
+    int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
+                                        (1, 2 = legacy DW; 3 = PS canonical) */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
     int force_close = 0;
