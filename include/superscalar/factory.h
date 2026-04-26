@@ -129,6 +129,13 @@ typedef struct {
     int ps_chain_len;            /* number of state advances (0 = initial state) */
     unsigned char ps_prev_txid[32];    /* txid (internal byte order) of the prior chain TX */
     uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX */
+
+    /* Static-near-root variant (Phase 3 of mixed-arity plan).
+       1 = kickoff-only node, no paired NODE_STATE, no DW counter contribution.
+       Children spend this kickoff's vout 0..N-1 directly.
+       The CLTV timeout is the sole escape mechanism for static nodes
+       (nsequence == 0xFFFFFFFE, no BIP-68 CSV). */
+    int is_static_only;
 } factory_node_t;
 
 typedef struct {
@@ -195,6 +202,16 @@ typedef struct {
     uint8_t level_arity[FACTORY_MAX_LEVELS];
     size_t n_level_arity;
 
+    /* Static-near-root variant (Phase 3 of mixed-arity plan).
+       Depths < this threshold are kickoff-only (no paired NODE_STATE,
+       no DW counter, no per-state nSequence). Only the per-node CLTV
+       timeout escapes a static layer.
+       0 = no static, full DW everywhere (default for backward compat).
+       Per `arity_at_depth` semantics, this is independent of arity:
+       a static depth still has its arity_at_depth fan-out, but the
+       fan-out happens directly off the kickoff TX (no state intermediary). */
+    uint32_t static_threshold_depth;
+
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
@@ -240,6 +257,17 @@ void factory_set_arity(factory_t *f, factory_arity_t arity);
    Last entry applies to all deeper levels. Clears uniform leaf_arity.
    Must be called after init, before build_tree. */
 void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
+
+/* Configure the static-near-root threshold (Phase 3 of mixed-arity plan).
+   Depths in [0, threshold) become kickoff-only (no paired NODE_STATE, no
+   DW counter, no per-state nSequence — only the per-node CLTV timeout
+   escapes that layer). Pass 0 (the default) to disable static-near-root
+   and keep full DW state pairs at every depth.
+   Must be called after factory_set_arity / factory_set_level_arity
+   (which initialize the DW counter), before factory_build_tree.
+   Reinitializes the DW counter so n_layers reflects only the non-static
+   depths, capped at DW_MAX_LAYERS. */
+void factory_set_static_near_root(factory_t *f, uint32_t threshold);
 
 void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,

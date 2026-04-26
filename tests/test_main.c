@@ -1128,6 +1128,8 @@ extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len2(void);
 extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len5(void);
 extern int test_regtest_mixed_arity_2_4_8_lifecycle(void);
 extern int test_regtest_nway_n64_arity_2_4_8_lifecycle(void);
+extern int test_regtest_static_near_root_lifecycle(void);
+extern int test_regtest_static_near_root_unilateral_exit(void);
 extern int test_regtest_ps_full_lifecycle_n8(void);
 extern int test_regtest_ps_heterogeneous_chains_n8(void);
 extern int test_regtest_ps_full_lifecycle_n16(void);
@@ -1639,6 +1641,10 @@ extern int test_factory_nway_n12_arity_2_4(void);
 extern int test_factory_nway_n64_arity_2_4_8(void);
 extern int test_factory_nway_arity_8_leaf_outputs(void);
 extern int test_factory_nway_backward_compat(void);
+extern int test_factory_static_near_root_basic(void);
+extern int test_factory_static_near_root_n128_arity_2_4_8_static_2(void);
+extern int test_factory_static_near_root_node_nsequence(void);
+extern int test_factory_static_near_root_backward_compat(void);
 
 /* Wire TLV Foundation (Mainnet Gap #8) */
 extern int test_tlv_encode_decode(void);
@@ -3382,6 +3388,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_nway_arity_8_leaf_outputs);
     RUN_TEST(test_factory_nway_backward_compat);
 
+    printf("\n=== Static-Near-Root (Phase 3) ===\n");
+    RUN_TEST(test_factory_static_near_root_basic);
+    RUN_TEST(test_factory_static_near_root_n128_arity_2_4_8_static_2);
+    RUN_TEST(test_factory_static_near_root_node_nsequence);
+    RUN_TEST(test_factory_static_near_root_backward_compat);
+
     printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");
     RUN_TEST(test_tlv_encode_decode);
     RUN_TEST(test_tlv_decode_truncated);
@@ -3673,6 +3685,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len5);
     RUN_TEST(test_regtest_mixed_arity_2_4_8_lifecycle);
     RUN_TEST(test_regtest_nway_n64_arity_2_4_8_lifecycle);
+    RUN_TEST(test_regtest_static_near_root_lifecycle);
+    RUN_TEST(test_regtest_static_near_root_unilateral_exit);
     RUN_TEST(test_regtest_ps_full_lifecycle_n8);
     RUN_TEST(test_regtest_ps_heterogeneous_chains_n8);
     RUN_TEST(test_regtest_ps_full_lifecycle_n16);

@@ -286,6 +286,9 @@ static void usage(const char *prog) {
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated for per-level mixed arity (e.g. 3,4,8).\n"
+        "  --static-near-root N  (Phase 3) Top N tree depths are kickoff-only (no paired\n"
+        "                       NODE_STATE, no DW counter, only CLTV timeout escape).\n"
+        "                       0 = disabled (default). E.g. --arity 2,4,8 --static-near-root 2.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
@@ -1038,6 +1041,8 @@ int main(int argc, char *argv[]) {
                                         (1, 2 = legacy DW; 3 = PS canonical) */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
+    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only.
+                                        0 = disabled (default for backward compat) */
     int force_close = 0;
     int test_burn = 0;
     int test_htlc_force_close = 0;
@@ -1292,6 +1297,18 @@ int main(int argc, char *argv[]) {
             } else {
                 leaf_arity = atoi(arity_str);
             }
+        }
+        else if (strcmp(argv[i], "--static-near-root") == 0 && i + 1 < argc) {
+            /* Phase 3: depths < N are kickoff-only (no paired NODE_STATE,
+               no DW counter, only CLTV timeout escape).  0 disables. */
+            int v = atoi(argv[++i]);
+            if (v < 0 || v >= FACTORY_MAX_LEVELS) {
+                fprintf(stderr,
+                        "Error: --static-near-root must be in [0, %d)\n",
+                        FACTORY_MAX_LEVELS);
+                return 1;
+            }
+            static_near_root = (uint32_t)v;
         }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
@@ -2969,6 +2986,11 @@ accept_new_factory:
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
+    /* Phase 3: optionally turn the top N depths into kickoff-only static
+       layers (CLTV-timeout-only, no DW state machine).  Must be applied
+       AFTER arity configuration so the DW counter is correctly resized. */
+    if (static_near_root > 0)
+        factory_set_static_near_root(&lsp_p->factory, static_near_root);
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 

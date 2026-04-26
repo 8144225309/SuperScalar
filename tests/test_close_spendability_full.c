@@ -6430,3 +6430,426 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ============================================================================
+ *  Static-near-root variant lifecycle (Phase 3 of mixed-arity plan).
+ *
+ *  N=12 with {2,4} and static_threshold=1: depth-0 root is kickoff-only
+ *  (no NODE_STATE), depth-1 mids and depth-2 leaves are regular DW pairs.
+ *  Children of the static root spend the root kickoff's vout 0..N-1
+ *  directly (no state intermediary).
+ *
+ *  Asserts:
+ *   - tree shape: root has is_static_only=1, children spend it directly
+ *   - broadcast: every TX confirms in DFS order
+ *   - sweep: every leaf channel + L-stock; per-party econ_assert_wallet_deltas
+ *   - conservation: Σ(swept) + Σ(fees) == fund_amount
+ *  ========================================================================== */
+
+/* N12_PARTY_SECKEYS already declared earlier in this file. */
+
+int test_regtest_static_near_root_lifecycle(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "static_nearroot_n12");
+    /* Tree depth=2 with ~16 nodes; bump scan depth so leaves stay findable. */
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 12;
+    secp256k1_keypair kps[12];
+    secp256k1_pubkey  pks[12];
+    for (size_t i = 0; i < N; i++) {
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i],
+                                               N12_PARTY_SECKEYS[i]),
+                    "keypair_create n12 static");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]),
+                    "keypair_pub n12 static");
+    }
+
+    unsigned char fund_spk[34];
+    unsigned char tw_ser[32];
+    TEST_ASSERT(build_n_party_funding_spk(ctx, pks, N, fund_spk, tw_ser),
+                "build n12 static funding spk");
+
+    char fund_addr[128];
+    TEST_ASSERT(regtest_derive_p2tr_address(&rt, tw_ser, fund_addr,
+                                              sizeof(fund_addr)),
+                "derive n12 static fund addr");
+    char fund_txid[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, fund_txid),
+                "fund n12 static factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    uint32_t fund_vout = UINT32_MAX;
+    uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0;
+        unsigned char s[64];
+        size_t sl = 0;
+        if (regtest_get_tx_output(&rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v;
+            fund_amount = a;
+            break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "find n12 static fund vout");
+    printf("  [static-nearroot {2,4} thr=1] funded %s:%u  %llu sats\n",
+           fund_txid, fund_vout, (unsigned long long)fund_amount);
+
+    /* Build factory: arity {2,4}, static_threshold=1 (root kickoff-only) */
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc factory");
+    factory_init(f, ctx, kps, N, 4, 4);
+    /* PR #104 bumped fee_per_tx to 1000 sats for N-way regtest mempool floor. */
+    f->fee_per_tx = 1000;
+    uint8_t arities[2] = {2, 4};
+    factory_set_level_arity(f, arities, 2);
+    factory_set_static_near_root(f, 1);
+
+    unsigned char fund_txid_bytes[32];
+    TEST_ASSERT(hex_decode(fund_txid, fund_txid_bytes, 32),
+                "decode fund txid");
+    reverse_bytes(fund_txid_bytes, 32);
+    factory_set_funding(f, fund_txid_bytes, fund_vout, fund_amount,
+                        fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build static-nearroot tree");
+    TEST_ASSERT(factory_sign_all(f), "sign static-nearroot tree");
+
+    /* Tree shape assertions */
+    int n_leaves = f->n_leaf_nodes;
+    printf("  [static-nearroot {2,4} thr=1] %zu nodes, %d leaves, "
+           "n_layers=%d\n",
+           f->n_nodes, n_leaves, (int)f->counter.n_layers);
+
+    TEST_ASSERT(f->nodes[0].type == NODE_KICKOFF,
+                "node 0 is kickoff");
+    TEST_ASSERT_EQ(f->nodes[0].is_static_only, 1,
+                   "node 0 is static_only");
+    TEST_ASSERT_EQ(f->nodes[0].dw_layer_index, -1,
+                   "static root dw_layer_index == -1");
+    TEST_ASSERT_EQ(f->nodes[0].nsequence, 0xFFFFFFFEu,
+                   "static root nsequence == 0xFFFFFFFE");
+    TEST_ASSERT_EQ(f->nodes[0].n_outputs, 2,
+                   "static root has 2 outputs (arity-2 fan-out)");
+    /* Children of static root: the next 2 kickoffs spend its vouts directly. */
+    TEST_ASSERT(f->nodes[1].type == NODE_KICKOFF,
+                "node 1 is depth-1 kickoff (no paired root state)");
+    TEST_ASSERT(f->nodes[1].parent_index == 0,
+                "node 1 parent is the static root (node 0)");
+    TEST_ASSERT(f->nodes[1].parent_vout == 0,
+                "node 1 spends root vout 0");
+
+    /* Conservation pre-check: sum of leaf input_amounts ≤ funding */
+    int total_client_channels = 0;
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        TEST_ASSERT(!leaf->is_ps_leaf, "no PS leaves in DW {2,4} tree");
+        size_t n_clients = leaf->n_signers - 1;
+        TEST_ASSERT(n_clients >= 1 && n_clients <= 4,
+                    "leaf 1..4 clients (arity-4 cap)");
+        TEST_ASSERT_EQ(leaf->n_outputs, n_clients + 1,
+                       "leaf n_outputs = n_clients + 1");
+        total_client_channels += (int)n_clients;
+    }
+    TEST_ASSERT_EQ(total_client_channels, 11, "all 11 clients placed");
+
+    /* Broadcast every signed tree node in order with BIP-68 spacing. */
+    char (*txids)[65] = calloc(FACTORY_MAX_NODES, sizeof(*txids));
+    TEST_ASSERT(txids != NULL, "alloc txids");
+    TEST_ASSERT(broadcast_factory_tree(&rt, f, mine_addr, txids),
+                "broadcast static-nearroot tree");
+    for (int li = 0; li < n_leaves; li++) {
+        int conf = regtest_get_confirmations(&rt,
+            txids[f->leaf_node_indices[li]]);
+        TEST_ASSERT(conf >= 1, "leaf on chain");
+    }
+    printf("  [static-nearroot] full tree broadcast OK — %zu nodes, "
+           "%d leaves confirmed\n", f->n_nodes, n_leaves);
+
+    /* Per-party P2TR(xonly(pk_i)) destinations */
+    unsigned char party_spk[12][34];
+    for (size_t p = 0; p < N; p++) {
+        secp256k1_xonly_pubkey xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pks[p]);
+        build_p2tr_script_pubkey(party_spk[p], &xo);
+    }
+
+    /* Wire econ harness for all 12 parties.  snap_pre BEFORE any sweep TX. */
+    econ_ctx_t econ;
+    econ_ctx_init(&econ, &rt, ctx);
+    static const char *party_names[12] = {
+        "LSP", "client01", "client02", "client03", "client04", "client05",
+        "client06", "client07", "client08", "client09", "client10", "client11"
+    };
+    for (size_t p = 0; p < N; p++) {
+        TEST_ASSERT(econ_register_party(&econ, p, party_names[p],
+                                         N12_PARTY_SECKEYS[p]),
+                    "register party static");
+    }
+    econ.factory_funding_amount = fund_amount;
+    TEST_ASSERT(econ_snap_pre(&econ), "econ_snap_pre static");
+
+    /* Per-leaf sweep loop */
+    const uint64_t LSTOCK_SWEEP_FEE = 300;
+    const uint64_t CHAN_SWEEP_FEE   = 400;
+    const uint64_t PAYMENT_SHIFT    = 1000;
+
+    uint64_t per_party_recv[12] = {0};
+    uint64_t total_sweep_fees = 0;
+    uint64_t total_allocated  = 0;
+
+    for (int li = 0; li < n_leaves; li++) {
+        size_t nidx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[nidx];
+        const char *leaf_txid = txids[nidx];
+
+        unsigned char leaf_txid_bytes[32];
+        TEST_ASSERT(hex_decode(leaf_txid, leaf_txid_bytes, 32),
+                    "decode leaf txid");
+        reverse_bytes(leaf_txid_bytes, 32);
+
+        TEST_ASSERT(leaf->signer_indices[0] == 0,
+                    "signer[0] is LSP for every leaf");
+
+        uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
+        int n_channels       = (int)leaf->n_outputs - 1;
+
+        /* (A) L-stock LSP-alone */
+        uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
+        unsigned char lstock_spk[34];
+        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
+
+        tx_buf_t lstock_sweep;
+        tx_buf_init(&lstock_sweep, 256);
+        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
+                        N12_PARTY_SECKEYS[0],
+                        leaf_txid, lstock_vout, lstock_amt,
+                        lstock_spk, 34,
+                        party_spk[0], 34,
+                        LSTOCK_SWEEP_FEE, &lstock_sweep),
+                    "build L-stock sweep static");
+        char *lh = malloc(lstock_sweep.len * 2 + 1);
+        TEST_ASSERT(lh != NULL, "lh malloc");
+        hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
+        lh[lstock_sweep.len * 2] = '\0';
+        char lstock_sweep_txid[65];
+        int lok = spend_broadcast_and_mine(&rt, lh, 1, lstock_sweep_txid);
+        free(lh); tx_buf_free(&lstock_sweep);
+        TEST_ASSERT(lok, "L-stock sweep confirmed static");
+        per_party_recv[0] += lstock_amt - LSTOCK_SWEEP_FEE;
+        total_sweep_fees  += LSTOCK_SWEEP_FEE;
+        total_allocated   += lstock_amt;
+
+        /* (B) Each channel via 2-of-2 MuSig {client, LSP} */
+        for (int ch = 0; ch < n_channels; ch++) {
+            uint32_t client_idx = leaf->signer_indices[1 + ch];
+            TEST_ASSERT(client_idx >= 1 && client_idx < N,
+                        "client_idx range");
+
+            uint64_t chan_amt = leaf->outputs[ch].amount_sats;
+            uint64_t after_fee = chan_amt - CHAN_SWEEP_FEE;
+            uint64_t balanced  = after_fee / 2;
+            uint64_t client_share = balanced - PAYMENT_SHIFT;
+            uint64_t lsp_share    = after_fee - client_share;
+            unsigned char chan_spk[34];
+            memcpy(chan_spk, leaf->outputs[ch].script_pubkey, 34);
+
+            tx_output_t outs[2];
+            memcpy(outs[0].script_pubkey, party_spk[client_idx], 34);
+            outs[0].script_pubkey_len = 34;
+            outs[0].amount_sats = client_share;
+            memcpy(outs[1].script_pubkey, party_spk[0], 34);
+            outs[1].script_pubkey_len = 34;
+            outs[1].amount_sats = lsp_share;
+
+            tx_buf_t chan_unsigned;
+            tx_buf_init(&chan_unsigned, 256);
+            TEST_ASSERT(build_unsigned_tx(&chan_unsigned, NULL,
+                                            leaf_txid_bytes,
+                                            (uint32_t)ch, 0xFFFFFFFEu,
+                                            outs, 2),
+                        "build unsigned channel sweep static");
+            unsigned char sighash[32];
+            TEST_ASSERT(compute_taproot_sighash(sighash,
+                            chan_unsigned.data, chan_unsigned.len,
+                            0, chan_spk, 34, chan_amt, 0xFFFFFFFEu),
+                        "channel sighash static");
+
+            secp256k1_keypair signers[2] = { kps[client_idx], kps[0] };
+            secp256k1_pubkey  ckpks[2];
+            secp256k1_keypair_pub(ctx, &ckpks[0], &signers[0]);
+            secp256k1_keypair_pub(ctx, &ckpks[1], &signers[1]);
+            musig_keyagg_t cka;
+            TEST_ASSERT(musig_aggregate_keys(ctx, &cka, ckpks, 2),
+                        "agg channel keys static");
+            unsigned char sig64[64];
+            TEST_ASSERT(musig_sign_taproot(ctx, sig64, sighash, signers, 2,
+                                             &cka, NULL),
+                        "2-of-2 MuSig2 sign channel sweep static");
+            tx_buf_t chan_signed;
+            tx_buf_init(&chan_signed, 256);
+            TEST_ASSERT(finalize_signed_tx(&chan_signed,
+                            chan_unsigned.data, chan_unsigned.len, sig64),
+                        "finalize channel sweep tx static");
+            tx_buf_free(&chan_unsigned);
+
+            char *ch_hex = malloc(chan_signed.len * 2 + 1);
+            TEST_ASSERT(ch_hex != NULL, "ch_hex malloc");
+            hex_encode(chan_signed.data, chan_signed.len, ch_hex);
+            ch_hex[chan_signed.len * 2] = '\0';
+            char chan_sweep_txid[65];
+            int cok = spend_broadcast_and_mine(&rt, ch_hex, 1, chan_sweep_txid);
+            free(ch_hex); tx_buf_free(&chan_signed);
+            TEST_ASSERT(cok, "channel 2-of-2 sweep confirmed static");
+            per_party_recv[client_idx] += client_share;
+            per_party_recv[0]          += lsp_share;
+            total_sweep_fees           += CHAN_SWEEP_FEE;
+            total_allocated            += chan_amt;
+        }
+    }
+
+    TEST_ASSERT(econ_snap_post(&econ), "econ_snap_post static");
+
+    uint64_t swept_sum = 0;
+    for (size_t p = 0; p < N; p++) swept_sum += per_party_recv[p];
+    TEST_ASSERT(swept_sum + total_sweep_fees == total_allocated,
+                "conservation Σswept + Σfees == Σallocations (static)");
+    printf("  [static-nearroot] conservation OK: swept=%llu + fees=%llu "
+           "== allocations=%llu\n",
+           (unsigned long long)swept_sum,
+           (unsigned long long)total_sweep_fees,
+           (unsigned long long)total_allocated);
+
+    uint64_t expected_deltas[12];
+    for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
+    TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
+                "per-party wallet deltas match expected (12 parties, static)");
+    econ_print_summary(&econ);
+
+    free(txids);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Static-near-root unilateral exit: confirms a static interior kickoff
+   spends via nSequence=0xFFFFFFFE (no BIP-68 CSV) and that its on-chain
+   broadcast does NOT rely on stacked nSequence delays.
+
+   We force-close a {2,4} factory with static_threshold=1: the root kickoff
+   (static) broadcasts with no CSV between funding confirmation and broadcast.
+   Asserts:
+     - root kickoff's nsequence == 0xFFFFFFFE
+     - the root kickoff spends the funding output 1 block after confirmation
+       (no extra BIP-68 wait)
+     - downstream child kickoff (depth=1, regular) requires its normal
+       BIP-68 + CLTV constraints */
+int test_regtest_static_near_root_unilateral_exit(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "static_unilat_n12");
+    rt.scan_depth = 600;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    const size_t N = 12;
+    secp256k1_keypair kps[12];
+    secp256k1_pubkey  pks[12];
+    for (size_t i = 0; i < N; i++) {
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i],
+                                               N12_PARTY_SECKEYS[i]),
+                    "keypair_create");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]),
+                    "keypair_pub");
+    }
+
+    unsigned char fund_spk[34];
+    unsigned char tw_ser[32];
+    TEST_ASSERT(build_n_party_funding_spk(ctx, pks, N, fund_spk, tw_ser),
+                "build fund spk");
+
+    char fund_addr[128];
+    TEST_ASSERT(regtest_derive_p2tr_address(&rt, tw_ser, fund_addr,
+                                              sizeof(fund_addr)),
+                "derive fund addr");
+    char fund_txid[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, fund_txid),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    uint32_t fund_vout = UINT32_MAX;
+    uint64_t fund_amount = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t a = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(&rt, fund_txid, v, &a, s, &sl) &&
+            sl == 34 && memcmp(s, fund_spk, 34) == 0) {
+            fund_vout = v; fund_amount = a; break;
+        }
+    }
+    TEST_ASSERT(fund_vout != UINT32_MAX, "find fund vout");
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc factory");
+    factory_init(f, ctx, kps, N, 4, 4);
+    f->fee_per_tx = 1000;
+    uint8_t arities[2] = {2, 4};
+    factory_set_level_arity(f, arities, 2);
+    factory_set_static_near_root(f, 1);
+
+    unsigned char fund_txid_bytes[32];
+    TEST_ASSERT(hex_decode(fund_txid, fund_txid_bytes, 32),
+                "decode fund txid");
+    reverse_bytes(fund_txid_bytes, 32);
+    factory_set_funding(f, fund_txid_bytes, fund_vout, fund_amount,
+                        fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    /* Static root assertions */
+    TEST_ASSERT_EQ(f->nodes[0].is_static_only, 1, "root static");
+    TEST_ASSERT_EQ(f->nodes[0].nsequence, 0xFFFFFFFEu,
+                   "static root nsequence == 0xFFFFFFFE");
+
+    /* Broadcast root kickoff DIRECTLY 1 block after funding confirmation
+       (no BIP-68 wait). Confirms BIP-68 is fully disabled on a static node. */
+    factory_node_t *root_ko = &f->nodes[0];
+    char *root_hex = malloc(root_ko->signed_tx.len * 2 + 1);
+    TEST_ASSERT(root_hex != NULL, "root_hex malloc");
+    hex_encode(root_ko->signed_tx.data, root_ko->signed_tx.len, root_hex);
+    char root_txid_out[65];
+    int rok = spend_broadcast_and_mine(&rt, root_hex, 1, root_txid_out);
+    free(root_hex);
+    TEST_ASSERT(rok, "static root kickoff broadcast + confirmed without "
+                     "any BIP-68 CSV wait");
+    printf("  [static unilat] static root kickoff broadcast OK at "
+           "1-block confirm — proves nsequence=0xFFFFFFFE eliminates BIP-68 CSV\n");
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

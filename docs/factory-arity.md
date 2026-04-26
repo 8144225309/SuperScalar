@@ -79,8 +79,8 @@ their CSV contribution entirely.
 
 ## Current implementation status (v0.1.x)
 
-**As of this document's commit, the implementation has delivered Phase 2
-of the full canonical design (TRUE N-way mixed-arity):**
+**As of this document's commit, the implementation has delivered Phase 3
+of the full canonical design (TRUE N-way mixed-arity + static-near-root):**
 
 - ✅ PS leaves at any N (proven on regtest at N=2-32 with full per-party
   accounting; unit-tested at N=64 and N=128)
@@ -93,15 +93,19 @@ of the full canonical design (TRUE N-way mixed-arity):**
 - ✅ **N-way leaves (Phase 2 — merged).** Arity-A leaves now produce
   `A + 1` outputs (A channels + 1 L-stock). Unit-tested at A=8 (9 outputs,
   per-channel MuSig SPK distinct).
-- ⚠️ **Static-near-root variant: NOT YET IMPLEMENTED.** Coming in
-  "Phase 3" of the same work — kickoff-only state pairs at depths near
-  the root (no DW counter), eliminating CSV contribution entirely from
-  those layers.
+- ✅ **Static-near-root variant (Phase 3 — merged).** `--static-near-root N`
+  turns the top N tree depths into kickoff-only nodes (no paired
+  `NODE_STATE`, no DW counter, only CLTV-timeout escape via
+  `nsequence=0xFFFFFFFE`). DW counter `n_layers` shifts by `N`,
+  eliminating CSV contribution from those layers entirely. Children of
+  a static node spend its outputs directly (no state intermediary).
+  Unit-tested + regtest-tested at N=12 `{2,4}` `static_threshold=1` with
+  full per-party `econ_assert_wallet_deltas`.
 
-The supported deployment ceiling is now **N=64+ clients per factory**
-with mixed arity `{2,4,8}` (proven end-to-end on regtest) — well within
-BOLT 2016. Single-factory N>16 with uniform PS leaves is also supported
-(unit-tested at N=128).
+The supported deployment ceiling is now **N=128 clients per factory**
+with mixed arity `{2,4,8}` + static-near-root (unit-tested) — well within
+BOLT 2016. End-to-end regtest at N=64 with `{2,4,8}` and N=12 with
+`{2,4} + static-near-root=1` is also exercised.
 
 ## Recommended shapes (target vs today)
 
@@ -132,8 +136,8 @@ defaults (`step_blocks = 144`, `states_per_layer = 4`, giving
 | Uniform PS, 128 clients (binary) | 7 layers | 7 | ~3024 blocks | **EXCEEDS** |
 | **Today (Phase 2):** PS leaves + `{2,4,8}` interior, 64 clients | 3 layers | 3 | ~1296 blocks | Under |
 | **Today (Phase 2):** `{2,4,8}` (DW leaves), 64 clients | 3 layers | 3 | ~1296 blocks | Under |
-| **Future (Phase 3):** `{2,4,8}` + `static_near_root=1`, 128 clients | 4 layers | 3 | ~1296 blocks | Under |
-| **Future (Phase 3):** `{2,4,8}` + `static_near_root=2`, 128 clients | 4 layers | 2 | ~864 blocks | Generous slack |
+| **Today (Phase 3):** `{2,4,8}` + `static_near_root=1`, 128 clients | 3 layers | 2 | ~864 blocks | Generous slack |
+| **Today (Phase 3):** `{2,4,8}` + `static_near_root=2`, 128 clients | 3 layers | 1 | ~432 blocks | Very generous slack |
 
 Regtest and testnet deployments use `step_blocks = 10` (not 144), so
 CSV budget is non-binding at any client count — but that's a test
@@ -170,12 +174,21 @@ shape combinations that would exceed BOLT 2016 (Phase 4 work).
 - `src/factory.c::subtree_is_leaf, split_clients_for_arity` — core N-way
   splitter (Phase 2). For arity-2 falls back to legacy binary algorithm
   bit-identically (tested by `test_factory_nway_backward_compat`).
-- `src/factory.c::build_subtree` — N-way recursive builder (Phase 2)
+- `src/factory.c::build_subtree` — N-way recursive builder (Phase 2);
+  also handles static-near-root depths (Phase 3) by emitting kickoff-only
+  nodes with `is_static_only = 1`
 - `src/factory.c::setup_nway_leaf_outputs` — N-way leaf outputs:
   N channels + 1 L-stock (Phase 2)
 - `src/factory.c::simulate_tree` — N-way tree shape simulator (Phase 2)
+- `src/factory.c::dw_n_layers_for` — translates `tree_depth +
+  static_threshold` to DW counter `n_layers` (Phase 3)
+- `src/factory.c::factory_set_static_near_root` — public API to set the
+  static-near-root threshold (Phase 3)
+- `src/factory.c::node_nsequence` — returns `0xFFFFFFFE` for `is_static_only`
+  nodes (Phase 3)
 - `tools/superscalar_lsp.c:1036` — default `leaf_arity` (currently 3 = PS,
   Phase 0)
+- `tools/superscalar_lsp.c` — `--static-near-root N` CLI flag (Phase 3)
 
 ## Caveats
 
