@@ -105,28 +105,60 @@ done
 
 # --- bitcoind regtest ---
 echo ""
-echo "--- bitcoind regtest ---"
-if ! $BCLI getblockchaininfo &>/dev/null; then
-    echo "  starting bitcoind..."
-    bitcoind -regtest -conf="$REGTEST_CONF" -daemon
-    for i in $(seq 1 30); do
-        $BCLI getblockchaininfo &>/dev/null && break
-        sleep 1
-    done
-    if ! $BCLI getblockchaininfo &>/dev/null; then
-        echo "FAIL: bitcoind failed to start (check $REGTEST_CONF)"
-        exit 1
-    fi
-fi
-echo "  bitcoind reachable"
+echo "--- bitcoind regtest (full chain reset for fresh subsidy) ---"
 
-# Wallet for mining + LSP funding source.
-WALLET_NAME="ss_mp_n8"
+# Resolve datadir from conf so the reset works regardless of layout.
+REGTEST_DATADIR=$(grep -E '^datadir=' "$REGTEST_CONF" 2>/dev/null | head -1 | cut -d= -f2)
+if [ -n "$REGTEST_DATADIR" ]; then
+    REGTEST_REGTEST_DIR="$REGTEST_DATADIR/regtest"
+else
+    REGTEST_REGTEST_DIR="$HOME/.bitcoin/regtest"
+fi
+
+# Try graceful shutdown, fall back to pkill.
+$BCLI stop 2>/dev/null || true
+sleep 2
+if pgrep -f "bitcoind.*regtest" > /dev/null; then
+    pkill -f "bitcoind.*regtest" 2>/dev/null || true
+    sleep 2
+fi
+
+# Reset chain (fresh subsidy).  Need bitcoin uid if the datadir is owned by it.
+DATADIR_OWNER=$(stat -c %U "$REGTEST_DATADIR" 2>/dev/null || echo "$USER")
+if [ "$DATADIR_OWNER" = "bitcoin" ]; then
+    sudo -u bitcoin sh -c "rm -rf '$REGTEST_REGTEST_DIR'" 2>/dev/null || \
+        rm -rf "$REGTEST_REGTEST_DIR"
+    sudo -u bitcoin bitcoind -regtest -conf="$REGTEST_CONF" -daemon
+else
+    rm -rf "$REGTEST_REGTEST_DIR"
+    bitcoind -regtest -conf="$REGTEST_CONF" -daemon
+fi
+
+for i in $(seq 1 30); do
+    $BCLI getblockchaininfo &>/dev/null && break
+    sleep 1
+done
+if ! $BCLI getblockchaininfo &>/dev/null; then
+    echo "FAIL: bitcoind failed to start (check $REGTEST_CONF)"
+    exit 1
+fi
+echo "  bitcoind reachable, fresh chain at height $($BCLI getblockcount)"
+
+# LSP uses the DEFAULT wallet (no -rpcwallet=) on regtest for funding +
+# mining.  After chain reset, the default wallet doesn't exist yet; create
+# it.  The LSP itself will mine 101 blocks to a fresh address it generates,
+# which gives it ~50 BTC of mature subsidy on a fresh regtest chain (block
+# subsidy halves every 150 blocks, so the first 150 are 50 BTC each).
+$BCLI createwallet "" 2>/dev/null || $BCLI loadwallet "" 2>/dev/null || true
+DEFAULT_BAL=$($BCLI -rpcwallet="" getbalance 2>/dev/null || echo "0")
+echo "  default wallet ready (balance=$DEFAULT_BAL BTC) — LSP will mine its own subsidy"
+
+# We still need a separate wallet for the heartbeat miner that pumps blocks
+# during the ceremony (BIP68 timelock progression).
+WALLET_NAME="ss_mp_n8_miner"
 $BCLI createwallet "$WALLET_NAME" 2>/dev/null || $BCLI loadwallet "$WALLET_NAME" 2>/dev/null || true
 MINE_ADDR=$($BCLI -rpcwallet="$WALLET_NAME" getnewaddress)
-$BCLI generatetoaddress 101 "$MINE_ADDR" > /dev/null
-WALLET_BAL=$($BCLI -rpcwallet="$WALLET_NAME" getbalance)
-echo "  wallet $WALLET_NAME funded (balance=$WALLET_BAL BTC, mine_addr=${MINE_ADDR:0:18}...)"
+echo "  miner wallet ready (mine_addr=${MINE_ADDR:0:18}...)"
 
 # --- LSP daemon (process #1) ---
 echo ""
