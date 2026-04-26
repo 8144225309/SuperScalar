@@ -4504,16 +4504,21 @@ static int setup_variable_arity_factory(factory_t *f, secp256k1_context *ctx,
                                          secp256k1_keypair *kps, size_t n_participants,
                                          const uint8_t *arities, size_t n_arities,
                                          uint64_t funding) {
+    ensure_seckeys_n();
     for (size_t i = 0; i < n_participants; i++) {
         if (!secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]))
             return 0;
     }
-    secp256k1_pubkey pks[16];
+    secp256k1_pubkey *pks = calloc(n_participants, sizeof(secp256k1_pubkey));
+    if (!pks) return 0;
     for (size_t i = 0; i < n_participants; i++)
         secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
 
     musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pks, n_participants)) return 0;
+    if (!musig_aggregate_keys(ctx, &ka, pks, n_participants)) {
+        free(pks);
+        return 0;
+    }
 
     unsigned char internal_ser[32];
     secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
@@ -4522,10 +4527,13 @@ static int setup_variable_arity_factory(factory_t *f, secp256k1_context *ctx,
 
     musig_keyagg_t tmp = ka;
     secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak))
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak)) {
+        free(pks);
         return 0;
+    }
     secp256k1_xonly_pubkey fund_xonly;
     secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_xonly, NULL, &tweaked_pk);
+    free(pks);
 
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &fund_xonly);
