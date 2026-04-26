@@ -12,7 +12,13 @@
 #include <secp256k1_extrakeys.h>
 
 #define FACTORY_MAX_NODES   512
-#define FACTORY_MAX_OUTPUTS  8
+/* FACTORY_MAX_OUTPUTS: max outputs per tree node. Sized for arity-15 leaves
+ * (15 client channels + 1 L-stock = 16 outputs) under the upcoming N-way
+ * mixed-arity work (Phase 2 of mixed-arity implementation plan). Internal
+ * state nodes use up to N child outputs. Memory cost: per-node growth from
+ * 8 × tx_output_t to 16 × tx_output_t; at 506 nodes (max PS factory at
+ * N=128) that's ~50KB extra per factory_t — acceptable. */
+#define FACTORY_MAX_OUTPUTS 16
 #define FACTORY_MAX_SIGNERS 128
 #define FACTORY_MAX_LEAVES  128
 
