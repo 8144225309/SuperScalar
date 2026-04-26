@@ -4885,6 +4885,10 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);  /* step_blocks=4, states_per_layer=4 */
+    /* Wider N-way state nodes are larger TXs than the binary builder's;
+       bump fee_per_tx above CI regtest mempool min relay (~240 sats for
+       these vBytes). 1000 sats clears all currently-known regtest floors. */
+    f->fee_per_tx = 1000;
 
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
@@ -6197,6 +6201,9 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
+    /* Wider N-way state nodes need more fee than default 200 sats to
+       clear CI regtest mempool min-relay (~240 sats). 1000 sats safe. */
+    f->fee_per_tx = 1000;
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
 
