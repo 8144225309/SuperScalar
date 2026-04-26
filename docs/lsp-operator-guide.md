@@ -138,7 +138,8 @@ Press **Ctrl+C**. The LSP will:
 | `--port` | 9735 | Listen port for client connections |
 | `--clients` | 4 | Number of clients to accept before starting ceremony |
 | `--amount` | 100000 | Factory funding amount in satoshis |
-| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). |
+| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). See [docs/factory-arity.md](factory-arity.md) for canonical shape selection by client count. |
+| `--static-near-root` | 0 | Number of near-root tree levels to make kickoff-only (no DW state machine). Reduces total CSV consumption — see [docs/factory-arity.md](factory-arity.md). |
 | `--network` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
 | `--daemon` | off | Long-lived mode (handles reconnections, Ctrl+C for close) |
 | `--demo` | off | Run scripted payment sequence then close |
