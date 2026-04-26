@@ -1197,6 +1197,27 @@ extern int test_daemon_event_loop(void);
 extern int test_client_daemon_autofulfill(void);
 extern int test_cli_command_parsing(void);
 
+/* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
+extern int test_cli_arity_uniform_3_parses(void);
+extern int test_cli_arity_mixed_248_parses(void);
+extern int test_cli_arity_rejects_16(void);
+extern int test_cli_arity_rejects_zero(void);
+extern int test_cli_arity_rejects_negative(void);
+extern int test_cli_arity_rejects_non_numeric(void);
+extern int test_cli_arity_rejects_mixed_with_oversize_entry(void);
+extern int test_cli_arity_rejects_empty(void);
+extern int test_cli_static_near_root_parses_1(void);
+extern int test_cli_static_near_root_parses_zero_disabled(void);
+extern int test_cli_static_near_root_rejects_negative(void);
+extern int test_cli_static_near_root_rejects_too_large(void);
+extern int test_cli_shape_uniform_ps_8_passes(void);
+extern int test_cli_shape_binary_n128_rejected(void);
+extern int test_cli_shape_arity_2_4_n64_passes(void);
+extern int test_cli_shape_uniform_arity2_n64_rejected(void);
+extern int test_cli_shape_mixed_248_n64_passes(void);
+extern int test_cli_shape_mixed_248_static2_n128_passes(void);
+extern int test_cli_shape_regtest_step10_always_passes(void);
+
 /* Phase 16: Reconnection */
 extern int test_reconnect_wire(void);
 extern int test_reconnect_pubkey_match(void);
@@ -2954,6 +2975,27 @@ static void run_unit_tests(void) {
     RUN_TEST(test_daemon_event_loop);
     RUN_TEST(test_client_daemon_autofulfill);
     RUN_TEST(test_cli_command_parsing);
+
+    printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
+    RUN_TEST(test_cli_arity_uniform_3_parses);
+    RUN_TEST(test_cli_arity_mixed_248_parses);
+    RUN_TEST(test_cli_arity_rejects_16);
+    RUN_TEST(test_cli_arity_rejects_zero);
+    RUN_TEST(test_cli_arity_rejects_negative);
+    RUN_TEST(test_cli_arity_rejects_non_numeric);
+    RUN_TEST(test_cli_arity_rejects_mixed_with_oversize_entry);
+    RUN_TEST(test_cli_arity_rejects_empty);
+    RUN_TEST(test_cli_static_near_root_parses_1);
+    RUN_TEST(test_cli_static_near_root_parses_zero_disabled);
+    RUN_TEST(test_cli_static_near_root_rejects_negative);
+    RUN_TEST(test_cli_static_near_root_rejects_too_large);
+    RUN_TEST(test_cli_shape_uniform_ps_8_passes);
+    RUN_TEST(test_cli_shape_binary_n128_rejected);
+    RUN_TEST(test_cli_shape_arity_2_4_n64_passes);
+    RUN_TEST(test_cli_shape_uniform_arity2_n64_rejected);
+    RUN_TEST(test_cli_shape_mixed_248_n64_passes);
+    RUN_TEST(test_cli_shape_mixed_248_static2_n128_passes);
+    RUN_TEST(test_cli_shape_regtest_step10_always_passes);
 
     printf("\n=== Reconnection (Phase 16) ===\n");
     RUN_TEST(test_reconnect_wire);

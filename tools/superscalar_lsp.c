@@ -33,6 +33,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/admin_rpc.h"
+#include "superscalar/cli_arity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -285,10 +286,17 @@ static void usage(const char *prog) {
         "  --no-jit            Disable JIT channel fallback\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
-        "                       Comma-separated for per-level mixed arity (e.g. 3,4,8).\n"
-        "  --static-near-root N  (Phase 3) Top N tree depths are kickoff-only (no paired\n"
-        "                       NODE_STATE, no DW counter, only CLTV timeout escape).\n"
-        "                       0 = disabled (default). E.g. --arity 2,4,8 --static-near-root 2.\n"
+        "                       Comma-separated activates TRUE N-way mixed arity per level\n"
+        "                       (root..leaves). Each value must be 1-15. Canonical shapes:\n"
+        "                       up to 16 clients => 3 (uniform PS); 17-32 => 3,4; 33-64 =>\n"
+        "                       3,4,8 (or 2,4,8 for DW leaves); 65-128 => 2,4,8 (with\n"
+        "                       --static-near-root 1 or 2). See docs/factory-arity.md.\n"
+        "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
+        "                       no DW counter, only CLTV timeout escape). Reduces total\n"
+        "                       CSV consumption from those layers to zero. Range 0..7\n"
+        "                       (FACTORY_MAX_LEVELS-1); 0 = disabled (default). Canonical\n"
+        "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
+        "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
@@ -1274,41 +1282,41 @@ int main(int argc, char *argv[]) {
                safer at scale: uniform arity-2 with 127 clients and mainnet
                step_blocks=144 stacks ~3024 blocks of BIP-68 CSV along the
                exit path, exceeding BOLT's 2016-block final_cltv_expiry
-               ceiling. See docs/factory-arity.md for recommended shapes. */
-            if (strchr(arity_str, ',')) {
-                char buf[128];
-                strncpy(buf, arity_str, sizeof(buf) - 1);
-                buf[sizeof(buf) - 1] = '\0';
-                char *tok = strtok(buf, ",");
-                while (tok && n_level_arity < FACTORY_MAX_LEVELS) {
-                    int v = atoi(tok);
-                    /* 1 = single-client DW leaf, 2 = two-client DW leaf,
-                       3 = pseudo-Spilman chained leaf, >= 4 = wide fan-out
-                       for interior/root levels. Capped at 16 to keep MuSig
-                       cohorts manageable. */
-                    if (v < 1 || v > 16) {
-                        fprintf(stderr, "Error: each arity must be in [1, 16]\n");
-                        return 1;
-                    }
-                    level_arities[n_level_arity++] = (uint8_t)v;
-                    tok = strtok(NULL, ",");
-                }
-                leaf_arity = (int)level_arities[n_level_arity - 1];
+               ceiling. See docs/factory-arity.md for recommended shapes.
+               Phase 4: parsing + per-entry range check delegated to
+               cli_parse_arity_spec() so unit tests can exercise it. */
+            char err[256];
+            uint8_t parsed[FACTORY_MAX_LEVELS];
+            size_t n_parsed = 0;
+            int parsed_leaf = 0;
+            if (!cli_parse_arity_spec(arity_str, parsed, FACTORY_MAX_LEVELS,
+                                       &n_parsed, &parsed_leaf,
+                                       err, sizeof(err))) {
+                fprintf(stderr, "%s\n", err);
+                return 1;
+            }
+            /* Treat a single value as uniform leaf_arity (legacy path);
+               two or more values activate level_arity mixed mode. */
+            if (n_parsed == 1) {
+                leaf_arity = parsed_leaf;
+                n_level_arity = 0;
             } else {
-                leaf_arity = atoi(arity_str);
+                memcpy(level_arities, parsed, n_parsed);
+                n_level_arity = n_parsed;
+                leaf_arity = parsed_leaf;
             }
         }
         else if (strcmp(argv[i], "--static-near-root") == 0 && i + 1 < argc) {
             /* Phase 3: depths < N are kickoff-only (no paired NODE_STATE,
-               no DW counter, only CLTV timeout escape).  0 disables. */
-            int v = atoi(argv[++i]);
-            if (v < 0 || v >= FACTORY_MAX_LEVELS) {
-                fprintf(stderr,
-                        "Error: --static-near-root must be in [0, %d)\n",
-                        FACTORY_MAX_LEVELS);
+               no DW counter, only CLTV timeout escape).  0 disables.
+               Phase 4: parsing delegated to cli_parse_static_near_root(). */
+            char err[256];
+            uint32_t v = 0;
+            if (!cli_parse_static_near_root(argv[++i], &v, err, sizeof(err))) {
+                fprintf(stderr, "%s\n", err);
                 return 1;
             }
-            static_near_root = (uint32_t)v;
+            static_near_root = v;
         }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
@@ -1743,13 +1751,41 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
     }
-    if (leaf_arity != 1 && leaf_arity != 2 && leaf_arity != 3) {
-        fprintf(stderr, "Error: --arity must be 1, 2, or 3 (PS)\n");
+    /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
+       in mixed mode the LAST entry can be any 1..15 since interior arities
+       are pure fan-out (Phase 2). */
+    if (n_level_arity == 0 &&
+        leaf_arity != 1 && leaf_arity != 2 && leaf_arity != 3) {
+        fprintf(stderr,
+                "Error: --arity (uniform) must be 1, 2, or 3 (PS); "
+                "use a comma list for mixed shapes (e.g. --arity 2,4,8)\n");
         return 1;
     }
     if (leaf_arity == 2 && n_clients < 2) {
         fprintf(stderr, "Error: --arity 2 requires at least 2 clients\n");
         return 1;
+    }
+
+    /* Phase 4 BOLT-2016 ceiling check: reject shapes whose worst-case
+       early-warning-time exceeds 2016 blocks given the configured
+       step_blocks/states_per_layer.  Regtest defaults (step_blocks=10) keep
+       the budget non-binding; mainnet defaults (step_blocks=144) bite. */
+    {
+        char err[512];
+        uint32_t ewt = 0;
+        factory_arity_t fa = (factory_arity_t)leaf_arity;
+        const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
+        if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (size_t)n_clients,
+                                              static_near_root,
+                                              step_blocks,
+                                              (uint32_t)states_per_layer,
+                                              &ewt, err, sizeof(err))) {
+            fprintf(stderr, "%s\n", err);
+            return 1;
+        }
+        printf("LSP: shape ewt = %u blocks (BOLT 2016 ceiling = %u)\n",
+               ewt, CLI_ARITY_BOLT2016_CEILING);
     }
 
     /* Initialize diagnostic report */

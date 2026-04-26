@@ -79,69 +79,102 @@ their CSV contribution entirely.
 
 ## Current implementation status (v0.1.x)
 
-**As of this document's commit, the implementation has delivered Phase 3
-of the full canonical design (TRUE N-way mixed-arity + static-near-root):**
+**As of this document's commit, the implementation has delivered the
+full canonical SuperScalar design — TRUE N-way mixed-arity interior
+branching + static-near-root variant (Phases 0-4 of the mixed-arity
+plan, all merged):**
 
-- ✅ PS leaves at any N (proven on regtest at N=2-32 with full per-party
+- PS leaves at any N (proven on regtest at N=2-32 with full per-party
   accounting; unit-tested at N=64 and N=128)
-- ✅ DW arity-1 and arity-2 leaves (legacy)
-- ✅ **TRUE N-way interior branching (Phase 2 — merged).** `--arity 2,4,8`
-  now produces an authentic 3-level fan-out: root arity-2 → mid arity-4 →
-  leaves arity-8 (per `arity_at_depth`). Unit tests assert per-level
-  `n_outputs` and full N=64 lifecycle is exercised on regtest with
-  per-party `econ_assert_wallet_deltas`.
-- ✅ **N-way leaves (Phase 2 — merged).** Arity-A leaves now produce
+- DW arity-1 and arity-2 leaves (legacy, kept for migration)
+- **TRUE N-way interior branching (Phase 2 — merged in PR #104).**
+  `--arity 2,4,8` produces an authentic 3-level fan-out: root arity-2 →
+  mid arity-4 → leaves arity-8 (per `arity_at_depth`). Unit tests assert
+  per-level `n_outputs` and full N=64 lifecycle is exercised on regtest
+  with per-party `econ_assert_wallet_deltas`.
+- **N-way leaves (Phase 2 — merged in PR #104).** Arity-A leaves produce
   `A + 1` outputs (A channels + 1 L-stock). Unit-tested at A=8 (9 outputs,
   per-channel MuSig SPK distinct).
-- ✅ **Static-near-root variant (Phase 3 — merged).** `--static-near-root N`
-  turns the top N tree depths into kickoff-only nodes (no paired
-  `NODE_STATE`, no DW counter, only CLTV-timeout escape via
-  `nsequence=0xFFFFFFFE`). DW counter `n_layers` shifts by `N`,
-  eliminating CSV contribution from those layers entirely. Children of
-  a static node spend its outputs directly (no state intermediary).
+- **Static-near-root variant (Phase 3 — merged in PR #105).**
+  `--static-near-root N` turns the top N tree depths into kickoff-only
+  nodes (no paired `NODE_STATE`, no DW counter, only CLTV-timeout escape
+  via `nsequence=0xFFFFFFFE`). DW counter `n_layers` shifts by `N`,
+  eliminating CSV contribution from those layers entirely. Children of a
+  static node spend its outputs directly (no state intermediary).
   Unit-tested + regtest-tested at N=12 `{2,4}` `static_threshold=1` with
   full per-party `econ_assert_wallet_deltas`.
+- **CLI hardening + BOLT-2016 ceiling check (Phase 4 — this commit).**
+  `--arity` accepts 1-15 per level; the LSP refuses to start when the
+  configured shape's worst-path ewt exceeds BOLT's 2016-block
+  `final_cltv_expiry` ceiling, with the error pointing operators at
+  this document. Implemented in `cli_arity.c` against
+  `factory_compute_ewt_for_shape()` (pure-math simulator); covered by
+  `test_cli_arity_*` unit tests asserting the specific error strings.
 
 The supported deployment ceiling is now **N=128 clients per factory**
-with mixed arity `{2,4,8}` + static-near-root (unit-tested) — well within
-BOLT 2016. End-to-end regtest at N=64 with `{2,4,8}` and N=12 with
-`{2,4} + static-near-root=1` is also exercised.
+with mixed arity `{2,4,8}` + `--static-near-root 2` (unit-tested with
+per-shape ewt assertion) — well within BOLT 2016. End-to-end regtest
+at N=64 with `{2,4,8}` and N=12 with `{2,4} + static-near-root=1` is
+also exercised.
 
-## Recommended shapes (target vs today)
+## Recommended shapes (canonical, all available today)
 
-| Client count | Today (canonical) | Future (after static-near-root) | Notes |
+All of these are implemented and unit-tested as of v0.1.14+:
+
+| Client count | Recommended shape | Leaf type | Notes |
 |---|---|---|---|
-| ≤ 8 | `--arity 3` (uniform PS) | same | Depth stays shallow; no mixed needed |
-| 9-16 | `--arity 3` (uniform PS) | same | Still under BOLT 2016 with binary interior |
-| 17-32 | `--arity 3,4` (PS leaves + arity-4 mid) | same | Adds one fan-out level |
-| 33-64 | `--arity 3,4,8` or `--arity 2,4,8` | same | ZmnSCPxj's canonical mid-tree shape (Phase 2 implemented) |
-| 65-127 | `--arity 2,4,8` | `--arity 2,4,8 --static-near-root 1` or `--arity 3,2,4,8` | Static gate at root for further depth reduction |
+| ≤ 16 | `--arity 3` (uniform PS) | PS | Depth ≤ 4, no mixed needed |
+| 17-32 | `--arity 3,4` (PS root, DW arity-4 leaves) | DW arity-4 | Adds one fan-out level |
+| 33-64 | `--arity 2,4,8` | DW arity-8 | ZmnSCPxj's canonical mid-tree shape |
+| 65-128 | `--arity 2,4,8 --static-near-root 1` | DW arity-8 | Static gate at root reduces depth contribution |
+| 65-128 | `--arity 2,4,8 --static-near-root 2` | DW arity-8 | The design target — only two DW layers remain |
 
-**Today, both uniform `--arity 3` (up to 16 clients) and mixed
-`--arity 2,4,8` (up to 64 clients tested on regtest) are supported on
-mainnet.** Higher N is supported in principle (FACTORY_MAX_SIGNERS=128)
-but the regtest end-to-end test currently exercises N=64.
+The CLI rejects any combination whose worst-path `ewt` would exceed BOLT
+2016 with a clear error pointing at this document.
+
+## Worked examples (mainnet defaults: step_blocks=144, states_per_layer=4)
+
+Each layer contributes `144 * (4-1) = 432` blocks of CSV. PS leaves
+contribute 0 (the leaf layer is subtracted from the running total). All
+values are produced by the same `factory_compute_ewt_for_shape()` the
+CLI uses for validation.
+
+| Clients | `--arity` | `--static-near-root` | Leaf type | Tree depth | DW layers (after PS subtraction) | ewt blocks | vs BOLT 2016 |
+|---|---|---|---|---|---|---|---|
+|   8 | `3` (uniform PS)              | 0 | PS  | 3 | 3 | 1296 | Under |
+|  16 | `3` (uniform PS)              | 0 | PS  | 4 | 4 | 1728 | Under |
+|  32 | `3,4` (PS root, DW arity-4 leaves) | 0 | DW arity-4 | 2 | 3 | 1296 | Under |
+|  64 | `2,4,8` (DW arity-8 leaves)   | 0 | DW arity-8 | 3 | 4 | 1728 | Under |
+| 128 | `2,4,8` (DW arity-8 leaves)   | 0 | DW arity-8 | 3 | 4 | 1728 | Under |
+| 128 | `2,4,8`                       | 1 | DW arity-8 | 3 | 3 | 1296 | Generous slack |
+| 128 | `2,4,8`                       | 2 | DW arity-8 | 3 | 2 |  864 | The design target |
+|  32 | `3` (uniform PS — too deep)   | 0 | PS  | 5 | 5 | 2160 | **EXCEEDS — rejected** |
+|  64 | `2` (uniform binary DW)       | 0 | DW arity-2 | 6 | 6 | 2592 | **EXCEEDS — rejected** |
+| 128 | `2` (uniform binary DW)       | 0 | DW arity-2 | 7 | 8 (capped) | 3456 | **EXCEEDS — rejected** |
+
+Regtest and testnet deployments use `step_blocks = 10` (not 144), so the
+CSV budget is non-binding at any client count — but that's a test
+artifact, not a property of the design. The CLI validator uses the
+operator's actual `--step-blocks` value, so regtest runs never trip the
+ceiling.
 
 ## CSV budget math
 
-With `FACTORY_MAX_SIGNERS = 128` (1 LSP + up to 127 clients) and mainnet
-defaults (`step_blocks = 144`, `states_per_layer = 4`, giving
-`144 * (4-1) = 432` blocks of CSV per layer):
+The factory's worst-case `early_warning_time` is the sum across all DW
+layers of `step_blocks * (states_per_layer - 1)`, with one leaf-layer's
+worth subtracted when any leaf is a PS leaf (TX chaining replaces
+nSequence at the leaf). For static-near-root, the top N depths
+contribute zero — the DW counter only carries layers `[N, depth]`.
 
-| Shape | Tree depth | DW layers | Worst-path CSV | vs BOLT 2016 |
-|---|---|---|---|---|
-| Uniform PS, 16 clients | 4 layers | 4 | ~1728 blocks | Under |
-| Uniform PS, 8 clients | 3 layers | 3 | ~1296 blocks | Under |
-| Uniform PS, 64 clients (binary) | 6 layers | 6 | ~2592 blocks | **EXCEEDS** |
-| Uniform PS, 128 clients (binary) | 7 layers | 7 | ~3024 blocks | **EXCEEDS** |
-| **Today (Phase 2):** PS leaves + `{2,4,8}` interior, 64 clients | 3 layers | 3 | ~1296 blocks | Under |
-| **Today (Phase 2):** `{2,4,8}` (DW leaves), 64 clients | 3 layers | 3 | ~1296 blocks | Under |
-| **Today (Phase 3):** `{2,4,8}` + `static_near_root=1`, 128 clients | 3 layers | 2 | ~864 blocks | Generous slack |
-| **Today (Phase 3):** `{2,4,8}` + `static_near_root=2`, 128 clients | 3 layers | 1 | ~432 blocks | Very generous slack |
+Closed form: `ewt = (depth + 1 - static_threshold) * step_blocks * (states_per_layer - 1)`,
+clamped to `[1 * per_layer, DW_MAX_LAYERS * per_layer]`, then minus
+`per_layer` if any leaf is PS.
 
-Regtest and testnet deployments use `step_blocks = 10` (not 144), so
-CSV budget is non-binding at any client count — but that's a test
-artifact, not a property of the design.
+The `factory_compute_ewt_for_shape()` API in `factory.h` returns this
+value for any candidate `(level_arities, leaf_arity, n_clients,
+static_threshold, step_blocks, states_per_layer)` tuple without
+building or signing anything. The CLI calls it once per startup before
+spending capital on funding.
 
 ## Setting the arity (current capability)
 
@@ -161,8 +194,10 @@ superscalar_lsp --arity 2,4,3 --clients 64 ...
 superscalar_lsp --arity 2,4,8 --clients 64 ...
 ```
 
-Supported values today are 1–16 per level. The CLI should reject
-shape combinations that would exceed BOLT 2016 (Phase 4 work).
+Supported values today are 1–15 per level (capped because arity-A
+leaves need A+1 outputs and `FACTORY_MAX_OUTPUTS = 16`). The CLI
+rejects shape combinations whose worst-path ewt would exceed BOLT 2016
+with a clear error string referencing this document.
 
 ## Implementation pointers
 
@@ -186,9 +221,17 @@ shape combinations that would exceed BOLT 2016 (Phase 4 work).
   static-near-root threshold (Phase 3)
 - `src/factory.c::node_nsequence` — returns `0xFFFFFFFE` for `is_static_only`
   nodes (Phase 3)
-- `tools/superscalar_lsp.c:1036` — default `leaf_arity` (currently 3 = PS,
-  Phase 0)
-- `tools/superscalar_lsp.c` — `--static-near-root N` CLI flag (Phase 3)
+- `tools/superscalar_lsp.c` — default `leaf_arity` (3 = PS, Phase 0);
+  delegates `--arity` and `--static-near-root` parsing + BOLT-2016
+  ceiling check to `cli_arity.c` (Phase 4)
+- `include/superscalar/cli_arity.h` + `src/cli_arity.c` —
+  `cli_parse_arity_spec()`, `cli_parse_static_near_root()`,
+  `cli_validate_shape_for_bolt2016()` (Phase 4)
+- `src/factory.c::factory_compute_ewt_for_shape` — pure-math ewt
+  simulator the CLI uses for validation, no factory_t needed (Phase 4)
+- `tests/test_cli_arity.c` — unit tests asserting specific error
+  strings for each invalid input + ewt math for canonical shapes
+  (Phase 4)
 
 ## Caveats
 

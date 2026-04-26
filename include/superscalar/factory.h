@@ -296,6 +296,29 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
    the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
 uint32_t factory_early_warning_time(const factory_t *f);
 
+/* Compute the worst-case factory_early_warning_time (blocks) for a given
+   tree-shape configuration WITHOUT building or signing anything.  Pure
+   math based on tree depth (computed from arity + n_clients), DW layer
+   count (with static_threshold applied), and step_blocks/states_per_layer.
+   Used by CLI validation (Phase 4 of mixed-arity plan) to reject shapes
+   that would exceed BOLT's 2016-block final_cltv_expiry ceiling.
+
+   - level_arities: per-level arity array; NULL or n_level_arity==0 means
+     uniform leaf_arity
+   - leaf_arity: used when level_arities is NULL/empty (3 = PS, 1/2 = DW)
+   - n_clients: client count (excludes LSP, so factory_clients_only)
+   - static_threshold: top N tree depths are kickoff-only (Phase 3)
+   - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
+   Returns ewt in blocks.  Treats PS leaves as 0-cost at the leaf layer
+   when leaf arity == FACTORY_ARITY_PS. */
+uint32_t factory_compute_ewt_for_shape(
+    const uint8_t *level_arities, size_t n_level_arity,
+    factory_arity_t leaf_arity,
+    size_t n_clients,
+    uint32_t static_threshold,
+    uint16_t step_blocks,
+    uint32_t states_per_layer);
+
 /* Sign a single node (local-only, all keypairs available). */
 int factory_sign_node(factory_t *f, size_t node_idx);
 
