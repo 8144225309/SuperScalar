@@ -40,6 +40,11 @@ CLIENTDB="$DATADIR/client1.db"
 CLIENT2DB="$DATADIR/client2.db"
 CLIENT3DB="$DATADIR/client3.db"
 CLIENT4DB="$DATADIR/client4.db"
+
+# Per-run parameters. Override via env: N_CLIENTS=8 ARITY=3 ./signet_setup.sh ...
+# Default 4 clients + arity-1 keeps backward compatibility with existing recipes.
+N_CLIENTS="${N_CLIENTS:-4}"
+ARITY="${ARITY:-1}"
 SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
 
 # ==========================================================================
@@ -513,7 +518,7 @@ cmd_start_lsp() {
     if pgrep -f "superscalar_lsp" &>/dev/null; then
         info "LSP is already running"
     else
-        step "Starting LSP (4 clients, 200k sats, arity-1, signet)..."
+        step "Starting LSP ($N_CLIENTS clients, 200k sats, arity-$ARITY, signet)..."
         # step-blocks=1 for fast demo, arity-1 for per-client leaves
         "$SCBIN/superscalar_lsp" \
                 --network signet \
@@ -630,7 +635,7 @@ _start_demo_clients() {
     local LOGPFX="$3"     # log filename prefix
     local EXTRA_ARGS="${4:-}"
 
-    for i in 1 2 3 4; do
+    for i in $(seq 1 "$N_CLIENTS"); do
         local KEYFILE="$DATADIR/client${i}.key"
         local DBFILE="$DATADIR/client${i}.db"
         local LOGFILE="$LOGDIR/${LOGPFX}_client${i}.log"
@@ -646,7 +651,7 @@ _start_demo_clients() {
         eval "CLIENT${i}_PID=$!"
         sleep 0.5
     done
-    info "4 clients started"
+    info "$N_CLIENTS clients started"
 }
 
 # ==========================================================================
@@ -664,10 +669,10 @@ cmd_demo_coop() {
     sleep 2
 
     # Clean DBs for fresh demo
-    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+    rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting cooperative close demo (4 clients, arity-1)..."
-    detail "This will: connect 4 clients → create factory → run payments → cooperative close"
+    step "Starting cooperative close demo ($N_CLIENTS clients, arity-$ARITY)..."
+    detail "This will: connect $N_CLIENTS clients → create factory → run payments → cooperative close"
     detail "On signet, factory creation waits for funding tx confirmation (~10 min)."
 
     # Start LSP in background first (needs to listen before clients connect)
@@ -677,9 +682,9 @@ cmd_demo_coop() {
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
             --port 9735 \
-            --clients 4 \
+            --clients "$N_CLIENTS" \
             --amount 200000 \
-            --arity 1 \
+            --arity "$ARITY" \
             --step-blocks 1 \
             --demo \
             --db "$LSPDB" \
@@ -725,10 +730,10 @@ cmd_demo_force_close() {
     sleep 2
 
     # Clean DBs for fresh demo
-    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+    rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting force-close demo (4 clients, arity-1)..."
-    detail "This will: connect 4 clients → create factory → run payments → broadcast tree → wait for confirmations"
+    step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY)..."
+    detail "This will: connect $N_CLIENTS clients → create factory → run payments → broadcast tree → wait for confirmations"
     detail "On signet with step-blocks=1, each node needs ~10 min per block of relative timelock."
     detail "Arity-1 tree has 14 nodes with 3 DW layers. Most nSequence values are 0-3 blocks."
 
@@ -739,9 +744,9 @@ cmd_demo_force_close() {
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
             --port 9735 \
-            --clients 4 \
+            --clients "$N_CLIENTS" \
             --amount 200000 \
-            --arity 1 \
+            --arity "$ARITY" \
             --step-blocks 1 \
             --demo \
             --force-close \
@@ -790,10 +795,10 @@ cmd_demo_breach() {
     sleep 2
 
     # Clean DBs for fresh demo
-    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+    rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting breach demo (4 clients, arity-1, $NET)..."
-    detail "This will: connect 4 clients → create factory → run payments"
+    step "Starting breach demo ($N_CLIENTS clients, arity-$ARITY, $NET)..."
+    detail "This will: connect $N_CLIENTS clients → create factory → run payments"
     detail "→ LSP broadcasts revoked commitment (--cheat-daemon)"
     detail "→ client watchtowers detect breach → broadcast penalty with P2A anchor"
     detail "→ CPFP child bumps fee → penalty confirms"
@@ -811,9 +816,9 @@ cmd_demo_breach() {
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
             --port 9735 \
-            --clients 4 \
+            --clients "$N_CLIENTS" \
             --amount 200000 \
-            --arity 1 \
+            --arity "$ARITY" \
             --step-blocks 1 \
             --demo \
             --cheat-daemon \
