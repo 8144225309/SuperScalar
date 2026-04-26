@@ -138,7 +138,7 @@ Press **Ctrl+C**. The LSP will:
 | `--port` | 9735 | Listen port for client connections |
 | `--clients` | 4 | Number of clients to accept before starting ceremony |
 | `--amount` | 100000 | Factory funding amount in satoshis |
-| `--arity` | 2 | Leaf arity: `1` = one client per leaf, `2` = paired leaves |
+| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). |
 | `--network` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
 | `--daemon` | off | Long-lived mode (handles reconnections, Ctrl+C for close) |
 | `--demo` | off | Run scripted payment sequence then close |

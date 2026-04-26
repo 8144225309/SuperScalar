@@ -478,7 +478,7 @@ superscalar_lsp [OPTIONS]
 |------|----------|---------|-------------|
 | `--port` | PORT | 9735 | Listen port |
 | `--clients` | N | 4 | Number of clients |
-| `--arity` | N | 2 | Leaf arity: 1 (per-client leaves) or 2 (paired leaves) |
+| `--arity` | N | 3 | Leaf arity: 3 (Pseudo-Spilman, canonical) — 1 (legacy DW), 2 (legacy DW). Comma-list for mixed `3,4,8`. |
 | `--amount` | SATS | 100000 | Funding amount |
 | `--network` | MODE | regtest | regtest / signet / testnet / mainnet |
 | `--daemon` | — | off | Long-lived daemon mode |

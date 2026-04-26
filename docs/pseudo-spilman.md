@@ -6,20 +6,44 @@ design, and that is correct. This doc records why.
 
 ## Background
 
-SuperScalar leaves come in three arities. See
-[docs/factory-arity.md](factory-arity.md) for picking between them at
+**Pseudo-Spilman (PS, arity 3) is the canonical SuperScalar leaf
+mechanism.** All new deployments should default to it. The DW arity-1
+and arity-2 leaves remain implemented for backward compatibility but
+are not recommended for new factories.
+
+See [docs/factory-arity.md](factory-arity.md) for picking shapes at
 deployment time; this doc focuses on the state-invalidation mechanism.
 
-| Arity constant | Leaf shape | State ordering |
-|---|---|---|
-| `FACTORY_ARITY_1` | Single client + LSP, 2-of-2 | Decker–Wattenhofer (decrementing nSequence) |
-| `FACTORY_ARITY_2` | Two clients + LSP, 3-of-3 | Decker–Wattenhofer (decrementing nSequence) |
-| `FACTORY_ARITY_PS` | LSP-unidirectional, 2-of-2 | Pseudo-Spilman (TX chaining) |
+| Arity constant | Leaf shape | State ordering | Status |
+|---|---|---|---|
+| `FACTORY_ARITY_PS` | LSP + client, 2-of-2 with chained TX advances | Pseudo-Spilman (TX chaining) | **Canonical, default** |
+| `FACTORY_ARITY_2` | Two clients + LSP, 3-of-3 | Decker–Wattenhofer (decrementing nSequence) | Legacy |
+| `FACTORY_ARITY_1` | Single client + LSP, 2-of-2 | Decker–Wattenhofer (decrementing nSequence) | Legacy |
 
 The PS leaf design is from ZmnSCPxj. References:
 
 - Bitcoin Optech "SuperScalar" deepdive
 - Delving Bitcoin "SuperScalar" thread t/1242
+
+## When to use PS vs DW
+
+**Use PS (`--arity 3`) for:**
+- All new factory deployments
+- Any deployment expecting many state advances per channel (PS adds
+  per-advance fee but no CSV consumption; DW exhausts the state machine
+  after `states_per_layer × DW_MAX_LAYERS` advances and forces rotation)
+- Any deployment where the simpler trust model (no revocation keys, no
+  watchtower for leaf state) is preferred
+
+**Use DW arity-1 / arity-2 only for:**
+- Migrating existing deployments that pre-date PS support
+- Interop with peers that don't yet implement PS
+
+**Both PS and DW leaves support bidirectional inner BOLT-2 channels** —
+the "PS is unidirectional" framing in older docs refers only to
+leaf-level state advances (which only the LSP triggers), NOT to HTLC
+flow. Verified by regtest tests `test_regtest_htlc_force_to_local_arity_ps`
+and `test_regtest_htlc_breach_arity_ps`.
 
 ## Why PS is non-revocable
 
