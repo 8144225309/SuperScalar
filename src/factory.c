@@ -141,6 +141,13 @@ static int build_single_p2tr_spk(
    When per-leaf mode is enabled, non-PS leaf state nodes use their independent
    per-leaf DW layer instead of the global counter. */
 static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
+    /* Static-near-root: kickoff-only nodes (no paired state) have no DW
+       counter contribution; spend uses CLTV timeout only.  BIP-68 must be
+       enabled (nsequence < 0xFFFFFFFE) so the CLTV (nLockTime) takes effect.
+       Check BEFORE the generic NODE_KICKOFF branch which would return
+       0xFFFFFFFF (BIP-68 disabled). */
+    if (node->is_static_only)
+        return 0xFFFFFFFEu;
     if (node->type == NODE_KICKOFF)
         return NSEQUENCE_DISABLE_BIP68;
     if (node->is_ps_leaf)
@@ -449,6 +456,22 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
 static int compute_tree_depth(size_t n_clients, factory_arity_t arity);
 static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
 
+/* Compute the DW counter n_layers given a tree depth and the static-near-root
+   threshold (Phase 3 of mixed-arity plan).  Depths [0, threshold) are
+   kickoff-only and contribute no DW layers; depths [threshold, depth] each
+   get a DW layer.  Caps at DW_MAX_LAYERS.  Always returns >= 1 to keep the
+   counter array valid (a degenerate fully-static tree leaves a single unused
+   layer slot rather than 0). */
+static int dw_n_layers_for(int tree_depth, uint32_t static_threshold) {
+    int t = (int)static_threshold;
+    if (t < 0) t = 0;
+    if (t > tree_depth + 1) t = tree_depth + 1;
+    int n = tree_depth - t + 1;
+    if (n < 1) n = 1;
+    if (n > (int)DW_MAX_LAYERS) n = (int)DW_MAX_LAYERS;
+    return n;
+}
+
 /* ---- Public API ---- */
 
 void factory_config_default(factory_config_t *cfg) {
@@ -540,7 +563,10 @@ void factory_set_arity(factory_t *f, factory_arity_t arity) {
     f->n_level_arity = 0;  /* clear variable arity */
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
     int n_leaves = compute_leaf_count(nc, arity);
-    int n_layers = compute_tree_depth(nc, arity) + 1;
+    int tree_depth = compute_tree_depth(nc, arity);
+    /* For arity-only (no variable arity set), threshold defaults to 0
+       so this is a no-op for backward compat. */
+    int n_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     f->n_leaf_nodes = n_leaves;
     dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
     for (int i = 0; i < n_leaves; i++)
@@ -673,7 +699,27 @@ void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
     int depth, n_leaves;
     simulate_tree(f, nc, &depth, &n_leaves);
-    int n_layers = depth + 1;
+    int n_layers = dw_n_layers_for(depth, f->static_threshold_depth);
+    f->n_leaf_nodes = n_leaves;
+    dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
+    for (int i = 0; i < n_leaves; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+    f->per_leaf_enabled = 0;
+}
+
+void factory_set_static_near_root(factory_t *f, uint32_t threshold) {
+    f->static_threshold_depth = threshold;
+    /* Recompute n_layers based on current arity/level configuration, since
+       the threshold shrinks the DW counter shape. */
+    size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
+    int depth, n_leaves;
+    if (f->n_level_arity > 0) {
+        simulate_tree(f, nc, &depth, &n_leaves);
+    } else {
+        depth = compute_tree_depth(nc, f->leaf_arity);
+        n_leaves = compute_leaf_count(nc, f->leaf_arity);
+    }
+    int n_layers = dw_n_layers_for(depth, threshold);
     f->n_leaf_nodes = n_leaves;
     dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
     for (int i = 0; i < n_leaves; i++)
@@ -945,11 +991,96 @@ static int build_subtree(
         st_cltv = (cltv > st_offset) ? cltv - st_offset : 0;
     }
 
-    /* DW layer index for state nodes: depth maps to layer.
-       Kickoff nodes get dw_layer_index = -1. */
-    int dw_layer = depth;
+    /* DW layer index for state nodes: depth maps to (depth - static_threshold).
+       Kickoff nodes get dw_layer_index = -1.
+       When static-near-root is enabled, depths in [0, threshold) become
+       kickoff-only with no paired NODE_STATE — handled below.  This
+       remapping ensures that depth=threshold is the FIRST DW layer (index 0). */
+    int dw_layer = depth - (int)f->static_threshold_depth;
+    if (dw_layer < 0) dw_layer = -1;
     if (dw_layer >= (int)f->counter.n_layers)
         dw_layer = (int)f->counter.n_layers - 1;
+
+    /* Determine if this depth is "static" (kickoff-only, no DW state).
+       Static depths still fan out their arity-many children — those children
+       spend the kickoff's vout 0..N-1 directly (no state intermediary). */
+    int is_static = (depth < (int)f->static_threshold_depth);
+
+    /* Determine if this is a leaf (using per-level arity).  Static nodes
+       cannot themselves be leaves — leaves always need a state node to host
+       channels + L-stock; the threshold should never be set to swallow the
+       entire tree.  Guard against misconfiguration: if a static node has
+       only enough clients to be a leaf, we fall back to the non-static
+       state-paired path. */
+    int cur_arity = arity_at_depth(f, depth);
+    int is_leaf = subtree_is_leaf(cur_arity, n_clients);
+    if (is_leaf) is_static = 0;
+
+    if (is_static) {
+        /* ---- Static (kickoff-only) interior node ---- */
+        /* Split clients into N children FIRST so we can size kickoff outputs. */
+        size_t parts[FACTORY_MAX_OUTPUTS];
+        size_t n_parts = split_clients_for_arity(cur_arity, n_clients, parts);
+        if (n_parts < 2 || n_parts > f->config.max_outputs_per_node) {
+            fprintf(stderr, "build_subtree(static): invalid n_parts %zu (max %u) at depth %d arity %d\n",
+                    n_parts, f->config.max_outputs_per_node, depth, cur_arity);
+            return 0;
+        }
+
+        /* Create the kickoff node ONLY (no paired state).  No DW layer. */
+        int ko_idx = add_node(f, NODE_KICKOFF, signers, n_signers,
+                              parent_state_idx, parent_vout, -1, ko_cltv);
+        if (ko_idx < 0) return 0;
+        f->nodes[ko_idx].is_static_only = 1;
+        f->nodes[ko_idx].input_amount = input_amount;
+
+        /* Kickoff has n_parts outputs, one per child.  Distribute the input
+           amount minus one fee evenly among children. */
+        uint64_t fee = f->fee_per_tx;
+        if (input_amount <= fee) return 0;
+        uint64_t kickoff_budget = input_amount - fee;
+        uint64_t per_child_budget = kickoff_budget / n_parts;
+        uint64_t budget_remainder = kickoff_budget - per_child_budget * n_parts;
+
+        f->nodes[ko_idx].n_outputs = n_parts;
+        /* Outputs will be filled after children are created (need their spk). */
+
+        /* Recurse into each child, remembering its kickoff node index. */
+        int child_ko_indices[FACTORY_MAX_OUTPUTS];
+        size_t client_offset = 0;
+        for (size_t k = 0; k < n_parts; k++) {
+            uint64_t child_budget = per_child_budget;
+            if (k == n_parts - 1) child_budget += budget_remainder;
+
+            size_t saved_n_nodes = f->n_nodes;
+            if (parts[k] == 0) {
+                f->nodes[ko_idx].n_outputs--;
+                continue;
+            }
+            if (!build_subtree(f, client_indices + client_offset, parts[k],
+                               ko_idx, (uint32_t)k, depth + 1, max_depth,
+                               child_budget, leaf_counter))
+                return 0;
+            child_ko_indices[k] = (int)saved_n_nodes;
+            client_offset += parts[k];
+        }
+
+        /* Wire kickoff outputs to each child's spending_spk.  When the child
+           is itself a static node, its first node is the static kickoff;
+           when it's a regular subtree, its first node is the regular kickoff.
+           Either way we point at child_ko_indices[k]->spending_spk. */
+        for (size_t k = 0; k < f->nodes[ko_idx].n_outputs; k++) {
+            uint64_t child_budget = per_child_budget;
+            if (k == f->nodes[ko_idx].n_outputs - 1) child_budget += budget_remainder;
+            f->nodes[ko_idx].outputs[k].amount_sats = child_budget;
+            memcpy(f->nodes[ko_idx].outputs[k].script_pubkey,
+                   f->nodes[child_ko_indices[k]].spending_spk, 34);
+            f->nodes[ko_idx].outputs[k].script_pubkey_len = 34;
+        }
+        return 1;
+    }
+
+    /* ---- Regular (kickoff/state pair) node ---- */
 
     /* Add kickoff node */
     int ko_idx = add_node(f, NODE_KICKOFF, signers, n_signers,
@@ -972,10 +1103,6 @@ static int build_subtree(
            f->nodes[st_idx].spending_spk, 34);
     f->nodes[ko_idx].outputs[0].script_pubkey_len = 34;
     f->nodes[ko_idx].input_amount = input_amount;
-
-    /* Determine if this is a leaf (using per-level arity) */
-    int cur_arity = arity_at_depth(f, depth);
-    int is_leaf = subtree_is_leaf(cur_arity, n_clients);
 
     if (is_leaf) {
         /* Leaf node: set up channel outputs */
@@ -1097,7 +1224,9 @@ int factory_build_tree(factory_t *f) {
         tree_depth = compute_tree_depth(n_clients, f->leaf_arity);
         n_leaves = compute_leaf_count(n_clients, f->leaf_arity);
     }
-    int n_dw_layers = tree_depth + 1;
+    /* Phase 3: respect static_threshold_depth — only non-static depths get
+       DW layers. */
+    int n_dw_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
     if (total_nodes_ub > (int)f->config.max_nodes) return 0;

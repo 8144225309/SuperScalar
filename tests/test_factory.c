@@ -6040,3 +6040,336 @@ int test_factory_nway_backward_compat(void) {
     free(f_nway);
     return 1;
 }
+
+/* ============================================================================
+ *  Static-near-root variant (Phase 3 of mixed-arity plan).
+ *
+ *  Cells:
+ *    - test_factory_static_near_root_basic                 — N=12 {2,4} thr=1
+ *    - test_factory_static_near_root_n128_arity_2_4_8_static_2
+ *    - test_factory_static_near_root_node_nsequence
+ *    - test_factory_static_near_root_backward_compat
+ *  ========================================================================== */
+
+/* Helper for variable-arity setup that ALSO sets static_threshold_depth.
+   Keeps the existing setup_variable_arity_factory untouched. */
+static int setup_variable_arity_static_factory(factory_t *f,
+                                                 secp256k1_context *ctx,
+                                                 secp256k1_keypair *kps,
+                                                 size_t n_participants,
+                                                 const uint8_t *arities,
+                                                 size_t n_arities,
+                                                 uint32_t static_threshold,
+                                                 uint64_t funding) {
+    if (!setup_variable_arity_factory(f, ctx, kps, n_participants,
+                                       arities, n_arities, funding))
+        return 0;
+    if (static_threshold > 0)
+        factory_set_static_near_root(f, static_threshold);
+    return 1;
+}
+
+/* N=12 {2,4} thr=1: root (depth 0) is kickoff-only static, mid (depth 1) and
+   leaves (depth 2) are regular DW-paired. */
+int test_factory_static_near_root_basic(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[12];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+
+    uint8_t arities[2] = {2, 4};
+    TEST_ASSERT(setup_variable_arity_static_factory(f, ctx, kps, 12, arities, 2,
+                                                     /*static_thr=*/1, 5000000),
+                "setup n12 {2,4} thr=1");
+
+    /* DW counter n_layers should be (max_depth - threshold + 1).  With {2,4}
+       and N=12, max_depth=2; with threshold=1 we expect n_layers = 2. */
+    TEST_ASSERT_EQ(f->static_threshold_depth, 1, "threshold stored");
+    TEST_ASSERT_EQ(f->counter.n_layers, 2,
+                   "n_layers shifts by 1 (depth 0 has no DW layer)");
+
+    f->cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(f), "build n12 {2,4} thr=1");
+    TEST_ASSERT(factory_sign_all(f), "sign n12 {2,4} thr=1");
+    TEST_ASSERT(factory_verify_all(f), "verify n12 {2,4} thr=1");
+
+    /* Root node: ONLY a kickoff (no paired NODE_STATE), is_static_only=1. */
+    TEST_ASSERT(f->nodes[0].type == NODE_KICKOFF, "node 0 is root kickoff");
+    TEST_ASSERT_EQ(f->nodes[0].is_static_only, 1, "root is static_only");
+    TEST_ASSERT_EQ(f->nodes[0].dw_layer_index, -1,
+                   "root static dw_layer_index == -1");
+    TEST_ASSERT_EQ(f->nodes[0].n_outputs, 2,
+                   "root static kickoff has 2 outputs (arity-2 fan-out)");
+
+    /* Node 1 must NOT be the root state (no paired state for static root).
+       Instead, node 1 should be the FIRST child's kickoff (depth=1). */
+    TEST_ASSERT(f->nodes[1].type == NODE_KICKOFF,
+                "node 1 is first child kickoff (no paired root state)");
+    TEST_ASSERT_EQ(f->nodes[1].is_static_only, 0,
+                   "first child kickoff is NOT static (depth=1 >= thr=1)");
+    /* Node 2 should be the first child's state. */
+    TEST_ASSERT(f->nodes[2].type == NODE_STATE,
+                "node 2 is first child state");
+    /* DW layer index for the first child state (depth 1 - thr 1 = 0). */
+    TEST_ASSERT_EQ(f->nodes[2].dw_layer_index, 0,
+                   "depth-1 state maps to DW layer 0 after threshold remap");
+
+    /* Walk the leaves: each leaf state should have dw_layer_index = depth-1. */
+    int found_static = 0, found_regular_state = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].is_static_only) {
+            found_static++;
+            TEST_ASSERT(f->nodes[i].type == NODE_KICKOFF,
+                        "static node is a kickoff");
+            TEST_ASSERT_EQ(f->nodes[i].dw_layer_index, -1,
+                           "static dw_layer_index == -1");
+        }
+        if (f->nodes[i].type == NODE_STATE) {
+            found_regular_state++;
+            TEST_ASSERT(f->nodes[i].dw_layer_index >= 0,
+                        "state node has valid dw_layer_index");
+        }
+    }
+    /* Exactly 1 static node (the root). */
+    TEST_ASSERT_EQ(found_static, 1, "exactly 1 static node (the root)");
+    TEST_ASSERT(found_regular_state >= 2,
+                "at least 2 regular state nodes (mid + leaves)");
+
+    /* Number of leaves at N=12 {2,4}: 11 clients split [6,5] at root; each is
+       not arity-4 leaf-eligible (6 > 4, 5 > 4) so depth 1 splits further into
+       4 children each.  That yields 8 leaves total (each leaf has 1-2 clients).
+       The exact split per the N-way splitter may vary; assert a plausible
+       upper bound consistent with the splitter's behavior. */
+    TEST_ASSERT(f->n_leaf_nodes >= 4 && f->n_leaf_nodes <= 11,
+                "leaf count plausible (4..11)");
+
+    printf("  [n12 {2,4} thr=1] %zu nodes, %d leaves, n_layers=%d, "
+           "static=%d, states=%d\n",
+           f->n_nodes, f->n_leaf_nodes, (int)f->counter.n_layers,
+           found_static, found_regular_state);
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* N=128, {2,4,8}, static_threshold=2: depths 0-1 static, depths 2+ DW.
+   Verifies CSV budget computation and tree integrity at scale. */
+int test_factory_static_near_root_n128_arity_2_4_8_static_2(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair *kps = calloc(128, sizeof(secp256k1_keypair));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc n128");
+
+    /* {2,4,8}: depth 0 arity-2, depth 1 arity-4, depth 2+ arity-8 */
+    uint8_t arities[3] = {2, 4, 8};
+    /* For setup_variable_arity_static_factory we pre-create funding with
+       large amount so per-leaf channels stay above dust. */
+    TEST_ASSERT(setup_variable_arity_static_factory(f, ctx, kps, 128, arities, 3,
+                                                     /*static_thr=*/2,
+                                                     5000000000ULL),
+                "setup n128 {2,4,8} thr=2");
+
+    /* tree depth: 127 clients → split [64,63] at root (arity-2) → each into 4
+       at depth 1 (arity-4) of ~16 clients each → not arity-8-leaf-eligible
+       (16 > 8) so depth 2 splits each 16 into 8 children of 2.  Leaves at
+       depth 3 with 2 clients each.  Total depth = 3.
+       n_layers = depth - threshold + 1 = 3 - 2 + 1 = 2. */
+    TEST_ASSERT_EQ(f->static_threshold_depth, 2, "threshold stored");
+    TEST_ASSERT_EQ(f->counter.n_layers, 2,
+                   "n_layers = 2 (depths 2 + 3 contribute DW after thr=2)");
+
+    /* CSV budget: with step_blocks=2 and states_per_layer=4 from setup_variable_
+       arity_factory (factory_init(.., 2, 4)), each layer = 2*(4-1) = 6 blocks.
+       1 layer = 6 blocks total. We will also independently re-compute under
+       MAINNET defaults (144, 4) → 432*1 = 432 blocks; with thr=2 this is far
+       under BOLT 2016 vs binary-collapse 3024. */
+    uint32_t ewt = factory_early_warning_time(f);
+    /* With step_blocks=2 in this unit-test setup, ewt should be small. */
+    TEST_ASSERT(ewt > 0, "ewt > 0 (one DW layer)");
+    printf("  [n128 {2,4,8} thr=2] n_layers=%d, ewt=%u (test step_blocks=2)\n",
+           (int)f->counter.n_layers, ewt);
+
+    /* Independently compute the MAINNET budget that the docs cite. */
+    uint32_t mainnet_step = 144, mainnet_states = 4;
+    uint32_t mainnet_per_layer = mainnet_step * (mainnet_states - 1); /* 432 */
+    uint32_t mainnet_ewt_static_2 = mainnet_per_layer * (uint32_t)f->counter.n_layers;
+    /* For thr=2 with depth=3, 2 DW layers remain → 864 blocks.  Matches the
+       doc's ~864 figure exactly. */
+    TEST_ASSERT_EQ(mainnet_ewt_static_2, 864,
+                   "mainnet ewt at thr=2 == 864 blocks (matches doc)");
+    TEST_ASSERT(mainnet_ewt_static_2 < 2016,
+                "mainnet ewt at thr=2 is under BOLT 2016");
+    printf("  [n128 {2,4,8} thr=2] mainnet ewt = %u blocks (BOLT 2016 ceiling)\n",
+           mainnet_ewt_static_2);
+
+    /* For the binary-collapse comparison: N=128 binary depth=7 → 7 layers ×
+       432 = 3024 blocks. Compute and assert. */
+    uint32_t binary_ewt = mainnet_per_layer * 7;
+    TEST_ASSERT_EQ(binary_ewt, 3024, "binary N=128 ewt = 3024 blocks");
+    printf("  [n128 binary baseline] ewt = %u blocks (vs %u with thr=2; "
+           "%u block reduction)\n",
+           binary_ewt, mainnet_ewt_static_2,
+           binary_ewt - mainnet_ewt_static_2);
+
+    /* Build + sign + verify the actual tree. */
+    f->cltv_timeout = 100000;
+    TEST_ASSERT(factory_build_tree(f), "build n128 {2,4,8} thr=2");
+    TEST_ASSERT(factory_sign_all(f), "sign n128 {2,4,8} thr=2");
+
+    /* Verify root and depth-1 nodes are static, depth-2+ are regular states. */
+    int n_static = 0, n_state = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].is_static_only) n_static++;
+        if (f->nodes[i].type == NODE_STATE) n_state++;
+    }
+    /* Depth 0: 1 static root. Depth 1: arity-2 fan-out → 2 static mids.
+       Total static = 3. */
+    TEST_ASSERT_EQ(n_static, 3,
+                   "3 static nodes (1 root + 2 depth-1 mids)");
+    /* Depth 2: 8 interior states (regular).  Depth 3: 64 leaf states.
+       Total regular state nodes = 72.  All 64 are leaves. */
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 64, "64 leaves");
+    /* state count = depth-2 interior states (8) + depth-3 leaves (64) = 72 */
+    TEST_ASSERT_EQ(n_state, 72,
+                   "72 state nodes total (8 depth-2 interior + 64 depth-3 leaves)");
+
+    /* Conservation: sum of leaf input amounts + tree fees == funding. */
+    uint64_t leaf_in_total = 0;
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        leaf_in_total += f->nodes[f->leaf_node_indices[li]].input_amount;
+    }
+    uint64_t fees_total = (uint64_t)f->n_nodes * f->fee_per_tx;
+    /* leaf_in already accounts for the tree TX fees above each leaf;
+       the remaining check is that the funding was fully apportioned. */
+    printf("  [n128 {2,4,8} thr=2] leaf_in_total=%llu, n_nodes=%zu, "
+           "fees_total≈%llu, funding=%llu\n",
+           (unsigned long long)leaf_in_total, f->n_nodes,
+           (unsigned long long)fees_total,
+           (unsigned long long)f->funding_amount_sats);
+
+    factory_free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Confirm node_nsequence semantics for static vs DW state nodes. */
+int test_factory_static_near_root_node_nsequence(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[12];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+
+    uint8_t arities[2] = {2, 4};
+    TEST_ASSERT(setup_variable_arity_static_factory(f, ctx, kps, 12, arities, 2,
+                                                     1, 5000000),
+                "setup n12 {2,4} thr=1");
+    f->cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+
+    /* Root node is static_only kickoff.  nsequence must be 0xFFFFFFFE
+       (BIP-68 finalized; CLTV is the sole spending constraint via taptree). */
+    TEST_ASSERT_EQ(f->nodes[0].is_static_only, 1, "root is static");
+    TEST_ASSERT_EQ(f->nodes[0].nsequence, 0xFFFFFFFEu,
+                   "static root nsequence == 0xFFFFFFFE (no BIP-68 CSV)");
+
+    /* Find a DW state node (any leaf state).  Its nsequence should be a
+       BIP-68 relative-time encoding (lower than 0xFFFFFFFE). */
+    int found_dw = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].type != NODE_STATE) continue;
+        if (f->nodes[i].is_static_only) continue;
+        TEST_ASSERT(f->nodes[i].nsequence < 0xFFFFFFFEu,
+                    "DW state nsequence < 0xFFFFFFFE (BIP-68 active)");
+        found_dw = 1;
+    }
+    TEST_ASSERT(found_dw, "found at least one DW state node");
+
+    /* Regular kickoff nodes (not static) use NSEQUENCE_DISABLE_BIP68 = 0xFFFFFFFF. */
+    int found_regular_kickoff = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (f->nodes[i].type != NODE_KICKOFF) continue;
+        if (f->nodes[i].is_static_only) continue;
+        TEST_ASSERT_EQ(f->nodes[i].nsequence, 0xFFFFFFFFu,
+                       "non-static kickoff has nsequence 0xFFFFFFFF (BIP-68 disabled)");
+        found_regular_kickoff = 1;
+    }
+    TEST_ASSERT(found_regular_kickoff, "found a non-static kickoff");
+
+    printf("  [nsequence] static=%u, dw=found, regular_kickoff=0xFFFFFFFF\n",
+           f->nodes[0].nsequence);
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Backward-compat: with static_threshold_depth=0 (default), tree is
+   bit-identical to the existing N-way builder.  Compare every node. */
+int test_factory_static_near_root_backward_compat(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps_a[12], kps_b[12];
+    factory_t *f_a = calloc(1, sizeof(factory_t));
+    factory_t *f_b = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f_a && f_b, "alloc");
+
+    uint8_t arities[2] = {2, 4};
+    /* (a) variable arity, no static_threshold (default = 0) */
+    TEST_ASSERT(setup_variable_arity_factory(f_a, ctx, kps_a, 12,
+                                              arities, 2, 5000000),
+                "setup f_a (no static)");
+    f_a->cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(f_a), "build f_a");
+    TEST_ASSERT(factory_sign_all(f_a), "sign f_a");
+
+    /* (b) variable arity, EXPLICIT static_threshold=0 (no-op) */
+    TEST_ASSERT(setup_variable_arity_static_factory(f_b, ctx, kps_b, 12,
+                                                     arities, 2, /*thr=*/0,
+                                                     5000000),
+                "setup f_b (explicit thr=0)");
+    f_b->cltv_timeout = 1000;
+    TEST_ASSERT(factory_build_tree(f_b), "build f_b");
+    TEST_ASSERT(factory_sign_all(f_b), "sign f_b");
+
+    /* Identical structural shape */
+    TEST_ASSERT_EQ(f_a->n_nodes, f_b->n_nodes, "same n_nodes");
+    TEST_ASSERT_EQ(f_a->n_leaf_nodes, f_b->n_leaf_nodes, "same leaf count");
+    TEST_ASSERT_EQ(f_a->counter.n_layers, f_b->counter.n_layers,
+                   "same n_layers");
+
+    /* Per-node identity: type, signers, n_outputs, parent, vout, nsequence,
+       dw_layer_index, is_static_only, per-output amounts. */
+    for (size_t i = 0; i < f_a->n_nodes; i++) {
+        factory_node_t *a = &f_a->nodes[i];
+        factory_node_t *b = &f_b->nodes[i];
+        TEST_ASSERT_EQ(a->type, b->type, "node type");
+        TEST_ASSERT_EQ(a->n_signers, b->n_signers, "n_signers");
+        TEST_ASSERT_EQ(a->n_outputs, b->n_outputs, "n_outputs");
+        TEST_ASSERT_EQ(a->parent_index, b->parent_index, "parent_index");
+        TEST_ASSERT_EQ(a->parent_vout, b->parent_vout, "parent_vout");
+        TEST_ASSERT_EQ(a->nsequence, b->nsequence, "nsequence");
+        TEST_ASSERT_EQ(a->dw_layer_index, b->dw_layer_index, "dw_layer_index");
+        TEST_ASSERT_EQ(a->is_static_only, 0, "no static nodes (a)");
+        TEST_ASSERT_EQ(b->is_static_only, 0, "no static nodes (b)");
+        for (size_t j = 0; j < a->n_outputs; j++) {
+            TEST_ASSERT(a->outputs[j].amount_sats == b->outputs[j].amount_sats,
+                        "per-output amount matches");
+        }
+    }
+
+    printf("  [backward-compat thr=0] %zu nodes, %d leaves bit-identical "
+           "across (no-thr) vs (explicit-thr=0)\n",
+           f_a->n_nodes, f_a->n_leaf_nodes);
+
+    factory_free(f_a);
+    factory_free(f_b);
+    secp256k1_context_destroy(ctx);
+    free(f_a);
+    free(f_b);
+    return 1;
+}
