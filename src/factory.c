@@ -1034,34 +1034,44 @@ static int build_subtree(
         f->nodes[ko_idx].is_static_only = 1;
         f->nodes[ko_idx].input_amount = input_amount;
 
-        /* Kickoff has n_parts outputs, one per child.  Distribute the input
-           amount minus one fee evenly among children. */
+        /* Compute fee + budget. Count non-empty children up front so budget is
+           split correctly even if split_clients_for_arity ever returned an
+           empty slot (it currently never does for shapes that reach this
+           branch — interior, non-leaf — but the contract is enforced
+           defensively in case it changes). */
         uint64_t fee = f->fee_per_tx;
         if (input_amount <= fee) return 0;
         uint64_t kickoff_budget = input_amount - fee;
-        uint64_t per_child_budget = kickoff_budget / n_parts;
-        uint64_t budget_remainder = kickoff_budget - per_child_budget * n_parts;
 
-        f->nodes[ko_idx].n_outputs = n_parts;
+        size_t n_actual = 0;
+        for (size_t k = 0; k < n_parts; k++)
+            if (parts[k] > 0) n_actual++;
+        if (n_actual == 0) return 0;
+
+        uint64_t per_child_budget = kickoff_budget / n_actual;
+        uint64_t budget_remainder = kickoff_budget - per_child_budget * n_actual;
+
+        f->nodes[ko_idx].n_outputs = n_actual;
         /* Outputs will be filled after children are created (need their spk). */
 
-        /* Recurse into each child, remembering its kickoff node index. */
-        int child_ko_indices[FACTORY_MAX_OUTPUTS];
+        /* Recurse into each non-empty child, writing into compacted indices
+           so the second loop can iterate 0..n_actual-1 without gaps. */
+        int child_ko_indices[FACTORY_MAX_OUTPUTS] = {0};
+        size_t n_built = 0;
         size_t client_offset = 0;
         for (size_t k = 0; k < n_parts; k++) {
+            if (parts[k] == 0) continue;
+
             uint64_t child_budget = per_child_budget;
-            if (k == n_parts - 1) child_budget += budget_remainder;
+            if (n_built == n_actual - 1) child_budget += budget_remainder;
 
             size_t saved_n_nodes = f->n_nodes;
-            if (parts[k] == 0) {
-                f->nodes[ko_idx].n_outputs--;
-                continue;
-            }
             if (!build_subtree(f, client_indices + client_offset, parts[k],
-                               ko_idx, (uint32_t)k, depth + 1, max_depth,
+                               ko_idx, (uint32_t)n_built, depth + 1, max_depth,
                                child_budget, leaf_counter))
                 return 0;
-            child_ko_indices[k] = (int)saved_n_nodes;
+            child_ko_indices[n_built] = (int)saved_n_nodes;
+            n_built++;
             client_offset += parts[k];
         }
 
@@ -1069,9 +1079,9 @@ static int build_subtree(
            is itself a static node, its first node is the static kickoff;
            when it's a regular subtree, its first node is the regular kickoff.
            Either way we point at child_ko_indices[k]->spending_spk. */
-        for (size_t k = 0; k < f->nodes[ko_idx].n_outputs; k++) {
+        for (size_t k = 0; k < n_actual; k++) {
             uint64_t child_budget = per_child_budget;
-            if (k == f->nodes[ko_idx].n_outputs - 1) child_budget += budget_remainder;
+            if (k == n_actual - 1) child_budget += budget_remainder;
             f->nodes[ko_idx].outputs[k].amount_sats = child_budget;
             memcpy(f->nodes[ko_idx].outputs[k].script_pubkey,
                    f->nodes[child_ko_indices[k]].spending_spk, 34);
@@ -1147,43 +1157,50 @@ static int build_subtree(
             return 0;
         }
 
-        /* State node has n_parts outputs, one per child */
+        /* Count non-empty children up front so budget is split correctly even
+           if split_clients_for_arity ever returns an empty slot (it currently
+           never does for shapes that reach this branch — interior, non-leaf —
+           but the contract is enforced defensively in case it changes). */
         if (ko_out_amount <= fee) return 0;
         uint64_t state_budget = ko_out_amount - fee;
-        /* Distribute state budget evenly among children, with remainder to last */
-        uint64_t per_child_budget = state_budget / n_parts;
-        uint64_t budget_remainder = state_budget - per_child_budget * n_parts;
+
+        size_t n_actual = 0;
+        for (size_t k = 0; k < n_parts; k++)
+            if (parts[k] > 0) n_actual++;
+        if (n_actual == 0) return 0;
+
+        uint64_t per_child_budget = state_budget / n_actual;
+        uint64_t budget_remainder = state_budget - per_child_budget * n_actual;
 
         f->nodes[st_idx].input_amount = ko_out_amount;
-        f->nodes[st_idx].n_outputs = n_parts;
+        f->nodes[st_idx].n_outputs = n_actual;
         /* Outputs will be filled after children are created (need their spk) */
 
-        /* Recurse into each child, remembering its kickoff node index */
-        int child_ko_indices[FACTORY_MAX_OUTPUTS];
+        /* Recurse into each non-empty child, writing into compacted indices
+           so the second loop can iterate 0..n_actual-1 without gaps. */
+        int child_ko_indices[FACTORY_MAX_OUTPUTS] = {0};
+        size_t n_built = 0;
         size_t client_offset = 0;
         for (size_t k = 0; k < n_parts; k++) {
+            if (parts[k] == 0) continue;
+
             uint64_t child_budget = per_child_budget;
-            if (k == n_parts - 1) child_budget += budget_remainder;
+            if (n_built == n_actual - 1) child_budget += budget_remainder;
 
             size_t saved_n_nodes = f->n_nodes;
-            if (parts[k] == 0) {
-                /* Empty child: shouldn't happen with split_clients_for_arity,
-                   but guard against it. Drop the slot. */
-                f->nodes[st_idx].n_outputs--;
-                continue;
-            }
             if (!build_subtree(f, client_indices + client_offset, parts[k],
-                               st_idx, (uint32_t)k, depth + 1, max_depth,
+                               st_idx, (uint32_t)n_built, depth + 1, max_depth,
                                child_budget, leaf_counter))
                 return 0;
-            child_ko_indices[k] = (int)saved_n_nodes;
+            child_ko_indices[n_built] = (int)saved_n_nodes;
+            n_built++;
             client_offset += parts[k];
         }
 
         /* Wire state outputs to each child's kickoff spending_spk */
-        for (size_t k = 0; k < f->nodes[st_idx].n_outputs; k++) {
+        for (size_t k = 0; k < n_actual; k++) {
             uint64_t child_budget = per_child_budget;
-            if (k == f->nodes[st_idx].n_outputs - 1) child_budget += budget_remainder;
+            if (k == n_actual - 1) child_budget += budget_remainder;
             f->nodes[st_idx].outputs[k].amount_sats = child_budget;
             memcpy(f->nodes[st_idx].outputs[k].script_pubkey,
                    f->nodes[child_ko_indices[k]].spending_spk, 34);
