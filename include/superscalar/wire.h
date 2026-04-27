@@ -113,7 +113,7 @@
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
-#define WIRE_MAX_FRAME_SIZE     (65536)         /* 64 KB */
+#define WIRE_MAX_FRAME_SIZE     (16 * 1024 * 1024) /* 16 MB; needed for ALL_NONCES at N=64+ */
 #define WIRE_DEFAULT_TIMEOUT_SEC 120
 
 /* --- Wire frame: [uint32 len][uint8 type][JSON payload] --- */
@@ -190,6 +190,11 @@ typedef struct {
 
 /* Client → LSP: HELLO {pubkey} */
 cJSON *wire_build_hello(const secp256k1_context *ctx, const secp256k1_pubkey *pubkey);
+
+/* Optional: append `"slot_hint": N` to a HELLO json. N = 1..n_clients (LSP slot
+   the client wants placed at). N = 0 means no hint. LSP may use this to enforce
+   a deterministic keyagg order across restarts. */
+void wire_hello_set_slot_hint(cJSON *hello, int slot_hint);
 
 /* LSP → Client: HELLO_ACK {lsp_pubkey, participant_index, all_pubkeys[]} */
 cJSON *wire_build_hello_ack(const secp256k1_context *ctx,

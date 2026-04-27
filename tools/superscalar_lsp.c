@@ -1067,6 +1067,7 @@ int main(int argc, char *argv[]) {
     int max_connections_arg = 0;      /* 0 = use LSP_MAX_CLIENTS default */
     int max_conn_rate_arg = 10;      /* max connections per IP per minute */
     int max_handshakes_arg = 4;      /* max concurrent handshakes */
+    const char *funding_txid_override = NULL; /* --funding-txid: skip wallet funding, use existing UTXO */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
     int lsp_balance_pct_explicit = 0; /* 1 if user passed --lsp-balance-pct */
@@ -1366,6 +1367,8 @@ int main(int argc, char *argv[]) {
             max_conn_rate_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--max-handshakes") == 0 && i + 1 < argc)
             max_handshakes_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--funding-txid") == 0 && i + 1 < argc)
+            funding_txid_override = argv[++i];
         else if (strcmp(argv[i], "--accept-timeout") == 0 && i + 1 < argc) {
             accept_timeout_arg = atoi(argv[++i]);
             if (accept_timeout_arg <= 0) {
@@ -2871,6 +2874,9 @@ accept_new_factory:
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+        } else if (funding_txid_override) {
+            printf("LSP: --funding-txid override: skipping wallet funding, "
+                   "will use existing UTXO from %s\n", funding_txid_override);
         } else {
             double bal = regtest_get_balance(&rt);
             double needed = (double)funding_sats / 100000000.0;
@@ -2923,25 +2929,43 @@ accept_new_factory:
             }
         }
     } else if (rt_ok) {
-        double funding_btc = (double)funding_sats / 100000000.0;
-        if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
-            fprintf(stderr, "LSP: failed to fund factory address\n");
-            lsp_cleanup(lsp_p);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        if (is_regtest) {
-            regtest_mine_blocks(&rt, 1, mine_addr);
-        } else {
-            printf("LSP: waiting for funding tx confirmation on %s...\n", network);
+        if (funding_txid_override) {
+            /* Reuse existing on-chain UTXO at fund_addr — no wallet funding,
+               no broadcast. Just set funding_txid_hex from the flag and wait
+               for confirmation (in case it isn't yet). */
+            strncpy(funding_txid_hex, funding_txid_override, sizeof(funding_txid_hex) - 1);
+            funding_txid_hex[sizeof(funding_txid_hex) - 1] = '\0';
+            printf("LSP: using existing funding txid: %s\n", funding_txid_hex);
             int conf = wait_for_confirmation_servicing(&rt, funding_txid_hex,
                                                          confirm_timeout_secs,
                                                          lsp_p, NULL);
             if (!conf) {
-                fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+                fprintf(stderr, "LSP: existing funding tx not confirmed within timeout\n");
                 lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
+            }
+        } else {
+            double funding_btc = (double)funding_sats / 100000000.0;
+            if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
+                fprintf(stderr, "LSP: failed to fund factory address\n");
+                lsp_cleanup(lsp_p);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            if (is_regtest) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+            } else {
+                printf("LSP: waiting for funding tx confirmation on %s...\n", network);
+                int conf = wait_for_confirmation_servicing(&rt, funding_txid_hex,
+                                                             confirm_timeout_secs,
+                                                             lsp_p, NULL);
+                if (!conf) {
+                    fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+                    lsp_cleanup(lsp_p);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
             }
         }
     } else {
