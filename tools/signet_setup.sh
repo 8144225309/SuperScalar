@@ -52,6 +52,9 @@ CLIENT4DB="$DATADIR/client4.db"
 N_CLIENTS="${N_CLIENTS:-4}"
 ARITY="${ARITY:-3}"
 STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-0}"
+# LSP listening port. Default 9735 (LN convention) but VPS hosts that already
+# run a production lightningd on 9735 must override (e.g. LSP_PORT=9745).
+LSP_PORT="${LSP_PORT:-9735}"
 SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
 
 # Build the optional --static-near-root LSP CLI fragment.  Empty when 0 so
@@ -501,9 +504,9 @@ cmd_start_bridge() {
     if pgrep -f "superscalar_bridge" &>/dev/null; then
         info "Bridge is already running"
     else
-        step "Starting bridge (LSP port 9735, plugin port 9736)..."
+        step "Starting bridge (LSP port $LSP_PORT, plugin port 9736)..."
         "$SCBIN/superscalar_bridge" \
-                --lsp-port 9735 \
+                --lsp-port $LSP_PORT \
                 --plugin-port 9736 \
             > "$LOGDIR/bridge.log" 2>&1 &
         BRIDGE_PID=$!
@@ -541,7 +544,7 @@ cmd_start_lsp() {
                 --cli-path "$BTCBIN/bitcoin-cli" \
                 --rpcuser "$RPCUSER" \
                 --rpcpassword "$RPCPASS" \
-                --port 9735 \
+                --port $LSP_PORT \
                 --clients "$N_CLIENTS" \
                 --amount 200000 \
                 --arity "$ARITY" \
@@ -585,7 +588,7 @@ cmd_start_client() {
                 --keyfile "$DATADIR/client1.key" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
-                --port 9735 \
+                --port $LSP_PORT \
                 --daemon \
                 --db "$CLIENTDB" \
             > "$LOGDIR/client.log" 2>&1 &
@@ -622,7 +625,7 @@ cmd_start_client2() {
                 --keyfile "$DATADIR/client2.key" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
-                --port 9735 \
+                --port $LSP_PORT \
                 --daemon \
                 --db "$CLIENT2DB" \
             > "$LOGDIR/client2.log" 2>&1 &
@@ -652,6 +655,30 @@ _start_demo_clients() {
     local LOGPFX="$3"     # log filename prefix
     local EXTRA_ARGS="${4:-}"
 
+    # On non-regtest networks the client refuses to connect without
+    # --lsp-pubkey (MITM defense). Wait for the LSP to print its pubkey
+    # to its log, then pass it through to clients.
+    local LSP_PUBKEY_ARG=""
+    if [ "$NET" != "regtest" ]; then
+        local LSP_LOG="$LOGDIR/${LOGPFX}.log"
+        local LSP_PUBKEY=""
+        for i in $(seq 1 30); do
+            if [ -f "$LSP_LOG" ]; then
+                LSP_PUBKEY=$(grep -oE 'LSP: NK static pubkey: [0-9a-f]{66}' "$LSP_LOG" 2>/dev/null | head -1 | awk '{print $5}')
+                if [ -n "$LSP_PUBKEY" ]; then
+                    break
+                fi
+            fi
+            sleep 1
+        done
+        if [ -z "$LSP_PUBKEY" ]; then
+            warn "LSP pubkey not found in $LSP_LOG after 30s; clients may fail to authenticate"
+        else
+            LSP_PUBKEY_ARG="--lsp-pubkey $LSP_PUBKEY"
+            detail "Passing --lsp-pubkey ${LSP_PUBKEY:0:16}... to clients"
+        fi
+    fi
+
     for i in $(seq 1 "$N_CLIENTS"); do
         local KEYFILE="$DATADIR/client${i}.key"
         local DBFILE="$DATADIR/client${i}.db"
@@ -663,6 +690,7 @@ _start_demo_clients() {
                 --network "$NET" \
                 --port "$PORT" \
                 --db "$DBFILE" \
+                $LSP_PUBKEY_ARG \
                 $EXTRA_ARGS \
             > "$LOGFILE" 2>&1 &
         eval "CLIENT${i}_PID=$!"
@@ -698,7 +726,7 @@ cmd_demo_coop() {
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
-            --port 9735 \
+            --port $LSP_PORT \
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
@@ -712,7 +740,7 @@ cmd_demo_coop() {
     LSP_PID=$!
     sleep 2
 
-    _start_demo_clients signet 9735 demo_coop "--daemon"
+    _start_demo_clients signet $LSP_PORT demo_coop "--daemon"
 
     # Wait for LSP to finish
     wait "$LSP_PID"
@@ -761,7 +789,7 @@ cmd_demo_force_close() {
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
-            --port 9735 \
+            --port $LSP_PORT \
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
@@ -776,7 +804,7 @@ cmd_demo_force_close() {
     LSP_PID=$!
     sleep 2
 
-    _start_demo_clients signet 9735 demo_fc "--daemon"
+    _start_demo_clients signet $LSP_PORT demo_fc "--daemon"
 
     # Wait for LSP to finish
     wait "$LSP_PID"
@@ -834,7 +862,7 @@ cmd_demo_breach() {
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
-            --port 9735 \
+            --port $LSP_PORT \
             --clients "$N_CLIENTS" \
             --amount 200000 \
             --arity "$ARITY" \
@@ -850,7 +878,7 @@ cmd_demo_breach() {
     LSP_PID=$!
     sleep 2
 
-    _start_demo_clients "$NET" 9735 demo_breach "--daemon"
+    _start_demo_clients "$NET" "$LSP_PORT" demo_breach "--daemon"
 
     # Wait for LSP to finish (it sleeps ~30s after breach on regtest, longer on signet)
     wait "$LSP_PID"
