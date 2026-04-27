@@ -184,4 +184,9 @@ void client_set_persist(persist_t *persist);
    If NULL (default), falls back to NN with no server authentication. */
 void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey);
 
+/* Set a slot hint to send in HELLO. Range 1..n_clients. 0 = no hint (default).
+   When set, the LSP places this client at the requested slot in the keyagg
+   array, making the funding address deterministic across restarts. */
+void client_set_slot_hint(int slot_hint);
+
 #endif /* SUPERSCALAR_CLIENT_H */

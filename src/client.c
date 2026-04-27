@@ -38,6 +38,13 @@ void client_set_min_profit_bps(uint16_t bps) {
     g_min_profit_bps = bps;
 }
 
+/* Optional slot hint sent in HELLO (1..n_clients). 0 = no hint. */
+static int g_slot_hint = 0;
+
+void client_set_slot_hint(int slot_hint) {
+    g_slot_hint = slot_hint;
+}
+
 /* Routing fee rate from SCID_ASSIGN — set during factory creation,
    read by the daemon callback for fee tracking. */
 uint32_t g_routing_fee_ppm = 0;
@@ -445,7 +452,7 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                             ? (uint32_t)ht->valuedouble : current_height;
 
     size_t n_outputs = (size_t)cJSON_GetArraySize(outputs_arr);
-    if (n_outputs == 0 || n_outputs > 32) {
+    if (n_outputs == 0 || n_outputs > FACTORY_MAX_SIGNERS) {
         fprintf(stderr, "Client: bad output count %zu\n", n_outputs);
         if (!initial_msg) cJSON_Delete(msg.json);
         return 0;
@@ -969,8 +976,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        wire_bundle_entry_t all_entries[256];
-        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, 256, 66);
+        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
+        if (!all_entries) {
+            cJSON_Delete(msg.json); free(secnonces); free(nonce_entries); return 0;
+        }
+        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, cap, 66);
         for (size_t e = 0; e < n_all; e++) {
             secp256k1_musig_pubnonce pn;
             if (!musig_pubnonce_parse(ctx, &pn, all_entries[e].data)) continue;
@@ -982,6 +993,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                          all_entries[e].signer_slot, &pn);
             }
         }
+        free(all_entries);
     }
     cJSON_Delete(msg.json);
 
@@ -1262,6 +1274,7 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* Send HELLO */
     cJSON *hello = wire_build_hello(ctx, &my_pubkey);
+    wire_hello_set_slot_hint(hello, g_slot_hint);
     if (!wire_send(fd, MSG_HELLO, hello)) {
         fprintf(stderr, "Client: send HELLO failed\n");
         cJSON_Delete(hello);
@@ -1685,13 +1698,19 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        wire_bundle_entry_t all_entries[256];
-        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, 256, 66);
+        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
+        if (!all_entries) {
+            cJSON_Delete(msg.json);
+            goto fail;
+        }
+        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, cap, 66);
 
         for (size_t e = 0; e < n_all; e++) {
             secp256k1_musig_pubnonce pn;
             if (!musig_pubnonce_parse(ctx, &pn, all_entries[e].data)) {
                 fprintf(stderr, "Client: bad pubnonce in ALL_NONCES\n");
+                free(all_entries);
                 cJSON_Delete(msg.json);
                 goto fail;
             }
@@ -1702,10 +1721,12 @@ int client_run_with_channels(secp256k1_context *ctx,
                                             all_entries[e].signer_slot, &pn)) {
                 fprintf(stderr, "Client: set nonce failed node %u slot %u\n",
                         all_entries[e].node_idx, all_entries[e].signer_slot);
+                free(all_entries);
                 cJSON_Delete(msg.json);
                 goto fail;
             }
         }
+        free(all_entries);
     }
     cJSON_Delete(msg.json);
 

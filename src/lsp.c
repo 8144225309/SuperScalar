@@ -74,6 +74,8 @@ int lsp_accept_clients(lsp_t *lsp) {
     }
 
     lsp->n_clients = 0;
+    int hello_slot_hints[FACTORY_MAX_SIGNERS];
+    for (size_t k = 0; k < FACTORY_MAX_SIGNERS; k++) hello_slot_hints[k] = 0;
 
     for (size_t i = 0; i < lsp->expected_clients; i++) {
         /* Timeout: wait for incoming connection with select() */
@@ -162,10 +164,49 @@ int lsp_accept_clients(lsp_t *lsp) {
             wire_close(fd);
             goto accept_fail;
         }
+
+        /* Optional slot_hint for deterministic keyagg ordering */
+        cJSON *sh_item = cJSON_GetObjectItem(msg.json, "slot_hint");
+        if (sh_item && cJSON_IsNumber(sh_item))
+            hello_slot_hints[i] = (int)sh_item->valuedouble;
+
         cJSON_Delete(msg.json);
 
         lsp->client_fds[i] = fd;
         lsp->n_clients = i + 1;
+    }
+
+    /* If every client sent a valid slot_hint forming a permutation of
+       1..n_clients, reorder client_pubkeys/client_fds to match. This makes
+       the funding-address keyagg deterministic across restarts. */
+    {
+        int all_hinted = 1;
+        int seen[FACTORY_MAX_SIGNERS] = {0};
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            int s = hello_slot_hints[i];
+            if (s < 1 || (size_t)s > lsp->n_clients || seen[s]) { all_hinted = 0; break; }
+            seen[s] = 1;
+        }
+        if (all_hinted && lsp->n_clients > 0) {
+            for (size_t target = 0; target < lsp->n_clients; target++) {
+                if ((size_t)hello_slot_hints[target] - 1 == target) continue;
+                for (size_t j = target + 1; j < lsp->n_clients; j++) {
+                    if ((size_t)hello_slot_hints[j] - 1 == target) {
+                        secp256k1_pubkey tpk = lsp->client_pubkeys[target];
+                        int tfd = lsp->client_fds[target];
+                        int th = hello_slot_hints[target];
+                        lsp->client_pubkeys[target] = lsp->client_pubkeys[j];
+                        lsp->client_fds[target] = lsp->client_fds[j];
+                        hello_slot_hints[target] = hello_slot_hints[j];
+                        lsp->client_pubkeys[j] = tpk;
+                        lsp->client_fds[j] = tfd;
+                        hello_slot_hints[j] = th;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "LSP: deterministic ordering applied via slot_hints\n");
+        }
     }
 
     /* Build all_pubkeys array: [LSP, client0, client1, ...] */
@@ -390,7 +431,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect NONCE_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t ceremony;
-        ceremony_init(&ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
+        ceremony_init(&ceremony, lsp->n_clients, 300, (int)lsp->n_clients);
         ceremony.state = CEREMONY_COLLECTING_NONCES;
         size_t nonces_received = 0;
 
@@ -635,7 +676,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* Collect PSIG_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t psig_ceremony;
-        ceremony_init(&psig_ceremony, lsp->n_clients, 60, (int)lsp->n_clients);
+        ceremony_init(&psig_ceremony, lsp->n_clients, 300, (int)lsp->n_clients);
         psig_ceremony.state = CEREMONY_COLLECTING_PSIGS;
         size_t psigs_received = 0;
 
@@ -890,7 +931,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
 
     {
         ceremony_t close_nonce_cer;
-        ceremony_init(&close_nonce_cer, lsp->n_clients, 60, (int)lsp->n_clients);
+        ceremony_init(&close_nonce_cer, lsp->n_clients, 300, (int)lsp->n_clients);
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
@@ -1007,7 +1048,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     /* Collect CLOSE_PSIG from all clients (parallel select) */
     {
         ceremony_t close_psig_cer;
-        ceremony_init(&close_psig_cer, lsp->n_clients, 60, (int)lsp->n_clients);
+        ceremony_init(&close_psig_cer, lsp->n_clients, 300, (int)lsp->n_clients);
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {

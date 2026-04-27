@@ -2266,6 +2266,8 @@ int main(int argc, char *argv[]) {
             auto_accept_jit = 1;
         } else if (strcmp(argv[i], "--min-profit-bps") == 0 && i + 1 < argc) {
             client_set_min_profit_bps((uint16_t)atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--participant-id") == 0 && i + 1 < argc) {
+            client_set_slot_hint(atoi(argv[++i]));
         } else if (strcmp(argv[i], "--test-lsps2") == 0) {
             test_lsps2 = 1;
         } else if (strcmp(argv[i], "--test-lsps2-buy") == 0) {

@@ -565,6 +565,11 @@ cJSON *wire_build_hello(const secp256k1_context *ctx,
     return j;
 }
 
+void wire_hello_set_slot_hint(cJSON *hello, int slot_hint) {
+    if (!hello || slot_hint <= 0) return;
+    cJSON_AddNumberToObject(hello, "slot_hint", slot_hint);
+}
+
 cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
                             const secp256k1_pubkey *lsp_pubkey,
                             uint32_t participant_index,
