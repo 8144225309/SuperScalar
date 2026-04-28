@@ -1128,6 +1128,8 @@ extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len2(void);
 extern int test_regtest_full_force_close_and_sweep_arity_ps_chain_len5(void);
 extern int test_regtest_mixed_arity_2_4_8_lifecycle(void);
 extern int test_regtest_nway_n64_arity_2_4_8_lifecycle(void);
+extern int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void);
+extern int test_regtest_nway_n64_dw_advance_resign_lifecycle(void);
 extern int test_regtest_static_near_root_lifecycle(void);
 extern int test_regtest_static_near_root_unilateral_exit(void);
 extern int test_regtest_ps_full_lifecycle_n8(void);
@@ -3727,6 +3729,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_full_force_close_and_sweep_arity_ps_chain_len5);
     RUN_TEST(test_regtest_mixed_arity_2_4_8_lifecycle);
     RUN_TEST(test_regtest_nway_n64_arity_2_4_8_lifecycle);
+    RUN_TEST(test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle);
+    RUN_TEST(test_regtest_nway_n64_dw_advance_resign_lifecycle);
     RUN_TEST(test_regtest_static_near_root_lifecycle);
     RUN_TEST(test_regtest_static_near_root_unilateral_exit);
     RUN_TEST(test_regtest_ps_full_lifecycle_n8);
