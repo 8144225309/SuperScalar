@@ -992,8 +992,15 @@ static int run_htlc_in_flight(regtest_t *rt, secp256k1_context *ctx,
     TEST_ASSERT(htlc_out_amt == htlc_amt, "htlc: amount matches");
     TEST_ASSERT(htlc_spk_len == 34, "htlc: output is P2TR");
 
-    /* Register the preimage so channel_build_htlc_success_tx can find it. */
-    channel_fulfill_htlc(&lsp_ch, lsp_htlc_id, preimage);
+    /* Register the preimage so channel_build_htlc_success_tx can find it.
+       NOTE: do NOT call channel_fulfill_htlc — that advances commitment_number
+       as a side effect, which would cause channel_rebuild_htlc_leaves to
+       derive HTLC keys with a DIFFERENT per_commitment_point than was used
+       to build the on-chain commitment, producing a witness program hash
+       mismatch.  Mirror test_regtest_htlc_success (test_channel.c) by
+       writing the preimage directly. */
+    (void)lsp_htlc_id;
+    memcpy(lsp_ch.htlcs[0].payment_preimage, preimage, 32);
 
     /* Build + broadcast HTLC-success tx.  channel_build_htlc_success_tx
        sets nSequence=to_self_delay (=csv=10) for HTLC_RECEIVED.  BIP-68
@@ -1191,21 +1198,22 @@ int test_regtest_rotation_all_arities(void) {
 }
 
 int test_regtest_htlc_in_flight_spendability(void) {
-    /* HTLC-in-flight resolution is covered by test_regtest_htlc_success
-       (test_channel.c) and test_regtest_htlc_timeout for the
-       single-channel preimage and CLTV paths.
-
-       The in-process two-channel re-implementation `run_htlc_in_flight`
-       (above) reproducibly fails with `mempool-script-verify-flag-failed
-       (Witness program hash mismatch)`. Real protocol-level bug in how
-       the two-channel test setup derives htlc_basepoint keys vs the
-       single-channel pattern. Investigation notes are in
-       .claude/CAMPAIGN4_FORCE_CLOSE_N64_JOURNAL.md (never committed).
-       Tracked as a separate task — needs ~2-4 hr focused debug. */
-    (void)run_htlc_in_flight;
-    printf("  covered by test_regtest_htlc_success + test_regtest_htlc_timeout\n");
-    printf("  TODO: fix run_htlc_in_flight witness-key derivation mismatch\n");
-    return 1;
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "htlc_inflight_spend");
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    int ok = run_htlc_in_flight(&rt, ctx, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
 }
 
 int test_regtest_ps_chain_close_spendability(void) {
