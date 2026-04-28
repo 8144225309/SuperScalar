@@ -613,6 +613,13 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
             cJSON_AddItemToArray(la, cJSON_CreateNumber(f->level_arity[i]));
         cJSON_AddItemToObject(j, "level_arity", la);
     }
+    /* Phase 3 (mixed-arity): static-near-root threshold.  Without this,
+       LSP and clients build divergent trees when --static-near-root N is
+       configured: LSP applies it, clients build a non-static tree, the
+       node-to-signer mappings diverge, and MuSig nonce assignment fails. */
+    if (f->static_threshold_depth > 0)
+        cJSON_AddNumberToObject(j, "static_threshold_depth",
+                                (double)f->static_threshold_depth);
     cJSON_AddNumberToObject(j, "placement_mode", (double)f->placement_mode);
     cJSON_AddNumberToObject(j, "economic_mode", (double)f->economic_mode);
 
