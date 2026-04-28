@@ -589,6 +589,7 @@ cmd_start_client() {
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
                 --port $LSP_PORT \
+                --participant-id 1 \
                 --daemon \
                 --db "$CLIENTDB" \
             > "$LOGDIR/client.log" 2>&1 &
@@ -626,6 +627,7 @@ cmd_start_client2() {
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
                 --port $LSP_PORT \
+                --participant-id 2 \
                 --daemon \
                 --db "$CLIENT2DB" \
             > "$LOGDIR/client2.log" 2>&1 &
@@ -684,11 +686,17 @@ _start_demo_clients() {
         local DBFILE="$DATADIR/client${i}.db"
         local LOGFILE="$LOGDIR/${LOGPFX}_client${i}.log"
 
+        # --participant-id N is REQUIRED on non-regtest networks to make the
+        # funding-address keyagg deterministic across restarts.  Without it,
+        # connect-order non-determinism strands funds.  Campaign #3 lost
+        # 6.5M signet sats this way.  signet_setup.sh assigns id = client
+        # number (1..N) so the LSP can sort consistently every restart.
         "$SCBIN/superscalar_client" \
                 --keyfile "$KEYFILE" \
                 --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network "$NET" \
                 --port "$PORT" \
+                --participant-id "$i" \
                 --db "$DBFILE" \
                 $LSP_PUBKEY_ARG \
                 $EXTRA_ARGS \

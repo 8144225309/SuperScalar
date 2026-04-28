@@ -52,6 +52,14 @@ typedef struct {
        NULL = use equal split (initial creation). */
     const uint64_t *dist_client_amounts;
     size_t dist_n_client_amounts;
+
+    /* When set, lsp_accept_clients refuses to proceed unless every client's
+       HELLO included a valid slot_hint forming a permutation of 1..n_clients.
+       Without slot_hints the funding-address derivation depends on TCP accept
+       order — non-deterministic across restarts, which is a fund-loss risk
+       (Campaign #3 stranded 6.5M signet sats this way). Enable on all
+       non-regtest deployments. Default: 0 (off, regtest-friendly). */
+    int require_slot_hints;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

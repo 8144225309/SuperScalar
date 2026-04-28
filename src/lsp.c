@@ -178,7 +178,13 @@ int lsp_accept_clients(lsp_t *lsp) {
 
     /* If every client sent a valid slot_hint forming a permutation of
        1..n_clients, reorder client_pubkeys/client_fds to match. This makes
-       the funding-address keyagg deterministic across restarts. */
+       the funding-address keyagg deterministic across restarts.
+
+       If require_slot_hints is set (production deployments), refuse to
+       proceed without a valid permutation — operator forgot to pass
+       --participant-id to clients. This avoids the silent fund-loss
+       Campaign #3 hit: connect-order-dependent funding addresses get
+       stranded on every restart. */
     {
         int all_hinted = 1;
         int seen[FACTORY_MAX_SIGNERS] = {0};
@@ -186,6 +192,16 @@ int lsp_accept_clients(lsp_t *lsp) {
             int s = hello_slot_hints[i];
             if (s < 1 || (size_t)s > lsp->n_clients || seen[s]) { all_hinted = 0; break; }
             seen[s] = 1;
+        }
+        if (lsp->require_slot_hints && !all_hinted) {
+            fprintf(stderr, "LSP: ERROR — require_slot_hints is set but not all "
+                    "clients supplied a valid slot_hint forming a permutation "
+                    "of 1..%zu. Funding-address derivation would be "
+                    "non-deterministic across restarts (fund-loss risk). "
+                    "Each client must launch with --participant-id N "
+                    "(unique value 1..%zu).\n",
+                    lsp->n_clients, lsp->n_clients);
+            goto accept_fail;
         }
         if (all_hinted && lsp->n_clients > 0) {
             for (size_t target = 0; target < lsp->n_clients; target++) {

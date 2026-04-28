@@ -2147,6 +2147,10 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             g_lsp = lsp_rp;
+            /* Recovery path uses persisted state — require_slot_hints would
+               only kick in for new client reconnections; honor same policy
+               as fresh launch so deployments stay consistent. */
+            lsp_rp->require_slot_hints = (strcmp(network, "regtest") != 0);
             lsp_rp->use_nk = 1;
             memcpy(lsp_rp->nk_seckey, lsp_seckey, 32);
 
@@ -2552,6 +2556,13 @@ accept_new_factory:
     if (max_connections_arg > 0)
         lsp_p->max_connections = max_connections_arg;
     rate_limiter_init(&lsp_p->rate_limiter, max_conn_rate_arg, 60, max_handshakes_arg);
+
+    /* On non-regtest networks, REQUIRE every client to send a slot_hint in
+       HELLO (via --participant-id N). Without it, the funding-address
+       derivation depends on TCP accept order — non-deterministic across
+       restarts, which strands funds. Campaign #3 stranded 6.5M signet sats
+       this way. Regtest skips the check since tests use ephemeral funding. */
+    lsp_p->require_slot_hints = (strcmp(network, "regtest") != 0);
 
     /* Enable NK (server-authenticated) noise handshake */
     lsp_p->use_nk = 1;
