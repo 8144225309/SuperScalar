@@ -1671,6 +1671,7 @@ extern int test_factory_static_near_root_basic(void);
 extern int test_factory_static_near_root_n128_arity_2_4_8_static_2(void);
 extern int test_factory_static_near_root_node_nsequence(void);
 extern int test_factory_static_near_root_backward_compat(void);
+extern int test_factory_client_to_leaf_roundtrip(void);
 
 /* Wire TLV Foundation (Mainnet Gap #8) */
 extern int test_tlv_encode_decode(void);
@@ -3440,6 +3441,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_static_near_root_n128_arity_2_4_8_static_2);
     RUN_TEST(test_factory_static_near_root_node_nsequence);
     RUN_TEST(test_factory_static_near_root_backward_compat);
+    RUN_TEST(test_factory_client_to_leaf_roundtrip);
 
     printf("\n=== Wire TLV Foundation (Mainnet Gap #8) ===\n");
     RUN_TEST(test_tlv_encode_decode);

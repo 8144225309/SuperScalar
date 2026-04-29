@@ -258,6 +258,32 @@ void factory_set_arity(factory_t *f, factory_arity_t arity);
    Must be called after init, before build_tree. */
 void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
 
+/* Map a 0-based client index to its (leaf-node, vout) position in the
+   built tree.  Returns 1 on success, 0 if the client_idx is out of range
+   or doesn't appear in any leaf's signer_indices.
+
+   Behavior is arity-aware:
+
+   - Mixed-arity factories (n_level_arity > 0): walks
+     factory->leaf_node_indices[] and matches my_index = client_idx + 1
+     against each leaf's signer_indices[].  vout = position in
+     signer_indices minus 1 (signer_indices[0] == 0 is the LSP).  This
+     is the only correct mapping when leaves can hold > 2 channels.
+
+   - Uniform ARITY_1: each client owns its own leaf at vout 0.
+     node_idx = leaf_node_indices[client_idx], vout = 0.
+
+   - Uniform ARITY_2 / ARITY_PS: legacy 2-clients-per-leaf packing.
+     leaf_idx = client_idx / 2, vout = client_idx % 2.  PS leaves rely
+     on this shared-leaf chain semantic that the walk-leaves approach
+     would not reproduce.
+
+   Use this from any code that previously open-coded the mapping
+   (src/client.c::client_init_channel, src/lsp_channels.c::client_to_leaf,
+   etc.) to keep the two sides of the wire ceremony in sync. */
+int factory_client_to_leaf(const factory_t *f, size_t client_idx,
+                            size_t *node_idx_out, uint32_t *vout_out);
+
 /* Configure the static-near-root threshold (Phase 3 of mixed-arity plan).
    Depths in [0, threshold) become kickoff-only (no paired NODE_STATE, no
    DW counter, no per-state nSequence — only the per-node CLTV timeout
