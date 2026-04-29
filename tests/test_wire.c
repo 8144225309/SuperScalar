@@ -1051,6 +1051,232 @@ int test_regtest_wire_factory_arity1(void) {
     return 1;
 }
 
+/* Mixed-arity + static-near-root regtest test: factory creation with
+   --arity 2,4 + --static-near-root 1 over the wire path.  This is the
+   CI guard against the silent-collapse bug where lsp_run_factory_creation
+   used to wipe f->level_arity[] and f->static_threshold_depth via its
+   internal factory_init_from_pubkeys reset, causing every non-regtest
+   production deployment with --arity X,Y,Z or --static-near-root N to
+   ship a uniform binary tree (FACTORY_PROPOSE would never carry the
+   configured shape, and clients would build/sign the wrong tree). */
+int test_regtest_wire_factory_mixed_arity(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: regtest not available\n");
+        return 0;
+    }
+    if (!regtest_create_wallet(&rt, "test_wire_mixed")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_wire_mixed\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_wire_mixed", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor field");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "factory setup for funding");
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    /* Distinct port to avoid colliding with the arity-1/arity-2 tests. */
+    int port = 19836 + (getpid() % 1000);
+
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
+
+            int ok = client_run_ceremony(child_ctx, &child_kp, "127.0.0.1", port);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 4);
+
+    int lsp_ok = 1;
+    if (!lsp_accept_clients(lsp)) {
+        fprintf(stderr, "LSP: accept clients failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Configure mixed-arity {2,4} + static_threshold=1 BEFORE
+       lsp_run_factory_creation.  The whole point of this test is to verify
+       these survive the function's internal factory_init_from_pubkeys reset. */
+    uint8_t arities[2] = { 2, 4 };
+    factory_set_level_arity(&lsp->factory, arities, 2);
+    factory_set_static_near_root(&lsp->factory, 1);
+
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
+                                             funding_txid, funding_vout,
+                                             funding_amount,
+                                             fund_spk, 34,
+                                             10, 4, 200)) {
+        fprintf(stderr, "LSP: factory creation (mixed-arity) failed\n");
+        lsp_ok = 0;
+    }
+
+    /* The CI guard.  If lsp_run_factory_creation drops these, every
+       non-regtest deployment using --arity X,Y,Z silently builds a
+       uniform binary tree. */
+    if (lsp_ok) {
+        TEST_ASSERT_EQ(lsp->factory.n_level_arity, 2,
+                       "level_arity preserved across init reset");
+        TEST_ASSERT_EQ(lsp->factory.level_arity[0], 2, "level_arity[0] == 2");
+        TEST_ASSERT_EQ(lsp->factory.level_arity[1], 4, "level_arity[1] == 4");
+        TEST_ASSERT_EQ(lsp->factory.static_threshold_depth, 1,
+                       "static_threshold_depth preserved across init reset");
+        TEST_ASSERT(lsp->factory.n_nodes > 0, "tree was built");
+        printf("  Mixed-arity factory: %zu nodes, %d leaf nodes, "
+               "n_level_arity=%zu, static_threshold=%u\n",
+               lsp->factory.n_nodes, lsp->factory.n_leaf_nodes,
+               lsp->factory.n_level_arity,
+               lsp->factory.static_threshold_depth);
+    }
+
+    /* Cooperative close (5-of-5 on funding output, same as arity-1 test). */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        uint64_t per_party = close_total / 5;
+        tx_output_t close_outputs[5];
+        for (int i = 0; i < 5; i++) {
+            close_outputs[i].amount_sats = per_party;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        close_outputs[4].amount_sats = close_total - per_party * 4;
+
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, 5, 0)) {
+            fprintf(stderr, "LSP: cooperative close (mixed-arity) failed\n");
+            lsp_ok = 0;
+        } else {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                int conf = regtest_get_confirmations(&rt, close_txid);
+                if (conf < 1) {
+                    fprintf(stderr, "LSP: close tx not confirmed\n");
+                    lsp_ok = 0;
+                }
+            } else {
+                fprintf(stderr, "LSP: broadcast close tx failed\n");
+                lsp_ok = 0;
+            }
+        }
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_cleanup(lsp);
+    free(lsp);
+
+    int all_children_ok = 1;
+    for (int c = 0; c < 4; c++) {
+        int status;
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "Client %d (mixed) exited with status %d\n", c + 1,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            all_children_ok = 0;
+        }
+    }
+
+    secp256k1_context_destroy(ctx);
+
+    TEST_ASSERT(lsp_ok, "LSP mixed-arity ceremony");
+    TEST_ASSERT(all_children_ok, "all mixed-arity clients");
+    return 1;
+}
+
 /* --- Wire frame size limit (Phase 2: item 2.5) --- */
 
 int test_wire_oversized_frame_rejected(void) {

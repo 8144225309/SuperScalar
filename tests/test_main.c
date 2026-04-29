@@ -1098,6 +1098,7 @@ extern int test_wire_close_unsigned(void);
 extern int test_wire_distributed_signing(void);
 extern int test_regtest_wire_factory(void);
 extern int test_regtest_wire_factory_arity1(void);
+extern int test_regtest_wire_factory_mixed_arity(void);
 
 /* Phase 10: Channel operations over wire */
 extern int test_channel_msg_round_trip(void);
@@ -3701,6 +3702,7 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Phase 9 (Wire Protocol) ===\n");
     RUN_TEST(test_regtest_wire_factory);
     RUN_TEST(test_regtest_wire_factory_arity1);
+    RUN_TEST(test_regtest_wire_factory_mixed_arity);
 
     printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
     RUN_TEST(test_regtest_intra_factory_payment);

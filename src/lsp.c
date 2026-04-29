@@ -276,6 +276,20 @@ int lsp_run_factory_creation(lsp_t *lsp,
        Initialize from pubkeys, then we'll use factory_sessions_* */
     factory_t *f = &lsp->factory;
     factory_arity_t saved_arity = f->leaf_arity;
+    /* Mixed-arity + static-near-root must survive the factory_init_from_pubkeys
+       reset below.  The CLI sets these via factory_set_level_arity /
+       factory_set_static_near_root BEFORE lsp_run_factory_creation runs;
+       without these saves, --arity X,Y,Z and --static-near-root N silently
+       collapse to uniform arity-2 / no static threshold (a real fund-loss
+       risk in production: tree shape would not match what the operator
+       configured, and clients would receive a default tree in
+       FACTORY_PROPOSE rather than the configured shape). */
+    size_t saved_n_level_arity = f->n_level_arity;
+    uint8_t saved_level_arity[FACTORY_MAX_LEVELS];
+    if (saved_n_level_arity > 0)
+        memcpy(saved_level_arity, f->level_arity,
+               saved_n_level_arity * sizeof(uint8_t));
+    uint32_t saved_static_threshold = f->static_threshold_depth;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
     participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
@@ -291,10 +305,20 @@ int lsp_run_factory_creation(lsp_t *lsp,
         memcpy(saved_shachain_seed, f->shachain_seed, 32);
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
-    if (saved_arity == FACTORY_ARITY_1)
+    /* Restore arity in priority order: mixed-arity wins over uniform.
+       factory_set_level_arity also sets leaf_arity = arities[n-1] so the
+       uniform path below is skipped naturally when mixed is in play. */
+    if (saved_n_level_arity > 0) {
+        factory_set_level_arity(f, saved_level_arity, saved_n_level_arity);
+    } else if (saved_arity == FACTORY_ARITY_1) {
         factory_set_arity(f, FACTORY_ARITY_1);
-    else if (saved_arity == FACTORY_ARITY_PS)
+    } else if (saved_arity == FACTORY_ARITY_PS) {
         factory_set_arity(f, FACTORY_ARITY_PS);
+    }
+    /* static_near_root MUST be set after the arity restore: it recomputes
+       the DW counter shape based on f->level_arity / f->leaf_arity. */
+    if (saved_static_threshold > 0)
+        factory_set_static_near_root(f, saved_static_threshold);
     f->cltv_timeout = cltv_timeout;  /* set BEFORE build_tree for staggered taptrees */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;

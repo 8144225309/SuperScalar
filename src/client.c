@@ -771,6 +771,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                 rot_level_arities[rot_n_level_arity++] = (uint8_t)rlai->valuedouble;
         }
     }
+    cJSON *rsnr_item = cJSON_GetObjectItem(pj, "static_threshold_depth");
+    uint32_t rot_static_threshold =
+        (rsnr_item && cJSON_IsNumber(rsnr_item)) ? (uint32_t)rsnr_item->valuedouble : 0;
 
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *rpm_item = cJSON_GetObjectItem(pj, "placement_mode");
@@ -842,6 +845,8 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     else if (rot_leaf_arity == 3)
         factory_set_arity(factory_out, FACTORY_ARITY_PS);
+    if (rot_static_threshold > 0)
+        factory_set_static_near_root(factory_out, rot_static_threshold);
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     free(rot_hashes);
@@ -1420,6 +1425,14 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
+    /* Parse static-near-root threshold (Phase 3 mixed-arity).  Backward-
+       compatible: missing field = 0 (no static layers).  Without this the
+       client and LSP build divergent trees when the operator configured
+       --static-near-root N. */
+    cJSON *snr_item = cJSON_GetObjectItem(msg.json, "static_threshold_depth");
+    uint32_t static_threshold_depth =
+        (snr_item && cJSON_IsNumber(snr_item)) ? (uint32_t)snr_item->valuedouble : 0;
+
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
     int placement_mode = (pm_item && cJSON_IsNumber(pm_item)) ? (int)pm_item->valuedouble : 0;
@@ -1548,6 +1561,10 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_arity(factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(factory, FACTORY_ARITY_PS);
+    /* Apply static-near-root after the arity restore: it recomputes the
+       DW counter shape based on f->level_arity / f->leaf_arity. */
+    if (static_threshold_depth > 0)
+        factory_set_static_near_root(factory, static_threshold_depth);
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
     free(parsed_l_stock_hashes);
