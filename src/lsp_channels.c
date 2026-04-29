@@ -105,16 +105,45 @@ void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
  */
 
 /* Map client index (0-based) to factory state node and vout.
-   Uses factory's leaf_node_indices[] for arity-agnostic lookup. */
+   Uses factory's leaf_node_indices[] for arity-agnostic lookup.
+
+   Mixed-arity (n_level_arity > 0) leaves can hold up to 8 channels, so the
+   legacy `leaf_idx = client_idx / 2; vout = client_idx % 2` formula
+   computes a leaf index that may not exist, AND it would disagree with
+   the client side (src/client.c::client_init_channel uses a leaf-walk
+   for mixed-arity).  Without this match the LSP and client build
+   different funding SPKs / different channels, MuSig commitment sigs
+   never verify, and channels for any client beyond #0 are non-functional.
+   For uniform arities (ARITY_1, ARITY_2, ARITY_PS) keep the legacy
+   formula — PS leaves rely on its shared-leaf chain semantics. */
 static void client_to_leaf(size_t client_idx, const factory_t *factory,
                             size_t *node_idx_out, uint32_t *vout_out) {
+    if (factory->n_level_arity > 0) {
+        uint32_t my_index = (uint32_t)(client_idx + 1);  /* 1-based in signer_indices */
+        for (int li = 0; li < factory->n_leaf_nodes; li++) {
+            size_t ni = factory->leaf_node_indices[li];
+            const factory_node_t *leaf = &factory->nodes[ni];
+            for (size_t s = 1; s < leaf->n_signers; s++) {
+                if (leaf->signer_indices[s] == my_index) {
+                    *node_idx_out = ni;
+                    *vout_out = (uint32_t)(s - 1);
+                    return;
+                }
+            }
+        }
+        /* Not found — fall through to fallback so callers' n_outputs
+           bounds check rejects this entry instead of accessing wrong leaf. */
+        *node_idx_out = 0;
+        *vout_out = UINT32_MAX;
+        return;
+    }
     if (factory->leaf_arity == FACTORY_ARITY_1) {
         /* Arity-1: each client has its own leaf node, channel at vout 0 */
         *node_idx_out = (client_idx < (size_t)factory->n_leaf_nodes)
             ? factory->leaf_node_indices[client_idx] : 0;
         *vout_out = 0;
     } else {
-        /* Arity-2: 2 clients share a leaf node */
+        /* Arity-2 (and ARITY_PS via shared-leaf chain): 2 clients per leaf */
         size_t leaf_idx = client_idx / 2;
         *node_idx_out = (leaf_idx < (size_t)factory->n_leaf_nodes)
             ? factory->leaf_node_indices[leaf_idx] : 0;
