@@ -24,6 +24,17 @@
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
+/* Default CSV (BIP-68 relative locktime) on the L-stock SPK's L&CSV
+   script-path leaf, in blocks.  Spec source: ZmnSCPxj's t/1242 doesn't
+   pin a value; the rationale is "long enough that watchtowers / clients
+   can broadcast the pre-signed L-stock poison TX before the LSP can
+   spend L-stock alone via the script-path."  144 blocks ≈ 1 day on
+   mainnet — generous reaction window, manageable on regtest.
+
+   The CSV value is per-factory configurable via factory_set_l_stock_csv()
+   (see below).  Override before factory_build_tree(). */
+#define L_STOCK_CSV_DEFAULT_BLOCKS 144u
+
 typedef enum {
     FACTORY_ARITY_2  = 2,   /* 2 clients per leaf (3-of-3), 2 DW layers */
     FACTORY_ARITY_1  = 1,   /* 1 client per leaf (2-of-2), 3 DW layers */
@@ -212,6 +223,11 @@ typedef struct {
        fan-out happens directly off the kickoff TX (no state intermediary). */
     uint32_t static_threshold_depth;
 
+    /* CSV (BIP-68 relative locktime) on the L-stock SPK's L&CSV
+       script-path leaf, in blocks.  See L_STOCK_CSV_DEFAULT_BLOCKS for
+       rationale and default. */
+    uint32_t l_stock_csv_blocks;
+
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
@@ -257,6 +273,70 @@ void factory_set_arity(factory_t *f, factory_arity_t arity);
    Last entry applies to all deeper levels. Clears uniform leaf_arity.
    Must be called after init, before build_tree. */
 void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
+
+/* Override the default L-stock CSV (BIP-68) blocks.  Must be called
+   before factory_build_tree() — otherwise the L-stock SPK is already
+   committed.  Pass 0 to keep the L_STOCK_CSV_DEFAULT_BLOCKS default. */
+void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks);
+
+/* Build the unsigned L-stock POISON TRANSACTION for a leaf state.
+   Spends the L-stock UTXO (`l_stock_txid:l_stock_vout` carrying
+   `l_stock_amount_sats`) and pays each non-LSP signer in the leaf an
+   equal share of `(l_stock_amount_sats - fee)` to a P2TR output keyed on
+   that signer's xonly pubkey.
+
+   Implements ZmnSCPxj's t/1242 "poison transaction" cheating-recovery
+   mechanism: pre-signed at leaf-state-advance time, broadcast (by any
+   client / watchtower) if the LSP publishes the corresponding stale
+   leaf state on chain.  See docs/poison-tx.md (added in this PR) for
+   the full security argument.
+
+   Returns 1 on success.  Caller must initialize *poison_tx_out and
+   free it after use.  Sets *sighash_out32 to the BIP-341 key-path
+   sighash that signers must MuSig over to authorize the spend. */
+int factory_build_l_stock_poison_tx_unsigned(
+    const factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    tx_buf_t *poison_tx_out,
+    unsigned char *sighash_out32);
+
+/* Single-process variant: builds + N-of-N MuSig-co-signs + assembles
+   the witness for the L-stock poison TX.  Requires that f->keypairs[]
+   holds the seckey for every leaf signer (only true in the unit-test
+   builder; the wire ceremony will use a multi-round equivalent in a
+   follow-up PR).  Returns the fully-witnessed poison TX in *signed_out. */
+int factory_sign_l_stock_poison_tx(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    tx_buf_t *signed_out);
+
+/* Cooperative N-of-N spend of an L-stock UTXO to a caller-specified
+   output distribution.  The poison TX is a special case of this where
+   outputs are the per-client equal split; the same helper is used for
+   any legitimate cooperative L-stock spend (e.g. routing L-stock back
+   to the LSP's wallet during a planned close, with all clients having
+   agreed to the new distribution).
+
+   Like factory_sign_l_stock_poison_tx, requires f->keypairs[] to hold
+   the seckey for every leaf signer.  Multi-process wire-ceremony
+   equivalent is a follow-up PR. */
+int factory_sign_l_stock_cooperative_spend(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    tx_buf_t *signed_out);
 
 /* Map a 0-based client index to its (leaf-node, vout) position in the
    built tree.  Returns 1 on success, 0 if the client_idx is out of range
@@ -402,8 +482,20 @@ void factory_set_l_stock_hashes(factory_t *f,
 int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
                                     unsigned char *secret_out32);
 
-/* Build a burn tx spending an old-state L-stock output via hashlock script path. */
-int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
+/* Build the L-stock POISON TX for a stale leaf state (canonical t/1242
+   design — supersedes the legacy OP_RETURN burn-as-fee approach).  Thin
+   wrapper around factory_sign_l_stock_poison_tx; kept for source
+   compatibility with the existing watchtower call site.
+
+   `leaf_node` identifies which leaf's L-stock is being poisoned (its
+   keyagg + signers determine the SPK and the per-client distribution).
+   `l_stock_txid32` / `l_stock_vout` / `l_stock_amount` describe the
+   on-chain UTXO of the OLD stale state being recovered from.
+
+   The `epoch` parameter is unused — the new design's authority is the
+   leaf signers' N-of-N MuSig, not a per-epoch hashlock secret. */
+int factory_build_burn_tx(factory_t *f, tx_buf_t *burn_tx_out,
+                           const factory_node_t *leaf_node,
                            const unsigned char *l_stock_txid,
                            uint32_t l_stock_vout,
                            uint64_t l_stock_amount,

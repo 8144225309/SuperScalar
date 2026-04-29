@@ -938,13 +938,16 @@ int test_factory_l_stock_with_burn_path(void) {
     size_t ll = f_plain->leaf_node_indices[0];  /* left leaf */
     size_t rl = f_plain->leaf_node_indices[1];  /* right leaf */
 
-    /* L-stock output (last) on leaf state nodes should differ */
+    /* CANONICAL DESIGN (t/1242): L-stock SPK = or(N-of-N keyagg, L&CSV).
+       It depends on leaf signers + LSP pubkey + CSV — NOT on shachain
+       (which is for channel-level revocation, not L-stock).  So with vs
+       without shachain, the L-stock SPK is the SAME for the same leaf. */
     TEST_ASSERT(memcmp(f_plain->nodes[ll].outputs[2].script_pubkey,
-                        f_sc->nodes[ll].outputs[2].script_pubkey, 34) != 0,
-                "L-stock spk differs with shachain (left leaf)");
+                        f_sc->nodes[ll].outputs[2].script_pubkey, 34) == 0,
+                "L-stock spk does NOT depend on shachain (left leaf)");
     TEST_ASSERT(memcmp(f_plain->nodes[rl].outputs[2].script_pubkey,
-                        f_sc->nodes[rl].outputs[2].script_pubkey, 34) != 0,
-                "L-stock spk differs with shachain (right leaf)");
+                        f_sc->nodes[rl].outputs[2].script_pubkey, 34) == 0,
+                "L-stock spk does NOT depend on shachain (right leaf)");
 
     /* Channel outputs (indices 0, 1) should be the same */
     TEST_ASSERT(memcmp(f_plain->nodes[ll].outputs[0].script_pubkey,
@@ -962,9 +965,11 @@ int test_factory_l_stock_with_burn_path(void) {
     TEST_ASSERT(factory_sign_all(f_sc), "sign at epoch 0");
     TEST_ASSERT(factory_advance(f_sc), "advance to epoch 1");
 
-    /* L-stock spk should change after epoch advance */
-    TEST_ASSERT(memcmp(l_spk_epoch0, f_sc->nodes[ll].outputs[2].script_pubkey, 34) != 0,
-                "L-stock spk changes with new epoch");
+    /* CANONICAL DESIGN: L-stock SPK does NOT change across state advances
+       (the same leaf node has the same signers and CSV, so the same SPK).
+       The OLD design changed the SPK each epoch via the per-epoch hashlock. */
+    TEST_ASSERT(memcmp(l_spk_epoch0, f_sc->nodes[ll].outputs[2].script_pubkey, 34) == 0,
+                "L-stock spk is stable across state advances (canonical t/1242)");
 
     factory_free(f_plain);
     factory_free(f_sc);
@@ -996,51 +1001,47 @@ int test_factory_burn_tx_construction(void) {
     TEST_ASSERT(factory_build_tree(f), "build tree");
     TEST_ASSERT(factory_sign_all(f), "sign all");
 
-    /* Get leaf state node's txid and L-stock amount */
-    factory_node_t *leaf = &f->nodes[4];
+    /* Get leaf state node + L-stock amount.  Use leaf_node_indices instead
+       of hardcoded `f->nodes[4]` (which was a kickoff in this tree shape;
+       the OLD burn TX didn't validate node identity so it didn't notice). */
+    factory_node_t *leaf = &f->nodes[f->leaf_node_indices[1]];
     uint64_t l_amount = leaf->outputs[2].amount_sats;
 
-    /* Build burn tx for epoch 0 */
+    /* Build the canonical L-stock POISON TX (t/1242: per-client equal-split
+       distribution).  Note: factory_build_burn_tx now requires the leaf
+       node, since after a state advance node->txid points at the NEW state's
+       txid not the OLD one we're trying to poison. */
     tx_buf_t burn_tx;
     tx_buf_init(&burn_tx, 256);
-    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, leaf->txid, 2,
+    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, leaf, leaf->txid, 2,
                                         l_amount, 0),
-                "build burn tx");
+                "build poison tx");
+    TEST_ASSERT(burn_tx.len > 0, "poison tx non-empty");
 
-    /* Verify burn tx is non-empty */
-    TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
+    /* Canonical poison TX has 2 outputs (one per non-LSP signer at this
+       arity-2 leaf with 2 clients).  Sanity check: tx is bigger than the
+       old OP_RETURN burn (which was ~120 bytes) and smaller than 1KB. */
+    TEST_ASSERT(burn_tx.len > 150 && burn_tx.len < 1024,
+                "poison tx is in the expected size range for 2 outputs");
 
-    /* Verify the burn tx contains the correct preimage */
-    unsigned char expected_secret[32];
-    TEST_ASSERT(factory_get_revocation_secret(f, 0, expected_secret),
-                "get revocation secret");
-
-    /* Verify the preimage hashes to the expected hashlock */
-    unsigned char expected_hash[32];
-    sha256(expected_secret, 32, expected_hash);
-
-    /* Search for the preimage in the tx data */
-    int found_preimage = 0;
-    for (size_t i = 0; i + 32 <= burn_tx.len; i++) {
-        if (memcmp(burn_tx.data + i, expected_secret, 32) == 0) {
-            found_preimage = 1;
-            break;
-        }
-    }
-    TEST_ASSERT(found_preimage, "burn tx contains correct preimage");
-
-    /* Verify that building burn tx without shachain fails */
+    /* The new design works regardless of shachain (no per-epoch hashlock
+       on the L-stock SPK).  Verify the no-shachain case produces a valid
+       poison TX too. */
     factory_t *f_no_sc = calloc(1, sizeof(factory_t));
     if (!f_no_sc) return 0;
     factory_init(f_no_sc, ctx, kps, 5, 2, 4);
     factory_set_funding(f_no_sc, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f_no_sc), "build tree (no shachain)");
+    TEST_ASSERT(factory_sign_all(f_no_sc), "sign tree (no shachain)");
 
     tx_buf_t burn_tx2;
     tx_buf_init(&burn_tx2, 256);
-    int result = factory_build_burn_tx(f_no_sc, &burn_tx2, leaf->txid, 2,
-                                         l_amount, 0);
-    TEST_ASSERT(result == 0, "burn tx fails without shachain");
+    factory_node_t *leaf2 = &f_no_sc->nodes[f_no_sc->leaf_node_indices[1]];
+    int result = factory_build_burn_tx(f_no_sc, &burn_tx2, leaf2,
+                                         leaf2->txid, 2,
+                                         leaf2->outputs[2].amount_sats, 0);
+    TEST_ASSERT(result == 1, "poison tx works without shachain "
+                "(per t/1242 — L-stock SPK doesn't use shachain)");
 
     tx_buf_free(&burn_tx);
     tx_buf_free(&burn_tx2);
@@ -1074,16 +1075,21 @@ int test_factory_advance_with_shachain(void) {
     TEST_ASSERT(factory_build_tree(f), "build tree");
     TEST_ASSERT(factory_sign_all(f), "sign at epoch 0");
 
-    /* Save old L-stock info from epoch 0 */
+    /* Save old L-stock info from epoch 0 — captured BEFORE advance because
+       factory_advance() overwrites node->txid with the new state's txid.
+       Use leaf_node_indices for the actual leaf state node. */
+    factory_node_t *leaf_at_epoch0 = &f->nodes[f->leaf_node_indices[1]];
     unsigned char old_leaf_txid[32];
-    memcpy(old_leaf_txid, f->nodes[4].txid, 32);
-    uint64_t old_l_amount = f->nodes[4].outputs[2].amount_sats;
+    memcpy(old_leaf_txid, leaf_at_epoch0->txid, 32);
+    uint64_t old_l_amount = leaf_at_epoch0->outputs[2].amount_sats;
 
     /* Advance to epoch 1 */
     TEST_ASSERT(factory_advance(f), "advance to epoch 1");
     TEST_ASSERT_EQ(f->counter.current_epoch, 1, "epoch 1");
 
-    /* Get revocation secret for old epoch 0 */
+    /* Get revocation secret for old epoch 0 (still used for channel-level
+       revocation; the canonical t/1242 L-stock poison TX doesn't depend
+       on this). */
     unsigned char secret_epoch0[32];
     TEST_ASSERT(factory_get_revocation_secret(f, 0, secret_epoch0),
                 "get epoch 0 secret");
@@ -1095,13 +1101,17 @@ int test_factory_advance_with_shachain(void) {
     TEST_ASSERT(memcmp(secret_epoch0, expected, 32) == 0,
                 "epoch 0 secret matches shachain");
 
-    /* Build burn tx for epoch 0 using the old L-stock outpoint */
+    /* Build the L-stock poison TX for the old (epoch-0) state.  Pass the
+       leaf node + the saved old outpoint — the leaf node identifies signers
+       (stable across advances), the outpoint identifies the on-chain UTXO
+       being recovered from. */
     tx_buf_t burn_tx;
     tx_buf_init(&burn_tx, 256);
-    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, old_leaf_txid, 2,
+    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, leaf_at_epoch0,
+                                        old_leaf_txid, 2,
                                         old_l_amount, 0),
-                "build burn tx for epoch 0");
-    TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
+                "build poison tx for epoch 0 outpoint");
+    TEST_ASSERT(burn_tx.len > 0, "poison tx non-empty");
 
     /* Verify current (epoch 1) signatures are still valid */
     for (size_t i = 0; i < f->n_nodes; i++) {
@@ -1307,9 +1317,9 @@ int test_regtest_burn_tx(void) {
     uint64_t l_stock_amount = f->nodes[3].outputs[2].amount_sats;
     printf("  L-stock amount: %lu sats\n", (unsigned long)l_stock_amount);
 
-    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, f->nodes[3].txid, 2,
+    TEST_ASSERT(factory_build_burn_tx(f, &burn_tx, &f->nodes[3], f->nodes[3].txid, 2,
                                         l_stock_amount, f->counter.current_epoch),
-                "build burn tx");
+                "build poison tx");
     TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
 
     /* Broadcast burn tx */
@@ -3290,10 +3300,12 @@ int test_factory_flat_secrets_round_trip(void) {
     /* Build burn tx for old epoch 0 */
     tx_buf_t burn;
     tx_buf_init(&burn, 256);
-    /* Use leaf state node's txid as dummy l_stock_txid */
-    TEST_ASSERT(factory_build_burn_tx(f, &burn,
-                f->nodes[4].txid, 2, 1000, 0), "burn tx epoch 0");
-    TEST_ASSERT(burn.len > 0, "burn tx has data");
+    /* Use a real leaf state node (via leaf_node_indices, not hardcoded
+       index).  Bump amount to 100k so the per-client split clears dust. */
+    factory_node_t *leaf_for_burn = &f->nodes[f->leaf_node_indices[0]];
+    TEST_ASSERT(factory_build_burn_tx(f, &burn, leaf_for_burn,
+                leaf_for_burn->txid, 2, 100000, 0), "poison tx epoch 0");
+    TEST_ASSERT(burn.len > 0, "poison tx has data");
     tx_buf_free(&burn);
 
     factory_free(f);
