@@ -490,7 +490,21 @@ lightning-cli plugin list | grep cln_plugin
 | Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
 | "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |
 
-## 11. Factory Rotation
+## 11. JIT operations and rollback
+
+Buy-liquidity, leaf reallocation, and bridge HTLC forwarding can all
+fail mid-flight (e.g. a client times out during the realloc MuSig
+ceremony, or a downstream BOLT-11 payment fails).  SuperScalar relies
+on **cut-through** for reconciliation rather than a per-realloc undo
+hashlock — the on-chain factory is never mutated mid-flight, so failed
+operations leave the factory at its last fully-signed state and the
+next legitimate state advance absorbs the gap.
+
+See [`docs/jit-and-rollback.md`](jit-and-rollback.md) for the full
+rollback contract per primitive (realloc, buy-liquidity, bridge HTLC,
+coop close).
+
+## 12. Factory Rotation
 
 Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before expiry, the LSP rotates to a new factory:
 
@@ -501,7 +515,7 @@ Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before
 
 This happens automatically in daemon mode when `--active-blocks` is reached. You can also trigger it manually with `--test-rotation` for testing.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
