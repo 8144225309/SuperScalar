@@ -159,19 +159,35 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const unsigned char *local_revoc_sec32,
                                  const unsigned char *local_htlc_sec32,
                                  fee_estimator_t *fee_est) {
-    /* Map client index to leaf output (arity-aware) */
-    size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
-    size_t node_idx;
-    uint32_t vout;
-    if (factory->leaf_arity == FACTORY_ARITY_1) {
-        if (client_idx >= (size_t)factory->n_leaf_nodes) return 0;
-        node_idx = factory->leaf_node_indices[client_idx];
-        vout = 0;
-    } else {
-        size_t leaf_idx = client_idx / 2;
-        if (leaf_idx >= (size_t)factory->n_leaf_nodes) return 0;
-        node_idx = factory->leaf_node_indices[leaf_idx];
-        vout = (uint32_t)(client_idx % 2);
+    /* Map client index to (leaf, vout) by walking leaves and matching
+       my_index against signer_indices[].  This works generically for any
+       arity (1, 2, PS, mixed-arity {2,4,8}, ...).  The legacy hard-coded
+       arity-1/arity-2 mapping was a holdover from before TRUE N-way leaves
+       (PR #161 updated the builder but not this consumer); with mixed-arity
+       leaves of size > 2 the legacy formula computes a leaf index that
+       doesn't even exist (and an output_idx that's wrong), so client_init
+       fails for every client whose true leaf has > 2 channels. */
+    size_t node_idx = (size_t)-1;
+    uint32_t vout = (uint32_t)-1;
+    for (int li = 0; li < factory->n_leaf_nodes; li++) {
+        size_t ni = factory->leaf_node_indices[li];
+        const factory_node_t *leaf = &factory->nodes[ni];
+        /* signer_indices[0] == 0 (LSP); clients occupy 1..n_signers-1.
+           Their leaf-output positions are 0..n_signers-2 (the L-stock
+           output is the last entry, after the per-channel outputs). */
+        for (size_t s = 1; s < leaf->n_signers; s++) {
+            if (leaf->signer_indices[s] == my_index) {
+                node_idx = ni;
+                vout = (uint32_t)(s - 1);
+                break;
+            }
+        }
+        if (node_idx != (size_t)-1) break;
+    }
+    if (node_idx == (size_t)-1) {
+        fprintf(stderr, "Client %u: not found in any leaf signer_indices\n",
+                my_index);
+        return 0;
     }
 
     const factory_node_t *state_node = &factory->nodes[node_idx];
