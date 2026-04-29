@@ -1001,6 +1001,11 @@ static const unsigned char bridge_seckeys[5][32] = {
 typedef struct {
     unsigned char payment_hash[32];
     unsigned char preimage[32];
+    /* my_index of the bridge payee.  Default 1 keeps the legacy N=5
+       single-payee behavior; tests that route to a non-leaf-0 client
+       (to exercise the LSP-side leaf mapping at mixed-arity scale)
+       set this to the target client's my_index (1-based). */
+    uint32_t payee_my_index;
 } bridge_payee_data_t;
 
 static int recv_skip_revocations_bridge(int fd, wire_msg_t *out) {
@@ -1020,8 +1025,11 @@ static int bridge_payee_cb(int fd, channel_t *ch, uint32_t my_index,
     bridge_payee_data_t *data = (bridge_payee_data_t *)user_data;
     (void)keypair; (void)factory; (void)n_participants;
 
-    if (my_index != 1) {
-        /* Only client 0 (index 1) is the payee. Others idle. */
+    /* The caller signals payee selection by setting payee_my_index = my
+       1-based slot.  Idle clients are passed a zero-initialized struct
+       (payee_my_index == 0); they immediately return without trying to
+       receive the bridge HTLC. */
+    if (data->payee_my_index == 0 || my_index != data->payee_my_index) {
         return 1;
     }
 
@@ -1202,8 +1210,10 @@ int test_regtest_bridge_payment(void) {
 
     /* Prepare per-client callback data */
     bridge_payee_data_t payee_data;
+    memset(&payee_data, 0, sizeof(payee_data));
     memcpy(payee_data.payment_hash, payment_hash, 32);
     memcpy(payee_data.preimage, preimage, 32);
+    payee_data.payee_my_index = 1;  /* client 0 is the payee in this N=5 test */
 
     bridge_payee_data_t idle_data;
     memset(&idle_data, 0, sizeof(idle_data));
@@ -2379,16 +2389,23 @@ static void init_n64_bridge_seckeys(void) {
     }
 }
 
-int test_regtest_bridge_payment_n64_mixed_arity(void) {
+/* Internal helper — single function body, parameterized by payee_client_idx
+   (0-based) and a wallet/port-bias label so the two thin wrappers below can
+   exercise the cross-leaf LSP-side mapping without colliding. */
+static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
+                                                const char *wallet_label,
+                                                int port_bias) {
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  FAIL: regtest not available\n");
         return 0;
     }
-    if (!regtest_create_wallet(&rt, "test_bridge_n64")) {
-        char *lr = regtest_exec(&rt, "loadwallet", "\"test_bridge_n64\"");
+    if (!regtest_create_wallet(&rt, wallet_label)) {
+        char loadparam[128];
+        snprintf(loadparam, sizeof(loadparam), "\"%s\"", wallet_label);
+        char *lr = regtest_exec(&rt, "loadwallet", loadparam);
         if (lr) free(lr);
-        strncpy(rt.wallet, "test_bridge_n64", sizeof(rt.wallet) - 1);
+        strncpy(rt.wallet, wallet_label, sizeof(rt.wallet) - 1);
     }
     /* Tree depth ~3 with up to 80+ nodes; bump scan depth so close output
        lookups don't miss deep history on hosts without -txindex. */
@@ -2490,7 +2507,7 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
     unsigned char payment_hash[32];
     sha256(preimage, 32, payment_hash);
 
-    int lsp_port = 19900 + (getpid() % 1000);
+    int lsp_port = 19900 + port_bias + (getpid() % 1000);
 
     /* Pre-bind the LSP listen socket BEFORE forking so the 64 children
        don't race ahead of accept_clients.  Without this, children that
@@ -2504,6 +2521,7 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
     bridge_payee_data_t payee_data;
     memcpy(payee_data.payment_hash, payment_hash, 32);
     memcpy(payee_data.preimage, preimage, 32);
+    payee_data.payee_my_index = (uint32_t)(payee_client_idx + 1);  /* 1-based */
     bridge_payee_data_t idle_data;
     memset(&idle_data, 0, sizeof(idle_data));
 
@@ -2524,8 +2542,8 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
                                            N64_BRIDGE_SECKEYS[c + 1]))
                 _exit(1);
 
-            /* Only client 0 (my_index == 1) is the bridge payee. */
-            void *cb_data = (c == 0) ? (void *)&payee_data : (void *)&idle_data;
+            void *cb_data = ((size_t)c == payee_client_idx)
+                ? (void *)&payee_data : (void *)&idle_data;
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", lsp_port,
                                                bridge_payee_cb, cb_data,
@@ -2619,9 +2637,10 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
         } else {
             ch_mgr.bridge_fd = sv[0];
 
-            /* Register invoice routed to client 0 (channel 0). */
-            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage, 0,
-                                           5000000);
+            /* Register invoice routed to the configured payee channel.
+               channel index = client index (0-based). */
+            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage,
+                                           payee_client_idx, 5000000);
 
             cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000,
                                                      600, 1);
@@ -2728,4 +2747,23 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
     free(pks);
     secp256k1_context_destroy(ctx);
     return lsp_ok;
+}
+
+/* Original test: route to client 0.  Client 0 lives in leaf 0; both the
+   legacy `client_idx/2` formula and the mixed-arity walk-leaves logic
+   produce the same (leaf 0, vout 0) for client 0, so this case alone
+   doesn't catch LSP/client divergence in the leaf mapping. */
+int test_regtest_bridge_payment_n64_mixed_arity(void) {
+    return run_bridge_payment_n64_mixed_arity(0, "test_bridge_n64", 0);
+}
+
+/* Cross-leaf coverage: route to client 8.  At N=64 mixed-arity {2,4,8} the
+   first leaf holds clients 0..7; client 8 is the FIRST client of the
+   SECOND leaf.  This exercises the LSP-side leaf mapping path that the
+   client-0 case skips — without the matching mixed-arity fix in
+   src/lsp_channels.c::client_to_leaf the LSP and client end up on
+   DIFFERENT leaves, MuSig commitment sigs fail to verify, and the
+   bridge HTLC never fulfills. */
+int test_regtest_bridge_payment_n64_mixed_arity_client8(void) {
+    return run_bridge_payment_n64_mixed_arity(8, "test_bridge_n64_c8", 200);
 }
