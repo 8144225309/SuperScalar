@@ -6514,7 +6514,39 @@ int test_factory_client_to_leaf_roundtrip(void) {
         factory_free(f); free(f);
     }
 
-    /* Shape 3: mixed-arity {2,4} at N=12.  Walk-leaves path; 2-of-3
+    /* Shape 3: ARITY_PS at N=4 — each client owns its own PS leaf at
+       vout 0 (chain root).  Catches the legacy formula bug where PS got
+       the arity-2 mapping (`client_idx/2`), which silently mapped clients
+       1,3 to L-stock outputs (LSP-only) instead of their channel slots. */
+    {
+        secp256k1_keypair kps[5];
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(f, "alloc PS factory");
+        ensure_seckeys_n();
+        for (int i = 0; i < 5; i++)
+            TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]),
+                        "kp PS");
+        factory_init(f, ctx, kps, 5, 2, 4);
+        factory_set_arity(f, FACTORY_ARITY_PS);
+        unsigned char fake_txid[32]; memset(fake_txid, 0xDD, 32);
+        unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
+        TEST_ASSERT(factory_build_tree(f), "build PS tree");
+
+        /* Spot-check: client i → leaf i, vout 0 (no client_idx/2 packing). */
+        for (size_t c = 0; c < 4; c++) {
+            size_t ni = (size_t)-1; uint32_t vo = (uint32_t)-1;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vo), "PS lookup");
+            TEST_ASSERT_EQ(ni, f->leaf_node_indices[c],
+                           "PS client→own leaf");
+            TEST_ASSERT_EQ(vo, 0, "PS vout=0 (chain root)");
+        }
+        TEST_ASSERT(verify_client_to_leaf_roundtrip(f, 4, "ARITY_PS N=4"),
+                    "PS round-trip");
+        factory_free(f); free(f);
+    }
+
+    /* Shape 4: mixed-arity {2,4} at N=12.  Walk-leaves path; 2-of-3
        sub-trees of arity-4 leaves. */
     {
         secp256k1_keypair kps[12];
