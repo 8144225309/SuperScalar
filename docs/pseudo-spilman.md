@@ -181,3 +181,10 @@ Cross-references for the test cases that pin this contract:
 If you change PS leaf construction, the double-spend check, or the
 persist schema, run all four. They are the contract test suite for this
 doc.
+
+## See also
+
+- [`docs/jit-and-rollback.md`](jit-and-rollback.md) — what happens when
+  a JIT operation (buy-liquidity, realloc, bridge HTLC) fails partway
+  through.  Per zmn's t/1242, SuperScalar uses **cut-through** as the
+  reconciliation mechanism, not a per-realloc rollback hashlock.
