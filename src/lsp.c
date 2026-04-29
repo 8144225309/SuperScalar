@@ -290,6 +290,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
         memcpy(saved_level_arity, f->level_arity,
                saved_n_level_arity * sizeof(uint8_t));
     uint32_t saved_static_threshold = f->static_threshold_depth;
+    /* fee_per_tx must also survive: the N=64 mixed-arity factory needs
+       1000 sats/tx (interior state nodes are wider — 240+ vB — and 200
+       sats falls below regtest mempool min relay).  Preserving here lets
+       callers (CLI, tests) override the default before the ceremony. */
+    uint64_t saved_fee_per_tx = f->fee_per_tx;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
     participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
@@ -319,6 +324,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
        the DW counter shape based on f->level_arity / f->leaf_arity. */
     if (saved_static_threshold > 0)
         factory_set_static_near_root(f, saved_static_threshold);
+    /* Restore fee_per_tx if caller had bumped it above the init default.
+       factory_build_tree below may further override from the fee estimator
+       (see factory.c:1233), but in absence of an estimator this restore is
+       what lets tests (and CLI overrides) take effect. */
+    if (saved_fee_per_tx > 200)
+        f->fee_per_tx = saved_fee_per_tx;
     f->cltv_timeout = cltv_timeout;  /* set BEFORE build_tree for staggered taptrees */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;

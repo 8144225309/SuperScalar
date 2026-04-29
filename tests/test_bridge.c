@@ -2344,3 +2344,388 @@ int test_bridge_keysend_inbound(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- N=64 mixed-arity bridge payment (Campaign #3 canonical shape) ----
+ *
+ * Mirrors test_regtest_bridge_payment but on the production canonical shape
+ * (1 LSP + 64 clients, mixed-arity {2,4,8}, static_threshold=1).  Proves the
+ * bridge HTLC forward path works at N=64 over the wire ceremony AFTER the
+ * mixed-arity preservation fix (PR #115 + the fee_per_tx preservation in
+ * this PR) — before those fixes the LSP would silently build a uniform
+ * binary tree and clients would diverge on tree shape.
+ *
+ * One client (index 1, the "payee") receives a bridge ADD_HTLC from a
+ * simulated bridge daemon; the other 63 clients are idle.  We assert:
+ *   - factory builds with the configured shape (level_arity preserved,
+ *     static_threshold=1 root)
+ *   - bridge ADD_HTLC forwards to client 0, gets fulfilled with preimage
+ *   - cooperative close confirms with 65 outputs on chain
+ *
+ * Per-output sweep + econ_assert at this N is already covered by
+ * test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle (PR #112).
+ * This test focuses on the wire-ceremony + bridge HTLC path at scale.
+ */
+
+static unsigned char N64_BRIDGE_SECKEYS[65][32];
+
+static void init_n64_bridge_seckeys(void) {
+    /* 0xFC prefix to avoid colliding with N64_SECKEYS (0xFD), N32 (0xFE),
+       and the 4-client bridge_seckeys (0x10/0x21/0x32/0x43/0x54). */
+    for (int i = 0; i < 65; i++) {
+        memset(N64_BRIDGE_SECKEYS[i], 0, 32);
+        N64_BRIDGE_SECKEYS[i][0] = 0xFC;
+        N64_BRIDGE_SECKEYS[i][30] = (unsigned char)((i + 1) >> 8);
+        N64_BRIDGE_SECKEYS[i][31] = (unsigned char)((i + 1) & 0xFF);
+    }
+}
+
+int test_regtest_bridge_payment_n64_mixed_arity(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: regtest not available\n");
+        return 0;
+    }
+    if (!regtest_create_wallet(&rt, "test_bridge_n64")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_bridge_n64\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_bridge_n64", sizeof(rt.wallet) - 1);
+    }
+    /* Tree depth ~3 with up to 80+ nodes; bump scan depth so close output
+       lookups don't miss deep history on hosts without -txindex. */
+    rt.scan_depth = 1200;
+
+    init_n64_bridge_seckeys();
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    const size_t N = 65;  /* 1 LSP + 64 clients */
+    secp256k1_keypair *kps = calloc(N, sizeof(secp256k1_keypair));
+    secp256k1_pubkey  *pks = calloc(N, sizeof(secp256k1_pubkey));
+    if (!kps || !pks) return 0;
+    for (size_t i = 0; i < N; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], N64_BRIDGE_SECKEYS[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* N-of-N MuSig + taptweak P2TR funding SPK */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, N);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.10, "10M sats funding budget");
+
+    /* Fund 0.10 BTC = 10M sats. After ~80 nodes × 1000 sats tree fees,
+       each of 64 channels ends with ~150k sats — generous headroom for
+       commitment fee + dust limit + 5000 sat HTLC. */
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.10, funding_txid_hex),
+                "fund n64 factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "find n64 funding vout");
+
+    unsigned char preimage[32] = { [0 ... 31] = 0xCC };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    int lsp_port = 19900 + (getpid() % 1000);
+
+    /* Pre-bind the LSP listen socket BEFORE forking so the 64 children
+       don't race ahead of accept_clients.  Without this, children that
+       connect during the init/accept gap get ECONNREFUSED. */
+    int pre_listen_fd = wire_listen(NULL, lsp_port);
+    if (pre_listen_fd < 0) {
+        fprintf(stderr, "LSP-n64: wire_listen failed on port %d\n", lsp_port);
+        return 0;
+    }
+
+    bridge_payee_data_t payee_data;
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+    bridge_payee_data_t idle_data;
+    memset(&idle_data, 0, sizeof(idle_data));
+
+    /* Fork 64 client processes.  Stagger by 30ms so connect order is stable
+       (test_init defaults require_slot_hints=0, so order matters for keyagg). */
+    const int N_CLIENTS = 64;
+    pid_t *child_pids = calloc(N_CLIENTS, sizeof(pid_t));
+    if (!child_pids) return 0;
+    for (int c = 0; c < N_CLIENTS; c++) {
+        pid_t cpid = fork();
+        if (cpid == 0) {
+            close(pre_listen_fd);  /* child doesn't need the listen socket */
+            usleep(30000 * (unsigned)(c + 1));
+            secp256k1_context *child_ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp,
+                                           N64_BRIDGE_SECKEYS[c + 1]))
+                _exit(1);
+
+            /* Only client 0 (my_index == 1) is the bridge payee. */
+            void *cb_data = (c == 0) ? (void *)&payee_data : (void *)&idle_data;
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", lsp_port,
+                                               bridge_payee_cb, cb_data,
+                                               NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = cpid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], lsp_port, (size_t)N_CLIENTS);
+    /* Hand off the pre-bound listen socket so accept_clients doesn't try to
+       re-bind a port that's still in TIME_WAIT or held by a child. */
+    lsp->listen_fd = pre_listen_fd;
+    /* Generous per-handshake budget — accepting 64 clients with 30ms stagger
+       takes ~2s minimum; leave headroom for slow CI hosts. */
+    lsp->accept_timeout_sec = 30;
+    /* Default per-IP rate limiter (10/min, 4 concurrent handshakes) is way
+       too tight for 64 clients connecting from 127.0.0.1 in rapid succession.
+       Production CLI sets this via --max-connection-rate / --max-handshakes;
+       for the test we just override directly. */
+    rate_limiter_init(&lsp->rate_limiter, 256, 60, 128);
+    int lsp_ok = 1;
+
+    if (!lsp_accept_clients(lsp)) {
+        fprintf(stderr, "LSP-n64: accept clients failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Configure Campaign #3 canonical shape BEFORE lsp_run_factory_creation.
+       PR #115 made these survive the function's internal init reset; the
+       fee_per_tx preservation in this PR likewise lets 1000 sats/tx survive
+       (default 200 falls below regtest mempool min relay for wider state
+       nodes at this scale). */
+    if (lsp_ok) {
+        uint8_t arities[3] = { 2, 4, 8 };
+        factory_set_level_arity(&lsp->factory, arities, 3);
+        factory_set_static_near_root(&lsp->factory, 1);
+        lsp->factory.fee_per_tx = 1000;
+    }
+
+    if (lsp_ok && !lsp_run_factory_creation(lsp,
+                                             funding_txid, funding_vout,
+                                             funding_amount,
+                                             fund_spk, 34,
+                                             10, 4, 0)) {
+        fprintf(stderr, "LSP-n64: factory creation failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Verify the wire ceremony preserved the configured shape. */
+    if (lsp_ok) {
+        TEST_ASSERT_EQ(lsp->factory.n_level_arity, 3,
+                       "n64 mixed-arity preserved (n_level_arity=3)");
+        TEST_ASSERT_EQ(lsp->factory.static_threshold_depth, 1,
+                       "n64 static_threshold=1 preserved");
+        TEST_ASSERT(lsp->factory.fee_per_tx >= 1000,
+                    "n64 fee_per_tx >= 1000 preserved");
+        TEST_ASSERT(lsp->factory.n_leaf_nodes == 8,
+                    "n64 mixed {2,4,8} -> 8 leaves at depth 2");
+        printf("  [bridge-n64] factory: %zu nodes, %d leaves, fee_per_tx=%llu\n",
+               lsp->factory.n_nodes, lsp->factory.n_leaf_nodes,
+               (unsigned long long)lsp->factory.fee_per_tx);
+    }
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok) {
+        if (!lsp_channels_init(&ch_mgr, ctx, &lsp->factory,
+                                N64_BRIDGE_SECKEYS[0], (size_t)N_CLIENTS)) {
+            fprintf(stderr, "LSP-n64: channel init failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
+        fprintf(stderr, "LSP-n64: basepoint exchange failed\n");
+        lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) {
+        fprintf(stderr, "LSP-n64: send channel_ready failed\n");
+        lsp_ok = 0;
+    }
+
+    if (lsp_ok) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            fprintf(stderr, "LSP-n64: bridge socketpair failed\n");
+            lsp_ok = 0;
+        } else {
+            ch_mgr.bridge_fd = sv[0];
+
+            /* Register invoice routed to client 0 (channel 0). */
+            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage, 0,
+                                           5000000);
+
+            cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000,
+                                                     600, 1);
+            wire_send(sv[1], MSG_BRIDGE_ADD_HTLC, add);
+            cJSON_Delete(add);
+
+            /* Two iterations: bridge ADD_HTLC -> forward to client 0; then
+               client 0 FULFILL -> bridge FULFILL response. */
+            if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 2)) {
+                fprintf(stderr, "LSP-n64: event loop failed\n");
+                lsp_ok = 0;
+            }
+
+            if (lsp_ok) {
+                wire_msg_t fulfill_msg;
+                if (!wire_recv(sv[1], &fulfill_msg)) {
+                    fprintf(stderr, "Bridge-n64: recv fulfill failed\n");
+                    lsp_ok = 0;
+                } else {
+                    TEST_ASSERT_EQ(fulfill_msg.msg_type,
+                                   MSG_BRIDGE_FULFILL_HTLC,
+                                   "n64 fulfill msg type");
+                    unsigned char recv_ph[32], recv_pi[32];
+                    uint64_t recv_hid;
+                    TEST_ASSERT(wire_parse_bridge_fulfill_htlc(fulfill_msg.json,
+                                    recv_ph, recv_pi, &recv_hid),
+                                "n64 parse bridge fulfill");
+                    unsigned char check_hash[32];
+                    sha256(recv_pi, 32, check_hash);
+                    TEST_ASSERT_MEM_EQ(check_hash, payment_hash, 32,
+                                       "n64 preimage->hash valid");
+                    printf("Bridge-n64: preimage matches, fulfill received\n");
+                    cJSON_Delete(fulfill_msg.json);
+                }
+            }
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+
+    /* Cooperative close: 65 equal-share outputs to the funding SPK
+       (we're not exercising per-party deltas here — that's covered by
+       the dedicated N=64 lifecycle tests). */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 5000;  /* 5000 sat fee */
+        size_t n_total = N;
+        uint64_t per_party = close_total / n_total;
+
+        tx_output_t *close_outputs = calloc(n_total, sizeof(tx_output_t));
+        if (!close_outputs) lsp_ok = 0;
+        if (lsp_ok) {
+            for (size_t i = 0; i < n_total; i++) {
+                close_outputs[i].amount_sats = per_party;
+                memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+                close_outputs[i].script_pubkey_len = 34;
+            }
+            close_outputs[n_total - 1].amount_sats =
+                close_total - per_party * (n_total - 1);
+
+            tx_buf_t close_tx;
+            tx_buf_init(&close_tx, 4096);
+
+            if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
+                                            n_total, 0)) {
+                fprintf(stderr, "LSP-n64: cooperative close failed\n");
+                lsp_ok = 0;
+            } else {
+                char *close_hex = malloc(close_tx.len * 2 + 1);
+                if (close_hex) {
+                    hex_encode(close_tx.data, close_tx.len, close_hex);
+                    char close_txid[65];
+                    if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                        regtest_mine_blocks(&rt, 1, mine_addr);
+                        printf("Bridge-n64: coop close confirmed (%s)\n",
+                               close_txid);
+                    } else {
+                        fprintf(stderr, "LSP-n64: broadcast close tx failed\n");
+                        lsp_ok = 0;
+                    }
+                    free(close_hex);
+                }
+            }
+            tx_buf_free(&close_tx);
+            free(close_outputs);
+        }
+    }
+
+    /* Wait for all 64 children */
+    for (int c = 0; c < N_CLIENTS; c++) {
+        int status;
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "Child client %d (n64) failed (status=%d)\n", c,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            lsp_ok = 0;
+        }
+    }
+    free(child_pids);
+
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    free(kps);
+    free(pks);
+    secp256k1_context_destroy(ctx);
+    return lsp_ok;
+}

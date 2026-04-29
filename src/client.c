@@ -159,11 +159,42 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const unsigned char *local_revoc_sec32,
                                  const unsigned char *local_htlc_sec32,
                                  fee_estimator_t *fee_est) {
-    /* Map client index to leaf output (arity-aware) */
+    /* Map client index to leaf output (arity-aware).
+       Mixed-arity (n_level_arity > 0) leaves can hold up to 8 channels,
+       so the legacy `leaf_idx = client_idx / 2; vout = client_idx % 2`
+       formula computes a leaf index that may not exist (and an output_idx
+       that's wrong).  For mixed-arity, walk leaves and match my_index
+       against signer_indices[]; the in-leaf position becomes the vout.
+       For uniform arities (ARITY_1, ARITY_2, ARITY_PS), keep the legacy
+       formula — PS leaves rely on a shared-leaf chain semantic that the
+       walk-leaves approach would not reproduce. */
     size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
     size_t node_idx;
     uint32_t vout;
-    if (factory->leaf_arity == FACTORY_ARITY_1) {
+    if (factory->n_level_arity > 0) {
+        node_idx = (size_t)-1;
+        vout = (uint32_t)-1;
+        for (int li = 0; li < factory->n_leaf_nodes; li++) {
+            size_t ni = factory->leaf_node_indices[li];
+            const factory_node_t *leaf = &factory->nodes[ni];
+            /* signer_indices[0] == 0 (LSP); clients occupy 1..n_signers-1.
+               Their leaf-output positions are 0..n_signers-2 (L-stock
+               output is the last entry, after the per-channel outputs). */
+            for (size_t s = 1; s < leaf->n_signers; s++) {
+                if (leaf->signer_indices[s] == my_index) {
+                    node_idx = ni;
+                    vout = (uint32_t)(s - 1);
+                    break;
+                }
+            }
+            if (node_idx != (size_t)-1) break;
+        }
+        if (node_idx == (size_t)-1) {
+            fprintf(stderr, "Client %u: not found in any mixed-arity leaf "
+                    "signer_indices\n", my_index);
+            return 0;
+        }
+    } else if (factory->leaf_arity == FACTORY_ARITY_1) {
         if (client_idx >= (size_t)factory->n_leaf_nodes) return 0;
         node_idx = factory->leaf_node_indices[client_idx];
         vout = 0;
