@@ -6373,3 +6373,182 @@ int test_factory_static_near_root_backward_compat(void) {
     free(f_b);
     return 1;
 }
+
+/* factory_client_to_leaf — canonical helper round-trip across every
+   supported factory shape.  Catches the bug class fixed in PRs #116/#117
+   (divergent open-coded mappings on the LSP and client sides) by asserting
+   that every client maps to a (node_idx, vout) that:
+     - points to an existing leaf node
+     - has vout < leaf->n_outputs
+     - leaf's signer_indices contains client_idx + 1 (the LSP-side check).
+   And that the mapping is 1:1 (no two clients land on the same slot).
+
+   Verifies arity-1, arity-2, mixed-arity {2,4}, mixed-arity {2,4,8}.
+   PS isn't covered here because factory_set_arity(PS) shares the
+   ARITY_2 codepath; the dedicated PS regtest tests
+   (test_regtest_multi_payment_arity_ps) exercise it end-to-end. */
+static int verify_client_to_leaf_roundtrip(factory_t *f, size_t n_clients,
+                                            const char *label) {
+    /* Track which (node_idx, vout) pairs have been assigned. */
+    typedef struct { size_t node; uint32_t vout; int taken; } slot_t;
+    slot_t *taken = calloc(n_clients * 2, sizeof(slot_t));
+    if (!taken) return 0;
+
+    for (size_t c = 0; c < n_clients; c++) {
+        size_t node_idx = (size_t)-1;
+        uint32_t vout = (uint32_t)-1;
+        if (!factory_client_to_leaf(f, c, &node_idx, &vout)) {
+            fprintf(stderr, "[%s] client %zu: factory_client_to_leaf returned 0\n",
+                    label, c);
+            free(taken);
+            return 0;
+        }
+        if (node_idx >= f->n_nodes) {
+            fprintf(stderr, "[%s] client %zu: node_idx %zu out of range\n",
+                    label, c, node_idx);
+            free(taken);
+            return 0;
+        }
+        const factory_node_t *leaf = &f->nodes[node_idx];
+        if (vout >= leaf->n_outputs) {
+            fprintf(stderr, "[%s] client %zu: vout %u >= leaf n_outputs %zu\n",
+                    label, c, vout, leaf->n_outputs);
+            free(taken);
+            return 0;
+        }
+
+        /* Mixed-arity sanity: signer_indices should contain my_index. */
+        if (f->n_level_arity > 0) {
+            uint32_t my_index = (uint32_t)(c + 1);
+            int found = 0;
+            for (size_t s = 1; s < leaf->n_signers; s++) {
+                if (leaf->signer_indices[s] == my_index) { found = 1; break; }
+            }
+            if (!found) {
+                fprintf(stderr, "[%s] client %zu: my_index=%u not in leaf "
+                        "signer_indices\n", label, c, my_index);
+                free(taken);
+                return 0;
+            }
+        }
+
+        /* 1:1 check */
+        for (size_t k = 0; k < n_clients * 2; k++) {
+            if (taken[k].taken &&
+                taken[k].node == node_idx && taken[k].vout == vout) {
+                fprintf(stderr, "[%s] client %zu collides with prior client "
+                        "at (node=%zu, vout=%u)\n", label, c, node_idx, vout);
+                free(taken);
+                return 0;
+            }
+        }
+        for (size_t k = 0; k < n_clients * 2; k++) {
+            if (!taken[k].taken) {
+                taken[k].node = node_idx;
+                taken[k].vout = vout;
+                taken[k].taken = 1;
+                break;
+            }
+        }
+    }
+    free(taken);
+    return 1;
+}
+
+int test_factory_client_to_leaf_roundtrip(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    /* Shape 1: arity-1 at N=4 — each client owns its own leaf at vout 0. */
+    {
+        secp256k1_keypair kps[5];
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(f, "alloc arity-1 factory");
+        ensure_seckeys_n();
+        for (int i = 0; i < 5; i++)
+            TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]),
+                        "kp arity-1");
+        factory_init(f, ctx, kps, 5, 2, 4);
+        factory_set_arity(f, FACTORY_ARITY_1);
+        unsigned char fake_txid[32]; memset(fake_txid, 0xBB, 32);
+        unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
+        TEST_ASSERT(factory_build_tree(f), "build arity-1 tree");
+
+        /* Spot-check known mapping: client i → leaf i, vout 0. */
+        for (size_t c = 0; c < 4; c++) {
+            size_t ni = (size_t)-1; uint32_t vo = (uint32_t)-1;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vo), "arity-1 lookup");
+            TEST_ASSERT_EQ(ni, f->leaf_node_indices[c], "arity-1 client→leaf");
+            TEST_ASSERT_EQ(vo, 0, "arity-1 vout=0");
+        }
+        TEST_ASSERT(verify_client_to_leaf_roundtrip(f, 4, "arity-1 N=4"),
+                    "arity-1 round-trip");
+        factory_free(f); free(f);
+    }
+
+    /* Shape 2: arity-2 at N=4 — legacy formula, 2 clients per leaf. */
+    {
+        secp256k1_keypair kps[5];
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(f, "alloc arity-2 factory");
+        ensure_seckeys_n();
+        for (int i = 0; i < 5; i++)
+            TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys_n[i]),
+                        "kp arity-2");
+        factory_init(f, ctx, kps, 5, 2, 4);  /* default arity-2 */
+        unsigned char fake_txid[32]; memset(fake_txid, 0xCC, 32);
+        unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
+        TEST_ASSERT(factory_build_tree(f), "build arity-2 tree");
+
+        /* Spot-check: client 0 → leaf 0 vout 0, client 1 → leaf 0 vout 1, ... */
+        for (size_t c = 0; c < 4; c++) {
+            size_t ni = (size_t)-1; uint32_t vo = (uint32_t)-1;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vo), "arity-2 lookup");
+            TEST_ASSERT_EQ(ni, f->leaf_node_indices[c / 2],
+                           "arity-2 client→leaf");
+            TEST_ASSERT_EQ(vo, (uint32_t)(c % 2), "arity-2 vout");
+        }
+        TEST_ASSERT(verify_client_to_leaf_roundtrip(f, 4, "arity-2 N=4"),
+                    "arity-2 round-trip");
+        factory_free(f); free(f);
+    }
+
+    /* Shape 3: mixed-arity {2,4} at N=12.  Walk-leaves path; 2-of-3
+       sub-trees of arity-4 leaves. */
+    {
+        secp256k1_keypair kps[12];
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(f, "alloc mixed {2,4} factory");
+        uint8_t arities[2] = { 2, 4 };
+        TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 12, arities, 2,
+                                                  5000000),
+                    "setup mixed {2,4}");
+        TEST_ASSERT(factory_build_tree(f), "build mixed {2,4}");
+        TEST_ASSERT(verify_client_to_leaf_roundtrip(f, 11, "mixed {2,4} N=11"),
+                    "mixed {2,4} round-trip");
+        factory_free(f); free(f);
+    }
+
+    /* Shape 4: mixed-arity {2,4,8} at N=16.  Three-level fan-out with
+       arity-8 leaves. */
+    {
+        const size_t N = 17;  /* 1 LSP + 16 clients */
+        secp256k1_keypair *kps = calloc(N, sizeof(secp256k1_keypair));
+        factory_t *f = calloc(1, sizeof(factory_t));
+        TEST_ASSERT(kps && f, "alloc mixed {2,4,8} factory");
+        uint8_t arities[3] = { 2, 4, 8 };
+        TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, N, arities, 3,
+                                                  10000000),
+                    "setup mixed {2,4,8}");
+        TEST_ASSERT(factory_build_tree(f), "build mixed {2,4,8}");
+        TEST_ASSERT(verify_client_to_leaf_roundtrip(f, 16, "mixed {2,4,8} N=16"),
+                    "mixed {2,4,8} round-trip");
+        factory_free(f);
+        free(f);
+        free(kps);
+    }
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -689,6 +689,48 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
     *leaves_out = leaves;
 }
 
+int factory_client_to_leaf(const factory_t *f, size_t client_idx,
+                            size_t *node_idx_out, uint32_t *vout_out) {
+    if (!f || !node_idx_out || !vout_out) return 0;
+
+    if (f->n_level_arity > 0) {
+        /* Mixed-arity factories: walk leaves and match by signer_indices.
+           Leaves can hold up to 8 channels; the legacy formula below
+           computes leaves that may not exist and outputs that are wrong. */
+        uint32_t my_index = (uint32_t)(client_idx + 1);  /* signer_indices is 1-based */
+        for (int li = 0; li < f->n_leaf_nodes; li++) {
+            size_t ni = f->leaf_node_indices[li];
+            const factory_node_t *leaf = &f->nodes[ni];
+            for (size_t s = 1; s < leaf->n_signers; s++) {
+                if (leaf->signer_indices[s] == my_index) {
+                    *node_idx_out = ni;
+                    *vout_out = (uint32_t)(s - 1);
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (f->leaf_arity == FACTORY_ARITY_1) {
+        if (client_idx >= (size_t)f->n_leaf_nodes) return 0;
+        *node_idx_out = f->leaf_node_indices[client_idx];
+        *vout_out = 0;
+        return 1;
+    }
+
+    /* ARITY_2 (and ARITY_PS via shared-leaf chain semantic): 2 clients per
+       leaf, layout [vout 0 = client A's channel, vout 1 = client B's channel
+       or PS-chain second slot, vout 2 = L-stock when present]. */
+    {
+        size_t leaf_idx = client_idx / 2;
+        if (leaf_idx >= (size_t)f->n_leaf_nodes) return 0;
+        *node_idx_out = f->leaf_node_indices[leaf_idx];
+        *vout_out = (uint32_t)(client_idx % 2);
+        return 1;
+    }
+}
+
 void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
     if (n > FACTORY_MAX_LEVELS) n = FACTORY_MAX_LEVELS;
     memcpy(f->level_arity, arities, n);
