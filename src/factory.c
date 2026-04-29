@@ -712,16 +712,29 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
         return 0;
     }
 
-    if (f->leaf_arity == FACTORY_ARITY_1) {
+    /* ARITY_1 and ARITY_PS both build 1-client-per-leaf: ARITY_1 has a leaf
+       output of [vout 0 = client channel, vout 1 = L-stock]; ARITY_PS uses
+       [vout 0 = factory-consensus channel for the chain, vout 1 = L-stock]
+       with 1 client per leaf via setup_ps_leaf_outputs.  Both are looked up
+       the same way: client i owns leaf i, channel at vout 0.
+
+       Earlier versions of this helper conflated PS with arity-2 (2 clients
+       per leaf via `client_idx/2`), which silently broke ON-CHAIN ops for
+       any client beyond #0 in a PS factory: the channel keyagg got built
+       against the wrong leaf's L-stock SPK (LSP-only), so commitment sigs
+       could never verify on chain.  Off-chain payments still worked because
+       both sides agreed on the wrong keyagg, masking the bug — caught here
+       during the canonical-design audit (.claude/CANONICAL_DESIGN_GAPS.md
+       Gap E). */
+    if (f->leaf_arity == FACTORY_ARITY_1 || f->leaf_arity == FACTORY_ARITY_PS) {
         if (client_idx >= (size_t)f->n_leaf_nodes) return 0;
         *node_idx_out = f->leaf_node_indices[client_idx];
         *vout_out = 0;
         return 1;
     }
 
-    /* ARITY_2 (and ARITY_PS via shared-leaf chain semantic): 2 clients per
-       leaf, layout [vout 0 = client A's channel, vout 1 = client B's channel
-       or PS-chain second slot, vout 2 = L-stock when present]. */
+    /* ARITY_2: 2 clients per leaf, layout [vout 0 = client A's channel,
+       vout 1 = client B's channel, vout 2 = L-stock]. */
     {
         size_t leaf_idx = client_idx / 2;
         if (leaf_idx >= (size_t)f->n_leaf_nodes) return 0;
