@@ -117,23 +117,9 @@ static int build_musig_p2tr_spk(
     return 1;
 }
 
-/* Build P2TR spk for a single pubkey (no MuSig). */
-static int build_single_p2tr_spk(
-    const secp256k1_context *ctx,
-    unsigned char *spk_out34,
-    secp256k1_xonly_pubkey *tweaked_out,
-    const secp256k1_pubkey *pubkey
-) {
-    secp256k1_xonly_pubkey internal;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &internal, NULL, pubkey))
-        return 0;
-
-    if (!taproot_tweak_pubkey(ctx, tweaked_out, NULL, &internal, NULL))
-        return 0;
-
-    build_p2tr_script_pubkey(spk_out34, tweaked_out);
-    return 1;
-}
+/* (build_single_p2tr_spk removed — was only used by the legacy
+   shachain-hashlock L-stock SPK; the canonical or(N-of-N, L&CSV)
+   structure does not need it.) */
 
 /* Get nSequence for a node based on its type and DW layer.
    PS leaf state nodes always use 0xFFFFFFFE (BIP-68 disabled, anti-fee-snipe
@@ -230,58 +216,55 @@ static int add_node(
     return idx;
 }
 
-/* Build L-stock scriptPubKey.
-   If shachain is enabled: P2TR with key-path = LSP, script-path = hashlock.
-   If not: simple P2TR of LSP key. */
-static int build_l_stock_spk(const factory_t *f, unsigned char *spk_out34) {
-    if (f->has_shachain) {
-        unsigned char hash[32];
-        uint32_t epoch = f->counter.current_epoch;
+/* Build L-stock scriptPubKey per ZmnSCPxj's SuperScalar spec
+   (delvingbitcoin.org/t/1242).  Output is a P2TR with:
 
-        /* Use pre-computed hash if available (client side has hashes
-           but not secrets), otherwise derive from secret (LSP side). */
-        if (f->n_l_stock_hashes > 0) {
-            if (epoch >= f->n_l_stock_hashes) return 0;
-            memcpy(hash, f->l_stock_hashes[epoch], 32);
-        } else {
-            unsigned char secret[32];
-            if (f->use_flat_secrets) {
-                if (epoch >= f->n_revocation_secrets) return 0;
-                memcpy(secret, f->revocation_secrets[epoch], 32);
-            } else {
-                uint64_t sc_index = shachain_epoch_to_index(epoch);
-                shachain_from_seed(f->shachain_seed, sc_index, secret);
-            }
-            sha256(secret, 32, hash);
-            memset(secret, 0, 32);
-        }
+       key-path:    MuSig(LSP, all clients in this leaf)   "A & B & L"
+       script-leaf: <csv> CSV DROP <LSP_xonly> CHECKSIG    "L & CSV"
 
-        /* Build hashlock leaf */
-        tapscript_leaf_t hashlock_leaf;
-        tapscript_build_hashlock(&hashlock_leaf, hash);
+   The N-of-N key-path is what the pre-signed L-stock POISON transaction
+   uses to redirect L-stock value to clients if the LSP publishes a stale
+   leaf state.  The L&CSV script-path is the LSP's unilateral fallback —
+   gated by a CSV delay so clients / watchtowers have time to broadcast
+   the matching poison TX before the LSP can drain L-stock alone.
 
-        /* Compute merkle root from single leaf */
-        unsigned char merkle_root[32];
-        tapscript_merkle_root(merkle_root, &hashlock_leaf, 1);
+   Replaces the older shachain-hashlock-with-OP_RETURN-burn design from
+   t/1143 (which destroyed L-stock value on cheat detection rather than
+   redistributing it).  See docs/poison-tx.md and
+   .claude/CANONICAL_DESIGN_GAPS.md (Gap A + G).
 
-        /* Get LSP's xonly pubkey as internal key */
-        secp256k1_xonly_pubkey lsp_internal;
-        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_internal, NULL,
-                                                  &f->pubkeys[0]))
-            return 0;
+   Caller passes the leaf state node — `leaf_node->keyagg.agg_pubkey` is
+   the N-of-N internal key, `leaf_node->signer_indices[]` enumerates the
+   clients that will receive equal shares in the poison TX. */
+static int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
+                              unsigned char *spk_out34) {
+    if (!f || !leaf_node || !spk_out34) return 0;
 
-        /* Tweak with merkle root */
-        secp256k1_xonly_pubkey tweaked;
-        if (!tapscript_tweak_pubkey(f->ctx, &tweaked, NULL,
-                                     &lsp_internal, merkle_root))
-            return 0;
+    /* Internal key = leaf's N-of-N MuSig agg pubkey (LSP + all leaf clients). */
+    secp256k1_xonly_pubkey internal_key = leaf_node->keyagg.agg_pubkey;
 
-        build_p2tr_script_pubkey(spk_out34, &tweaked);
-    } else {
-        secp256k1_xonly_pubkey tw;
-        if (!build_single_p2tr_spk(f->ctx, spk_out34, &tw, &f->pubkeys[0]))
-            return 0;
-    }
+    /* Script-leaf: <csv_blocks> CSV DROP <LSP_xonly> CHECKSIG. */
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
+                                              &f->pubkeys[0]))
+        return 0;
+    uint32_t csv = f->l_stock_csv_blocks > 0
+                   ? f->l_stock_csv_blocks
+                   : L_STOCK_CSV_DEFAULT_BLOCKS;
+    tapscript_leaf_t csv_leaf;
+    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx))
+        return 0;
+
+    unsigned char merkle_root[32];
+    if (!tapscript_merkle_root(merkle_root, &csv_leaf, 1))
+        return 0;
+
+    secp256k1_xonly_pubkey tweaked;
+    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, NULL,
+                                 &internal_key, merkle_root))
+        return 0;
+
+    build_p2tr_script_pubkey(spk_out34, &tweaked);
     return 1;
 }
 
@@ -302,7 +285,7 @@ static int update_l_stock_outputs(factory_t *f) {
             continue;
 
         /* L-stock is always the last output */
-        if (!build_l_stock_spk(f, node->outputs[node->n_outputs - 1].script_pubkey))
+        if (!build_l_stock_spk(f, node, node->outputs[node->n_outputs - 1].script_pubkey))
             return 0;
     }
     return 1;
@@ -374,8 +357,8 @@ static int setup_leaf_outputs(
         node->outputs[1].amount_sats = per_output;
     }
 
-    /* L stock: LSP only, optionally with hashlock burn path */
-    if (!build_l_stock_spk(f, node->outputs[2].script_pubkey))
+    /* L-stock SPK: or(N-of-N keyagg, L&CSV) per ZmnSCPxj's t/1242 */
+    if (!build_l_stock_spk(f, node, node->outputs[2].script_pubkey))
         return 0;
     node->outputs[2].script_pubkey_len = 34;
     node->outputs[2].amount_sats = per_output + remainder;
@@ -689,6 +672,11 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
     *leaves_out = leaves;
 }
 
+void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks) {
+    if (!f) return;
+    f->l_stock_csv_blocks = csv_blocks;
+}
+
 int factory_client_to_leaf(const factory_t *f, size_t client_idx,
                             size_t *node_idx_out, uint32_t *vout_out) {
     if (!f || !node_idx_out || !vout_out) return 0;
@@ -842,8 +830,8 @@ static int setup_single_leaf_outputs(
         node->outputs[0].amount_sats = per_output;
     }
 
-    /* L stock: LSP only, optionally with hashlock burn path */
-    if (!build_l_stock_spk(f, node->outputs[1].script_pubkey))
+    /* L-stock SPK: or(N-of-N keyagg, L&CSV) per ZmnSCPxj's t/1242 */
+    if (!build_l_stock_spk(f, node, node->outputs[1].script_pubkey))
         return 0;
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
@@ -885,8 +873,8 @@ static int setup_ps_leaf_outputs(
     node->outputs[0].script_pubkey_len = node->spending_spk_len;
     node->outputs[0].amount_sats = per_output;
 
-    /* vout 1: L-stock */
-    if (!build_l_stock_spk(f, node->outputs[1].script_pubkey))
+    /* vout 1: L-stock SPK = or(N-of-N keyagg, L&CSV) per t/1242 */
+    if (!build_l_stock_spk(f, node, node->outputs[1].script_pubkey))
         return 0;
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
@@ -989,8 +977,8 @@ static int setup_nway_leaf_outputs(
         node->outputs[i].amount_sats = per_output;
     }
 
-    /* L-stock at LAST output (vout n_client) */
-    if (!build_l_stock_spk(f, node->outputs[n_client].script_pubkey))
+    /* L-stock at LAST output: or(N-of-N keyagg, L&CSV) per t/1242 */
+    if (!build_l_stock_spk(f, node, node->outputs[n_client].script_pubkey))
         return 0;
     node->outputs[n_client].script_pubkey_len = 34;
     node->outputs[n_client].amount_sats = per_output + remainder;
@@ -1863,7 +1851,7 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     if (node->n_outputs < 2)
         return 1;
 
-    return build_l_stock_spk(f, node->outputs[node->n_outputs - 1].script_pubkey);
+    return build_l_stock_spk(f, node, node->outputs[node->n_outputs - 1].script_pubkey);
 }
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
@@ -2081,104 +2069,303 @@ int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
     return 1;
 }
 
-int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
+int factory_build_burn_tx(factory_t *f, tx_buf_t *burn_tx_out,
+                           const factory_node_t *leaf_node,
                            const unsigned char *l_stock_txid,
                            uint32_t l_stock_vout,
                            uint64_t l_stock_amount,
                            uint32_t epoch) {
-    (void)l_stock_amount;
-    if (!f->has_shachain)
+    /* Backward-compat shim: the legacy (t/1143) "burn-as-fee" OP_RETURN
+       design has been superseded by the canonical t/1242 per-client
+       distribution.  Caller passes leaf_node directly (since after a
+       state advance, leaf_node->txid points to the NEW state's tx, not
+       the OLD one we need to poison). */
+    (void)epoch;  /* obsolete — N-of-N MuSig replaces per-epoch hashlock */
+    if (!f || !burn_tx_out || !leaf_node || !l_stock_txid) return 0;
+
+    /* Fee: small fixed value (1000 sats), matches our N=64 mixed-arity
+       fee_per_tx policy.  Clients can CPFP if mempool fees rise. */
+    return factory_sign_l_stock_poison_tx(
+        f, leaf_node, l_stock_txid, l_stock_vout, l_stock_amount,
+        /* fee_sats */ 1000, burn_tx_out);
+}
+
+/* ============================================================================
+ * L-stock POISON TRANSACTION (canonical SuperScalar t/1242 design)
+ *
+ * Per ZmnSCPxj:
+ *   "Channel with A: entirely goes to A.  Channel with B: entirely goes to B.
+ *    LSP liquidity stock: split: 10 units go to A. 10 units go to B."
+ *
+ * The poison TX redistributes a leaf state's L-stock UTXO to the leaf's
+ * non-LSP signers in equal shares.  Pre-signed at leaf-state-advance time
+ * via the L-stock SPK's N-of-N key-path (A&B&L MuSig); broadcast (by any
+ * client or watchtower) if the LSP publishes a stale leaf state on chain.
+ *
+ * Spec source: delvingbitcoin.org/t/1242 (newer canonical SuperScalar
+ * design — supersedes the t/1143 OP_RETURN burn-as-fee approach).
+ * ============================================================================ */
+
+/* Compute the equal-split distribution amount per non-LSP signer.
+   Subtracts the fee from the total L-stock value, then divides equally.
+   Any rounding remainder goes to the LAST recipient.
+   Returns 1 on success; 0 if the result would be < dust. */
+static int compute_l_stock_poison_per_client(
+    uint64_t l_stock_amount_sats, uint64_t fee_sats, size_t n_clients,
+    uint64_t *per_client_out, uint64_t *last_client_extra_out)
+{
+    if (n_clients == 0) return 0;
+    if (l_stock_amount_sats <= fee_sats) return 0;
+    uint64_t output_total = l_stock_amount_sats - fee_sats;
+    uint64_t per_client = output_total / (uint64_t)n_clients;
+    /* Dust limit on P2TR is 330 sats per Bitcoin Core policy (CDustLimit
+       for SegWit v1).  CHANNEL_DUST_LIMIT_SATS is the conservative 546
+       used elsewhere in this codebase; reuse it. */
+    if (per_client < CHANNEL_DUST_LIMIT_SATS) return 0;
+    uint64_t accounted = per_client * (uint64_t)n_clients;
+    *per_client_out = per_client;
+    *last_client_extra_out = output_total - accounted;
+    return 1;
+}
+
+int factory_build_l_stock_poison_tx_unsigned(
+    const factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    tx_buf_t *poison_tx_out,
+    unsigned char *sighash_out32)
+{
+    if (!f || !leaf_node || !l_stock_txid32 || !poison_tx_out) return 0;
+    /* leaf_node->n_signers includes LSP (signer_indices[0] == 0).  The
+       poison TX pays each non-LSP signer; n_clients = n_signers - 1. */
+    if (leaf_node->n_signers < 2) return 0;
+    size_t n_clients = leaf_node->n_signers - 1;
+
+    uint64_t per_client = 0, last_extra = 0;
+    if (!compute_l_stock_poison_per_client(l_stock_amount_sats, fee_sats,
+                                            n_clients, &per_client, &last_extra))
         return 0;
 
-    /* 1. Derive revocation secret for the given epoch */
-    unsigned char secret[32];
-    if (f->use_flat_secrets) {
-        if (epoch >= f->n_revocation_secrets) return 0;
-        memcpy(secret, f->revocation_secrets[epoch], 32);
-    } else {
-        uint64_t sc_index = shachain_epoch_to_index(epoch);
-        shachain_from_seed(f->shachain_seed, sc_index, secret);
+    /* Build per-client P2TR(client_xonly) outputs.  Each non-LSP signer gets
+       a key-path-only P2TR of their own pubkey — they sweep with their own
+       seckey alone, no MuSig coordination needed. */
+    tx_output_t *outputs = (tx_output_t *)calloc(n_clients, sizeof(tx_output_t));
+    if (!outputs) return 0;
+    for (size_t i = 0; i < n_clients; i++) {
+        uint32_t signer_idx = leaf_node->signer_indices[1 + i];  /* skip LSP at [0] */
+        if (signer_idx >= f->n_participants) { free(outputs); return 0; }
+
+        secp256k1_xonly_pubkey client_xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &client_xonly, NULL,
+                                                  &f->pubkeys[signer_idx])) {
+            free(outputs);
+            return 0;
+        }
+        secp256k1_xonly_pubkey tweaked;
+        if (!taproot_tweak_pubkey(f->ctx, &tweaked, NULL, &client_xonly, NULL)) {
+            free(outputs);
+            return 0;
+        }
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &tweaked);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = per_client;
+    }
+    outputs[n_clients - 1].amount_sats += last_extra;
+
+    /* Build the unsigned TX — single input from L-stock outpoint, nSequence
+       0xFFFFFFFE (BIP-68 disabled; the CSV gate is on the script-path leaf,
+       not on this key-path spend).  Zmn's quote: "any client can trivially
+       CPFP the 'poisoning' transaction" — so we don't add a fee output, the
+       fee is paid by the input/output delta. */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    if (!build_unsigned_tx(&unsigned_tx, NULL, l_stock_txid32, l_stock_vout,
+                            0xFFFFFFFEu, outputs, n_clients)) {
+        tx_buf_free(&unsigned_tx);
+        free(outputs);
+        return 0;
     }
 
-    /* 2. Compute SHA256(secret) -> hashlock hash */
-    unsigned char hash[32];
-    sha256(secret, 32, hash);
+    /* Compute the BIP-341 keypath sighash against the L-stock SPK.  This
+       sighash will be MuSig-signed by all leaf signers (LSP + clients). */
+    unsigned char l_stock_spk[34];
+    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) {
+        tx_buf_free(&unsigned_tx);
+        free(outputs);
+        return 0;
+    }
+    if (sighash_out32) {
+        if (!compute_taproot_sighash(sighash_out32, unsigned_tx.data,
+                                       unsigned_tx.len, 0,
+                                       l_stock_spk, 34,
+                                       l_stock_amount_sats,
+                                       0xFFFFFFFEu)) {
+            tx_buf_free(&unsigned_tx);
+            free(outputs);
+            return 0;
+        }
+    }
 
-    /* 3. Build hashlock tapscript leaf */
-    tapscript_leaf_t hashlock_leaf;
-    tapscript_build_hashlock(&hashlock_leaf, hash);
+    /* Caller owns the unsigned TX bytes. */
+    tx_buf_reset(poison_tx_out);
+    tx_buf_write_bytes(poison_tx_out, unsigned_tx.data, unsigned_tx.len);
+    tx_buf_free(&unsigned_tx);
+    free(outputs);
+    return 1;
+}
 
-    /* 4. Compute merkle root from single leaf */
-    unsigned char merkle_root[32];
-    tapscript_merkle_root(merkle_root, &hashlock_leaf, 1);
-
-    /* 5. Get LSP's xonly pubkey (internal key), tweak, get parity */
-    secp256k1_xonly_pubkey lsp_internal;
-    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_internal, NULL,
-                                              &f->pubkeys[0]))
+/* Internal helper: cooperatively N-of-N MuSig-sign a single-input TX
+   that spends an L-stock UTXO to a caller-supplied output set.  The
+   poison TX and the cooperative-spend public APIs both delegate here. */
+static int sign_l_stock_spend_with_outputs(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    const tx_output_t *outputs, size_t n_outputs,
+    tx_buf_t *signed_out)
+{
+    if (!f || !leaf_node || !l_stock_txid32 || !outputs || n_outputs == 0
+        || !signed_out)
         return 0;
 
-    secp256k1_xonly_pubkey tweaked;
-    int parity = 0;
-    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity,
-                                 &lsp_internal, merkle_root))
-        return 0;
-
-    /* 6. Build control block (33 bytes: leaf_version|parity || internal_key) */
-    unsigned char control_block[33];
-    size_t cb_len = 0;
-    if (!tapscript_build_control_block(control_block, &cb_len, parity,
-                                        &lsp_internal, f->ctx))
-        return 0;
-
-    /* 7. Build unsigned burn tx:
-       Input: L-stock outpoint, nSequence = 0xFFFFFFFE
-       Output: OP_RETURN with hashlock hash as data (ensures stripped tx >= 82 bytes) */
-    tx_output_t burn_output;
-    burn_output.amount_sats = 0;
-    burn_output.script_pubkey[0] = 0x6a;  /* OP_RETURN */
-    burn_output.script_pubkey[1] = 0x20;  /* OP_PUSHBYTES_32 */
-    memcpy(burn_output.script_pubkey + 2, hash, 32);
-    burn_output.script_pubkey_len = 34;
-
+    /* 1. Build the unsigned TX. */
     tx_buf_t unsigned_tx;
-    tx_buf_init(&unsigned_tx, 128);
-    if (!build_unsigned_tx(&unsigned_tx, NULL,
-                            l_stock_txid, l_stock_vout,
-                            0xFFFFFFFEu,
-                            &burn_output, 1)) {
+    tx_buf_init(&unsigned_tx, 256);
+    if (!build_unsigned_tx(&unsigned_tx, NULL, l_stock_txid32, l_stock_vout,
+                            0xFFFFFFFEu, outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
 
-    /* 8. Build witness: 3 items [preimage(32), script(37), control_block(33)] */
-    tx_buf_reset(burn_tx_out);
+    /* 2. Compute BIP-341 keypath sighash against the L-stock SPK. */
+    unsigned char l_stock_spk[34];
+    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                   0, l_stock_spk, 34, l_stock_amount_sats,
+                                   0xFFFFFFFEu)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
 
-    /* nVersion */
-    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data, 4);
-    /* segwit marker + flag */
-    tx_buf_write_u8(burn_tx_out, 0x00);
-    tx_buf_write_u8(burn_tx_out, 0x01);
-    /* inputs + outputs (between nVersion and nLockTime) */
-    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data + 4,
-                        unsigned_tx.len - 8);
-    /* witness: 3 items */
-    tx_buf_write_varint(burn_tx_out, 3);
-    /* Item 1: preimage (32 bytes) */
-    tx_buf_write_varint(burn_tx_out, 32);
-    tx_buf_write_bytes(burn_tx_out, secret, 32);
-    /* Item 2: script */
-    tx_buf_write_varint(burn_tx_out, hashlock_leaf.script_len);
-    tx_buf_write_bytes(burn_tx_out, hashlock_leaf.script, hashlock_leaf.script_len);
-    /* Item 3: control block */
-    tx_buf_write_varint(burn_tx_out, cb_len);
-    tx_buf_write_bytes(burn_tx_out, control_block, cb_len);
-    /* nLockTime */
-    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data + unsigned_tx.len - 4, 4);
+    /* 3. Gather leaf signers' keypairs.  Single-process only: requires
+       f->keypairs[] to hold the seckey for every leaf signer. */
+    secp256k1_keypair *kps = (secp256k1_keypair *)calloc(leaf_node->n_signers,
+                                                          sizeof(secp256k1_keypair));
+    if (!kps) { tx_buf_free(&unsigned_tx); return 0; }
+    for (size_t i = 0; i < leaf_node->n_signers; i++) {
+        uint32_t idx = leaf_node->signer_indices[i];
+        if (idx >= f->n_participants) {
+            free(kps); tx_buf_free(&unsigned_tx); return 0;
+        }
+        kps[i] = f->keypairs[idx];
+    }
 
+    /* 4. Compute the L-stock SPK's script-tree merkle root (single leaf:
+       <csv> CSV DROP <LSP> CHECKSIG).  musig_sign_taproot needs this to
+       apply the BIP-341 taptweak that matches the SPK. */
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
+                                              &f->pubkeys[0])) {
+        free(kps); tx_buf_free(&unsigned_tx); return 0;
+    }
+    uint32_t csv = f->l_stock_csv_blocks > 0
+                   ? f->l_stock_csv_blocks
+                   : L_STOCK_CSV_DEFAULT_BLOCKS;
+    tapscript_leaf_t csv_leaf;
+    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx)) {
+        free(kps); tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char merkle_root[32];
+    if (!tapscript_merkle_root(merkle_root, &csv_leaf, 1)) {
+        free(kps); tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* 5. Sign via N-of-N MuSig + taptweak. */
+    musig_keyagg_t keyagg = leaf_node->keyagg;  /* copy — sign_taproot mutates cache */
+    unsigned char sig64[64];
+    if (!musig_sign_taproot(f->ctx, sig64, sighash, kps,
+                              leaf_node->n_signers, &keyagg, merkle_root)) {
+        free(kps); tx_buf_free(&unsigned_tx); return 0;
+    }
+    free(kps);
+
+    /* 6. Attach 64-byte Schnorr keypath witness. */
+    if (!finalize_signed_tx(signed_out, unsigned_tx.data, unsigned_tx.len, sig64)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
     tx_buf_free(&unsigned_tx);
-    memset(secret, 0, 32);
     return 1;
+}
+
+int factory_sign_l_stock_poison_tx(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    tx_buf_t *signed_out)
+{
+    if (!f || !leaf_node || !signed_out) return 0;
+    if (leaf_node->n_signers < 2) return 0;
+    size_t n_clients = leaf_node->n_signers - 1;
+
+    /* Compute per-client equal-split outputs (zmn's "10 to A, 10 to B"). */
+    uint64_t per_client = 0, last_extra = 0;
+    if (!compute_l_stock_poison_per_client(l_stock_amount_sats, fee_sats,
+                                            n_clients, &per_client, &last_extra))
+        return 0;
+
+    tx_output_t *outs = (tx_output_t *)calloc(n_clients, sizeof(tx_output_t));
+    if (!outs) return 0;
+    for (size_t i = 0; i < n_clients; i++) {
+        uint32_t signer_idx = leaf_node->signer_indices[1 + i];  /* skip LSP[0] */
+        if (signer_idx >= f->n_participants) { free(outs); return 0; }
+        secp256k1_xonly_pubkey x;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &x, NULL,
+                                                  &f->pubkeys[signer_idx])) {
+            free(outs); return 0;
+        }
+        secp256k1_xonly_pubkey tw;
+        if (!taproot_tweak_pubkey(f->ctx, &tw, NULL, &x, NULL)) {
+            free(outs); return 0;
+        }
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &tw);
+        outs[i].script_pubkey_len = 34;
+        outs[i].amount_sats = per_client;
+    }
+    outs[n_clients - 1].amount_sats += last_extra;
+
+    int ok = sign_l_stock_spend_with_outputs(f, leaf_node, l_stock_txid32,
+                                               l_stock_vout, l_stock_amount_sats,
+                                               outs, n_clients, signed_out);
+    free(outs);
+    return ok;
+}
+
+int factory_sign_l_stock_cooperative_spend(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    tx_buf_t *signed_out)
+{
+    return sign_l_stock_spend_with_outputs(f, leaf_node, l_stock_txid32,
+                                             l_stock_vout, l_stock_amount_sats,
+                                             outputs, n_outputs, signed_out);
 }
 
 int factory_build_cooperative_close(

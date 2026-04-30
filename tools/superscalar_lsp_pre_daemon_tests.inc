@@ -1208,10 +1208,10 @@
             }
             printf("All %zu tree nodes confirmed on-chain.\n", lsp_p->factory.n_nodes);
 
-            /* Step 2: Build burn TX for epoch 0 L-stock */
+            /* Step 2: Build poison TX for epoch 0 L-stock (canonical t/1242) */
             tx_buf_t burn_tx;
             tx_buf_init(&burn_tx, 256);
-            if (!factory_build_burn_tx(&lsp_p->factory, &burn_tx,
+            if (!factory_build_burn_tx(&lsp_p->factory, &burn_tx, leaf,
                                          leaf->txid, l_stock_vout,
                                          l_stock_amount, 0)) {
                 fprintf(stderr, "BURN TEST: factory_build_burn_tx failed\n");

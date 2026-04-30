@@ -3,6 +3,7 @@
 
 #include "superscalar/tx_builder.h"
 #include "superscalar/regtest.h"
+#include "superscalar/factory.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
@@ -97,5 +98,28 @@ int spend_coop_close_gauntlet(secp256k1_context *ctx,
                                const char *close_txid,
                                const unsigned char seckeys[][32],
                                size_t n_clients);
+
+/*
+ * Cooperatively spend an L-stock UTXO via the canonical
+ * `or(N-of-N, L&CSV)` SPK's key-path (N-of-N MuSig over leaf signers).
+ *
+ * Wraps factory_sign_l_stock_cooperative_spend with a call shape
+ * matching spend_build_p2tr_bip341_keypath: passes the leaf node and
+ * factory (which holds all keypairs in the test process) instead of an
+ * LSP seckey.
+ *
+ * dest_spk is wrapped in a single tx_output_t with amount =
+ * (l_stock_amount - fee_sats).
+ */
+int spend_l_stock_cooperative(secp256k1_context *ctx,
+                                factory_t *f,
+                                const factory_node_t *leaf_node,
+                                const char *l_stock_txid_hex,
+                                uint32_t l_stock_vout,
+                                uint64_t l_stock_amount,
+                                const unsigned char *dest_spk,
+                                size_t dest_spk_len,
+                                uint64_t fee_sats,
+                                tx_buf_t *tx_out);
 
 #endif /* SUPERSCALAR_TESTS_SPEND_HELPERS_H */

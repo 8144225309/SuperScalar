@@ -2531,20 +2531,20 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
         factory_node_t *leaf = &f->nodes[nidx];
         const char *leaf_txid = txids[nidx];
 
-        /* (A) Sweep L-stock (vout 1) LSP-alone to LSP's P2TR(xonly(LSP)). */
+        /* (A) Sweep L-stock (vout 1) cooperatively via N-of-N MuSig.
+           Per canonical t/1242, L-stock SPK = or(N-of-N keyagg, L&CSV) —
+           LSP can't take L-stock alone immediately; either all leaf
+           signers cooperate (this path, since the test holds all keys),
+           or LSP waits CSV blocks and uses the script-path. */
         uint64_t lstock_amt = leaf->outputs[1].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[1].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N_PARTY_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, 1, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep");
+                    "build L-stock cooperative sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -2799,20 +2799,17 @@ int test_regtest_full_force_close_and_sweep_arity2(void) {
                     "decode leaf txid");
         reverse_bytes(leaf_txid_bytes, 32);
 
-        /* (A) Sweep L-stock (vout 2) LSP-alone to LSP's P2TR(xonly(LSP)). */
+        /* (A) Sweep L-stock (vout 2) cooperatively via N-of-N MuSig
+           (canonical t/1242 — see L-stock sweep block at line 2540). */
         uint64_t lstock_amt = leaf->outputs[2].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[2].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N_PARTY_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, 2, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep");
+                    "build L-stock cooperative sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -3059,20 +3056,17 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
                     "decode leaf txid");
         reverse_bytes(leaf_txid_bytes, 32);
 
-        /* (A) Sweep L-stock (vout 1) LSP-alone. */
+        /* (A) Sweep L-stock (vout 1) cooperatively via N-of-N MuSig
+           (canonical t/1242 — see L-stock sweep block at line 2540). */
         uint64_t lstock_amt = leaf->outputs[1].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[1].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N_PARTY_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, 1, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep");
+                    "build L-stock cooperative sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -3364,13 +3358,14 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N_PARTY_SECKEYS[0],
+        /* L-stock SPK now requires N-of-N MuSig (canonical t/1242).
+           leaf0 == &f->nodes[f->leaf_node_indices[0]]. */
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f,
+                        &f->nodes[f->leaf_node_indices[0]],
                         leaf0_chain0_txid, 1, leaf0_chain0_lstock_amt,
-                        leaf0_chain0_lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build leaf0 L-stock sweep");
+                    "build leaf0 L-stock cooperative sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -3479,11 +3474,11 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
         memcpy(lstock_spk, leaf1->outputs[1].script_pubkey, 34);
         tx_buf_t ls;
         tx_buf_init(&ls, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N_PARTY_SECKEYS[0],
-                        leaf1_txid, 1, lstock_amt, lstock_spk, 34,
+        /* L-stock SPK now requires N-of-N MuSig (canonical t/1242). */
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf1,
+                        leaf1_txid, 1, lstock_amt,
                         party_spk[0], 34, LSTOCK_SWEEP_FEE, &ls),
-                    "build leaf1 L-stock sweep");
+                    "build leaf1 L-stock cooperative sweep");
         char *lh = malloc(ls.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(ls.data, ls.len, lh);
@@ -5051,20 +5046,17 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
         uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
         int n_channels       = (int)leaf->n_outputs - 1;
 
-        /* (A) Sweep L-stock LSP-alone to LSP's P2TR(xonly(LSP)). */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical
+           t/1242 — see L-stock sweep block at line 2540). */
         uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N12_PARTY_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, lstock_vout, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep");
+                    "build L-stock cooperative sweep");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -5636,18 +5628,18 @@ static int run_ps_full_lifecycle(regtest_t *rt,
         uint32_t client_idx = lc->client_idx;
         TEST_ASSERT(client_idx >= 1 && client_idx < N, "client_idx in range");
 
-        /* (A) LSP solo-sweeps L-stock from chain[0] vout 1. The chain[0] TX
-              still has vout 1 untouched even when chain advances spent vout 0. */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical
+           t/1242).  The chain[0] TX still has vout 1 untouched even when
+           chain advances spent vout 0. */
         {
+            (void)seckeys;  /* not needed — factory holds all keypairs */
             tx_buf_t ls;
             tx_buf_init(&ls, 256);
-            TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                            seckeys[0],
+            TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                             chain0_txid, 1, lc->chain0_lstock_amt,
-                            lc->lstock_spk, 34,
                             party_spk[0], 34,
                             LSTOCK_SWEEP_FEE, &ls),
-                        "build L-stock sweep");
+                        "build L-stock cooperative sweep");
             char *lh = malloc(ls.len * 2 + 1);
             TEST_ASSERT(lh != NULL, "lh malloc");
             hex_encode(ls.data, ls.len, lh);
@@ -6317,20 +6309,18 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
         uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
         int n_channels       = (int)leaf->n_outputs - 1;
 
-        /* (A) Sweep L-stock LSP-alone */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical
+           t/1242 — L-stock SPK requires either all leaf signers
+           cooperating, or LSP+CSV-delay). */
         uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N64_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, lstock_vout, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep n64");
+                    "build L-stock cooperative sweep n64");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -6633,20 +6623,18 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
         uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
         int n_channels       = (int)leaf->n_outputs - 1;
 
-        /* (A) Sweep L-stock LSP-alone */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical
+           t/1242 — L-stock SPK requires either all leaf signers
+           cooperating, or LSP+CSV-delay). */
         uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N64_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, lstock_vout, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep n64");
+                    "build L-stock cooperative sweep n64");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -6960,20 +6948,18 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
         uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
         int n_channels       = (int)leaf->n_outputs - 1;
 
-        /* (A) Sweep L-stock LSP-alone */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical
+           t/1242 — L-stock SPK requires either all leaf signers
+           cooperating, or LSP+CSV-delay). */
         uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N64_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, lstock_vout, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep n64");
+                    "build L-stock cooperative sweep n64");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);
@@ -7285,20 +7271,16 @@ int test_regtest_static_near_root_lifecycle(void) {
         uint32_t lstock_vout = (uint32_t)(leaf->n_outputs - 1);
         int n_channels       = (int)leaf->n_outputs - 1;
 
-        /* (A) L-stock LSP-alone */
+        /* (A) Sweep L-stock cooperatively via N-of-N MuSig (canonical t/1242). */
         uint64_t lstock_amt = leaf->outputs[lstock_vout].amount_sats;
-        unsigned char lstock_spk[34];
-        memcpy(lstock_spk, leaf->outputs[lstock_vout].script_pubkey, 34);
 
         tx_buf_t lstock_sweep;
         tx_buf_init(&lstock_sweep, 256);
-        TEST_ASSERT(spend_build_p2tr_bip341_keypath(ctx,
-                        N12_PARTY_SECKEYS[0],
+        TEST_ASSERT(spend_l_stock_cooperative(ctx, f, leaf,
                         leaf_txid, lstock_vout, lstock_amt,
-                        lstock_spk, 34,
                         party_spk[0], 34,
                         LSTOCK_SWEEP_FEE, &lstock_sweep),
-                    "build L-stock sweep static");
+                    "build L-stock cooperative sweep static");
         char *lh = malloc(lstock_sweep.len * 2 + 1);
         TEST_ASSERT(lh != NULL, "lh malloc");
         hex_encode(lstock_sweep.data, lstock_sweep.len, lh);

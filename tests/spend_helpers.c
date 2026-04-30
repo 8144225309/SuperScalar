@@ -242,3 +242,34 @@ int spend_coop_close_gauntlet(secp256k1_context *ctx,
     }
     return 1;
 }
+
+int spend_l_stock_cooperative(secp256k1_context *ctx,
+                                factory_t *f,
+                                const factory_node_t *leaf_node,
+                                const char *l_stock_txid_hex,
+                                uint32_t l_stock_vout,
+                                uint64_t l_stock_amount,
+                                const unsigned char *dest_spk,
+                                size_t dest_spk_len,
+                                uint64_t fee_sats,
+                                tx_buf_t *tx_out) {
+    (void)ctx;  /* uses f->ctx internally */
+    if (!f || !leaf_node || !l_stock_txid_hex || !dest_spk || !tx_out) return 0;
+    if (l_stock_amount <= fee_sats) return 0;
+
+    unsigned char l_stock_txid[32];
+    if (!hex_decode(l_stock_txid_hex, l_stock_txid, sizeof(l_stock_txid)))
+        return 0;
+    reverse_bytes(l_stock_txid, 32);
+
+    tx_output_t dest;
+    memset(&dest, 0, sizeof(dest));
+    if (dest_spk_len > sizeof(dest.script_pubkey)) return 0;
+    memcpy(dest.script_pubkey, dest_spk, dest_spk_len);
+    dest.script_pubkey_len = dest_spk_len;
+    dest.amount_sats = l_stock_amount - fee_sats;
+
+    return factory_sign_l_stock_cooperative_spend(
+        f, leaf_node, l_stock_txid, l_stock_vout, l_stock_amount,
+        &dest, 1, tx_out);
+}

@@ -1615,7 +1615,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         int burn_ok = 0;
         if (old_n_outputs >= 2) {
             size_t l_vout = (size_t)(old_n_outputs - 1);
-            burn_ok = factory_build_burn_tx(f, &burn_tx,
+            burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
                 old_leaf_txid, (uint32_t)l_vout,
                 old_l_amount, old_epoch);
         }
