@@ -86,7 +86,12 @@
 #define MSG_LEAF_REALLOC_PSIG       0x5F  /* Client → LSP: partial sig */
 #define MSG_LEAF_REALLOC_DONE       0x64  /* LSP → Clients: reallocation complete */
 
-/* Path-scoped signing (subtree re-sign on leaf exhaustion) */
+/* Path-scoped signing — used by the Tier B state-advance ceremony when
+   the DW counter rolls over and a path through the tree (or the whole
+   tree, in the worst case) needs to be re-signed.  The single-process
+   equivalent is factory_advance() (Tier A, PR #112).  Wire ceremony
+   driver is lsp_run_state_advance() in src/lsp.c. */
+#define MSG_STATE_ADVANCE_PROPOSE 0x55 /* LSP -> Clients: advance to new epoch */
 #define MSG_PATH_NONCE_BUNDLE   0x60  /* Client -> LSP: nonces for path nodes */
 #define MSG_PATH_ALL_NONCES     0x61  /* LSP -> Clients: aggregated path nonces */
 #define MSG_PATH_PSIG_BUNDLE    0x62  /* Client -> LSP: partial sigs for path */
