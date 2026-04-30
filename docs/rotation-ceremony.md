@@ -194,18 +194,22 @@ TXs are simultaneously stored.
   affected node ends with a fresh signed_tx for the new epoch, and
   proves the factory state machine is healthy enough to advance
   again post-ceremony.
-- ⏳ Multi-process regtest test driving root rollover end-to-end on
-  bitcoind — deferred to follow-up.  Requires extending the existing
-  N=8 multi-process harness with enough advances to exhaust the
-  per-leaf counter (states_per_layer × n_layers iterations); an
-  isolated change.
+- ✅ Multi-process regtest test driving root rollover end-to-end on
+  bitcoind: `tools/test_multiprocess_tier_b_rollover.sh` spawns 1 LSP
+  + 4 client daemons (5 distinct OS processes) at `--arity 1
+  --states-per-layer 2`, drives 3 leaf-0 advances over the wire (the
+  3rd hits rc=-1 inside `lsp_advance_leaf` and triggers
+  `lsp_run_state_advance`).  Verifies LSP log contains "running Tier
+  B state-advance ceremony" and "state advance complete", and every
+  client logs "state advance complete, epoch N (M nodes signed)".
+  Then `--force-close` broadcasts the post-rollover tree on regtest
+  to confirm the new-epoch signed TXs are valid on-chain.
 
-The cryptographic and state-machine correctness of the ceremony is
-verified by the unit test.  The wire transport is exercised by every
-existing multi-process test that uses `wire_build_nonce_bundle` /
-`wire_parse_bundle` / `wire_build_psig_bundle` (the same helpers Tier B
-reuses for `MSG_PATH_*`).  The remaining follow-up is a regtest
-scenario that proves the two compose end-to-end at scale.
+The cryptographic and state-machine correctness is verified by the
+unit test; the wire transport is now also verified end-to-end by the
+multi-process test.  Both compose: 14 nodes re-signed for the new
+epoch via bundled MuSig over 5 separate OS processes, and the
+post-rollover tree confirms on regtest.
 
 ## Cross-references
 
