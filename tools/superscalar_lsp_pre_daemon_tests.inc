@@ -1169,8 +1169,15 @@
                    needs them. */
                 {
                     size_t n_total = (size_t)(n_clients + 1);
+                    /* Cap to the canonical seckey range we hardcode below
+                       (0x01..0x09).  Cppcheck flags the memcpy below as
+                       reading uninitialized entries when n_total > 9; the
+                       cap keeps the analyzer happy AND limits the test
+                       to configs we actually support. */
+                    if (n_total > 9) n_total = 9;
                     secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
-                    for (size_t pi = 0; pi < n_total && pi < 9; pi++) {
+                    memset(all_kps, 0, n_total * sizeof(secp256k1_keypair));
+                    for (size_t pi = 0; pi < n_total; pi++) {
                         unsigned char sk[32];
                         memset(sk, 0, 32);
                         sk[31] = (unsigned char)(pi + 1);
