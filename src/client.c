@@ -2827,13 +2827,32 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         return 0;
     }
 
-    /* Advance local DW counter — must hit root rollover (rc=-1) for
-       Tier B to be correct.  rc=1 (normal advance) means LSP triggered
-       the wrong ceremony; rc=0 means factory exhausted. */
-    int rc = factory_advance_leaf_unsigned(factory, trigger_leaf);
+    /* Advance local DW counter to root rollover.
+
+       The LSP triggered Tier B because its OWN factory_advance_leaf_unsigned
+       returned -1.  The client's counter is typically ONE step behind the
+       LSP because the prior per-leaf-advance ceremony exited cleanly on
+       the LSP side at rc=-1 without sending MSG_LEAF_ADVANCE_PROPOSE
+       (the rc=-1 branch in lsp_advance_leaf hands off to Tier B
+       directly).  So the client must drive its own advance until rc=-1
+       fires too — at most one extra step in the lockstep case, but the
+       loop also handles unsynchronized recovery scenarios.  Bounded by
+       states_per_layer+2 as a safety cap. */
+    int rc = 0;
+    int max_steps = (int)(factory->states_per_layer + 2);
+    if (max_steps < 4) max_steps = 4;
+    for (int s = 0; s < max_steps; s++) {
+        rc = factory_advance_leaf_unsigned(factory, trigger_leaf);
+        if (rc == -1) break;
+        if (rc != 1) {
+            fprintf(stderr, "Client %u: state_advance: advance step %d returned %d\n",
+                    my_index, s, rc);
+            return 0;
+        }
+    }
     if (rc != -1) {
-        fprintf(stderr, "Client %u: state advance: expected root rollover (rc=-1), got rc=%d\n",
-                my_index, rc);
+        fprintf(stderr, "Client %u: state advance: never hit rc=-1 within %d steps\n",
+                my_index, max_steps);
         return 0;
     }
 

@@ -163,7 +163,7 @@ stdbuf -oL "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" \
     --arity 1 \
-    --states "$STATES_PER_LAYER" \
+    --states-per-layer "$STATES_PER_LAYER" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --demo \
