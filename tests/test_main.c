@@ -1532,6 +1532,7 @@ extern int test_factory_arity1_cltv_strict_ordering(void);
 extern int test_factory_arity1_min_funding_reject(void);
 extern int test_factory_arity1_input_amounts_consistent(void);
 extern int test_factory_arity1_split_round_leaf_advance(void);
+extern int test_factory_tier_b_state_advance_root_rollover(void);
 extern int test_factory_variable_arity_build(void);
 extern int test_factory_variable_arity_sign(void);
 extern int test_factory_variable_arity_backward_compat(void);
@@ -3294,6 +3295,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_arity1_min_funding_reject);
     RUN_TEST(test_factory_arity1_input_amounts_consistent);
     RUN_TEST(test_factory_arity1_split_round_leaf_advance);
+    RUN_TEST(test_factory_tier_b_state_advance_root_rollover);
 
     printf("\n=== Variable Arity ===\n");
     RUN_TEST(test_factory_variable_arity_build);

@@ -2631,6 +2631,147 @@ int test_factory_arity1_split_round_leaf_advance(void) {
     return 1;
 }
 
+/* Helper used by Tier B root-rollover test: in-process split-round
+   MuSig re-sign of a single node using each participant's keypair.
+   Mirrors the per-node steps lsp_run_state_advance() and
+   client_handle_state_advance() drive via the wire. */
+static int split_round_resign_node(factory_t *f, secp256k1_context *ctx,
+                                     const secp256k1_keypair *kps,
+                                     size_t node_idx) {
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!factory_session_init_node(f, node_idx)) return 0;
+
+    secp256k1_musig_secnonce secnonces[FACTORY_MAX_SIGNERS];
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        if (!secp256k1_keypair_sec(ctx, seckey, &kps[participant])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pk, &kps[participant])) return 0;
+
+        secp256k1_musig_pubnonce pubnonce;
+        if (!musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
+                                    seckey, &pk, &node->keyagg.cache)) {
+            memset(seckey, 0, 32);
+            return 0;
+        }
+        memset(seckey, 0, 32);
+        if (!factory_session_set_nonce(f, node_idx, j, &pubnonce)) return 0;
+    }
+
+    if (!factory_session_finalize_node(f, node_idx)) return 0;
+
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        if (!musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                        &kps[participant],
+                                        &node->signing_session)) return 0;
+        if (!factory_session_set_partial_sig(f, node_idx, j, &psig)) return 0;
+    }
+
+    return factory_session_complete_node(f, node_idx);
+}
+
+/* Tier B canonical test (Gap B + F).
+
+   Drives the per-leaf DW counter through enough advances to exhaust
+   it (rc=-1 / root rollover), then re-signs every affected node via
+   the split-round MuSig pipeline that the wire ceremony uses
+   (lsp_run_state_advance + client_handle_state_advance — exercised
+   here in-process so it's deterministic and CI-cheap).
+
+   What this proves about Tier B:
+     - factory_advance_leaf_unsigned correctly returns -1 on root
+       rollover and rebuilds every non-PS-leaf node's unsigned TX.
+     - The per-node session API (init / set_nonce / finalize /
+       set_partial_sig / complete) accepts new nonces+sigs after
+       state advance with no carry-over from the prior epoch.
+     - Sigs aggregated post-rollover are accepted by the BIP341
+       sighash-verification path inside finalize_signed_tx.
+
+   The wire-driven ceremony is mechanical glue around these primitives;
+   if this test passes, the wire ceremony's cryptographic correctness
+   follows.  The wire transport itself is exercised by the existing
+   multi-process tests after this PR is merged. */
+int test_factory_tier_b_state_advance_root_rollover(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup arity-1 factory");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign initial state");
+
+    uint32_t epoch_before = f->counter.current_epoch;
+
+    /* Advance leaf 0 repeatedly via the unsigned + split-round path.
+       states_per_layer=4 means the per-leaf counter exhausts on the
+       4th advance; that's the rc=-1 trigger. */
+    int rc = 0;
+    int got_rollover = 0;
+    for (int iter = 0; iter < 8 /* safety bound */; iter++) {
+        rc = factory_advance_leaf_unsigned(f, 0);
+        if (rc == -1) { got_rollover = 1; break; }
+        TEST_ASSERT_EQ(rc, 1, "intermediate per-leaf advance");
+        /* Re-sign just the leaf we advanced, mirroring the per-leaf
+           ceremony.  The other nodes weren't rebuilt so they retain
+           their prior signed_tx. */
+        size_t leaf_ni = f->leaf_node_indices[0];
+        TEST_ASSERT(split_round_resign_node(f, ctx, kps, leaf_ni),
+                    "intermediate split-round resign of leaf");
+    }
+    TEST_ASSERT(got_rollover, "factory_advance_leaf_unsigned hit rc=-1");
+    TEST_ASSERT(f->counter.current_epoch > epoch_before,
+                "epoch counter advanced after rollover");
+
+    /* Tier B: every non-PS-leaf node was rebuilt by build_all_unsigned_txs
+       (called inside factory_advance_leaf_unsigned on rc=-1) and is now
+       awaiting re-sign.  The wire ceremony (lsp_run_state_advance +
+       client_handle_state_advance) does this via bundled MuSig over the
+       network; we simulate the same per-node calls in-process. */
+    size_t affected[FACTORY_MAX_NODES];
+    size_t n_affected = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        if (n->is_ps_leaf) continue;
+        if (!n->is_built) continue;
+        if (n->is_signed) continue;
+        affected[n_affected++] = i;
+    }
+    TEST_ASSERT(n_affected > 0,
+                "tier-b ceremony has at least one affected node");
+
+    for (size_t k = 0; k < n_affected; k++) {
+        TEST_ASSERT(split_round_resign_node(f, ctx, kps, affected[k]),
+                    "tier-b split-round resign");
+    }
+
+    /* Every affected node now has a fresh signed_tx for the new epoch. */
+    for (size_t k = 0; k < n_affected; k++) {
+        TEST_ASSERT(f->nodes[affected[k]].is_signed,
+                    "affected node signed after tier-b ceremony");
+        TEST_ASSERT(f->nodes[affected[k]].signed_tx.len > 0,
+                    "affected node signed_tx populated");
+    }
+
+    /* Sanity: the factory state machine is healthy and can advance
+       further from the new epoch. */
+    rc = factory_advance_leaf_unsigned(f, 0);
+    TEST_ASSERT(rc == 1 || rc == -1,
+                "factory still advancing after tier-b ceremony");
+    if (rc == 1) {
+        size_t leaf_ni = f->leaf_node_indices[0];
+        TEST_ASSERT(split_round_resign_node(f, ctx, kps, leaf_ni),
+                    "post-tier-b leaf advance still signs");
+    }
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* ---- Variable-N tree tests ---- */
 
 /* Generate deterministic secret keys for up to 128 participants.

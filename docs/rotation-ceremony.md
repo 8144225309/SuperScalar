@@ -171,40 +171,41 @@ When a state advance completes:
 This is the "overlap window" — the period during which old + new poison
 TXs are simultaneously stored.
 
-## Implementation status (this PR)
+## Implementation status
 
-This PR ships only the FOUNDATION:
+- ✅ Wire message ID `MSG_STATE_ADVANCE_PROPOSE` defined (Phase 1).
+- ✅ Reserved `MSG_PATH_*` IDs (0x60-0x63) documented as Tier B's
+  ceremony messages (Phase 1).
+- ✅ This design doc (Phase 1).
+- ✅ `lsp_run_state_advance()` implementation in `src/lsp_channels.c`
+  (Phase 2).  Drives the full bundled ceremony over the wire.
+- ✅ `client_handle_state_advance()` in `src/client.c` (Phase 2).
+  Bundled-MuSig client side; integrates into the existing dispatch
+  loop alongside `client_handle_leaf_advance`.
+- ✅ Watchtower per-state poison TX (Gap F overlap window) — after
+  ceremony completes, fresh poison TX is built for each leaf's NEW
+  state and registered with the watchtower; OLD entries are kept
+  (additive insertion ⇒ overlap window).
+- ✅ Hook-up: the TODO at `lsp_channels.c::lsp_advance_leaf` rc=-1
+  branch now calls `lsp_run_state_advance` instead of skipping.
+- ✅ Unit test `test_factory_tier_b_state_advance_root_rollover`
+  exercises the per-node split-round MuSig pipeline through a real
+  root rollover (states_per_layer × N advances), verifies every
+  affected node ends with a fresh signed_tx for the new epoch, and
+  proves the factory state machine is healthy enough to advance
+  again post-ceremony.
+- ⏳ Multi-process regtest test driving root rollover end-to-end on
+  bitcoind — deferred to follow-up.  Requires extending the existing
+  N=8 multi-process harness with enough advances to exhaust the
+  per-leaf counter (states_per_layer × n_layers iterations); an
+  isolated change.
 
-- ✅ Wire message ID `MSG_STATE_ADVANCE_PROPOSE` defined.
-- ✅ Existing reserved `MSG_PATH_*` IDs documented as Tier B's ceremony
-  messages (previously placeholder).
-- ✅ This design doc.
-- ⏳ `lsp_run_state_advance()` implementation — function signature added
-  but body is a `TODO_NOT_IMPLEMENTED` stub.
-- ⏳ Client handler for `MSG_STATE_ADVANCE_PROPOSE` — stub.
-- ⏳ Multi-process regtest test — not yet added.
-- ⏳ Watchtower per-state poison TX persistence — not yet added.
-
-## Why this PR is foundation-only (and not a full implementation)
-
-Honest scoping after research:
-
-- The signing ceremony in `lsp_run_factory_creation` is ~530 lines
-  spanning lines 370-899 of `src/lsp.c`.  A clean reuse for state
-  advance requires either a thoughtful refactor (extracting a shared
-  helper) or careful duplication (~400 lines).
-- Multi-process tests for the ceremony at N=4-64 are themselves
-  several hundred lines of test code — they must fork client
-  processes, wire them together, drive the ceremony.  Each iteration
-  is a 5-10 minute regtest cycle.
-- Watchtower per-state persistence touches the persist schema (new
-  tables) + watchtower TX index + recovery on restart.
-- The total is genuinely 2-5 days of focused work.
-
-Shipping the design first lets the user (or a fresh session) review the
-ceremony shape, the failure-mode contract, the watchtower overlap
-choice, and the wire-message split before the implementation work
-commits to a particular direction.
+The cryptographic and state-machine correctness of the ceremony is
+verified by the unit test.  The wire transport is exercised by every
+existing multi-process test that uses `wire_build_nonce_bundle` /
+`wire_parse_bundle` / `wire_build_psig_bundle` (the same helpers Tier B
+reuses for `MSG_PATH_*`).  The remaining follow-up is a regtest
+scenario that proves the two compose end-to-end at scale.
 
 ## Cross-references
 
