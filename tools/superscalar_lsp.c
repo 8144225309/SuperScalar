@@ -306,6 +306,7 @@ static void usage(const char *prog) {
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
         "  --test-ps-advance   After demo: advance all PS leaves (chain_pos 0->1), verify amounts, force-close\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
+        "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
@@ -1095,6 +1096,7 @@ int main(int argc, char *argv[]) {
     int test_rebalance = 0;
     int test_batch_rebalance = 0;
     int test_realloc = 0;
+    int test_tier_b_rollover = 0;  /* Tier B (Gap B+F) — drive root rollover */
     int test_jit = 0;
     int test_lsps2 = 0;
     int test_bolt12 = 0;
@@ -1241,6 +1243,8 @@ int main(int argc, char *argv[]) {
             test_batch_rebalance = 1;
         else if (strcmp(argv[i], "--test-realloc") == 0)
             test_realloc = 1;
+        else if (strcmp(argv[i], "--test-tier-b-rollover") == 0)
+            test_tier_b_rollover = 1;
         else if (strcmp(argv[i], "--test-jit") == 0)
             test_jit = 1;
         else if (strcmp(argv[i], "--test-lsps2") == 0)
@@ -3282,6 +3286,7 @@ accept_new_factory:
         force_close || test_burn ||
         test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
+        test_tier_b_rollover ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
         test_buy_liquidity || test_large_factory || test_ps_advance) {
         /* Set fee policy before init (init preserves these across memset) */
