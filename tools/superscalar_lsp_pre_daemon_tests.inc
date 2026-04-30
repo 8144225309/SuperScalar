@@ -1152,6 +1152,60 @@
                 printf("  SKIP: --test-tier-b-rollover requires --leaf-arity 1 (DW leaves)\n");
                 printf("TIER B ROLLOVER TEST: SKIP\n");
             } else {
+                /* Populate factory.keypairs[] for the LSP's local
+                   factory_build_burn_tx call inside lsp_advance_leaf.
+                   In multi-process mode the LSP only has its own keypair;
+                   the burn-TX signer (factory_sign_l_stock_poison_tx) is
+                   a single-process helper that needs every leaf signer's
+                   keypair.  This is a pre-existing limitation of the
+                   poison-TX signer (orthogonal to Tier B) and the same
+                   workaround is used by --test-dw-advance / --test-leaf-
+                   advance.  We hardcode the canonical multi-process test
+                   seckeys 0x01 (LSP) + 0x02..0x09 (clients) so the
+                   keypairs match factory.pubkeys received over the wire.
+                   The Tier B ceremony itself does NOT use these
+                   keypairs — it drives MuSig over the wire from each
+                   client's own seckey.  Only the burn-TX side-effect
+                   needs them. */
+                {
+                    size_t n_total = (size_t)(n_clients + 1);
+                    secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+                    for (size_t pi = 0; pi < n_total && pi < 9; pi++) {
+                        unsigned char sk[32];
+                        memset(sk, 0, 32);
+                        sk[31] = (unsigned char)(pi + 1);
+                        if (!secp256k1_keypair_create(ctx, &all_kps[pi], sk)) {
+                            fprintf(stderr, "TIER B: keypair create p=%zu failed\n", pi);
+                            return 1;
+                        }
+                    }
+                    /* Reorder to match factory.pubkeys connection order. */
+                    secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                    memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                    for (size_t slot = 0; slot < n_total; slot++) {
+                        unsigned char target[33];
+                        size_t tlen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                                                      &lsp_p->factory.pubkeys[slot],
+                                                      SECP256K1_EC_COMPRESSED);
+                        for (size_t k = 0; k < n_total; k++) {
+                            secp256k1_pubkey kpub;
+                            secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                            unsigned char kser[33];
+                            size_t klen = 33;
+                            secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                          &kpub, SECP256K1_EC_COMPRESSED);
+                            if (memcmp(target, kser, 33) == 0) {
+                                all_kps[slot] = ordered[k];
+                                break;
+                            }
+                        }
+                    }
+                    memcpy(lsp_p->factory.keypairs, all_kps,
+                           n_total * sizeof(secp256k1_keypair));
+                    printf("  populated %zu keypairs for burn-TX signing\n", n_total);
+                }
+
                 uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
                 int n_iters = states_per_layer + 1;
                 printf("  states_per_layer=%d → driving %d leaf-0 advances "
