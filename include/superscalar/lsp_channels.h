@@ -317,6 +317,30 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts);
 
+/* --- Tier B state-advance ceremony (Gap B + F) ---
+
+   Driven when factory_advance_leaf_unsigned() returns -1 (per-leaf DW
+   counter exhausted, root layer advanced, every non-PS-leaf node's
+   unsigned TX rebuilt and waiting to be re-signed).  Runs an N-of-N
+   MuSig ceremony bundled across all affected nodes — see
+   docs/rotation-ceremony.md.
+
+   Preconditions:
+     - factory_advance_leaf_unsigned(f, trigger_leaf_side) returned -1
+       (caller must NOT call advance again before invoking us)
+     - All clients are connected on lsp->client_fds[]
+   Postconditions:
+     - On success: every affected node has signed_tx populated, the
+       watchtower has a fresh poison TX for each leaf's NEW state
+       (overlap window — old entries remain), persist has the new DW
+       counter.  All clients receive PATH_SIGN_DONE.
+     - On failure: returns 0, on-chain factory is unchanged, ceremony
+       can be retried.
+
+   Returns 1 on success, 0 on any failure. */
+int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                            int trigger_leaf_side);
+
 /* Buy inbound liquidity from L-stock for a client (arity-2 only).
    Moves amount_sats from L-stock to client's channel, increasing inbound capacity.
    Returns 1 on success. */

@@ -561,6 +561,37 @@ cJSON *wire_build_leaf_advance_done(int leaf_side);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
 
+/* --- Tier B: state-advance ceremony (root rollover, MSG_PATH_*) ---
+
+   When factory_advance_leaf_unsigned() returns -1, the leaf's per-leaf
+   DW counter exhausted, the root layer advanced, and every non-PS,
+   non-static-only node's nSequence changed.  All such nodes need to be
+   re-signed via N-of-N MuSig.  This ceremony bundles per-node nonces
+   and partial sigs across the wire so we get O(1) round trips instead
+   of O(n_nodes).  See docs/rotation-ceremony.md.
+
+   The bundle messages MSG_PATH_NONCE_BUNDLE/ALL_NONCES/PSIG_BUNDLE
+   reuse the existing wire_build_nonce_bundle/all_nonces/psig_bundle
+   JSON shape and wire_parse_bundle parser — they're dispatched by
+   message ID, not JSON shape. */
+
+/* LSP → Clients: STATE_ADVANCE_PROPOSE {epoch, trigger_leaf, lsp_nonces[]}
+   lsp_nonces is the LSP's own per-node pubnonce contributions, bundled
+   over every node in the tree where the LSP is a signer. */
+cJSON *wire_build_state_advance_propose(uint32_t epoch, int trigger_leaf,
+                                          const wire_bundle_entry_t *lsp_nonces,
+                                          size_t n_lsp_nonces);
+
+int wire_parse_state_advance_propose(const cJSON *json, uint32_t *epoch_out,
+                                       int *trigger_leaf_out,
+                                       wire_bundle_entry_t *lsp_nonces_out,
+                                       size_t max_nonces, size_t *n_out);
+
+/* LSP → Clients: PATH_SIGN_DONE {epoch} */
+cJSON *wire_build_path_sign_done(uint32_t epoch);
+
+int wire_parse_path_sign_done(const cJSON *json, uint32_t *epoch_out);
+
 /* --- Leaf-Level Fund Reallocation message builders (Upgrade 3) --- */
 
 /* LSP → Clients: LEAF_REALLOC_PROPOSE {leaf_side, amounts[], pubnonce} */

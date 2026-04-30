@@ -1869,6 +1869,20 @@ handle_message:
             break;
         }
 
+        case MSG_STATE_ADVANCE_PROPOSE: {
+            /* Tier B (Gap B + F): LSP detected per-leaf DW counter rollover
+               and is driving the whole-tree re-sign ceremony.  Delegate to
+               the canonical handler in src/client.c; it bundles per-node
+               nonces and partial sigs across MSG_PATH_*. */
+            wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
+            if (!client_handle_state_advance(fd, ctx, keypair, factory,
+                                              my_index, &propose_msg)) {
+                fprintf(stderr, "Client %u: state advance failed\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         /* -------------------------------------------------------------------
          * Splice protocol — LSP-initiated quiescence and funding replacement
          * ----------------------------------------------------------------- */

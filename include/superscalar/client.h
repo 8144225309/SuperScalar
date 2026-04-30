@@ -174,6 +174,27 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  uint32_t my_index,
                                  const wire_msg_t *propose_msg);
 
+/* Handler for MSG_STATE_ADVANCE_PROPOSE (Tier B ceremony, Gap B + F).
+   Drives the client side of the multi-party state-advance ceremony when
+   the LSP has detected a per-leaf DW counter rollover.
+
+   Round structure (see docs/rotation-ceremony.md):
+     receive STATE_ADVANCE_PROPOSE  ← caller passes propose_msg
+     advance local DW counter (must hit -1 / root rollover)
+     init MuSig session for every non-PS-leaf node where this client signs
+     send PATH_NONCE_BUNDLE         (own pubnonces)
+     receive PATH_ALL_NONCES        (every signer's nonce per node)
+     finalize sessions
+     send PATH_PSIG_BUNDLE          (own partial sigs)
+     receive PATH_SIGN_DONE
+
+   Returns 1 on success, 0 on any failure (parse / advance / crypto). */
+int client_handle_state_advance(int fd, secp256k1_context *ctx,
+                                  const secp256k1_keypair *keypair,
+                                  factory_t *factory,
+                                  uint32_t my_index,
+                                  const wire_msg_t *propose_msg);
+
 /* Set (or clear) the persistence handle used for the PS double-spend
    defense. Pass NULL to disable. Must be called before any PS advance
    happens; safe to call once at startup. */
