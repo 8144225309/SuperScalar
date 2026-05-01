@@ -413,11 +413,23 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
     uint64_t prev_amount;
 
     if (node->is_ps_leaf && node->ps_chain_len > 0) {
-        /* Spending vout 0 (channel output) of the previous chain TX.
-           Channel SPK is node->outputs[0] (unchanged between advances). */
-        prev_spk = node->outputs[0].script_pubkey;
-        prev_spk_len = node->outputs[0].script_pubkey_len;
-        prev_amount = node->ps_prev_chan_amount;
+        if (node->type == NODE_PS_SUBFACTORY) {
+            /* Sub-factory chain extension (Phase 2 of k² PS, t/1242).
+               Spends the LAST vout (sales-stock) of the previous chain TX.
+               sales-stock SPK is node->outputs[n_outputs - 1] (unchanged
+               between advances — keyed on sub-factory's keyagg). */
+            size_t sstock_vout = node->n_outputs - 1;
+            prev_spk = node->outputs[sstock_vout].script_pubkey;
+            prev_spk_len = node->outputs[sstock_vout].script_pubkey_len;
+            prev_amount = node->ps_prev_chan_amount;
+        } else {
+            /* 1-client-per-leaf PS (legacy k=1 shape).  Spends vout 0
+               (channel output) of the previous chain TX.  Channel SPK is
+               node->outputs[0] (unchanged between advances). */
+            prev_spk = node->outputs[0].script_pubkey;
+            prev_spk_len = node->outputs[0].script_pubkey_len;
+            prev_amount = node->ps_prev_chan_amount;
+        }
     } else if (node->parent_index < 0) {
         prev_spk = f->funding_spk;
         prev_spk_len = f->funding_spk_len;
@@ -1943,7 +1955,13 @@ static int rebuild_node_tx(factory_t *f, size_t node_idx) {
 
     if (node->is_ps_leaf && node->ps_chain_len > 0) {
         input_txid = node->ps_prev_txid;
-        input_vout = 0;
+        /* Sub-factory chain extension spends the prior state's sales-stock
+           vout (= last output, indexed at the new state's n_outputs - 1
+           since the layout is preserved between chain steps).  1-client
+           PS leaves spend vout 0 (channel) of the prior chain TX. */
+        input_vout = (node->type == NODE_PS_SUBFACTORY)
+                     ? (uint32_t)(node->n_outputs - 1)
+                     : 0;
     } else if (node->parent_index < 0) {
         input_txid = f->funding_txid;
         input_vout = f->funding_vout;
@@ -2196,6 +2214,76 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     /* Only rebuild the leaf node (no signing) */
     if (!update_l_stock_for_leaf(f, node_idx)) return 0;
     if (!rebuild_node_tx(f, node_idx)) return 0;
+    return 1;
+}
+
+/* Sub-factory chain extension (Gap E followup Phase 2, t/1242).
+
+   "Buy liquidity from sales-stock" operation: client at
+   `channel_idx_in_sub` within sub-factory `sub_idx_in_leaf` of
+   leaf `leaf_side` gains `delta_sats` of inbound capacity by
+   moving that amount from the sub-factory's sales-stock output to
+   their channel output.  Builds the new chain[N+1] unsigned TX
+   spending the prior state's sales-stock vout.  Caller must drive
+   the multi-party MuSig ceremony to sign the result (LSP +
+   sub-factory clients, n_signers signers).
+
+   Returns:
+     1 on success — chain_len incremented, unsigned_tx rebuilt,
+       is_signed cleared (caller must re-sign).
+     0 on failure (leaf_side / sub_idx / channel_idx out of range,
+       sales-stock too small, dust limit, etc).
+
+   Phase 2 scope: just the unsigned-state primitive + sighash/rebuild
+   wiring.  The wire ceremony driver and client handler are Phase 2b. */
+int factory_subfactory_chain_advance_unsigned(
+    factory_t *f, int leaf_side, int sub_idx_in_leaf,
+    int channel_idx_in_sub, uint64_t delta_sats)
+{
+    if (!f) return 0;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    if (sub_idx_in_leaf < 0) return 0;
+
+    size_t leaf_node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *leaf = &f->nodes[leaf_node_idx];
+    if (sub_idx_in_leaf >= leaf->n_subfactories) return 0;
+    int sub_node_i = leaf->subfactory_node_indices[sub_idx_in_leaf];
+    if (sub_node_i < 0) return 0;
+
+    factory_node_t *sub = &f->nodes[sub_node_i];
+    if (sub->type != NODE_PS_SUBFACTORY) return 0;
+    if (!sub->is_ps_leaf) return 0;
+    if (sub->n_outputs < 2) return 0;     /* need at least 1 channel + sales-stock */
+    if (channel_idx_in_sub < 0) return 0;
+    /* Last vout is sales-stock; channel vouts are 0..n_outputs-2. */
+    if ((size_t)channel_idx_in_sub >= sub->n_outputs - 1) return 0;
+
+    size_t sstock_vout = sub->n_outputs - 1;
+    uint64_t sstock_amount = sub->outputs[sstock_vout].amount_sats;
+
+    /* Need enough sales-stock to cover delta + fee + remaining dust. */
+    if (delta_sats == 0) return 0;
+    if (sstock_amount < delta_sats + f->fee_per_tx + CHANNEL_DUST_LIMIT_SATS)
+        return 0;
+
+    /* Capture prior chain state for the sighash binding. */
+    memcpy(sub->ps_prev_txid, sub->txid, 32);
+    sub->ps_prev_chan_amount = sstock_amount;  /* spending the sales-stock vout */
+    sub->ps_chain_len++;
+
+    /* New state amounts: channel grows by delta, sales-stock shrinks by
+       delta + fee.  Other channels untouched. */
+    sub->outputs[channel_idx_in_sub].amount_sats += delta_sats;
+    sub->outputs[sstock_vout].amount_sats =
+        sstock_amount - delta_sats - f->fee_per_tx;
+
+    if (!rebuild_node_tx(f, (size_t)sub_node_i)) {
+        /* On failure, roll back the chain state (chain_len already bumped;
+           leave it — the caller is expected to retry with a different
+           delta or abort).  Mark the node as not-built so the inconsistent
+           state is visible. */
+        return 0;
+    }
     return 1;
 }
 
