@@ -307,6 +307,8 @@ static void usage(const char *prog) {
         "  --test-ps-advance   After demo: advance all PS leaves (chain_pos 0->1), verify amounts, force-close\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
+        "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
+        "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
@@ -1097,6 +1099,8 @@ int main(int argc, char *argv[]) {
     int test_batch_rebalance = 0;
     int test_realloc = 0;
     int test_tier_b_rollover = 0;  /* Tier B (Gap B+F) — drive root rollover */
+    int test_subfactory_advance = 0;  /* Phase 2c — drive sub-factory chain extension */
+    int ps_subfactory_arity_arg = 0;  /* k for PS k² sub-factories (0 = default k=1) */
     int test_jit = 0;
     int test_lsps2 = 0;
     int test_bolt12 = 0;
@@ -1245,6 +1249,10 @@ int main(int argc, char *argv[]) {
             test_realloc = 1;
         else if (strcmp(argv[i], "--test-tier-b-rollover") == 0)
             test_tier_b_rollover = 1;
+        else if (strcmp(argv[i], "--test-subfactory-advance") == 0)
+            test_subfactory_advance = 1;
+        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc)
+            ps_subfactory_arity_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--test-jit") == 0)
             test_jit = 1;
         else if (strcmp(argv[i], "--test-lsps2") == 0)
@@ -3066,6 +3074,11 @@ accept_new_factory:
        AFTER arity configuration so the DW counter is correctly resized. */
     if (static_near_root > 0)
         factory_set_static_near_root(&lsp_p->factory, static_near_root);
+    /* PS k² sub-factory arity: applied AFTER arity configuration so the
+       leaf-count + DW counter recompute correctly for k>1. */
+    if (ps_subfactory_arity_arg > 0)
+        factory_set_ps_subfactory_arity(&lsp_p->factory,
+                                          (uint32_t)ps_subfactory_arity_arg);
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
@@ -3286,7 +3299,7 @@ accept_new_factory:
         force_close || test_burn ||
         test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
-        test_tier_b_rollover ||
+        test_tier_b_rollover || test_subfactory_advance ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
         test_buy_liquidity || test_large_factory || test_ps_advance) {
         /* Set fee policy before init (init preserves these across memset) */

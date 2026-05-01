@@ -1883,6 +1883,21 @@ handle_message:
             break;
         }
 
+        case MSG_SUBFACTORY_PROPOSE: {
+            /* Phase 2c (Gap E followup): LSP "selling sales-stock" to a
+               client.  Delegate to client_handle_subfactory_advance;
+               handles MSG_SUBFACTORY_NONCE → ALL_NONCES → PSIG → DONE
+               internally for one sub-factory's k+1 signers (LSP + k
+               clients in this sub-factory). */
+            wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
+            if (!client_handle_subfactory_advance(fd, ctx, keypair, factory,
+                                                    my_index, &propose_msg)) {
+                fprintf(stderr, "Client %u: sub-factory advance failed\n", my_index);
+            }
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         /* -------------------------------------------------------------------
          * Splice protocol — LSP-initiated quiescence and funding replacement
          * ----------------------------------------------------------------- */

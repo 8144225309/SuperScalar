@@ -626,6 +626,12 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     if (f->static_threshold_depth > 0)
         cJSON_AddNumberToObject(j, "static_threshold_depth",
                                 (double)f->static_threshold_depth);
+    /* PS k² sub-factory arity (Gap E followup, t/1242).  Only emitted
+       when k>1 to avoid bloat for the common 1-client-per-PS-leaf case;
+       missing field on the parser side defaults to k=1. */
+    if (f->ps_subfactory_arity > 1)
+        cJSON_AddNumberToObject(j, "ps_subfactory_arity",
+                                (double)f->ps_subfactory_arity);
     cJSON_AddNumberToObject(j, "placement_mode", (double)f->placement_mode);
     cJSON_AddNumberToObject(j, "economic_mode", (double)f->economic_mode);
 
