@@ -460,6 +460,31 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
 
+/* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
+
+   Drives the canonical "buy liquidity from sales-stock" operation:
+   the client at `channel_idx_in_sub` within sub-factory
+   `sub_idx_in_leaf` of `leaf_side` gains `delta_sats` of inbound
+   capacity by moving that amount out of the sub-factory's
+   sales-stock vout.  Increments the sub-factory's ps_chain_len and
+   rebuilds its unsigned_tx spending the prior chain TX's
+   sales-stock vout.
+
+   Caller drives the multi-party MuSig ceremony to re-sign the
+   sub-factory node (LSP + k clients in this sub-factory) using the
+   existing factory_session_*_node helpers.
+
+   Phase 2 ships the unsigned-state primitive here; the wire
+   ceremony driver (lsp_run_subfactory_advance) and client handler
+   are Phase 2b — see docs/ps-subfactories.md.
+
+   Returns 1 on success, 0 on failure (range checks, dust limit,
+   sales-stock too small).  Pre-condition: factory_set_ps_subfactory_arity
+   was set to k>1 and factory_build_tree completed. */
+int factory_subfactory_chain_advance_unsigned(
+    factory_t *f, int leaf_side, int sub_idx_in_leaf,
+    int channel_idx_in_sub, uint64_t delta_sats);
+
 /* Compute the factory_early_warning_time (blocks) per BLIP-56.
    This is the worst-case blocks needed for full unilateral close from
    the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
