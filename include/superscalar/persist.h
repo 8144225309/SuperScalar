@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 20
+#define PERSIST_SCHEMA_VERSION 21
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -79,6 +79,32 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
                            uint64_t *amounts_out, int max_chain);
+
+/* --- Pseudo-Spilman SUB-FACTORY chain persistence (k² shape) --- */
+
+/* Save one sub-factory chain entry. Each entry has per-channel amounts plus
+   the trailing sales-stock amount (the sub-factory analogue of the L-stock
+   on the parent leaf). channel_amounts[]: amount per child channel,
+   length = n_channels. The sales_stock vout is the last output. */
+int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
+                                          uint32_t sub_node_idx, int chain_pos,
+                                          const unsigned char *txid_display,
+                                          const unsigned char *signed_tx, size_t signed_tx_len,
+                                          uint64_t sales_stock_amount_sats,
+                                          const uint64_t *channel_amounts, int n_channels);
+
+/* Load all sub-factory chain entries for a sub-factory node in chain_pos order.
+   chain_txs_out: caller-allocated tx_buf_t[max_chain].
+   txids_out: caller-allocated [max_chain][32] internal-order txids.
+   sales_stock_out: caller-allocated uint64_t[max_chain] sales-stock amounts.
+   channel_amounts_out: caller-allocated uint64_t[max_chain][max_channels].
+   n_channels_out: caller-allocated int[max_chain] number of channels per entry.
+   Returns number of entries loaded, 0 on no entries or error. */
+int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t sub_node_idx,
+                                    tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
+                                    uint64_t *sales_stock_out,
+                                    uint64_t (*channel_amounts_out)[16],
+                                    int *n_channels_out, int max_chain);
 
 /* --- Client-side PS double-spend defense --- */
 

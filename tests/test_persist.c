@@ -145,6 +145,115 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
     return ok;
 }
 
+/* ---- v21: PS sub-factory chain entry round-trip with per-channel amounts ----
+
+   The v21 ps_subfactory_chains table replaces the Phase 4a workaround of
+   reusing ps_leaf_chains.  Each entry now carries:
+     - sales_stock_amount_sats (the trailing vout amount, as before)
+     - channel_amounts_csv (per-client channel amounts — new in v21)
+
+   Without per-channel persistence, a restart of the LSP could not rebuild
+   sub->outputs[] correctly and post-restart sweep would not be able to
+   attribute outputs to clients.
+
+   Saves three chain entries, each with a different channel count + mix
+   of amounts, then loads back and asserts every field round-trips
+   exactly. */
+int test_persist_ps_subfactory_chain_v21_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t factory_id = 0;
+    const uint32_t sub_node_idx = 137;
+
+    /* 3 entries — varying n_channels (2, 4, 3) and varying amounts. */
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][96];
+    size_t signed_tx_lens[3] = { 24, 60, 80 };
+    uint64_t sstock_amounts[3] = { 100000, 75000, 50000 };
+    int n_channels[3] = { 2, 4, 3 };
+    uint64_t channel_amounts[3][16] = {
+        { 25000, 25000 },
+        { 15000, 20000, 18000, 22000 },
+        { 30000, 10000, 10000 },
+    };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0xC0 + i, 32);
+        memset(signed_txs[i], 0xD0 + i, signed_tx_lens[i]);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(persist_save_subfactory_chain_entry(
+                        &db, factory_id, sub_node_idx, i,
+                        txids[i],
+                        signed_txs[i], signed_tx_lens[i],
+                        sstock_amounts[i],
+                        channel_amounts[i], n_channels[i]),
+                    "save v21 sub-factory entry");
+    }
+
+    /* Load back. NOTE: do NOT pre-init loaded_txs[]; persist_load_*
+       calls tx_buf_init internally and pre-allocation would leak. */
+    tx_buf_t loaded_txs[3] = {0};
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_sstock[3];
+    uint64_t loaded_channels[3][16];
+    int loaded_n_channels[3];
+    int n_loaded = persist_load_subfactory_chain(&db, factory_id, sub_node_idx,
+                                                    loaded_txs, loaded_txids,
+                                                    loaded_sstock, loaded_channels,
+                                                    loaded_n_channels, 3);
+
+    int ok = 1;
+    if (n_loaded != 3) {
+        printf("  FAIL: v21 n_loaded=%d expected 3\n", n_loaded);
+        ok = 0;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
+                printf("  FAIL: v21 chain[%d] txid mismatch\n", i);
+                ok = 0;
+            }
+            if (loaded_txs[i].len != signed_tx_lens[i]) {
+                printf("  FAIL: v21 chain[%d] tx len %zu != %zu\n",
+                       i, loaded_txs[i].len, signed_tx_lens[i]);
+                ok = 0;
+            } else if (memcmp(loaded_txs[i].data, signed_txs[i],
+                                signed_tx_lens[i]) != 0) {
+                printf("  FAIL: v21 chain[%d] tx bytes mismatch\n", i);
+                ok = 0;
+            }
+            if (loaded_sstock[i] != sstock_amounts[i]) {
+                printf("  FAIL: v21 chain[%d] sales-stock %llu != %llu\n",
+                       i, (unsigned long long)loaded_sstock[i],
+                       (unsigned long long)sstock_amounts[i]);
+                ok = 0;
+            }
+            if (loaded_n_channels[i] != n_channels[i]) {
+                printf("  FAIL: v21 chain[%d] n_channels %d != %d\n",
+                       i, loaded_n_channels[i], n_channels[i]);
+                ok = 0;
+            } else {
+                for (int ci = 0; ci < n_channels[i]; ci++) {
+                    if (loaded_channels[i][ci] != channel_amounts[i][ci]) {
+                        printf("  FAIL: v21 chain[%d] channel[%d] %llu != %llu\n",
+                               i, ci,
+                               (unsigned long long)loaded_channels[i][ci],
+                               (unsigned long long)channel_amounts[i][ci]);
+                        ok = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < n_loaded && i < 3; i++)
+        tx_buf_free(&loaded_txs[i]);
+
+    persist_close(&db);
+    return ok;
+}
+
 /* ---- Test 1: Open/close in-memory database ---- */
 
 int test_persist_open_close(void) {

@@ -2553,31 +2553,40 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Step 10: Persist sub-factory chain entry (Phase 4a — durability).
+    /* Step 10: Persist sub-factory chain entry (Phase 4a save +
+       Phase 4c per-channel amounts) into the dedicated v21
+       `ps_subfactory_chains` table.
 
-       Reuses the existing ps_leaf_chains table (PRIMARY KEY (factory_id,
-       leaf_node_idx, chain_pos)) — `leaf_node_idx` here is the
-       sub-factory's node index in f->nodes[], `chain_pos` is the
-       0-based chain position (= ps_chain_len - 1 after the bump),
-       `chan_amount_sats` stores the sales-stock amount (the value
-       being chained from), and `signed_tx_hex` stores the new chain
-       state for breach-recovery + restart.  Identical pattern to how
-       lsp_advance_leaf persists 1-client-per-PS-leaf entries; the
-       same table works for k² sub-factories because the schema is
-       generic on (node_idx, chain_pos). */
+       Per-channel amounts are stored as CSV alongside the trailing
+       sales-stock amount so factory_recovery_load can rebuild
+       sub->outputs[] exactly on LSP restart — without per-channel
+       persistence the recovered sub-factory would not know how to
+       sweep individual client balances after a crash.
+
+       The table is keyed (factory_id, sub_node_idx, chain_pos), where
+       sub_node_idx is the sub-factory's f->nodes[] index — this is
+       schema-distinct from the leaf-level ps_leaf_chains keyed on
+       leaf_node_idx, even though the index spaces happen not to
+       collide today. */
     if (mgr->persist) {
         extern void reverse_bytes(unsigned char *, size_t);
         unsigned char txid_display[32];
         memcpy(txid_display, sub->txid, 32);
         reverse_bytes(txid_display, 32);
         size_t sstock_vout = sub->n_outputs - 1;
-        persist_save_ps_chain_entry(
+        uint64_t chan_amounts[16] = {0};
+        int n_chans = (int)sstock_vout;
+        if (n_chans > 16) n_chans = 16;
+        for (int ci = 0; ci < n_chans; ci++)
+            chan_amounts[ci] = sub->outputs[ci].amount_sats;
+        persist_save_subfactory_chain_entry(
             (persist_t *)mgr->persist, /* factory_id = */ 0,
             (uint32_t)sub_node_i,
             sub->ps_chain_len - 1,
             txid_display,
             sub->signed_tx.data, sub->signed_tx.len,
-            sub->outputs[sstock_vout].amount_sats);
+            sub->outputs[sstock_vout].amount_sats,
+            chan_amounts, n_chans);
     }
 
     /* Step 11: Broadcast DONE to all sub-factory clients. */
