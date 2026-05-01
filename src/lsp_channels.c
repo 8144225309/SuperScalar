@@ -2553,7 +2553,34 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Step 10: Broadcast DONE to all sub-factory clients. */
+    /* Step 10: Persist sub-factory chain entry (Phase 4a — durability).
+
+       Reuses the existing ps_leaf_chains table (PRIMARY KEY (factory_id,
+       leaf_node_idx, chain_pos)) — `leaf_node_idx` here is the
+       sub-factory's node index in f->nodes[], `chain_pos` is the
+       0-based chain position (= ps_chain_len - 1 after the bump),
+       `chan_amount_sats` stores the sales-stock amount (the value
+       being chained from), and `signed_tx_hex` stores the new chain
+       state for breach-recovery + restart.  Identical pattern to how
+       lsp_advance_leaf persists 1-client-per-PS-leaf entries; the
+       same table works for k² sub-factories because the schema is
+       generic on (node_idx, chain_pos). */
+    if (mgr->persist) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, sub->txid, 32);
+        reverse_bytes(txid_display, 32);
+        size_t sstock_vout = sub->n_outputs - 1;
+        persist_save_ps_chain_entry(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)sub_node_i,
+            sub->ps_chain_len - 1,
+            txid_display,
+            sub->signed_tx.data, sub->signed_tx.len,
+            sub->outputs[sstock_vout].amount_sats);
+    }
+
+    /* Step 11: Broadcast DONE to all sub-factory clients. */
     cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf,
                                                 (uint32_t)sub->ps_chain_len);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
