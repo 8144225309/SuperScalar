@@ -243,13 +243,14 @@ int test_offer_decode_bad_checksum(void)
 }
 
 /* Schema version smoke test (v2=HD wallet, v3=BOLT 12 offers, v4=pending_cs,
- * v5=hd_utxos.reserved) */
+ * v5=hd_utxos.reserved, ..., v20=client_ps_signed_inputs,
+ * v21=ps_subfactory_chains with per-channel amounts) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 20, "schema version is 20 (v20 adds client_ps_signed_inputs)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 21, "schema version is 21 (v21 adds ps_subfactory_chains)");
     persist_close(&p);
     return 1;
 }
