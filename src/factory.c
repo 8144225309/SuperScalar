@@ -438,6 +438,11 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
 /* Forward declarations for helpers used in init/set_arity */
 static int compute_tree_depth(size_t n_clients, factory_arity_t arity);
 static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
+static int compute_tree_depth_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap);
+static int compute_leaf_count_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap);
+static size_t ps_leaf_capacity(const factory_t *f);
 
 /* Compute the DW counter n_layers given a tree depth and the static-near-root
    threshold (Phase 3 of mixed-arity plan).  Depths [0, threshold) are
@@ -502,6 +507,11 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
+
+    /* k=1 default for PS sub-factory arity (1-client-per-PS-leaf, no
+       sub-factories — preserves all historical PS test behavior).
+       Override with factory_set_ps_subfactory_arity() before build. */
+    f->ps_subfactory_arity = 1;
     return 1;
 }
 
@@ -539,14 +549,20 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
+
+    /* k=1 default for PS sub-factory arity (1-client-per-PS-leaf, no
+       sub-factories — preserves all historical PS test behavior).
+       Override with factory_set_ps_subfactory_arity() before build. */
+    f->ps_subfactory_arity = 1;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
     f->leaf_arity = arity;
     f->n_level_arity = 0;  /* clear variable arity */
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
-    int n_leaves = compute_leaf_count(nc, arity);
-    int tree_depth = compute_tree_depth(nc, arity);
+    size_t cap = ps_leaf_capacity(f);
+    int n_leaves = compute_leaf_count_psk(nc, arity, cap);
+    int tree_depth = compute_tree_depth_psk(nc, arity, cap);
     /* For arity-only (no variable arity set), threshold defaults to 0
        so this is a no-op for backward compat. */
     int n_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
@@ -568,10 +584,25 @@ static int arity_at_depth(const factory_t *f, int depth) {
     return (int)f->level_arity[f->n_level_arity - 1];
 }
 
-/* Determine if a subtree of `nc` clients is a leaf at a level whose arity is `a`. */
-static int subtree_is_leaf(int a, size_t nc) {
-    /* arity-1 / PS: 1 client per leaf */
-    if (a == 1 || a == FACTORY_ARITY_PS) return (nc <= 1);
+/* PS-leaf capacity for the canonical k² shape (t/1242).  Returns k²
+   when the factory is configured for PS with sub-factories (k>1), else
+   1 (current 1-client-per-PS-leaf historical behavior).  Helper used
+   by tree-shape calculations below. */
+static size_t ps_leaf_capacity(const factory_t *f) {
+    if (!f) return 1;
+    uint32_t k = f->ps_subfactory_arity;
+    if (k <= 1) return 1;
+    return (size_t)k * (size_t)k;
+}
+
+/* Determine if a subtree of `nc` clients is a leaf at a level whose
+   arity is `a`.  For PS with k²-sub-factories enabled, leaves hold up
+   to k² clients; otherwise PS holds 1 client per leaf (legacy). */
+static int subtree_is_leaf(const factory_t *f, int a, size_t nc) {
+    /* arity-1: 1 client per leaf */
+    if (a == 1) return (nc <= 1);
+    /* PS: 1 client per leaf at k=1, k² clients per leaf at k>1 */
+    if (a == FACTORY_ARITY_PS) return (nc <= ps_leaf_capacity(f));
     /* arity-A (A >= 2): up to A clients per leaf */
     return (nc <= (size_t)a);
 }
@@ -652,7 +683,7 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
         if (nc == 0) continue;
         if (d > max_depth) max_depth = d;
         int a = arity_at_depth(f, d);
-        if (subtree_is_leaf(a, nc)) {
+        if (subtree_is_leaf(f, a, nc)) {
             leaves++;
         } else {
             size_t parts[FACTORY_MAX_OUTPUTS];
@@ -675,6 +706,34 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
 void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks) {
     if (!f) return;
     f->l_stock_csv_blocks = csv_blocks;
+}
+
+void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
+    if (!f) return;
+    /* Cap at FACTORY_MAX_OUTPUTS - 1 so the leaf's k sub-factory entry
+       outputs + 1 L-stock output fit within FACTORY_MAX_OUTPUTS.  k=0
+       is treated as k=1 (no sub-factories). */
+    if (k == 0) k = 1;
+    if (k > (uint32_t)(FACTORY_MAX_OUTPUTS - 1))
+        k = (uint32_t)(FACTORY_MAX_OUTPUTS - 1);
+    f->ps_subfactory_arity = k;
+
+    /* If we're a PS factory, the leaf capacity changed → recompute
+       n_leaf_nodes and re-init the DW counter.  For non-PS factories
+       (e.g. arity-2 with sub-factory-arity set to a stray non-default)
+       the value is meaningless and we leave the leaf count untouched. */
+    if (f->leaf_arity != FACTORY_ARITY_PS) return;
+
+    size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
+    size_t cap = ps_leaf_capacity(f);
+    int n_leaves = compute_leaf_count_psk(nc, FACTORY_ARITY_PS, cap);
+    int tree_depth = compute_tree_depth_psk(nc, FACTORY_ARITY_PS, cap);
+    int n_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
+    f->n_leaf_nodes = n_leaves;
+    dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
+    for (int i = 0; i < n_leaves; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+    f->per_leaf_enabled = 0;
 }
 
 int factory_client_to_leaf(const factory_t *f, size_t client_idx,
@@ -700,11 +759,31 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
         return 0;
     }
 
-    /* ARITY_1 and ARITY_PS both build 1-client-per-leaf: ARITY_1 has a leaf
-       output of [vout 0 = client channel, vout 1 = L-stock]; ARITY_PS uses
-       [vout 0 = factory-consensus channel for the chain, vout 1 = L-stock]
-       with 1 client per leaf via setup_ps_leaf_outputs.  Both are looked up
-       the same way: client i owns leaf i, channel at vout 0.
+    /* ARITY_PS with k>1 sub-factories (canonical t/1242 k² shape):
+       client i lives on leaf i/k² in sub-factory (i%k²)/k as the
+       (i%k)-th channel output of that sub-factory's chain[0] TX. */
+    if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity > 1) {
+        size_t k = (size_t)f->ps_subfactory_arity;
+        size_t cap = k * k;
+        size_t leaf_idx = client_idx / cap;
+        size_t sub_idx_in_leaf = (client_idx % cap) / k;
+        size_t channel_in_sub = client_idx % k;
+        if (leaf_idx >= (size_t)f->n_leaf_nodes) return 0;
+        const factory_node_t *leaf =
+            &f->nodes[f->leaf_node_indices[leaf_idx]];
+        if ((int)sub_idx_in_leaf >= leaf->n_subfactories) return 0;
+        int sub_node = leaf->subfactory_node_indices[sub_idx_in_leaf];
+        if (sub_node < 0) return 0;
+        *node_idx_out = (size_t)sub_node;
+        *vout_out = (uint32_t)channel_in_sub;
+        return 1;
+    }
+
+    /* ARITY_1 and ARITY_PS (k=1) both build 1-client-per-leaf: ARITY_1 has a
+       leaf output of [vout 0 = client channel, vout 1 = L-stock]; ARITY_PS
+       uses [vout 0 = factory-consensus channel for the chain, vout 1 =
+       L-stock] with 1 client per leaf via setup_ps_leaf_outputs.  Both are
+       looked up the same way: client i owns leaf i, channel at vout 0.
 
        Earlier versions of this helper conflated PS with arity-2 (2 clients
        per leaf via `client_idx/2`), which silently broke ON-CHAIN ops for
@@ -759,8 +838,9 @@ void factory_set_static_near_root(factory_t *f, uint32_t threshold) {
     if (f->n_level_arity > 0) {
         simulate_tree(f, nc, &depth, &n_leaves);
     } else {
-        depth = compute_tree_depth(nc, f->leaf_arity);
-        n_leaves = compute_leaf_count(nc, f->leaf_arity);
+        size_t cap = ps_leaf_capacity(f);
+        depth = compute_tree_depth_psk(nc, f->leaf_arity, cap);
+        n_leaves = compute_leaf_count_psk(nc, f->leaf_arity, cap);
     }
     int n_layers = dw_n_layers_for(depth, threshold);
     f->n_leaf_nodes = n_leaves;
@@ -886,6 +966,146 @@ static int setup_ps_leaf_outputs(
     return 1;
 }
 
+/* Forward decl — defined below for the n-way leaf path; reused here for
+   sub-factory output setup (sub-factory shape == k channels + 1 sales-stock
+   == n-way leaf with n = k clients). */
+static int setup_nway_leaf_outputs(
+    factory_t *f,
+    factory_node_t *node,
+    const uint32_t *client_indices,
+    size_t n_client,
+    uint64_t input_amount);
+
+/* Set up a PS leaf with k² sub-factory shape (canonical t/1242).
+
+   Layout:
+     leaf node (NODE_STATE, n_signers = 1 + n_leaf_clients):
+       outputs[0..k-1] = sub-factory entry SPKs (MuSig(LSP, sub-factory clients))
+       outputs[k]      = L-stock SPK (or(N-of-N over all k² clients, L&CSV))
+       n_subfactories  = k
+
+     for each sub-factory si in 0..k-1 (NODE_PS_SUBFACTORY):
+       n_signers = 1 + n_clients_in_sub  (LSP + k sub-factory clients)
+       parent    = leaf, parent_vout = si
+       outputs[0..k-1] = MuSig(LSP, client_j) channel SPKs
+       outputs[k]      = sub-factory's "sales-stock" SPK (same shape as L-stock,
+                          keyed on the sub-factory's own keyagg)
+
+   Each sub-factory is itself a unidirectional PS chain primitive (the
+   LSP holds sales-stock; future Phase 2 will implement the dynamic
+   chain extension that lets the LSP move sales-stock value into a
+   client's channel).  At Phase 1 we just sign chain[0] of each
+   sub-factory and stop there. */
+static int setup_ps_leaf_with_subfactories(
+    factory_t *f,
+    int leaf_node_idx,
+    const uint32_t *leaf_client_indices,
+    size_t n_leaf_clients,
+    uint64_t input_amount
+) {
+    if (!f) return 0;
+    factory_node_t *leaf = &f->nodes[leaf_node_idx];
+    uint32_t k = f->ps_subfactory_arity;
+    if (k <= 1) return 0;
+    if (n_leaf_clients == 0) return 0;
+    if (n_leaf_clients > (size_t)k * (size_t)k) return 0;
+
+    /* Distribute clients into k sub-factories: ceil(n / k) clients each
+       (last sub-factory gets the remainder when n_leaf_clients < k²). */
+    size_t per_sub = (n_leaf_clients + k - 1) / k;
+    if (per_sub > k) per_sub = k;
+    if (per_sub == 0) return 0;
+
+    /* k sub-factory entry vouts + 1 L-stock vout. */
+    size_t n_outputs = (size_t)k + 1;
+    if (n_outputs > f->config.max_outputs_per_node) {
+        fprintf(stderr, "Factory: PS k=%u leaf needs %zu outputs > max %u\n",
+                k, n_outputs, f->config.max_outputs_per_node);
+        return 0;
+    }
+    if (input_amount <= f->fee_per_tx) return 0;
+    uint64_t output_total = input_amount - f->fee_per_tx;
+    uint64_t per_output = output_total / n_outputs;
+    uint64_t remainder = output_total - per_output * n_outputs;
+    if (per_output < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Factory: PS k=%u leaf per-output %llu below dust\n",
+                k, (unsigned long long)per_output);
+        return 0;
+    }
+
+    /* Set leaf-node fields BEFORE creating sub-factory children (their
+       add_node calls populate child_indices on the leaf). */
+    leaf->n_outputs = n_outputs;
+    leaf->is_ps_leaf = 1;
+    leaf->ps_chain_len = 0;
+    memset(leaf->ps_prev_txid, 0, 32);
+    leaf->ps_prev_chan_amount = 0;
+    leaf->n_subfactories = (int)k;
+
+    for (uint32_t si = 0; si < k; si++) {
+        size_t start_client = (size_t)si * per_sub;
+        if (start_client >= n_leaf_clients) {
+            /* Empty sub-factory — happens only if n_leaf_clients < k²
+               and we've exhausted clients before the last sub-factory.
+               Not canonical k² but tolerated for non-power-of-k² N. */
+            leaf->subfactory_node_indices[si] = -1;
+            /* Spend leaf vout to a 0-value placeholder won't work — just
+               require canonical k² N.  Reject. */
+            fprintf(stderr, "Factory: PS k=%u leaf has empty sub-factory %u "
+                    "(n_leaf_clients=%zu, per_sub=%zu) — require canonical k² N\n",
+                    k, si, n_leaf_clients, per_sub);
+            return 0;
+        }
+        size_t end_client = start_client + per_sub;
+        if (end_client > n_leaf_clients) end_client = n_leaf_clients;
+        size_t n_in_sub = end_client - start_client;
+
+        uint32_t sub_signers[FACTORY_MAX_SIGNERS];
+        sub_signers[0] = 0;
+        for (size_t ci = 0; ci < n_in_sub; ci++)
+            sub_signers[ci + 1] = leaf_client_indices[start_client + ci];
+
+        int sub_idx = add_node(f, NODE_PS_SUBFACTORY,
+                                sub_signers, n_in_sub + 1,
+                                leaf_node_idx, si,
+                                -1,    /* no DW layer for sub-factory */
+                                0);    /* no per-node CLTV at this phase */
+        if (sub_idx < 0) {
+            fprintf(stderr, "Factory: add sub-factory node %u failed\n", si);
+            return 0;
+        }
+        leaf->subfactory_node_indices[si] = sub_idx;
+
+        /* Wire leaf's vout[si] → sub-factory's spending_spk. */
+        memcpy(leaf->outputs[si].script_pubkey,
+               f->nodes[sub_idx].spending_spk, 34);
+        leaf->outputs[si].script_pubkey_len = 34;
+        leaf->outputs[si].amount_sats = per_output;
+
+        /* Set up sub-factory's own outputs: per-client channels + sales-stock.
+           Reuses setup_nway_leaf_outputs which produces exactly that shape:
+           k MuSig(LSP, client_i) channels + 1 L-stock (= sales-stock when
+           applied to a sub-factory's keyagg).  Mark the sub-factory as a
+           PS leaf so existing PS-aware code paths handle it correctly. */
+        if (!setup_nway_leaf_outputs(f, &f->nodes[sub_idx],
+                                       sub_signers + 1, n_in_sub,
+                                       per_output)) {
+            fprintf(stderr, "Factory: sub-factory %u channel setup failed\n", si);
+            return 0;
+        }
+        f->nodes[sub_idx].input_amount = per_output;
+        f->nodes[sub_idx].is_ps_leaf = 1;
+        f->nodes[sub_idx].ps_chain_len = 0;
+    }
+
+    /* Leaf-level L-stock at the LAST output. */
+    if (!build_l_stock_spk(f, leaf, leaf->outputs[k].script_pubkey))
+        return 0;
+    leaf->outputs[k].script_pubkey_len = 34;
+    leaf->outputs[k].amount_sats = per_output + remainder;
+    return 1;
+}
+
 /* ---- Generalized N-participant tree builder ---- */
 
 #define TIMEOUT_STEP_BLOCKS 5
@@ -894,14 +1114,19 @@ static int setup_ps_leaf_outputs(
    n_clients = n_participants - 1 (excluding LSP).
    Arity-2:  each leaf holds 2 clients → ceil(log2(ceil(n_clients/2))) splits.
    Arity-1:  each leaf holds 1 client  → ceil(log2(n_clients)) splits.
-   Arity-PS: same as arity-1 (1 client per leaf, PS chain replaces leaf DW layer).
-   Returns 0 for a single leaf (1 or 2 clients depending on arity). */
-static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
+   Arity-PS: each leaf holds ps_leaf_cap clients (1 at k=1, k² at k>1).
+   Returns 0 for a single leaf. */
+static int compute_tree_depth_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap) {
     size_t n_leaves;
-    if (arity == FACTORY_ARITY_1 || arity == FACTORY_ARITY_PS)
+    if (arity == FACTORY_ARITY_1)
         n_leaves = n_clients;
-    else
+    else if (arity == FACTORY_ARITY_PS) {
+        if (ps_leaf_cap < 1) ps_leaf_cap = 1;
+        n_leaves = (n_clients + ps_leaf_cap - 1) / ps_leaf_cap;
+    } else {
         n_leaves = (n_clients + 1) / 2;  /* ceil(n_clients / 2) */
+    }
 
     if (n_leaves <= 1) return 0;
     int depth = 0;
@@ -910,12 +1135,29 @@ static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
     return depth;
 }
 
+/* Backwards-compat shim: assumes ps_leaf_cap = 1 (legacy 1-client-per-PS-leaf). */
+static int compute_tree_depth(size_t n_clients, factory_arity_t arity) {
+    return compute_tree_depth_psk(n_clients, arity, 1);
+}
+
 /* Compute number of leaf nodes.
-   Arity-2: ceil(n_clients / 2).  Arity-1 / Arity-PS: n_clients. */
-static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
-    if (arity == FACTORY_ARITY_1 || arity == FACTORY_ARITY_PS)
+   Arity-2: ceil(n_clients / 2).
+   Arity-1: n_clients.
+   Arity-PS: ceil(n_clients / ps_leaf_cap)  (k² for canonical k>1, else 1). */
+static int compute_leaf_count_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap) {
+    if (arity == FACTORY_ARITY_1)
         return (int)n_clients;
+    if (arity == FACTORY_ARITY_PS) {
+        if (ps_leaf_cap < 1) ps_leaf_cap = 1;
+        return (int)((n_clients + ps_leaf_cap - 1) / ps_leaf_cap);
+    }
     return (int)((n_clients + 1) / 2);
+}
+
+/* Backwards-compat shim: assumes ps_leaf_cap = 1 (legacy 1-client-per-PS-leaf). */
+static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
+    return compute_leaf_count_psk(n_clients, arity, 1);
 }
 
 /* Set up N-way leaf outputs for arity A >= 2.
@@ -1056,7 +1298,7 @@ static int build_subtree(
        only enough clients to be a leaf, we fall back to the non-static
        state-paired path. */
     int cur_arity = arity_at_depth(f, depth);
-    int is_leaf = subtree_is_leaf(cur_arity, n_clients);
+    int is_leaf = subtree_is_leaf(f, cur_arity, n_clients);
     if (is_leaf) is_static = 0;
 
     if (is_static) {
@@ -1162,10 +1404,22 @@ static int build_subtree(
         f->nodes[st_idx].input_amount = ko_out_amount;
 
         if (cur_arity == FACTORY_ARITY_PS) {
-            /* Pseudo-Spilman leaf: 1 client, chained TXs instead of DW nSequence */
-            if (!setup_ps_leaf_outputs(f, &f->nodes[st_idx],
-                                       client_indices[0], ko_out_amount))
-                return 0;
+            uint32_t k = f->ps_subfactory_arity;
+            if (k > 1) {
+                /* Canonical k² PS leaf (t/1242): k sub-factories of k clients.
+                   The leaf's k+1 outputs are k sub-factory entries + L-stock;
+                   each sub-factory gets its own NODE_PS_SUBFACTORY child. */
+                if (!setup_ps_leaf_with_subfactories(f, st_idx,
+                                                      client_indices, n_clients,
+                                                      ko_out_amount))
+                    return 0;
+            } else {
+                /* Legacy 1-client-per-PS-leaf: chained TXs replace the leaf
+                   DW nSequence, no sub-factories. */
+                if (!setup_ps_leaf_outputs(f, &f->nodes[st_idx],
+                                           client_indices[0], ko_out_amount))
+                    return 0;
+            }
         } else if (n_clients == 1) {
             if (!setup_single_leaf_outputs(f, &f->nodes[st_idx],
                                            client_indices[0], ko_out_amount))
@@ -1281,8 +1535,9 @@ int factory_build_tree(factory_t *f) {
     if (f->n_level_arity > 0) {
         simulate_tree(f, n_clients, &tree_depth, &n_leaves);
     } else {
-        tree_depth = compute_tree_depth(n_clients, f->leaf_arity);
-        n_leaves = compute_leaf_count(n_clients, f->leaf_arity);
+        size_t cap = ps_leaf_capacity(f);
+        tree_depth = compute_tree_depth_psk(n_clients, f->leaf_arity, cap);
+        n_leaves = compute_leaf_count_psk(n_clients, f->leaf_arity, cap);
     }
     /* Phase 3: respect static_threshold_depth — only non-static depths get
        DW layers. */

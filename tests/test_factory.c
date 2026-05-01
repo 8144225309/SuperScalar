@@ -5249,6 +5249,146 @@ int test_factory_ps_leaf_build(void) {
     return 1;
 }
 
+/* Canonical k² PS sub-factory shape from t/1242 (Gap E followup, task #181).
+
+   Builds a 5-participant PS factory (LSP + 4 clients) with k=2 sub-factory
+   arity.  Per the spec, this should produce:
+     - 1 PS leaf (k² = 4 = n_clients, single leaf with all clients)
+     - leaf.n_signers = 5 (LSP + 4 clients)
+     - leaf.n_outputs = k+1 = 3 (2 sub-factory entries + 1 L-stock)
+     - leaf.n_subfactories = 2
+     - 2 NODE_PS_SUBFACTORY child nodes:
+         sub-factory 0: signers [LSP, A, B], outputs = 3 (A&L, B&L, sales-stock)
+         sub-factory 1: signers [LSP, C, D], outputs = 3 (C&L, D&L, sales-stock)
+
+   Verifies:
+     - tree shape (node count, leaf count, sub-factory count)
+     - sub-factory keyaggs include the right signers
+     - leaf's outputs[0..1] SPKs match sub-factories' spending_spk
+     - factory_sign_all + factory_verify_all both pass (every sub-factory's
+       chain[0] is signed by N-of-N MuSig and verifies against the leaf's
+       output SPK)
+     - factory_client_to_leaf maps each client to the right (sub-factory,
+       channel-vout). */
+int test_factory_ps_subfactory_k2_n4(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xCC;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    /* funding SPK: P2TR of 5-of-5 aggregate */
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDD, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);  /* k=2 → k²=4 clients per leaf */
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+
+    /* Sanity: setting k=2 should have collapsed to 1 leaf (4/4=1). */
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 1, "k=2 N=4 → 1 leaf");
+
+    TEST_ASSERT(factory_build_tree(f), "build k² PS tree");
+
+    /* Tree shape: 1 leaf with 2 sub-factories.  Single-leaf factories have
+       a kickoff/state pair (no interior splits when n_leaves==1):
+         node 0: root kickoff
+         node 1: leaf (state)
+         node 2: sub-factory 0
+         node 3: sub-factory 1
+       Total: 4 nodes. */
+    TEST_ASSERT_EQ((int)f->n_nodes, 4, "4 nodes (kickoff + leaf + 2 subs)");
+
+    /* Verify leaf node */
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    TEST_ASSERT(leaf->is_ps_leaf, "leaf is_ps_leaf");
+    TEST_ASSERT_EQ((int)leaf->n_signers, 5, "leaf n_signers = 5 (LSP+4)");
+    TEST_ASSERT_EQ((int)leaf->n_outputs, 3, "leaf n_outputs = k+1 = 3");
+    TEST_ASSERT_EQ(leaf->n_subfactories, 2, "leaf has 2 sub-factories");
+
+    /* Verify each sub-factory */
+    for (int si = 0; si < 2; si++) {
+        int sub_node_idx = leaf->subfactory_node_indices[si];
+        TEST_ASSERT(sub_node_idx >= 0, "sub-factory node index valid");
+        factory_node_t *sub = &f->nodes[sub_node_idx];
+        TEST_ASSERT(sub->type == NODE_PS_SUBFACTORY, "sub type is NODE_PS_SUBFACTORY");
+        TEST_ASSERT_EQ((int)sub->n_signers, 3, "sub n_signers = LSP+2 = 3");
+        TEST_ASSERT_EQ((int)sub->n_outputs, 3, "sub n_outputs = k+1 = 3 (2 chan + sales)");
+        TEST_ASSERT(sub->parent_index == (int)leaf_idx, "sub parent is leaf");
+        TEST_ASSERT_EQ((int)sub->parent_vout, si, "sub parent_vout matches index");
+        /* LSP is signer slot 0 */
+        TEST_ASSERT_EQ((int)sub->signer_indices[0], 0, "sub signer[0] = LSP");
+        /* Clients on sub 0 should be 1, 2 (i.e. participant 1 and 2) */
+        if (si == 0) {
+            TEST_ASSERT_EQ((int)sub->signer_indices[1], 1, "sub0 client A = pid 1");
+            TEST_ASSERT_EQ((int)sub->signer_indices[2], 2, "sub0 client B = pid 2");
+        } else {
+            TEST_ASSERT_EQ((int)sub->signer_indices[1], 3, "sub1 client C = pid 3");
+            TEST_ASSERT_EQ((int)sub->signer_indices[2], 4, "sub1 client D = pid 4");
+        }
+        /* Leaf's outputs[si] SPK must equal sub-factory's spending_spk */
+        TEST_ASSERT(memcmp(leaf->outputs[si].script_pubkey,
+                            sub->spending_spk, 34) == 0,
+                    "leaf vout SPK == sub-factory spending_spk");
+    }
+
+    /* factory_client_to_leaf must route each client to its sub-factory channel. */
+    for (size_t ci = 0; ci < 4; ci++) {
+        size_t out_node;
+        uint32_t out_vout;
+        TEST_ASSERT(factory_client_to_leaf(f, ci, &out_node, &out_vout),
+                    "client_to_leaf returns ok");
+        int expected_sub_node = leaf->subfactory_node_indices[ci / 2];
+        uint32_t expected_vout = (uint32_t)(ci % 2);
+        TEST_ASSERT_EQ((int)out_node, expected_sub_node,
+                        "client maps to expected sub-factory node");
+        TEST_ASSERT_EQ((int)out_vout, (int)expected_vout,
+                        "client maps to expected channel vout");
+    }
+
+    /* Sign and verify EVERY node — proves chain[0] of each sub-factory is
+       a valid N-of-N MuSig signature against the leaf's vout SPK. */
+    TEST_ASSERT(factory_sign_all(f), "sign k² PS factory");
+    TEST_ASSERT(factory_verify_all(f), "verify k² PS factory");
+
+    /* Each sub-factory's signed_tx must be populated. */
+    for (int si = 0; si < 2; si++) {
+        factory_node_t *sub = &f->nodes[leaf->subfactory_node_indices[si]];
+        TEST_ASSERT(sub->is_signed, "sub-factory signed");
+        TEST_ASSERT(sub->signed_tx.len > 0, "sub-factory signed_tx populated");
+    }
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Build, sign, verify, and advance a PS factory at N=64 (1 LSP + 63 clients).
  * This is the scale test — the existing PS tests use N=3 (2 clients), which
  * doesn't exercise the interior-tree layers or the 64-way MuSig ceremony.

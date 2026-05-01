@@ -77,7 +77,25 @@ typedef struct {
 /* Fill config with compiled-in defaults. */
 void factory_config_default(factory_config_t *cfg);
 
-typedef enum { NODE_KICKOFF, NODE_STATE } factory_node_type_t;
+/* Node types in a factory tree.
+
+   NODE_KICKOFF / NODE_STATE — the canonical Decker-Wattenhofer kickoff
+     + state pair that interior factory nodes use.
+
+   NODE_PS_SUBFACTORY — Pseudo-Spilman sub-factory child of a PS leaf
+     (only used when ps_subfactory_arity > 1, the canonical k² shape
+     from t/1242).  Spends one of the parent leaf's vouts.  Its own
+     outputs are k client channels + 1 sales-stock output that the LSP
+     can chain into new client channels via the dynamic extension
+     ceremony (Phase 2 of docs/ps-subfactories.md).
+     For k=1 (current default), this type is unused — PS leaves
+     remain 1-client-per-leaf and the leaf node directly owns the
+     channel + L-stock outputs. */
+typedef enum {
+    NODE_KICKOFF,
+    NODE_STATE,
+    NODE_PS_SUBFACTORY
+} factory_node_type_t;
 
 /* Factory lifecycle states (Phase 8) */
 typedef enum {
@@ -140,6 +158,25 @@ typedef struct {
     int ps_chain_len;            /* number of state advances (0 = initial state) */
     unsigned char ps_prev_txid[32];    /* txid (internal byte order) of the prior chain TX */
     uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX */
+
+    /* PS sub-factory wiring (only used when ps_subfactory_arity > 1, the
+       canonical k² shape from t/1242).
+
+       On a PS LEAF node (is_ps_leaf == 1) with k>1: n_subfactories == k
+       and subfactory_node_indices[0..k-1] point into f->nodes[] at the
+       k sub-factory child nodes.  The leaf node's outputs[0..k-1] are
+       the entry-point SPKs for each sub-factory, and outputs[k] is the
+       leaf-level L-stock.
+
+       On a NODE_PS_SUBFACTORY node: n_subfactories == 0, parent_index
+       points back to the leaf, parent_vout indicates which leaf vout
+       this sub-factory occupies.  The sub-factory's own outputs[0..k-1]
+       are the per-client channel SPKs and outputs[k] is the sub-factory's
+       sales-stock SPK.
+
+       For k=1 (default) both fields are 0. */
+    int n_subfactories;
+    int subfactory_node_indices[FACTORY_MAX_OUTPUTS];
 
     /* Static-near-root variant (Phase 3 of mixed-arity plan).
        1 = kickoff-only node, no paired NODE_STATE, no DW counter contribution.
@@ -228,6 +265,22 @@ typedef struct {
        rationale and default. */
     uint32_t l_stock_csv_blocks;
 
+    /* PS sub-factory arity (k) for the canonical k² PS leaf shape from
+       t/1242 (docs/ps-subfactories.md, Gap E followup, task #181).
+
+       k=1 (default): 1-client-per-PS-leaf, no sub-factories — current
+                      historical behavior, preserves all existing tests.
+       k>1: each PS leaf hosts k sub-factories of k clients each (k²
+            clients per leaf total).  Each sub-factory is a unidirectional
+            PS chain rooted at one of the leaf's vouts, with the LSP
+            holding "sales-stock" that can be dynamically chained into
+            new client channels.
+
+       Only meaningful when leaf_arity == FACTORY_ARITY_PS.  Phase 1 of
+       the implementation (this PR) builds the structure + signs the
+       initial state; Phase 2 adds the dynamic chain extension ceremony. */
+    uint32_t ps_subfactory_arity;
+
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
@@ -278,6 +331,15 @@ void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
    before factory_build_tree() — otherwise the L-stock SPK is already
    committed.  Pass 0 to keep the L_STOCK_CSV_DEFAULT_BLOCKS default. */
 void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks);
+
+/* Set PS sub-factory arity k for the canonical k² PS leaf shape from
+   t/1242.  k=1 (default) preserves 1-client-per-PS-leaf behavior; k>1
+   makes each PS leaf host k sub-factories of k clients each (k²
+   clients per leaf total).  Only meaningful for FACTORY_ARITY_PS;
+   ignored otherwise.  Must be called before factory_build_tree().
+   Bounded by FACTORY_MAX_OUTPUTS-1 (need room for the leaf-level
+   L-stock output as the last vout). */
+void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k);
 
 /* Build the unsigned L-stock POISON TRANSACTION for a leaf state.
    Spends the L-stock UTXO (`l_stock_txid:l_stock_vout` carrying
