@@ -961,6 +961,16 @@ static int setup_ps_leaf_outputs(
     return 1;
 }
 
+/* Forward decl — defined below for the n-way leaf path; reused here for
+   sub-factory output setup (sub-factory shape == k channels + 1 sales-stock
+   == n-way leaf with n = k clients). */
+static int setup_nway_leaf_outputs(
+    factory_t *f,
+    factory_node_t *node,
+    const uint32_t *client_indices,
+    size_t n_client,
+    uint64_t input_amount);
+
 /* Set up a PS leaf with k² sub-factory shape (canonical t/1242).
 
    Layout:
