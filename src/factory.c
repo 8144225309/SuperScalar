@@ -438,6 +438,11 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
 /* Forward declarations for helpers used in init/set_arity */
 static int compute_tree_depth(size_t n_clients, factory_arity_t arity);
 static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
+static int compute_tree_depth_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap);
+static int compute_leaf_count_psk(size_t n_clients, factory_arity_t arity,
+                                    size_t ps_leaf_cap);
+static size_t ps_leaf_capacity(const factory_t *f);
 
 /* Compute the DW counter n_layers given a tree depth and the static-near-root
    threshold (Phase 3 of mixed-arity plan).  Depths [0, threshold) are
