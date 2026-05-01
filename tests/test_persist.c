@@ -53,6 +53,81 @@ static secp256k1_context *test_ctx(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 }
 
+/* ---- PS sub-factory chain entry persist round-trip (Phase 4a) ----
+
+   Verifies that the existing persist_save_ps_chain_entry +
+   persist_load_ps_chain helpers correctly round-trip a sub-factory
+   chain entry.  The schema is generic on (factory_id, leaf_node_idx,
+   chain_pos) so a sub-factory's node_idx in f->nodes[] can be stored
+   directly — no schema change needed for k² support.
+
+   Saves three consecutive chain entries for a sub-factory at node_idx
+   42 (chain_pos 0, 1, 2), then loads them back and asserts:
+     - exact count returned
+     - per-entry txid matches (32 bytes)
+     - per-entry signed_tx matches (variable length)
+     - per-entry chan_amount matches (which is the sales-stock amount
+       in the sub-factory case — see lsp_subfactory_chain_advance) */
+int test_persist_ps_subfactory_chain_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t factory_id = 0;
+    const uint32_t sub_node_idx = 42;  /* a sub-factory node, not a leaf */
+
+    /* Three chain entries, each a different chain_pos. */
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][64];
+    size_t signed_tx_lens[3] = { 32, 48, 64 };
+    uint64_t sstock_amounts[3] = { 50000, 40000, 30000 };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0xA0 + i, 32);
+        memset(signed_txs[i], 0xB0 + i, signed_tx_lens[i]);
+    }
+
+    /* Save chain[0..2] */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(persist_save_ps_chain_entry(
+                        &db, factory_id, sub_node_idx, i,
+                        txids[i],
+                        signed_txs[i], signed_tx_lens[i],
+                        sstock_amounts[i]),
+                    "save sub-factory chain entry");
+    }
+
+    /* Load back and verify round-trip. */
+    tx_buf_t loaded_txs[3];
+    for (int i = 0; i < 3; i++) tx_buf_init(&loaded_txs[i], 64);
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_amounts[3];
+    int n_loaded = persist_load_ps_chain(&db, factory_id, sub_node_idx,
+                                            loaded_txs, loaded_txids,
+                                            loaded_amounts, 3);
+    TEST_ASSERT_EQ(n_loaded, 3, "n_loaded chain entries");
+
+    for (int i = 0; i < 3; i++) {
+        if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
+            printf("  FAIL: chain[%d] txid mismatch\n", i);
+            return 0;
+        }
+        if (loaded_txs[i].len != signed_tx_lens[i]) {
+            printf("  FAIL: chain[%d] signed_tx_len mismatch (got %zu, want %zu)\n",
+                    i, loaded_txs[i].len, signed_tx_lens[i]);
+            return 0;
+        }
+        if (memcmp(loaded_txs[i].data, signed_txs[i], signed_tx_lens[i]) != 0) {
+            printf("  FAIL: chain[%d] signed_tx bytes mismatch\n", i);
+            return 0;
+        }
+        TEST_ASSERT_EQ((long)loaded_amounts[i], (long)sstock_amounts[i],
+                        "chain entry sales-stock amount");
+        tx_buf_free(&loaded_txs[i]);
+    }
+
+    persist_close(&db);
+    return 1;
+}
+
 /* ---- Test 1: Open/close in-memory database ---- */
 
 int test_persist_open_close(void) {
