@@ -1117,6 +1117,7 @@ extern int test_regtest_ps_chain_close_spendability(void);
 extern int test_regtest_htlc_in_flight_spendability(void);
 extern int test_regtest_rotation_all_arities(void);
 extern int test_regtest_full_tree_force_close_all_arities(void);
+extern int test_regtest_k2_ps_subfactory_force_close(void);
 extern int test_regtest_jit_recovery_close_coop_full(void);
 extern int test_regtest_jit_recovery_close_force_full(void);
 extern int test_regtest_inversion_of_timeout_default(void);
@@ -3733,6 +3734,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_htlc_in_flight_spendability);
     RUN_TEST(test_regtest_rotation_all_arities);
     RUN_TEST(test_regtest_full_tree_force_close_all_arities);
+    RUN_TEST(test_regtest_k2_ps_subfactory_force_close);
     RUN_TEST(test_regtest_jit_recovery_close_coop_full);
     RUN_TEST(test_regtest_jit_recovery_close_force_full);
     RUN_TEST(test_regtest_inversion_of_timeout_default);
