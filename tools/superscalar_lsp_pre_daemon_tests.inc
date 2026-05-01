@@ -1178,7 +1178,12 @@
                     uint64_t ch0_before = sub0->outputs[0].amount_sats;
                     uint64_t sstock_before =
                         sub0->outputs[sub0->n_outputs - 1].amount_sats;
-                    uint64_t delta = 50000;
+                    /* Pick delta well under sales-stock capacity.  At
+                       funding=400k with k=2 N=4 the per-output budget
+                       is ~44k after 3 fee rounds; 10k leaves comfortable
+                       headroom and exercises the cryptographic flow
+                       without bumping into dust limits. */
+                    uint64_t delta = 10000;
 
                     printf("  pre-extension: chain_len=%d, ch[0]=%llu, "
                            "sales-stock=%llu, delta=%llu\n",
