@@ -568,6 +568,77 @@ int watchtower_check(watchtower_t *wt) {
             continue;
         }
 
+        if (e->type == WATCH_SUBFACTORY_NODE) {
+            /* PS sub-factory chain breach (k² shape).
+               Stale chain[N-1] confirmed; we broadcast the latest chain[N]
+               (which spends a UTXO that no longer exists on-chain after
+               the stale state confirms — but this is the same shape as
+               the FACTORY_NODE response, retained for symmetry until the
+               poison TX builder lands).  We then broadcast the poison TX
+               that distributes the stale sales-stock to clients pro-rata.
+
+               Unlike WATCH_FACTORY_NODE we do NOT auto-settle channels —
+               sub-factory clients live inside the sub-factory chain TX,
+               not as separately registered channels in wt->channels[].
+               Their per-channel claims are encoded in the poison TX
+               outputs, not in independent commitment TXs. */
+            printf("SUB-FACTORY BREACH on node %u (txid: %s, %zu channels, "
+                   "sales-stock %llu sats)!\n",
+                   e->channel_id, txid_hex, e->n_sub_channels,
+                   (unsigned long long)e->sub_sales_stock_amount);
+            fflush(stdout);
+
+            char sub_resp_txid[65] = {0};
+
+            if (e->response_tx && e->response_tx_len > 0) {
+                char *resp_hex = (char *)malloc(e->response_tx_len * 2 + 1);
+                if (resp_hex) {
+                    hex_encode(e->response_tx, e->response_tx_len, resp_hex);
+                    char resp_txid[65];
+                    if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
+                        printf("  Sub-factory response tx broadcast: %s\n", resp_txid);
+                        memcpy(sub_resp_txid, resp_txid, 64);
+                        sub_resp_txid[64] = '\0';
+                        penalties_broadcast++;
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, resp_txid,
+                                                  "subfactory_response", resp_hex, "ok");
+                    } else {
+                        fprintf(stderr, "  Sub-factory response tx broadcast failed\n");
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "subfactory_response", resp_hex, "failed");
+                    }
+                    free(resp_hex);
+                }
+            }
+
+            if (e->burn_tx && e->burn_tx_len > 0) {
+                char *poison_hex = (char *)malloc(e->burn_tx_len * 2 + 1);
+                if (poison_hex) {
+                    hex_encode(e->burn_tx, e->burn_tx_len, poison_hex);
+                    char poison_txid[65];
+                    if (wt->chain->send_raw_tx(wt->chain, poison_hex, poison_txid)) {
+                        printf("  Sub-factory poison tx broadcast: %s\n", poison_txid);
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, poison_txid,
+                                                  "subfactory_poison", poison_hex, "ok");
+                    } else {
+                        fprintf(stderr, "  Sub-factory poison tx broadcast failed\n");
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "subfactory_poison", poison_hex, "failed");
+                    }
+                    free(poison_hex);
+                }
+            }
+
+            e->penalty_broadcast = 1;
+            memcpy(e->penalty_txid, sub_resp_txid, 65);
+            i++;
+            continue;
+        }
+
         /* WATCH_COMMITMENT: build and broadcast penalty tx */
         printf("BREACH DETECTED on channel %u, commitment %llu (txid: %s)!\n",
                e->channel_id, (unsigned long long)e->commit_num, txid_hex);
@@ -1156,17 +1227,80 @@ int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
     return 1;
 }
 
+int watchtower_watch_subfactory_node(watchtower_t *wt,
+    uint32_t sub_node_idx,
+    const unsigned char *old_chain_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *poison_tx, size_t poison_tx_len,
+    const uint64_t *channel_amounts, size_t n_channels,
+    uint64_t sales_stock_amount)
+{
+    if (!wt || !old_chain_txid32 || !response_tx || response_tx_len == 0) return 0;
+    if (wt->n_entries >= wt->entries_cap) return 0;
+
+    watchtower_entry_t *e = &wt->entries[wt->n_entries];
+    memset(e, 0, sizeof(*e));
+    e->type = WATCH_SUBFACTORY_NODE;
+    e->channel_id = sub_node_idx;
+    e->commit_num = 0;
+    memcpy(e->txid, old_chain_txid32, 32);
+
+    e->response_tx = (unsigned char *)malloc(response_tx_len);
+    if (!e->response_tx) return 0;
+    memcpy(e->response_tx, response_tx, response_tx_len);
+    e->response_tx_len = response_tx_len;
+
+    /* Poison TX: distributes stale sales-stock to clients on breach.
+       Optional during early integration; the actual poison-TX builder
+       lands in a follow-up PR.  Reuses the burn_tx[] storage in the
+       entry (same shape — pre-built TX to broadcast on breach). */
+    if (poison_tx && poison_tx_len > 0) {
+        e->burn_tx = (unsigned char *)malloc(poison_tx_len);
+        if (!e->burn_tx) {
+            free(e->response_tx);
+            e->response_tx = NULL;
+            return 0;
+        }
+        memcpy(e->burn_tx, poison_tx, poison_tx_len);
+        e->burn_tx_len = poison_tx_len;
+    }
+
+    /* Per-channel amounts at chain[N-1] — needed by analytics + by the
+       poison TX builder once wired.  Copied so caller's buffer is free
+       to be reused. */
+    if (channel_amounts && n_channels > 0) {
+        e->sub_channel_amounts = (uint64_t *)malloc(n_channels * sizeof(uint64_t));
+        if (!e->sub_channel_amounts) {
+            free(e->response_tx);  e->response_tx = NULL;
+            free(e->burn_tx);       e->burn_tx = NULL;
+            return 0;
+        }
+        memcpy(e->sub_channel_amounts, channel_amounts,
+               n_channels * sizeof(uint64_t));
+        e->n_sub_channels = n_channels;
+    }
+    e->sub_sales_stock_amount = sales_stock_amount;
+
+    wt->n_entries++;
+    return 1;
+}
+
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
         free(wt->entries[i].leaf_channel_ids);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
-        if (wt->entries[i].type == WATCH_FACTORY_NODE) {
+        if (wt->entries[i].type == WATCH_FACTORY_NODE ||
+            wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
             wt->entries[i].response_tx = NULL;
             free(wt->entries[i].burn_tx);
             wt->entries[i].burn_tx = NULL;
+        }
+        if (wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
+            free(wt->entries[i].sub_channel_amounts);
+            wt->entries[i].sub_channel_amounts = NULL;
         }
     }
     free(wt->entries);
@@ -1236,11 +1370,16 @@ void watchtower_clear_entries(watchtower_t *wt) {
         entry_unregister_scripts(wt, &wt->entries[i]);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
-        if (wt->entries[i].type == WATCH_FACTORY_NODE) {
+        if (wt->entries[i].type == WATCH_FACTORY_NODE ||
+            wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
             wt->entries[i].response_tx = NULL;
             free(wt->entries[i].burn_tx);
             wt->entries[i].burn_tx = NULL;
+        }
+        if (wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
+            free(wt->entries[i].sub_channel_amounts);
+            wt->entries[i].sub_channel_amounts = NULL;
         }
     }
     wt->n_entries = 0;

@@ -286,6 +286,73 @@ int test_factory_node_watch(void) {
     return 1;
 }
 
+/* Test 5b: watchtower_watch_subfactory_node creates entry with response,
+   poison TX, and per-channel amounts (Phase 4b) */
+int test_subfactory_node_watch(void) {
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
+
+    unsigned char old_chain_txid[32];
+    memset(old_chain_txid, 0x77, 32);
+
+    /* Fake "latest sub-factory chain TX" as response */
+    unsigned char response[80];
+    memset(response, 0x88, 80);
+
+    /* Fake "poison TX" that distributes stale sales-stock to clients */
+    unsigned char poison[60];
+    memset(poison, 0x99, 60);
+
+    /* k=3 channels at chain[N-1] with distinct amounts */
+    uint64_t channel_amounts[3] = { 25000, 15000, 30000 };
+    uint64_t sales_stock = 12345;
+
+    int ok = watchtower_watch_subfactory_node(&wt, /* sub_node_idx */ 7,
+                                                old_chain_txid,
+                                                response, 80,
+                                                poison, 60,
+                                                channel_amounts, 3,
+                                                sales_stock);
+    TEST_ASSERT(ok == 1, "watchtower_watch_subfactory_node should succeed");
+    TEST_ASSERT(wt.n_entries == 1, "should have 1 entry");
+    TEST_ASSERT(wt.entries[0].type == WATCH_SUBFACTORY_NODE,
+                "entry type should be WATCH_SUBFACTORY_NODE");
+    TEST_ASSERT(wt.entries[0].channel_id == 7, "sub_node_idx should be 7");
+    TEST_ASSERT(memcmp(wt.entries[0].txid, old_chain_txid, 32) == 0,
+                "stale txid should match");
+    TEST_ASSERT(wt.entries[0].response_tx_len == 80,
+                "response_tx_len should be 80");
+    TEST_ASSERT(memcmp(wt.entries[0].response_tx, response, 80) == 0,
+                "response_tx data should match");
+    TEST_ASSERT(wt.entries[0].burn_tx_len == 60,
+                "poison_tx (stored as burn_tx) len should be 60");
+    TEST_ASSERT(memcmp(wt.entries[0].burn_tx, poison, 60) == 0,
+                "poison_tx data should match");
+    TEST_ASSERT(wt.entries[0].n_sub_channels == 3, "n_sub_channels should be 3");
+    TEST_ASSERT(wt.entries[0].sub_channel_amounts[0] == 25000, "channel[0] amount");
+    TEST_ASSERT(wt.entries[0].sub_channel_amounts[1] == 15000, "channel[1] amount");
+    TEST_ASSERT(wt.entries[0].sub_channel_amounts[2] == 30000, "channel[2] amount");
+    TEST_ASSERT(wt.entries[0].sub_sales_stock_amount == 12345,
+                "sales-stock amount");
+
+    /* Verify NULL poison TX path (early integration before builder lands) */
+    int ok2 = watchtower_watch_subfactory_node(&wt, /* sub_node_idx */ 8,
+                                                 old_chain_txid,
+                                                 response, 80,
+                                                 NULL, 0,
+                                                 channel_amounts, 3,
+                                                 sales_stock);
+    TEST_ASSERT(ok2 == 1, "NULL poison_tx path should succeed");
+    TEST_ASSERT(wt.n_entries == 2, "should have 2 entries");
+    TEST_ASSERT(wt.entries[1].burn_tx == NULL, "no poison TX stored when NULL");
+    TEST_ASSERT(wt.entries[1].burn_tx_len == 0, "no poison TX len when NULL");
+
+    watchtower_cleanup(&wt);
+    return 1;
+}
+
 /* Test 6: factory node entry coexists with commitment entries */
 int test_factory_and_commitment_entries(void) {
     watchtower_t wt;

@@ -15,6 +15,11 @@
 typedef enum {
     WATCH_COMMITMENT,      /* Channel commitment breach — build penalty tx */
     WATCH_FACTORY_NODE,    /* Factory state breach — broadcast latest state tx */
+    WATCH_SUBFACTORY_NODE, /* PS sub-factory chain breach (k² shape) — broadcast
+                              latest sub-factory chain TX + poison TX that
+                              distributes stale sales-stock to clients.  Unlike
+                              FACTORY_NODE, sub-factory clients are not directly
+                              on-chain so no auto-settle. */
     WATCH_FORCE_CLOSE      /* Force-close: sweep expired HTLC timeout outputs */
 } watchtower_entry_type_t;
 
@@ -58,6 +63,16 @@ typedef struct {
     size_t burn_tx_len;
     uint32_t *leaf_channel_ids;   /* channel indices on this leaf (for auto-settle) */
     size_t n_leaf_channels;       /* number of channels on this leaf */
+
+    /* WATCH_SUBFACTORY_NODE additional fields.
+       The sub-factory analogue of L-stock is a "sales-stock" output (the
+       trailing vout of each chain TX).  When stale state confirms, the
+       poison TX (carried in burn_tx/burn_tx_len above — same field name,
+       different semantics) distributes the stale sales-stock to the
+       sub-factory's clients pro-rata to their per-channel amounts. */
+    uint64_t *sub_channel_amounts; /* heap-allocated per-channel amounts at chain[N-1] */
+    size_t n_sub_channels;
+    uint64_t sub_sales_stock_amount;
 
     /* Reorg resistance: penalty broadcast tracking.
        After penalty broadcast, entry is KEPT (not removed) until penalty
@@ -173,6 +188,25 @@ int watchtower_watch_factory_node_with_channels(watchtower_t *wt,
     const unsigned char *response_tx, size_t response_tx_len,
     const unsigned char *burn_tx, size_t burn_tx_len,
     const uint32_t *channel_ids, size_t n_channels);
+
+/* Watch for an old PS sub-factory chain entry (k² shape).
+   sub_node_idx: f->nodes[] index of the NODE_PS_SUBFACTORY node.
+   old_chain_txid32: txid (internal byte order) of the stale chain[N-1] TX.
+   response_tx: latest signed chain[N] TX to broadcast on breach.
+   poison_tx: TX that spends old chain[N-1]'s sales-stock and distributes
+              it to clients (Gap A poison response — may be NULL during
+              early integration; future PR adds the actual builder).
+   channel_amounts: per-channel amounts at chain[N-1] (used by analytics
+                    + by the poison TX builder once wired).  Length =
+                    n_channels.  Copied internally.
+   sales_stock_amount: amount on the trailing sales-stock vout of chain[N-1]. */
+int watchtower_watch_subfactory_node(watchtower_t *wt,
+    uint32_t sub_node_idx,
+    const unsigned char *old_chain_txid32,
+    const unsigned char *response_tx, size_t response_tx_len,
+    const unsigned char *poison_tx, size_t poison_tx_len,
+    const uint64_t *channel_amounts, size_t n_channels,
+    uint64_t sales_stock_amount);
 
 /* Register a force-closed commitment for HTLC timeout sweeping.
    After a legitimate force-close (not breach), HTLCs need to be swept

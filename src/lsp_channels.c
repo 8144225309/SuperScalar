@@ -2384,6 +2384,20 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     size_t n_clients_in_sub = sub->n_signers - 1;
     if (n_clients_in_sub == 0) return 0;
 
+    /* Snapshot the soon-to-be-stale chain[N-1] state for the watchtower
+       (Phase 4b).  Once factory_subfactory_chain_advance_unsigned runs,
+       sub->txid / sub->outputs[] reflect the new chain[N] state, so the
+       previous txid + per-channel amounts must be captured first. */
+    unsigned char wt_old_chain_txid[32];
+    memcpy(wt_old_chain_txid, sub->txid, 32);
+    size_t wt_old_n_chans = (sub->n_outputs > 0) ? sub->n_outputs - 1 : 0;
+    if (wt_old_n_chans > 16) wt_old_n_chans = 16;
+    uint64_t wt_old_chan_amounts[16] = {0};
+    for (size_t ci = 0; ci < wt_old_n_chans; ci++)
+        wt_old_chan_amounts[ci] = sub->outputs[ci].amount_sats;
+    uint64_t wt_old_sstock_amount = (sub->n_outputs > 0)
+        ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
+
     /* Step 1: Advance sub-factory state (rebuilds unsigned_tx, clears is_signed). */
     if (!factory_subfactory_chain_advance_unsigned(f, leaf_side,
                                                     sub_idx_in_leaf,
@@ -2587,6 +2601,23 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             sub->signed_tx.data, sub->signed_tx.len,
             sub->outputs[sstock_vout].amount_sats,
             chan_amounts, n_chans);
+    }
+
+    /* Step 10b: Register the now-stale chain[N-1] with the watchtower
+       (Phase 4b).  If the LSP later attempts to confirm chain[N-1] on
+       the chain (rolling sub-factory state back), the watchtower will
+       broadcast our latest signed chain[N] and the poison TX (when the
+       builder lands in a follow-up PR; passed NULL here for now).
+       Per-channel amounts at chain[N-1] are recorded so the future
+       poison-TX builder can attribute outputs back to clients. */
+    if (mgr->watchtower && sub->ps_chain_len >= 2) {
+        watchtower_watch_subfactory_node(mgr->watchtower,
+            (uint32_t)sub_node_i,
+            wt_old_chain_txid,
+            sub->signed_tx.data, sub->signed_tx.len,
+            /* poison_tx */ NULL, 0,
+            wt_old_chan_amounts, wt_old_n_chans,
+            wt_old_sstock_amount);
     }
 
     /* Step 11: Broadcast DONE to all sub-factory clients. */

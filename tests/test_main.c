@@ -1359,6 +1359,7 @@ extern int test_bidirectional_revocation(void);
 extern int test_client_watch_revoked_commitment(void);
 extern int test_lsp_revoke_and_ack_wire(void);
 extern int test_factory_node_watch(void);
+extern int test_subfactory_node_watch(void);
 extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 
@@ -3132,6 +3133,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_watch_revoked_commitment);
     RUN_TEST(test_lsp_revoke_and_ack_wire);
     RUN_TEST(test_factory_node_watch);
+    RUN_TEST(test_subfactory_node_watch);
     RUN_TEST(test_factory_and_commitment_entries);
     RUN_TEST(test_htlc_penalty_watch);
 
