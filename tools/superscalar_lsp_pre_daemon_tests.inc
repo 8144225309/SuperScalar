@@ -1132,6 +1132,148 @@
         }
 
         /* === Force-close: broadcast entire factory tree === */
+        /* === Tier B State-Advance Rollover Test (Gap B + F, PR #122) ===
+
+           Drives enough multi-party leaf advances to exhaust the per-leaf
+           DW counter; the (states_per_layer + 1)-th call returns rc=-1
+           inside lsp_advance_leaf, which then calls lsp_run_state_advance
+           to drive the whole-tree re-sign ceremony over the wire.  Runs
+           BEFORE force_close so the post-rollover tree is what gets
+           broadcast on-chain — the broadcast itself is then part of the
+           verification (the new-epoch signed TXs must be valid).
+
+           Requires arity-1 (DW leaves) — PS chains never trigger rc=-1. */
+        if (test_tier_b_rollover) {
+            printf("\n=== TIER B STATE-ADVANCE ROLLOVER TEST ===\n");
+            fflush(stdout);
+            int rollover_pass = 1;
+
+            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1) {
+                printf("  SKIP: --test-tier-b-rollover requires --leaf-arity 1 (DW leaves)\n");
+                printf("TIER B ROLLOVER TEST: SKIP\n");
+            } else {
+                /* Populate factory.keypairs[] for the LSP's local
+                   factory_build_burn_tx call inside lsp_advance_leaf.
+                   In multi-process mode the LSP only has its own keypair;
+                   the burn-TX signer (factory_sign_l_stock_poison_tx) is
+                   a single-process helper that needs every leaf signer's
+                   keypair.  This is a pre-existing limitation of the
+                   poison-TX signer (orthogonal to Tier B) and the same
+                   workaround is used by --test-dw-advance / --test-leaf-
+                   advance.  We hardcode the canonical multi-process test
+                   seckeys 0x01 (LSP) + 0x02..0x09 (clients) so the
+                   keypairs match factory.pubkeys received over the wire.
+                   The Tier B ceremony itself does NOT use these
+                   keypairs — it drives MuSig over the wire from each
+                   client's own seckey.  Only the burn-TX side-effect
+                   needs them. */
+                {
+                    size_t n_total = (size_t)(n_clients + 1);
+                    /* Cap to the canonical seckey range we hardcode below
+                       (0x01..0x09).  Cppcheck flags the memcpy below as
+                       reading uninitialized entries when n_total > 9; the
+                       cap keeps the analyzer happy AND limits the test
+                       to configs we actually support. */
+                    if (n_total > 9) n_total = 9;
+                    secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+                    memset(all_kps, 0, n_total * sizeof(secp256k1_keypair));
+                    for (size_t pi = 0; pi < n_total; pi++) {
+                        unsigned char sk[32];
+                        memset(sk, 0, 32);
+                        sk[31] = (unsigned char)(pi + 1);
+                        if (!secp256k1_keypair_create(ctx, &all_kps[pi], sk)) {
+                            fprintf(stderr, "TIER B: keypair create p=%zu failed\n", pi);
+                            return 1;
+                        }
+                    }
+                    /* Reorder to match factory.pubkeys connection order. */
+                    secp256k1_keypair ordered[FACTORY_MAX_SIGNERS];
+                    memcpy(ordered, all_kps, n_total * sizeof(secp256k1_keypair));
+                    for (size_t slot = 0; slot < n_total; slot++) {
+                        unsigned char target[33];
+                        size_t tlen = 33;
+                        secp256k1_ec_pubkey_serialize(ctx, target, &tlen,
+                                                      &lsp_p->factory.pubkeys[slot],
+                                                      SECP256K1_EC_COMPRESSED);
+                        for (size_t k = 0; k < n_total; k++) {
+                            secp256k1_pubkey kpub;
+                            secp256k1_keypair_pub(ctx, &kpub, &ordered[k]);
+                            unsigned char kser[33];
+                            size_t klen = 33;
+                            secp256k1_ec_pubkey_serialize(ctx, kser, &klen,
+                                                          &kpub, SECP256K1_EC_COMPRESSED);
+                            if (memcmp(target, kser, 33) == 0) {
+                                all_kps[slot] = ordered[k];
+                                break;
+                            }
+                        }
+                    }
+                    memcpy(lsp_p->factory.keypairs, all_kps,
+                           n_total * sizeof(secp256k1_keypair));
+                    printf("  populated %zu keypairs for burn-TX signing\n", n_total);
+                }
+
+                uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
+                int n_iters = states_per_layer + 1;
+                printf("  states_per_layer=%d → driving %d leaf-0 advances "
+                       "(last one triggers rc=-1 / Tier B ceremony)\n",
+                       states_per_layer, n_iters);
+
+                for (int it = 0; it < n_iters; it++) {
+                    printf("  iter %d/%d: lsp_channels_advance_ps_leaf(0)...\n",
+                           it + 1, n_iters);
+                    fflush(stdout);
+                    int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                    if (rc != 1) {
+                        printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
+                        rollover_pass = 0;
+                        break;
+                    }
+                }
+
+                if (rollover_pass) {
+                    uint32_t epoch_after = lsp_p->factory.counter.current_epoch;
+                    if (epoch_after <= epoch_before) {
+                        printf("  FAIL: epoch did not advance "
+                               "(before=%u, after=%u) — rc=-1 path likely never fired\n",
+                               epoch_before, epoch_after);
+                        rollover_pass = 0;
+                    } else {
+                        printf("  epoch advanced %u → %u (rc=-1 / Tier B ceremony fired)\n",
+                               epoch_before, epoch_after);
+
+                        /* Verify every non-PS-leaf node is signed for the new epoch */
+                        int all_signed = 1;
+                        size_t n_checked = 0;
+                        for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                            const factory_node_t *node = &lsp_p->factory.nodes[ni];
+                            if (node->is_ps_leaf) continue;
+                            if (!node->is_built) continue;
+                            n_checked++;
+                            if (!node->is_signed || node->signed_tx.len == 0) {
+                                printf("  FAIL: node %zu not signed after Tier B ceremony\n", ni);
+                                all_signed = 0;
+                            }
+                        }
+                        if (all_signed)
+                            printf("  all %zu non-PS-leaf nodes signed after Tier B\n",
+                                   n_checked);
+                        else
+                            rollover_pass = 0;
+                    }
+                }
+
+                printf("TIER B ROLLOVER TEST: %s\n", rollover_pass ? "PASS" : "FAIL");
+            }
+            fflush(stdout);
+            if (!rollover_pass) {
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+
         if (force_close) {
             printf("\n=== FORCE CLOSE ===\n");
             printf("Broadcasting factory tree (%zu nodes) on %s...\n",

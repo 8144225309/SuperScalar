@@ -111,6 +111,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x52: return "JIT_ACCEPT";
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
+    case 0x55: return "STATE_ADVANCE_PROPOSE";
     case 0x58: return "LEAF_ADVANCE_PROPOSE";
     case 0x59: return "LEAF_ADVANCE_PSIG";
     case 0x5A: return "LEAF_ADVANCE_DONE";
@@ -1786,6 +1787,49 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
         count++;
     }
     return count;
+}
+
+/* --- Tier B state-advance ceremony --- */
+
+cJSON *wire_build_state_advance_propose(uint32_t epoch, int trigger_leaf,
+                                          const wire_bundle_entry_t *lsp_nonces,
+                                          size_t n_lsp_nonces) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "epoch", (double)epoch);
+    cJSON_AddNumberToObject(j, "trigger_leaf", trigger_leaf);
+    cJSON_AddItemToObject(j, "lsp_nonces", build_bundle_array(lsp_nonces, n_lsp_nonces));
+    return j;
+}
+
+int wire_parse_state_advance_propose(const cJSON *json, uint32_t *epoch_out,
+                                       int *trigger_leaf_out,
+                                       wire_bundle_entry_t *lsp_nonces_out,
+                                       size_t max_nonces, size_t *n_out) {
+    if (!json) return 0;
+    cJSON *e = cJSON_GetObjectItem(json, "epoch");
+    cJSON *t = cJSON_GetObjectItem(json, "trigger_leaf");
+    cJSON *n = cJSON_GetObjectItem(json, "lsp_nonces");
+    if (!e || !cJSON_IsNumber(e)) return 0;
+    if (!t || !cJSON_IsNumber(t)) return 0;
+    if (!n || !cJSON_IsArray(n)) return 0;
+    *epoch_out = (uint32_t)e->valuedouble;
+    *trigger_leaf_out = (int)t->valuedouble;
+    *n_out = wire_parse_bundle(n, lsp_nonces_out, max_nonces, 66);
+    return 1;
+}
+
+cJSON *wire_build_path_sign_done(uint32_t epoch) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "epoch", (double)epoch);
+    return j;
+}
+
+int wire_parse_path_sign_done(const cJSON *json, uint32_t *epoch_out) {
+    if (!json) return 0;
+    cJSON *e = cJSON_GetObjectItem(json, "epoch");
+    if (!e || !cJSON_IsNumber(e)) return 0;
+    *epoch_out = (uint32_t)e->valuedouble;
+    return 1;
 }
 
 /* --- Encrypted transport convenience (Phase 19) --- */

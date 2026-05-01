@@ -397,9 +397,11 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                 cJSON_Delete(msg.json);
                 continue;
             }
-            if (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE) {
-                /* Participate in the advance ceremony inline.
-                   Derive my_index from the factory's pubkey list. */
+            if (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
+                msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
+                /* Participate in the (per-leaf or whole-tree state-advance)
+                   ceremony inline.  Derive my_index from the factory's pubkey
+                   list. */
                 uint32_t my_idx = UINT32_MAX;
                 for (size_t p = 0; p < factory->n_participants; p++) {
                     unsigned char a[33], b[33]; size_t la = 33, lb = 33;
@@ -414,16 +416,23 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                         break;
                     }
                 }
-                if (my_idx == UINT32_MAX ||
-                    !client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                                  my_idx, &msg)) {
+                int handled = 0;
+                if (my_idx != UINT32_MAX) {
+                    handled = (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE)
+                        ? client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                      my_idx, &msg)
+                        : client_handle_state_advance(fd, ctx, keypair, factory,
+                                                        my_idx, &msg);
+                }
+                if (!handled) {
                     cJSON_Delete(msg.json);
                     return 0;
                 }
                 cJSON_Delete(msg.json);
                 continue;
             }
-            if (msg.msg_type == MSG_LEAF_ADVANCE_DONE) {
+            if (msg.msg_type == MSG_LEAF_ADVANCE_DONE ||
+                msg.msg_type == MSG_PATH_SIGN_DONE) {
                 /* Stray DONE after an advance we already processed; skip. */
                 cJSON_Delete(msg.json);
                 continue;
@@ -559,7 +568,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             cJSON_Delete(all_nonces_msg.json);
             continue;
         }
-        if (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE) {
+        if (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
+            all_nonces_msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
             uint32_t my_idx = UINT32_MAX;
             for (size_t p = 0; p < factory->n_participants; p++) {
                 unsigned char a[33], b[33]; size_t la = 33, lb = 33;
@@ -574,9 +584,15 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                     break;
                 }
             }
-            if (my_idx == UINT32_MAX ||
-                !client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                              my_idx, &all_nonces_msg)) {
+            int handled = 0;
+            if (my_idx != UINT32_MAX) {
+                handled = (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE)
+                    ? client_handle_leaf_advance(fd, ctx, keypair, factory,
+                                                  my_idx, &all_nonces_msg)
+                    : client_handle_state_advance(fd, ctx, keypair, factory,
+                                                    my_idx, &all_nonces_msg);
+            }
+            if (!handled) {
                 cJSON_Delete(all_nonces_msg.json);
                 tx_buf_free(&close_unsigned);
                 return 0;
@@ -2790,6 +2806,240 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     if (done_msg.json) cJSON_Delete(done_msg.json);
 
     printf("Client %u: leaf %d advance complete\n", my_index, leaf_side);
+    return 1;
+}
+
+int client_handle_state_advance(int fd, secp256k1_context *ctx,
+                                  const secp256k1_keypair *keypair,
+                                  factory_t *factory,
+                                  uint32_t my_index,
+                                  const wire_msg_t *propose_msg) {
+    /* Parse propose */
+    uint32_t epoch_in;
+    int trigger_leaf;
+    wire_bundle_entry_t lsp_nonces[FACTORY_MAX_NODES];
+    size_t n_lsp_nonces = 0;
+    if (!wire_parse_state_advance_propose(propose_msg->json, &epoch_in,
+                                            &trigger_leaf,
+                                            lsp_nonces, FACTORY_MAX_NODES,
+                                            &n_lsp_nonces)) {
+        fprintf(stderr, "Client %u: failed to parse STATE_ADVANCE_PROPOSE\n", my_index);
+        return 0;
+    }
+
+    /* Advance local DW counter to root rollover.
+
+       The LSP triggered Tier B because its OWN factory_advance_leaf_unsigned
+       returned -1.  The client's counter is typically ONE step behind the
+       LSP because the prior per-leaf-advance ceremony exited cleanly on
+       the LSP side at rc=-1 without sending MSG_LEAF_ADVANCE_PROPOSE
+       (the rc=-1 branch in lsp_advance_leaf hands off to Tier B
+       directly).  So the client must drive its own advance until rc=-1
+       fires too — at most one extra step in the lockstep case, but the
+       loop also handles unsynchronized recovery scenarios.  Bounded by
+       states_per_layer+2 as a safety cap. */
+    int rc = 0;
+    int max_steps = (int)(factory->states_per_layer + 2);
+    if (max_steps < 4) max_steps = 4;
+    for (int s = 0; s < max_steps; s++) {
+        rc = factory_advance_leaf_unsigned(factory, trigger_leaf);
+        if (rc == -1) break;
+        if (rc != 1) {
+            fprintf(stderr, "Client %u: state_advance: advance step %d returned %d\n",
+                    my_index, s, rc);
+            return 0;
+        }
+    }
+    if (rc != -1) {
+        fprintf(stderr, "Client %u: state advance: never hit rc=-1 within %d steps\n",
+                my_index, max_steps);
+        return 0;
+    }
+
+    /* Determine affected nodes — every non-PS-leaf node that's built
+       and not yet signed (i.e., what factory_advance_leaf_unsigned
+       just rebuilt). */
+    size_t affected[FACTORY_MAX_NODES];
+    size_t n_affected = 0;
+    for (size_t i = 0; i < factory->n_nodes; i++) {
+        const factory_node_t *n = &factory->nodes[i];
+        if (n->is_ps_leaf) continue;
+        if (!n->is_built) continue;
+        if (n->is_signed) continue;
+        affected[n_affected++] = i;
+    }
+
+    /* For each affected node where I'm a signer: init session, generate
+       my nonce, save secnonce for later partial sig. */
+    secp256k1_musig_secnonce my_secnonce_per_node[FACTORY_MAX_NODES];
+    int my_slot_per_node[FACTORY_MAX_NODES];
+    int has_my_nonce[FACTORY_MAX_NODES];
+    wire_bundle_entry_t my_nonce_bundle[FACTORY_MAX_NODES];
+    size_t my_bundle_count = 0;
+
+    for (size_t k = 0; k < n_affected; k++) {
+        my_slot_per_node[k] = -1;
+        has_my_nonce[k] = 0;
+    }
+
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        fprintf(stderr, "Client %u: keypair_sec failed\n", my_index);
+        return 0;
+    }
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    for (size_t k = 0; k < n_affected; k++) {
+        size_t ni = affected[k];
+        int slot = factory_find_signer_slot(factory, ni, my_index);
+        if (slot < 0) continue;  /* not a signer on this node */
+
+        if (!factory_session_init_node(factory, ni)) {
+            fprintf(stderr, "Client %u: state_advance session_init node %zu failed\n",
+                    my_index, ni);
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+
+        secp256k1_musig_pubnonce my_pubnonce;
+        if (!musig_generate_nonce(ctx, &my_secnonce_per_node[k], &my_pubnonce,
+                                   my_seckey, &my_pubkey,
+                                   &factory->nodes[ni].keyagg.cache)) {
+            fprintf(stderr, "Client %u: state_advance nonce_gen node %zu failed\n",
+                    my_index, ni);
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+        my_slot_per_node[k] = slot;
+        has_my_nonce[k] = 1;
+
+        unsigned char ser[66];
+        musig_pubnonce_serialize(ctx, ser, &my_pubnonce);
+        my_nonce_bundle[my_bundle_count].node_idx = (uint32_t)ni;
+        my_nonce_bundle[my_bundle_count].signer_slot = (uint32_t)slot;
+        memcpy(my_nonce_bundle[my_bundle_count].data, ser, 66);
+        my_nonce_bundle[my_bundle_count].data_len = 66;
+        my_bundle_count++;
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send PATH_NONCE_BUNDLE */
+    cJSON *nb = wire_build_nonce_bundle(my_nonce_bundle, my_bundle_count);
+    /* Note: wire_build_nonce_bundle wraps with key "entries"; the LSP's
+       state-advance receiver pulls the same key.  Reusing that builder
+       saves us a duplicate JSON helper. */
+    if (!wire_send(fd, MSG_PATH_NONCE_BUNDLE, nb)) {
+        fprintf(stderr, "Client %u: send PATH_NONCE_BUNDLE failed\n", my_index);
+        cJSON_Delete(nb);
+        return 0;
+    }
+    cJSON_Delete(nb);
+
+    /* Receive PATH_ALL_NONCES */
+    wire_msg_t all_msg;
+    if (!wire_recv(fd, &all_msg) || all_msg.msg_type != MSG_PATH_ALL_NONCES) {
+        fprintf(stderr, "Client %u: expected PATH_ALL_NONCES, got 0x%02x\n",
+                my_index, all_msg.json ? all_msg.msg_type : 0);
+        if (all_msg.json) cJSON_Delete(all_msg.json);
+        return 0;
+    }
+    cJSON *all_arr = cJSON_GetObjectItem(all_msg.json, "nonces");
+    if (!all_arr) {
+        fprintf(stderr, "Client %u: PATH_ALL_NONCES missing 'nonces' key\n", my_index);
+        cJSON_Delete(all_msg.json);
+        return 0;
+    }
+    size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+    wire_bundle_entry_t *all = calloc(cap, sizeof(wire_bundle_entry_t));
+    if (!all) { cJSON_Delete(all_msg.json); return 0; }
+    size_t n_all = wire_parse_bundle(all_arr, all, cap, 66);
+
+    /* Set every nonce we DON'T already have (sessions reject double-set
+       which would push nonces_collected past n_signers).  We already
+       set our own nonces during nonce-gen via factory_session_set_nonce
+       — but actually we did NOT set them on session, only generated.
+       Re-check: musig_generate_nonce just produces sec/pub; it doesn't
+       set on session.  We need to set every nonce here. */
+    for (size_t e = 0; e < n_all; e++) {
+        secp256k1_musig_pubnonce pn;
+        if (!musig_pubnonce_parse(ctx, &pn, all[e].data)) {
+            fprintf(stderr, "Client %u: bad pubnonce in ALL_NONCES\n", my_index);
+            free(all); cJSON_Delete(all_msg.json);
+            return 0;
+        }
+        if (!factory_session_set_nonce(factory, all[e].node_idx,
+                                        all[e].signer_slot, &pn)) {
+            fprintf(stderr, "Client %u: state_advance set_nonce node=%u slot=%u failed\n",
+                    my_index, all[e].node_idx, all[e].signer_slot);
+            free(all); cJSON_Delete(all_msg.json);
+            return 0;
+        }
+    }
+    free(all);
+    cJSON_Delete(all_msg.json);
+
+    /* Finalize sessions for every node we signed on */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!has_my_nonce[k]) continue;
+        if (!factory_session_finalize_node(factory, affected[k])) {
+            fprintf(stderr, "Client %u: state_advance finalize node %zu failed\n",
+                    my_index, affected[k]);
+            return 0;
+        }
+    }
+
+    /* Generate partial sigs */
+    wire_bundle_entry_t my_psig_bundle[FACTORY_MAX_NODES];
+    size_t my_psig_count = 0;
+
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!has_my_nonce[k]) continue;
+        size_t ni = affected[k];
+        secp256k1_musig_partial_sig psig;
+        if (!musig_create_partial_sig(ctx, &psig, &my_secnonce_per_node[k],
+                                        keypair,
+                                        &factory->nodes[ni].signing_session)) {
+            fprintf(stderr, "Client %u: state_advance create_partial_sig node %zu failed\n",
+                    my_index, ni);
+            return 0;
+        }
+        unsigned char psig_ser[32];
+        musig_partial_sig_serialize(ctx, psig_ser, &psig);
+        my_psig_bundle[my_psig_count].node_idx = (uint32_t)ni;
+        my_psig_bundle[my_psig_count].signer_slot = (uint32_t)my_slot_per_node[k];
+        memcpy(my_psig_bundle[my_psig_count].data, psig_ser, 32);
+        my_psig_bundle[my_psig_count].data_len = 32;
+        my_psig_count++;
+    }
+
+    /* Send PATH_PSIG_BUNDLE */
+    cJSON *pb = wire_build_psig_bundle(my_psig_bundle, my_psig_count);
+    if (!wire_send(fd, MSG_PATH_PSIG_BUNDLE, pb)) {
+        fprintf(stderr, "Client %u: send PATH_PSIG_BUNDLE failed\n", my_index);
+        cJSON_Delete(pb);
+        return 0;
+    }
+    cJSON_Delete(pb);
+
+    /* Receive PATH_SIGN_DONE */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_PATH_SIGN_DONE) {
+        fprintf(stderr, "Client %u: expected PATH_SIGN_DONE, got 0x%02x\n",
+                my_index, done_msg.json ? done_msg.msg_type : 0);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        return 0;
+    }
+    uint32_t epoch_done = 0;
+    wire_parse_path_sign_done(done_msg.json, &epoch_done);
+    cJSON_Delete(done_msg.json);
+
+    printf("Client %u: state advance complete, epoch %u (%zu nodes signed)\n",
+           my_index, epoch_done, my_psig_count);
+    /* Suppress -Wunused warnings for fields we kept for future error paths */
+    (void)trigger_leaf;
+    (void)epoch_in;
+    (void)n_lsp_nonces;  /* LSP nonces also arrive in ALL_NONCES; propose copy is informational */
     return 1;
 }
 

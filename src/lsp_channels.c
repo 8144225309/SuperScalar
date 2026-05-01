@@ -1456,10 +1456,15 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         return 0;
     }
     if (rc == -1) {
-        /* DW only: root advanced + full rebuild needed — trigger factory rotation. */
-        printf("LSP: leaf %d exhausted, root advanced — skipping per-leaf signing\n",
+        /* DW root rolled over.  factory_advance_leaf_unsigned() rebuilt
+           every node's unsigned TX; we now drive the multi-party Tier B
+           ceremony to re-sign all affected nodes.  Old signed TXs and
+           the watchtower's old burn-TX entries remain in place to guard
+           against a stale-state broadcast (overlap window).
+           See docs/rotation-ceremony.md. */
+        printf("LSP: leaf %d exhausted, root advanced — running Tier B state-advance ceremony\n",
                leaf_side);
-        return 1;
+        return lsp_run_state_advance(mgr, lsp, leaf_side);
     }
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
@@ -1683,6 +1688,385 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     else
         printf("LSP: DW leaf %d advanced (node %zu), DW state %u\n",
                leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
+    return 1;
+}
+
+/* Tier B state-advance ceremony driver (Gap B + F).
+
+   Triggered when factory_advance_leaf_unsigned() returns -1 — the
+   triggering leaf's per-leaf DW counter exhausted, the root layer
+   advanced, and every non-PS-leaf node's nSequence (or input-txid via
+   parent rebuild) changed.  build_all_unsigned_txs() has already
+   rebuilt every node->unsigned_tx; we now need to drive an N-of-N
+   MuSig signing ceremony bundled across all such nodes.
+
+   Wire round structure (see docs/rotation-ceremony.md):
+     LSP   → all clients: STATE_ADVANCE_PROPOSE (epoch, trigger_leaf, lsp_nonces[])
+     Client → LSP:        PATH_NONCE_BUNDLE (client's nonces for nodes it signs)
+     LSP   → all clients: PATH_ALL_NONCES (every signer's nonce per node)
+     Client → LSP:        PATH_PSIG_BUNDLE (client's partial sigs)
+     LSP   → all clients: PATH_SIGN_DONE (epoch confirms)
+
+   Returns 1 on success, 0 on any failure (clients dropped, timeouts,
+   crypto failures).  On failure the factory_t is left in a state where
+   unsigned TXs are rebuilt but signed_tx is unset for affected nodes;
+   the LSP can retry by calling lsp_run_state_advance() again.  The
+   on-chain factory is unaffected — old signed TXs remain stored
+   (overlap window) and the watchtower still has the old burn TXs. */
+int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                            int trigger_leaf_side) {
+    factory_t *f = &lsp->factory;
+    if (!mgr || !lsp) return 0;
+
+    /* Capture pre-advance leaf-node state for watchtower overlap window:
+       the OLD signed_tx + OLD txid + OLD L-stock vout/amount become the
+       parameters used to register a NEW poison/burn TX after the
+       ceremony completes.  We capture before factory_advance_leaf_unsigned
+       overwrites these fields. */
+    typedef struct {
+        size_t node_idx;
+        int had_old_signed;
+        unsigned char old_txid[32];
+        uint64_t old_l_amount;
+        int old_n_outputs;
+    } leaf_pre_state_t;
+
+    leaf_pre_state_t leaf_pre[FACTORY_MAX_LEAVES];
+    size_t n_leaf_pre = 0;
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        size_t ni = f->leaf_node_indices[li];
+        leaf_pre[n_leaf_pre].node_idx = ni;
+        leaf_pre[n_leaf_pre].had_old_signed =
+            (f->nodes[ni].is_signed && f->nodes[ni].signed_tx.len > 0);
+        if (leaf_pre[n_leaf_pre].had_old_signed)
+            memcpy(leaf_pre[n_leaf_pre].old_txid, f->nodes[ni].txid, 32);
+        leaf_pre[n_leaf_pre].old_n_outputs = f->nodes[ni].n_outputs;
+        leaf_pre[n_leaf_pre].old_l_amount =
+            (f->nodes[ni].n_outputs >= 2)
+            ? f->nodes[ni].outputs[f->nodes[ni].n_outputs - 1].amount_sats
+            : 0;
+        n_leaf_pre++;
+    }
+
+    /* Advance + rebuild unsigned (caller may have already done this; if
+       so, rc=-1 path won't fire again — call returns 1 for normal advance
+       which is wrong here.  Caller must invoke lsp_run_state_advance ONLY
+       when factory_advance_leaf_unsigned returned -1, i.e. unsigned TXs
+       are already rebuilt.  We do NOT re-call advance here. */
+
+    uint32_t new_epoch = f->counter.current_epoch;
+
+    /* Determine affected nodes: every non-PS-leaf node was rebuilt.  We
+       re-sign every node where !is_ps_leaf && is_built && !is_signed. */
+    size_t affected[FACTORY_MAX_NODES];
+    size_t n_affected = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        if (n->is_ps_leaf) continue;
+        if (!n->is_built) continue;
+        if (n->is_signed) continue;
+        affected[n_affected++] = i;
+    }
+    if (n_affected == 0) {
+        /* Nothing to do — likely already signed.  Send DONE for completeness. */
+        cJSON *done = wire_build_path_sign_done(new_epoch);
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            wire_send(lsp->client_fds[i], MSG_PATH_SIGN_DONE, done);
+        cJSON_Delete(done);
+        return 1;
+    }
+
+    /* --- Step 1: Init MuSig sessions for every affected node --- */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!factory_session_init_node(f, affected[k])) {
+            fprintf(stderr, "LSP state_advance: session_init_node %zu failed\n", affected[k]);
+            return 0;
+        }
+    }
+
+    /* --- Step 2: Generate LSP's nonce pool over all affected nodes
+       where LSP is a signer --- */
+    size_t lsp_node_count = 0;
+    for (size_t k = 0; k < n_affected; k++) {
+        if (factory_find_signer_slot(f, affected[k], 0) >= 0)
+            lsp_node_count++;
+    }
+
+    musig_nonce_pool_t lsp_pool;
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+        return 0;
+    if (!musig_nonce_pool_generate(lsp->ctx, &lsp_pool, lsp_node_count,
+                                    lsp_seckey, &lsp->lsp_pubkey, NULL)) {
+        fprintf(stderr, "LSP state_advance: nonce pool gen failed\n");
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    memset(lsp_seckey, 0, 32);
+
+    /* Track LSP secnonce pointers per affected node for later partial sigs.
+       Indexed parallel to affected[] for entries where LSP signs; -1 for
+       entries where LSP doesn't sign that node. */
+    secp256k1_musig_secnonce *lsp_sec_per_node[FACTORY_MAX_NODES];
+    int lsp_slot_per_node[FACTORY_MAX_NODES];
+    for (size_t k = 0; k < n_affected; k++) {
+        lsp_sec_per_node[k] = NULL;
+        lsp_slot_per_node[k] = -1;
+    }
+
+    wire_bundle_entry_t lsp_nonce_bundle[FACTORY_MAX_NODES];
+    size_t lsp_bundle_count = 0;
+
+    for (size_t k = 0; k < n_affected; k++) {
+        int slot = factory_find_signer_slot(f, affected[k], 0);
+        if (slot < 0) continue;
+
+        secp256k1_musig_secnonce *sec;
+        secp256k1_musig_pubnonce pub;
+        if (!musig_nonce_pool_next(&lsp_pool, &sec, &pub)) {
+            fprintf(stderr, "LSP state_advance: pool exhausted node %zu\n", affected[k]);
+            return 0;
+        }
+        lsp_sec_per_node[k] = sec;
+        lsp_slot_per_node[k] = slot;
+
+        if (!factory_session_set_nonce(f, affected[k], (size_t)slot, &pub)) {
+            fprintf(stderr, "LSP state_advance: set_nonce LSP node %zu slot %d failed\n",
+                    affected[k], slot);
+            return 0;
+        }
+
+        unsigned char nonce_ser[66];
+        musig_pubnonce_serialize(lsp->ctx, nonce_ser, &pub);
+        lsp_nonce_bundle[lsp_bundle_count].node_idx = (uint32_t)affected[k];
+        lsp_nonce_bundle[lsp_bundle_count].signer_slot = (uint32_t)slot;
+        memcpy(lsp_nonce_bundle[lsp_bundle_count].data, nonce_ser, 66);
+        lsp_nonce_bundle[lsp_bundle_count].data_len = 66;
+        lsp_bundle_count++;
+    }
+
+    /* --- Step 3: Send STATE_ADVANCE_PROPOSE to all clients --- */
+    cJSON *propose = wire_build_state_advance_propose(new_epoch, trigger_leaf_side,
+                                                       lsp_nonce_bundle, lsp_bundle_count);
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (!wire_send(lsp->client_fds[i], MSG_STATE_ADVANCE_PROPOSE, propose)) {
+            fprintf(stderr, "LSP state_advance: send PROPOSE to client %zu failed\n", i);
+            cJSON_Delete(propose);
+            return 0;
+        }
+    }
+    cJSON_Delete(propose);
+
+    /* --- Step 4: Collect PATH_NONCE_BUNDLE from each client.  Aggregate
+       into all_nonce_entries[] which we'll broadcast as PATH_ALL_NONCES. */
+    size_t total_slots = 0;
+    for (size_t k = 0; k < n_affected; k++)
+        total_slots += f->nodes[affected[k]].n_signers;
+
+    wire_bundle_entry_t *all_nonces =
+        (wire_bundle_entry_t *)calloc(total_slots, sizeof(wire_bundle_entry_t));
+    if (!all_nonces) return 0;
+    size_t all_count = 0;
+
+    /* Seed all_nonces with LSP's own contributions */
+    for (size_t i = 0; i < lsp_bundle_count; i++)
+        all_nonces[all_count++] = lsp_nonce_bundle[i];
+
+    for (size_t c = 0; c < lsp->n_clients; c++) {
+        wire_msg_t nmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &nmsg, 60) ||
+            nmsg.msg_type != MSG_PATH_NONCE_BUNDLE) {
+            fprintf(stderr, "LSP state_advance: expected PATH_NONCE_BUNDLE from client %zu, got 0x%02x\n",
+                    c, nmsg.msg_type);
+            if (nmsg.json) cJSON_Delete(nmsg.json);
+            free(all_nonces);
+            return 0;
+        }
+        cJSON *arr = cJSON_GetObjectItem(nmsg.json, "entries");
+        if (!arr) {
+            fprintf(stderr, "LSP state_advance: PATH_NONCE_BUNDLE missing entries from client %zu\n", c);
+            cJSON_Delete(nmsg.json);
+            free(all_nonces);
+            return 0;
+        }
+        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *cents = calloc(cap, sizeof(wire_bundle_entry_t));
+        if (!cents) {
+            cJSON_Delete(nmsg.json);
+            free(all_nonces);
+            return 0;
+        }
+        size_t ne = wire_parse_bundle(arr, cents, cap, 66);
+        for (size_t e = 0; e < ne; e++) {
+            secp256k1_musig_pubnonce pn;
+            if (!musig_pubnonce_parse(lsp->ctx, &pn, cents[e].data)) {
+                fprintf(stderr, "LSP state_advance: bad pubnonce from client %zu\n", c);
+                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                return 0;
+            }
+            if (!factory_session_set_nonce(f, cents[e].node_idx,
+                                            cents[e].signer_slot, &pn)) {
+                fprintf(stderr, "LSP state_advance: set_nonce client=%zu node=%u slot=%u failed\n",
+                        c, cents[e].node_idx, cents[e].signer_slot);
+                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                return 0;
+            }
+            if (all_count >= total_slots) {
+                fprintf(stderr, "LSP state_advance: nonce overflow (got more than total_slots=%zu)\n",
+                        total_slots);
+                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                return 0;
+            }
+            all_nonces[all_count++] = cents[e];
+        }
+        free(cents);
+        cJSON_Delete(nmsg.json);
+    }
+
+    /* --- Step 5: Broadcast PATH_ALL_NONCES --- */
+    cJSON *all_msg = wire_build_all_nonces(all_nonces, all_count);
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        wire_send(lsp->client_fds[i], MSG_PATH_ALL_NONCES, all_msg);
+    cJSON_Delete(all_msg);
+    free(all_nonces);
+
+    /* --- Step 6: Finalize sessions for all affected nodes (compute sighash,
+       aggregate nonces).  Must happen AFTER all nonces are set. --- */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!factory_session_finalize_node(f, affected[k])) {
+            fprintf(stderr, "LSP state_advance: finalize_node %zu failed\n", affected[k]);
+            return 0;
+        }
+    }
+
+    /* --- Step 7: Generate LSP's partial sigs --- */
+    secp256k1_keypair lsp_kp = lsp->lsp_keypair;
+    for (size_t k = 0; k < n_affected; k++) {
+        if (lsp_slot_per_node[k] < 0) continue;  /* LSP not signer here */
+        secp256k1_musig_partial_sig psig;
+        if (!musig_create_partial_sig(lsp->ctx, &psig, lsp_sec_per_node[k],
+                                        &lsp_kp,
+                                        &f->nodes[affected[k]].signing_session)) {
+            fprintf(stderr, "LSP state_advance: create_partial_sig node=%zu failed\n",
+                    affected[k]);
+            return 0;
+        }
+        if (!factory_session_set_partial_sig(f, affected[k],
+                                              (size_t)lsp_slot_per_node[k], &psig)) {
+            fprintf(stderr, "LSP state_advance: set_partial_sig LSP node=%zu failed\n",
+                    affected[k]);
+            return 0;
+        }
+    }
+
+    /* --- Step 8: Collect PATH_PSIG_BUNDLE from each client --- */
+    for (size_t c = 0; c < lsp->n_clients; c++) {
+        wire_msg_t pmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg, 60) ||
+            pmsg.msg_type != MSG_PATH_PSIG_BUNDLE) {
+            fprintf(stderr, "LSP state_advance: expected PATH_PSIG_BUNDLE from client %zu, got 0x%02x\n",
+                    c, pmsg.msg_type);
+            if (pmsg.json) cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        cJSON *arr = cJSON_GetObjectItem(pmsg.json, "entries");
+        if (!arr) {
+            cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *cents = calloc(cap, sizeof(wire_bundle_entry_t));
+        if (!cents) { cJSON_Delete(pmsg.json); return 0; }
+        size_t ne = wire_parse_bundle(arr, cents, cap, 32);
+        for (size_t e = 0; e < ne; e++) {
+            secp256k1_musig_partial_sig psig;
+            if (!musig_partial_sig_parse(lsp->ctx, &psig, cents[e].data)) {
+                fprintf(stderr, "LSP state_advance: bad psig from client %zu\n", c);
+                free(cents); cJSON_Delete(pmsg.json);
+                return 0;
+            }
+            if (!factory_session_set_partial_sig(f, cents[e].node_idx,
+                                                  cents[e].signer_slot, &psig)) {
+                fprintf(stderr, "LSP state_advance: set_partial_sig client=%zu node=%u slot=%u failed\n",
+                        c, cents[e].node_idx, cents[e].signer_slot);
+                free(cents); cJSON_Delete(pmsg.json);
+                return 0;
+            }
+        }
+        free(cents);
+        cJSON_Delete(pmsg.json);
+    }
+
+    /* --- Step 9: Aggregate sigs + finalize signed_tx for each affected node --- */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!factory_session_complete_node(f, affected[k])) {
+            fprintf(stderr, "LSP state_advance: complete_node %zu failed\n", affected[k]);
+            return 0;
+        }
+    }
+
+    /* --- Step 10: Watchtower per-state poison TX (Gap F overlap window).
+       For each leaf, build a fresh poison TX bound to the NEW state's
+       L-stock UTXO and register it with the watchtower.  We do NOT
+       remove the OLD state's watchtower entries — they remain valid
+       guards against a stale-state broadcast.  See docs/poison-tx.md
+       and docs/rotation-ceremony.md "Watchtower coordination". */
+    if (mgr->watchtower) {
+        for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+            size_t ni = leaf_pre[lp].node_idx;
+            factory_node_t *leaf_node = &f->nodes[ni];
+            if (leaf_node->is_ps_leaf) continue;  /* PS leaves: no poison */
+            if (!leaf_pre[lp].had_old_signed) continue;
+            if (leaf_pre[lp].old_n_outputs < 2) continue;
+
+            tx_buf_t burn_tx;
+            tx_buf_init(&burn_tx, 256);
+            uint32_t old_epoch = (new_epoch > 0) ? new_epoch - 1 : 0;
+            size_t l_vout = (size_t)(leaf_pre[lp].old_n_outputs - 1);
+            int burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
+                leaf_pre[lp].old_txid, (uint32_t)l_vout,
+                leaf_pre[lp].old_l_amount, old_epoch);
+
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            size_t n_leaf_ch = 0;
+            for (size_t cc = 0; cc < mgr->n_channels; cc++) {
+                size_t c_node; uint32_t c_vout;
+                client_to_leaf(cc, f, &c_node, &c_vout);
+                if (c_node == ni)
+                    leaf_ch_ids[n_leaf_ch++] = (uint32_t)cc;
+            }
+            watchtower_watch_factory_node_with_channels(mgr->watchtower,
+                (uint32_t)ni, leaf_pre[lp].old_txid,
+                leaf_node->signed_tx.data, leaf_node->signed_tx.len,
+                burn_ok ? burn_tx.data : NULL,
+                burn_ok ? burn_tx.len : 0,
+                leaf_ch_ids, n_leaf_ch);
+            tx_buf_free(&burn_tx);
+        }
+    }
+
+    /* --- Step 11: Persist new DW counter state --- */
+    if (mgr->persist) {
+        uint32_t leaf_states[FACTORY_MAX_LEAVES];
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
+        uint32_t layer_states[DW_MAX_LAYERS];
+        for (uint32_t i = 0; i < f->counter.n_layers; i++)
+            layer_states[i] = f->counter.layers[i].config.max_states;
+        persist_save_dw_counter_with_leaves(
+            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+            f->counter.n_layers, layer_states,
+            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+    }
+
+    /* --- Step 12: Broadcast PATH_SIGN_DONE --- */
+    cJSON *done = wire_build_path_sign_done(new_epoch);
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        wire_send(lsp->client_fds[i], MSG_PATH_SIGN_DONE, done);
+    cJSON_Delete(done);
+
+    printf("LSP: state advance complete — epoch %u, %zu nodes re-signed (trigger leaf %d)\n",
+           new_epoch, n_affected, trigger_leaf_side);
     return 1;
 }
 
