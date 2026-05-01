@@ -2076,27 +2076,32 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts) {
     factory_t *f = &lsp->factory;
 
-    /* Only for arity-2 (each leaf = 2 clients, 3-of-3 signing) */
-    if (f->leaf_arity != FACTORY_ARITY_2) {
-        fprintf(stderr, "LSP realloc: only supported for arity-2 leaves\n");
-        return 0;
-    }
+    /* Generalized to N-of-N MuSig.  Works for any leaf arity where the
+       leaf node has at least one client signer + the LSP (so n_signers
+       >= 2).  Pre-PR-#123 this was gated to FACTORY_ARITY_2 (3-of-3);
+       lifting that gate was Gap C-followup from the canonical-design
+       audit.  PS leaves (n_signers=2, n_outputs=2 = 1 channel + L-stock
+       OR 1 channel without L-stock post-advance) and arity-1 leaves
+       (n_signers=2, n_outputs=2 = 1 channel + L-stock) are now
+       supported in addition to arity-2 (n_signers=3, n_outputs=3). */
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
 
-    if (node->n_signers != 3) {
-        fprintf(stderr, "LSP realloc: leaf node %zu has %zu signers, expected 3\n",
+    if (node->n_signers < 2) {
+        fprintf(stderr, "LSP realloc: leaf node %zu has %zu signers, need >= 2\n",
                 node_idx, node->n_signers);
         return 0;
     }
 
-    /* Get both client participant indices */
-    uint32_t clients[2];
-    size_t n_clients = factory_get_subtree_clients(f, (int)node_idx, clients, 2);
-    if (n_clients != 2) {
-        fprintf(stderr, "LSP realloc: expected 2 clients on leaf, got %zu\n", n_clients);
+    /* Get all client participant indices on this leaf (may be 1..N-1). */
+    uint32_t clients[FACTORY_MAX_SIGNERS];
+    size_t n_clients = factory_get_subtree_clients(f, (int)node_idx, clients,
+                                                     FACTORY_MAX_SIGNERS);
+    if (n_clients != node->n_signers - 1) {
+        fprintf(stderr, "LSP realloc: leaf %zu has %zu signers but %zu clients found\n",
+                node_idx, node->n_signers, n_clients);
         return 0;
     }
 
@@ -2150,12 +2155,12 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Step 5: Send REALLOC_PROPOSE to both clients */
+    /* Step 5: Send REALLOC_PROPOSE to all clients on this leaf */
     unsigned char lsp_pubnonce_ser[66];
     musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
     cJSON *propose = wire_build_leaf_realloc_propose(leaf_side, amounts, n_amounts,
                                                       lsp_pubnonce_ser);
-    for (int ci = 0; ci < 2; ci++) {
+    for (size_t ci = 0; ci < n_clients; ci++) {
         /* client_fds indexed by client_idx - 1 (participant_idx 1-based) */
         size_t fd_idx = (size_t)(clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_LEAF_REALLOC_PROPOSE, propose)) {
@@ -2166,11 +2171,11 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     cJSON_Delete(propose);
 
-    /* Step 6: Recv REALLOC_NONCE from both clients, set their nonces */
-    unsigned char all_pubnonces[3][66];
+    /* Step 6: Recv REALLOC_NONCE from each client, set their nonces */
+    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
     memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
 
-    for (int ci = 0; ci < 2; ci++) {
+    for (size_t ci = 0; ci < n_clients; ci++) {
         size_t fd_idx = (size_t)(clients[ci] - 1);
         wire_msg_t nonce_msg;
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &nonce_msg, 30) ||
@@ -2209,10 +2214,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         memcpy(all_pubnonces[client_slot], client_pn_ser, 66);
     }
 
-    /* Step 7: Send REALLOC_ALL_NONCES to both clients */
+    /* Step 7: Send REALLOC_ALL_NONCES to all clients on this leaf */
     cJSON *all_nonces = wire_build_leaf_realloc_all_nonces(
         (const unsigned char (*)[66])all_pubnonces, node->n_signers);
-    for (int ci = 0; ci < 2; ci++) {
+    for (size_t ci = 0; ci < n_clients; ci++) {
         size_t fd_idx = (size_t)(clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_LEAF_REALLOC_ALL_NONCES, all_nonces)) {
             cJSON_Delete(all_nonces);
@@ -2246,8 +2251,8 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!factory_session_set_partial_sig(f, node_idx, (size_t)lsp_slot, &lsp_psig))
         return 0;
 
-    /* Step 10: Recv REALLOC_PSIG from both clients */
-    for (int ci = 0; ci < 2; ci++) {
+    /* Step 10: Recv REALLOC_PSIG from each client */
+    for (size_t ci = 0; ci < n_clients; ci++) {
         size_t fd_idx = (size_t)(clients[ci] - 1);
         wire_msg_t psig_msg;
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &psig_msg, 30) ||
@@ -2282,26 +2287,40 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Step 12: Update channel amounts in lsp_channel_entry_t */
-    for (int ci = 0; ci < 2; ci++) {
-        size_t fd_idx = (size_t)(clients[ci] - 1);
-        if (fd_idx < mgr->n_channels) {
-            lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
-            /* The leaf outputs map to: output 0 = channel A, output 1 = channel B,
-               output 2 = L-stock.  Update funding amount based on this client's output. */
-            entry->channel.funding_amount = amounts[ci];  /* sats, matching channel_init */
-            /* Recalculate using lsp_balance_pct (matching channel init logic) */
-            uint16_t pct = mgr->lsp_balance_pct;
-            if (pct == 0) pct = 50;
-            if (pct > 100) pct = 100;
-            fee_estimator_static_t _fe_realloc;
-            fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
-            if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
-            uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
-            uint64_t usable_ra = amounts[ci] > commit_fee_ra ? amounts[ci] - commit_fee_ra : 0;
-            entry->channel.local_amount = (usable_ra * pct) / 100;
-            entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
-        }
+    /* Step 12: Update channel amounts in lsp_channel_entry_t.
+
+       Generic mapping: each client owns the leaf output at the vout
+       returned by client_to_leaf().  L-stock (if present) is at the
+       last vout.  We update each client's funding_amount from the new
+       outputs[client_vout].  This is correct for any leaf arity:
+         - arity-1: 1 client at vout 0, L-stock at vout 1
+         - arity-2: 2 clients at vouts 0/1, L-stock at vout 2
+         - arity-N: N clients at vouts 0..N-1, L-stock at vout N
+         - PS leaves: 1 client at vout 0, L-stock at vout 1 (pre-advance)
+                       or 1 client at vout 0 only (post-advance). */
+    for (size_t ci = 0; ci < n_clients; ci++) {
+        size_t client_idx_zero = (size_t)(clients[ci] - 1);
+        if (client_idx_zero >= mgr->n_channels) continue;
+
+        size_t client_node;
+        uint32_t client_vout;
+        if (!factory_client_to_leaf(f, client_idx_zero, &client_node, &client_vout)) continue;
+        if (client_vout >= n_amounts) continue;
+        uint64_t client_amt = amounts[client_vout];
+
+        lsp_channel_entry_t *entry = &mgr->entries[client_idx_zero];
+        entry->channel.funding_amount = client_amt;  /* sats, matching channel_init */
+        /* Recalculate using lsp_balance_pct (matching channel init logic) */
+        uint16_t pct = mgr->lsp_balance_pct;
+        if (pct == 0) pct = 50;
+        if (pct > 100) pct = 100;
+        fee_estimator_static_t _fe_realloc;
+        fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
+        if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
+        uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
+        uint64_t usable_ra = client_amt > commit_fee_ra ? client_amt - commit_fee_ra : 0;
+        entry->channel.local_amount = (usable_ra * pct) / 100;
+        entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
     }
 
     /* Step 13: Send REALLOC_DONE to both clients */
@@ -2332,18 +2351,19 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
-/* Buy inbound liquidity from L-stock for a client (arity-2 only).
-   Moves amount_sats from L-stock (output 2) to client's channel output,
-   then adjusts channel balance so purchased sats become LSP local_amount
-   (= client's inbound capacity). Returns 1 on success. */
+/* Buy inbound liquidity from L-stock for a client.
+   Moves amount_sats from the L-stock output (last vout on the leaf) to
+   the client's channel output, then adjusts channel balance so purchased
+   sats become LSP local_amount (= client's inbound capacity).
+
+   Generalized in PR #123 (Gap C-followup) to work for any leaf arity
+   that has an L-stock output (i.e., n_outputs >= 2 — at least 1 channel
+   + L-stock).  PS leaves post-advance (n_outputs == 1, no L-stock) are
+   correctly rejected. */
 int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 size_t client_idx, uint64_t amount_sats) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
-    if (f->leaf_arity != FACTORY_ARITY_2) {
-        fprintf(stderr, "buy_liquidity: only supported for arity-2\n");
-        return 0;
-    }
     if (client_idx >= mgr->n_channels || amount_sats == 0) {
         fprintf(stderr, "buy_liquidity: invalid client %zu or amount 0\n", client_idx);
         return 0;
@@ -2354,29 +2374,49 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint32_t vout;
     client_to_leaf(client_idx, f, &node_idx, &vout);
     factory_node_t *ln = &f->nodes[node_idx];
-    if (ln->n_outputs < 3) {
-        fprintf(stderr, "buy_liquidity: leaf has %zu outputs, need 3\n", ln->n_outputs);
+    if (ln->n_outputs < 2) {
+        fprintf(stderr, "buy_liquidity: leaf %zu has %zu outputs, need >= 2 (channels + L-stock)\n",
+                node_idx, ln->n_outputs);
+        return 0;
+    }
+
+    /* L-stock is the LAST output on the leaf (canonical layout for both
+       uniform-arity and mixed-arity factories). */
+    size_t lstock_vout = ln->n_outputs - 1;
+    if (vout == lstock_vout) {
+        fprintf(stderr, "buy_liquidity: client %zu maps to L-stock vout, not a channel\n", client_idx);
         return 0;
     }
 
     /* Validate L-stock has enough (keep >= 546 dust) */
-    uint64_t lstock = ln->outputs[2].amount_sats;
+    uint64_t lstock = ln->outputs[lstock_vout].amount_sats;
     if (lstock < 546 + amount_sats) {
         fprintf(stderr, "buy_liquidity: amount %llu exceeds L-stock %llu (dust limit)\n",
                 (unsigned long long)amount_sats, (unsigned long long)lstock);
         return 0;
     }
 
+    /* Find which leaf_side this client's leaf is at.  We need this for
+       lsp_realloc_leaf which takes leaf_side (index into
+       f->leaf_node_indices[]), not raw node_idx. */
+    int leaf_side = -1;
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        if (f->leaf_node_indices[i] == node_idx) { leaf_side = i; break; }
+    }
+    if (leaf_side < 0) {
+        fprintf(stderr, "buy_liquidity: node %zu not found in leaf_node_indices\n", node_idx);
+        return 0;
+    }
+
     /* Build new amounts: add to client's output, subtract from L-stock */
-    int leaf_side = (int)(client_idx / 2);
-    uint64_t new_amounts[3];
-    for (size_t k = 0; k < 3; k++)
+    uint64_t new_amounts[FACTORY_MAX_OUTPUTS];
+    for (size_t k = 0; k < ln->n_outputs; k++)
         new_amounts[k] = ln->outputs[k].amount_sats;
     new_amounts[vout] += amount_sats;
-    new_amounts[2] -= amount_sats;
+    new_amounts[lstock_vout] -= amount_sats;
 
     /* Perform the reallocation (DW advance + MuSig2 re-sign) */
-    if (!lsp_realloc_leaf(mgr, lsp, leaf_side, new_amounts, 3)) {
+    if (!lsp_realloc_leaf(mgr, lsp, leaf_side, new_amounts, ln->n_outputs)) {
         fprintf(stderr, "buy_liquidity: realloc failed\n");
         return 0;
     }

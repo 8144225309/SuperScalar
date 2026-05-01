@@ -4994,6 +4994,105 @@ int test_leaf_realloc_signing(void) {
     return 1;
 }
 
+/* Mirror of test_leaf_realloc_signing for arity-1 leaves (LSP + 1 client,
+   n_signers=2, n_outputs=2 = 1 channel + L-stock).  Proves the per-node
+   MuSig primitives that lsp_realloc_leaf wraps work at the smallest non-
+   arity-2 configuration.  Without the FACTORY_ARITY_2 gate lift in PR
+   #123, lsp_realloc_leaf rejected this configuration outright. */
+int test_leaf_realloc_signing_arity1(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    factory_set_arity(f, FACTORY_ARITY_1);
+    f->placement_mode = PLACEMENT_SEQUENTIAL;
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "initial sign all");
+
+    /* Advance leaf 0 (per-leaf DW counter). */
+    int rc = factory_advance_leaf_unsigned(f, 0);
+    TEST_ASSERT(rc == 1, "advance leaf 0 (rc=1, normal advance)");
+
+    size_t node_idx = f->leaf_node_indices[0];
+    factory_node_t *node = &f->nodes[node_idx];
+
+    /* Arity-1 leaf: 2 signers (LSP + 1 client), 2 outputs (channel + L-stock). */
+    TEST_ASSERT_EQ((long)node->n_signers, 2L, "arity-1 leaf has 2 signers");
+    TEST_ASSERT_EQ((long)node->n_outputs, 2L, "arity-1 leaf has 2 outputs");
+
+    /* Realloc: shift 10% from channel to L-stock. */
+    uint64_t total = 0;
+    for (size_t i = 0; i < node->n_outputs; i++)
+        total += node->outputs[i].amount_sats;
+    uint64_t shift = node->outputs[0].amount_sats / 10;
+    uint64_t new_amounts[2] = {
+        node->outputs[0].amount_sats - shift,
+        node->outputs[1].amount_sats + shift
+    };
+    TEST_ASSERT(factory_set_leaf_amounts(f, 0, new_amounts, 2), "set amounts");
+    TEST_ASSERT_EQ((long)(new_amounts[0] + new_amounts[1]), (long)total,
+                    "conservation");
+
+    /* Init signing session for the leaf node. */
+    TEST_ASSERT(factory_session_init_node(f, node_idx), "session init");
+
+    /* Generate nonces for both signers (LSP + client). */
+    secp256k1_musig_secnonce secnonces[2];
+    for (size_t i = 0; i < node->n_signers; i++) {
+        uint32_t participant = node->signer_indices[i];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]), "get seckey");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]), "get pubkey");
+
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i], &pubnonce,
+                                           seckey, &pk, &node->keyagg.cache),
+                    "gen nonce");
+        TEST_ASSERT(factory_session_set_nonce(f, node_idx, i, &pubnonce), "set nonce");
+        memset(seckey, 0, 32);
+    }
+
+    TEST_ASSERT(factory_session_finalize_node(f, node_idx), "finalize");
+
+    /* Create + set partial sigs for both signers. */
+    for (size_t i = 0; i < node->n_signers; i++) {
+        uint32_t participant = node->signer_indices[i];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[i],
+                                               &kps[participant],
+                                               &node->signing_session),
+                    "create psig");
+        TEST_ASSERT(factory_session_set_partial_sig(f, node_idx, i, &psig), "set psig");
+    }
+
+    /* Aggregate. */
+    TEST_ASSERT(factory_session_complete_node(f, node_idx), "complete node");
+    TEST_ASSERT(node->is_signed, "node is signed");
+    TEST_ASSERT(node->signed_tx.len > 0, "signed_tx populated");
+
+    /* Verify the post-realloc amounts persisted. */
+    TEST_ASSERT_EQ((long)node->outputs[0].amount_sats, (long)new_amounts[0], "final amt[0]");
+    TEST_ASSERT_EQ((long)node->outputs[1].amount_sats, (long)new_amounts[1], "final amt[1]");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* --- Factory Config Tests (Mainnet Gap #6) --- */
 
 int test_factory_config_custom(void) {

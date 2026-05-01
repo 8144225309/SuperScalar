@@ -1541,6 +1541,7 @@ extern int test_wire_scid_assign(void);
 extern int test_wire_leaf_realloc(void);
 extern int test_factory_set_leaf_amounts(void);
 extern int test_leaf_realloc_signing(void);
+extern int test_leaf_realloc_signing_arity1(void);
 extern int test_persist_dw_counter_with_leaves_4(void);
 extern int test_persist_file_reopen_round_trip(void);
 
@@ -3310,6 +3311,7 @@ static void run_unit_tests(void) {
     printf("\n=== Leaf-Level Fund Reallocation ===\n");
     RUN_TEST(test_factory_set_leaf_amounts);
     RUN_TEST(test_leaf_realloc_signing);
+    RUN_TEST(test_leaf_realloc_signing_arity1);
 
     RUN_TEST(test_persist_dw_counter_with_leaves_4);
     RUN_TEST(test_persist_file_reopen_round_trip);
