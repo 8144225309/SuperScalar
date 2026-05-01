@@ -2351,6 +2351,223 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
+/* Sub-factory chain extension ceremony driver (Gap E followup Phase 2b,
+   t/1242 k² PS).  Drives the multi-party MuSig signing of a new
+   sub-factory state when the LSP "sells liquidity from sales-stock":
+   one client's channel grows by delta_sats, sales-stock shrinks by
+   delta_sats + fee, all other channels unchanged.  N-of-N MuSig over
+   the sub-factory's signers (LSP + k clients in this sub-factory only).
+
+   Mirrors lsp_realloc_leaf's round structure but scoped to one
+   sub-factory's signers, and uses the new MSG_SUBFACTORY_* messages.
+
+   Returns 1 on success (chain extended, all participants confirmed
+   via DONE), 0 on any failure (validation, ceremony timeout, crypto). */
+int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                   int leaf_side, int sub_idx_in_leaf,
+                                   int channel_idx_in_sub,
+                                   uint64_t delta_sats) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    size_t leaf_node_idx = f->leaf_node_indices[leaf_side];
+    factory_node_t *leaf = &f->nodes[leaf_node_idx];
+    if (sub_idx_in_leaf < 0 || sub_idx_in_leaf >= leaf->n_subfactories)
+        return 0;
+    int sub_node_i = leaf->subfactory_node_indices[sub_idx_in_leaf];
+    if (sub_node_i < 0) return 0;
+
+    factory_node_t *sub = &f->nodes[sub_node_i];
+    if (sub->type != NODE_PS_SUBFACTORY) return 0;
+    /* k clients on this sub-factory (LSP is signer 0). */
+    size_t n_clients_in_sub = sub->n_signers - 1;
+    if (n_clients_in_sub == 0) return 0;
+
+    /* Step 1: Advance sub-factory state (rebuilds unsigned_tx, clears is_signed). */
+    if (!factory_subfactory_chain_advance_unsigned(f, leaf_side,
+                                                    sub_idx_in_leaf,
+                                                    channel_idx_in_sub,
+                                                    delta_sats)) {
+        fprintf(stderr, "LSP subfactory advance: chain_advance_unsigned failed\n");
+        return 0;
+    }
+
+    /* Step 2: Init signing session for the sub-factory node. */
+    if (!factory_session_init_node(f, (size_t)sub_node_i)) {
+        fprintf(stderr, "LSP subfactory advance: session init failed\n");
+        return 0;
+    }
+
+    /* Step 3: Generate LSP's nonce (signer slot 0). */
+    int lsp_slot = factory_find_signer_slot(f, (size_t)sub_node_i, 0);
+    if (lsp_slot < 0) return 0;
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+        return 0;
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
+                               lsp_seckey, &lsp->lsp_pubkey,
+                               &sub->keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP subfactory advance: nonce gen failed\n");
+        return 0;
+    }
+    /* Note: do NOT set the LSP nonce on the session here.  ALL_NONCES
+       carries every signer's nonce; we set them all in one pass on the
+       LSP side too (mirrors the leaf-realloc pattern). */
+
+    /* Step 4: Send PROPOSE to each client on the sub-factory. */
+    unsigned char lsp_pubnonce_ser[66];
+    musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+
+    /* Build the client list (signer_indices[1..n] are clients; signer 0 is LSP). */
+    uint32_t sub_clients[FACTORY_MAX_SIGNERS];
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++)
+        sub_clients[ci] = sub->signer_indices[ci + 1];
+
+    cJSON *propose = wire_build_subfactory_propose(leaf_side, sub_idx_in_leaf,
+                                                     channel_idx_in_sub,
+                                                     delta_sats,
+                                                     lsp_pubnonce_ser);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE, propose)) {
+            cJSON_Delete(propose);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+    }
+    cJSON_Delete(propose);
+
+    /* Step 5: Collect NONCE from each client. */
+    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t nmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &nmsg, 30) ||
+            nmsg.msg_type != MSG_SUBFACTORY_NONCE) {
+            fprintf(stderr, "LSP subfactory advance: expected SUBFACTORY_NONCE "
+                    "from client %u, got 0x%02x\n",
+                    sub_clients[ci], nmsg.msg_type);
+            if (nmsg.json) cJSON_Delete(nmsg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        unsigned char client_pn[66];
+        if (!wire_parse_subfactory_nonce(nmsg.json, client_pn)) {
+            cJSON_Delete(nmsg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        cJSON_Delete(nmsg.json);
+        int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
+                                                    sub_clients[ci]);
+        if (client_slot < 0) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        memcpy(all_pubnonces[client_slot], client_pn, 66);
+    }
+
+    /* Step 6: Set every nonce on the session, broadcast ALL_NONCES, finalize. */
+    for (size_t s = 0; s < sub->n_signers; s++) {
+        secp256k1_musig_pubnonce pn;
+        if (!musig_pubnonce_parse(lsp->ctx, &pn, all_pubnonces[s])) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        if (!factory_session_set_nonce(f, (size_t)sub_node_i, s, &pn)) {
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+    }
+    cJSON *all_nonces = wire_build_subfactory_all_nonces(
+        (const unsigned char (*)[66])all_pubnonces, sub->n_signers);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_ALL_NONCES, all_nonces);
+    }
+    cJSON_Delete(all_nonces);
+
+    if (!factory_session_finalize_node(f, (size_t)sub_node_i)) {
+        fprintf(stderr, "LSP subfactory advance: finalize failed\n");
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Step 7: Create LSP's partial sig. */
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    memset(lsp_seckey, 0, 32);
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
+                                    &sub->signing_session)) {
+        fprintf(stderr, "LSP subfactory advance: LSP partial sig failed\n");
+        return 0;
+    }
+    if (!factory_session_set_partial_sig(f, (size_t)sub_node_i,
+                                          (size_t)lsp_slot, &lsp_psig))
+        return 0;
+
+    /* Step 8: Collect PSIG from each client. */
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t pmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &pmsg, 30) ||
+            pmsg.msg_type != MSG_SUBFACTORY_PSIG) {
+            fprintf(stderr, "LSP subfactory advance: expected SUBFACTORY_PSIG "
+                    "from client %u, got 0x%02x\n",
+                    sub_clients[ci], pmsg.msg_type);
+            if (pmsg.json) cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        unsigned char client_psig_ser[32];
+        if (!wire_parse_subfactory_psig(pmsg.json, client_psig_ser)) {
+            cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        cJSON_Delete(pmsg.json);
+        int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
+                                                    sub_clients[ci]);
+        if (client_slot < 0) return 0;
+        secp256k1_musig_partial_sig client_psig;
+        if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser))
+            return 0;
+        if (!factory_session_set_partial_sig(f, (size_t)sub_node_i,
+                                              (size_t)client_slot, &client_psig))
+            return 0;
+    }
+
+    /* Step 9: Aggregate + finalize the new chain[N] signed_tx. */
+    if (!factory_session_complete_node(f, (size_t)sub_node_i)) {
+        fprintf(stderr, "LSP subfactory advance: complete failed\n");
+        return 0;
+    }
+
+    /* Step 10: Broadcast DONE to all sub-factory clients. */
+    cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf,
+                                                (uint32_t)sub->ps_chain_len);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
+    }
+    cJSON_Delete(done);
+
+    printf("LSP: sub-factory %d.%d chain extended to len %d (client[%d]+=%llu sats)\n",
+           leaf_side, sub_idx_in_leaf, sub->ps_chain_len,
+           channel_idx_in_sub, (unsigned long long)delta_sats);
+    return 1;
+}
+
 /* Buy inbound liquidity from L-stock for a client.
    Moves amount_sats from the L-stock output (last vout on the leaf) to
    the client's channel output, then adjusts channel balance so purchased

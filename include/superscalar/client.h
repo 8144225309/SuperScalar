@@ -195,6 +195,18 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
                                   uint32_t my_index,
                                   const wire_msg_t *propose_msg);
 
+/* Sub-factory chain extension client handler (Gap E followup Phase 2b,
+   t/1242 k² PS).  The LSP is "selling sales-stock to a client";
+   every co-signer of the sub-factory must participate.  Drives the
+   wire ceremony: parses PROPOSE → applies chain advance locally →
+   sends NONCE → waits for ALL_NONCES → finalizes session → sends
+   PSIG → waits for DONE.  Returns 1 on success, 0 on any failure. */
+int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
+                                       const secp256k1_keypair *keypair,
+                                       factory_t *factory,
+                                       uint32_t my_index,
+                                       const wire_msg_t *propose_msg);
+
 /* Set (or clear) the persistence handle used for the PS double-spend
    defense. Pass NULL to disable. Must be called before any PS advance
    happens; safe to call once at startup. */

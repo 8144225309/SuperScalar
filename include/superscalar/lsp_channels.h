@@ -341,6 +341,24 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             int trigger_leaf_side);
 
+/* PS k² sub-factory chain extension ceremony driver (Gap E followup
+   Phase 2b, t/1242).  Drives the multi-party MuSig signing of a new
+   sub-factory state when the LSP "sells liquidity from sales-stock":
+   the client at `channel_idx_in_sub` within sub-factory
+   `sub_idx_in_leaf` of `leaf_side` gains `delta_sats` of inbound
+   capacity by moving that amount out of the sub-factory's sales-stock.
+   N-of-N MuSig over the sub-factory's signers (LSP + k clients in this
+   sub-factory only).  See docs/ps-subfactories.md and the canonical
+   t/1242 spec passage on "buying liquidity via the pseudo-Spilman
+   factory".
+
+   Returns 1 on success (chain extended, all participants confirmed
+   via DONE), 0 on any failure. */
+int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                   int leaf_side, int sub_idx_in_leaf,
+                                   int channel_idx_in_sub,
+                                   uint64_t delta_sats);
+
 /* Buy inbound liquidity from L-stock for a client (arity-2 only).
    Moves amount_sats from L-stock to client's channel, increasing inbound capacity.
    Returns 1 on success. */
