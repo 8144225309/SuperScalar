@@ -3076,16 +3076,9 @@ accept_new_factory:
         factory_set_static_near_root(&lsp_p->factory, static_near_root);
     /* PS k² sub-factory arity: applied AFTER arity configuration so the
        leaf-count + DW counter recompute correctly for k>1. */
-    if (ps_subfactory_arity_arg > 0) {
+    if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-        printf("LSP: PS sub-factory arity = %u (factory.ps_subfactory_arity now %u, "
-               "leaf_arity=%d, n_leaf_nodes=%d)\n",
-               ps_subfactory_arity_arg,
-               lsp_p->factory.ps_subfactory_arity,
-               (int)lsp_p->factory.leaf_arity,
-               lsp_p->factory.n_leaf_nodes);
-    }
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 

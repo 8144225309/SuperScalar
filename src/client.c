@@ -1449,6 +1449,15 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint32_t static_threshold_depth =
         (snr_item && cJSON_IsNumber(snr_item)) ? (uint32_t)snr_item->valuedouble : 0;
 
+    /* PS k² sub-factory arity (Gap E followup, t/1242).  Backward-
+       compatible: missing field = k=1 (legacy 1-client-per-PS-leaf).
+       Without this the client builds a divergent tree when the LSP
+       configured --ps-subfactory-arity K>1 — same divergence mode that
+       broke --static-near-root before its FACTORY_PROPOSE field landed. */
+    cJSON *psa_item = cJSON_GetObjectItem(msg.json, "ps_subfactory_arity");
+    uint32_t ps_subfactory_arity_in =
+        (psa_item && cJSON_IsNumber(psa_item)) ? (uint32_t)psa_item->valuedouble : 0;
+
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
     int placement_mode = (pm_item && cJSON_IsNumber(pm_item)) ? (int)pm_item->valuedouble : 0;
@@ -1581,6 +1590,12 @@ int client_run_with_channels(secp256k1_context *ctx,
        DW counter shape based on f->level_arity / f->leaf_arity. */
     if (static_threshold_depth > 0)
         factory_set_static_near_root(factory, static_threshold_depth);
+    /* Apply ps_subfactory_arity after the arity restore — the setter
+       short-circuits when leaf_arity != FACTORY_ARITY_PS, so arity must
+       come first.  k>1 reshapes the tree to the canonical k² PS shape
+       from t/1242 (k sub-factories of k clients each per leaf). */
+    if (ps_subfactory_arity_in > 1)
+        factory_set_ps_subfactory_arity(factory, ps_subfactory_arity_in);
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
     free(parsed_l_stock_hashes);
