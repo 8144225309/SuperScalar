@@ -290,6 +290,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
         memcpy(saved_level_arity, f->level_arity,
                saved_n_level_arity * sizeof(uint8_t));
     uint32_t saved_static_threshold = f->static_threshold_depth;
+    /* Same survival rationale: --ps-subfactory-arity K (canonical k² PS
+       shape) is set on the CLI before lsp_run_factory_creation runs.
+       Without this save, k>1 silently collapses to k=1 (legacy 1-client-
+       per-PS-leaf), losing the entire k² structure. */
+    uint32_t saved_ps_subfactory_arity = f->ps_subfactory_arity;
     /* fee_per_tx must also survive: the N=64 mixed-arity factory needs
        1000 sats/tx (interior state nodes are wider — 240+ vB — and 200
        sats falls below regtest mempool min relay).  Preserving here lets
@@ -324,6 +329,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
        the DW counter shape based on f->level_arity / f->leaf_arity. */
     if (saved_static_threshold > 0)
         factory_set_static_near_root(f, saved_static_threshold);
+    /* ps_subfactory_arity also needs to follow arity restore — the setter
+       short-circuits when leaf_arity != FACTORY_ARITY_PS, so the arity
+       restore must precede it. */
+    if (saved_ps_subfactory_arity > 1)
+        factory_set_ps_subfactory_arity(f, saved_ps_subfactory_arity);
     /* Restore fee_per_tx if caller had bumped it above the init default.
        factory_build_tree below may further override from the fee estimator
        (see factory.c:1233), but in absence of an estimator this restore is
