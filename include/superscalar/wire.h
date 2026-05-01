@@ -115,6 +115,19 @@
 #define MSG_QUEUE_ITEMS         0x6E  /* LSP → Client: pending work items response */
 #define MSG_QUEUE_DONE          0x6F  /* Client → LSP: acknowledge processed item IDs */
 
+/* PS k² sub-factory chain extension ceremony (Gap E followup Phase 2b,
+   t/1242 k² PS).  Drives the multi-party MuSig signing of a new
+   sub-factory state when the LSP "sells liquidity from sales-stock".
+   N-of-N over (LSP + k clients in this sub-factory).  Same shape as
+   MSG_LEAF_REALLOC_* but scoped to one sub-factory's signers and
+   carrying the (leaf_side, sub_idx, channel_idx, delta_sats) tuple
+   in the propose. */
+#define MSG_SUBFACTORY_PROPOSE      0x73  /* LSP → sub clients: propose chain extension */
+#define MSG_SUBFACTORY_NONCE        0x74  /* Client → LSP: client pubnonce */
+#define MSG_SUBFACTORY_ALL_NONCES   0x75  /* LSP → sub clients: all pubnonces */
+#define MSG_SUBFACTORY_PSIG         0x76  /* Client → LSP: client partial sig */
+#define MSG_SUBFACTORY_DONE         0x77  /* LSP → sub clients: chain extension complete */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -629,6 +642,44 @@ cJSON *wire_build_leaf_realloc_done(int leaf_side,
 int wire_parse_leaf_realloc_done(const cJSON *json, int *leaf_side,
                                    uint64_t *amounts, size_t max_amounts,
                                    size_t *n_amounts_out);
+
+/* --- PS k² Sub-factory Chain Extension (Gap E followup Phase 2b) ---
+
+   Wire ceremony for the canonical "buy liquidity from sales-stock" op
+   (factory_subfactory_chain_advance_unsigned).  N-of-N MuSig over
+   (LSP + k clients in the target sub-factory). */
+
+/* LSP → sub clients: SUBFACTORY_PROPOSE
+     {leaf_side, sub_idx, channel_idx, delta_sats, lsp_pubnonce} */
+cJSON *wire_build_subfactory_propose(int leaf_side, int sub_idx,
+                                       int channel_idx, uint64_t delta_sats,
+                                       const unsigned char *lsp_pubnonce66);
+
+int wire_parse_subfactory_propose(const cJSON *json,
+                                    int *leaf_side, int *sub_idx,
+                                    int *channel_idx, uint64_t *delta_sats,
+                                    unsigned char *lsp_pubnonce66);
+
+/* Client → LSP: SUBFACTORY_NONCE {pubnonce} */
+cJSON *wire_build_subfactory_nonce(const unsigned char *pubnonce66);
+int wire_parse_subfactory_nonce(const cJSON *json, unsigned char *pubnonce66);
+
+/* LSP → sub clients: SUBFACTORY_ALL_NONCES {pubnonces[]} */
+cJSON *wire_build_subfactory_all_nonces(const unsigned char pubnonces[][66],
+                                          size_t n_signers);
+int wire_parse_subfactory_all_nonces(const cJSON *json,
+                                       unsigned char pubnonces_out[][66],
+                                       size_t max_signers, size_t *n_out);
+
+/* Client → LSP: SUBFACTORY_PSIG {partial_sig} */
+cJSON *wire_build_subfactory_psig(const unsigned char *partial_sig32);
+int wire_parse_subfactory_psig(const cJSON *json, unsigned char *partial_sig32);
+
+/* LSP → sub clients: SUBFACTORY_DONE {leaf_side, sub_idx, chain_len} */
+cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len);
+int wire_parse_subfactory_done(const cJSON *json,
+                                 int *leaf_side, int *sub_idx,
+                                 uint32_t *chain_len);
 
 /* --- SCID assignment for route hints (4B) --- */
 

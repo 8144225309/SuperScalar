@@ -112,6 +112,11 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
     case 0x55: return "STATE_ADVANCE_PROPOSE";
+    case 0x73: return "SUBFACTORY_PROPOSE";
+    case 0x74: return "SUBFACTORY_NONCE";
+    case 0x75: return "SUBFACTORY_ALL_NONCES";
+    case 0x76: return "SUBFACTORY_PSIG";
+    case 0x77: return "SUBFACTORY_DONE";
     case 0x58: return "LEAF_ADVANCE_PROPOSE";
     case 0x59: return "LEAF_ADVANCE_PSIG";
     case 0x5A: return "LEAF_ADVANCE_DONE";
@@ -1720,6 +1725,112 @@ int wire_parse_leaf_realloc_done(const cJSON *json, int *leaf_side,
         amounts[i] = (uint64_t)item->valuedouble;
     }
     *n_amounts_out = n;
+    return 1;
+}
+
+/* --- PS k² Sub-factory Chain Extension (Gap E followup Phase 2b) --- */
+
+cJSON *wire_build_subfactory_propose(int leaf_side, int sub_idx,
+                                       int channel_idx, uint64_t delta_sats,
+                                       const unsigned char *lsp_pubnonce66) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    cJSON_AddNumberToObject(j, "sub_idx", sub_idx);
+    cJSON_AddNumberToObject(j, "channel_idx", channel_idx);
+    cJSON_AddNumberToObject(j, "delta_sats", (double)delta_sats);
+    wire_json_add_hex(j, "pubnonce", lsp_pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_subfactory_propose(const cJSON *json,
+                                    int *leaf_side, int *sub_idx,
+                                    int *channel_idx, uint64_t *delta_sats,
+                                    unsigned char *lsp_pubnonce66) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    cJSON *si = cJSON_GetObjectItem(json, "sub_idx");
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_idx");
+    cJSON *ds = cJSON_GetObjectItem(json, "delta_sats");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    if (!si || !cJSON_IsNumber(si)) return 0;
+    if (!ci || !cJSON_IsNumber(ci)) return 0;
+    if (!wire_check_nonneg(ds)) return 0;
+    *leaf_side = (int)ls->valuedouble;
+    *sub_idx = (int)si->valuedouble;
+    *channel_idx = (int)ci->valuedouble;
+    *delta_sats = (uint64_t)ds->valuedouble;
+    if (wire_json_get_hex(json, "pubnonce", lsp_pubnonce66, 66) != 66) return 0;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_nonce(const unsigned char *pubnonce66) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_subfactory_nonce(const cJSON *json, unsigned char *pubnonce66) {
+    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_all_nonces(const unsigned char pubnonces[][66],
+                                          size_t n_signers) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "pubnonces");
+    char hex[133];
+    for (size_t i = 0; i < n_signers; i++) {
+        hex_encode(pubnonces[i], 66, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+    return j;
+}
+
+int wire_parse_subfactory_all_nonces(const cJSON *json,
+                                       unsigned char pubnonces_out[][66],
+                                       size_t max_signers, size_t *n_out) {
+    cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max_signers) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsString(item)) return 0;
+        if (hex_decode(item->valuestring, pubnonces_out[i], 66) != 66) return 0;
+    }
+    *n_out = n;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_psig(const unsigned char *partial_sig32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    return j;
+}
+
+int wire_parse_subfactory_psig(const cJSON *json, unsigned char *partial_sig32) {
+    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32) return 0;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    cJSON_AddNumberToObject(j, "sub_idx", sub_idx);
+    cJSON_AddNumberToObject(j, "chain_len", (double)chain_len);
+    return j;
+}
+
+int wire_parse_subfactory_done(const cJSON *json, int *leaf_side,
+                                 int *sub_idx, uint32_t *chain_len) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    cJSON *si = cJSON_GetObjectItem(json, "sub_idx");
+    cJSON *cl = cJSON_GetObjectItem(json, "chain_len");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    if (!si || !cJSON_IsNumber(si)) return 0;
+    if (!cl || !cJSON_IsNumber(cl)) return 0;
+    *leaf_side = (int)ls->valuedouble;
+    *sub_idx = (int)si->valuedouble;
+    *chain_len = (uint32_t)cl->valuedouble;
     return 1;
 }
 
