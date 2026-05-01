@@ -1143,6 +1143,93 @@
            verification (the new-epoch signed TXs must be valid).
 
            Requires arity-1 (DW leaves) — PS chains never trigger rc=-1. */
+        /* === PS k² Sub-factory Chain Extension Test (Phase 2c) ===
+
+           Drives a single sub-factory chain extension via
+           lsp_subfactory_chain_advance.  Requires --arity 3 (PS) and
+           --ps-subfactory-arity K with K>1 so the factory has actual
+           sub-factory child nodes to extend. */
+        if (test_subfactory_advance) {
+            printf("\n=== PS K² SUB-FACTORY CHAIN EXTENSION TEST ===\n");
+            fflush(stdout);
+            int sub_pass = 1;
+
+            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_PS ||
+                lsp_p->factory.ps_subfactory_arity <= 1) {
+                printf("  SKIP: --test-subfactory-advance requires --arity 3 "
+                       "and --ps-subfactory-arity K (K>1)\n");
+                printf("PS K² SUB-FACTORY TEST: SKIP\n");
+            } else if (lsp_p->factory.n_leaf_nodes < 1) {
+                printf("  SKIP: no leaves built\n");
+                printf("PS K² SUB-FACTORY TEST: SKIP\n");
+            } else {
+                /* Pick leaf 0, sub-factory 0, channel 0; transfer 50000 sats
+                   from sales-stock to channel 0. */
+                size_t leaf0_idx = lsp_p->factory.leaf_node_indices[0];
+                factory_node_t *leaf = &lsp_p->factory.nodes[leaf0_idx];
+                if (leaf->n_subfactories < 1) {
+                    printf("  SKIP: leaf 0 has no sub-factories\n");
+                    printf("PS K² SUB-FACTORY TEST: SKIP\n");
+                } else {
+                    int sub0_node_i = leaf->subfactory_node_indices[0];
+                    factory_node_t *sub0 =
+                        &lsp_p->factory.nodes[sub0_node_i];
+                    int chain_before = sub0->ps_chain_len;
+                    uint64_t ch0_before = sub0->outputs[0].amount_sats;
+                    uint64_t sstock_before =
+                        sub0->outputs[sub0->n_outputs - 1].amount_sats;
+                    uint64_t delta = 50000;
+
+                    printf("  pre-extension: chain_len=%d, ch[0]=%llu, "
+                           "sales-stock=%llu, delta=%llu\n",
+                           chain_before, (unsigned long long)ch0_before,
+                           (unsigned long long)sstock_before,
+                           (unsigned long long)delta);
+                    fflush(stdout);
+
+                    int rc = lsp_subfactory_chain_advance(mgr, lsp_p,
+                                                           /*leaf_side=*/0,
+                                                           /*sub_idx=*/0,
+                                                           /*channel_idx=*/0,
+                                                           delta);
+                    if (rc != 1) {
+                        printf("  FAIL: lsp_subfactory_chain_advance returned %d\n", rc);
+                        sub_pass = 0;
+                    } else if (sub0->ps_chain_len != chain_before + 1) {
+                        printf("  FAIL: chain_len did not increment "
+                               "(was %d, now %d)\n",
+                               chain_before, sub0->ps_chain_len);
+                        sub_pass = 0;
+                    } else if (sub0->outputs[0].amount_sats !=
+                                ch0_before + delta) {
+                        printf("  FAIL: ch[0] did not grow by delta "
+                               "(was %llu, now %llu)\n",
+                               (unsigned long long)ch0_before,
+                               (unsigned long long)sub0->outputs[0].amount_sats);
+                        sub_pass = 0;
+                    } else if (!sub0->is_signed) {
+                        printf("  FAIL: chain[N+1] is not signed\n");
+                        sub_pass = 0;
+                    } else {
+                        printf("  post-extension: chain_len=%d, ch[0]=%llu, "
+                               "sales-stock=%llu (signed=%d)\n",
+                               sub0->ps_chain_len,
+                               (unsigned long long)sub0->outputs[0].amount_sats,
+                               (unsigned long long)sub0->outputs[sub0->n_outputs - 1].amount_sats,
+                               sub0->is_signed);
+                    }
+                }
+                printf("PS K² SUB-FACTORY TEST: %s\n", sub_pass ? "PASS" : "FAIL");
+            }
+            fflush(stdout);
+            if (!sub_pass) {
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+
         if (test_tier_b_rollover) {
             printf("\n=== TIER B STATE-ADVANCE ROLLOVER TEST ===\n");
             fflush(stdout);
