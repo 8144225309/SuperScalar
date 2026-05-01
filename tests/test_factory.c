@@ -5389,6 +5389,220 @@ int test_factory_ps_subfactory_k2_n4(void) {
     return 1;
 }
 
+/* Sub-factory chain extension test (Gap E followup Phase 2, t/1242 k² PS).
+
+   Builds a k=2 N=4 PS factory (same shape as
+   test_factory_ps_subfactory_k2_n4), then:
+     1. Picks sub-factory 0 (clients A, B).
+     2. Records initial channel + sales-stock amounts.
+     3. Calls factory_subfactory_chain_advance_unsigned to "buy" 50000
+        sats of inbound for client A from sub-factory 0's sales-stock.
+     4. Verifies sub-factory 0:
+        - ps_chain_len incremented to 1
+        - outputs[0] (A's channel) grew by 50000
+        - outputs[1] (B's channel) unchanged
+        - outputs[2] (sales-stock) shrunk by 50000 + fee
+        - is_signed cleared (rebuild_node_tx resets it)
+     5. Re-signs sub-factory 0 via in-process per-node MuSig (2-of-3 LSP+A+B).
+     6. Asserts the new signed_tx verifies correctly against the prior
+        sales-stock SPK (which is what compute_node_sighash binds to
+        for sub-factory chain extensions).
+     7. Performs a SECOND chain extension to verify multi-step
+        chains work (chain[2]). */
+int test_factory_ps_subfactory_chain_extension(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xEE;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xFE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(f), "build k² PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign initial state (chain[0])");
+
+    /* Locate sub-factory 0 of leaf 0 */
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    TEST_ASSERT_EQ(leaf->n_subfactories, 2, "leaf has 2 sub-factories");
+    int sub0_node_idx = leaf->subfactory_node_indices[0];
+    factory_node_t *sub = &f->nodes[sub0_node_idx];
+
+    /* Pre-extension state */
+    TEST_ASSERT_EQ(sub->ps_chain_len, 0, "sub-factory chain_len starts at 0");
+    TEST_ASSERT_EQ((int)sub->n_outputs, 3, "sub has 3 outputs");
+    TEST_ASSERT(sub->is_signed, "sub initially signed");
+    uint64_t a_chan_before = sub->outputs[0].amount_sats;
+    uint64_t b_chan_before = sub->outputs[1].amount_sats;
+    uint64_t sstock_before = sub->outputs[2].amount_sats;
+    uint64_t total_before = a_chan_before + b_chan_before + sstock_before;
+
+    /* Extend sub-factory: client A buys 50000 sats from sales-stock */
+    uint64_t delta = 50000;
+    int rc = factory_subfactory_chain_advance_unsigned(
+        f, /*leaf_side=*/0, /*sub_idx=*/0, /*channel_idx=*/0, delta);
+    TEST_ASSERT_EQ(rc, 1, "chain advance succeeds");
+
+    /* Post-extension state (still unsigned) */
+    TEST_ASSERT_EQ(sub->ps_chain_len, 1, "chain_len incremented to 1");
+    TEST_ASSERT(!sub->is_signed, "is_signed cleared by rebuild");
+    TEST_ASSERT_EQ(sub->ps_prev_chan_amount, sstock_before,
+                    "ps_prev_chan_amount = prior sales-stock amount");
+    TEST_ASSERT_EQ((long)sub->outputs[0].amount_sats,
+                    (long)(a_chan_before + delta), "A's channel grew by delta");
+    TEST_ASSERT_EQ((long)sub->outputs[1].amount_sats, (long)b_chan_before,
+                    "B's channel unchanged");
+    TEST_ASSERT_EQ((long)sub->outputs[2].amount_sats,
+                    (long)(sstock_before - delta - f->fee_per_tx),
+                    "sales-stock = prior - delta - fee");
+    /* Conservation: total decreased by exactly fee_per_tx. */
+    uint64_t total_after = sub->outputs[0].amount_sats +
+                           sub->outputs[1].amount_sats +
+                           sub->outputs[2].amount_sats;
+    TEST_ASSERT_EQ((long)total_after, (long)(total_before - f->fee_per_tx),
+                    "conservation: total - fee");
+
+    /* Re-sign sub-factory 0 via in-process per-node MuSig (LSP + A + B = 3 signers).
+       Mirrors what the wire ceremony would do but in-process for the unit test. */
+    TEST_ASSERT(factory_session_init_node(f, (size_t)sub0_node_idx),
+                "session init for chain[1]");
+    secp256k1_musig_secnonce secnonces[3];
+    for (size_t j = 0; j < sub->n_signers; j++) {
+        uint32_t participant = sub->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
+                    "get seckey");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]),
+                    "get pubkey");
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
+                                           seckey, &pk, &sub->keyagg.cache),
+                    "gen nonce");
+        TEST_ASSERT(factory_session_set_nonce(f, (size_t)sub0_node_idx, j, &pubnonce),
+                    "set nonce");
+        memset(seckey, 0, 32);
+    }
+    TEST_ASSERT(factory_session_finalize_node(f, (size_t)sub0_node_idx),
+                "finalize");
+    for (size_t j = 0; j < sub->n_signers; j++) {
+        uint32_t participant = sub->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &sub->signing_session),
+                    "create psig");
+        TEST_ASSERT(factory_session_set_partial_sig(f, (size_t)sub0_node_idx, j, &psig),
+                    "set psig");
+    }
+    TEST_ASSERT(factory_session_complete_node(f, (size_t)sub0_node_idx),
+                "complete chain[1] sig");
+    TEST_ASSERT(sub->is_signed, "chain[1] signed");
+    TEST_ASSERT(sub->signed_tx.len > 0, "chain[1] signed_tx populated");
+
+    /* Capture chain[1] state for the second extension */
+    uint64_t a_chan_chain1 = sub->outputs[0].amount_sats;
+    uint64_t sstock_chain1 = sub->outputs[2].amount_sats;
+
+    /* Second extension: client B buys 30000 from sales-stock */
+    uint64_t delta2 = 30000;
+    rc = factory_subfactory_chain_advance_unsigned(
+        f, /*leaf_side=*/0, /*sub_idx=*/0, /*channel_idx=*/1, delta2);
+    TEST_ASSERT_EQ(rc, 1, "second chain advance succeeds");
+    TEST_ASSERT_EQ(sub->ps_chain_len, 2, "chain_len incremented to 2");
+    TEST_ASSERT_EQ((long)sub->outputs[0].amount_sats, (long)a_chan_chain1,
+                    "A's channel still at chain[1] amount");
+    TEST_ASSERT_EQ((long)sub->outputs[1].amount_sats,
+                    (long)(b_chan_before + delta2),
+                    "B's channel grew by delta2");
+    TEST_ASSERT_EQ((long)sub->outputs[2].amount_sats,
+                    (long)(sstock_chain1 - delta2 - f->fee_per_tx),
+                    "sales-stock = chain[1] - delta2 - fee");
+
+    /* Sign chain[2] same way to confirm multi-extension works */
+    TEST_ASSERT(factory_session_init_node(f, (size_t)sub0_node_idx),
+                "chain[2] session init");
+    for (size_t j = 0; j < sub->n_signers; j++) {
+        uint32_t participant = sub->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
+        secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
+                                           seckey, &pk, &sub->keyagg.cache),
+                    "chain[2] gen nonce");
+        TEST_ASSERT(factory_session_set_nonce(f, (size_t)sub0_node_idx, j, &pubnonce),
+                    "chain[2] set nonce");
+        memset(seckey, 0, 32);
+    }
+    TEST_ASSERT(factory_session_finalize_node(f, (size_t)sub0_node_idx),
+                "chain[2] finalize");
+    for (size_t j = 0; j < sub->n_signers; j++) {
+        uint32_t participant = sub->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &sub->signing_session),
+                    "chain[2] create psig");
+        TEST_ASSERT(factory_session_set_partial_sig(f, (size_t)sub0_node_idx, j, &psig),
+                    "chain[2] set psig");
+    }
+    TEST_ASSERT(factory_session_complete_node(f, (size_t)sub0_node_idx),
+                "chain[2] complete");
+    TEST_ASSERT(sub->is_signed, "chain[2] signed");
+
+    /* Failure cases */
+    /* (a) buy more than sales-stock can afford */
+    rc = factory_subfactory_chain_advance_unsigned(
+        f, 0, 0, 0, sub->outputs[2].amount_sats);  /* would zero out sales-stock */
+    TEST_ASSERT_EQ(rc, 0, "reject: not enough sales-stock for delta+fee+dust");
+    /* chain_len must be unchanged after rejection */
+    TEST_ASSERT_EQ(sub->ps_chain_len, 2, "chain_len unchanged after rejection");
+
+    /* (b) bad sub_idx */
+    rc = factory_subfactory_chain_advance_unsigned(f, 0, 99, 0, 1000);
+    TEST_ASSERT_EQ(rc, 0, "reject: sub_idx out of range");
+
+    /* (c) channel_idx out of range (= sales-stock vout) */
+    rc = factory_subfactory_chain_advance_unsigned(f, 0, 0, 2, 1000);
+    TEST_ASSERT_EQ(rc, 0, "reject: channel_idx == sales-stock vout");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Build, sign, verify, and advance a PS factory at N=64 (1 LSP + 63 clients).
  * This is the scale test — the existing PS tests use N=3 (2 clients), which
  * doesn't exercise the interior-tree layers or the 64-way MuSig ceremony.
