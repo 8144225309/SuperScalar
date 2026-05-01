@@ -95,37 +95,54 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
                     "save sub-factory chain entry");
     }
 
-    /* Load back and verify round-trip. */
-    tx_buf_t loaded_txs[3];
-    for (int i = 0; i < 3; i++) tx_buf_init(&loaded_txs[i], 64);
+    /* Load back and verify round-trip.
+
+       NOTE: persist_load_ps_chain calls tx_buf_init() on each entry
+       internally — do NOT pre-init or the prior allocation leaks
+       (caught by LSan in CI). */
+    tx_buf_t loaded_txs[3] = {0};
     unsigned char loaded_txids[3][32];
     uint64_t loaded_amounts[3];
     int n_loaded = persist_load_ps_chain(&db, factory_id, sub_node_idx,
                                             loaded_txs, loaded_txids,
                                             loaded_amounts, 3);
-    TEST_ASSERT_EQ(n_loaded, 3, "n_loaded chain entries");
 
-    for (int i = 0; i < 3; i++) {
-        if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
-            printf("  FAIL: chain[%d] txid mismatch\n", i);
-            return 0;
+    int ok = 1;
+    if (n_loaded != 3) {
+        printf("  FAIL: n_loaded=%d expected 3\n", n_loaded);
+        ok = 0;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
+                printf("  FAIL: chain[%d] txid mismatch\n", i);
+                ok = 0;
+            }
+            if (loaded_txs[i].len != signed_tx_lens[i]) {
+                printf("  FAIL: chain[%d] signed_tx_len mismatch "
+                       "(got %zu, want %zu)\n",
+                       i, loaded_txs[i].len, signed_tx_lens[i]);
+                ok = 0;
+            } else if (memcmp(loaded_txs[i].data, signed_txs[i],
+                                signed_tx_lens[i]) != 0) {
+                printf("  FAIL: chain[%d] signed_tx bytes mismatch\n", i);
+                ok = 0;
+            }
+            if ((long)loaded_amounts[i] != (long)sstock_amounts[i]) {
+                printf("  FAIL: chain[%d] sales-stock amount %ld != %ld\n",
+                       i, (long)loaded_amounts[i], (long)sstock_amounts[i]);
+                ok = 0;
+            }
         }
-        if (loaded_txs[i].len != signed_tx_lens[i]) {
-            printf("  FAIL: chain[%d] signed_tx_len mismatch (got %zu, want %zu)\n",
-                    i, loaded_txs[i].len, signed_tx_lens[i]);
-            return 0;
-        }
-        if (memcmp(loaded_txs[i].data, signed_txs[i], signed_tx_lens[i]) != 0) {
-            printf("  FAIL: chain[%d] signed_tx bytes mismatch\n", i);
-            return 0;
-        }
-        TEST_ASSERT_EQ((long)loaded_amounts[i], (long)sstock_amounts[i],
-                        "chain entry sales-stock amount");
-        tx_buf_free(&loaded_txs[i]);
     }
 
+    /* Always free everything persist_load_ps_chain allocated, regardless
+       of pass/fail.  LSan would otherwise flag the loaded tx_buf data
+       as leaked on the failure path. */
+    for (int i = 0; i < n_loaded && i < 3; i++)
+        tx_buf_free(&loaded_txs[i]);
+
     persist_close(&db);
-    return 1;
+    return ok;
 }
 
 /* ---- Test 1: Open/close in-memory database ---- */
