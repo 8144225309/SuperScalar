@@ -502,6 +502,11 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
+
+    /* k=1 default for PS sub-factory arity (1-client-per-PS-leaf, no
+       sub-factories — preserves all historical PS test behavior).
+       Override with factory_set_ps_subfactory_arity() before build. */
+    f->ps_subfactory_arity = 1;
     return 1;
 }
 
@@ -539,6 +544,11 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
         dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
+
+    /* k=1 default for PS sub-factory arity (1-client-per-PS-leaf, no
+       sub-factories — preserves all historical PS test behavior).
+       Override with factory_set_ps_subfactory_arity() before build. */
+    f->ps_subfactory_arity = 1;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -675,6 +685,17 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
 void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks) {
     if (!f) return;
     f->l_stock_csv_blocks = csv_blocks;
+}
+
+void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
+    if (!f) return;
+    /* Cap at FACTORY_MAX_OUTPUTS - 1 so the leaf's k sub-factory entry
+       outputs + 1 L-stock output fit within FACTORY_MAX_OUTPUTS.  k=0
+       is treated as k=1 (no sub-factories). */
+    if (k == 0) k = 1;
+    if (k > (uint32_t)(FACTORY_MAX_OUTPUTS - 1))
+        k = (uint32_t)(FACTORY_MAX_OUTPUTS - 1);
+    f->ps_subfactory_arity = k;
 }
 
 int factory_client_to_leaf(const factory_t *f, size_t client_idx,
