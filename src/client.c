@@ -2641,6 +2641,159 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* Sub-factory chain extension client handler (Gap E followup Phase 2b,
+   t/1242 k² PS).  The client is a member of one of the leaf's k
+   sub-factories; the LSP triggers a chain extension to "sell" some
+   sales-stock to one of the sub-factory's clients.  All k clients in
+   the sub-factory must co-sign the new state.
+
+   Returns 1 on success, 0 on any failure. */
+int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
+                                       const secp256k1_keypair *keypair,
+                                       factory_t *factory, uint32_t my_index,
+                                       const wire_msg_t *propose_msg) {
+    int leaf_side, sub_idx, channel_idx;
+    uint64_t delta_sats;
+    unsigned char lsp_pubnonce_ser[66];
+    if (!wire_parse_subfactory_propose(propose_msg->json, &leaf_side, &sub_idx,
+                                         &channel_idx, &delta_sats,
+                                         lsp_pubnonce_ser)) {
+        fprintf(stderr, "Client %u: failed to parse SUBFACTORY_PROPOSE\n", my_index);
+        return 0;
+    }
+
+    /* Apply the chain advance locally so our unsigned_tx matches the LSP's. */
+    if (!factory_subfactory_chain_advance_unsigned(factory, leaf_side, sub_idx,
+                                                     channel_idx, delta_sats)) {
+        fprintf(stderr, "Client %u: subfactory chain_advance_unsigned failed "
+                "(leaf=%d sub=%d ch=%d delta=%llu)\n",
+                my_index, leaf_side, sub_idx, channel_idx,
+                (unsigned long long)delta_sats);
+        return 0;
+    }
+
+    /* Locate the sub-factory node we just advanced. */
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
+    size_t leaf_idx = factory->leaf_node_indices[leaf_side];
+    factory_node_t *leaf = &factory->nodes[leaf_idx];
+    if (sub_idx < 0 || sub_idx >= leaf->n_subfactories) return 0;
+    int sub_node_i = leaf->subfactory_node_indices[sub_idx];
+    if (sub_node_i < 0) return 0;
+    factory_node_t *sub = &factory->nodes[sub_node_i];
+
+    /* Init signing session for the sub-factory node. */
+    if (!factory_session_init_node(factory, (size_t)sub_node_i)) {
+        fprintf(stderr, "Client %u: subfactory session_init failed\n", my_index);
+        return 0;
+    }
+
+    /* Find own slot and generate own nonce. */
+    int my_slot = factory_find_signer_slot(factory, (size_t)sub_node_i, my_index);
+    if (my_slot < 0) {
+        fprintf(stderr, "Client %u: not a signer on sub-factory %d.%d\n",
+                my_index, leaf_side, sub_idx);
+        return 0;
+    }
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) return 0;
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+    secp256k1_musig_secnonce my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+                               my_seckey, &my_pubkey,
+                               &sub->keyagg.cache)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Send NONCE. */
+    unsigned char my_pn_ser[66];
+    musig_pubnonce_serialize(ctx, my_pn_ser, &my_pubnonce);
+    cJSON *nm = wire_build_subfactory_nonce(my_pn_ser);
+    if (!wire_send(fd, MSG_SUBFACTORY_NONCE, nm)) {
+        cJSON_Delete(nm);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(nm);
+
+    /* Receive ALL_NONCES, set every nonce on the session. */
+    wire_msg_t am;
+    if (!wire_recv(fd, &am) || am.msg_type != MSG_SUBFACTORY_ALL_NONCES) {
+        fprintf(stderr, "Client %u: expected SUBFACTORY_ALL_NONCES, got 0x%02x\n",
+                my_index, am.json ? am.msg_type : 0);
+        if (am.json) cJSON_Delete(am.json);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    size_t n_pn;
+    if (!wire_parse_subfactory_all_nonces(am.json, all_pubnonces,
+                                            FACTORY_MAX_SIGNERS, &n_pn)) {
+        cJSON_Delete(am.json);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(am.json);
+    for (size_t s = 0; s < n_pn; s++) {
+        secp256k1_musig_pubnonce pn;
+        if (!musig_pubnonce_parse(ctx, &pn, all_pubnonces[s])) {
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+        if (!factory_session_set_nonce(factory, (size_t)sub_node_i, s, &pn)) {
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+    }
+
+    /* Finalize. */
+    if (!factory_session_finalize_node(factory, (size_t)sub_node_i)) {
+        fprintf(stderr, "Client %u: subfactory finalize failed\n", my_index);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Create + send PSIG. */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+                                    &sub->signing_session)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+    unsigned char my_psig_ser[32];
+    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+    cJSON *pm = wire_build_subfactory_psig(my_psig_ser);
+    if (!wire_send(fd, MSG_SUBFACTORY_PSIG, pm)) {
+        cJSON_Delete(pm);
+        return 0;
+    }
+    cJSON_Delete(pm);
+
+    /* Wait for DONE. */
+    wire_msg_t dm;
+    if (!wire_recv(fd, &dm) || dm.msg_type != MSG_SUBFACTORY_DONE) {
+        fprintf(stderr, "Client %u: expected SUBFACTORY_DONE, got 0x%02x\n",
+                my_index, dm.json ? dm.msg_type : 0);
+        if (dm.json) cJSON_Delete(dm.json);
+        return 0;
+    }
+    int dn_leaf, dn_sub;
+    uint32_t dn_chain_len;
+    wire_parse_subfactory_done(dm.json, &dn_leaf, &dn_sub, &dn_chain_len);
+    cJSON_Delete(dm.json);
+    /* Suppress -Wunused warnings on parsed-but-not-checked fields */
+    (void)dn_leaf; (void)dn_sub;
+
+    printf("Client %u: sub-factory %d.%d advanced to chain_len %u "
+           "(channel[%d]+=%llu sats)\n",
+           my_index, leaf_side, sub_idx, dn_chain_len,
+           channel_idx, (unsigned long long)delta_sats);
+    return 1;
+}
+
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory, uint32_t my_index,

@@ -1539,6 +1539,7 @@ extern int test_factory_variable_arity_backward_compat(void);
 extern int test_factory_derive_scid(void);
 extern int test_wire_scid_assign(void);
 extern int test_wire_leaf_realloc(void);
+extern int test_wire_subfactory(void);
 extern int test_factory_set_leaf_amounts(void);
 extern int test_leaf_realloc_signing(void);
 extern int test_leaf_realloc_signing_arity1(void);
@@ -3309,6 +3310,7 @@ static void run_unit_tests(void) {
     printf("\n=== Route Hints (SCID) ===\n");
     RUN_TEST(test_wire_scid_assign);
     RUN_TEST(test_wire_leaf_realloc);
+    RUN_TEST(test_wire_subfactory);
 
     printf("\n=== Leaf-Level Fund Reallocation ===\n");
     RUN_TEST(test_factory_set_leaf_amounts);

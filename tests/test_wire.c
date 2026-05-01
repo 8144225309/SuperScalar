@@ -1570,6 +1570,79 @@ int test_wire_leaf_realloc(void) {
     return 1;
 }
 
+/* --- PS k² Sub-factory chain extension wire round-trip --- */
+
+int test_wire_subfactory(void) {
+    /* PROPOSE round-trip */
+    unsigned char lsp_pn[66];
+    memset(lsp_pn, 0xA1, 66);
+    cJSON *propose = wire_build_subfactory_propose(2, 1, 0, 75000, lsp_pn);
+    TEST_ASSERT(propose != NULL, "build subfactory_propose");
+
+    int ls_out, sub_out, ch_out;
+    uint64_t delta_out;
+    unsigned char pn_out[66];
+    TEST_ASSERT(wire_parse_subfactory_propose(propose, &ls_out, &sub_out,
+                                                &ch_out, &delta_out, pn_out),
+                "parse subfactory_propose");
+    TEST_ASSERT_EQ(ls_out, 2, "leaf_side");
+    TEST_ASSERT_EQ(sub_out, 1, "sub_idx");
+    TEST_ASSERT_EQ(ch_out, 0, "channel_idx");
+    TEST_ASSERT_EQ((long)delta_out, 75000, "delta_sats");
+    TEST_ASSERT_MEM_EQ(pn_out, lsp_pn, 66, "lsp pubnonce round-trip");
+    cJSON_Delete(propose);
+
+    /* NONCE round-trip */
+    unsigned char nin[66];
+    memset(nin, 0xB2, 66);
+    cJSON *nm = wire_build_subfactory_nonce(nin);
+    TEST_ASSERT(nm != NULL, "build subfactory_nonce");
+    unsigned char nout[66];
+    TEST_ASSERT(wire_parse_subfactory_nonce(nm, nout), "parse subfactory_nonce");
+    TEST_ASSERT_MEM_EQ(nout, nin, 66, "nonce round-trip");
+    cJSON_Delete(nm);
+
+    /* ALL_NONCES round-trip (3 signers = LSP + 2 clients on a k=2 sub-factory) */
+    unsigned char pns[3][66];
+    memset(pns[0], 0x10, 66);
+    memset(pns[1], 0x20, 66);
+    memset(pns[2], 0x30, 66);
+    cJSON *all = wire_build_subfactory_all_nonces(pns, 3);
+    TEST_ASSERT(all != NULL, "build subfactory_all_nonces");
+    unsigned char pns_out[4][66];
+    size_t n_pns;
+    TEST_ASSERT(wire_parse_subfactory_all_nonces(all, pns_out, 4, &n_pns),
+                "parse subfactory_all_nonces");
+    TEST_ASSERT_EQ((long)n_pns, 3, "n_signers");
+    TEST_ASSERT_MEM_EQ(pns_out[0], pns[0], 66, "pubnonce[0]");
+    TEST_ASSERT_MEM_EQ(pns_out[1], pns[1], 66, "pubnonce[1]");
+    TEST_ASSERT_MEM_EQ(pns_out[2], pns[2], 66, "pubnonce[2]");
+    cJSON_Delete(all);
+
+    /* PSIG round-trip */
+    unsigned char psig_in[32];
+    memset(psig_in, 0xC3, 32);
+    cJSON *pm = wire_build_subfactory_psig(psig_in);
+    TEST_ASSERT(pm != NULL, "build subfactory_psig");
+    unsigned char psig_out[32];
+    TEST_ASSERT(wire_parse_subfactory_psig(pm, psig_out), "parse subfactory_psig");
+    TEST_ASSERT_MEM_EQ(psig_out, psig_in, 32, "psig round-trip");
+    cJSON_Delete(pm);
+
+    /* DONE round-trip */
+    cJSON *dm = wire_build_subfactory_done(0, 1, 5);
+    TEST_ASSERT(dm != NULL, "build subfactory_done");
+    int dn_ls, dn_si;
+    uint32_t dn_cl;
+    TEST_ASSERT(wire_parse_subfactory_done(dm, &dn_ls, &dn_si, &dn_cl),
+                "parse subfactory_done");
+    TEST_ASSERT_EQ(dn_ls, 0, "done leaf_side");
+    TEST_ASSERT_EQ(dn_si, 1, "done sub_idx");
+    TEST_ASSERT_EQ((int)dn_cl, 5, "done chain_len");
+    cJSON_Delete(dm);
+    return 1;
+}
+
 /* --- 4B: SCID_ASSIGN wire round-trip --- */
 
 int test_wire_scid_assign(void) {
