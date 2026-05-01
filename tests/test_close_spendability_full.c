@@ -1374,6 +1374,186 @@ static int run_full_tree_force_close_for_arity(regtest_t *rt,
     return 1;
 }
 
+/* Phase 3 of the k² PS sub-factory work (Gap E followup, t/1242).
+
+   Build a k=2 N=4 PS factory with the canonical k² shape (1 leaf with
+   2 sub-factories of 2 clients each), broadcast every signed node on
+   regtest, confirm that all 4 nodes (root_kickoff, leaf, sub-factory
+   0, sub-factory 1) land on chain.  This proves the entire k² shape
+   actually produces valid Bitcoin TXs that confirm and chain through
+   each other, with sub-factory inputs/outputs wired correctly via
+   the leaf's vout SPKs.
+
+   Spendability of the per-channel sub-factory outputs (i.e. each
+   client sweeping their MuSig(LSP, client_i) channel) is identical
+   to the existing PS chain close path
+   (test_regtest_ps_chain_close_spendability) — the channel SPK shape
+   doesn't change, only the parent it spends from changes (sub-factory
+   chain[0] vout vs leaf vout).  So this test focuses on what's new:
+   the chain-of-three TX structure (root → leaf → sub-factory) lands
+   on chain. */
+static int run_k2_ps_subfactory_force_close(regtest_t *rt,
+                                              secp256k1_context *ctx,
+                                              const char *mine_addr) {
+    const size_t N = 5;  /* 1 LSP + 4 clients */
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+
+    unsigned char fund_spk[34];
+    char fund_txid[65];
+    uint32_t fund_vout = 0;
+    uint64_t fund_amount = 0;
+    /* fund_n_party_factory builds + signs with the default k=1 shape;
+       we want k=2 so we manually replicate the funding part and
+       inject factory_set_ps_subfactory_arity before factory_build_tree. */
+    secp256k1_pubkey pks[5];
+    for (size_t i = 0; i < N; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], N_PARTY_SECKEYS[i])) {
+            free(f); return 0;
+        }
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) { free(f); return 0; }
+    }
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, N)) { free(f); return 0; }
+    unsigned char agg_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey)) {
+        free(f); return 0;
+    }
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", agg_ser, 32, tweak);
+    musig_keyagg_t ka_spk = ka;
+    secp256k1_pubkey tw_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka_spk.cache, tweak)) {
+        free(f); return 0;
+    }
+    secp256k1_xonly_pubkey tw_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw_pk)) {
+        free(f); return 0;
+    }
+    build_p2tr_script_pubkey(fund_spk, &tw_xonly);
+    unsigned char tw_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &tw_xonly)) {
+        free(f); return 0;
+    }
+    char fund_addr[128];
+    if (!regtest_derive_p2tr_address(rt, tw_ser, fund_addr, sizeof(fund_addr))) {
+        free(f); return 0;
+    }
+    if (!regtest_fund_address(rt, fund_addr, 0.005, fund_txid)) { free(f); return 0; }
+    regtest_mine_blocks(rt, 1, mine_addr);
+    fund_vout = UINT32_MAX;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t amt = 0;
+        unsigned char spk[64];
+        size_t spk_len = 0;
+        if (regtest_get_tx_output(rt, fund_txid, v, &amt, spk, &spk_len) &&
+            spk_len == 34 && memcmp(spk, fund_spk, 34) == 0) {
+            fund_vout = v;
+            fund_amount = amt;
+            break;
+        }
+    }
+    if (fund_vout == UINT32_MAX) { free(f); return 0; }
+
+    unsigned char txid_bytes[32];
+    if (!hex_decode(fund_txid, txid_bytes, 32)) { free(f); return 0; }
+    reverse_bytes(txid_bytes, 32);
+    factory_init(f, ctx, kps, N, 2, 4);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);  /* k=2 → 1 leaf with 2 sub-factories */
+    factory_set_funding(f, txid_bytes, fund_vout, fund_amount, fund_spk, 34);
+    if (!factory_build_tree(f)) { factory_free(f); free(f); return 0; }
+    if (!factory_sign_all(f))   { factory_free(f); free(f); return 0; }
+
+    /* k² shape: 1 root_kickoff + 1 leaf (NODE_STATE) + 2 sub-factories
+       (NODE_PS_SUBFACTORY) = 4 nodes total. */
+    TEST_ASSERT_EQ((int)f->n_nodes, 4, "k=2 N=4 → 4 nodes");
+    TEST_ASSERT_EQ((int)f->n_leaf_nodes, 1, "1 leaf");
+    size_t leaf_idx = f->leaf_node_indices[0];
+    TEST_ASSERT_EQ((int)f->nodes[leaf_idx].n_subfactories, 2,
+                    "leaf has 2 sub-factories");
+    int sub0 = f->nodes[leaf_idx].subfactory_node_indices[0];
+    int sub1 = f->nodes[leaf_idx].subfactory_node_indices[1];
+    TEST_ASSERT(sub0 >= 0 && sub1 >= 0, "sub-factory indices populated");
+    TEST_ASSERT(f->nodes[sub0].type == NODE_PS_SUBFACTORY, "sub0 is NODE_PS_SUBFACTORY");
+    TEST_ASSERT(f->nodes[sub1].type == NODE_PS_SUBFACTORY, "sub1 is NODE_PS_SUBFACTORY");
+
+    printf("  [k=2 N=4 PS] factory funded: %s:%u  %llu sats  4 nodes "
+           "(root + leaf + 2 sub-factories)\n",
+           fund_txid, fund_vout, (unsigned long long)fund_amount);
+
+    /* Broadcast each signed node in order; mine BIP-68 wait blocks
+       between parent and child (sub-factory nodes have nSequence =
+       0xFFFFFFFE so no wait needed for them). */
+    char txids[FACTORY_MAX_NODES][65];
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *nd = &f->nodes[i];
+        if (!nd->is_signed || nd->signed_tx.len == 0) {
+            fprintf(stderr, "  [k=2] node %zu not signed\n", i);
+            factory_free(f); free(f); return 0;
+        }
+        char *tx_hex = malloc(nd->signed_tx.len * 2 + 1);
+        if (!tx_hex) { factory_free(f); free(f); return 0; }
+        hex_encode(nd->signed_tx.data, nd->signed_tx.len, tx_hex);
+        int ok = regtest_send_raw_tx(rt, tx_hex, txids[i]);
+        free(tx_hex);
+        if (!ok) {
+            fprintf(stderr, "  [k=2] node %zu broadcast failed (nseq=0x%X)\n",
+                    i, nd->nsequence);
+            factory_free(f); free(f); return 0;
+        }
+        printf("    node[%zu] (%s) broadcast: %.16s...\n", i,
+                nd->type == NODE_KICKOFF ? "kickoff" :
+                nd->type == NODE_STATE ? "state/leaf" : "sub-factory",
+                txids[i]);
+        int blocks_to_mine = 1;
+        if (i + 1 < f->n_nodes) {
+            uint32_t child_nseq = f->nodes[i + 1].nsequence;
+            if (!(child_nseq & 0x80000000u))
+                blocks_to_mine = (int)(child_nseq & 0xFFFF) + 1;
+        }
+        regtest_mine_blocks(rt, blocks_to_mine, mine_addr);
+    }
+
+    /* Verify: leaf and both sub-factories confirmed on-chain. */
+    int leaf_conf = regtest_get_confirmations(rt, txids[leaf_idx]);
+    int sub0_conf = regtest_get_confirmations(rt, txids[sub0]);
+    int sub1_conf = regtest_get_confirmations(rt, txids[sub1]);
+    TEST_ASSERT(leaf_conf >= 1, "leaf TX confirmed");
+    TEST_ASSERT(sub0_conf >= 1, "sub-factory 0 TX confirmed");
+    TEST_ASSERT(sub1_conf >= 1, "sub-factory 1 TX confirmed");
+
+    printf("  [k=2 N=4 PS] PASS — leaf (%d confs), sub0 (%d confs), "
+           "sub1 (%d confs) all on chain\n",
+           leaf_conf, sub0_conf, sub1_conf);
+
+    factory_free(f); free(f);
+    return 1;
+}
+
+int test_regtest_k2_ps_subfactory_force_close(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "k2_ps_subfactory_fc");
+    rt.scan_depth = 200;
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    int ok = run_k2_ps_subfactory_force_close(&rt, ctx, mine_addr);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
 int test_regtest_full_tree_force_close_all_arities(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
