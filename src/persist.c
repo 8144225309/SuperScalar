@@ -832,6 +832,32 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v21 migration: PS sub-factory chain entries (k² shape).
+       Each PS leaf can host k sub-factories, each of k client channels. The
+       sub-factory is itself a chained sequence (sales-stock model) where each
+       row carries per-channel amounts plus the trailing sales-stock amount.
+       channel_amounts_csv: comma-separated decimal sat amounts for each child
+       channel vout (parsed at load time).
+       Separate from ps_leaf_chains because:
+         - sub-factories have N+1 outputs (N channels + sales-stock), not 1
+         - per-channel amounts must persist exactly to drive correct sweep
+         - decoupled schema lets future sub-factory metadata grow without
+           touching the (stable, audited) ps_leaf_chains layout. */
+    if (db_version < 21) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS ps_subfactory_chains ("
+            "  factory_id INTEGER NOT NULL,"
+            "  sub_node_idx INTEGER NOT NULL,"
+            "  chain_pos INTEGER NOT NULL,"
+            "  txid TEXT NOT NULL,"
+            "  signed_tx_hex TEXT NOT NULL,"
+            "  sales_stock_amount_sats INTEGER NOT NULL,"
+            "  channel_amounts_csv TEXT NOT NULL,"
+            "  PRIMARY KEY (factory_id, sub_node_idx, chain_pos)"
+            ");",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1108,6 +1134,127 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
     return count;
 }
 
+/* --- PS sub-factory chain persistence (v21, k² shape) --- */
+
+int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
+                                          uint32_t sub_node_idx, int chain_pos,
+                                          const unsigned char *txid_display,
+                                          const unsigned char *signed_tx, size_t signed_tx_len,
+                                          uint64_t sales_stock_amount_sats,
+                                          const uint64_t *channel_amounts, int n_channels)
+{
+    if (!p || !p->db || !channel_amounts || n_channels <= 0 || n_channels > 16) return 0;
+
+    char txid_hex[65];
+    hex_encode(txid_display, 32, txid_hex);
+
+    size_t hex_len = signed_tx_len * 2 + 1;
+    char *tx_hex = malloc(hex_len);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    /* Build CSV: "amt0,amt1,...,amtN-1" — max 16 entries × 21 chars/u64 + commas + NUL. */
+    char csv[16 * 22 + 1];
+    int off = 0;
+    for (int i = 0; i < n_channels; i++) {
+        int n = snprintf(csv + off, sizeof(csv) - off, "%s%llu",
+                         i ? "," : "", (unsigned long long)channel_amounts[i]);
+        if (n < 0 || (size_t)(off + n) >= sizeof(csv)) { free(tx_hex); return 0; }
+        off += n;
+    }
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO ps_subfactory_chains "
+        "(factory_id, sub_node_idx, chain_pos, txid, signed_tx_hex, "
+        " sales_stock_amount_sats, channel_amounts_csv) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(tx_hex);
+        return 0;
+    }
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)sub_node_idx);
+    sqlite3_bind_int(stmt, 3, chain_pos);
+    sqlite3_bind_text(stmt, 4, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, tx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)sales_stock_amount_sats);
+    sqlite3_bind_text(stmt, 7, csv, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t sub_node_idx,
+                                    tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
+                                    uint64_t *sales_stock_out,
+                                    uint64_t (*channel_amounts_out)[16],
+                                    int *n_channels_out, int max_chain)
+{
+    if (!p || !p->db || !chain_txs_out || !txids_out || !sales_stock_out ||
+        !channel_amounts_out || !n_channels_out || max_chain <= 0)
+        return 0;
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT chain_pos, txid, signed_tx_hex, sales_stock_amount_sats, channel_amounts_csv "
+        "FROM ps_subfactory_chains "
+        "WHERE factory_id=? AND sub_node_idx=? ORDER BY chain_pos ASC;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)sub_node_idx);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_chain) {
+        int pos = sqlite3_column_int(stmt, 0);
+        if (pos != count) break;  /* gap → corrupt */
+
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *tx_hex   = (const char *)sqlite3_column_text(stmt, 2);
+        if (!txid_hex || !tx_hex) break;
+
+        unsigned char txid_display[32];
+        if (!hex_decode(txid_hex, txid_display, 32)) break;
+        memcpy(txids_out[count], txid_display, 32);
+        reverse_bytes(txids_out[count], 32);
+
+        size_t tx_hex_len = strlen(tx_hex);
+        size_t tx_len = tx_hex_len / 2;
+        tx_buf_init(&chain_txs_out[count], (int)tx_len);
+        if (!hex_decode(tx_hex, chain_txs_out[count].data, tx_len)) {
+            tx_buf_free(&chain_txs_out[count]);
+            break;
+        }
+        chain_txs_out[count].len = tx_len;
+
+        sales_stock_out[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
+
+        const char *csv = (const char *)sqlite3_column_text(stmt, 4);
+        if (!csv) {
+            tx_buf_free(&chain_txs_out[count]);
+            break;
+        }
+        /* Parse CSV → channel_amounts_out[count][...]; cap at 16. */
+        int nc = 0;
+        const char *q = csv;
+        while (*q && nc < 16) {
+            char *end = NULL;
+            unsigned long long v = strtoull(q, &end, 10);
+            if (end == q) break;
+            channel_amounts_out[count][nc++] = (uint64_t)v;
+            q = end;
+            if (*q == ',') q++;
+        }
+        n_channels_out[count] = nc;
+
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 /* --- Client-side PS double-spend defense (v20) --- */
 
 int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
@@ -1350,14 +1497,26 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
        factory_build_tree produces chain[0] (unsigned). If any advances were
        persisted, replay them so ps_chain_len / ps_prev_txid / signed_tx are
        current. Without this a restart would try to spend the already-spent
-       chain[0] output on the next advance. */
+       chain[0] output on the next advance.
+
+       For k² sub-factory shape (ps_subfactory_arity > 1): each PS leaf hosts
+       k sub-factory children whose state lives in the v21 ps_subfactory_chains
+       table. After restoring leaf-level state we also walk subfactory_node_indices[]
+       and restore each sub-factory's chain — preserving per-channel amounts so
+       force-close / sweep can target the correct outputs after a restart. */
     if (leaf_arity == FACTORY_ARITY_PS) {
         #define PS_RESTORE_MAX 4096
         tx_buf_t       *chain_txs  = calloc(PS_RESTORE_MAX, sizeof(tx_buf_t));
         unsigned char (*chain_ids)[32] = calloc(PS_RESTORE_MAX, 32);
         uint64_t       *chain_amts = calloc(PS_RESTORE_MAX, sizeof(uint64_t));
+        /* Sub-factory load buffers: per-entry trailing sales-stock + per-channel
+           amounts (cap 16 channels per sub-factory, matches FACTORY_MAX_OUTPUTS). */
+        uint64_t       *sub_sstock  = calloc(PS_RESTORE_MAX, sizeof(uint64_t));
+        uint64_t      (*sub_chans)[16] = calloc(PS_RESTORE_MAX, sizeof(uint64_t[16]));
+        int            *sub_n_chans = calloc(PS_RESTORE_MAX, sizeof(int));
 
-        if (chain_txs && chain_ids && chain_amts) {
+        if (chain_txs && chain_ids && chain_amts &&
+            sub_sstock && sub_chans && sub_n_chans) {
             for (int li = 0; li < f->n_leaf_nodes; li++) {
                 size_t node_idx = f->leaf_node_indices[li];
                 factory_node_t *node = &f->nodes[node_idx];
@@ -1367,46 +1526,110 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                     (uint32_t)node_idx, chain_txs, chain_ids, chain_amts,
                     PS_RESTORE_MAX);
 
-                if (count <= 0) continue;
+                if (count > 0) {
+                    /* chain[0] txid is node->txid as set by factory_build_tree
+                       (segwit txid excludes witness, so unsigned == signed txid). */
+                    unsigned char chain0_txid[32];
+                    memcpy(chain0_txid, node->txid, 32);
+                    uint64_t chain0_amount = node->outputs[0].amount_sats;
 
-                /* chain[0] txid is node->txid as set by factory_build_tree
-                   (segwit txid excludes witness, so unsigned == signed txid). */
-                unsigned char chain0_txid[32];
-                memcpy(chain0_txid, node->txid, 32);
-                uint64_t chain0_amount = node->outputs[0].amount_sats;
+                    node->ps_chain_len = count;
+                    node->n_outputs    = 1;
 
-                node->ps_chain_len = count;
-                node->n_outputs    = 1;
+                    if (count == 1) {
+                        memcpy(node->ps_prev_txid, chain0_txid, 32);
+                        node->ps_prev_chan_amount = chain0_amount;
+                    } else {
+                        memcpy(node->ps_prev_txid, chain_ids[count - 2], 32);
+                        node->ps_prev_chan_amount = chain_amts[count - 2];
+                    }
 
-                if (count == 1) {
-                    memcpy(node->ps_prev_txid, chain0_txid, 32);
-                    node->ps_prev_chan_amount = chain0_amount;
-                } else {
-                    memcpy(node->ps_prev_txid, chain_ids[count - 2], 32);
-                    node->ps_prev_chan_amount = chain_amts[count - 2];
+                    memcpy(node->txid, chain_ids[count - 1], 32);
+                    node->outputs[0].amount_sats = chain_amts[count - 1];
+
+                    /* Restore latest signed TX */
+                    tx_buf_free(&node->signed_tx);
+                    tx_buf_t *last = &chain_txs[count - 1];
+                    tx_buf_init(&node->signed_tx, (int)last->len);
+                    memcpy(node->signed_tx.data, last->data, last->len);
+                    node->signed_tx.len = last->len;
+                    node->is_signed = 1;
+
+                    for (int j = 0; j < count; j++) tx_buf_free(&chain_txs[j]);
+
+                    printf("persist: PS leaf %d restored to chain_len=%d "
+                           "(%lu sats)\n", li, count,
+                           (unsigned long)node->outputs[0].amount_sats);
                 }
 
-                memcpy(node->txid, chain_ids[count - 1], 32);
-                node->outputs[0].amount_sats = chain_amts[count - 1];
+                /* Sub-factory recovery (k² shape, v21).
+                   Walk the leaf's subfactory_node_indices[] and restore each
+                   sub-factory's chain.  Each entry restores the sub-factory's
+                   per-channel amounts + sales-stock + signed_tx + ps_prev_*
+                   linkage.  Without per-channel amounts, post-restart sweep
+                   would not know how to attribute outputs to clients. */
+                for (int si = 0; si < node->n_subfactories; si++) {
+                    int sub_node_i = node->subfactory_node_indices[si];
+                    if (sub_node_i < 0 || (size_t)sub_node_i >= f->n_nodes) continue;
+                    factory_node_t *sub = &f->nodes[sub_node_i];
 
-                /* Restore latest signed TX */
-                tx_buf_free(&node->signed_tx);
-                tx_buf_t *last = &chain_txs[count - 1];
-                tx_buf_init(&node->signed_tx, (int)last->len);
-                memcpy(node->signed_tx.data, last->data, last->len);
-                node->signed_tx.len = last->len;
-                node->is_signed = 1;
+                    int sub_count = persist_load_subfactory_chain(p, factory_id,
+                        (uint32_t)sub_node_i,
+                        chain_txs, chain_ids, sub_sstock, sub_chans, sub_n_chans,
+                        PS_RESTORE_MAX);
+                    if (sub_count <= 0) continue;
 
-                for (int j = 0; j < count; j++) tx_buf_free(&chain_txs[j]);
+                    /* Linkage parents (chain[0] is the sub's existing
+                       node->txid built by factory_build_tree). */
+                    unsigned char sub_chain0_txid[32];
+                    memcpy(sub_chain0_txid, sub->txid, 32);
 
-                printf("persist: PS leaf %d restored to chain_len=%d "
-                       "(%lu sats)\n", li, count,
-                       (unsigned long)node->outputs[0].amount_sats);
+                    sub->ps_chain_len = sub_count;
+
+                    /* Per-output amounts: n channels + 1 sales-stock vout. */
+                    int last = sub_count - 1;
+                    int nc = sub_n_chans[last];
+                    if (nc < 0) nc = 0;
+                    if (nc > FACTORY_MAX_OUTPUTS - 1) nc = FACTORY_MAX_OUTPUTS - 1;
+                    sub->n_outputs = (size_t)(nc + 1);
+                    for (int ci = 0; ci < nc; ci++)
+                        sub->outputs[ci].amount_sats = sub_chans[last][ci];
+                    sub->outputs[nc].amount_sats = sub_sstock[last];
+
+                    /* ps_prev_* tracks the sales-stock UTXO being spent by the
+                       latest chain TX (mirrors lsp_subfactory_chain_advance). */
+                    if (sub_count == 1) {
+                        memcpy(sub->ps_prev_txid, sub_chain0_txid, 32);
+                        sub->ps_prev_chan_amount = sub->outputs[nc].amount_sats;
+                    } else {
+                        memcpy(sub->ps_prev_txid, chain_ids[last - 1], 32);
+                        sub->ps_prev_chan_amount = sub_sstock[last - 1];
+                    }
+
+                    memcpy(sub->txid, chain_ids[last], 32);
+
+                    tx_buf_free(&sub->signed_tx);
+                    tx_buf_t *latest = &chain_txs[last];
+                    tx_buf_init(&sub->signed_tx, (int)latest->len);
+                    memcpy(sub->signed_tx.data, latest->data, latest->len);
+                    sub->signed_tx.len = latest->len;
+                    sub->is_signed = 1;
+
+                    for (int j = 0; j < sub_count; j++) tx_buf_free(&chain_txs[j]);
+
+                    printf("persist: PS sub-factory leaf=%d sub=%d restored to "
+                           "chain_len=%d (sales-stock %lu sats, %d channels)\n",
+                           li, si, sub_count,
+                           (unsigned long)sub->outputs[nc].amount_sats, nc);
+                }
             }
         }
         free(chain_txs);
         free(chain_ids);
         free(chain_amts);
+        free(sub_sstock);
+        free(sub_chans);
+        free(sub_n_chans);
         #undef PS_RESTORE_MAX
     }
 
