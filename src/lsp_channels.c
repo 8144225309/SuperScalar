@@ -57,6 +57,37 @@ static int verify_revocation_secret(const secp256k1_context *ctx,
     return memcmp(d_ser, s_ser, 33) == 0;
 }
 
+/* Detect single-process mode: returns 1 only when f->keypairs[i] holds a
+   real seckey for every signer in `node` (LSP + every non-LSP signer).
+   In multi-process mode the LSP only owns its own keypair (slot 0); the
+   client keypairs are zero-filled and `factory_sign_l_stock_poison_tx`
+   would crash inside libsecp256k1 with "illegal argument".
+
+   This guard exists because the L-stock poison TX builder is a
+   single-process primitive — it requires every leaf signer's seckey
+   locally.  Multi-process LSPs must fall back to NULL poison_tx
+   (graceful degradation) until the wire-ceremony equivalent that
+   gathers per-client partial sigs over MuSig2 lands.  Tracked in
+   .claude/CANONICAL_DESIGN_GAPS.md (Gap A follow-up).  This is a
+   SECURITY GAP for multi-process deployments — the watchtower can
+   detect breaches but cannot redistribute L-stock to clients. */
+static int lsp_have_all_signer_keypairs(const secp256k1_context *ctx,
+                                          const factory_t *f,
+                                          const factory_node_t *node) {
+    if (!ctx || !f || !node) return 0;
+    for (size_t si = 0; si < node->n_signers; si++) {
+        uint32_t pidx = node->signer_indices[si];
+        if (pidx >= f->n_participants) return 0;
+        unsigned char tmp[32];
+        if (!secp256k1_keypair_sec(ctx, tmp, &f->keypairs[pidx])) return 0;
+        int all_zero = 1;
+        for (int b = 0; b < 32; b++) if (tmp[b]) { all_zero = 0; break; }
+        memset(tmp, 0, 32);
+        if (all_zero) return 0;
+    }
+    return 1;
+}
+
 /* Send the LSP's own revocation secret to a client after each commitment update.
    This enables bidirectional revocation so clients can detect LSP breaches.
    old_cn: the commitment number whose secret is being revealed. */
@@ -1618,7 +1649,19 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         uint32_t old_epoch = f->counter.current_epoch > 0
                            ? f->counter.current_epoch - 1 : 0;
         int burn_ok = 0;
-        if (old_n_outputs >= 2) {
+        /* Multi-process guard: factory_build_burn_tx wraps
+           factory_sign_l_stock_poison_tx which crashes in libsecp256k1
+           if any leaf signer's seckey is missing.  Same SECURITY GAP
+           as the sub-factory poison TX path. */
+        int have_leaf_seckeys =
+            lsp_have_all_signer_keypairs(lsp->ctx, f, leaf_node);
+        if (!have_leaf_seckeys)
+            fprintf(stderr,
+                    "LSP advance leaf: multi-process mode — skipping "
+                    "L-stock poison TX (SECURITY GAP: clients cannot "
+                    "recover L-stock on breach without wire-ceremony "
+                    "poison TX)\n");
+        if (have_leaf_seckeys && old_n_outputs >= 2) {
             size_t l_vout = (size_t)(old_n_outputs - 1);
             burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
                 old_leaf_txid, (uint32_t)l_vout,
@@ -2023,9 +2066,18 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             tx_buf_init(&burn_tx, 256);
             uint32_t old_epoch = (new_epoch > 0) ? new_epoch - 1 : 0;
             size_t l_vout = (size_t)(leaf_pre[lp].old_n_outputs - 1);
-            int burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
-                leaf_pre[lp].old_txid, (uint32_t)l_vout,
-                leaf_pre[lp].old_l_amount, old_epoch);
+            /* Multi-process guard — see lsp_have_all_signer_keypairs. */
+            int burn_ok = 0;
+            if (lsp_have_all_signer_keypairs(lsp->ctx, f, leaf_node)) {
+                burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
+                    leaf_pre[lp].old_txid, (uint32_t)l_vout,
+                    leaf_pre[lp].old_l_amount, old_epoch);
+            } else {
+                fprintf(stderr,
+                        "LSP rotation: multi-process mode — skipping "
+                        "L-stock poison TX for leaf %zu (SECURITY GAP)\n",
+                        ni);
+            }
 
             uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
             size_t n_leaf_ch = 0;
@@ -2628,30 +2680,18 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         const uint64_t POISON_FEE_SATS = 1000;  /* matches PS leaf default */
         int poison_ok = 0;
 
-        /* factory_sign_l_stock_poison_tx is a single-process primitive —
-           it requires f->keypairs[i] to hold every sub-factory signer's
-           seckey, which is only true when the LSP also owns the client
-           keys (unit tests, --demo single-process LSP).  In a real
-           multi-process LSP the clients hold their own keys and we'd
-           crash inside libsecp256k1 with "illegal argument".  Detect
-           multi-process by checking whether each non-LSP signer's
-           keypair has a non-zero seckey; if any are zero, skip the
-           poison build and register the watchtower with NULL poison_tx
-           (graceful degradation — the wire-ceremony equivalent that
-           gathers per-client partial sigs is the proper long-term fix,
-           tracked in CANONICAL_DESIGN_GAPS.md). */
-        int have_all_seckeys = 1;
-        for (size_t si = 1; si < sub->n_signers; si++) {
-            uint32_t pidx = sub->signer_indices[si];
-            unsigned char tmp[32];
-            if (!secp256k1_keypair_sec(lsp->ctx, tmp, &f->keypairs[pidx])) {
-                have_all_seckeys = 0;
-                break;
-            }
-            int all_zero = 1;
-            for (int b = 0; b < 32; b++) if (tmp[b]) { all_zero = 0; break; }
-            memset(tmp, 0, 32);
-            if (all_zero) { have_all_seckeys = 0; break; }
+        /* See lsp_have_all_signer_keypairs comment: skip poison TX in
+           multi-process mode (graceful degradation, NULL poison_tx
+           registered with watchtower).  This is a SECURITY GAP — the
+           watchtower can still detect breach via response_tx broadcast
+           but cannot redistribute the sales-stock to clients.  Tracked
+           in CANONICAL_DESIGN_GAPS.md (Gap A follow-up). */
+        int have_all_seckeys = lsp_have_all_signer_keypairs(lsp->ctx, f, sub);
+        if (!have_all_seckeys) {
+            fprintf(stderr,
+                    "LSP subfactory advance: multi-process mode — skipping "
+                    "poison TX (SECURITY GAP: client cannot recover "
+                    "sales-stock on breach without wire-ceremony poison TX)\n");
         }
 
         if (have_all_seckeys &&

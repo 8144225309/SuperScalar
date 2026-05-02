@@ -8,6 +8,8 @@
 
 > v0.1.12 — 30/30 signet exhibition tests passed (S1–S30). Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, rotation conservation fix. 1363 unit tests, 42 regtest integration tests.
 
+> ⚠️ **Production readiness — multi-process LSPs**: real-deployment LSPs (with clients running as separate processes) currently lack the wire-ceremony poison TX defense.  The watchtower can detect breaches and broadcast the latest signed state TX, but cannot redistribute L-stock / sales-stock to clients on cheating — that defense was implemented as a single-process primitive (PR #121) and the multi-process MuSig2 ceremony equivalent is not yet wired.  See [`docs/poison-tx.md`](docs/poison-tx.md) "SECURITY-CRITICAL: multi-process production gap" for details.  Single-process / signet self-tests / `--demo` deployments have full poison TX protection and are unaffected.  Mainnet multi-process LSPs should wait for the wire-ceremony poison TX to land.
+
 Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
 A Bitcoin channel factory protocol combining:

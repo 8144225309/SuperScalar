@@ -221,17 +221,45 @@ This change affects only **future** factories:
   unchanged.  Only the L-stock SPK and the burn-vs-poison TX semantics
   changed.
 
+## ⚠️ SECURITY-CRITICAL: multi-process production gap
+
+**`factory_sign_l_stock_poison_tx` is a single-process primitive.**  It
+requires `f->keypairs[i]` to hold every leaf signer's seckey, which is
+true ONLY in unit tests / single-process `--demo` LSPs where one
+process owns all the keys.
+
+**In multi-process production (real LSP + separate client processes):**
+- Each client's seckey lives in their own process — the LSP does NOT
+  have them.
+- Calling the poison TX builder would crash inside libsecp256k1 with
+  "illegal argument" (PR #135 added a `lsp_have_all_signer_keypairs`
+  guard that detects this and skips the build, registering the
+  watchtower with `NULL` poison_tx as graceful degradation).
+- Result: the watchtower can still detect a stale leaf / sub-factory
+  state confirming on chain and broadcast the latest signed state TX
+  (response_tx), but the L-stock or sales-stock UTXO of the stale state
+  is NOT redistributed to clients.  After CSV (default 144 blocks ≈ 1
+  day on mainnet) the LSP can unilaterally drain it via the script-path.
+
+**This breaks the t/1242 economic security argument** — without poison
+TX defense, an LSP that broadcasts a stale state can recover L-stock
+value after a CSV delay.  If the stale state had a more LSP-favorable
+distribution than the latest state, cheating becomes profitable.
+
+**Operators must NOT deploy multi-process LSPs to mainnet until the
+wire-ceremony poison TX is implemented.** Single-process / signet
+self-tests / demo deployments are unaffected (the in-process key
+availability path is exercised end-to-end by unit tests).
+
 ## What's deferred to a follow-up PR
 
-This PR ships the **single-process** poison TX flow:
-`factory_sign_l_stock_poison_tx` requires `f->keypairs[]` to hold the
-seckey for every leaf signer.  That's what the watchtower / unit-test
-builders have.  In the multi-process wire ceremony (LSP + clients on
-separate machines), each client's seckey isn't available to the LSP, so
-the LSP must coordinate a split-round MuSig2 round to gather partial
-sigs from each client.  That wire-ceremony co-signing is a follow-up:
-it'll extend the existing leaf-state-advance ceremony to also produce
-the poison TX signature alongside the new state TX.
+This PR ships the **single-process** poison TX flow only.  The
+wire-ceremony equivalent must coordinate a split-round MuSig2 round
+across all leaf signers (LSP + clients in separate processes) to
+gather partial sigs from each client over the poison TX sighash, then
+aggregate.  This is the same shape as the existing state-advance
+ceremony — a second round on a different sighash.  Estimated 2-3 days
+of plumbing (no crypto redesign).
 
 The single-process flow shipped here is sufficient for:
 - Unit testing of the new SPK + TX shape
@@ -239,5 +267,5 @@ The single-process flow shipped here is sufficient for:
   all keys (test fixtures, signet self-tests)
 - The `factory_build_burn_tx` shim that the watchtower call site uses
 
-The wire-ceremony version is tracked in
-`.claude/CANONICAL_DESIGN_GAPS.md` (Gap A follow-up).
+**Tracked in `.claude/CANONICAL_DESIGN_GAPS.md` Gap A (status:
+SECURITY-CRITICAL, BLOCKS PRODUCTION).**
