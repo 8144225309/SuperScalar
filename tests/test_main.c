@@ -1164,6 +1164,8 @@ extern int test_regtest_lsp_restart_recovery(void);
 extern int test_persist_open_close(void);
 extern int test_persist_ps_subfactory_chain_round_trip(void);
 extern int test_persist_ps_subfactory_chain_v21_round_trip(void);
+extern int test_persist_ps_leaf_chain_v22_poison_round_trip(void);
+extern int test_persist_ps_subfactory_chain_v22_poison_round_trip(void);
 extern int test_persist_channel_round_trip(void);
 extern int test_persist_revocation_round_trip(void);
 extern int test_persist_watchtower_hydrate_round_trip(void);
@@ -2956,6 +2958,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_open_close);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);
+    RUN_TEST(test_persist_ps_leaf_chain_v22_poison_round_trip);
+    RUN_TEST(test_persist_ps_subfactory_chain_v22_poison_round_trip);
     RUN_TEST(test_persist_channel_round_trip);
     RUN_TEST(test_persist_revocation_round_trip);
     RUN_TEST(test_persist_watchtower_hydrate_round_trip);

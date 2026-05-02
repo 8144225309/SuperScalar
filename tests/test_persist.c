@@ -85,13 +85,15 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
         memset(signed_txs[i], 0xB0 + i, signed_tx_lens[i]);
     }
 
-    /* Save chain[0..2] */
+    /* Save chain[0..2] (no poison TX in this older test — that case is
+       covered by the dedicated v22 round-trip below). */
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(persist_save_ps_chain_entry(
                         &db, factory_id, sub_node_idx, i,
                         txids[i],
                         signed_txs[i], signed_tx_lens[i],
-                        sstock_amounts[i]),
+                        sstock_amounts[i],
+                        /* poison_tx */ NULL, 0),
                     "save sub-factory chain entry");
     }
 
@@ -105,7 +107,8 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
     uint64_t loaded_amounts[3];
     int n_loaded = persist_load_ps_chain(&db, factory_id, sub_node_idx,
                                             loaded_txs, loaded_txids,
-                                            loaded_amounts, 3);
+                                            loaded_amounts,
+                                            /* poison_txs_out */ NULL, 3);
 
     int ok = 1;
     if (n_loaded != 3) {
@@ -188,7 +191,8 @@ int test_persist_ps_subfactory_chain_v21_round_trip(void) {
                         txids[i],
                         signed_txs[i], signed_tx_lens[i],
                         sstock_amounts[i],
-                        channel_amounts[i], n_channels[i]),
+                        channel_amounts[i], n_channels[i],
+                        /* poison_tx */ NULL, 0),
                     "save v21 sub-factory entry");
     }
 
@@ -202,7 +206,8 @@ int test_persist_ps_subfactory_chain_v21_round_trip(void) {
     int n_loaded = persist_load_subfactory_chain(&db, factory_id, sub_node_idx,
                                                     loaded_txs, loaded_txids,
                                                     loaded_sstock, loaded_channels,
-                                                    loaded_n_channels, 3);
+                                                    loaded_n_channels,
+                                                    /* poison_txs_out */ NULL, 3);
 
     int ok = 1;
     if (n_loaded != 3) {
@@ -249,6 +254,151 @@ int test_persist_ps_subfactory_chain_v21_round_trip(void) {
 
     for (int i = 0; i < n_loaded && i < 3; i++)
         tx_buf_free(&loaded_txs[i]);
+
+    persist_close(&db);
+    return ok;
+}
+
+/* ---- v22: PS leaf + sub-factory chain entry round-trip with poison TX ----
+
+   Verifies the poison_tx_hex column added in PR-B persists end-to-end.
+   Mixes presence/absence of poison TX across entries to confirm NULL
+   handling works (chain[0] typically has no poison; degraded ceremonies
+   may also produce NULL poison even on later entries). */
+int test_persist_ps_leaf_chain_v22_poison_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t factory_id = 0;
+    const uint32_t leaf_node_idx = 7;
+
+    /* 3 entries: entry 0 has no poison (initial state), entries 1+2 have
+       poison TXs of distinct lengths to catch off-by-one decode bugs. */
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][32];
+    unsigned char poison_txs[3][96];
+    size_t poison_lens[3] = { 0, 50, 80 };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0xE0 + i, 32);
+        memset(signed_txs[i], 0xF0 + i, 32);
+        if (poison_lens[i] > 0)
+            memset(poison_txs[i], 0x70 + i, poison_lens[i]);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(persist_save_ps_chain_entry(
+                        &db, factory_id, leaf_node_idx, i,
+                        txids[i],
+                        signed_txs[i], 32,
+                        100000 - (uint64_t)i * 1000,
+                        poison_lens[i] > 0 ? poison_txs[i] : NULL,
+                        poison_lens[i]),
+                    "save v22 ps leaf entry with poison");
+    }
+
+    tx_buf_t loaded_txs[3]     = {0};
+    tx_buf_t loaded_poisons[3] = {0};
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_amounts[3];
+    int n_loaded = persist_load_ps_chain(&db, factory_id, leaf_node_idx,
+                                            loaded_txs, loaded_txids,
+                                            loaded_amounts,
+                                            loaded_poisons, 3);
+
+    int ok = (n_loaded == 3);
+    if (!ok) printf("  FAIL: v22 leaf n_loaded=%d expected 3\n", n_loaded);
+    for (int i = 0; ok && i < 3; i++) {
+        if (loaded_poisons[i].len != poison_lens[i]) {
+            printf("  FAIL: v22 leaf chain[%d] poison_len %zu != %zu\n",
+                   i, loaded_poisons[i].len, poison_lens[i]);
+            ok = 0;
+        } else if (poison_lens[i] > 0 &&
+                   memcmp(loaded_poisons[i].data, poison_txs[i],
+                          poison_lens[i]) != 0) {
+            printf("  FAIL: v22 leaf chain[%d] poison bytes mismatch\n", i);
+            ok = 0;
+        }
+    }
+
+    for (int i = 0; i < n_loaded && i < 3; i++) {
+        tx_buf_free(&loaded_txs[i]);
+        tx_buf_free(&loaded_poisons[i]);
+    }
+
+    persist_close(&db);
+    return ok;
+}
+
+int test_persist_ps_subfactory_chain_v22_poison_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t factory_id = 0;
+    const uint32_t sub_node_idx = 41;
+
+    /* 3 entries: mix of poison_tx presence + sizes. */
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][64];
+    unsigned char poison_txs[3][120];
+    size_t signed_tx_lens[3] = { 32, 48, 64 };
+    size_t poison_lens[3] = { 60, 0, 100 };
+    uint64_t sstock_amounts[3] = { 80000, 70000, 60000 };
+    int n_channels[3] = { 2, 3, 4 };
+    uint64_t channel_amounts[3][16] = {
+        { 30000, 20000 },
+        { 25000, 25000, 20000 },
+        { 15000, 15000, 15000, 15000 },
+    };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0x10 + i, 32);
+        memset(signed_txs[i], 0x20 + i, signed_tx_lens[i]);
+        if (poison_lens[i] > 0)
+            memset(poison_txs[i], 0x80 + i, poison_lens[i]);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(persist_save_subfactory_chain_entry(
+                        &db, factory_id, sub_node_idx, i,
+                        txids[i],
+                        signed_txs[i], signed_tx_lens[i],
+                        sstock_amounts[i],
+                        channel_amounts[i], n_channels[i],
+                        poison_lens[i] > 0 ? poison_txs[i] : NULL,
+                        poison_lens[i]),
+                    "save v22 sub-factory entry with poison");
+    }
+
+    tx_buf_t loaded_txs[3]     = {0};
+    tx_buf_t loaded_poisons[3] = {0};
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_sstock[3];
+    uint64_t loaded_channels[3][16];
+    int loaded_n_channels[3];
+    int n_loaded = persist_load_subfactory_chain(&db, factory_id, sub_node_idx,
+                                                    loaded_txs, loaded_txids,
+                                                    loaded_sstock, loaded_channels,
+                                                    loaded_n_channels,
+                                                    loaded_poisons, 3);
+
+    int ok = (n_loaded == 3);
+    if (!ok) printf("  FAIL: v22 sub n_loaded=%d expected 3\n", n_loaded);
+    for (int i = 0; ok && i < 3; i++) {
+        if (loaded_poisons[i].len != poison_lens[i]) {
+            printf("  FAIL: v22 sub chain[%d] poison_len %zu != %zu\n",
+                   i, loaded_poisons[i].len, poison_lens[i]);
+            ok = 0;
+        } else if (poison_lens[i] > 0 &&
+                   memcmp(loaded_poisons[i].data, poison_txs[i],
+                          poison_lens[i]) != 0) {
+            printf("  FAIL: v22 sub chain[%d] poison bytes mismatch\n", i);
+            ok = 0;
+        }
+    }
+
+    for (int i = 0; i < n_loaded && i < 3; i++) {
+        tx_buf_free(&loaded_txs[i]);
+        tx_buf_free(&loaded_poisons[i]);
+    }
 
     persist_close(&db);
     return ok;
