@@ -1663,6 +1663,7 @@ extern int test_factory_config_default(void);
 extern int test_factory_ps_leaf_build(void);
 extern int test_factory_ps_subfactory_k2_n4(void);
 extern int test_factory_ps_subfactory_chain_extension(void);
+extern int test_factory_ps_subfactory_poison_tx_k2_n4(void);
 extern int test_factory_ps_leaf_build_n64(void);
 extern int test_factory_ps_build_n128(void);
 extern int test_factory_ps_leaf_advance(void);
@@ -3439,6 +3440,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_ps_leaf_build);
     RUN_TEST(test_factory_ps_subfactory_k2_n4);
     RUN_TEST(test_factory_ps_subfactory_chain_extension);
+    RUN_TEST(test_factory_ps_subfactory_poison_tx_k2_n4);
     RUN_TEST(test_factory_ps_leaf_build_n64);
     RUN_TEST(test_factory_ps_build_n128);
     RUN_TEST(test_factory_ps_leaf_advance);
