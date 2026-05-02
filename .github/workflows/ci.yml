@@ -235,6 +235,19 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           bash tools/test_multiprocess_subfactory_advance.sh build
+      # PR-C: end-to-end k² sub-factory breach detection.  Builds the
+      # factory, advances chain, LSP cheats by broadcasting stale
+      # chain[N-1], watchtower must detect + broadcast response_tx +
+      # poison_tx.  The 5-blocks-then-sleep pattern between cheat-
+      # broadcast and watchtower_check is intentional (see master plan).
+      - name: Multi-process k² sub-factory BREACH (under ASan+LSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_k2_subfactory_breach.sh build
       - name: Multi-process MuSig N=8 PS (under ASan+LSan)
         env:
           # verify_asan_link_order=0: harness wraps binaries with `stdbuf -oL`

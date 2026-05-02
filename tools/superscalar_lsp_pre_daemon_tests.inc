@@ -1178,6 +1178,19 @@
                     uint64_t ch0_before = sub0->outputs[0].amount_sats;
                     uint64_t sstock_before =
                         sub0->outputs[sub0->n_outputs - 1].amount_sats;
+
+                    /* Snapshot the pre-advance signed_tx so we can broadcast
+                       it post-advance as the "stale" chain[N-1] for the
+                       --cheat-subfactory breach test. */
+                    tx_buf_t cheat_stale_tx;
+                    tx_buf_init(&cheat_stale_tx, 0);
+                    if (cheat_subfactory_after_advance && sub0->is_signed &&
+                        sub0->signed_tx.len > 0) {
+                        tx_buf_init(&cheat_stale_tx, (int)sub0->signed_tx.len);
+                        memcpy(cheat_stale_tx.data,
+                               sub0->signed_tx.data, sub0->signed_tx.len);
+                        cheat_stale_tx.len = sub0->signed_tx.len;
+                    }
                     /* Pick delta well under sales-stock capacity.  At
                        funding=400k with k=2 N=4 the per-output budget
                        is ~44k after 3 fee rounds; 10k leaves comfortable
@@ -1223,6 +1236,141 @@
                                (unsigned long long)sub0->outputs[sub0->n_outputs - 1].amount_sats,
                                sub0->is_signed);
                     }
+
+                    /* === Sub-factory CHEATING + WATCHTOWER POISON ===
+
+                       The LSP "cheats" by broadcasting the now-stale
+                       chain[N-1] TX (snapshotted pre-advance).  For
+                       chain[N-1] to confirm, its parent vout (the leaf
+                       node's outputs[sub_idx]) must already be on-chain
+                       — so we first broadcast the path from the funding
+                       UTXO down through root + leaf (skipping
+                       sub-factory nodes themselves so chain[N] doesn't
+                       race chain[N-1]), then broadcast chain[N-1] as
+                       the cheat, mine a block, and run watchtower_check.
+                       The watchtower must:
+                         1. Detect chain[N-1] confirming (its watched txid)
+                         2. Broadcast the latest chain[N] (response_tx)
+                         3. Broadcast the pre-signed poison TX */
+                    if (sub_pass && cheat_subfactory_after_advance &&
+                        cheat_stale_tx.len > 0) {
+                        printf("\n--- CHEAT-SUBFACTORY: broadcasting parent path then stale chain[N-1] ---\n");
+                        fflush(stdout);
+                        if (!is_regtest) {
+                            printf("  SKIP: --cheat-subfactory requires regtest\n");
+                        } else if (!mgr->watchtower) {
+                            printf("  FAIL: no watchtower configured\n");
+                            sub_pass = 0;
+                        } else {
+                            /* Broadcast all non-sub-factory nodes (root,
+                               kickoff, leaf state).  This puts the
+                               sub-factory's parent UTXO on-chain so
+                               chain[N-1] can spend it. */
+                            int parent_ok = 1;
+                            for (size_t ni = 0;
+                                 ni < lsp_p->factory.n_nodes && parent_ok;
+                                 ni++) {
+                                factory_node_t *node =
+                                    &lsp_p->factory.nodes[ni];
+                                if (node->type == NODE_PS_SUBFACTORY) continue;
+                                if (!node->is_signed || node->signed_tx.len == 0)
+                                    continue;
+                                char *nh = malloc(node->signed_tx.len * 2 + 1);
+                                char tid[65] = {0};
+                                if (!nh) { parent_ok = 0; break; }
+                                hex_encode(node->signed_tx.data,
+                                           node->signed_tx.len, nh);
+                                int psent = regtest_send_raw_tx(&rt, nh, tid);
+                                if (g_db)
+                                    persist_log_broadcast(g_db,
+                                        psent ? tid : "?",
+                                        "cheat_subfactory_parent",
+                                        nh, psent ? "ok" : "failed");
+                                free(nh);
+                                if (!psent) {
+                                    printf("  WARN: parent node[%zu] broadcast "
+                                           "failed (may already be on chain)\n",
+                                           ni);
+                                } else {
+                                    printf("  parent node[%zu] broadcast: %s\n",
+                                           ni, tid);
+                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                }
+                            }
+
+                            char *cheat_hex =
+                                malloc(cheat_stale_tx.len * 2 + 1);
+                            char cheat_txid_str[65] = {0};
+                            int sent = 0;
+                            if (cheat_hex) {
+                                hex_encode(cheat_stale_tx.data,
+                                           cheat_stale_tx.len, cheat_hex);
+                                sent = regtest_send_raw_tx(&rt, cheat_hex,
+                                                           cheat_txid_str);
+                                if (g_db)
+                                    persist_log_broadcast(g_db,
+                                        sent ? cheat_txid_str : "?",
+                                        "cheat_subfactory_stale",
+                                        cheat_hex,
+                                        sent ? "ok" : "failed");
+                                free(cheat_hex);
+                            }
+                            if (!sent) {
+                                printf("  FAIL: stale chain[N-1] broadcast failed\n");
+                                sub_pass = 0;
+                            } else {
+                                printf("  Stale chain[N-1] broadcast: %s\n",
+                                       cheat_txid_str);
+                                /* Mine 5 blocks + sleep 2s before watchtower
+                                   check so chain[N-1] is solidly confirmed
+                                   (out of mempool, no race with chain[N]
+                                   that the watchtower will broadcast).  Per
+                                   the v0.1.15 master plan: 1 block was not
+                                   enough because bitcoind's mempool/wallet
+                                   reorg detection had transient state. */
+                                regtest_mine_blocks(&rt, 5, mine_addr);
+                                sleep(2);
+
+                                int detected =
+                                    watchtower_check(mgr->watchtower);
+
+                                /* Count entries that the check visited and
+                                   marked as broadcast (regardless of whether
+                                   the actual sendrawtransaction succeeded —
+                                   the printf "SUB-FACTORY BREACH on node X"
+                                   in src/watchtower.c fires before the
+                                   broadcast attempt, so this is the closest
+                                   we can get to "was the breach detected"
+                                   without grepping our own log. */
+                                int entries_marked_broadcast = 0;
+                                for (size_t we = 0;
+                                     we < mgr->watchtower->n_entries; we++) {
+                                    if (mgr->watchtower->entries[we].penalty_broadcast)
+                                        entries_marked_broadcast++;
+                                }
+                                printf("  watchtower_check returned %d, "
+                                       "%d entries marked broadcast\n",
+                                       detected, entries_marked_broadcast);
+
+                                if (detected <= 0 && entries_marked_broadcast == 0) {
+                                    printf("  FAIL: watchtower did not detect "
+                                           "sub-factory breach (detected=%d)\n",
+                                           detected);
+                                    sub_pass = 0;
+                                } else {
+                                    printf("  SUB-FACTORY BREACH DETECTED — "
+                                           "%d penalty tx broadcast\n",
+                                           detected);
+                                    /* Mine 5 more blocks so the response_tx
+                                       and poison_tx confirm together. */
+                                    regtest_mine_blocks(&rt, 5, mine_addr);
+                                    sleep(2);
+                                    printf("  Penalty + poison TXs confirmed\n");
+                                }
+                            }
+                        }
+                    }
+                    tx_buf_free(&cheat_stale_tx);
                 }
                 printf("PS K² SUB-FACTORY TEST: %s\n", sub_pass ? "PASS" : "FAIL");
             }
