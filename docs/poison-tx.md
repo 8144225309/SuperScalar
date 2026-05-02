@@ -223,33 +223,40 @@ This change affects only **future** factories:
 
 ## ⚠️ SECURITY-CRITICAL: multi-process production gap
 
-**`factory_sign_l_stock_poison_tx` is a single-process primitive.**  It
-requires `f->keypairs[i]` to hold every leaf signer's seckey, which is
-true ONLY in unit tests / single-process `--demo` LSPs where one
-process owns all the keys.
+**Status (2026-05-02):** wire-ceremony poison TX is now implemented for
+**3 of 4** ceremony paths.  Multi-process LSPs running these flows
+produce a fully-signed L-stock / sales-stock poison TX via a second
+MuSig2 round bundled with each state advance.
 
-**In multi-process production (real LSP + separate client processes):**
-- Each client's seckey lives in their own process — the LSP does NOT
-  have them.
-- Calling the poison TX builder would crash inside libsecp256k1 with
-  "illegal argument" (PR #135 added a `lsp_have_all_signer_keypairs`
-  guard that detects this and skips the build, registering the
-  watchtower with `NULL` poison_tx as graceful degradation).
-- Result: the watchtower can still detect a stale leaf / sub-factory
-  state confirming on chain and broadcast the latest signed state TX
-  (response_tx), but the L-stock or sales-stock UTXO of the stale state
-  is NOT redistributed to clients.  After CSV (default 144 blocks ≈ 1
-  day on mainnet) the LSP can unilaterally drain it via the script-path.
+| Ceremony path | Status | PR |
+|---|---|---|
+| `lsp_subfactory_chain_advance` (k² PS chain extension) | ✅ wire-ceremony | #136 |
+| `lsp_advance_leaf` (DW per-leaf state advance) | ✅ wire-ceremony | #137 |
+| `lsp_realloc_leaf` (per-leaf fund reallocation) | ✅ wire-ceremony | #138 |
+| `lsp_run_state_advance` (Tier B root rollover) | ⏳ single-process fallback only | TODO |
 
-**This breaks the t/1242 economic security argument** — without poison
-TX defense, an LSP that broadcasts a stale state can recover L-stock
-value after a CSV delay.  If the stale state had a more LSP-favorable
-distribution than the latest state, cheating becomes profitable.
+**Remaining gap — Tier B root rollover** (`lsp_run_state_advance`):
+- Triggered when a leaf's per-leaf DW counter exhausts and the root layer advances
+- Re-signs N nodes simultaneously using `MSG_PATH_*` bundle messages and nonce pools
+- Watchtower hook at `src/lsp_channels.c:2195+` still uses
+  `factory_build_burn_tx` (single-process) for each affected leaf
+- In multi-process mode the `lsp_have_all_signer_keypairs` guard skips
+  the build, registering the watchtower with `NULL` poison_tx for that
+  rotation — operators see a SECURITY GAP stderr warning per leaf
 
-**Operators must NOT deploy multi-process LSPs to mainnet until the
-wire-ceremony poison TX is implemented.** Single-process / signet
-self-tests / demo deployments are unaffected (the in-process key
-availability path is exercised end-to-end by unit tests).
+**Frequency**: Tier B rotation fires roughly once per N leaf advances (the
+per-leaf DW counter exhausts after `states_per_layer` advances).  Per-leaf
+advances now have full poison TX defense, but the rare rotation event
+falls back to NULL until Tier B gets the same wire-ceremony treatment.
+
+**The 3 closed paths cover the common case** — every payment-driven state
+advance, every k² sub-factory chain extension, and every per-leaf realloc
+already produces a real signed poison TX in multi-process mode.  Mainnet
+deployments that anticipate root rollovers should still wait for Tier B.
+
+**Single-process / signet self-tests / `--demo` deployments are
+unaffected on all 4 paths** (the in-process key availability path is
+exercised end-to-end by unit tests).
 
 ## What's deferred to a follow-up PR
 
