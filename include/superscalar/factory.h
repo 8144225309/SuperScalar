@@ -153,6 +153,23 @@ typedef struct {
     secp256k1_musig_partial_sig partial_sigs[FACTORY_MAX_SIGNERS];
     int partial_sigs_received;
 
+    /* Wire-ceremony poison TX state — second MuSig session per node so a
+       multi-process LSP can co-sign the L-stock / sales-stock poison TX
+       alongside the new state TX during the same advance ceremony.
+       MUST use independent nonces from `signing_session` (MuSig2 demands
+       fresh nonces per signed message).  Lifetime: populated when the
+       LSP and clients run a state-advance with poison-TX bundling; the
+       `poison_signed_tx` is then handed to the watchtower so it can
+       broadcast the poison TX on breach detection.  Closes the SECURITY
+       GAP documented in docs/poison-tx.md. */
+    musig_signing_session_t poison_signing_session;
+    secp256k1_musig_partial_sig poison_partial_sigs[FACTORY_MAX_SIGNERS];
+    int poison_partial_sigs_received;
+    unsigned char poison_sighash[32];
+    tx_buf_t poison_unsigned_tx;
+    tx_buf_t poison_signed_tx;
+    int poison_is_signed;
+
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
     int ps_chain_len;            /* number of state advances (0 = initial state) */
@@ -520,6 +537,45 @@ int factory_sign_node(factory_t *f, size_t node_idx);
 int factory_session_init_node(factory_t *f, size_t node_idx);
 int factory_session_finalize_node(factory_t *f, size_t node_idx);
 int factory_session_complete_node(factory_t *f, size_t node_idx);
+
+/* --- Wire-ceremony poison TX dual-signing helpers (closes SECURITY GAP) ---
+   These mirror the per-node session helpers above but operate on the
+   `poison_signing_session` slot, allowing the LSP to coordinate a
+   second MuSig2 round across all signers for the OLD state's L-stock /
+   sales-stock poison TX in lockstep with the new state advance.
+   Critical: each helper uses INDEPENDENT nonces from the state-advance
+   session — MuSig2 mandates fresh nonces per signed message.
+
+   Lifecycle:
+     1. factory_session_prepare_poison_tx_subfactory — builds the unsigned
+        poison TX bytes against the OLD chain[N-1] sales-stock UTXO and
+        records its sighash on the node.
+     2. factory_session_init_node_poison — fresh musig session.
+     3. factory_session_set_nonce_poison — set each signer's pubnonce.
+     4. factory_session_finalize_node_poison — compute aggnonce against
+        the stored poison_sighash.
+     5. factory_session_set_partial_sig_poison — collect partial sigs.
+     6. factory_session_complete_node_poison — aggregate + finalize a
+        64-byte witness, finalize signed_tx in poison_signed_tx. */
+int factory_session_prepare_poison_tx_subfactory(
+    factory_t *f, size_t sub_node_idx,
+    const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
+    uint64_t old_sstock_amount_sats, uint64_t fee_sats);
+int factory_session_init_node_poison(factory_t *f, size_t node_idx);
+int factory_session_set_nonce_poison(factory_t *f, size_t node_idx,
+                                       size_t signer_slot,
+                                       const secp256k1_musig_pubnonce *pubnonce);
+int factory_session_finalize_node_poison(factory_t *f, size_t node_idx);
+int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
+                                             size_t signer_slot,
+                                             const secp256k1_musig_partial_sig *psig);
+int factory_session_complete_node_poison(factory_t *f, size_t node_idx);
+
+/* Reset poison state on a node (free the unsigned/signed tx buffers + clear
+   sighash + reset received counter).  Safe to call on a never-prepared
+   node.  Used during cleanup and after the poison TX is handed to the
+   watchtower. */
+void factory_session_reset_poison(factory_t *f, size_t node_idx);
 
 /* Set custom output amounts on a leaf state node.
    leaf_side: 0..n_leaf_nodes-1.  amounts must sum to current output total.
