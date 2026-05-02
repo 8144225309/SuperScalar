@@ -2437,9 +2437,10 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (n_clients_in_sub == 0) return 0;
 
     /* Snapshot the soon-to-be-stale chain[N-1] state for the watchtower
-       (Phase 4b).  Once factory_subfactory_chain_advance_unsigned runs,
-       sub->txid / sub->outputs[] reflect the new chain[N] state, so the
-       previous txid + per-channel amounts must be captured first. */
+       (Phase 4b) AND for the wire-ceremony poison-TX prep (Gap A close).
+       Once factory_subfactory_chain_advance_unsigned runs, sub->txid /
+       sub->outputs[] reflect the new chain[N] state, so the previous
+       txid + per-channel amounts + sales-stock must be captured first. */
     unsigned char wt_old_chain_txid[32];
     memcpy(wt_old_chain_txid, sub->txid, 32);
     size_t wt_old_n_chans = (sub->n_outputs > 0) ? sub->n_outputs - 1 : 0;
@@ -2450,35 +2451,83 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t wt_old_sstock_amount = (sub->n_outputs > 0)
         ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
 
+    /* === Wire-ceremony poison TX prep ===
+       Build the unsigned poison TX (deterministic: spends OLD chain[N-1]
+       sales-stock UTXO, distributes equal share to each non-LSP signer)
+       and stash its sighash on the node so factory_session_*_poison
+       helpers can run the second MuSig session in lockstep.  Clients
+       run the same prepare call from their snapshot of the OLD state,
+       so both sides arrive at byte-identical sighash. */
+    const uint64_t POISON_FEE_SATS = 1000;
+    int poison_prepared = 0;
+    if (mgr->watchtower &&
+        wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
+        if (factory_session_prepare_poison_tx_subfactory(
+                f, (size_t)sub_node_i,
+                wt_old_chain_txid, (uint32_t)wt_old_n_chans,
+                wt_old_sstock_amount, POISON_FEE_SATS)) {
+            poison_prepared = 1;
+        } else {
+            fprintf(stderr,
+                    "LSP subfactory advance: poison TX prep failed "
+                    "(sstock=%llu sats, n_chans=%zu) — falling back to NULL "
+                    "poison_tx\n",
+                    (unsigned long long)wt_old_sstock_amount, wt_old_n_chans);
+        }
+    }
+
     /* Step 1: Advance sub-factory state (rebuilds unsigned_tx, clears is_signed). */
     if (!factory_subfactory_chain_advance_unsigned(f, leaf_side,
                                                     sub_idx_in_leaf,
                                                     channel_idx_in_sub,
                                                     delta_sats)) {
         fprintf(stderr, "LSP subfactory advance: chain_advance_unsigned failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
     }
 
-    /* Step 2: Init signing session for the sub-factory node. */
+    /* Step 2: Init BOTH signing sessions (state + poison).  Poison
+       session uses the SAME keyagg as state but a separate session so
+       nonces are independent (MuSig2 demands fresh nonces per message). */
     if (!factory_session_init_node(f, (size_t)sub_node_i)) {
-        fprintf(stderr, "LSP subfactory advance: session init failed\n");
+        fprintf(stderr, "LSP subfactory advance: state session init failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
     }
+    if (poison_prepared &&
+        !factory_session_init_node_poison(f, (size_t)sub_node_i)) {
+        fprintf(stderr, "LSP subfactory advance: poison session init failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
+        poison_prepared = 0;
+    }
 
-    /* Step 3: Generate LSP's nonce (signer slot 0). */
+    /* Step 3: Generate LSP's nonces (one per session, MUST be distinct). */
     int lsp_slot = factory_find_signer_slot(f, (size_t)sub_node_i, 0);
-    if (lsp_slot < 0) return 0;
+    if (lsp_slot < 0) { factory_session_reset_poison(f, (size_t)sub_node_i); return 0; }
     unsigned char lsp_seckey[32];
-    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair))
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
-    secp256k1_musig_secnonce lsp_secnonce;
-    secp256k1_musig_pubnonce lsp_pubnonce;
+    }
+    secp256k1_musig_secnonce lsp_secnonce, lsp_poison_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce, lsp_poison_pubnonce;
     if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
                                lsp_seckey, &lsp->lsp_pubkey,
                                &sub->keyagg.cache)) {
         memset(lsp_seckey, 0, 32);
-        fprintf(stderr, "LSP subfactory advance: nonce gen failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
+        fprintf(stderr, "LSP subfactory advance: state nonce gen failed\n");
         return 0;
+    }
+    if (poison_prepared &&
+        !musig_generate_nonce(lsp->ctx, &lsp_poison_secnonce, &lsp_poison_pubnonce,
+                                lsp_seckey, &lsp->lsp_pubkey,
+                                &sub->keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        factory_session_reset_poison(f, (size_t)sub_node_i);
+        fprintf(stderr, "LSP subfactory advance: poison nonce gen failed — "
+                "skipping poison ceremony\n");
+        poison_prepared = 0;
     }
     /* Note: do NOT set the LSP nonce on the session here.  ALL_NONCES
        carries every signer's nonce; we set them all in one pass on the
@@ -2507,9 +2556,15 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     cJSON_Delete(propose);
 
-    /* Step 5: Collect NONCE from each client. */
+    /* Step 5: Collect NONCE from each client (state + poison if prepared). */
     unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
     memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+    if (poison_prepared) {
+        unsigned char lsp_poison_pn_ser[66];
+        musig_pubnonce_serialize(lsp->ctx, lsp_poison_pn_ser, &lsp_poison_pubnonce);
+        memcpy(all_poison_pubnonces[lsp_slot], lsp_poison_pn_ser, 66);
+    }
 
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
@@ -2522,38 +2577,66 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     sub_clients[ci], nmsg.msg_type);
             if (nmsg.json) cJSON_Delete(nmsg.json);
             memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
         }
-        unsigned char client_pn[66];
-        if (!wire_parse_subfactory_nonce(nmsg.json, client_pn)) {
-            cJSON_Delete(nmsg.json);
-            memset(lsp_seckey, 0, 32);
-            return 0;
-        }
+        unsigned char client_pn[66], client_poison_pn[66];
+        int parse_rc = wire_parse_subfactory_nonce(
+            nmsg.json, client_pn,
+            poison_prepared ? client_poison_pn : NULL);
         cJSON_Delete(nmsg.json);
+        if (parse_rc == 0) {
+            memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        if (poison_prepared && parse_rc < 2) {
+            /* Client doesn't speak the poison ceremony — degrade gracefully. */
+            fprintf(stderr,
+                    "LSP subfactory advance: client %u omitted poison nonce "
+                    "— degrading to NULL poison_tx\n", sub_clients[ci]);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
         int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
                                                     sub_clients[ci]);
         if (client_slot < 0) {
             memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
         }
         memcpy(all_pubnonces[client_slot], client_pn, 66);
+        if (poison_prepared)
+            memcpy(all_poison_pubnonces[client_slot], client_poison_pn, 66);
     }
 
-    /* Step 6: Set every nonce on the session, broadcast ALL_NONCES, finalize. */
+    /* Step 6: Set every nonce on both sessions, broadcast ALL_NONCES, finalize both. */
     for (size_t s = 0; s < sub->n_signers; s++) {
         secp256k1_musig_pubnonce pn;
         if (!musig_pubnonce_parse(lsp->ctx, &pn, all_pubnonces[s])) {
             memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
         }
         if (!factory_session_set_nonce(f, (size_t)sub_node_i, s, &pn)) {
             memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
+        }
+        if (poison_prepared) {
+            secp256k1_musig_pubnonce ppn;
+            if (!musig_pubnonce_parse(lsp->ctx, &ppn, all_poison_pubnonces[s]) ||
+                !factory_session_set_nonce_poison(f, (size_t)sub_node_i, s, &ppn)) {
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            }
         }
     }
     cJSON *all_nonces = wire_build_subfactory_all_nonces(
-        (const unsigned char (*)[66])all_pubnonces, sub->n_signers);
+        (const unsigned char (*)[66])all_pubnonces,
+        poison_prepared ? (const unsigned char (*)[66])all_poison_pubnonces : NULL,
+        sub->n_signers);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_ALL_NONCES, all_nonces);
@@ -2561,29 +2644,55 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     cJSON_Delete(all_nonces);
 
     if (!factory_session_finalize_node(f, (size_t)sub_node_i)) {
-        fprintf(stderr, "LSP subfactory advance: finalize failed\n");
+        fprintf(stderr, "LSP subfactory advance: state finalize failed\n");
         memset(lsp_seckey, 0, 32);
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
     }
+    if (poison_prepared &&
+        !factory_session_finalize_node_poison(f, (size_t)sub_node_i)) {
+        fprintf(stderr, "LSP subfactory advance: poison finalize failed — "
+                "degrading to NULL poison_tx\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
+        poison_prepared = 0;
+    }
 
-    /* Step 7: Create LSP's partial sig. */
+    /* Step 7: Create LSP's partial sigs (one per session). */
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
         memset(lsp_seckey, 0, 32);
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
     }
     memset(lsp_seckey, 0, 32);
-    secp256k1_musig_partial_sig lsp_psig;
+    secp256k1_musig_partial_sig lsp_psig, lsp_poison_psig;
     if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
                                     &sub->signing_session)) {
-        fprintf(stderr, "LSP subfactory advance: LSP partial sig failed\n");
+        fprintf(stderr, "LSP subfactory advance: LSP state partial sig failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
     }
     if (!factory_session_set_partial_sig(f, (size_t)sub_node_i,
-                                          (size_t)lsp_slot, &lsp_psig))
+                                          (size_t)lsp_slot, &lsp_psig)) {
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
+    }
+    if (poison_prepared) {
+        if (!musig_create_partial_sig(lsp->ctx, &lsp_poison_psig,
+                                        &lsp_poison_secnonce, &lsp_kp,
+                                        &sub->poison_signing_session)) {
+            fprintf(stderr, "LSP subfactory advance: LSP poison psig failed — "
+                    "degrading to NULL poison_tx\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        } else if (!factory_session_set_partial_sig_poison(
+                       f, (size_t)sub_node_i, (size_t)lsp_slot, &lsp_poison_psig)) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
+    }
 
-    /* Step 8: Collect PSIG from each client. */
+    /* Step 8: Collect PSIG from each client (state + poison if prepared). */
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_msg_t pmsg;
@@ -2594,29 +2703,69 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     "from client %u, got 0x%02x\n",
                     sub_clients[ci], pmsg.msg_type);
             if (pmsg.json) cJSON_Delete(pmsg.json);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
         }
-        unsigned char client_psig_ser[32];
-        if (!wire_parse_subfactory_psig(pmsg.json, client_psig_ser)) {
-            cJSON_Delete(pmsg.json);
-            return 0;
-        }
+        unsigned char client_psig_ser[32], client_poison_psig_ser[32];
+        int parse_rc = wire_parse_subfactory_psig(
+            pmsg.json, client_psig_ser,
+            poison_prepared ? client_poison_psig_ser : NULL);
         cJSON_Delete(pmsg.json);
+        if (parse_rc == 0) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        if (poison_prepared && parse_rc < 2) {
+            fprintf(stderr,
+                    "LSP subfactory advance: client %u omitted poison psig "
+                    "— degrading to NULL poison_tx\n", sub_clients[ci]);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
         int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
                                                     sub_clients[ci]);
-        if (client_slot < 0) return 0;
-        secp256k1_musig_partial_sig client_psig;
-        if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser))
+        if (client_slot < 0) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
+        }
+        secp256k1_musig_partial_sig client_psig, client_poison_psig;
+        if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser)) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
         if (!factory_session_set_partial_sig(f, (size_t)sub_node_i,
-                                              (size_t)client_slot, &client_psig))
+                                              (size_t)client_slot, &client_psig)) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
             return 0;
+        }
+        if (poison_prepared) {
+            if (!musig_partial_sig_parse(lsp->ctx, &client_poison_psig,
+                                          client_poison_psig_ser) ||
+                !factory_session_set_partial_sig_poison(
+                    f, (size_t)sub_node_i, (size_t)client_slot, &client_poison_psig)) {
+                fprintf(stderr,
+                        "LSP subfactory advance: client %u poison psig parse/set "
+                        "failed — degrading to NULL poison_tx\n", sub_clients[ci]);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            }
+        }
     }
 
-    /* Step 9: Aggregate + finalize the new chain[N] signed_tx. */
+    /* Step 9: Aggregate + finalize both signed TXs (state + poison). */
     if (!factory_session_complete_node(f, (size_t)sub_node_i)) {
-        fprintf(stderr, "LSP subfactory advance: complete failed\n");
+        fprintf(stderr, "LSP subfactory advance: state complete failed\n");
+        factory_session_reset_poison(f, (size_t)sub_node_i);
         return 0;
+    }
+    if (poison_prepared) {
+        if (!factory_session_complete_node_poison(f, (size_t)sub_node_i)) {
+            fprintf(stderr,
+                    "LSP subfactory advance: poison complete failed — "
+                    "degrading to NULL poison_tx\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
     }
 
     /* Step 10: Persist sub-factory chain entry (Phase 4a save +
@@ -2658,68 +2807,42 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Step 10b: Build the sub-factory sales-stock POISON TX (Gap A) and
        register the now-stale chain[N-1] with the watchtower (Phase 4b).
 
-       The sub-factory's sales-stock SPK has the same shape as a PS
-       leaf's L-stock (or(N-of-N, L&CSV) per t/1242), so the existing
-       factory_sign_l_stock_poison_tx builder works directly here — its
-       authority is the passed factory_node_t's keyagg, which on a
-       sub-factory is the (LSP + sub-factory clients) MuSig.
-
-       The poison TX spends chain[N-1]'s sales-stock UTXO (txid =
-       wt_old_chain_txid, vout = old_n_outputs - 1, amount =
-       wt_old_sstock_amount) and pays each sub-factory client an equal
-       share, less fee.  Pre-signed at advance time so any client /
-       watchtower can broadcast it on breach without coordination. */
-    /* After the first advance, ps_chain_len == 1 (chain[0] → chain[1])
-       and chain[0] is already a stale state worth watching.  Guard at
-       >= 1 (not >= 2) so we register the watchtower entry on the very
-       first advance — the original >= 2 guard was a Phase 4b bug. */
+       The poison TX was co-signed by all sub-factory signers via the
+       wire-ceremony second MuSig round above (closes Gap A SECURITY
+       GAP).  If poison_prepared is true and the ceremony succeeded,
+       sub->poison_signed_tx now holds the fully-signed poison TX.  If
+       any phase of the poison ceremony failed (one client out of date,
+       sales-stock too small, etc.) we fall back to NULL poison_tx —
+       graceful degradation, watchtower still broadcasts response_tx on
+       breach but cannot redistribute the sales-stock. */
     if (mgr->watchtower && sub->ps_chain_len >= 1) {
-        tx_buf_t poison_tx;
-        tx_buf_init(&poison_tx, 256);
-        uint32_t old_sstock_vout = (uint32_t)wt_old_n_chans;  /* trailing */
-        const uint64_t POISON_FEE_SATS = 1000;  /* matches PS leaf default */
-        int poison_ok = 0;
-
-        /* See lsp_have_all_signer_keypairs comment: skip poison TX in
-           multi-process mode (graceful degradation, NULL poison_tx
-           registered with watchtower).  This is a SECURITY GAP — the
-           watchtower can still detect breach via response_tx broadcast
-           but cannot redistribute the sales-stock to clients.  Tracked
-           in CANONICAL_DESIGN_GAPS.md (Gap A follow-up). */
-        int have_all_seckeys = lsp_have_all_signer_keypairs(lsp->ctx, f, sub);
-        if (!have_all_seckeys) {
+        int have_poison = (poison_prepared && sub->poison_is_signed &&
+                           sub->poison_signed_tx.len > 0);
+        if (have_poison)
+            printf("LSP: sub-factory %d.%d wire-ceremony poison TX signed "
+                   "(%zu bytes, sales-stock %llu sats → %zu clients)\n",
+                   leaf_side, sub_idx_in_leaf,
+                   sub->poison_signed_tx.len,
+                   (unsigned long long)wt_old_sstock_amount, wt_old_n_chans);
+        else
             fprintf(stderr,
-                    "LSP subfactory advance: multi-process mode — skipping "
-                    "poison TX (SECURITY GAP: client cannot recover "
-                    "sales-stock on breach without wire-ceremony poison TX)\n");
-        }
-
-        if (have_all_seckeys &&
-            wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
-            poison_ok = factory_sign_l_stock_poison_tx(
-                f, sub,
-                wt_old_chain_txid, old_sstock_vout,
-                wt_old_sstock_amount, POISON_FEE_SATS,
-                &poison_tx);
-            if (!poison_ok)
-                fprintf(stderr,
-                        "LSP subfactory advance: poison TX sign failed "
-                        "(sub=%d, sstock=%llu sats) — registering watchtower "
-                        "without poison\n",
-                        sub_node_i,
-                        (unsigned long long)wt_old_sstock_amount);
-        }
+                    "LSP subfactory advance: registering watchtower without "
+                    "poison TX (poison_prepared=%d, poison_is_signed=%d) — "
+                    "DEGRADED, breach cannot redistribute sales-stock\n",
+                    poison_prepared, sub->poison_is_signed);
 
         watchtower_watch_subfactory_node(mgr->watchtower,
             (uint32_t)sub_node_i,
             wt_old_chain_txid,
             sub->signed_tx.data, sub->signed_tx.len,
-            poison_ok ? poison_tx.data : NULL,
-            poison_ok ? poison_tx.len  : 0,
+            have_poison ? sub->poison_signed_tx.data : NULL,
+            have_poison ? sub->poison_signed_tx.len  : 0,
             wt_old_chan_amounts, wt_old_n_chans,
             wt_old_sstock_amount);
 
-        tx_buf_free(&poison_tx);
+        /* Watchtower copied the bytes; safe to free our poison-session
+           state now that it's been handed off. */
+        factory_session_reset_poison(f, (size_t)sub_node_i);
     }
 
     /* Step 11: Broadcast DONE to all sub-factory clients. */

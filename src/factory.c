@@ -2340,6 +2340,138 @@ int factory_session_complete_node(factory_t *f, size_t node_idx) {
     return 1;
 }
 
+/* === Wire-ceremony poison TX helpers (closes SECURITY GAP) === */
+
+void factory_session_reset_poison(factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return;
+    factory_node_t *node = &f->nodes[node_idx];
+    tx_buf_free(&node->poison_unsigned_tx);
+    tx_buf_free(&node->poison_signed_tx);
+    memset(node->poison_sighash, 0, 32);
+    node->poison_partial_sigs_received = 0;
+    node->poison_is_signed = 0;
+    /* secp256k1_musig structures are POD-style; zeroing is safe. */
+    memset(&node->poison_signing_session, 0, sizeof(node->poison_signing_session));
+    memset(node->poison_partial_sigs, 0, sizeof(node->poison_partial_sigs));
+}
+
+int factory_session_prepare_poison_tx_subfactory(
+    factory_t *f, size_t sub_node_idx,
+    const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
+    uint64_t old_sstock_amount_sats, uint64_t fee_sats)
+{
+    if (!f || sub_node_idx >= f->n_nodes || !old_chain_txid32) return 0;
+    factory_node_t *sub = &f->nodes[sub_node_idx];
+    if (sub->type != NODE_PS_SUBFACTORY) return 0;
+
+    /* Reuse the existing single-process unsigned-poison-TX builder.
+       It produces the bytes + sighash; we don't sign here — that's
+       what the wire ceremony rounds do. */
+    factory_session_reset_poison(f, sub_node_idx);
+    tx_buf_init(&sub->poison_unsigned_tx, 256);
+    if (!factory_build_l_stock_poison_tx_unsigned(
+            f, sub, old_chain_txid32, old_sstock_vout,
+            old_sstock_amount_sats, fee_sats,
+            &sub->poison_unsigned_tx, sub->poison_sighash)) {
+        factory_session_reset_poison(f, sub_node_idx);
+        return 0;
+    }
+    return 1;
+}
+
+int factory_session_init_node_poison(factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->is_built) return 0;
+    /* The poison TX is signed against the SAME keyagg as the state TX
+       (LSP + leaf signers, N-of-N MuSig).  The SIGHASH differs (poison
+       TX bytes vs new state TX bytes) and the NONCES MUST be fresh. */
+    musig_session_init(&node->poison_signing_session, &node->keyagg,
+                        node->n_signers);
+    node->poison_partial_sigs_received = 0;
+    return 1;
+}
+
+int factory_session_set_nonce_poison(factory_t *f, size_t node_idx,
+                                       size_t signer_slot,
+                                       const secp256k1_musig_pubnonce *pubnonce) {
+    if (!f || node_idx >= f->n_nodes || !pubnonce) return 0;
+    return musig_session_set_pubnonce(&f->nodes[node_idx].poison_signing_session,
+                                        signer_slot, pubnonce);
+}
+
+int factory_session_finalize_node_poison(factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+
+    /* The poison TX spends the OLD state's L-stock / sales-stock UTXO
+       whose SPK is `or(N-of-N keyagg, L&CSV)` — the keypath spend uses
+       the leaf-level taptree merkle root (single CSV leaf).  Match what
+       sign_l_stock_spend_with_outputs does internally so the sighash
+       resolves to the same value on both LSP + clients. */
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
+                                              &f->pubkeys[0]))
+        return 0;
+    uint32_t csv = f->l_stock_csv_blocks > 0
+                   ? f->l_stock_csv_blocks
+                   : L_STOCK_CSV_DEFAULT_BLOCKS;
+    tapscript_leaf_t csv_leaf;
+    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx))
+        return 0;
+    unsigned char merkle_root[32];
+    if (!tapscript_merkle_root(merkle_root, &csv_leaf, 1))
+        return 0;
+
+    int ok = musig_session_finalize_nonces(f->ctx,
+                                             &node->poison_signing_session,
+                                             node->poison_sighash,
+                                             merkle_root, NULL);
+    if (!ok)
+        fprintf(stderr,
+                "finalize_node_poison %zu: musig_session_finalize_nonces failed "
+                "(n_signers=%zu, nonces_collected=%d)\n",
+                node_idx, node->n_signers,
+                node->poison_signing_session.nonces_collected);
+    return ok;
+}
+
+int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
+                                             size_t signer_slot,
+                                             const secp256k1_musig_partial_sig *psig) {
+    if (!f || node_idx >= f->n_nodes || !psig) return 0;
+    if (signer_slot >= FACTORY_MAX_SIGNERS) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    memcpy(&node->poison_partial_sigs[signer_slot], psig,
+           sizeof(secp256k1_musig_partial_sig));
+    node->poison_partial_sigs_received++;
+    return 1;
+}
+
+int factory_session_complete_node_poison(factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+
+    if (node->poison_partial_sigs_received != (int)node->n_signers)
+        return 0;
+    if (node->poison_unsigned_tx.len == 0) return 0;
+
+    unsigned char sig[64];
+    if (!musig_aggregate_partial_sigs(f->ctx, sig,
+                                        &node->poison_signing_session,
+                                        node->poison_partial_sigs,
+                                        node->n_signers))
+        return 0;
+
+    if (!finalize_signed_tx(&node->poison_signed_tx,
+                              node->poison_unsigned_tx.data,
+                              node->poison_unsigned_tx.len, sig))
+        return 0;
+
+    node->poison_is_signed = 1;
+    return 1;
+}
+
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {
     memcpy(f->shachain_seed, seed32, 32);
     f->has_shachain = 1;
@@ -3400,6 +3532,11 @@ void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);
         tx_buf_free(&f->nodes[i].signed_tx);
+        /* Wire-ceremony poison TX buffers — populated by
+           factory_session_prepare_poison_tx_subfactory.  Free always
+           (tx_buf_free is a no-op on zero-init). */
+        tx_buf_free(&f->nodes[i].poison_unsigned_tx);
+        tx_buf_free(&f->nodes[i].poison_signed_tx);
     }
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;

@@ -286,6 +286,24 @@ if ! grep -q "PS K² SUB-FACTORY TEST: PASS" "$LSP_LOG"; then
 fi
 echo "  PS K² SUB-FACTORY TEST: PASS"
 
+# Wire-ceremony poison TX assertion (closes Gap A SECURITY GAP).  The dual
+# MuSig2 round must have produced a fully-signed poison TX; absence of a
+# "wire-ceremony poison TX signed" line OR presence of any "DEGRADED" /
+# "SECURITY GAP" line means we fell back to NULL poison_tx and the
+# watchtower would have no defense for the sales-stock on breach.
+if grep -q "DEGRADED\|SECURITY GAP" "$LSP_LOG"; then
+    echo "FAIL: poison TX wire-ceremony degraded (SECURITY GAP triggered)"
+    grep -E "DEGRADED|SECURITY GAP|poison" "$LSP_LOG" | head -20
+    exit 1
+fi
+if ! grep -q "wire-ceremony poison TX signed" "$LSP_LOG"; then
+    echo "FAIL: wire-ceremony poison TX was not signed (no positive log)"
+    grep -E "poison|sub-factory" "$LSP_LOG" | head -20
+    exit 1
+fi
+POISON_LINE=$(grep "wire-ceremony poison TX signed" "$LSP_LOG" | head -1)
+echo "  $POISON_LINE"
+
 # --- Per-client participation ---
 echo ""
 echo "=== Verifying clients participated in sub-factory ceremony ==="
