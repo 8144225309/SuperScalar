@@ -1321,7 +1321,15 @@
                             } else {
                                 printf("  Stale chain[N-1] broadcast: %s\n",
                                        cheat_txid_str);
-                                regtest_mine_blocks(&rt, 1, mine_addr);
+                                /* Mine 5 blocks + sleep 2s before watchtower
+                                   check so chain[N-1] is solidly confirmed
+                                   (out of mempool, no race with chain[N]
+                                   that the watchtower will broadcast).  Per
+                                   the v0.1.15 master plan: 1 block was not
+                                   enough because bitcoind's mempool/wallet
+                                   reorg detection had transient state. */
+                                regtest_mine_blocks(&rt, 5, mine_addr);
+                                sleep(2);
                                 int detected =
                                     watchtower_check(mgr->watchtower);
                                 if (detected <= 0) {
@@ -1333,7 +1341,10 @@
                                     printf("  SUB-FACTORY BREACH DETECTED — "
                                            "%d penalty tx broadcast\n",
                                            detected);
-                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                    /* Mine 5 more blocks so the response_tx
+                                       and poison_tx confirm together. */
+                                    regtest_mine_blocks(&rt, 5, mine_addr);
+                                    sleep(2);
                                     printf("  Penalty + poison TXs confirmed\n");
                                 }
                             }
