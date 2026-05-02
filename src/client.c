@@ -2501,36 +2501,75 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
                                 factory_t *factory,
                                 uint32_t my_index,
                                 const wire_msg_t *propose_msg) {
-    /* Parse REALLOC_PROPOSE */
+    /* Parse REALLOC_PROPOSE (state + optional poison nonce) */
     int leaf_side;
     uint64_t amounts[FACTORY_MAX_OUTPUTS];
     size_t n_amounts;
-    unsigned char lsp_pubnonce_ser[66];
+    unsigned char lsp_pubnonce_ser[66], lsp_poison_pn_ser[66];
 
-    if (!wire_parse_leaf_realloc_propose(propose_msg->json, &leaf_side,
-                                          amounts, FACTORY_MAX_OUTPUTS,
-                                          &n_amounts, lsp_pubnonce_ser)) {
+    int propose_rc = wire_parse_leaf_realloc_propose(propose_msg->json, &leaf_side,
+                                                       amounts, FACTORY_MAX_OUTPUTS,
+                                                       &n_amounts, lsp_pubnonce_ser,
+                                                       lsp_poison_pn_ser);
+    if (propose_rc == 0) {
         fprintf(stderr, "Client %u: failed to parse REALLOC_PROPOSE\n", my_index);
         return 0;
+    }
+    int wire_poison_offered = (propose_rc == 2);
+
+    /* Snapshot OLD leaf state BEFORE the realloc — needed to deterministically
+       prep the wire-ceremony poison TX in lockstep with the LSP. */
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
+    size_t pre_node_idx_r = factory->leaf_node_indices[leaf_side];
+    factory_node_t *pre_leaf_r = &factory->nodes[pre_node_idx_r];
+    unsigned char pre_old_leaf_txid_r[32];
+    memcpy(pre_old_leaf_txid_r, pre_leaf_r->txid, 32);
+    int pre_old_n_outputs_r = pre_leaf_r->n_outputs;
+    uint64_t pre_old_l_amount_r = (pre_old_n_outputs_r >= 2)
+                                  ? pre_leaf_r->outputs[pre_old_n_outputs_r - 1].amount_sats
+                                  : 0;
+    int pre_had_signed_r = (pre_leaf_r->is_signed && pre_leaf_r->signed_tx.len > 0);
+
+    const uint64_t REALLOC_POISON_FEE_SATS = 1000;
+    int realloc_poison_prepared = 0;
+    if (wire_poison_offered && pre_had_signed_r && pre_old_n_outputs_r >= 2 &&
+        pre_old_l_amount_r > REALLOC_POISON_FEE_SATS +
+                             (uint64_t)(pre_leaf_r->n_signers - 1) * 330u) {
+        if (factory_session_prepare_poison_tx_leaf(
+                factory, pre_node_idx_r,
+                pre_old_leaf_txid_r, (uint32_t)(pre_old_n_outputs_r - 1),
+                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS)) {
+            realloc_poison_prepared = 1;
+        }
     }
 
     /* Advance local DW + set amounts */
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
         fprintf(stderr, "Client %u: leaf advance for realloc failed\n", my_index);
+        factory_session_reset_poison(factory, pre_node_idx_r);
         return 0;
     }
     if (!factory_set_leaf_amounts(factory, leaf_side, amounts, n_amounts)) {
         fprintf(stderr, "Client %u: set_leaf_amounts failed\n", my_index);
+        factory_session_reset_poison(factory, pre_node_idx_r);
         return 0;
     }
 
     size_t node_idx = factory->leaf_node_indices[leaf_side];
 
-    /* Init signing session for this node */
+    /* Init both signing sessions */
     if (!factory_session_init_node(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc session_init_node failed (node %zu)\n", my_index, node_idx);
+        fprintf(stderr, "Client %u: realloc state session_init_node failed (node %zu)\n",
+                my_index, node_idx);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
+    }
+    if (realloc_poison_prepared &&
+        !factory_session_init_node_poison(factory, node_idx)) {
+        fprintf(stderr, "Client %u: realloc poison session_init failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        realloc_poison_prepared = 0;
     }
 
     /* NOTE: Do NOT set the LSP nonce here.  The ALL_NONCES message
@@ -2553,94 +2592,159 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
         return 0;
     }
 
+    /* Set LSP nonces (state + poison if offered) */
+    int lsp_slot_r = factory_find_signer_slot(factory, node_idx, 0);
+    if (lsp_slot_r < 0) {
+        memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+    /* (LSP nonce will be set via ALL_NONCES below — same as before) */
+
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    secp256k1_musig_secnonce my_secnonce;
-    secp256k1_musig_pubnonce my_pubnonce;
+    secp256k1_musig_secnonce my_secnonce, my_poison_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce, my_poison_pubnonce;
     if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
                                my_seckey, &my_pubkey,
                                &factory->nodes[node_idx].keyagg.cache)) {
-        fprintf(stderr, "Client %u: realloc nonce_gen failed\n", my_index);
+        fprintf(stderr, "Client %u: realloc state nonce_gen failed\n", my_index);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
+    if (realloc_poison_prepared &&
+        !musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
+                                my_seckey, &my_pubkey,
+                                &factory->nodes[node_idx].keyagg.cache)) {
+        fprintf(stderr, "Client %u: realloc poison nonce_gen failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        realloc_poison_prepared = 0;
+    }
 
-    /* Send REALLOC_NONCE */
-    unsigned char my_pubnonce_ser[66];
+    /* Send REALLOC_NONCE (state + optional poison) */
+    unsigned char my_pubnonce_ser[66], my_poison_pn_ser[66];
     musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
-    cJSON *nonce_msg = wire_build_leaf_realloc_nonce(my_pubnonce_ser);
+    if (realloc_poison_prepared)
+        musig_pubnonce_serialize(ctx, my_poison_pn_ser, &my_poison_pubnonce);
+    cJSON *nonce_msg = wire_build_leaf_realloc_nonce(
+        my_pubnonce_ser, realloc_poison_prepared ? my_poison_pn_ser : NULL);
     if (!wire_send(fd, MSG_LEAF_REALLOC_NONCE, nonce_msg)) {
         fprintf(stderr, "Client %u: realloc send NONCE failed\n", my_index);
         cJSON_Delete(nonce_msg);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     cJSON_Delete(nonce_msg);
 
-    /* Receive REALLOC_ALL_NONCES */
+    /* Receive REALLOC_ALL_NONCES (state + optional poison) */
     wire_msg_t all_msg;
     if (!wire_recv(fd, &all_msg) || all_msg.msg_type != MSG_LEAF_REALLOC_ALL_NONCES) {
         fprintf(stderr, "Client %u: expected REALLOC_ALL_NONCES, got 0x%02x\n",
                 my_index, all_msg.msg_type);
         if (all_msg.json) cJSON_Delete(all_msg.json);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
 
     unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
     size_t n_signers;
-    if (!wire_parse_leaf_realloc_all_nonces(all_msg.json, all_pubnonces,
-                                              FACTORY_MAX_SIGNERS, &n_signers)) {
+    int an_parse_rc = wire_parse_leaf_realloc_all_nonces(
+        all_msg.json, all_pubnonces,
+        realloc_poison_prepared ? all_poison_pubnonces : NULL,
+        FACTORY_MAX_SIGNERS, &n_signers);
+    cJSON_Delete(all_msg.json);
+    if (an_parse_rc == 0) {
         fprintf(stderr, "Client %u: realloc parse all_nonces failed\n", my_index);
-        cJSON_Delete(all_msg.json);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
-    cJSON_Delete(all_msg.json);
+    if (realloc_poison_prepared && an_parse_rc < 2) {
+        factory_session_reset_poison(factory, node_idx);
+        realloc_poison_prepared = 0;
+    }
 
-    /* Set all nonces */
+    /* Set all nonces (state + poison if prepared) */
     for (size_t i = 0; i < n_signers; i++) {
         secp256k1_musig_pubnonce pn;
         if (!musig_pubnonce_parse(ctx, &pn, all_pubnonces[i])) {
             fprintf(stderr, "Client %u: realloc parse nonce[%zu] failed\n", my_index, i);
             memset(my_seckey, 0, 32);
+            factory_session_reset_poison(factory, node_idx);
             return 0;
         }
         if (!factory_session_set_nonce(factory, node_idx, i, &pn)) {
             fprintf(stderr, "Client %u: realloc set_nonce[%zu] failed\n", my_index, i);
             memset(my_seckey, 0, 32);
+            factory_session_reset_poison(factory, node_idx);
             return 0;
+        }
+        if (realloc_poison_prepared) {
+            secp256k1_musig_pubnonce ppn;
+            if (!musig_pubnonce_parse(ctx, &ppn, all_poison_pubnonces[i]) ||
+                !factory_session_set_nonce_poison(factory, node_idx, i, &ppn)) {
+                fprintf(stderr, "Client %u: realloc poison set_nonce[%zu] failed — degrading\n",
+                        my_index, i);
+                factory_session_reset_poison(factory, node_idx);
+                realloc_poison_prepared = 0;
+            }
         }
     }
 
-    /* Finalize */
+    /* Finalize both sessions */
     if (!factory_session_finalize_node(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc session_finalize failed (node %zu)\n", my_index, node_idx);
+        fprintf(stderr, "Client %u: realloc state session_finalize failed (node %zu)\n",
+                my_index, node_idx);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
+    if (realloc_poison_prepared &&
+        !factory_session_finalize_node_poison(factory, node_idx)) {
+        fprintf(stderr, "Client %u: realloc poison session_finalize failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        realloc_poison_prepared = 0;
+    }
 
-    /* Create partial sig */
-    secp256k1_musig_partial_sig my_psig;
+    /* Create partial sigs (state + poison if prepared) */
+    secp256k1_musig_partial_sig my_psig, my_poison_psig;
     if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
                                     &factory->nodes[node_idx].signing_session)) {
-        fprintf(stderr, "Client %u: realloc partial_sig creation failed\n", my_index);
+        fprintf(stderr, "Client %u: realloc state partial_sig creation failed\n", my_index);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
+    }
+    if (realloc_poison_prepared &&
+        !musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce, keypair,
+                                    &factory->nodes[node_idx].poison_signing_session)) {
+        fprintf(stderr, "Client %u: realloc poison partial_sig creation failed — degrading\n",
+                my_index);
+        factory_session_reset_poison(factory, node_idx);
+        realloc_poison_prepared = 0;
     }
     memset(my_seckey, 0, 32);
 
-    /* Send REALLOC_PSIG */
-    unsigned char my_psig_ser[32];
+    /* Send REALLOC_PSIG (state + poison if prepared) */
+    unsigned char my_psig_ser[32], my_poison_psig_ser[32];
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
-    cJSON *psig_json = wire_build_leaf_realloc_psig(my_psig_ser);
+    if (realloc_poison_prepared)
+        musig_partial_sig_serialize(ctx, my_poison_psig_ser, &my_poison_psig);
+    cJSON *psig_json = wire_build_leaf_realloc_psig(
+        my_psig_ser, realloc_poison_prepared ? my_poison_psig_ser : NULL);
     if (!wire_send(fd, MSG_LEAF_REALLOC_PSIG, psig_json)) {
         fprintf(stderr, "Client %u: realloc wire_send PSIG failed\n", my_index);
         cJSON_Delete(psig_json);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     cJSON_Delete(psig_json);
+    factory_session_reset_poison(factory, node_idx);
 
     /* Receive REALLOC_DONE */
     wire_msg_t done_msg;

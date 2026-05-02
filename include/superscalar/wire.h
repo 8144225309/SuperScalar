@@ -622,33 +622,48 @@ int wire_parse_path_sign_done(const cJSON *json, uint32_t *epoch_out);
 
 /* --- Leaf-Level Fund Reallocation message builders (Upgrade 3) --- */
 
-/* LSP → Clients: LEAF_REALLOC_PROPOSE {leaf_side, amounts[], pubnonce} */
+/* LSP → Clients: LEAF_REALLOC_PROPOSE {leaf_side, amounts[], pubnonce, [poison_pubnonce]}.
+   Optional poison_pubnonce closes Wire-Ceremony Gap A for Tier B
+   rotation — when present it accompanies the state pubnonce so a
+   second MuSig2 round runs in lockstep over the OLD leaf state's
+   L-stock poison TX sighash.  Pass NULL to skip.  Parse return value:
+   0 = failure, 1 = state-only parsed, 2 = state + poison parsed. */
 cJSON *wire_build_leaf_realloc_propose(int leaf_side,
                                         const uint64_t *amounts, size_t n_amounts,
-                                        const unsigned char *pubnonce66);
+                                        const unsigned char *state_pubnonce66,
+                                        const unsigned char *poison_pubnonce66);
 
 int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
                                       uint64_t *amounts, size_t max_amounts,
                                       size_t *n_amounts_out,
-                                      unsigned char *pubnonce66);
+                                      unsigned char *state_pubnonce66,
+                                      unsigned char *poison_pubnonce66);
 
-/* Client → LSP: LEAF_REALLOC_NONCE {pubnonce} */
-cJSON *wire_build_leaf_realloc_nonce(const unsigned char *pubnonce66);
+/* Client → LSP: LEAF_REALLOC_NONCE {pubnonce, [poison_pubnonce]} */
+cJSON *wire_build_leaf_realloc_nonce(const unsigned char *state_pubnonce66,
+                                       const unsigned char *poison_pubnonce66);
 
-int wire_parse_leaf_realloc_nonce(const cJSON *json, unsigned char *pubnonce66);
+int wire_parse_leaf_realloc_nonce(const cJSON *json,
+                                    unsigned char *state_pubnonce66,
+                                    unsigned char *poison_pubnonce66);
 
-/* LSP → Clients: LEAF_REALLOC_ALL_NONCES {pubnonces[3]} */
+/* LSP → Clients: LEAF_REALLOC_ALL_NONCES {pubnonces[], [poison_pubnonces[]]} */
 cJSON *wire_build_leaf_realloc_all_nonces(const unsigned char pubnonces[][66],
+                                            const unsigned char poison_pubnonces[][66],
                                             size_t n_signers);
 
 int wire_parse_leaf_realloc_all_nonces(const cJSON *json,
                                          unsigned char pubnonces_out[][66],
+                                         unsigned char poison_pubnonces_out[][66],
                                          size_t max_signers, size_t *n_out);
 
-/* Client → LSP: LEAF_REALLOC_PSIG {partial_sig} */
-cJSON *wire_build_leaf_realloc_psig(const unsigned char *partial_sig32);
+/* Client → LSP: LEAF_REALLOC_PSIG {partial_sig, [poison_partial_sig]} */
+cJSON *wire_build_leaf_realloc_psig(const unsigned char *state_psig32,
+                                      const unsigned char *poison_psig32);
 
-int wire_parse_leaf_realloc_psig(const cJSON *json, unsigned char *partial_sig32);
+int wire_parse_leaf_realloc_psig(const cJSON *json,
+                                   unsigned char *state_psig32,
+                                   unsigned char *poison_psig32);
 
 /* LSP → Clients: LEAF_REALLOC_DONE {leaf_side, amounts[]} */
 cJSON *wire_build_leaf_realloc_done(int leaf_side,
