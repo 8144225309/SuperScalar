@@ -308,6 +308,7 @@ static void usage(const char *prog) {
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
+        "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (regtest only; Gap A end-to-end)\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
@@ -1100,6 +1101,7 @@ int main(int argc, char *argv[]) {
     int test_realloc = 0;
     int test_tier_b_rollover = 0;  /* Tier B (Gap B+F) — drive root rollover */
     int test_subfactory_advance = 0;  /* Phase 2c — drive sub-factory chain extension */
+    int cheat_subfactory_after_advance = 0;  /* Gap A test: broadcast stale chain[N-1] post-advance */
     int ps_subfactory_arity_arg = 0;  /* k for PS k² sub-factories (0 = default k=1) */
     int test_jit = 0;
     int test_lsps2 = 0;
@@ -1251,6 +1253,14 @@ int main(int argc, char *argv[]) {
             test_tier_b_rollover = 1;
         else if (strcmp(argv[i], "--test-subfactory-advance") == 0)
             test_subfactory_advance = 1;
+        else if (strcmp(argv[i], "--cheat-subfactory") == 0) {
+            /* Sub-factory cheating mode: after --test-subfactory-advance
+               extends the chain, broadcast the now-stale chain[N-1] TX
+               on regtest and let the LSP's own watchtower detect and
+               respond with the pre-signed poison TX (Gap A). */
+            test_subfactory_advance = 1;
+            cheat_subfactory_after_advance = 1;
+        }
         else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc)
             ps_subfactory_arity_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--test-jit") == 0)
