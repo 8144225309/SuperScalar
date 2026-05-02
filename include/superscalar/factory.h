@@ -561,6 +561,14 @@ int factory_session_prepare_poison_tx_subfactory(
     factory_t *f, size_t sub_node_idx,
     const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
     uint64_t old_sstock_amount_sats, uint64_t fee_sats);
+
+/* Same as the subfactory variant but for a DW / PS LEAF node — used by
+   the lsp_advance_leaf wire ceremony to bundle a poison TX over the
+   OLD state's L-stock UTXO alongside the new state TX advance. */
+int factory_session_prepare_poison_tx_leaf(
+    factory_t *f, size_t leaf_node_idx,
+    const unsigned char *old_leaf_txid32, uint32_t old_l_stock_vout,
+    uint64_t old_l_stock_amount_sats, uint64_t fee_sats);
 int factory_session_init_node_poison(factory_t *f, size_t node_idx);
 int factory_session_set_nonce_poison(factory_t *f, size_t node_idx,
                                        size_t signer_slot,
