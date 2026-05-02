@@ -858,6 +858,24 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v22 migration: poison TX persistence on PS leaf and sub-factory chain
+       entries.  Without this, the wire-signed poison TXs from the
+       multi-process MuSig ceremonies (PRs #136-#138) live only in memory
+       and are silently lost on the first LSP crash — leaving the watchtower
+       unable to redistribute the L-stock / sales-stock on a post-restart
+       breach.  NULL is tolerated for backward compatibility (degrades to
+       the same behavior as pre-#136: response_tx broadcast on breach,
+       but no poison TX redistribution).  ALTER TABLE ... ADD COLUMN with
+       no default is the standard SQLite approach for nullable additions. */
+    if (db_version < 22) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_leaf_chains ADD COLUMN poison_tx_hex TEXT;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_subfactory_chains ADD COLUMN poison_tx_hex TEXT;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1045,12 +1063,17 @@ int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
    chain_pos: 0-based position in the chain (equal to old ps_chain_len before advance).
    signed_tx / signed_tx_len: the signed TX being stored.
    txid_display: 32-byte display-order txid.
-   chan_amount_sats: channel output amount for this chain position. */
+   chan_amount_sats: channel output amount for this chain position.
+   poison_tx / poison_tx_len: optional L-stock poison TX (v22). Pass NULL/0
+   when no poison TX exists for this advance (chain[0] or a degraded
+   single-process advance). */
 int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint32_t leaf_node_idx, int chain_pos,
                                  const unsigned char *txid_display,
                                  const unsigned char *signed_tx, size_t signed_tx_len,
-                                 uint64_t chan_amount_sats) {
+                                 uint64_t chan_amount_sats,
+                                 const unsigned char *poison_tx,
+                                 size_t poison_tx_len) {
     if (!p || !p->db) return 0;
 
     char txid_hex[65];
@@ -1061,13 +1084,21 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
     if (!tx_hex) return 0;
     hex_encode(signed_tx, signed_tx_len, tx_hex);
 
+    char *poison_hex = NULL;
+    if (poison_tx && poison_tx_len > 0) {
+        poison_hex = malloc(poison_tx_len * 2 + 1);
+        if (!poison_hex) { free(tx_hex); return 0; }
+        hex_encode(poison_tx, poison_tx_len, poison_hex);
+    }
+
     sqlite3_stmt *stmt;
     const char *sql =
         "INSERT OR REPLACE INTO ps_leaf_chains "
-        "(factory_id, leaf_node_idx, chain_pos, txid, signed_tx_hex, chan_amount_sats) "
-        "VALUES (?, ?, ?, ?, ?, ?);";
+        "(factory_id, leaf_node_idx, chain_pos, txid, signed_tx_hex, chan_amount_sats, poison_tx_hex) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         free(tx_hex);
+        free(poison_hex);
         return 0;
     }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
@@ -1076,25 +1107,34 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
     sqlite3_bind_text(stmt, 4, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 5, tx_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 6, (sqlite3_int64)chan_amount_sats);
+    if (poison_hex)
+        sqlite3_bind_text(stmt, 7, poison_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 7);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     free(tx_hex);
+    free(poison_hex);
     return ok;
 }
 
 /* Load PS leaf chain for a given leaf node.
    Fills chain_txs_out (caller-allocated array of tx_buf_t, size max_chain).
    txids_out: caller-allocated [max_chain][32] for internal-order txids.
+   poison_txs_out: optional per-entry poison TX bytes (v22).  Entries with
+   no persisted poison are left zeroed (data=NULL, len=0).
    Returns number of chain entries loaded (0 = no PS chain or error). */
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
-                           uint64_t *amounts_out, int max_chain) {
+                           uint64_t *amounts_out,
+                           tx_buf_t *poison_txs_out, int max_chain) {
     if (!p || !p->db || !chain_txs_out || !txids_out || max_chain <= 0) return 0;
 
     sqlite3_stmt *stmt;
     const char *sql =
-        "SELECT chain_pos, txid, signed_tx_hex, chan_amount_sats FROM ps_leaf_chains "
+        "SELECT chain_pos, txid, signed_tx_hex, chan_amount_sats, poison_tx_hex "
+        "FROM ps_leaf_chains "
         "WHERE factory_id=? AND leaf_node_idx=? ORDER BY chain_pos ASC;";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(stmt, 1, (int)factory_id);
@@ -1128,6 +1168,26 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
         if (amounts_out)
             amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
 
+        /* Optional v22 poison TX column (NULL on pre-v22 rows or when no
+           poison TX was signed for this advance). */
+        if (poison_txs_out) {
+            memset(&poison_txs_out[count], 0, sizeof(tx_buf_t));
+            const char *poison_hex = (const char *)sqlite3_column_text(stmt, 4);
+            if (poison_hex) {
+                size_t poison_hex_len = strlen(poison_hex);
+                size_t poison_len = poison_hex_len / 2;
+                if (poison_len > 0) {
+                    tx_buf_init(&poison_txs_out[count], (int)poison_len);
+                    if (!hex_decode(poison_hex,
+                                    poison_txs_out[count].data, poison_len)) {
+                        tx_buf_free(&poison_txs_out[count]);
+                    } else {
+                        poison_txs_out[count].len = poison_len;
+                    }
+                }
+            }
+        }
+
         count++;
     }
     sqlite3_finalize(stmt);
@@ -1141,7 +1201,9 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx, size_t signed_tx_len,
                                           uint64_t sales_stock_amount_sats,
-                                          const uint64_t *channel_amounts, int n_channels)
+                                          const uint64_t *channel_amounts, int n_channels,
+                                          const unsigned char *poison_tx,
+                                          size_t poison_tx_len)
 {
     if (!p || !p->db || !channel_amounts || n_channels <= 0 || n_channels > 16) return 0;
 
@@ -1153,13 +1215,22 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
     if (!tx_hex) return 0;
     hex_encode(signed_tx, signed_tx_len, tx_hex);
 
+    char *poison_hex = NULL;
+    if (poison_tx && poison_tx_len > 0) {
+        poison_hex = malloc(poison_tx_len * 2 + 1);
+        if (!poison_hex) { free(tx_hex); return 0; }
+        hex_encode(poison_tx, poison_tx_len, poison_hex);
+    }
+
     /* Build CSV: "amt0,amt1,...,amtN-1" — max 16 entries × 21 chars/u64 + commas + NUL. */
     char csv[16 * 22 + 1];
     int off = 0;
     for (int i = 0; i < n_channels; i++) {
         int n = snprintf(csv + off, sizeof(csv) - off, "%s%llu",
                          i ? "," : "", (unsigned long long)channel_amounts[i]);
-        if (n < 0 || (size_t)(off + n) >= sizeof(csv)) { free(tx_hex); return 0; }
+        if (n < 0 || (size_t)(off + n) >= sizeof(csv)) {
+            free(tx_hex); free(poison_hex); return 0;
+        }
         off += n;
     }
 
@@ -1167,10 +1238,11 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
     const char *sql =
         "INSERT OR REPLACE INTO ps_subfactory_chains "
         "(factory_id, sub_node_idx, chain_pos, txid, signed_tx_hex, "
-        " sales_stock_amount_sats, channel_amounts_csv) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+        " sales_stock_amount_sats, channel_amounts_csv, poison_tx_hex) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         free(tx_hex);
+        free(poison_hex);
         return 0;
     }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
@@ -1180,10 +1252,15 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
     sqlite3_bind_text(stmt, 5, tx_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 6, (sqlite3_int64)sales_stock_amount_sats);
     sqlite3_bind_text(stmt, 7, csv, -1, SQLITE_TRANSIENT);
+    if (poison_hex)
+        sqlite3_bind_text(stmt, 8, poison_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 8);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     free(tx_hex);
+    free(poison_hex);
     return ok;
 }
 
@@ -1191,7 +1268,8 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
                                     tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
                                     uint64_t *sales_stock_out,
                                     uint64_t (*channel_amounts_out)[16],
-                                    int *n_channels_out, int max_chain)
+                                    int *n_channels_out,
+                                    tx_buf_t *poison_txs_out, int max_chain)
 {
     if (!p || !p->db || !chain_txs_out || !txids_out || !sales_stock_out ||
         !channel_amounts_out || !n_channels_out || max_chain <= 0)
@@ -1199,7 +1277,8 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
 
     sqlite3_stmt *stmt;
     const char *sql =
-        "SELECT chain_pos, txid, signed_tx_hex, sales_stock_amount_sats, channel_amounts_csv "
+        "SELECT chain_pos, txid, signed_tx_hex, sales_stock_amount_sats, "
+        "       channel_amounts_csv, poison_tx_hex "
         "FROM ps_subfactory_chains "
         "WHERE factory_id=? AND sub_node_idx=? ORDER BY chain_pos ASC;";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
@@ -1248,6 +1327,26 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
             if (*q == ',') q++;
         }
         n_channels_out[count] = nc;
+
+        /* Optional v22 poison TX column (NULL on pre-v22 rows or when no
+           poison TX was signed for this advance). */
+        if (poison_txs_out) {
+            memset(&poison_txs_out[count], 0, sizeof(tx_buf_t));
+            const char *poison_hex = (const char *)sqlite3_column_text(stmt, 5);
+            if (poison_hex) {
+                size_t poison_hex_len = strlen(poison_hex);
+                size_t poison_len = poison_hex_len / 2;
+                if (poison_len > 0) {
+                    tx_buf_init(&poison_txs_out[count], (int)poison_len);
+                    if (!hex_decode(poison_hex,
+                                    poison_txs_out[count].data, poison_len)) {
+                        tx_buf_free(&poison_txs_out[count]);
+                    } else {
+                        poison_txs_out[count].len = poison_len;
+                    }
+                }
+            }
+        }
 
         count++;
     }
@@ -1514,17 +1613,29 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         uint64_t       *sub_sstock  = calloc(PS_RESTORE_MAX, sizeof(uint64_t));
         uint64_t      (*sub_chans)[16] = calloc(PS_RESTORE_MAX, sizeof(uint64_t[16]));
         int            *sub_n_chans = calloc(PS_RESTORE_MAX, sizeof(int));
+        /* PR-B (v22): per-entry poison TX bytes for both leaf chains and
+           sub-factory chains.  Heap-allocated to keep ~100KB off the
+           stack — same rationale as chain_txs above. */
+        tx_buf_t       *leaf_poisons = calloc(PS_RESTORE_MAX, sizeof(tx_buf_t));
+        tx_buf_t       *sub_poisons  = calloc(PS_RESTORE_MAX, sizeof(tx_buf_t));
 
         if (chain_txs && chain_ids && chain_amts &&
-            sub_sstock && sub_chans && sub_n_chans) {
+            sub_sstock && sub_chans && sub_n_chans &&
+            leaf_poisons && sub_poisons) {
             for (int li = 0; li < f->n_leaf_nodes; li++) {
                 size_t node_idx = f->leaf_node_indices[li];
                 factory_node_t *node = &f->nodes[node_idx];
                 if (!node->is_ps_leaf) continue;
 
+                /* PR-B: load per-entry poison TX bytes alongside the chain
+                   so the recovery code can attach the latest poison TX to
+                   the in-memory leaf node — superscalar_lsp.c reads this
+                   from node->poison_signed_tx when re-registering with the
+                   watchtower after restart. */
+                memset(leaf_poisons, 0, PS_RESTORE_MAX * sizeof(tx_buf_t));
                 int count = persist_load_ps_chain(p, factory_id,
                     (uint32_t)node_idx, chain_txs, chain_ids, chain_amts,
-                    PS_RESTORE_MAX);
+                    leaf_poisons, PS_RESTORE_MAX);
 
                 if (count > 0) {
                     /* chain[0] txid is node->txid as set by factory_build_tree
@@ -1555,11 +1666,32 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                     node->signed_tx.len = last->len;
                     node->is_signed = 1;
 
+                    /* PR-B: restore the latest entry's poison TX so that
+                       superscalar_lsp.c's recovery branch can re-register
+                       (chain[N-1].txid → response=chain[N], poison) with
+                       the watchtower.  Older entries' poisons are dropped
+                       — this PR only recovers the most-recent advance to
+                       avoid the M-watch-entries-per-chain blow-up. */
+                    tx_buf_free(&node->poison_signed_tx);
+                    node->poison_is_signed = 0;
+                    if (leaf_poisons[count - 1].len > 0) {
+                        tx_buf_init(&node->poison_signed_tx,
+                                    (int)leaf_poisons[count - 1].len);
+                        memcpy(node->poison_signed_tx.data,
+                               leaf_poisons[count - 1].data,
+                               leaf_poisons[count - 1].len);
+                        node->poison_signed_tx.len = leaf_poisons[count - 1].len;
+                        node->poison_is_signed = 1;
+                    }
+
                     for (int j = 0; j < count; j++) tx_buf_free(&chain_txs[j]);
+                    for (int j = 0; j < count; j++) tx_buf_free(&leaf_poisons[j]);
 
                     printf("persist: PS leaf %d restored to chain_len=%d "
-                           "(%lu sats)\n", li, count,
-                           (unsigned long)node->outputs[0].amount_sats);
+                           "(%lu sats, poison_tx=%s)\n",
+                           li, count,
+                           (unsigned long)node->outputs[0].amount_sats,
+                           node->poison_is_signed ? "yes" : "no");
                 }
 
                 /* Sub-factory recovery (k² shape, v21).
@@ -1573,10 +1705,11 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                     if (sub_node_i < 0 || (size_t)sub_node_i >= f->n_nodes) continue;
                     factory_node_t *sub = &f->nodes[sub_node_i];
 
+                    memset(sub_poisons, 0, PS_RESTORE_MAX * sizeof(tx_buf_t));
                     int sub_count = persist_load_subfactory_chain(p, factory_id,
                         (uint32_t)sub_node_i,
                         chain_txs, chain_ids, sub_sstock, sub_chans, sub_n_chans,
-                        PS_RESTORE_MAX);
+                        sub_poisons, PS_RESTORE_MAX);
                     if (sub_count <= 0) continue;
 
                     /* Linkage parents (chain[0] is the sub's existing
@@ -1615,12 +1748,30 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                     sub->signed_tx.len = latest->len;
                     sub->is_signed = 1;
 
+                    /* PR-B: restore the latest sub-factory entry's poison TX
+                       so superscalar_lsp.c's recovery branch can re-register
+                       with the watchtower via watchtower_watch_subfactory_node. */
+                    tx_buf_free(&sub->poison_signed_tx);
+                    sub->poison_is_signed = 0;
+                    if (sub_poisons[last].len > 0) {
+                        tx_buf_init(&sub->poison_signed_tx,
+                                    (int)sub_poisons[last].len);
+                        memcpy(sub->poison_signed_tx.data,
+                               sub_poisons[last].data,
+                               sub_poisons[last].len);
+                        sub->poison_signed_tx.len = sub_poisons[last].len;
+                        sub->poison_is_signed = 1;
+                    }
+
                     for (int j = 0; j < sub_count; j++) tx_buf_free(&chain_txs[j]);
+                    for (int j = 0; j < sub_count; j++) tx_buf_free(&sub_poisons[j]);
 
                     printf("persist: PS sub-factory leaf=%d sub=%d restored to "
-                           "chain_len=%d (sales-stock %lu sats, %d channels)\n",
+                           "chain_len=%d (sales-stock %lu sats, %d channels, "
+                           "poison_tx=%s)\n",
                            li, si, sub_count,
-                           (unsigned long)sub->outputs[nc].amount_sats, nc);
+                           (unsigned long)sub->outputs[nc].amount_sats, nc,
+                           sub->poison_is_signed ? "yes" : "no");
                 }
             }
         }
@@ -1630,6 +1781,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         free(sub_sstock);
         free(sub_chans);
         free(sub_n_chans);
+        free(leaf_poisons);
+        free(sub_poisons);
         #undef PS_RESTORE_MAX
     }
 

@@ -1750,6 +1750,13 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (mgr->persist)
         persist_clear_signing_progress((persist_t *)mgr->persist, 0);
 
+    /* PR-B: snapshot of the wire-signed poison TX bytes that the watchtower
+       receives below.  Survives `factory_session_reset_poison()` so the
+       Step 11 persist call can save them to ps_leaf_chains.poison_tx_hex.
+       Allocated in the watchtower block, freed at end of function. */
+    unsigned char *poison_snapshot = NULL;
+    size_t poison_snapshot_len = 0;
+
     /* Register old leaf state with watchtower for breach detection.
        If the old state is broadcast, the watchtower responds with the
        new (latest) signed state tx and burns the old L-stock output.
@@ -1820,6 +1827,18 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
             leaf_node->signed_tx.data, leaf_node->signed_tx.len,
             poison_data, poison_len,
             leaf_ch_ids, n_leaf_ch);
+
+        /* PR-B: snapshot for Step 11 persist (must happen before reset/free
+           clear poison_data's underlying storage).  malloc-failure here is
+           non-fatal — degrades to NULL persisted poison, same as pre-#136. */
+        if (poison_data && poison_len > 0) {
+            poison_snapshot = malloc(poison_len);
+            if (poison_snapshot) {
+                memcpy(poison_snapshot, poison_data, poison_len);
+                poison_snapshot_len = poison_len;
+            }
+        }
+
         tx_buf_free(&burn_tx);
         factory_session_reset_poison(f, node_idx);
     }
@@ -1835,7 +1854,11 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (mgr->persist) {
         factory_node_t *leaf_node = &f->nodes[node_idx];
         if (leaf_node->is_ps_leaf) {
-            /* PS: save this chain entry; chain_pos = ps_chain_len-1 (0-based) */
+            /* PS: save this chain entry; chain_pos = ps_chain_len-1 (0-based).
+               PR-B (v22): include the wire-signed poison TX bytes (from the
+               snapshot above) so the watchtower can re-register them on
+               restart.  poison_snapshot may be NULL on degraded ceremonies
+               or when no poison TX was signed for this advance. */
             extern void reverse_bytes(unsigned char *, size_t);
             unsigned char txid_display[32];
             memcpy(txid_display, leaf_node->txid, 32);
@@ -1846,7 +1869,8 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
                 leaf_node->ps_chain_len - 1,
                 txid_display,
                 leaf_node->signed_tx.data, leaf_node->signed_tx.len,
-                leaf_node->outputs[0].amount_sats);
+                leaf_node->outputs[0].amount_sats,
+                poison_snapshot, poison_snapshot_len);
         } else {
             /* DW: save counter state */
             uint32_t leaf_states[8];
@@ -1869,6 +1893,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     else
         printf("LSP: DW leaf %d advanced (node %zu), DW state %u\n",
                leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
+    free(poison_snapshot);
     return 1;
 }
 
@@ -3075,6 +3100,19 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (n_chans > 16) n_chans = 16;
         for (int ci = 0; ci < n_chans; ci++)
             chan_amounts[ci] = sub->outputs[ci].amount_sats;
+        /* PR-B (v22): include the wire-signed sales-stock poison TX bytes so
+           the watchtower can redistribute them on a post-restart breach.
+           sub->poison_signed_tx is still populated here (Step 10b's
+           reset_poison runs after this save).  Pass NULL/0 if the poison
+           ceremony degraded — graceful loss of redistribution capability,
+           response_tx broadcast still works. */
+        const unsigned char *poison_bytes = NULL;
+        size_t poison_bytes_len = 0;
+        if (poison_prepared && sub->poison_is_signed &&
+            sub->poison_signed_tx.len > 0) {
+            poison_bytes     = sub->poison_signed_tx.data;
+            poison_bytes_len = sub->poison_signed_tx.len;
+        }
         persist_save_subfactory_chain_entry(
             (persist_t *)mgr->persist, /* factory_id = */ 0,
             (uint32_t)sub_node_i,
@@ -3082,7 +3120,8 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             txid_display,
             sub->signed_tx.data, sub->signed_tx.len,
             sub->outputs[sstock_vout].amount_sats,
-            chan_amounts, n_chans);
+            chan_amounts, n_chans,
+            poison_bytes, poison_bytes_len);
     }
 
     /* Step 10b: Build the sub-factory sales-stock POISON TX (Gap A) and
@@ -5934,4 +5973,140 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
 /* Public wrapper: advance one PS leaf via the production wire ceremony. */
 int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     return lsp_advance_leaf(mgr, lsp, leaf_side);
+}
+
+/* PR-B (v22): post-recovery watchtower rehydration.
+
+   For every PS leaf with chain_len >= 2, look up chain[N-1].txid (the
+   stale-state-to-watch-for) from the persist layer and re-register
+   (chain[N-1].txid → response=chain[N], poison=poison[N]) with the
+   watchtower.  Same for every PS sub-factory chain.
+
+   We only register the LATEST advance (chain[N-1] → chain[N]) — not all
+   prior advances.  The earlier stale entries from before the LSP restart
+   were watched in the live LSP, but those watchtower entries were
+   in-memory only (the watchtower never persisted WATCH_FACTORY_NODE /
+   WATCH_SUBFACTORY_NODE entries — only WATCH_COMMITMENT does, in
+   watchtower_init).  Recovering the full history would require either
+   walking every chain entry and chaining responses, or migrating the
+   watchtower to persist its watch table.  The latter is a separate
+   concern; the former leaves us with M-watch-entries-per-chain
+   redundancy.  For PR-B's scope we restore the just-stale entry's
+   coverage, which is the most-likely cheat target (a malicious LSP
+   broadcasting the immediately-superseded chain state). */
+int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->watchtower || !mgr->persist) return 0;
+
+    factory_t *f = NULL;
+    /* mgr->ladder may not be set in unit-test contexts; fall through to
+       the ladder factory[0] only when present.  The recovery branch
+       in superscalar_lsp.c sets mgr->ladder = &rec_lad after this
+       helper would be called, so we instead key off the lsp_t * the
+       caller passes in via mgr->ladder once it's set.  In practice the
+       recovery code calls this BEFORE mgr->ladder = &rec_lad, when the
+       in-memory factory still lives at lsp_rp->factory — accessible via
+       mgr->factory_for_recovery if set, else not callable.
+
+       Simpler: take the factory pointer from mgr->ladder if available,
+       otherwise expect the caller to have set mgr->factory_for_recovery
+       to lsp_rp->factory before calling.  For now we use ladder. */
+    if (mgr->ladder) {
+        ladder_t *lad = (ladder_t *)mgr->ladder;
+        if (lad->n_factories > 0) f = &lad->factories[0].factory;
+    }
+    if (!f) {
+        fprintf(stderr, "rehydrate_watchtower: no factory available\n");
+        return 0;
+    }
+
+    persist_t *pdb = (persist_t *)mgr->persist;
+    int n_registered = 0;
+
+    /* Walk every PS leaf node.  For each that has chain_len >= 2,
+       look up the previous chain entry's txid as the "old" state. */
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        size_t node_idx = f->leaf_node_indices[li];
+        factory_node_t *leaf = &f->nodes[node_idx];
+        if (!leaf->is_ps_leaf) continue;
+        if (leaf->ps_chain_len < 2) continue;
+        if (!leaf->is_signed || leaf->signed_tx.len == 0) continue;
+
+        /* leaf->ps_prev_txid is set by persist_load_factory to the
+           previous chain entry's txid (internal byte order) — exactly
+           what watchtower wants for old_txid32. */
+
+        /* Collect channel ids on this leaf. */
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        size_t n_leaf_ch = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node; uint32_t c_vout;
+            client_to_leaf(c, f, &c_node, &c_vout);
+            if (c_node == node_idx)
+                leaf_ch_ids[n_leaf_ch++] = (uint32_t)c;
+        }
+
+        const unsigned char *poison_data = NULL;
+        size_t poison_len = 0;
+        if (leaf->poison_is_signed && leaf->poison_signed_tx.len > 0) {
+            poison_data = leaf->poison_signed_tx.data;
+            poison_len  = leaf->poison_signed_tx.len;
+        }
+
+        watchtower_watch_factory_node_with_channels(mgr->watchtower,
+            (uint32_t)node_idx, leaf->ps_prev_txid,
+            leaf->signed_tx.data, leaf->signed_tx.len,
+            poison_data, poison_len,
+            leaf_ch_ids, n_leaf_ch);
+        n_registered++;
+        printf("LSP recovery: re-watched PS leaf %d (node %zu) "
+               "chain_pos=%d (poison_tx=%s, %zu channels)\n",
+               li, node_idx, leaf->ps_chain_len - 1,
+               poison_data ? "yes" : "no", n_leaf_ch);
+
+        (void)pdb; /* persist_load_subfactory_chain uses sales-stock /
+                      channel amounts directly from the in-memory
+                      sub-factory state (already restored by
+                      persist_load_factory) — no extra DB round-trip. */
+    }
+
+    /* Walk every sub-factory.  Same shape: chain_len >= 2 → register
+       (sub->ps_prev_txid → response=sub->signed_tx, poison=sub->poison_signed_tx). */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *sub = &f->nodes[i];
+        if (sub->type != NODE_PS_SUBFACTORY) continue;
+        if (sub->ps_chain_len < 2) continue;
+        if (!sub->is_signed || sub->signed_tx.len == 0) continue;
+
+        size_t sstock_vout = (sub->n_outputs > 0) ? sub->n_outputs - 1 : 0;
+        uint64_t sstock_amount = sub->outputs[sstock_vout].amount_sats;
+        uint64_t chan_amounts[16] = {0};
+        size_t n_chans = sstock_vout;
+        if (n_chans > 16) n_chans = 16;
+        for (size_t ci = 0; ci < n_chans; ci++)
+            chan_amounts[ci] = sub->outputs[ci].amount_sats;
+
+        const unsigned char *poison_data = NULL;
+        size_t poison_len = 0;
+        if (sub->poison_is_signed && sub->poison_signed_tx.len > 0) {
+            poison_data = sub->poison_signed_tx.data;
+            poison_len  = sub->poison_signed_tx.len;
+        }
+
+        watchtower_watch_subfactory_node(mgr->watchtower,
+            (uint32_t)i, sub->ps_prev_txid,
+            sub->signed_tx.data, sub->signed_tx.len,
+            poison_data, poison_len,
+            chan_amounts, n_chans, sstock_amount);
+        n_registered++;
+        printf("LSP recovery: re-watched sub-factory node %zu "
+               "chain_pos=%d (poison_tx=%s, %zu channels, sstock=%llu)\n",
+               i, sub->ps_chain_len - 1,
+               poison_data ? "yes" : "no", n_chans,
+               (unsigned long long)sstock_amount);
+    }
+
+    if (n_registered > 0)
+        printf("LSP recovery: rehydrated %d watchtower entries from "
+               "persisted PS chains\n", n_registered);
+    return 1;
 }

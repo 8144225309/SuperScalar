@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 21
+#define PERSIST_SCHEMA_VERSION 22
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -64,34 +64,50 @@ int persist_has_factory(persist_t *p, uint32_t factory_id);
 
 /* Save one PS chain entry (call after each PS leaf advance).
    chain_pos: index of this entry (0 = initial state, equals old ps_chain_len).
-   txid_display: 32-byte display-order txid.  chan_amount_sats: channel vout amount. */
+   txid_display: 32-byte display-order txid.  chan_amount_sats: channel vout amount.
+   poison_tx / poison_tx_len (v22): the L-stock poison TX co-signed by all
+   leaf signers when this advance was made.  Pass NULL/0 if no poison TX
+   was signed for this advance (e.g. the initial chain[0] entry, which has
+   no preceding stale state to poison). */
 int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint32_t leaf_node_idx, int chain_pos,
                                  const unsigned char *txid_display,
                                  const unsigned char *signed_tx, size_t signed_tx_len,
-                                 uint64_t chan_amount_sats);
+                                 uint64_t chan_amount_sats,
+                                 const unsigned char *poison_tx,
+                                 size_t poison_tx_len);
 
 /* Load all PS chain entries for a leaf in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
    txids_out: caller-allocated [max_chain][32] internal-order txids.
    amounts_out: caller-allocated uint64_t[max_chain] channel amounts; may be NULL.
+   poison_txs_out: caller-allocated tx_buf_t[max_chain] for per-entry poison
+                   TX bytes (v22). Entries with no persisted poison TX are
+                   left zero-initialized (data=NULL, len=0). May be NULL.
+                   Caller must tx_buf_free() each non-empty entry.
    Returns number of entries loaded, 0 on error or no PS chain. */
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
-                           uint64_t *amounts_out, int max_chain);
+                           uint64_t *amounts_out,
+                           tx_buf_t *poison_txs_out, int max_chain);
 
 /* --- Pseudo-Spilman SUB-FACTORY chain persistence (k² shape) --- */
 
 /* Save one sub-factory chain entry. Each entry has per-channel amounts plus
    the trailing sales-stock amount (the sub-factory analogue of the L-stock
    on the parent leaf). channel_amounts[]: amount per child channel,
-   length = n_channels. The sales_stock vout is the last output. */
+   length = n_channels. The sales_stock vout is the last output.
+   poison_tx / poison_tx_len (v22): the sales-stock poison TX co-signed by
+   all sub-factory signers when this advance was made.  Pass NULL/0 if no
+   poison TX was signed for this advance. */
 int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           uint32_t sub_node_idx, int chain_pos,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx, size_t signed_tx_len,
                                           uint64_t sales_stock_amount_sats,
-                                          const uint64_t *channel_amounts, int n_channels);
+                                          const uint64_t *channel_amounts, int n_channels,
+                                          const unsigned char *poison_tx,
+                                          size_t poison_tx_len);
 
 /* Load all sub-factory chain entries for a sub-factory node in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain].
@@ -99,12 +115,17 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
    sales_stock_out: caller-allocated uint64_t[max_chain] sales-stock amounts.
    channel_amounts_out: caller-allocated uint64_t[max_chain][max_channels].
    n_channels_out: caller-allocated int[max_chain] number of channels per entry.
+   poison_txs_out: caller-allocated tx_buf_t[max_chain] for per-entry poison
+                   TX bytes (v22). Entries with no persisted poison TX are
+                   left zero-initialized.  May be NULL.  Caller must
+                   tx_buf_free() each non-empty entry.
    Returns number of entries loaded, 0 on no entries or error. */
 int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t sub_node_idx,
                                     tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
                                     uint64_t *sales_stock_out,
                                     uint64_t (*channel_amounts_out)[16],
-                                    int *n_channels_out, int max_chain);
+                                    int *n_channels_out,
+                                    tx_buf_t *poison_txs_out, int max_chain);
 
 /* --- Client-side PS double-spend defense --- */
 
