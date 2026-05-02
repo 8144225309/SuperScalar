@@ -2818,7 +2818,13 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (mgr->watchtower && sub->ps_chain_len >= 1) {
         int have_poison = (poison_prepared && sub->poison_is_signed &&
                            sub->poison_signed_tx.len > 0);
-        if (!have_poison)
+        if (have_poison)
+            printf("LSP: sub-factory %d.%d wire-ceremony poison TX signed "
+                   "(%zu bytes, sales-stock %llu sats → %zu clients)\n",
+                   leaf_side, sub_idx_in_leaf,
+                   sub->poison_signed_tx.len,
+                   (unsigned long long)wt_old_sstock_amount, wt_old_n_chans);
+        else
             fprintf(stderr,
                     "LSP subfactory advance: registering watchtower without "
                     "poison TX (poison_prepared=%d, poison_is_signed=%d) — "
