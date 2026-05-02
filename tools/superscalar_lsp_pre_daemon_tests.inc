@@ -1331,22 +1331,60 @@
                                 regtest_mine_blocks(&rt, 5, mine_addr);
                                 sleep(2);
 
-                                /* Diagnostic: what's in the watchtower? */
-                                printf("  watchtower has %zu entries:\n",
-                                       mgr->watchtower->n_entries);
+                                /* Diagnostic: what's in the watchtower(s)?
+                                   There are TWO instances in this binary:
+                                   - mgr->watchtower (static `wt` allocated
+                                     in superscalar_lsp.c daemon path)
+                                   - g_watchtower (global, used by the
+                                     on_new_block callback)
+                                   The wire ceremony's
+                                   watchtower_watch_subfactory_node call
+                                   uses mgr->watchtower.  But the daemon's
+                                   block-event callback uses g_watchtower.
+                                   If they're different, the entry might be
+                                   in only one of them. */
+                                fflush(stdout);
+                                fprintf(stderr,
+                                    "DBG: mgr->watchtower=%p &g_watchtower=%p "
+                                    "ready=%d same=%d\n",
+                                    (void *)mgr->watchtower,
+                                    (void *)&g_watchtower,
+                                    g_watchtower_ready,
+                                    mgr->watchtower == &g_watchtower);
+                                fflush(stderr);
+                                fprintf(stderr,
+                                    "DBG: mgr->watchtower has %zu entries:\n",
+                                    mgr->watchtower->n_entries);
                                 for (size_t we = 0;
                                      we < mgr->watchtower->n_entries; we++) {
                                     watchtower_entry_t *en =
                                         &mgr->watchtower->entries[we];
-                                    printf("    entry[%zu] type=%d ch=%u "
-                                           "resp_len=%zu burn_len=%zu "
-                                           "penalty_broadcast=%d\n",
-                                           we, (int)en->type,
-                                           en->channel_id,
-                                           en->response_tx_len,
-                                           en->burn_tx_len,
-                                           en->penalty_broadcast);
+                                    fprintf(stderr,
+                                        "DBG:   mgr_entry[%zu] type=%d ch=%u "
+                                        "resp_len=%zu burn_len=%zu pb=%d\n",
+                                        we, (int)en->type,
+                                        en->channel_id,
+                                        en->response_tx_len,
+                                        en->burn_tx_len,
+                                        en->penalty_broadcast);
                                 }
+                                fprintf(stderr,
+                                    "DBG: g_watchtower has %zu entries:\n",
+                                    g_watchtower.n_entries);
+                                for (size_t we = 0;
+                                     we < g_watchtower.n_entries; we++) {
+                                    watchtower_entry_t *en =
+                                        &g_watchtower.entries[we];
+                                    fprintf(stderr,
+                                        "DBG:   g_entry[%zu] type=%d ch=%u "
+                                        "resp_len=%zu burn_len=%zu pb=%d\n",
+                                        we, (int)en->type,
+                                        en->channel_id,
+                                        en->response_tx_len,
+                                        en->burn_tx_len,
+                                        en->penalty_broadcast);
+                                }
+                                fflush(stderr);
 
                                 int detected =
                                     watchtower_check(mgr->watchtower);
