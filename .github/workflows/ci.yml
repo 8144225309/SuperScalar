@@ -185,11 +185,17 @@ jobs:
       - name: Install Bitcoin Core
         run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
       - name: Configure regtest
+        # The bash harnesses (set -euo pipefail) grep `^datadir=` from this
+        # conf with no `|| true` fallback — under pipefail, an empty match
+        # kills the script before any reset logic runs.  Include datadir
+        # explicitly so the harness's reset path (rm -rf $datadir/regtest)
+        # has something to act on.
         run: |
           mkdir -p ~/.bitcoin
           cat > ~/.bitcoin/bitcoin.conf <<CONF
           regtest=1
           server=1
+          datadir=/home/runner/.bitcoin
           rpcuser=rpcuser
           rpcpassword=rpcpass
           fallbackfee=0.00001
