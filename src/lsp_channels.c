@@ -2603,21 +2603,51 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             chan_amounts, n_chans);
     }
 
-    /* Step 10b: Register the now-stale chain[N-1] with the watchtower
-       (Phase 4b).  If the LSP later attempts to confirm chain[N-1] on
-       the chain (rolling sub-factory state back), the watchtower will
-       broadcast our latest signed chain[N] and the poison TX (when the
-       builder lands in a follow-up PR; passed NULL here for now).
-       Per-channel amounts at chain[N-1] are recorded so the future
-       poison-TX builder can attribute outputs back to clients. */
+    /* Step 10b: Build the sub-factory sales-stock POISON TX (Gap A) and
+       register the now-stale chain[N-1] with the watchtower (Phase 4b).
+
+       The sub-factory's sales-stock SPK has the same shape as a PS
+       leaf's L-stock (or(N-of-N, L&CSV) per t/1242), so the existing
+       factory_sign_l_stock_poison_tx builder works directly here — its
+       authority is the passed factory_node_t's keyagg, which on a
+       sub-factory is the (LSP + sub-factory clients) MuSig.
+
+       The poison TX spends chain[N-1]'s sales-stock UTXO (txid =
+       wt_old_chain_txid, vout = old_n_outputs - 1, amount =
+       wt_old_sstock_amount) and pays each sub-factory client an equal
+       share, less fee.  Pre-signed at advance time so any client /
+       watchtower can broadcast it on breach without coordination. */
     if (mgr->watchtower && sub->ps_chain_len >= 2) {
+        tx_buf_t poison_tx;
+        tx_buf_init(&poison_tx, 256);
+        uint32_t old_sstock_vout = (uint32_t)wt_old_n_chans;  /* trailing */
+        const uint64_t POISON_FEE_SATS = 1000;  /* matches PS leaf default */
+        int poison_ok = 0;
+        if (wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
+            poison_ok = factory_sign_l_stock_poison_tx(
+                f, sub,
+                wt_old_chain_txid, old_sstock_vout,
+                wt_old_sstock_amount, POISON_FEE_SATS,
+                &poison_tx);
+            if (!poison_ok)
+                fprintf(stderr,
+                        "LSP subfactory advance: poison TX sign failed "
+                        "(sub=%d, sstock=%llu sats) — registering watchtower "
+                        "without poison\n",
+                        sub_node_i,
+                        (unsigned long long)wt_old_sstock_amount);
+        }
+
         watchtower_watch_subfactory_node(mgr->watchtower,
             (uint32_t)sub_node_i,
             wt_old_chain_txid,
             sub->signed_tx.data, sub->signed_tx.len,
-            /* poison_tx */ NULL, 0,
+            poison_ok ? poison_tx.data : NULL,
+            poison_ok ? poison_tx.len  : 0,
             wt_old_chan_amounts, wt_old_n_chans,
             wt_old_sstock_amount);
+
+        tx_buf_free(&poison_tx);
     }
 
     /* Step 11: Broadcast DONE to all sub-factory clients. */
