@@ -45,13 +45,20 @@ CLIENT4DB="$DATADIR/client4.db"
 #   N_CLIENTS=8 ARITY=3 STATIC_NEAR_ROOT=0 bash tools/signet_setup.sh demo-coop
 #   N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1 bash tools/signet_setup.sh demo-force-close
 #   N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2 bash tools/signet_setup.sh demo-force-close
+#   N_CLIENTS=4 ARITY=3 PS_SUBFACTORY_ARITY=2 bash tools/signet_setup.sh demo-k2-subfactory
 #
 # Defaults follow PS-first canonical positioning (PR #102): arity-3 (PS leaves)
 # at 4 clients with no static-near-root.  See docs/factory-arity.md and
 # docs/signet-ps-n8-procedure.md for the recommended canonical shapes.
+#
+# PS_SUBFACTORY_ARITY: k for the canonical k² PS shape from t/1242.  k=1
+# (default) keeps the historical 1-client-per-PS-leaf layout; k>1 places
+# k clients in each of k sub-factories per leaf (k² clients per leaf, with
+# sub-factory chain extension via lsp_subfactory_chain_advance).
 N_CLIENTS="${N_CLIENTS:-4}"
 ARITY="${ARITY:-3}"
 STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-0}"
+PS_SUBFACTORY_ARITY="${PS_SUBFACTORY_ARITY:-1}"
 # LSP listening port. Default 9735 (LN convention) but VPS hosts that already
 # run a production lightningd on 9735 must override (e.g. LSP_PORT=9745).
 LSP_PORT="${LSP_PORT:-9735}"
@@ -62,6 +69,14 @@ SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
 lsp_static_args() {
     if [ "${STATIC_NEAR_ROOT:-0}" -gt 0 ] 2>/dev/null; then
         printf -- "--static-near-root %s" "$STATIC_NEAR_ROOT"
+    fi
+}
+
+# Build the optional --ps-subfactory-arity LSP CLI fragment.  Empty when 1
+# so default 1-client-per-PS-leaf invocations stay bit-identical.
+lsp_subfactory_args() {
+    if [ "${PS_SUBFACTORY_ARITY:-1}" -gt 1 ] 2>/dev/null; then
+        printf -- "--ps-subfactory-arity %s" "$PS_SUBFACTORY_ARITY"
     fi
 }
 
@@ -536,9 +551,10 @@ cmd_start_lsp() {
     if pgrep -f "superscalar_lsp" &>/dev/null; then
         info "LSP is already running"
     else
-        step "Starting LSP ($N_CLIENTS clients, 200k sats, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, signet)..."
-        # step-blocks=1 for fast demo; --arity / --static-near-root come from
-        # the env-var block at the top of this script (PS-first defaults).
+        step "Starting LSP ($N_CLIENTS clients, 200k sats, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, ps-subfactory-arity=$PS_SUBFACTORY_ARITY, signet)..."
+        # step-blocks=1 for fast demo; --arity / --static-near-root /
+        # --ps-subfactory-arity come from the env-var block at the top of
+        # this script (PS-first defaults).
         "$SCBIN/superscalar_lsp" \
                 --network signet \
                 --cli-path "$BTCBIN/bitcoin-cli" \
@@ -549,6 +565,7 @@ cmd_start_lsp() {
                 --amount 200000 \
                 --arity "$ARITY" \
                 $(lsp_static_args) \
+                $(lsp_subfactory_args) \
                 --step-blocks 1 \
                 --daemon \
                 --db "$LSPDB" \
@@ -724,7 +741,7 @@ cmd_demo_coop() {
     # Clean DBs for fresh demo
     rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting cooperative close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT)..."
+    step "Starting cooperative close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, ps-subfactory-arity=$PS_SUBFACTORY_ARITY)..."
     detail "This will: connect $N_CLIENTS clients → create factory → run payments → cooperative close"
     detail "On signet, factory creation waits for funding tx confirmation (~10 min)."
 
@@ -739,6 +756,7 @@ cmd_demo_coop() {
             --amount 200000 \
             --arity "$ARITY" \
             $(lsp_static_args) \
+            $(lsp_subfactory_args) \
             --step-blocks 1 \
             --demo \
             --db "$LSPDB" \
@@ -786,10 +804,10 @@ cmd_demo_force_close() {
     # Clean DBs for fresh demo
     rm -f "$LSPDB" "$DATADIR"/client*.db
 
-    step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT)..."
+    step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, ps-subfactory-arity=$PS_SUBFACTORY_ARITY)..."
     detail "This will: connect $N_CLIENTS clients → create factory → run payments → broadcast tree → wait for confirmations"
     detail "On signet with step-blocks=1, each node needs ~10 min per block of relative timelock."
-    detail "Tree shape and ewt depend on \$ARITY and \$STATIC_NEAR_ROOT — see docs/signet-ps-n8-procedure.md."
+    detail "Tree shape and ewt depend on \$ARITY, \$STATIC_NEAR_ROOT, and \$PS_SUBFACTORY_ARITY — see docs/signet-ps-n8-procedure.md."
 
     # Start LSP in background first
     "$SCBIN/superscalar_lsp" \
@@ -802,6 +820,7 @@ cmd_demo_force_close() {
             --amount 200000 \
             --arity "$ARITY" \
             $(lsp_static_args) \
+            $(lsp_subfactory_args) \
             --step-blocks 1 \
             --demo \
             --force-close \
@@ -875,6 +894,7 @@ cmd_demo_breach() {
             --amount 200000 \
             --arity "$ARITY" \
             $(lsp_static_args) \
+            $(lsp_subfactory_args) \
             --step-blocks 1 \
             --demo \
             --cheat-daemon \
@@ -936,6 +956,103 @@ cmd_demo_breach() {
         info "Breach demo PASSED — watchtower detected and penalized!"
     else
         fail "Breach demo FAILED — check logs in $LOGDIR/"
+    fi
+}
+
+# ==========================================================================
+# Demo: PS k² sub-factory chain extension (LSP + k² clients, --test-subfactory-advance)
+#
+# Drives the canonical k² PS shape from t/1242: each PS leaf hosts k
+# sub-factories of k clients each.  After factory creation the LSP runs
+# lsp_subfactory_chain_advance to extend a sub-factory's chain (sells
+# liquidity from sales-stock to one client), and persistence (Phase 4c)
+# + watchtower (Phase 4b) keep the new chain entry durable.
+#
+# Required env: PS_SUBFACTORY_ARITY=k (k>=2).  N_CLIENTS must equal
+# n_leaves * k * k for the canonical shape (e.g. ARITY=3 → 1 leaf,
+# PS_SUBFACTORY_ARITY=2 → k²=4 → N_CLIENTS=4).
+# ==========================================================================
+
+cmd_demo_k2_subfactory() {
+    local NET="${2:-signet}"
+    header "Demo: PS k² Sub-Factory Chain Extension ($NET)"
+
+    if [ "${PS_SUBFACTORY_ARITY:-1}" -lt 2 ] 2>/dev/null; then
+        fail "demo-k2-subfactory requires PS_SUBFACTORY_ARITY>=2"
+        detail "Try: PS_SUBFACTORY_ARITY=2 N_CLIENTS=4 ARITY=3 bash $0 demo-k2-subfactory"
+        exit 1
+    fi
+
+    mkdir -p "$LOGDIR"
+
+    step "Stopping any running SuperScalar processes..."
+    pkill -f "superscalar_lsp" 2>/dev/null || true
+    pkill -f "superscalar_client" 2>/dev/null || true
+    sleep 2
+
+    rm -f "$LSPDB" "$DATADIR"/client*.db
+
+    step "Starting k² sub-factory demo ($N_CLIENTS clients, arity-$ARITY, ps-subfactory-arity=$PS_SUBFACTORY_ARITY, $NET)..."
+    detail "This will: connect $N_CLIENTS clients → create factory with k² shape"
+    detail "→ LSP drives lsp_subfactory_chain_advance (extends a sub-factory chain)"
+    detail "→ Phase 4c persists the new chain entry to ps_subfactory_chains"
+    detail "→ Phase 4b registers chain[N-1] with watchtower for breach defense"
+    detail "→ Coop close to verify per-client deltas including the chain extension"
+
+    "$SCBIN/superscalar_lsp" \
+            --network "$NET" \
+            --cli-path "$BTCBIN/bitcoin-cli" \
+            --rpcuser "$RPCUSER" \
+            --rpcpassword "$RPCPASS" \
+            --port $LSP_PORT \
+            --clients "$N_CLIENTS" \
+            --amount 400000 \
+            --arity "$ARITY" \
+            $(lsp_static_args) \
+            $(lsp_subfactory_args) \
+            --step-blocks 1 \
+            --demo \
+            --test-subfactory-advance \
+            --db "$LSPDB" \
+            --keyfile "$DATADIR/lsp.key" \
+            --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
+        > "$LOGDIR/demo_k2_subfactory.log" 2>&1 &
+    LSP_PID=$!
+    sleep 2
+
+    _start_demo_clients "$NET" "$LSP_PORT" demo_k2_subfactory "--daemon"
+
+    wait "$LSP_PID"
+    LSP_EXIT=$?
+
+    for i in $(seq 1 "$N_CLIENTS"); do
+        eval "wait \$CLIENT${i}_PID 2>/dev/null || true"
+    done
+
+    echo ""
+    echo "=== LSP Output (last 80 lines) ==="
+    tail -80 "$LOGDIR/demo_k2_subfactory.log"
+
+    # Verify the chain extension actually persisted by looking at the LSP DB.
+    if [ -f "$LSPDB" ]; then
+        SUBFACTORY_ROWS=$(python3 -c "
+import sqlite3
+try:
+    db = sqlite3.connect('file:$LSPDB?mode=ro', uri=True)
+    n = db.execute('SELECT COUNT(*) FROM ps_subfactory_chains').fetchone()[0]
+    print(n)
+    db.close()
+except Exception as e:
+    print(f'err:{e}')
+" 2>/dev/null)
+        info "ps_subfactory_chains rows: $SUBFACTORY_ROWS"
+    fi
+
+    if [ "$LSP_EXIT" -eq 0 ]; then
+        info "k² sub-factory demo completed successfully!"
+        info "Per-client durability + watchtower coverage exercised end-to-end."
+    else
+        fail "Demo failed (exit=$LSP_EXIT). Check logs in $LOGDIR/"
     fi
 }
 
@@ -1236,10 +1353,12 @@ cmd_help() {
     echo "  11.  bash $0 start-client2      Start SuperScalar client 2 (daemon)"
     echo ""
     echo -e "${BOLD}Demo (standalone, no CLN needed):${NC}"
-    echo "       bash $0 demo-coop          Factory + payments + cooperative close"
-    echo "       bash $0 demo-force-close   Factory + payments + force close (tree broadcast)"
-    echo "       bash $0 demo-breach        Breach + watchtower penalty + CPFP (regtest default)"
-    echo "       bash $0 demo-breach-signet Breach + watchtower penalty + CPFP (signet)"
+    echo "       bash $0 demo-coop             Factory + payments + cooperative close"
+    echo "       bash $0 demo-force-close      Factory + payments + force close (tree broadcast)"
+    echo "       bash $0 demo-breach           Breach + watchtower penalty + CPFP (regtest default)"
+    echo "       bash $0 demo-breach-signet    Breach + watchtower penalty + CPFP (signet)"
+    echo "       bash $0 demo-k2-subfactory    PS k² sub-factory chain extension (signet default)"
+    echo "                                     Required env: PS_SUBFACTORY_ARITY=2 (or higher)"
     echo ""
     echo -e "${BOLD}Diagnostics:${NC}"
     echo "       bash $0 status             Full system status dump"
@@ -1278,6 +1397,7 @@ case "${1:-}" in
     demo-force-close)    cmd_demo_force_close ;;
     demo-breach)         cmd_demo_breach "$@" ;;
     demo-breach-signet)  cmd_demo_breach "$@" signet ;;
+    demo-k2-subfactory)  cmd_demo_k2_subfactory "$@" signet ;;
     status)              cmd_status ;;
     test-payment)        cmd_test_payment ;;
     dump-state)          cmd_dump_state ;;
