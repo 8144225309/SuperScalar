@@ -2627,7 +2627,35 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t old_sstock_vout = (uint32_t)wt_old_n_chans;  /* trailing */
         const uint64_t POISON_FEE_SATS = 1000;  /* matches PS leaf default */
         int poison_ok = 0;
-        if (wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
+
+        /* factory_sign_l_stock_poison_tx is a single-process primitive —
+           it requires f->keypairs[i] to hold every sub-factory signer's
+           seckey, which is only true when the LSP also owns the client
+           keys (unit tests, --demo single-process LSP).  In a real
+           multi-process LSP the clients hold their own keys and we'd
+           crash inside libsecp256k1 with "illegal argument".  Detect
+           multi-process by checking whether each non-LSP signer's
+           keypair has a non-zero seckey; if any are zero, skip the
+           poison build and register the watchtower with NULL poison_tx
+           (graceful degradation — the wire-ceremony equivalent that
+           gathers per-client partial sigs is the proper long-term fix,
+           tracked in CANONICAL_DESIGN_GAPS.md). */
+        int have_all_seckeys = 1;
+        for (size_t si = 1; si < sub->n_signers; si++) {
+            uint32_t pidx = sub->signer_indices[si];
+            unsigned char tmp[32];
+            if (!secp256k1_keypair_sec(lsp->ctx, tmp, &f->keypairs[pidx])) {
+                have_all_seckeys = 0;
+                break;
+            }
+            int all_zero = 1;
+            for (int b = 0; b < 32; b++) if (tmp[b]) { all_zero = 0; break; }
+            memset(tmp, 0, 32);
+            if (all_zero) { have_all_seckeys = 0; break; }
+        }
+
+        if (have_all_seckeys &&
+            wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
             poison_ok = factory_sign_l_stock_poison_tx(
                 f, sub,
                 wt_old_chain_txid, old_sstock_vout,
