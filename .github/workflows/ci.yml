@@ -161,6 +161,95 @@ jobs:
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
 
+  regtest-multiprocess-sanitizers:
+    runs-on: ubuntu-latest
+    name: Regtest Multi-Process (sanitizers)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: Cache Bitcoin Core binary
+        id: btc-cache
+        uses: actions/cache@v4
+        with:
+          path: bitcoin-28.1
+          key: bitcoin-core-28.1-x86_64
+      - name: Download Bitcoin Core 28.1
+        if: steps.btc-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/SHA256SUMS
+          grep "bitcoin-28.1-x86_64-linux-gnu.tar.gz" SHA256SUMS | sha256sum -c -
+          tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
+      - name: Install Bitcoin Core
+        run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+      - name: Configure regtest
+        # The bash harnesses (set -euo pipefail) grep `^datadir=` from this
+        # conf with no `|| true` fallback — under pipefail, an empty match
+        # kills the script before any reset logic runs.  Include datadir
+        # explicitly so the harness's reset path (rm -rf $datadir/regtest)
+        # has something to act on.
+        run: |
+          mkdir -p ~/.bitcoin
+          cat > ~/.bitcoin/bitcoin.conf <<CONF
+          regtest=1
+          server=1
+          txindex=1
+          datadir=/home/runner/.bitcoin
+          rpcuser=rpcuser
+          rpcpassword=rpcpass
+          fallbackfee=0.00001
+          [regtest]
+          rpcport=18443
+          CONF
+      # Build LSP/client/test binaries with ASan+LSan so the bash
+      # multi-process harnesses (which spawn these binaries as separate
+      # OS processes) catch heap leaks and aliasing in the wire-ceremony
+      # driver code paths (lsp_subfactory_chain_advance, lsp_advance_leaf,
+      # lsp_realloc_leaf — all introduced by PRs #136-#138).  These paths
+      # are NOT exercised by the C-binary regtest suite (`./test_superscalar
+      # --regtest` in regtest-tests above) — they only fire under the
+      # multi-process bash harnesses below.  Skip TSan: it would flag
+      # legitimate cross-process socket I/O as races and break the test.
+      - name: Build (Debug + ASan + LSan)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_SANITIZERS=ON \
+            -DENABLE_TSAN=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      # The bash harnesses default to /var/lib/bitcoind-regtest/bitcoin.conf
+      # then fall back to $HOME/bitcoin-regtest/bitcoin.conf — neither is
+      # the GitHub Actions setup (~/.bitcoin/bitcoin.conf).  Override via
+      # REGTEST_CONF env so the BCLI helper inside the harness uses the
+      # right config.
+      - name: Multi-process k² sub-factory advance (under ASan+LSan)
+        env:
+          # verify_asan_link_order=0: harness wraps binaries with `stdbuf -oL`
+          # which preloads libstdbuf.so via LD_PRELOAD before the ASan
+          # runtime — without the override ASan aborts at libinit.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_multiprocess_subfactory_advance.sh build
+      - name: Multi-process MuSig N=8 PS (under ASan+LSan)
+        env:
+          # verify_asan_link_order=0: harness wraps binaries with `stdbuf -oL`
+          # which preloads libstdbuf.so via LD_PRELOAD before the ASan
+          # runtime — without the override ASan aborts at libinit.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_multiprocess_musig_n8.sh build
+      - name: Stop bitcoind
+        if: always()
+        run: bitcoin-cli -regtest stop 2>/dev/null || true
+
   coverage:
     runs-on: ubuntu-latest
     name: Coverage
