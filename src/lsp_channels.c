@@ -2617,7 +2617,11 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        wt_old_sstock_amount) and pays each sub-factory client an equal
        share, less fee.  Pre-signed at advance time so any client /
        watchtower can broadcast it on breach without coordination. */
-    if (mgr->watchtower && sub->ps_chain_len >= 2) {
+    /* After the first advance, ps_chain_len == 1 (chain[0] → chain[1])
+       and chain[0] is already a stale state worth watching.  Guard at
+       >= 1 (not >= 2) so we register the watchtower entry on the very
+       first advance — the original >= 2 guard was a Phase 4b bug. */
+    if (mgr->watchtower && sub->ps_chain_len >= 1) {
         tx_buf_t poison_tx;
         tx_buf_init(&poison_tx, 256);
         uint32_t old_sstock_vout = (uint32_t)wt_old_n_chans;  /* trailing */
