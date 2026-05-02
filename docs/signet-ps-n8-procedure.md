@@ -23,7 +23,7 @@ to the broadcast threshold (without burning multi-hour wall-clock):
 
 - `signet_setup.sh` parses cleanly with all canonical env-var combinations
   (`N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1`, `N_CLIENTS=64 ARITY=2,4,8 STATIC_NEAR_ROOT=1`,
-  `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2`)
+  `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2`, `PS_SUBFACTORY_ARITY=2 N_CLIENTS=4 ARITY=3`)
 - `superscalar_lsp` binary recognizes `--arity 3,4` and `--static-near-root 1`
   on `--network signet`
 - Signet bitcoind reachable at `/var/lib/bitcoind-signet`; `superscalar_lsp`
@@ -57,6 +57,7 @@ check enforces at LSP startup.
 | `N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1` | 1 | 1 | 432  | 3 | mid-size mixed-arity (smallest live signet test) |
 | `N_CLIENTS=64 ARITY=2,4,8 STATIC_NEAR_ROOT=1` | 2 | 2 | 864  | 6 | scale-shape canonical (depth halved vs uniform) |
 | `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2` | 3 | 2 | 864 | 6 | maximum-scale canonical (the design target) |
+| `N_CLIENTS=4 ARITY=3 PS_SUBFACTORY_ARITY=2` | 1 | 1 | 432 | 3 | k² PS sub-factory canonical (Phase 4 durability target) |
 
 > **Note:** `N_CLIENTS=64 ARITY=3` (uniform PS at scale) computes to mainnet
 > ewt=2592 blocks, which **exceeds the BOLT-2016 ceiling** (2016 blocks).
@@ -135,6 +136,28 @@ ssh root@68.168.216.243 "cd /root/SuperScalar && N_CLIENTS=64 ARITY=2,4,8 STATIC
 ```
 ssh root@68.168.216.243 "cd /root/SuperScalar && N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2 bash tools/signet_setup.sh demo-force-close 2>&1 | tee /tmp/signet_n128_canonical_fc.log"
 ```
+
+#### 3e. k² PS sub-factory canonical (Phase 4 durability target)
+
+The canonical k² shape from t/1242: each PS leaf hosts k sub-factories of k
+clients each (k² clients per leaf).  The dedicated `demo-k2-subfactory`
+subcommand exercises the chain-extension primitive
+(`lsp_subfactory_chain_advance`), then verifies the new chain entry survived
+into the v21 `ps_subfactory_chains` table (Phase 4c) and was registered with
+the watchtower as a stale state to defend against (Phase 4b).
+
+```
+ssh root@68.168.216.243 "cd /root/SuperScalar && PS_SUBFACTORY_ARITY=2 N_CLIENTS=4 ARITY=3 bash tools/signet_setup.sh demo-k2-subfactory 2>&1 | tee /tmp/signet_k2_subfactory.log"
+```
+
+Expected post-run state:
+- `ps_subfactory_chains` rows ≥1 in the LSP DB (the chain extension just
+  performed)
+- LSP log contains `"sub-factory ... chain extended to len 2"` and
+  `"persist: PS sub-factory ... chain_len=2"` lines
+- Watchtower has registered chain[0] as the stale state (visible by adding
+  `--cheat-daemon` for an end-to-end breach response — see follow-up PR
+  for the on-chain breach test on signet)
 
 The LSP prints `"shape ewt = N blocks (BOLT 2016 ceiling = 2016)"` at startup
 so the operator can verify the chosen shape was accepted. Then it streams
