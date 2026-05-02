@@ -2379,6 +2379,26 @@ int factory_session_prepare_poison_tx_subfactory(
     return 1;
 }
 
+int factory_session_prepare_poison_tx_leaf(
+    factory_t *f, size_t leaf_node_idx,
+    const unsigned char *old_leaf_txid32, uint32_t old_l_stock_vout,
+    uint64_t old_l_stock_amount_sats, uint64_t fee_sats)
+{
+    if (!f || leaf_node_idx >= f->n_nodes || !old_leaf_txid32) return 0;
+    factory_node_t *leaf = &f->nodes[leaf_node_idx];
+
+    factory_session_reset_poison(f, leaf_node_idx);
+    tx_buf_init(&leaf->poison_unsigned_tx, 256);
+    if (!factory_build_l_stock_poison_tx_unsigned(
+            f, leaf, old_leaf_txid32, old_l_stock_vout,
+            old_l_stock_amount_sats, fee_sats,
+            &leaf->poison_unsigned_tx, leaf->poison_sighash)) {
+        factory_session_reset_poison(f, leaf_node_idx);
+        return 0;
+    }
+    return 1;
+}
+
 int factory_session_init_node_poison(factory_t *f, size_t node_idx) {
     if (!f || node_idx >= f->n_nodes) return 0;
     factory_node_t *node = &f->nodes[node_idx];

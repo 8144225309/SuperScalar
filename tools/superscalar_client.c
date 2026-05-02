@@ -1727,7 +1727,7 @@ handle_message:
             int leaf_side;
             unsigned char lsp_pubnonce_ser[66];
             if (!wire_parse_leaf_advance_propose(msg.json, &leaf_side,
-                                                    lsp_pubnonce_ser)) {
+                                                    lsp_pubnonce_ser, NULL)) {
                 fprintf(stderr, "Client %u: bad LEAF_ADVANCE_PROPOSE\n", my_index);
                 cJSON_Delete(msg.json);
                 break;
@@ -1822,7 +1822,7 @@ handle_message:
             musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
 
             cJSON *psig_json = wire_build_leaf_advance_psig(
-                my_pubnonce_ser, my_psig_ser);
+                my_pubnonce_ser, my_psig_ser, NULL, NULL);
             wire_send(fd, MSG_LEAF_ADVANCE_PSIG, psig_json);
             cJSON_Delete(psig_json);
 

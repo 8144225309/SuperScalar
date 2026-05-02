@@ -554,20 +554,35 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 
-/* LSP -> Client: LEAF_ADVANCE_PROPOSE {leaf_side, pubnonce} */
+/* LSP -> Client: LEAF_ADVANCE_PROPOSE {leaf_side, pubnonce, [poison_pubnonce]}.
+   poison_pubnonce is OPTIONAL on the wire — when present it accompanies
+   the state pubnonce so the client can run two MuSig2 ceremonies in
+   lockstep (closes Wire-Ceremony Gap A for leaf advance: poison TX
+   defense in multi-process LSPs).  Pass `poison_pubnonce66 = NULL` to
+   either build or parse to skip the second nonce.  Parse return value:
+   0 = failure, 1 = state only, 2 = state + poison both parsed. */
 cJSON *wire_build_leaf_advance_propose(int leaf_side,
-                                        const unsigned char *pubnonce66);
+                                        const unsigned char *state_pubnonce66,
+                                        const unsigned char *poison_pubnonce66);
 
 int wire_parse_leaf_advance_propose(const cJSON *json, int *leaf_side,
-                                      unsigned char *pubnonce66);
+                                      unsigned char *state_pubnonce66,
+                                      unsigned char *poison_pubnonce66);
 
-/* Client -> LSP: LEAF_ADVANCE_PSIG {pubnonce, partial_sig} */
-cJSON *wire_build_leaf_advance_psig(const unsigned char *pubnonce66,
-                                      const unsigned char *partial_sig32);
+/* Client -> LSP: LEAF_ADVANCE_PSIG {pubnonce, partial_sig,
+                                       [poison_pubnonce, poison_partial_sig]}.
+   Same dual-sig semantics as PROPOSE — second pair is the client's
+   MuSig2 nonce + partial sig over the OLD state's poison TX sighash. */
+cJSON *wire_build_leaf_advance_psig(const unsigned char *state_pubnonce66,
+                                      const unsigned char *state_partial_sig32,
+                                      const unsigned char *poison_pubnonce66,
+                                      const unsigned char *poison_partial_sig32);
 
 int wire_parse_leaf_advance_psig(const cJSON *json,
-                                    unsigned char *pubnonce66,
-                                    unsigned char *partial_sig32);
+                                    unsigned char *state_pubnonce66,
+                                    unsigned char *state_partial_sig32,
+                                    unsigned char *poison_pubnonce66,
+                                    unsigned char *poison_partial_sig32);
 
 /* LSP -> All: LEAF_ADVANCE_DONE {leaf_side} */
 cJSON *wire_build_leaf_advance_done(int leaf_side);

@@ -4127,7 +4127,7 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memset(lsp_seckey, 0, 32);
     unsigned char lsp_pubnonce_ser[66];
     musig_pubnonce_serialize(ctx, lsp_pubnonce_ser, &lsp_pubnonce);
-    cJSON *propose_json = wire_build_leaf_advance_propose(0, lsp_pubnonce_ser);
+    cJSON *propose_json = wire_build_leaf_advance_propose(0, lsp_pubnonce_ser, NULL);
     TEST_ASSERT(propose_json != NULL, "build PROPOSE json");
     wire_msg_t propose = {0};
     propose.msg_type = 0x58;  /* MSG_LEAF_ADVANCE_PROPOSE — unused after

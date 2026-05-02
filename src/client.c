@@ -2914,16 +2914,48 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const wire_msg_t *propose_msg) {
     persist_t *persist = g_client_persist;
     int leaf_side;
-    unsigned char lsp_pubnonce_ser[66];
-    if (!wire_parse_leaf_advance_propose(propose_msg->json, &leaf_side, lsp_pubnonce_ser)) {
+    unsigned char lsp_pubnonce_ser[66], lsp_poison_pn_ser[66];
+    int propose_rc = wire_parse_leaf_advance_propose(propose_msg->json, &leaf_side,
+                                                       lsp_pubnonce_ser,
+                                                       lsp_poison_pn_ser);
+    if (propose_rc == 0) {
         fprintf(stderr, "Client %u: failed to parse LEAF_ADVANCE_PROPOSE\n", my_index);
         return 0;
+    }
+    int wire_poison_offered = (propose_rc == 2);
+
+    /* Snapshot OLD leaf state BEFORE applying the advance — needed to
+       deterministically prep the poison TX in lockstep with the LSP
+       (closes Wire-Ceremony Gap A for leaf advance). */
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
+    size_t pre_node_idx_c = factory->leaf_node_indices[leaf_side];
+    factory_node_t *pre_leaf = &factory->nodes[pre_node_idx_c];
+    unsigned char pre_old_leaf_txid[32];
+    memcpy(pre_old_leaf_txid, pre_leaf->txid, 32);
+    int pre_old_n_outputs = pre_leaf->n_outputs;
+    uint64_t pre_old_l_amount = (pre_old_n_outputs >= 2)
+                                ? pre_leaf->outputs[pre_old_n_outputs - 1].amount_sats
+                                : 0;
+    int pre_had_signed = (pre_leaf->is_signed && pre_leaf->signed_tx.len > 0);
+
+    const uint64_t LEAF_POISON_FEE_SATS = 1000;
+    int leaf_poison_prepared = 0;
+    if (wire_poison_offered && pre_had_signed && pre_old_n_outputs >= 2 &&
+        pre_old_l_amount > LEAF_POISON_FEE_SATS +
+                           (uint64_t)(pre_leaf->n_signers - 1) * 330u) {
+        if (factory_session_prepare_poison_tx_leaf(
+                factory, pre_node_idx_c,
+                pre_old_leaf_txid, (uint32_t)(pre_old_n_outputs - 1),
+                pre_old_l_amount, LEAF_POISON_FEE_SATS)) {
+            leaf_poison_prepared = 1;
+        }
     }
 
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
         fprintf(stderr, "Client %u: leaf %d advance_unsigned failed (rc=%d)\n",
                 my_index, leaf_side, rc);
+        factory_session_reset_poison(factory, pre_node_idx_c);
         return 0;
     }
 
@@ -2960,29 +2992,51 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
 
     if (!factory_session_init_node(factory, node_idx)) {
         fprintf(stderr, "Client %u: leaf %d session_init failed\n", my_index, leaf_side);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
+    if (leaf_poison_prepared &&
+        !factory_session_init_node_poison(factory, node_idx)) {
+        fprintf(stderr, "Client %u: leaf poison session init failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        leaf_poison_prepared = 0;
+    }
 
-    /* Set LSP nonce (participant 0) — received in PROPOSE */
+    /* Set LSP nonces (state + poison if prepared) — received in PROPOSE */
     int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
     if (lsp_slot < 0) {
         fprintf(stderr, "Client %u: LSP not signer on leaf node %zu\n", my_index, node_idx);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     secp256k1_musig_pubnonce lsp_pubnonce;
     if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser)) {
         fprintf(stderr, "Client %u: parse LSP pubnonce failed\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
         fprintf(stderr, "Client %u: set LSP nonce failed\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
+    if (leaf_poison_prepared) {
+        secp256k1_musig_pubnonce lsp_poison_pn;
+        if (!musig_pubnonce_parse(ctx, &lsp_poison_pn, lsp_poison_pn_ser) ||
+            !factory_session_set_nonce_poison(factory, node_idx, (size_t)lsp_slot,
+                                                &lsp_poison_pn)) {
+            fprintf(stderr, "Client %u: parse/set LSP poison nonce failed — degrading\n",
+                    my_index);
+            factory_session_reset_poison(factory, node_idx);
+            leaf_poison_prepared = 0;
+        }
+    }
 
-    /* Generate own nonce */
+    /* Generate own nonces (state + poison if prepared). */
     int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
     if (my_slot < 0) {
         fprintf(stderr, "Client %u: self not signer on leaf node %zu\n", my_index, node_idx);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
 
@@ -2990,45 +3044,83 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     secp256k1_pubkey my_pubkey;
     if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
         fprintf(stderr, "Client %u: keypair_sec failed\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    secp256k1_musig_secnonce my_secnonce;
-    secp256k1_musig_pubnonce my_pubnonce;
+    secp256k1_musig_secnonce my_secnonce, my_poison_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce, my_poison_pubnonce;
     if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
                                my_seckey, &my_pubkey,
                                &factory->nodes[node_idx].keyagg.cache)) {
-        fprintf(stderr, "Client %u: nonce gen failed\n", my_index);
+        fprintf(stderr, "Client %u: state nonce gen failed\n", my_index);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
+    }
+    if (leaf_poison_prepared &&
+        !musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
+                                my_seckey, &my_pubkey,
+                                &factory->nodes[node_idx].keyagg.cache)) {
+        fprintf(stderr, "Client %u: poison nonce gen failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        leaf_poison_prepared = 0;
     }
 
     if (!factory_session_set_nonce(factory, node_idx, (size_t)my_slot, &my_pubnonce)) {
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
+    }
+    if (leaf_poison_prepared &&
+        !factory_session_set_nonce_poison(factory, node_idx, (size_t)my_slot,
+                                            &my_poison_pubnonce)) {
+        fprintf(stderr, "Client %u: set own poison nonce failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        leaf_poison_prepared = 0;
     }
 
     if (!factory_session_finalize_node(factory, node_idx)) {
-        fprintf(stderr, "Client %u: session finalize failed\n", my_index);
+        fprintf(stderr, "Client %u: state session finalize failed\n", my_index);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
+    if (leaf_poison_prepared &&
+        !factory_session_finalize_node_poison(factory, node_idx)) {
+        fprintf(stderr, "Client %u: poison session finalize failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        leaf_poison_prepared = 0;
+    }
 
-    /* Create partial sig */
-    secp256k1_musig_partial_sig my_psig;
+    /* Create partial sigs (state + poison if prepared). */
+    secp256k1_musig_partial_sig my_psig, my_poison_psig;
     if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
                                     &factory->nodes[node_idx].signing_session)) {
-        fprintf(stderr, "Client %u: partial sig failed\n", my_index);
+        fprintf(stderr, "Client %u: state partial sig failed\n", my_index);
         memset(my_seckey, 0, 32);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
+    }
+    if (leaf_poison_prepared &&
+        !musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce, keypair,
+                                    &factory->nodes[node_idx].poison_signing_session)) {
+        fprintf(stderr, "Client %u: poison partial sig failed — degrading\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        leaf_poison_prepared = 0;
     }
     memset(my_seckey, 0, 32);
 
     /* Serialize now so we can record + send. */
     unsigned char my_pubnonce_ser[66], my_psig_ser[32];
+    unsigned char my_poison_pn_ser[66], my_poison_psig_ser[32];
     musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+    if (leaf_poison_prepared) {
+        musig_pubnonce_serialize(ctx, my_poison_pn_ser, &my_poison_pubnonce);
+        musig_partial_sig_serialize(ctx, my_poison_psig_ser, &my_poison_psig);
+    }
 
     /* PS defense: record what we just signed BEFORE releasing the partial
        sig over the wire. A crash after record + before send is safe —
@@ -3054,13 +3146,20 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
         }
     }
 
-    cJSON *psig_json = wire_build_leaf_advance_psig(my_pubnonce_ser, my_psig_ser);
+    cJSON *psig_json = wire_build_leaf_advance_psig(
+        my_pubnonce_ser, my_psig_ser,
+        leaf_poison_prepared ? my_poison_pn_ser : NULL,
+        leaf_poison_prepared ? my_poison_psig_ser : NULL);
     if (!wire_send(fd, MSG_LEAF_ADVANCE_PSIG, psig_json)) {
         fprintf(stderr, "Client %u: send LEAF_ADVANCE_PSIG failed\n", my_index);
         cJSON_Delete(psig_json);
+        factory_session_reset_poison(factory, node_idx);
         return 0;
     }
     cJSON_Delete(psig_json);
+    /* Free client poison-session memory now that we've contributed our
+       partial sig (LSP holds the canonical signed poison TX). */
+    factory_session_reset_poison(factory, node_idx);
 
     /* Wait for LEAF_ADVANCE_DONE */
     wire_msg_t done_msg;

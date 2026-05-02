@@ -1572,35 +1572,56 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
 /* --- Per-Leaf Advance messages (Upgrade 2) --- */
 
 cJSON *wire_build_leaf_advance_propose(int leaf_side,
-                                        const unsigned char *pubnonce66) {
+                                        const unsigned char *state_pubnonce66,
+                                        const unsigned char *poison_pubnonce66) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
-    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
+    if (poison_pubnonce66)
+        wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce66, 66);
     return j;
 }
 
+/* Returns: 0 on failure, 1 = state pubnonce parsed, 2 = state + poison parsed. */
 int wire_parse_leaf_advance_propose(const cJSON *json, int *leaf_side,
-                                      unsigned char *pubnonce66) {
+                                      unsigned char *state_pubnonce66,
+                                      unsigned char *poison_pubnonce66) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
-    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    if (wire_json_get_hex(json, "pubnonce", state_pubnonce66, 66) != 66) return 0;
+    if (poison_pubnonce66 &&
+        wire_json_get_hex(json, "poison_pubnonce", poison_pubnonce66, 66) == 66)
+        return 2;
     return 1;
 }
 
-cJSON *wire_build_leaf_advance_psig(const unsigned char *pubnonce66,
-                                      const unsigned char *partial_sig32) {
+cJSON *wire_build_leaf_advance_psig(const unsigned char *state_pubnonce66,
+                                      const unsigned char *state_partial_sig32,
+                                      const unsigned char *poison_pubnonce66,
+                                      const unsigned char *poison_partial_sig32) {
     cJSON *j = cJSON_CreateObject();
-    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
-    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
+    wire_json_add_hex(j, "partial_sig", state_partial_sig32, 32);
+    if (poison_pubnonce66 && poison_partial_sig32) {
+        wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce66, 66);
+        wire_json_add_hex(j, "poison_partial_sig", poison_partial_sig32, 32);
+    }
     return j;
 }
 
+/* Returns: 0 on failure, 1 = state-only parsed, 2 = state + poison parsed. */
 int wire_parse_leaf_advance_psig(const cJSON *json,
-                                    unsigned char *pubnonce66,
-                                    unsigned char *partial_sig32) {
-    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
-    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32) return 0;
+                                    unsigned char *state_pubnonce66,
+                                    unsigned char *state_partial_sig32,
+                                    unsigned char *poison_pubnonce66,
+                                    unsigned char *poison_partial_sig32) {
+    if (wire_json_get_hex(json, "pubnonce", state_pubnonce66, 66) != 66) return 0;
+    if (wire_json_get_hex(json, "partial_sig", state_partial_sig32, 32) != 32) return 0;
+    if (poison_pubnonce66 && poison_partial_sig32 &&
+        wire_json_get_hex(json, "poison_pubnonce", poison_pubnonce66, 66) == 66 &&
+        wire_json_get_hex(json, "poison_partial_sig", poison_partial_sig32, 32) == 32)
+        return 2;
     return 1;
 }
 
