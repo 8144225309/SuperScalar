@@ -195,6 +195,7 @@ jobs:
           cat > ~/.bitcoin/bitcoin.conf <<CONF
           regtest=1
           server=1
+          txindex=1
           datadir=/home/runner/.bitcoin
           rpcuser=rpcuser
           rpcpassword=rpcpass
