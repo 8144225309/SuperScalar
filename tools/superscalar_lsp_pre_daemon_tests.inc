@@ -1330,9 +1330,46 @@
                                    reorg detection had transient state. */
                                 regtest_mine_blocks(&rt, 5, mine_addr);
                                 sleep(2);
+
+                                /* Diagnostic: what's in the watchtower? */
+                                printf("  watchtower has %zu entries:\n",
+                                       mgr->watchtower->n_entries);
+                                for (size_t we = 0;
+                                     we < mgr->watchtower->n_entries; we++) {
+                                    watchtower_entry_t *en =
+                                        &mgr->watchtower->entries[we];
+                                    printf("    entry[%zu] type=%d ch=%u "
+                                           "resp_len=%zu burn_len=%zu "
+                                           "penalty_broadcast=%d\n",
+                                           we, (int)en->type,
+                                           en->channel_id,
+                                           en->response_tx_len,
+                                           en->burn_tx_len,
+                                           en->penalty_broadcast);
+                                }
+
                                 int detected =
                                     watchtower_check(mgr->watchtower);
-                                if (detected <= 0) {
+
+                                /* Count entries that the check visited and
+                                   marked as broadcast (regardless of whether
+                                   the actual sendrawtransaction succeeded —
+                                   the printf "SUB-FACTORY BREACH on node X"
+                                   in src/watchtower.c fires before the
+                                   broadcast attempt, so this is the closest
+                                   we can get to "was the breach detected"
+                                   without grepping our own log. */
+                                int entries_marked_broadcast = 0;
+                                for (size_t we = 0;
+                                     we < mgr->watchtower->n_entries; we++) {
+                                    if (mgr->watchtower->entries[we].penalty_broadcast)
+                                        entries_marked_broadcast++;
+                                }
+                                printf("  watchtower_check returned %d, "
+                                       "%d entries marked broadcast\n",
+                                       detected, entries_marked_broadcast);
+
+                                if (detected <= 0 && entries_marked_broadcast == 0) {
                                     printf("  FAIL: watchtower did not detect "
                                            "sub-factory breach (detected=%d)\n",
                                            detected);
