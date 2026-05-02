@@ -1642,20 +1642,25 @@ int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
 
 cJSON *wire_build_leaf_realloc_propose(int leaf_side,
                                         const uint64_t *amounts, size_t n_amounts,
-                                        const unsigned char *pubnonce66) {
+                                        const unsigned char *state_pubnonce66,
+                                        const unsigned char *poison_pubnonce66) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
     cJSON *arr = cJSON_AddArrayToObject(j, "amounts");
     for (size_t i = 0; i < n_amounts; i++)
         cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)amounts[i]));
-    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
+    if (poison_pubnonce66)
+        wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce66, 66);
     return j;
 }
 
+/* Returns: 0 = failure, 1 = state-only parsed, 2 = state + poison parsed. */
 int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
                                       uint64_t *amounts, size_t max_amounts,
                                       size_t *n_amounts_out,
-                                      unsigned char *pubnonce66) {
+                                      unsigned char *state_pubnonce66,
+                                      unsigned char *poison_pubnonce66) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
@@ -1671,22 +1676,34 @@ int wire_parse_leaf_realloc_propose(const cJSON *json, int *leaf_side,
     }
     *n_amounts_out = n;
 
-    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    if (wire_json_get_hex(json, "pubnonce", state_pubnonce66, 66) != 66) return 0;
+    if (poison_pubnonce66 &&
+        wire_json_get_hex(json, "poison_pubnonce", poison_pubnonce66, 66) == 66)
+        return 2;
     return 1;
 }
 
-cJSON *wire_build_leaf_realloc_nonce(const unsigned char *pubnonce66) {
+cJSON *wire_build_leaf_realloc_nonce(const unsigned char *state_pubnonce66,
+                                       const unsigned char *poison_pubnonce66) {
     cJSON *j = cJSON_CreateObject();
-    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
+    if (poison_pubnonce66)
+        wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce66, 66);
     return j;
 }
 
-int wire_parse_leaf_realloc_nonce(const cJSON *json, unsigned char *pubnonce66) {
-    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+int wire_parse_leaf_realloc_nonce(const cJSON *json,
+                                    unsigned char *state_pubnonce66,
+                                    unsigned char *poison_pubnonce66) {
+    if (wire_json_get_hex(json, "pubnonce", state_pubnonce66, 66) != 66) return 0;
+    if (poison_pubnonce66 &&
+        wire_json_get_hex(json, "poison_pubnonce", poison_pubnonce66, 66) == 66)
+        return 2;
     return 1;
 }
 
 cJSON *wire_build_leaf_realloc_all_nonces(const unsigned char pubnonces[][66],
+                                            const unsigned char poison_pubnonces[][66],
                                             size_t n_signers) {
     cJSON *j = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(j, "pubnonces");
@@ -1695,11 +1712,19 @@ cJSON *wire_build_leaf_realloc_all_nonces(const unsigned char pubnonces[][66],
         hex_encode(pubnonces[i], 66, hex);
         cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
     }
+    if (poison_pubnonces) {
+        cJSON *parr = cJSON_AddArrayToObject(j, "poison_pubnonces");
+        for (size_t i = 0; i < n_signers; i++) {
+            hex_encode(poison_pubnonces[i], 66, hex);
+            cJSON_AddItemToArray(parr, cJSON_CreateString(hex));
+        }
+    }
     return j;
 }
 
 int wire_parse_leaf_realloc_all_nonces(const cJSON *json,
                                          unsigned char pubnonces_out[][66],
+                                         unsigned char poison_pubnonces_out[][66],
                                          size_t max_signers, size_t *n_out) {
     cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
     if (!arr || !cJSON_IsArray(arr)) return 0;
@@ -1711,17 +1736,39 @@ int wire_parse_leaf_realloc_all_nonces(const cJSON *json,
         if (hex_decode(item->valuestring, pubnonces_out[i], 66) != 66) return 0;
     }
     *n_out = n;
+
+    if (poison_pubnonces_out) {
+        cJSON *parr = cJSON_GetObjectItem(json, "poison_pubnonces");
+        if (parr && cJSON_IsArray(parr) &&
+            (size_t)cJSON_GetArraySize(parr) == n) {
+            for (size_t i = 0; i < n; i++) {
+                cJSON *item = cJSON_GetArrayItem(parr, (int)i);
+                if (!item || !cJSON_IsString(item)) return 1;
+                if (hex_decode(item->valuestring, poison_pubnonces_out[i], 66) != 66)
+                    return 1;
+            }
+            return 2;
+        }
+    }
     return 1;
 }
 
-cJSON *wire_build_leaf_realloc_psig(const unsigned char *partial_sig32) {
+cJSON *wire_build_leaf_realloc_psig(const unsigned char *state_psig32,
+                                      const unsigned char *poison_psig32) {
     cJSON *j = cJSON_CreateObject();
-    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    wire_json_add_hex(j, "partial_sig", state_psig32, 32);
+    if (poison_psig32)
+        wire_json_add_hex(j, "poison_partial_sig", poison_psig32, 32);
     return j;
 }
 
-int wire_parse_leaf_realloc_psig(const cJSON *json, unsigned char *partial_sig32) {
-    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32) return 0;
+int wire_parse_leaf_realloc_psig(const cJSON *json,
+                                   unsigned char *state_psig32,
+                                   unsigned char *poison_psig32) {
+    if (wire_json_get_hex(json, "partial_sig", state_psig32, 32) != 32) return 0;
+    if (poison_psig32 &&
+        wire_json_get_hex(json, "poison_partial_sig", poison_psig32, 32) == 32)
+        return 2;
     return 1;
 }
 
