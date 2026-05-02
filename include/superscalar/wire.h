@@ -660,20 +660,41 @@ int wire_parse_subfactory_propose(const cJSON *json,
                                     int *channel_idx, uint64_t *delta_sats,
                                     unsigned char *lsp_pubnonce66);
 
-/* Client → LSP: SUBFACTORY_NONCE {pubnonce} */
-cJSON *wire_build_subfactory_nonce(const unsigned char *pubnonce66);
-int wire_parse_subfactory_nonce(const cJSON *json, unsigned char *pubnonce66);
+/* Client → LSP: SUBFACTORY_NONCE {pubnonce, [poison_pubnonce]}.
+   Both fields carry 66-byte MuSig2 pubnonces.  poison_pubnonce is
+   OPTIONAL on the wire (legacy clients omit it); when present it
+   accompanies the state pubnonce for the same signer in the same
+   message — this lets the LSP run two split-round MuSig2 ceremonies
+   in lockstep (closes Wire-Ceremony Gap A: poison TX in multi-process).
+   Pass `poison_pubnonce66 = NULL` to either build or parse to skip the
+   second nonce.  Parse return value: 0 = failure, 1 = state only,
+   2 = state + poison both parsed. */
+cJSON *wire_build_subfactory_nonce(const unsigned char *state_pubnonce66,
+                                     const unsigned char *poison_pubnonce66);
+int wire_parse_subfactory_nonce(const cJSON *json,
+                                  unsigned char *state_pubnonce66,
+                                  unsigned char *poison_pubnonce66);
 
-/* LSP → sub clients: SUBFACTORY_ALL_NONCES {pubnonces[]} */
+/* LSP → sub clients: SUBFACTORY_ALL_NONCES {pubnonces[], [poison_pubnonces[]]}.
+   Same dual-nonce semantics as SUBFACTORY_NONCE.  Pass
+   `poison_pubnonces = NULL` (build) or `poison_pubnonces_out = NULL`
+   (parse) to skip the second array. */
 cJSON *wire_build_subfactory_all_nonces(const unsigned char pubnonces[][66],
+                                          const unsigned char poison_pubnonces[][66],
                                           size_t n_signers);
 int wire_parse_subfactory_all_nonces(const cJSON *json,
                                        unsigned char pubnonces_out[][66],
+                                       unsigned char poison_pubnonces_out[][66],
                                        size_t max_signers, size_t *n_out);
 
-/* Client → LSP: SUBFACTORY_PSIG {partial_sig} */
-cJSON *wire_build_subfactory_psig(const unsigned char *partial_sig32);
-int wire_parse_subfactory_psig(const cJSON *json, unsigned char *partial_sig32);
+/* Client → LSP: SUBFACTORY_PSIG {partial_sig, [poison_partial_sig]}.
+   Same dual-sig semantics — second sig is the client's MuSig2 partial
+   sig over the OLD state's poison TX sighash.  Optional. */
+cJSON *wire_build_subfactory_psig(const unsigned char *state_psig32,
+                                    const unsigned char *poison_psig32);
+int wire_parse_subfactory_psig(const cJSON *json,
+                                 unsigned char *state_psig32,
+                                 unsigned char *poison_psig32);
 
 /* LSP → sub clients: SUBFACTORY_DONE {leaf_side, sub_idx, chain_len} */
 cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len);

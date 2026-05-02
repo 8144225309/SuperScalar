@@ -2725,7 +2725,7 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     /* Send NONCE. */
     unsigned char my_pn_ser[66];
     musig_pubnonce_serialize(ctx, my_pn_ser, &my_pubnonce);
-    cJSON *nm = wire_build_subfactory_nonce(my_pn_ser);
+    cJSON *nm = wire_build_subfactory_nonce(my_pn_ser, NULL);
     if (!wire_send(fd, MSG_SUBFACTORY_NONCE, nm)) {
         cJSON_Delete(nm);
         memset(my_seckey, 0, 32);
@@ -2744,7 +2744,7 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     }
     unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
     size_t n_pn;
-    if (!wire_parse_subfactory_all_nonces(am.json, all_pubnonces,
+    if (!wire_parse_subfactory_all_nonces(am.json, all_pubnonces, NULL,
                                             FACTORY_MAX_SIGNERS, &n_pn)) {
         cJSON_Delete(am.json);
         memset(my_seckey, 0, 32);
@@ -2780,7 +2780,7 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     memset(my_seckey, 0, 32);
     unsigned char my_psig_ser[32];
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
-    cJSON *pm = wire_build_subfactory_psig(my_psig_ser);
+    cJSON *pm = wire_build_subfactory_psig(my_psig_ser, NULL);
     if (!wire_send(fd, MSG_SUBFACTORY_PSIG, pm)) {
         cJSON_Delete(pm);
         return 0;

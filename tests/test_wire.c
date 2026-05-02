@@ -1592,42 +1592,87 @@ int test_wire_subfactory(void) {
     TEST_ASSERT_MEM_EQ(pn_out, lsp_pn, 66, "lsp pubnonce round-trip");
     cJSON_Delete(propose);
 
-    /* NONCE round-trip */
+    /* NONCE round-trip — state-only path (legacy compat) */
     unsigned char nin[66];
     memset(nin, 0xB2, 66);
-    cJSON *nm = wire_build_subfactory_nonce(nin);
-    TEST_ASSERT(nm != NULL, "build subfactory_nonce");
+    cJSON *nm = wire_build_subfactory_nonce(nin, NULL);
+    TEST_ASSERT(nm != NULL, "build subfactory_nonce (state-only)");
     unsigned char nout[66];
-    TEST_ASSERT(wire_parse_subfactory_nonce(nm, nout), "parse subfactory_nonce");
-    TEST_ASSERT_MEM_EQ(nout, nin, 66, "nonce round-trip");
+    TEST_ASSERT(wire_parse_subfactory_nonce(nm, nout, NULL) == 1,
+                "parse subfactory_nonce (state-only)");
+    TEST_ASSERT_MEM_EQ(nout, nin, 66, "state nonce round-trip");
     cJSON_Delete(nm);
+
+    /* NONCE round-trip — DUAL (state + poison) path (Wire-Ceremony Gap A) */
+    unsigned char nin_state[66], nin_poison[66];
+    memset(nin_state,  0xA1, 66);
+    memset(nin_poison, 0xA2, 66);
+    cJSON *nm2 = wire_build_subfactory_nonce(nin_state, nin_poison);
+    TEST_ASSERT(nm2 != NULL, "build subfactory_nonce (dual)");
+    unsigned char nout_state[66], nout_poison[66];
+    int rc = wire_parse_subfactory_nonce(nm2, nout_state, nout_poison);
+    TEST_ASSERT_EQ((long)rc, 2, "parse subfactory_nonce (dual) returns 2");
+    TEST_ASSERT_MEM_EQ(nout_state,  nin_state,  66, "state nonce dual round-trip");
+    TEST_ASSERT_MEM_EQ(nout_poison, nin_poison, 66, "poison nonce dual round-trip");
+    cJSON_Delete(nm2);
 
     /* ALL_NONCES round-trip (3 signers = LSP + 2 clients on a k=2 sub-factory) */
     unsigned char pns[3][66];
     memset(pns[0], 0x10, 66);
     memset(pns[1], 0x20, 66);
     memset(pns[2], 0x30, 66);
-    cJSON *all = wire_build_subfactory_all_nonces(pns, 3);
-    TEST_ASSERT(all != NULL, "build subfactory_all_nonces");
+    cJSON *all = wire_build_subfactory_all_nonces(pns, NULL, 3);
+    TEST_ASSERT(all != NULL, "build subfactory_all_nonces (state-only)");
     unsigned char pns_out[4][66];
     size_t n_pns;
-    TEST_ASSERT(wire_parse_subfactory_all_nonces(all, pns_out, 4, &n_pns),
-                "parse subfactory_all_nonces");
+    TEST_ASSERT(wire_parse_subfactory_all_nonces(all, pns_out, NULL, 4, &n_pns) == 1,
+                "parse subfactory_all_nonces (state-only)");
     TEST_ASSERT_EQ((long)n_pns, 3, "n_signers");
     TEST_ASSERT_MEM_EQ(pns_out[0], pns[0], 66, "pubnonce[0]");
     TEST_ASSERT_MEM_EQ(pns_out[1], pns[1], 66, "pubnonce[1]");
     TEST_ASSERT_MEM_EQ(pns_out[2], pns[2], 66, "pubnonce[2]");
     cJSON_Delete(all);
 
-    /* PSIG round-trip */
+    /* ALL_NONCES round-trip — DUAL (state + poison) */
+    unsigned char poison_pns[3][66];
+    memset(poison_pns[0], 0x40, 66);
+    memset(poison_pns[1], 0x50, 66);
+    memset(poison_pns[2], 0x60, 66);
+    cJSON *all2 = wire_build_subfactory_all_nonces(pns, poison_pns, 3);
+    TEST_ASSERT(all2 != NULL, "build subfactory_all_nonces (dual)");
+    unsigned char pns_out2[4][66], poison_out[4][66];
+    size_t n_pns2;
+    TEST_ASSERT(wire_parse_subfactory_all_nonces(all2, pns_out2, poison_out, 4, &n_pns2) == 2,
+                "parse subfactory_all_nonces (dual) returns 2");
+    TEST_ASSERT_EQ((long)n_pns2, 3, "n_signers (dual)");
+    TEST_ASSERT_MEM_EQ(poison_out[0], poison_pns[0], 66, "poison nonce[0]");
+    TEST_ASSERT_MEM_EQ(poison_out[1], poison_pns[1], 66, "poison nonce[1]");
+    TEST_ASSERT_MEM_EQ(poison_out[2], poison_pns[2], 66, "poison nonce[2]");
+    cJSON_Delete(all2);
+
+    /* PSIG round-trip — state-only path */
     unsigned char psig_in[32];
     memset(psig_in, 0xC3, 32);
-    cJSON *pm = wire_build_subfactory_psig(psig_in);
-    TEST_ASSERT(pm != NULL, "build subfactory_psig");
+    cJSON *pm = wire_build_subfactory_psig(psig_in, NULL);
+    TEST_ASSERT(pm != NULL, "build subfactory_psig (state-only)");
     unsigned char psig_out[32];
-    TEST_ASSERT(wire_parse_subfactory_psig(pm, psig_out), "parse subfactory_psig");
+    TEST_ASSERT(wire_parse_subfactory_psig(pm, psig_out, NULL) == 1,
+                "parse subfactory_psig (state-only)");
     TEST_ASSERT_MEM_EQ(psig_out, psig_in, 32, "psig round-trip");
     cJSON_Delete(pm);
+
+    /* PSIG round-trip — DUAL (state + poison) */
+    unsigned char state_psig_in[32], poison_psig_in[32];
+    memset(state_psig_in,  0xD1, 32);
+    memset(poison_psig_in, 0xD2, 32);
+    cJSON *pm2 = wire_build_subfactory_psig(state_psig_in, poison_psig_in);
+    TEST_ASSERT(pm2 != NULL, "build subfactory_psig (dual)");
+    unsigned char state_psig_out[32], poison_psig_out[32];
+    TEST_ASSERT(wire_parse_subfactory_psig(pm2, state_psig_out, poison_psig_out) == 2,
+                "parse subfactory_psig (dual) returns 2");
+    TEST_ASSERT_MEM_EQ(state_psig_out,  state_psig_in,  32, "state psig dual round-trip");
+    TEST_ASSERT_MEM_EQ(poison_psig_out, poison_psig_in, 32, "poison psig dual round-trip");
+    cJSON_Delete(pm2);
 
     /* DONE round-trip */
     cJSON *dm = wire_build_subfactory_done(0, 1, 5);

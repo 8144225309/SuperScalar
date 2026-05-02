@@ -2525,7 +2525,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         unsigned char client_pn[66];
-        if (!wire_parse_subfactory_nonce(nmsg.json, client_pn)) {
+        if (!wire_parse_subfactory_nonce(nmsg.json, client_pn, NULL)) {
             cJSON_Delete(nmsg.json);
             memset(lsp_seckey, 0, 32);
             return 0;
@@ -2553,7 +2553,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
     cJSON *all_nonces = wire_build_subfactory_all_nonces(
-        (const unsigned char (*)[66])all_pubnonces, sub->n_signers);
+        (const unsigned char (*)[66])all_pubnonces, NULL, sub->n_signers);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_ALL_NONCES, all_nonces);
@@ -2597,7 +2597,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         unsigned char client_psig_ser[32];
-        if (!wire_parse_subfactory_psig(pmsg.json, client_psig_ser)) {
+        if (!wire_parse_subfactory_psig(pmsg.json, client_psig_ser, NULL)) {
             cJSON_Delete(pmsg.json);
             return 0;
         }
