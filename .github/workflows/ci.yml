@@ -225,7 +225,10 @@ jobs:
       # right config.
       - name: Multi-process k² sub-factory advance (under ASan+LSan)
         env:
-          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0
+          # verify_asan_link_order=0: harness wraps binaries with `stdbuf -oL`
+          # which preloads libstdbuf.so via LD_PRELOAD before the ASan
+          # runtime — without the override ASan aborts at libinit.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
@@ -233,7 +236,10 @@ jobs:
           bash tools/test_multiprocess_subfactory_advance.sh build
       - name: Multi-process MuSig N=8 PS (under ASan+LSan)
         env:
-          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0
+          # verify_asan_link_order=0: harness wraps binaries with `stdbuf -oL`
+          # which preloads libstdbuf.so via LD_PRELOAD before the ASan
+          # runtime — without the override ASan aborts at libinit.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
