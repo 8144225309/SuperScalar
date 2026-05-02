@@ -1239,15 +1239,22 @@
 
                     /* === Sub-factory CHEATING + WATCHTOWER POISON ===
 
-                       After the chain extension succeeded, optionally
-                       broadcast the now-stale chain[N-1] TX (captured
-                       pre-advance) to simulate the LSP cheating, then
-                       call watchtower_check() to verify the watchtower
-                       detects + responds with the pre-signed poison TX
-                       (Phase 4b + Gap A end-to-end on regtest). */
+                       The LSP "cheats" by broadcasting the now-stale
+                       chain[N-1] TX (snapshotted pre-advance).  For
+                       chain[N-1] to confirm, its parent vout (the leaf
+                       node's outputs[sub_idx]) must already be on-chain
+                       — so we first broadcast the path from the funding
+                       UTXO down through root + leaf (skipping
+                       sub-factory nodes themselves so chain[N] doesn't
+                       race chain[N-1]), then broadcast chain[N-1] as
+                       the cheat, mine a block, and run watchtower_check.
+                       The watchtower must:
+                         1. Detect chain[N-1] confirming (its watched txid)
+                         2. Broadcast the latest chain[N] (response_tx)
+                         3. Broadcast the pre-signed poison TX */
                     if (sub_pass && cheat_subfactory_after_advance &&
                         cheat_stale_tx.len > 0) {
-                        printf("\n--- CHEAT-SUBFACTORY: broadcasting stale chain[N-1] ---\n");
+                        printf("\n--- CHEAT-SUBFACTORY: broadcasting parent path then stale chain[N-1] ---\n");
                         fflush(stdout);
                         if (!is_regtest) {
                             printf("  SKIP: --cheat-subfactory requires regtest\n");
@@ -1255,6 +1262,42 @@
                             printf("  FAIL: no watchtower configured\n");
                             sub_pass = 0;
                         } else {
+                            /* Broadcast all non-sub-factory nodes (root,
+                               kickoff, leaf state).  This puts the
+                               sub-factory's parent UTXO on-chain so
+                               chain[N-1] can spend it. */
+                            int parent_ok = 1;
+                            for (size_t ni = 0;
+                                 ni < lsp_p->factory.n_nodes && parent_ok;
+                                 ni++) {
+                                factory_node_t *node =
+                                    &lsp_p->factory.nodes[ni];
+                                if (node->type == NODE_PS_SUBFACTORY) continue;
+                                if (!node->is_signed || node->signed_tx.len == 0)
+                                    continue;
+                                char *nh = malloc(node->signed_tx.len * 2 + 1);
+                                char tid[65] = {0};
+                                if (!nh) { parent_ok = 0; break; }
+                                hex_encode(node->signed_tx.data,
+                                           node->signed_tx.len, nh);
+                                int psent = regtest_send_raw_tx(&rt, nh, tid);
+                                if (g_db)
+                                    persist_log_broadcast(g_db,
+                                        psent ? tid : "?",
+                                        "cheat_subfactory_parent",
+                                        nh, psent ? "ok" : "failed");
+                                free(nh);
+                                if (!psent) {
+                                    printf("  WARN: parent node[%zu] broadcast "
+                                           "failed (may already be on chain)\n",
+                                           ni);
+                                } else {
+                                    printf("  parent node[%zu] broadcast: %s\n",
+                                           ni, tid);
+                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                }
+                            }
+
                             char *cheat_hex =
                                 malloc(cheat_stale_tx.len * 2 + 1);
                             char cheat_txid_str[65] = {0};
