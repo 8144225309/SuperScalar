@@ -234,6 +234,28 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                                size_t n_clients,
                                void *db);
 
+/* Re-register every PS leaf chain entry and PS sub-factory chain entry
+   with the watchtower after recovery (PR-B / v22).
+
+   persist_load_factory restores in-memory factory state plus, for the
+   LATEST chain entry of each PS leaf and sub-factory, the wire-signed
+   poison TX bytes (now living in node->poison_signed_tx /
+   sub->poison_signed_tx with poison_is_signed=1).  This helper walks
+   every restored leaf + sub-factory, looks up the prior chain entry's
+   txid (the "stale" state to watch for), and calls
+   watchtower_watch_factory_node_with_channels /
+   watchtower_watch_subfactory_node so a post-restart breach still
+   triggers the response_tx + poison_tx broadcast.
+
+   Without this rehydrate step, the wire-ceremony work from PRs
+   #136-#138 is silently undone by the first LSP crash — watchtower
+   has no entries beyond DW commitments.
+
+   Pre-condition: mgr->watchtower set, mgr->persist set,
+   factory_recovery already loaded chains into the in-memory factory.
+   Returns 1 on success (even if 0 entries to register), 0 on bad args. */
+int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr);
+
 /* Exchange MSG_CHANNEL_BASEPOINTS with all clients.
    Must be called after lsp_channels_init() and before lsp_channels_send_ready().
    Sends LSP's basepoint pubkeys and receives client's basepoint pubkeys.

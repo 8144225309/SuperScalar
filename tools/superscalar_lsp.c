@@ -2334,6 +2334,16 @@ int main(int argc, char *argv[]) {
             mgr->ladder = &rec_lad;
             #undef rec_lad
 
+            /* PR-B (v22): re-register PS leaf + sub-factory chains with
+               the watchtower from the persisted poison TX bytes.
+               persist_load_factory above already restored the latest chain
+               entry's poison TX into node->poison_signed_tx; this helper
+               walks the factory and calls watchtower_watch_*_node so
+               post-restart breaches still trigger the response_tx +
+               poison_tx broadcast.  Without this, the wire-ceremony work
+               from PRs #136-#138 is silently undone on every restart. */
+            lsp_channels_rehydrate_watchtower_from_chains(mgr);
+
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
             mgr->rot_fee_est = fee_est;
