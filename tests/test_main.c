@@ -78,6 +78,9 @@ extern int test_build_p2tr_script_pubkey(void);
 extern int test_build_unsigned_tx(void);
 extern int test_build_unsigned_tx_multi(void);
 extern int test_finalize_signed_tx(void);
+extern int test_compute_taproot_sighash_multi_matches_single_for_n1(void);
+extern int test_compute_taproot_sighash_multi_n3_input_binding(void);
+extern int test_finalize_signed_tx_multi(void);
 extern int test_varint_encoding(void);
 
 /* Phase C: V3/TRUC CPFP */
@@ -1914,6 +1917,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_build_unsigned_tx);
     RUN_TEST(test_build_unsigned_tx_multi);
     RUN_TEST(test_finalize_signed_tx);
+    RUN_TEST(test_compute_taproot_sighash_multi_matches_single_for_n1);
+    RUN_TEST(test_compute_taproot_sighash_multi_n3_input_binding);
+    RUN_TEST(test_finalize_signed_tx_multi);
     RUN_TEST(test_varint_encoding);
 
     printf("\n=== Phase C: V3/TRUC CPFP ===\n");
