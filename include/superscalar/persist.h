@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 22
+#define PERSIST_SCHEMA_VERSION 23
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -126,6 +126,35 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
                                     uint64_t (*channel_amounts_out)[16],
                                     int *n_channels_out,
                                     tx_buf_t *poison_txs_out, int max_chain);
+
+/* --- Initial-state signed TX persistence (v23) ---
+   The factory tree is signed once at build time (factory_sign_all in
+   single-process, or wire ceremony in multi-process).  Each PS leaf and
+   PS sub-factory node's signed_tx at this point is "chain[0]" — the
+   initial state.  On the first PS chain advance, signed_tx is overwritten
+   with chain[1] and the original chain[0] bytes are lost (except for its
+   txid, which is preserved in node->ps_prev_txid).
+   For force-close after advance to broadcast the chain history correctly,
+   we need chain[0]'s signed bytes on disk.  This table stores them once,
+   keyed (factory_id, node_idx).  The save is idempotent (INSERT OR
+   REPLACE) so callers can save unconditionally.
+   Saved by lsp_subfactory_chain_advance + lsp_advance_leaf right before
+   the first advance overwrites node->signed_tx.  Loaded by
+   tools/superscalar_lsp.c's force-close broadcaster.  Closes the bug
+   discovered by the v0.1.15 signet campaign (force-close after sub-
+   factory advance hung indefinitely on -25 errors). */
+int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
+                                          uint32_t node_idx,
+                                          const unsigned char *txid_display,
+                                          const unsigned char *signed_tx,
+                                          size_t signed_tx_len);
+
+/* Returns 1 on success and fills out_buf via tx_buf_init + memcpy
+   (caller must tx_buf_free), 0 if no row or error. */
+int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
+                                          uint32_t node_idx,
+                                          tx_buf_t *out_tx,
+                                          unsigned char *out_txid_internal_be);
 
 /* --- Client-side PS double-spend defense --- */
 

@@ -404,6 +404,91 @@ int test_persist_ps_subfactory_chain_v22_poison_round_trip(void) {
     return ok;
 }
 
+/* ---- v23: ps_initial_signed_states round-trip ----
+
+   Verifies persist_save/load_ps_initial_signed_state correctly stores and
+   retrieves chain[0] signed bytes + display-order txid keyed on
+   (factory_id, node_idx).  Closes the v0.1.15 force-close-after-advance
+   bug discovered by the signet campaign. */
+int test_persist_ps_initial_signed_state_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t factory_id = 0;
+    const uint32_t node_idx_a = 5;
+    const uint32_t node_idx_b = 11;
+
+    /* Two distinct (node, txid, signed_tx) tuples to verify keying. */
+    unsigned char txid_a[32];
+    unsigned char txid_b[32];
+    memset(txid_a, 0xAA, 32);
+    memset(txid_b, 0xBB, 32);
+
+    unsigned char tx_a[64];
+    unsigned char tx_b[96];
+    memset(tx_a, 0x10, sizeof(tx_a));
+    memset(tx_b, 0x20, sizeof(tx_b));
+
+    TEST_ASSERT(persist_save_ps_initial_signed_state(
+                    &db, factory_id, node_idx_a, txid_a, tx_a, sizeof(tx_a)),
+                "save A");
+    TEST_ASSERT(persist_save_ps_initial_signed_state(
+                    &db, factory_id, node_idx_b, txid_b, tx_b, sizeof(tx_b)),
+                "save B");
+
+    /* Reload A and verify */
+    tx_buf_t out_a = {0};
+    unsigned char out_a_txid_be[32];
+    TEST_ASSERT(persist_load_ps_initial_signed_state(
+                    &db, factory_id, node_idx_a, &out_a, out_a_txid_be),
+                "load A");
+    TEST_ASSERT(out_a.len == sizeof(tx_a), "A tx_len round-trips");
+    TEST_ASSERT(memcmp(out_a.data, tx_a, sizeof(tx_a)) == 0,
+                "A tx bytes round-trip");
+    /* save passes display-order txid; load returns internal-byte-order
+       (display reversed) — so out_a_txid_be should equal reversed(txid_a).
+       For txid_a = 0xAA repeated, reversed is still 0xAA repeated. */
+    TEST_ASSERT(memcmp(out_a_txid_be, txid_a, 32) == 0,
+                "A txid round-trips (palindrome)");
+
+    /* Reload B and verify */
+    tx_buf_t out_b = {0};
+    TEST_ASSERT(persist_load_ps_initial_signed_state(
+                    &db, factory_id, node_idx_b, &out_b, NULL /*txid optional*/),
+                "load B");
+    TEST_ASSERT(out_b.len == sizeof(tx_b), "B tx_len round-trips");
+    TEST_ASSERT(memcmp(out_b.data, tx_b, sizeof(tx_b)) == 0,
+                "B tx bytes round-trip");
+
+    /* Idempotent save (INSERT OR REPLACE) — same row updates */
+    unsigned char tx_a2[80];
+    memset(tx_a2, 0x42, sizeof(tx_a2));
+    TEST_ASSERT(persist_save_ps_initial_signed_state(
+                    &db, factory_id, node_idx_a, txid_a, tx_a2, sizeof(tx_a2)),
+                "re-save A overwrites");
+    tx_buf_t out_a2 = {0};
+    TEST_ASSERT(persist_load_ps_initial_signed_state(
+                    &db, factory_id, node_idx_a, &out_a2, NULL),
+                "reload A after overwrite");
+    TEST_ASSERT(out_a2.len == sizeof(tx_a2), "A overwritten tx_len matches");
+    TEST_ASSERT(memcmp(out_a2.data, tx_a2, sizeof(tx_a2)) == 0,
+                "A overwritten tx bytes match");
+
+    /* Missing key returns 0 */
+    tx_buf_t out_missing = {0};
+    int loaded_missing = persist_load_ps_initial_signed_state(
+        &db, factory_id, /*node_idx=*/999, &out_missing, NULL);
+    TEST_ASSERT(loaded_missing == 0, "missing key returns 0");
+    TEST_ASSERT(out_missing.len == 0, "missing key leaves out_tx empty");
+
+    tx_buf_free(&out_a);
+    tx_buf_free(&out_b);
+    tx_buf_free(&out_a2);
+
+    persist_close(&db);
+    return 1;
+}
+
 /* ---- Test 1: Open/close in-memory database ---- */
 
 int test_persist_open_close(void) {
