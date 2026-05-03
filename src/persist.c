@@ -876,6 +876,29 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v23 migration: persist chain[0] (initial signed state) for PS leaves
+       and PS sub-factories so force-close after advance can broadcast the
+       full chain history.  Discovered by the v0.1.15 signet campaign:
+       after advance, node->signed_tx is overwritten with chain[1+] and
+       chain[0]'s signed bytes are lost.  Force-close trying to broadcast
+       chain[1] without chain[0] on-chain produces -25
+       bad-txns-inputs-missingorspent indefinitely.
+       Additive — keeps PR-B's ps_subfactory_chains and ps_leaf_chains
+       semantics unchanged (chain_pos=0..N-1 = chain[1..N]).  This new
+       table fills the missing chain[0] entry separately, keyed by
+       (factory_id, node_idx) since each node has at most one chain[0]. */
+    if (db_version < 23) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS ps_initial_signed_states ("
+            "  factory_id INTEGER NOT NULL,"
+            "  node_idx INTEGER NOT NULL,"
+            "  txid TEXT NOT NULL,"
+            "  signed_tx_hex TEXT NOT NULL,"
+            "  PRIMARY KEY (factory_id, node_idx)"
+            ");",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1352,6 +1375,88 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- Initial-state signed TX persistence (v23) ---
+   See header for design notes.  Closes the v0.1.15 force-close-after-
+   advance bug discovered by the signet campaign. */
+
+int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
+                                          uint32_t node_idx,
+                                          const unsigned char *txid_display,
+                                          const unsigned char *signed_tx,
+                                          size_t signed_tx_len) {
+    if (!p || !p->db || !txid_display || !signed_tx || signed_tx_len == 0)
+        return 0;
+
+    char txid_hex[65];
+    hex_encode(txid_display, 32, txid_hex);
+
+    char *tx_hex = malloc(signed_tx_len * 2 + 1);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO ps_initial_signed_states "
+        "(factory_id, node_idx, txid, signed_tx_hex) "
+        "VALUES (?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(tx_hex);
+        return 0;
+    }
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+    sqlite3_bind_text(stmt, 3, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, tx_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(tx_hex);
+    return ok;
+}
+
+int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
+                                          uint32_t node_idx,
+                                          tx_buf_t *out_tx,
+                                          unsigned char *out_txid_internal_be) {
+    if (!p || !p->db || !out_tx) return 0;
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT txid, signed_tx_hex FROM ps_initial_signed_states "
+        "WHERE factory_id=? AND node_idx=? LIMIT 1;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+
+    int ok = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *tx_hex   = (const char *)sqlite3_column_text(stmt, 1);
+        if (txid_hex && tx_hex) {
+            size_t tx_hex_len = strlen(tx_hex);
+            size_t tx_len = tx_hex_len / 2;
+            if (tx_len > 0) {
+                tx_buf_init(out_tx, (int)tx_len);
+                if (hex_decode(tx_hex, out_tx->data, tx_len)) {
+                    out_tx->len = tx_len;
+                    if (out_txid_internal_be) {
+                        unsigned char txid_display[32];
+                        if (hex_decode(txid_hex, txid_display, 32)) {
+                            memcpy(out_txid_internal_be, txid_display, 32);
+                            reverse_bytes(out_txid_internal_be, 32);
+                        }
+                    }
+                    ok = 1;
+                } else {
+                    tx_buf_free(out_tx);
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 /* --- Client-side PS double-spend defense (v20) --- */

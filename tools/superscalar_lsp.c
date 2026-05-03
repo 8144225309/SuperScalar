@@ -700,9 +700,127 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
     return 1;
 }
 
+/* Broadcast a single signed TX with BIP68 wait + retry logic.
+   Returns 1 on success, 0 on failure.  Logs to broadcast_log via g_db.
+   `display_txid_internal_be` is for the diagnostic print at the end. */
+static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
+                                     int is_regtest, int confirm_timeout,
+                                     const unsigned char *signed_tx,
+                                     size_t signed_tx_len,
+                                     uint32_t nsequence,
+                                     const char *log_source,
+                                     const unsigned char *display_txid_internal_be) {
+    char *tx_hex = malloc(signed_tx_len * 2 + 1);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, signed_tx_len, tx_hex);
+
+    char txid_out[65];
+
+    /* For nodes with nSequence > 0, we may need to wait for the parent
+       to reach sufficient depth before this tx is valid */
+    if (!(nsequence & 0x80000000u) && nsequence > 0) {  /* BIP68 enabled only when bit 31 clear */
+        uint32_t required_depth = (nsequence & 0xFFFF);
+        int est_mins = (int)required_depth * 10; /* ~10 min/block */
+        printf("  %s requires %u-block relative timelock "
+               "(~%dh%02dm), waiting...\n",
+               log_source, required_depth,
+               est_mins / 60, est_mins % 60);
+
+        if (is_regtest) {
+            regtest_mine_blocks(rt, (int)required_depth, mine_addr);
+        } else {
+            int start_height = regtest_get_block_height(rt);
+            int target_height = start_height + (int)required_depth;
+            int waited = 0;
+            while (regtest_get_block_height(rt) < target_height) {
+                if (waited >= confirm_timeout) {
+                    fprintf(stderr, "force-close: %s BIP68 wait "
+                            "timed out after %ds (height %d / %d)\n",
+                            log_source, waited, regtest_get_block_height(rt),
+                            target_height);
+                    free(tx_hex);
+                    return 0;
+                }
+                sleep(10);
+                waited += 10;
+                int cur_h = regtest_get_block_height(rt);
+                int blocks_left = target_height - cur_h;
+                int em = blocks_left * 10;
+                printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
+                       cur_h, target_height, waited, em / 60, em % 60);
+                fflush(stdout);
+            }
+        }
+    }
+
+    /* Try to broadcast — may need retries if BIP68 not yet satisfied */
+    int ok = 0;
+    int bcast_waited = 0;
+    int bcast_limit = is_regtest ? 60 : confirm_timeout;
+    for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
+        ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+        if (ok) break;
+        if (attempt == 0)
+            printf("  %s broadcast pending (waiting for BIP68)...\n", log_source);
+        if (is_regtest) {
+            regtest_mine_blocks(rt, 1, mine_addr);
+            bcast_waited++;
+        } else {
+            sleep(15);
+            bcast_waited += 15;
+        }
+    }
+
+    if (g_db) {
+        persist_log_broadcast(g_db, ok ? txid_out : "?", log_source, tx_hex,
+                              ok ? "ok" : "failed");
+    }
+    free(tx_hex);
+
+    if (!ok) {
+        fprintf(stderr, "force-close: %s broadcast failed after retries\n", log_source);
+        return 0;
+    }
+
+    /* Confirm it */
+    if (is_regtest) {
+        regtest_mine_blocks(rt, 1, mine_addr);
+    } else {
+        printf("  %s broadcast OK (txid=%.16s...), waiting for confirmation...\n",
+               log_source, txid_out);
+        fflush(stdout);
+        regtest_wait_for_confirmation(rt, txid_out, confirm_timeout);
+    }
+
+    if (display_txid_internal_be) {
+        unsigned char disp[32];
+        memcpy(disp, display_txid_internal_be, 32);
+        reverse_bytes(disp, 32);
+        char disp_hex[65];
+        hex_encode(disp, 32, disp_hex);
+        int conf = regtest_get_confirmations(rt, txid_out);
+        printf("  %s confirmed: %s (%d confs)\n", log_source, disp_hex, conf);
+    }
+    return 1;
+}
+
 /* Broadcast all signed factory tree nodes, waiting for real block confirmations.
    On regtest: mines blocks. On signet/testnet: polls getblockcount.
    Handles nSequence relative timelocks by waiting for the required depth.
+
+   v23 fix: for PS leaf and PS sub-factory nodes that have advanced
+   (ps_chain_len > 0), broadcasts the FULL chain history in order:
+     chain[0]  ← from ps_initial_signed_states (saved on first advance)
+     chain[1]  ← from ps_{leaf,subfactory}_chains chain_pos=0
+     chain[2]  ← from ps_{leaf,subfactory}_chains chain_pos=1
+     ...
+     chain[N]  ← from ps_{leaf,subfactory}_chains chain_pos=N-1
+                 (== node->signed_tx in memory)
+   Each chain[i+1] spends chain[i].sales_stock_vout, so they MUST go on-chain
+   sequentially.  Without this, force-close after any advance hangs forever
+   on bitcoin -25 bad-txns-inputs-missingorspent (the bug discovered by
+   the v0.1.15 signet campaign).
+
    Returns 1 on success. */
 static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
                                                 const char *mine_addr,
@@ -715,103 +833,107 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
             return 0;
         }
 
-        char *tx_hex = malloc(node->signed_tx.len * 2 + 1);
-        if (!tx_hex) return 0;
-        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+        int is_ps_chain_node = (node->is_ps_leaf ||
+                                node->type == NODE_PS_SUBFACTORY);
+        int has_advanced = (node->ps_chain_len > 0);
 
-        char txid_out[65];
+        if (is_ps_chain_node && has_advanced && g_db) {
+            /* === PS chain history broadcast === */
+            printf("  node[%zu] is PS-advanced (chain_len=%d) — broadcasting "
+                   "chain history\n", i, node->ps_chain_len);
 
-        /* For nodes with nSequence > 0, we may need to wait for the parent
-           to reach sufficient depth before this tx is valid */
-        if (!(node->nsequence & 0x80000000u) && node->nsequence > 0) {  /* BIP68 enabled only when bit 31 clear */
-            uint32_t required_depth = (node->nsequence & 0xFFFF);
-            int est_mins = (int)required_depth * 10; /* ~10 min/block */
-            printf("  node[%zu/%zu] requires %u-block relative timelock "
-                   "(~%dh%02dm), waiting...\n",
-                   i, f->n_nodes, required_depth,
-                   est_mins / 60, est_mins % 60);
+            /* Step 1: chain[0] from ps_initial_signed_states */
+            tx_buf_t init_tx;
+            memset(&init_tx, 0, sizeof(init_tx));
+            unsigned char init_txid_be[32] = {0};
+            if (!persist_load_ps_initial_signed_state(g_db, /*factory_id=*/0,
+                    (uint32_t)i, &init_tx, init_txid_be)) {
+                fprintf(stderr,
+                    "force-close: node %zu has %d PS advances but "
+                    "ps_initial_signed_states is missing chain[0] — cannot "
+                    "reconstruct broadcast history.  This factory advanced "
+                    "before v23 schema; force-close is unrecoverable.\n",
+                    i, node->ps_chain_len);
+                return 0;
+            }
+            char label0[64];
+            snprintf(label0, sizeof(label0), "tree_node_%zu_chain0", i);
+            /* chain[0]'s nSequence: PS chain[0] (the initial state) inherits
+               the node's CURRENT nsequence — but actually for chain history
+               we use 0 (no relative timelock on chain[0] itself; its parent
+               is the leaf above which has its own nsequence).  Actually safest:
+               use whatever the unsigned_tx had encoded.  For now use the same
+               nsequence as the node, which is correct for the topology. */
+            int ok0 = broadcast_one_signed_tx(rt, mine_addr, is_regtest,
+                confirm_timeout, init_tx.data, init_tx.len, node->nsequence,
+                label0, init_txid_be);
+            tx_buf_free(&init_tx);
+            if (!ok0) return 0;
 
-            if (is_regtest) {
-                /* Mine the required blocks */
-                regtest_mine_blocks(rt, (int)required_depth, mine_addr);
-            } else {
-                /* Poll for blocks on signet/testnet with timeout */
-                int start_height = regtest_get_block_height(rt);
-                int target_height = start_height + (int)required_depth;
-                int waited = 0;
-                while (regtest_get_block_height(rt) < target_height) {
-                    if (waited >= confirm_timeout) {
-                        fprintf(stderr, "force-close: node %zu BIP68 wait "
-                                "timed out after %ds (height %d / %d)\n",
-                                i, waited, regtest_get_block_height(rt),
-                                target_height);
-                        free(tx_hex);
-                        return 0;
-                    }
-                    sleep(10);
-                    waited += 10;
-                    int cur_h = regtest_get_block_height(rt);
-                    int blocks_left = target_height - cur_h;
-                    int est_mins = blocks_left * 10;
-                    printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
-                           cur_h, target_height, waited,
-                           est_mins / 60, est_mins % 60);
-                    fflush(stdout);
+            /* Step 2: load chain[1..ps_chain_len] from
+               ps_subfactory_chains (or ps_leaf_chains) and broadcast each.
+               PR-B's chain_pos=K-1 == chain[K] in semantic terms. */
+            #define CHAIN_HIST_MAX 256
+            tx_buf_t hist_txs[CHAIN_HIST_MAX];
+            unsigned char hist_txids[CHAIN_HIST_MAX][32];
+            memset(hist_txs, 0, sizeof(hist_txs));
+            int n_hist = 0;
+            if (node->type == NODE_PS_SUBFACTORY) {
+                uint64_t hist_sstock[CHAIN_HIST_MAX];
+                uint64_t hist_chans[CHAIN_HIST_MAX][16];
+                int hist_n_chans[CHAIN_HIST_MAX];
+                tx_buf_t hist_poison[CHAIN_HIST_MAX];
+                memset(hist_poison, 0, sizeof(hist_poison));
+                n_hist = persist_load_subfactory_chain(g_db, /*factory_id=*/0,
+                    (uint32_t)i, hist_txs, hist_txids,
+                    hist_sstock, hist_chans, hist_n_chans,
+                    hist_poison, CHAIN_HIST_MAX);
+                /* poison_txs and per-channel amounts not needed here —
+                   broadcast just needs signed_tx. */
+                for (int k = 0; k < n_hist; k++) tx_buf_free(&hist_poison[k]);
+            } else if (node->is_ps_leaf) {
+                uint64_t hist_amts[CHAIN_HIST_MAX];
+                tx_buf_t hist_poison[CHAIN_HIST_MAX];
+                memset(hist_poison, 0, sizeof(hist_poison));
+                n_hist = persist_load_ps_chain(g_db, /*factory_id=*/0,
+                    (uint32_t)i, hist_txs, hist_txids, hist_amts,
+                    hist_poison, CHAIN_HIST_MAX);
+                for (int k = 0; k < n_hist; k++) tx_buf_free(&hist_poison[k]);
+            }
+            if (n_hist != node->ps_chain_len) {
+                fprintf(stderr,
+                    "force-close: node %zu PS chain history mismatch — "
+                    "node->ps_chain_len=%d but loaded %d entries.  Aborting.\n",
+                    i, node->ps_chain_len, n_hist);
+                for (int k = 0; k < n_hist; k++) tx_buf_free(&hist_txs[k]);
+                return 0;
+            }
+            int chain_ok = 1;
+            for (int k = 0; k < n_hist && chain_ok; k++) {
+                char labelK[64];
+                snprintf(labelK, sizeof(labelK), "tree_node_%zu_chain%d", i, k + 1);
+                if (!broadcast_one_signed_tx(rt, mine_addr, is_regtest,
+                        confirm_timeout, hist_txs[k].data, hist_txs[k].len,
+                        node->nsequence,
+                        labelK, hist_txids[k])) {
+                    chain_ok = 0;
                 }
             }
+            for (int k = 0; k < n_hist; k++) tx_buf_free(&hist_txs[k]);
+            if (!chain_ok) return 0;
+            #undef CHAIN_HIST_MAX
+            /* Already broadcast node->signed_tx as the last chain entry. */
+            continue;
         }
 
-        /* Try to broadcast — may need retries if BIP68 not yet satisfied */
-        int ok = 0;
-        int bcast_waited = 0;
-        int bcast_limit = is_regtest ? 60 : confirm_timeout;
-        for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
-            ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
-            if (ok) break;
-            if (attempt == 0)
-                printf("  node[%zu] broadcast pending (waiting for BIP68)...\n", i);
-            if (is_regtest) {
-                regtest_mine_blocks(rt, 1, mine_addr);
-                bcast_waited++;
-            } else {
-                sleep(15);
-                bcast_waited += 15;
-            }
-        }
-
-        /* Audit log */
-        if (g_db) {
-            char src[32];
-            snprintf(src, sizeof(src), "tree_node_%zu", i);
-            persist_log_broadcast(g_db, ok ? txid_out : "?", src, tx_hex,
-                                  ok ? "ok" : "failed");
-        }
-        free(tx_hex);
-
-        if (!ok) {
-            fprintf(stderr, "force-close: node %zu broadcast failed after retries\n", i);
+        /* === Default: broadcast node->signed_tx === */
+        char label[32];
+        snprintf(label, sizeof(label), "tree_node_%zu", i);
+        if (!broadcast_one_signed_tx(rt, mine_addr, is_regtest, confirm_timeout,
+                node->signed_tx.data, node->signed_tx.len, node->nsequence,
+                label, node->txid)) {
             return 0;
         }
-
-        /* Confirm it: mine 1 block on regtest, wait on signet */
-        if (is_regtest) {
-            regtest_mine_blocks(rt, 1, mine_addr);
-        } else {
-            printf("  node[%zu/%zu] broadcast OK (txid=%.16s...), "
-                   "waiting for confirmation...\n",
-                   i, f->n_nodes, txid_out);
-            fflush(stdout);
-            regtest_wait_for_confirmation(rt, txid_out, confirm_timeout);
-        }
-
-        unsigned char display_txid[32];
-        memcpy(display_txid, node->txid, 32);
-        reverse_bytes(display_txid, 32);
-        char display_hex[65];
-        hex_encode(display_txid, 32, display_hex);
-
-        int conf = regtest_get_confirmations(rt, txid_out);
-        printf("  node[%zu] confirmed: %s (%d confs)\n", i, display_hex, conf);
     }
     return 1;
 }

@@ -1480,6 +1480,27 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
                             ? f->nodes[pre_node_idx].outputs[old_n_outputs - 1].amount_sats
                             : 0;
 
+    /* v23 fix: on FIRST PS advance only, persist chain[0] (the initial
+       signed leaf state) so force-close after advance can broadcast the
+       full chain history.  See ps_initial_signed_states in persist.h.
+       Discovered by the v0.1.15 signet campaign.  Only applies to PS
+       leaves (DW leaves don't have a chain that needs replay). */
+    if (f->leaf_arity == FACTORY_ARITY_PS &&
+        f->nodes[pre_node_idx].is_ps_leaf &&
+        f->nodes[pre_node_idx].ps_chain_len == 0 &&
+        mgr->persist && had_old_signed) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char chain0_txid_display[32];
+        memcpy(chain0_txid_display, f->nodes[pre_node_idx].txid, 32);
+        reverse_bytes(chain0_txid_display, 32);
+        persist_save_ps_initial_signed_state(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)pre_node_idx,
+            chain0_txid_display,
+            f->nodes[pre_node_idx].signed_tx.data,
+            f->nodes[pre_node_idx].signed_tx.len);
+    }
+
     /* Wire-ceremony poison-TX prep (closes SECURITY GAP for leaf advance).
        Both LSP and client run the same prepare call from their snapshot
        of the OLD state — deterministic, byte-identical sighash on both
@@ -2741,6 +2762,25 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* k clients on this sub-factory (LSP is signer 0). */
     size_t n_clients_in_sub = sub->n_signers - 1;
     if (n_clients_in_sub == 0) return 0;
+
+    /* v23 fix: on FIRST advance only, persist chain[0] (the initial
+       signed state) so force-close after advance can broadcast the full
+       chain history.  Without this, chain[1+]'s parent input
+       (chain[0].sales_stock) is never on-chain → bitcoin -25.
+       Discovered by the v0.1.15 signet campaign.  Idempotent (INSERT OR
+       REPLACE) so safe if called twice somehow. */
+    if (sub->ps_chain_len == 0 && mgr->persist &&
+        sub->is_signed && sub->signed_tx.len > 0) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char chain0_txid_display[32];
+        memcpy(chain0_txid_display, sub->txid, 32);
+        reverse_bytes(chain0_txid_display, 32);
+        persist_save_ps_initial_signed_state(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)sub_node_i,
+            chain0_txid_display,
+            sub->signed_tx.data, sub->signed_tx.len);
+    }
 
     /* Snapshot the soon-to-be-stale chain[N-1] state for the watchtower
        (Phase 4b) AND for the wire-ceremony poison-TX prep (Gap A close).
