@@ -3743,15 +3743,14 @@ static int run_subfactory_multi_input_ceremony(
             memcpy(per_input_pubnonces + ((size_t)client_slot * n_inputs + ii) * 66,
                    client_state_pn[ii], 66);
         }
-        /* Optional poison nonce — uses the legacy single-poison_pubnonce field */
+        /* Optional poison nonce — uses the legacy single-poison_pubnonce field.
+           We deliberately do NOT call wire_parse_subfactory_nonce here:
+           that helper dereferences its state_pubnonce66 arg unconditionally,
+           and we already pulled per-input state nonces via
+           wire_subfactory_nonce_get_pubnonces above.  Read the optional
+           poison_pubnonce field directly. */
         if (*poison_prepared) {
             unsigned char client_poison_pn[66];
-            int prc = wire_parse_subfactory_nonce(nmsg.json, NULL, client_poison_pn);
-            /* prc==2 means poison present; we don't care about state here
-               since we already pulled it via _get_pubnonces.  Fall back to
-               legacy single-state parse just to determine prc (1=state-only,
-               2=state+poison).  The bytes we'll use are client_poison_pn. */
-            (void)prc;
             cJSON *pp = cJSON_GetObjectItem(nmsg.json, "poison_pubnonce");
             if (pp && cJSON_IsString(pp) &&
                 wire_json_get_hex(nmsg.json, "poison_pubnonce",

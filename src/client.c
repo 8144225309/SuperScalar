@@ -3215,13 +3215,11 @@ static int run_client_subfactory_multi_input_ceremony(
             }
         }
     }
-    /* Optional poison_pubnonces (legacy format — single per signer). */
+    /* Optional poison_pubnonces (legacy format — single per signer).
+       Read directly via cJSON; wire_parse_subfactory_all_nonces would
+       crash on the NULL state-pubnonces arg (it dereferences it
+       unconditionally). */
     if (*poison_prepared) {
-        unsigned char all_poison_pn[FACTORY_MAX_SIGNERS][66];
-        size_t n_pn = 0;
-        int parse_an_rc = wire_parse_subfactory_all_nonces(
-            am.json, NULL, all_poison_pn, FACTORY_MAX_SIGNERS, &n_pn);
-        (void)parse_an_rc;
         cJSON *parr = cJSON_GetObjectItem(am.json, "poison_pubnonces");
         if (parr && cJSON_IsArray(parr) &&
             (size_t)cJSON_GetArraySize(parr) == n_signers) {
