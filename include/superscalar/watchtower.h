@@ -114,7 +114,16 @@ typedef struct {
     watchtower_entry_t *entries;
     size_t n_entries;
     size_t entries_cap;
-    channel_t **channels;  /* pointers to channels by index */
+    /* channels[], n_channels, channels_cap retained in #208 A3.2 only
+       to keep the HTLC/PTLC sweep + force-close-timeout-sweep loops
+       intact.  After A3.2, no production caller populates channels[],
+       so those secondary loops never fire (their `if (ch)` guards
+       short-circuit).  A3.3 will pre-build HTLC/PTLC penalty bytes at
+       revocation time too and remove these loops + the field
+       entirely.  Tests that exercise HTLC sweep can still populate
+       channels[] via the wt->channels[i] = ch direct write, but the
+       public watchtower_set_channel API was removed in this phase. */
+    channel_t **channels;
     size_t n_channels;
     size_t channels_cap;
     chain_backend_t *chain;        /* chain queries + tx broadcast (abstract) */
@@ -153,8 +162,7 @@ void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend);
    Pass NULL to disable CPFP (watchtower_build_cpfp_tx will return 0). */
 void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet);
 
-/* Set channel pointer for a given index. */
-void watchtower_set_channel(watchtower_t *wt, size_t idx, channel_t *ch);
+/* watchtower_set_channel removed in #208 A3.2 — see oracular API below. */
 
 /* Add an old commitment to watch for. */
 int watchtower_watch(watchtower_t *wt, uint32_t channel_id,

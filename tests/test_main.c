@@ -1466,8 +1466,9 @@ extern int test_jit_migrate_no_balance_hack(void);
 extern int test_jit_state_conversion(void);
 extern int test_jit_msg_type_names(void);
 
-/* JIT Hardening */
-extern int test_jit_watchtower_registration(void);
+/* JIT Hardening
+   (test_jit_watchtower_registration deleted in #208 A3.2 — tested
+   the dropped channel-pointer registration mechanism) */
 extern int test_jit_watchtower_revocation(void);
 extern int test_jit_watchtower_cleanup_on_close(void);
 extern int test_jit_persist_reload_active(void);
@@ -3250,7 +3251,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_msg_type_names);
 
     printf("\n=== JIT Hardening ===\n");
-    RUN_TEST(test_jit_watchtower_registration);
+    /* test_jit_watchtower_registration removed in #208 A3.2 — tested
+       channel-pointer registration which no longer exists */
     RUN_TEST(test_jit_watchtower_revocation);
     RUN_TEST(test_jit_watchtower_cleanup_on_close);
     RUN_TEST(test_jit_persist_reload_active);

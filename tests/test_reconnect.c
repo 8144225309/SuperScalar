@@ -758,10 +758,12 @@ int test_watchtower_watch_and_check(void) {
                   fund_txid, 0, 50000, fund_spk, 34,
                   25000, 25000, 144);
 
-    /* Init watchtower with no DB, no regtest */
+    /* Init watchtower with no DB, no regtest.  watchtower_set_channel
+       dropped in #208 A3.2 — direct field write below for legacy sweep
+       paths that still reach into channels[]. */
     watchtower_t wt;
     watchtower_init(&wt, 1, NULL, NULL, NULL);
-    watchtower_set_channel(&wt, 0, &ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &ch;
     TEST_ASSERT_EQ(wt.n_entries, 0, "no entries initially");
 
     /* Add a fake old commitment */
@@ -1368,10 +1370,11 @@ int test_watchtower_wired(void) {
     channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
     channel_set_remote_htlc_basepoint(&ch, &rhtlc);
 
-    /* Init watchtower */
+    /* Init watchtower.  watchtower_set_channel dropped in #208 A3.2 —
+       direct field access keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, NULL, NULL, NULL);
-    watchtower_set_channel(&wt, 0, &ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &ch;
 
     /* watchtower_watch should accept an entry */
     unsigned char fake_txid[32];
@@ -1814,10 +1817,12 @@ int test_breach_detect_old_commitment(void) {
     TEST_ASSERT_MEM_EQ(commit0_txid, rebuilt_txid, 32,
                         "rebuilt txid matches original");
 
-    /* Register in watchtower and verify entry matches */
+    /* Register in watchtower and verify entry matches.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, NULL, NULL, NULL);
-    watchtower_set_channel(&wt, 0, &ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &ch;
 
     unsigned char fake_spk[34];
     memset(fake_spk, 0, 34);

@@ -1580,9 +1580,8 @@ handle_message:
 
             jit_rd->state = JIT_STATE_OPEN;
 
-            /* Register JIT channel with client watchtower */
-            if (cbd && cbd->wt)
-                watchtower_set_channel(cbd->wt, 0, &jit_rd->channel);
+            /* JIT channel watchtower registration: dropped in #208 A3.2.
+               Penalty bytes pre-built at revocation receive time. */
 
             /* Persist JIT channel */
             if (cbd && cbd->db) {
@@ -3171,10 +3170,9 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                             if (cbd.jit_ch) {
-                                /* Register with watchtower */
-                                if (cbd.wt)
-                                    watchtower_set_channel(cbd.wt, 0,
-                                        &cbd.jit_ch->channel);
+                                /* watchtower_set_channel dropped in #208 A3.2 —
+                                   penalty bytes are pre-built at revocation
+                                   receive time. */
                                 printf("Client: loaded JIT channel %08x from DB\n",
                                        cbd.jit_ch->jit_channel_id);
                             }

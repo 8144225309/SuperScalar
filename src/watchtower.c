@@ -146,12 +146,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     return 1;
 }
 
-void watchtower_set_channel(watchtower_t *wt, size_t idx, channel_t *ch) {
-    if (!wt || idx >= wt->channels_cap) return;
-    wt->channels[idx] = ch;
-    if (idx >= wt->n_channels)
-        wt->n_channels = idx + 1;
-}
+/* watchtower_set_channel removed in #208 A3.2 — see oracular API. */
 
 int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
                        uint64_t commit_num, const unsigned char *txid32,
@@ -759,52 +754,32 @@ int watchtower_check(watchtower_t *wt) {
                 regtest_mine_blocks(wt->rt, 1, mine_addr);
         }
 
-        /* Oracular fast-path (#208 A3.1): if the LSP pre-signed the penalty
-           TX at revocation time and registered via watchtower_watch_oracular
-           or watchtower_watch_revoked_commitment_oracular, broadcast those
-           bytes directly without ever consulting wt->channels[].  This is
-           the path that lets the watchtower run in a separate process. */
+        /* Oracular path (#208 A3.2 — only path now): broadcast the
+           pre-signed bytes attached to the entry at registration time.
+           Fail-closed if missing — the legacy lazy-build via
+           wt->channels[] was removed in A3.2 along with the field. */
         tx_buf_t penalty_tx;
         tx_buf_init(&penalty_tx, 512);
         int use_anchor = fee_should_use_anchor(wt->fee);
-        channel_t *ch = NULL;
 
-        if (e->signed_penalty_tx && e->signed_penalty_tx_len > 0) {
-            tx_buf_write_bytes(&penalty_tx, e->signed_penalty_tx,
-                                e->signed_penalty_tx_len);
-            if (penalty_tx.oom) {
-                fprintf(stderr,
-                        "Watchtower: copy oracular penalty bytes failed (OOM)\n");
-                tx_buf_free(&penalty_tx);
-                i++;
-                continue;
-            }
-        } else {
-            /* Legacy lazy-build path — derefs live channel state.  This
-               path will be removed once A3.1b migrates all callers to
-               the oracular variants. */
-            if (e->channel_id < wt->channels_cap)
-                ch = wt->channels[e->channel_id];
-
-            if (!ch) {
-                fprintf(stderr, "Watchtower: no channel %u for penalty\n", e->channel_id);
-                i++;
-                continue;
-            }
-
-            if (!channel_build_penalty_tx(ch, &penalty_tx,
-                                            e->txid, e->to_local_vout,
-                                            e->to_local_amount,
-                                            e->to_local_spk, e->to_local_spk_len,
-                                            e->commit_num,
-                                            use_anchor ? wt->anchor_spk : NULL,
-                                            use_anchor ? wt->anchor_spk_len : 0)) {
-                fprintf(stderr, "Watchtower: build penalty tx failed for channel %u\n",
-                        e->channel_id);
-                tx_buf_free(&penalty_tx);
-                i++;
-                continue;
-            }
+        if (!e->signed_penalty_tx || e->signed_penalty_tx_len == 0) {
+            fprintf(stderr,
+                    "Watchtower: entry %u has no signed_penalty_tx — skipping "
+                    "(register via watchtower_watch_oracular or "
+                    "watchtower_watch_revoked_commitment to attach bytes)\n",
+                    e->channel_id);
+            tx_buf_free(&penalty_tx);
+            i++;
+            continue;
+        }
+        tx_buf_write_bytes(&penalty_tx, e->signed_penalty_tx,
+                            e->signed_penalty_tx_len);
+        if (penalty_tx.oom) {
+            fprintf(stderr,
+                    "Watchtower: copy penalty bytes failed (OOM)\n");
+            tx_buf_free(&penalty_tx);
+            i++;
+            continue;
         }
 
         /* Broadcast penalty tx */
@@ -830,6 +805,16 @@ int watchtower_check(watchtower_t *wt) {
             free(penalty_hex);
         }
         tx_buf_free(&penalty_tx);
+
+        /* Look up the live channel pointer for the secondary CPFP/HTLC/PTLC
+           sweep loops below.  In production this is always NULL (channels[]
+           is unpopulated after #208 A3.1b dropped watchtower_set_channel),
+           so all `if (ch)` branches short-circuit.  A3.3 will pre-build
+           these secondary TX bytes at revocation time and remove the
+           channels[] field entirely. */
+        channel_t *ch = NULL;
+        if (e->channel_id < wt->channels_cap)
+            ch = wt->channels[e->channel_id];
 
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.

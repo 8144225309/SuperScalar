@@ -159,12 +159,14 @@ int test_client_watch_revoked_commitment(void) {
     channel_t lsp_ch, client_ch;
     if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
 
-    /* Set up watchtower for client side */
+    /* Set up watchtower for client side.  watchtower_set_channel call
+       dropped in #208 A3.2 — the oracular path pre-builds penalty bytes
+       inside watchtower_watch_revoked_commitment using the ch arg
+       passed at registration time. */
     watchtower_t wt;
     fee_estimator_static_t fee;
     fee_estimator_static_init(&fee, 1000);
     watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
 
     /* Advance commitment and do revocation */
     uint64_t old_cn = client_ch.commitment_number;
@@ -406,12 +408,12 @@ int test_htlc_penalty_watch(void) {
     channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
     channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
 
-    /* Set up watchtower for client side */
+    /* Set up watchtower for client side.  watchtower_set_channel
+       dropped in #208 A3.2. */
     watchtower_t wt;
     fee_estimator_static_t fee;
     fee_estimator_static_init(&fee, 1000);
     watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
 
     /* Add 1 HTLC (5000 sats, offered from LSP to client) */
     unsigned char payment_hash[32];

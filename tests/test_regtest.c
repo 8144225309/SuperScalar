@@ -775,10 +775,13 @@ int test_regtest_breach_penalty_cpfp(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* --- Client watchtower: register old commitment #0 for monitoring --- */
+    /* --- Client watchtower: register old commitment #0 for monitoring.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       below populates wt.channels[0] for tests that exercise the legacy
+       lazy-build sweep paths. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
     TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor initialized");
 
     /* Build the remote-view commitment #0 to get the correct txid */
@@ -795,9 +798,20 @@ int test_regtest_breach_penalty_cpfp(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register old commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register old commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
     printf("  Watchtower watching commitment #0\n");
 
     /* --- BREACH: broadcast revoked commitment #0 --- */
@@ -982,10 +996,12 @@ int test_regtest_watchtower_mempool_detection(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* Register commitment #0 with watchtower */
+    /* Register commitment #0 with watchtower.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
 
     tx_buf_t remote_commit0;
     tx_buf_init(&remote_commit0, 512);
@@ -998,9 +1014,20 @@ int test_regtest_watchtower_mempool_detection(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
 
     /* BREACH: broadcast revoked commitment #0 — do NOT mine */
     char *commit0_hex = (char *)malloc(commit0_signed.len * 2 + 1);
@@ -1161,10 +1188,12 @@ int test_regtest_watchtower_late_detection(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* Register commitment #0 with watchtower */
+    /* Register commitment #0 with watchtower.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
 
     tx_buf_t remote_commit0;
     tx_buf_init(&remote_commit0, 512);
@@ -1177,9 +1206,20 @@ int test_regtest_watchtower_late_detection(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
 
     /* BREACH: broadcast revoked commitment #0 */
     char *commit0_hex = (char *)malloc(commit0_signed.len * 2 + 1);
