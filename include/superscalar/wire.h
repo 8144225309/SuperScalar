@@ -801,7 +801,7 @@ int wire_parse_subfactory_done(const cJSON *json,
      if (n_inp > 0)
          wire_subfactory_propose_get_pubnonces(json, lsp_pubnonces_out, max);
      else
-         /* legacy single-input — use existing wire_parse_subfactory_propose */
+         // legacy single-input — use existing wire_parse_subfactory_propose
 */
 
 /* PROPOSE — set/get optional `n_inputs` + `lsp_pubnonces[n_inputs]`. */
