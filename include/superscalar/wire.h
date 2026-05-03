@@ -233,6 +233,40 @@ cJSON *wire_build_all_nonces(const wire_bundle_entry_t *entries, size_t n);
 /* Client → LSP: PSIG_BUNDLE {entries: [{node_idx, slot, psig_hex}...]} */
 cJSON *wire_build_psig_bundle(const wire_bundle_entry_t *entries, size_t n);
 
+/* --- Bundle variants with optional poison TX entries (PR-D / Tier B
+   rotation poison wire ceremony, closes the SECURITY GAP at
+   lsp_channels.c::lsp_run_state_advance multi-process path).
+
+   Same JSON shape as the plain bundle builders, with an optional
+   second "poison_entries" array.  Receivers parsing a plain bundle
+   simply ignore the new field — backward compatible.  When n_poison is
+   0 OR poison_entries is NULL, the field is omitted entirely so the
+   wire bytes are byte-equal to the plain builder.
+
+   Use wire_parse_poison_bundle to read the second array out of any
+   incoming bundle message; returns 0 entries when the field is
+   absent.  */
+cJSON *wire_build_nonce_bundle_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                             const wire_bundle_entry_t *poison_entries,
+                                             size_t n_poison);
+
+cJSON *wire_build_all_nonces_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                           const wire_bundle_entry_t *poison_entries,
+                                           size_t n_poison);
+
+cJSON *wire_build_psig_bundle_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                            const wire_bundle_entry_t *poison_entries,
+                                            size_t n_poison);
+
+/* Look up the optional "poison_entries" array on a bundle message and parse
+   it into the caller-provided buffer.  Returns the number of parsed entries
+   (0 when the field is missing — that's a valid backward-compat case, not
+   an error).  data_size is 66 for pubnonce bundles, 32 for psig bundles. */
+size_t wire_parse_poison_bundle(const cJSON *json,
+                                  wire_bundle_entry_t *poison_entries,
+                                  size_t max_poison,
+                                  size_t data_size);
+
 /* LSP → Client: FACTORY_READY {signed_txs: [{node_idx, tx_hex}...]} */
 cJSON *wire_build_factory_ready(const factory_t *f);
 

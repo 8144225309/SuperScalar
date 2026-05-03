@@ -271,6 +271,135 @@ int test_wire_psig_bundle(void) {
     return 1;
 }
 
+/* PR-D — Tier B rotation poison wire ceremony.  The new
+   *_with_poison bundle builders attach an optional second array of
+   poison entries.  Receivers that don't recognize the field ignore
+   it (backward compat — proven by parsing the with-poison bundle
+   with the plain wire_parse_bundle parser). */
+int test_wire_path_bundle_with_poison_round_trip(void) {
+    /* state entries (3 nodes × 1 slot) */
+    wire_bundle_entry_t state_entries[3];
+    for (int i = 0; i < 3; i++) {
+        state_entries[i].node_idx = (uint32_t)i;
+        state_entries[i].signer_slot = 1;
+        memset(state_entries[i].data, 0xa0 + i, 66);
+        state_entries[i].data_len = 66;
+    }
+    /* poison entries (2 leaves × 1 slot) — fewer than state because
+       only leaf nodes get poison TXs */
+    wire_bundle_entry_t poison_entries[2];
+    for (int i = 0; i < 2; i++) {
+        poison_entries[i].node_idx = (uint32_t)(i + 7);
+        poison_entries[i].signer_slot = 1;
+        memset(poison_entries[i].data, 0xb0 + i, 66);
+        poison_entries[i].data_len = 66;
+    }
+
+    cJSON *bundle = wire_build_nonce_bundle_with_poison(
+        state_entries, 3, poison_entries, 2);
+    TEST_ASSERT(cJSON_GetObjectItem(bundle, "entries"), "state entries present");
+    TEST_ASSERT(cJSON_GetObjectItem(bundle, "poison_entries"), "poison entries present");
+
+    /* parse state side via existing parser */
+    cJSON *st_arr = cJSON_GetObjectItem(bundle, "entries");
+    wire_bundle_entry_t parsed_state[3];
+    size_t n_state = wire_parse_bundle(st_arr, parsed_state, 3, 66);
+    TEST_ASSERT_EQ(n_state, 3, "state parsed count");
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ(parsed_state[i].node_idx, state_entries[i].node_idx, "state node_idx");
+        TEST_ASSERT_MEM_EQ(parsed_state[i].data, state_entries[i].data, 66, "state data");
+    }
+
+    /* parse poison side via the new helper */
+    wire_bundle_entry_t parsed_poison[2];
+    size_t n_poison = wire_parse_poison_bundle(bundle, parsed_poison, 2, 66);
+    TEST_ASSERT_EQ(n_poison, 2, "poison parsed count");
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_EQ(parsed_poison[i].node_idx, poison_entries[i].node_idx, "poison node_idx");
+        TEST_ASSERT_MEM_EQ(parsed_poison[i].data, poison_entries[i].data, 66, "poison data");
+    }
+
+    cJSON_Delete(bundle);
+
+    /* Same flow for psig (32-byte data), and use the all_nonces builder
+       to verify the primary key changes ("nonces" instead of "entries"). */
+    wire_bundle_entry_t psig_state[2];
+    for (int i = 0; i < 2; i++) {
+        psig_state[i].node_idx = (uint32_t)i;
+        psig_state[i].signer_slot = 0;
+        memset(psig_state[i].data, 0xc0 + i, 32);
+        psig_state[i].data_len = 32;
+    }
+    wire_bundle_entry_t psig_poison[1];
+    psig_poison[0].node_idx = 9;
+    psig_poison[0].signer_slot = 1;
+    memset(psig_poison[0].data, 0xd0, 32);
+    psig_poison[0].data_len = 32;
+
+    cJSON *psig_bundle = wire_build_psig_bundle_with_poison(psig_state, 2,
+                                                              psig_poison, 1);
+    wire_bundle_entry_t parsed_psig_poison[1];
+    size_t np = wire_parse_poison_bundle(psig_bundle, parsed_psig_poison, 1, 32);
+    TEST_ASSERT_EQ(np, 1, "psig poison parsed count");
+    TEST_ASSERT_MEM_EQ(parsed_psig_poison[0].data, psig_poison[0].data, 32, "psig poison data");
+    cJSON_Delete(psig_bundle);
+
+    cJSON *all_bundle = wire_build_all_nonces_with_poison(state_entries, 3,
+                                                            poison_entries, 2);
+    TEST_ASSERT(cJSON_GetObjectItem(all_bundle, "nonces"), "all_nonces uses 'nonces' key");
+    TEST_ASSERT(cJSON_GetObjectItem(all_bundle, "poison_entries"), "all_nonces poison present");
+    cJSON_Delete(all_bundle);
+
+    return 1;
+}
+
+/* When n_poison=0 (or NULL poison_entries), the with_poison builder must
+   produce JSON byte-equal to the plain builder — backward compat receivers
+   parse it cleanly with no special handling. */
+int test_wire_path_bundle_no_poison_back_compat(void) {
+    wire_bundle_entry_t entries[2];
+    for (int i = 0; i < 2; i++) {
+        entries[i].node_idx = (uint32_t)i;
+        entries[i].signer_slot = 0;
+        memset(entries[i].data, 0xee, 66);
+        entries[i].data_len = 66;
+    }
+
+    cJSON *plain = wire_build_nonce_bundle(entries, 2);
+    cJSON *no_poison = wire_build_nonce_bundle_with_poison(entries, 2, NULL, 0);
+    cJSON *zero_poison = wire_build_nonce_bundle_with_poison(entries, 2, entries, 0);
+
+    char *plain_s = cJSON_PrintUnformatted(plain);
+    char *no_poison_s = cJSON_PrintUnformatted(no_poison);
+    char *zero_poison_s = cJSON_PrintUnformatted(zero_poison);
+
+    TEST_ASSERT(plain_s && no_poison_s && zero_poison_s, "render JSON");
+    TEST_ASSERT(strcmp(plain_s, no_poison_s) == 0,
+                "with_poison(NULL,0) == plain build");
+    TEST_ASSERT(strcmp(plain_s, zero_poison_s) == 0,
+                "with_poison(non-null,0) == plain build (n_poison=0 wins)");
+
+    /* Old parser handles new builder output (additive field ignored). */
+    cJSON *parsed_root = cJSON_Parse(no_poison_s);
+    cJSON *arr = cJSON_GetObjectItem(parsed_root, "entries");
+    wire_bundle_entry_t out[2];
+    size_t n = wire_parse_bundle(arr, out, 2, 66);
+    TEST_ASSERT_EQ(n, 2, "old parser still works on new builder");
+
+    /* And the new poison parser cleanly returns 0 when the field is absent. */
+    size_t np = wire_parse_poison_bundle(parsed_root, out, 2, 66);
+    TEST_ASSERT_EQ(np, 0, "missing poison_entries returns 0 entries (not error)");
+
+    free(plain_s);
+    free(no_poison_s);
+    free(zero_poison_s);
+    cJSON_Delete(plain);
+    cJSON_Delete(no_poison);
+    cJSON_Delete(zero_poison);
+    cJSON_Delete(parsed_root);
+    return 1;
+}
+
 /* ---- Test 6: cooperative close unsigned ---- */
 
 int test_wire_close_unsigned(void) {
