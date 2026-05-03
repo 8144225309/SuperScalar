@@ -334,9 +334,37 @@ echo ""
 echo "  $PARTICIPATED clients on sub-factory 0 logged completion (>= $PS_SUB_ARITY required)"
 
 echo ""
+
+# === #207 phase 2c.b end-to-end gate ===
+# After phases 1-2c.b, advancing a sub-factory's chain produces a valid
+# k+1-input TX that broadcasts cleanly.  Verify the LSP successfully
+# broadcast + confirmed chain[1] (the post-advance state) on-chain.
+# Without the fix this hangs indefinitely on bitcoin -25 bad-txns-in-belowout
+# OR -25 bad-txns-inputs-missingorspent, and the LSP eventually exits
+# non-zero — so reaching this assertion at all means the cryptography
+# checks out, but we still want a positive marker in the log.
+echo "=== #207 phase 2c.b: verify chain[1] confirmed on-chain ==="
+if ! grep -qE "tree_node_[0-9]+_chain1 confirmed" "$LSP_LOG"; then
+    echo "FAIL: no 'tree_node_<i>_chain1 confirmed' log line — chain[1]"
+    echo "      either failed to broadcast OR failed to reach 1 conf."
+    grep -E "chain[01]|broadcast|bad-txns" "$LSP_LOG" | head -20
+    exit 1
+fi
+CHAIN1_LINE=$(grep -E "tree_node_[0-9]+_chain1 confirmed" "$LSP_LOG" | head -1)
+echo "  $CHAIN1_LINE"
+# Also assert no broadcast-rejected error fired anywhere in force-close
+if grep -qE "bad-txns-in-belowout|bad-txns-inputs-missingorspent" "$LSP_LOG"; then
+    echo "FAIL: bitcoind rejected a chain TX (regression of #207)"
+    grep -E "bad-txns" "$LSP_LOG" | head -5
+    exit 1
+fi
+echo "  no bitcoind rejection of chain TXs — #207 fix verified end-to-end"
+
+echo ""
 echo "=== PASS: Multi-process k² PS sub-factory chain extension ==="
 echo "  - $((N_CLIENTS + 1)) distinct OS processes"
 echo "  - k=$PS_SUB_ARITY → 1 leaf with $PS_SUB_ARITY sub-factories of $PS_SUB_ARITY clients each"
 echo "  - LSP-driven sub-factory chain extension over MSG_SUBFACTORY_*"
 echo "  - $PARTICIPATED clients confirmed completion"
 echo "  - Post-extension factory tree force-closed on-chain"
+echo "  - chain[1] (post-advance multi-input TX) confirmed on-chain"
