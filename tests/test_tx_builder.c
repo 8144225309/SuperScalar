@@ -175,6 +175,91 @@ int test_build_unsigned_tx(void) {
     return 1;
 }
 
+int test_build_unsigned_tx_multi(void) {
+    /* Multi-input variant for the v0.1.15 #207 fix.  Asserts the wire
+       format encodes N inputs correctly + each input's nsequence is
+       independent + the txid hashes deterministically. */
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+
+    /* 3 distinct inputs (e.g. chain[N-1]'s 2 channel outputs + sales-stock). */
+    tx_input_t inputs[3];
+    memset(inputs[0].prev_txid, 0xa1, 32); inputs[0].prev_vout = 0; inputs[0].nsequence = 0xFFFFFFFE;
+    memset(inputs[1].prev_txid, 0xa1, 32); inputs[1].prev_vout = 1; inputs[1].nsequence = 0xFFFFFFFE;
+    memset(inputs[2].prev_txid, 0xa1, 32); inputs[2].prev_vout = 2; inputs[2].nsequence = 144;
+
+    /* Mock outputs (k+1 = 3). */
+    unsigned char seckey[32]; memset(seckey, 0x05, 32);
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
+    secp256k1_xonly_pubkey xpk;
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
+
+    tx_output_t outs[3];
+    for (int i = 0; i < 3; i++) {
+        outs[i].amount_sats = 40000 + (uint64_t)i * 1000;
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &xpk);
+        outs[i].script_pubkey_len = 34;
+    }
+
+    tx_buf_t buf; tx_buf_init(&buf, 512);
+    unsigned char txid[32];
+
+    TEST_ASSERT(build_unsigned_tx_multi(&buf, txid, inputs, 3, outs, 3, 2, 0),
+                "multi-input build");
+
+    /* Wire format spot-checks:
+       offset 0..3: nVersion=2 (LE)
+       offset 4: input count varint = 3
+       offset 5..36: input[0].prev_txid
+       offset 37..40: input[0].prev_vout=0
+       offset 41: scriptSig len = 0
+       offset 42..45: input[0].nsequence=0xFFFFFFFE */
+    TEST_ASSERT_EQ(buf.data[0], 0x02, "nVersion byte 0");
+    TEST_ASSERT_EQ(buf.data[4], 0x03, "input count = 3");
+    TEST_ASSERT(memcmp(buf.data + 5, inputs[0].prev_txid, 32) == 0,
+                "input[0] txid");
+    TEST_ASSERT_EQ(buf.data[37], 0x00, "input[0] vout = 0");
+    TEST_ASSERT_EQ(buf.data[42], 0xFE, "input[0] nseq[0] = 0xFE");
+    TEST_ASSERT_EQ(buf.data[43], 0xFF, "input[0] nseq[1] = 0xFF");
+    TEST_ASSERT_EQ(buf.data[44], 0xFF, "input[0] nseq[2] = 0xFF");
+    TEST_ASSERT_EQ(buf.data[45], 0xFF, "input[0] nseq[3] = 0xFF");
+
+    /* input[1]: at offset 46, txid (32) + vout (4) + scriptsig_len(1) + nseq(4) = 41 bytes */
+    TEST_ASSERT(memcmp(buf.data + 46, inputs[1].prev_txid, 32) == 0,
+                "input[1] txid");
+    TEST_ASSERT_EQ(buf.data[78], 0x01, "input[1] vout = 1");
+
+    /* input[2]: at offset 87, with nseq = 144 = 0x90 */
+    TEST_ASSERT_EQ(buf.data[87 + 32], 0x02, "input[2] vout = 2");
+    TEST_ASSERT_EQ(buf.data[87 + 32 + 4 + 1], 0x90, "input[2] nseq = 144");
+
+    /* txid is non-zero */
+    int all_zero = 1;
+    for (int i = 0; i < 32; i++) if (txid[i]) { all_zero = 0; break; }
+    TEST_ASSERT(!all_zero, "multi-input txid is non-zero");
+
+    /* Determinism — re-build with same inputs, expect identical bytes */
+    tx_buf_t buf2; tx_buf_init(&buf2, 512);
+    unsigned char txid2[32];
+    TEST_ASSERT(build_unsigned_tx_multi(&buf2, txid2, inputs, 3, outs, 3, 2, 0),
+                "multi-input rebuild");
+    TEST_ASSERT(buf.len == buf2.len, "deterministic length");
+    TEST_ASSERT(memcmp(buf.data, buf2.data, buf.len) == 0,
+                "deterministic bytes");
+    TEST_ASSERT(memcmp(txid, txid2, 32) == 0, "deterministic txid");
+
+    /* Argument validation */
+    TEST_ASSERT(!build_unsigned_tx_multi(&buf, NULL, NULL, 3, outs, 3, 2, 0),
+                "null inputs rejected");
+    TEST_ASSERT(!build_unsigned_tx_multi(&buf, NULL, inputs, 0, outs, 3, 2, 0),
+                "zero inputs rejected");
+
+    tx_buf_free(&buf);
+    tx_buf_free(&buf2);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 int test_finalize_signed_tx(void) {
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
 
