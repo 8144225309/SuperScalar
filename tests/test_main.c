@@ -76,6 +76,7 @@ extern int test_musig_split_round_5of5(void);
 extern int test_tx_buf_primitives(void);
 extern int test_build_p2tr_script_pubkey(void);
 extern int test_build_unsigned_tx(void);
+extern int test_build_unsigned_tx_multi(void);
 extern int test_finalize_signed_tx(void);
 extern int test_varint_encoding(void);
 
@@ -1911,6 +1912,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tx_buf_primitives);
     RUN_TEST(test_build_p2tr_script_pubkey);
     RUN_TEST(test_build_unsigned_tx);
+    RUN_TEST(test_build_unsigned_tx_multi);
     RUN_TEST(test_finalize_signed_tx);
     RUN_TEST(test_varint_encoding);
 

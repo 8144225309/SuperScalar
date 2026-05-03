@@ -113,6 +113,48 @@ int build_unsigned_tx(
                                             nsequence, 0, outputs, n_outputs);
 }
 
+int build_unsigned_tx_multi(
+    tx_buf_t *out,
+    unsigned char *txid_out32,
+    const tx_input_t *inputs,
+    size_t n_inputs,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion,
+    uint32_t nlocktime
+) {
+    if (!out || !inputs || n_inputs == 0 || (!outputs && n_outputs > 0))
+        return 0;
+    tx_buf_reset(out);
+
+    tx_buf_write_u32_le(out, nVersion);
+    tx_buf_write_varint(out, n_inputs);
+    for (size_t i = 0; i < n_inputs; i++) {
+        tx_buf_write_bytes(out, inputs[i].prev_txid, 32);
+        tx_buf_write_u32_le(out, inputs[i].prev_vout);
+        tx_buf_write_varint(out, 0);           /* empty scriptSig */
+        tx_buf_write_u32_le(out, inputs[i].nsequence);
+    }
+
+    tx_buf_write_varint(out, n_outputs);
+    for (size_t i = 0; i < n_outputs; i++) {
+        tx_buf_write_u64_le(out, outputs[i].amount_sats);
+        tx_buf_write_varint(out, outputs[i].script_pubkey_len);
+        tx_buf_write_bytes(out, outputs[i].script_pubkey,
+                           outputs[i].script_pubkey_len);
+    }
+
+    tx_buf_write_u32_le(out, nlocktime);
+
+    if (out->oom) return 0;
+
+    if (txid_out32) {
+        sha256_double(out->data, out->len, txid_out32);
+        reverse_bytes(txid_out32, 32);
+    }
+    return 1;
+}
+
 int build_unsigned_tx_v(
     tx_buf_t *out,
     unsigned char *txid_out32,

@@ -57,6 +57,28 @@ int build_unsigned_tx_v(
     uint32_t nVersion
 );
 
+/* Multi-input variant. Each tx_input_t describes one (prev_txid, prev_vout,
+   nsequence) triple.  Used by PS sub-factory chain advance (chain[N+1]
+   spends ALL k+1 vouts of chain[N] — see #207 fix for the full design).
+   txids are 32-byte internal-byte-order (little-endian when written to the
+   wire format, matching build_unsigned_tx's `funding_txid` layout). */
+typedef struct {
+    unsigned char prev_txid[32];
+    uint32_t      prev_vout;
+    uint32_t      nsequence;
+} tx_input_t;
+
+int build_unsigned_tx_multi(
+    tx_buf_t *out,
+    unsigned char *txid_out32,     /* can be NULL */
+    const tx_input_t *inputs,
+    size_t n_inputs,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion,             /* 2 standard, 3 TRUC */
+    uint32_t nlocktime
+);
+
 /* BIP-341 sighash (key-path, SIGHASH_DEFAULT). */
 int compute_taproot_sighash(
     unsigned char *sighash_out32,
