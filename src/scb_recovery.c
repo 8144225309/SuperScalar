@@ -17,11 +17,11 @@ int scb_recovery_channel(peer_mgr_t        *pmgr,
     /* Run channel reestablish (peer must already be connected at peer_idx) */
     int r = chan_reestablish(pmgr, peer_idx, ctx, ch);
     if (r == 0) {
-        /* DLP: peer is ahead — register for watchtower sweep */
-        fprintf(stderr, "scb_recovery: DLP detected on peer %d — registering sweep\n",
-                peer_idx);
-        if (wt)
-            watchtower_set_channel(wt, (size_t)peer_idx, ch);
+        /* DLP: peer is ahead — sweep is driven via revocation registration
+           (already happens elsewhere).  Watchtower channel-pointer
+           registration dropped in #208 A3.1b. */
+        fprintf(stderr, "scb_recovery: DLP detected on peer %d\n", peer_idx);
+        (void)wt; (void)ch;
         return 1;
     }
     return 0;

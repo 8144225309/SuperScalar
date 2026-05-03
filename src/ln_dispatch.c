@@ -320,9 +320,10 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         if (ch && d->pmgr) {
             int r = chan_reestablish(d->pmgr, peer_idx, d->ctx, ch);
             if (r == 0 && d->watchtower) {
-                /* DLP detected: peer is ahead — register for sweep */
+                /* DLP detected: peer is ahead — force close. */
                 fprintf(stderr, "ln_dispatch: DLP peer %d — force close\n", peer_idx);
-                watchtower_set_channel(d->watchtower, (size_t)peer_idx, ch);
+                /* Watchtower channel-pointer registration dropped in
+                   #208 A3.1b — penalty bytes pre-built at revocation time. */
             }
         }
         return (int)msg_type;

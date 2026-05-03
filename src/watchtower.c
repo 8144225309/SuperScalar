@@ -320,6 +320,36 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 watchtower_watch(wt, channel_id, old_commit_num,
                                    old_txid, 0, old_remote,
                                    to_local_spk, 34);
+
+                /* #208 A3.1b — pre-build the penalty TX bytes at registration
+                   time and attach to the entry we just created.  After this
+                   land, watchtower_check goes through the oracular fast-path
+                   (no channel_t deref) for every revoked-commitment entry.
+                   channel_build_penalty_tx is commit-state-independent (it
+                   looks up ch->received_revocations[old_commit_num] for the
+                   per-commitment secret), so it's safe to call after the
+                   channel state has been restored. */
+                if (wt->n_entries > 0) {
+                    watchtower_entry_t *just_added =
+                        &wt->entries[wt->n_entries - 1];
+                    int use_anchor = fee_should_use_anchor(wt->fee);
+                    tx_buf_t penalty;
+                    tx_buf_init(&penalty, 512);
+                    if (channel_build_penalty_tx(ch, &penalty,
+                            old_txid, 0, old_remote, to_local_spk, 34,
+                            old_commit_num,
+                            use_anchor ? wt->anchor_spk : NULL,
+                            use_anchor ? wt->anchor_spk_len : 0)) {
+                        unsigned char *copy = malloc(penalty.len);
+                        if (copy) {
+                            memcpy(copy, penalty.data, penalty.len);
+                            free(just_added->signed_penalty_tx);
+                            just_added->signed_penalty_tx = copy;
+                            just_added->signed_penalty_tx_len = penalty.len;
+                        }
+                    }
+                    tx_buf_free(&penalty);
+                }
             }
         }
 
