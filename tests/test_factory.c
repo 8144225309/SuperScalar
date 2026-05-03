@@ -5491,41 +5491,59 @@ int test_factory_ps_subfactory_chain_extension(void) {
     TEST_ASSERT_EQ((long)total_after, (long)(total_before - f->fee_per_tx),
                     "conservation: total - fee");
 
-    /* Re-sign sub-factory 0 via in-process per-node MuSig (LSP + A + B = 3 signers).
-       Mirrors what the wire ceremony would do but in-process for the unit test. */
-    TEST_ASSERT(factory_session_init_node(f, (size_t)sub0_node_idx),
-                "session init for chain[1]");
-    secp256k1_musig_secnonce secnonces[3];
-    for (size_t j = 0; j < sub->n_signers; j++) {
-        uint32_t participant = sub->signer_indices[j];
-        unsigned char seckey[32];
-        secp256k1_pubkey pk;
-        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
-                    "get seckey");
-        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]),
-                    "get pubkey");
-        secp256k1_musig_pubnonce pubnonce;
-        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
-                                           seckey, &pk, &sub->keyagg.cache),
-                    "gen nonce");
-        TEST_ASSERT(factory_session_set_nonce(f, (size_t)sub0_node_idx, j, &pubnonce),
-                    "set nonce");
-        memset(seckey, 0, 32);
+    /* Re-sign sub-factory 0 via the new multi-input per-node MuSig.
+       chain[N+1] consumes ALL k+1 outputs of chain[N], so signing runs k+1
+       independent MuSig sessions (one per input).  Mirrors what the
+       multi-input wire ceremony will do; here we drive it in-process. */
+    TEST_ASSERT(factory_node_uses_multi_input(f, (size_t)sub0_node_idx),
+                "advanced sub-factory uses multi-input");
+    {
+        size_t n_inp = sub->ps_n_prev_outputs;
+        TEST_ASSERT_EQ((long)n_inp, 3, "chain[1] n_inputs = k+1 = 3");
+        secp256k1_musig_secnonce secnonces[3][3];
+        for (size_t i = 0; i < n_inp; i++) {
+            TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
+                        "init per-input session");
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                unsigned char seckey[32];
+                secp256k1_pubkey pk;
+                TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
+                            "get seckey");
+                TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]),
+                            "get pubkey");
+                secp256k1_musig_pubnonce pubnonce;
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][j], &pubnonce,
+                                                   seckey, &pk, &sub->keyagg.cache),
+                            "gen nonce");
+                TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
+                                                              i, j, &pubnonce),
+                            "set nonce per-input");
+                memset(seckey, 0, 32);
+            }
+            TEST_ASSERT(factory_session_finalize_node_input(f, (size_t)sub0_node_idx, i),
+                        "finalize per-input");
+        }
+        for (size_t i = 0; i < n_inp; i++) {
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                secp256k1_musig_partial_sig psig;
+                TEST_ASSERT(musig_create_partial_sig(
+                                ctx, &psig, &secnonces[i][j], &kps[participant],
+                                &sub->input_signing_sessions[i]),
+                            "create per-input psig");
+                TEST_ASSERT(factory_session_set_partial_sig_input(
+                                f, (size_t)sub0_node_idx, i, j, &psig),
+                            "set per-input psig");
+            }
+            TEST_ASSERT(factory_session_complete_node_input(
+                            f, (size_t)sub0_node_idx, i),
+                        "complete per-input");
+        }
+        TEST_ASSERT(factory_session_assemble_signed_tx_multi(
+                        f, (size_t)sub0_node_idx),
+                    "assemble multi-witness chain[1] signed_tx");
     }
-    TEST_ASSERT(factory_session_finalize_node(f, (size_t)sub0_node_idx),
-                "finalize");
-    for (size_t j = 0; j < sub->n_signers; j++) {
-        uint32_t participant = sub->signer_indices[j];
-        secp256k1_musig_partial_sig psig;
-        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
-                                               &kps[participant],
-                                               &sub->signing_session),
-                    "create psig");
-        TEST_ASSERT(factory_session_set_partial_sig(f, (size_t)sub0_node_idx, j, &psig),
-                    "set psig");
-    }
-    TEST_ASSERT(factory_session_complete_node(f, (size_t)sub0_node_idx),
-                "complete chain[1] sig");
     TEST_ASSERT(sub->is_signed, "chain[1] signed");
     TEST_ASSERT(sub->signed_tx.len > 0, "chain[1] signed_tx populated");
 
@@ -5548,37 +5566,52 @@ int test_factory_ps_subfactory_chain_extension(void) {
                     (long)(sstock_chain1 - delta2 - f->fee_per_tx),
                     "sales-stock = chain[1] - delta2 - fee");
 
-    /* Sign chain[2] same way to confirm multi-extension works */
-    TEST_ASSERT(factory_session_init_node(f, (size_t)sub0_node_idx),
-                "chain[2] session init");
-    for (size_t j = 0; j < sub->n_signers; j++) {
-        uint32_t participant = sub->signer_indices[j];
-        unsigned char seckey[32];
-        secp256k1_pubkey pk;
-        secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
-        secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
-        secp256k1_musig_pubnonce pubnonce;
-        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
-                                           seckey, &pk, &sub->keyagg.cache),
-                    "chain[2] gen nonce");
-        TEST_ASSERT(factory_session_set_nonce(f, (size_t)sub0_node_idx, j, &pubnonce),
-                    "chain[2] set nonce");
-        memset(seckey, 0, 32);
+    /* Sign chain[2] via the per-input flow */
+    {
+        size_t n_inp2 = sub->ps_n_prev_outputs;
+        TEST_ASSERT_EQ((long)n_inp2, 3, "chain[2] n_inputs = 3");
+        secp256k1_musig_secnonce secnonces2[3][3];
+        for (size_t i = 0; i < n_inp2; i++) {
+            TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
+                        "chain[2] init per-input");
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                unsigned char seckey[32];
+                secp256k1_pubkey pk;
+                secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
+                secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
+                secp256k1_musig_pubnonce pubnonce;
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces2[i][j], &pubnonce,
+                                                   seckey, &pk, &sub->keyagg.cache),
+                            "chain[2] gen nonce");
+                TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
+                                                              i, j, &pubnonce),
+                            "chain[2] set per-input nonce");
+                memset(seckey, 0, 32);
+            }
+            TEST_ASSERT(factory_session_finalize_node_input(f, (size_t)sub0_node_idx, i),
+                        "chain[2] finalize per-input");
+        }
+        for (size_t i = 0; i < n_inp2; i++) {
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                secp256k1_musig_partial_sig psig;
+                TEST_ASSERT(musig_create_partial_sig(
+                                ctx, &psig, &secnonces2[i][j], &kps[participant],
+                                &sub->input_signing_sessions[i]),
+                            "chain[2] create psig");
+                TEST_ASSERT(factory_session_set_partial_sig_input(
+                                f, (size_t)sub0_node_idx, i, j, &psig),
+                            "chain[2] set per-input psig");
+            }
+            TEST_ASSERT(factory_session_complete_node_input(
+                            f, (size_t)sub0_node_idx, i),
+                        "chain[2] complete per-input");
+        }
+        TEST_ASSERT(factory_session_assemble_signed_tx_multi(
+                        f, (size_t)sub0_node_idx),
+                    "chain[2] assemble multi-witness");
     }
-    TEST_ASSERT(factory_session_finalize_node(f, (size_t)sub0_node_idx),
-                "chain[2] finalize");
-    for (size_t j = 0; j < sub->n_signers; j++) {
-        uint32_t participant = sub->signer_indices[j];
-        secp256k1_musig_partial_sig psig;
-        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
-                                               &kps[participant],
-                                               &sub->signing_session),
-                    "chain[2] create psig");
-        TEST_ASSERT(factory_session_set_partial_sig(f, (size_t)sub0_node_idx, j, &psig),
-                    "chain[2] set psig");
-    }
-    TEST_ASSERT(factory_session_complete_node(f, (size_t)sub0_node_idx),
-                "chain[2] complete");
     TEST_ASSERT(sub->is_signed, "chain[2] signed");
 
     /* Failure cases */
@@ -5596,6 +5629,180 @@ int test_factory_ps_subfactory_chain_extension(void) {
     /* (c) channel_idx out of range (= sales-stock vout) */
     rc = factory_subfactory_chain_advance_unsigned(f, 0, 0, 2, 1000);
     TEST_ASSERT_EQ(rc, 0, "reject: channel_idx == sales-stock vout");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* Decode chain[1]'s signed_tx bytes and assert TX-level conservation
+   (the regression that #207 fixes — pre-fix chain[1] was a 1-vin / 3-vout
+   TX whose outputs exceeded the single input by ~3x).
+
+   Reads the segwit serialization manually:
+     [nVersion(4)][marker(1)=00][flag(1)=01][vin_count varint]
+     [vin × N: txid(32) + vout(4) + scriptSig_varint(0) + nSeq(4)]
+     [vout_count varint]
+     [vout × M: amount(8) + spk_varint + spk]
+     [witness × N (each = stack_count varint + per-item varint+data)]
+     [nLockTime(4)] */
+int test_factory_ps_subfactory_chain_tx_validity(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xAB;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xFA, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build k² PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign initial state");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    int sub0_node_idx = leaf->subfactory_node_indices[0];
+    factory_node_t *sub = &f->nodes[sub0_node_idx];
+
+    /* Snapshot the 3 chain[0] output amounts (these become chain[1]'s 3 inputs). */
+    uint64_t in_amounts[3];
+    for (size_t i = 0; i < sub->n_outputs; i++)
+        in_amounts[i] = sub->outputs[i].amount_sats;
+    uint64_t in_total = in_amounts[0] + in_amounts[1] + in_amounts[2];
+
+    /* Advance: client A buys 50000 from sales-stock. */
+    uint64_t delta = 50000;
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, delta), 1,
+                    "advance ok");
+
+    /* Sign chain[1] via per-input flow. */
+    {
+        size_t n_inp = sub->ps_n_prev_outputs;
+        secp256k1_musig_secnonce secnonces[3][3];
+        for (size_t i = 0; i < n_inp; i++) {
+            TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
+                        "init input");
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                unsigned char seckey[32];
+                secp256k1_pubkey pk;
+                secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
+                secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
+                secp256k1_musig_pubnonce pubnonce;
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][j], &pubnonce,
+                                                   seckey, &pk, &sub->keyagg.cache),
+                            "gen nonce");
+                TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
+                                                              i, j, &pubnonce),
+                            "set nonce");
+                memset(seckey, 0, 32);
+            }
+            TEST_ASSERT(factory_session_finalize_node_input(f, (size_t)sub0_node_idx, i),
+                        "finalize input");
+        }
+        for (size_t i = 0; i < n_inp; i++) {
+            for (size_t j = 0; j < sub->n_signers; j++) {
+                uint32_t participant = sub->signer_indices[j];
+                secp256k1_musig_partial_sig psig;
+                TEST_ASSERT(musig_create_partial_sig(
+                                ctx, &psig, &secnonces[i][j], &kps[participant],
+                                &sub->input_signing_sessions[i]),
+                            "create psig");
+                TEST_ASSERT(factory_session_set_partial_sig_input(
+                                f, (size_t)sub0_node_idx, i, j, &psig),
+                            "set psig");
+            }
+        }
+        TEST_ASSERT(factory_session_assemble_signed_tx_multi(
+                        f, (size_t)sub0_node_idx),
+                    "assemble signed_tx");
+    }
+
+    /* === Decode signed_tx bytes and verify TX-level conservation === */
+    const unsigned char *tx = sub->signed_tx.data;
+    size_t tx_len = sub->signed_tx.len;
+    TEST_ASSERT(tx_len > 100, "signed_tx is non-trivial");
+
+    /* offset 0..3: nVersion = 2 */
+    TEST_ASSERT_EQ(tx[0], 0x02, "nVersion byte 0");
+    /* offset 4: segwit marker = 0x00 */
+    TEST_ASSERT_EQ(tx[4], 0x00, "segwit marker");
+    /* offset 5: segwit flag = 0x01 */
+    TEST_ASSERT_EQ(tx[5], 0x01, "segwit flag");
+
+    /* offset 6: vin_count varint.  We expect 3 inputs (= k+1). */
+    TEST_ASSERT_EQ(tx[6], 0x03, "vin_count = 3 (THIS IS THE #207 FIX)");
+
+    /* Walk the 3 inputs, each 41 bytes (32 txid + 4 vout + 1 scriptSig=0 + 4 nSeq). */
+    size_t pos = 7;
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(memcmp(tx + pos, sub->ps_prev_txid, 32) == 0,
+                    "input txid matches ps_prev_txid");
+        uint32_t vout = (uint32_t)tx[pos + 32] | ((uint32_t)tx[pos + 33] << 8) |
+                        ((uint32_t)tx[pos + 34] << 16) | ((uint32_t)tx[pos + 35] << 24);
+        TEST_ASSERT_EQ((long)vout, (long)i, "input vout matches index");
+        TEST_ASSERT_EQ(tx[pos + 36], 0x00, "scriptSig length = 0");
+        pos += 41;
+    }
+
+    /* vout_count varint */
+    TEST_ASSERT_EQ(tx[pos], 0x03, "vout_count = 3");
+    pos++;
+
+    /* Walk 3 outputs, sum amounts.  Each output = 8 (amount) + 1 (spk_len varint) + spk_len. */
+    uint64_t out_total = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t amount = 0;
+        for (int b = 0; b < 8; b++)
+            amount |= ((uint64_t)tx[pos + b]) << (b * 8);
+        out_total += amount;
+        size_t spk_len = (size_t)tx[pos + 8];
+        pos += 9 + spk_len;
+    }
+
+    /* Conservation: sum(in_amounts) == sum(out_amounts) + fee_per_tx.
+       The advance moves `delta` from sales-stock to channel A — total
+       just decreases by fee. */
+    TEST_ASSERT_EQ((long)out_total, (long)(in_total - f->fee_per_tx),
+                    "input total - fee = output total (conservation)");
+
+    /* 3 witnesses follow, each = 1 + 1 + 64 = 66 bytes (stack_count=1, sig_len=64, sig). */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ(tx[pos + 0], 0x01, "witness stack count = 1");
+        TEST_ASSERT_EQ(tx[pos + 1], 0x40, "witness sig len = 64");
+        pos += 66;
+    }
+
+    /* nLockTime at end: 4 bytes */
+    TEST_ASSERT(pos == tx_len - 4, "consumed all bytes except nLockTime");
+    TEST_ASSERT_EQ(tx[tx_len - 4], 0x00, "nLockTime byte 0");
 
     factory_free(f);
     secp256k1_context_destroy(ctx);
