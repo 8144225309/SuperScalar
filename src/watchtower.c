@@ -806,6 +806,16 @@ int watchtower_check(watchtower_t *wt) {
         }
         tx_buf_free(&penalty_tx);
 
+        /* Look up the live channel pointer for the secondary CPFP/HTLC/PTLC
+           sweep loops below.  In production this is always NULL (channels[]
+           is unpopulated after #208 A3.1b dropped watchtower_set_channel),
+           so all `if (ch)` branches short-circuit.  A3.3 will pre-build
+           these secondary TX bytes at revocation time and remove the
+           channels[] field entirely. */
+        channel_t *ch = NULL;
+        if (e->channel_id < wt->channels_cap)
+            ch = wt->channels[e->channel_id];
+
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
            Skip CPFP tracking at sub-1-sat/vB — no anchor output was created. */
