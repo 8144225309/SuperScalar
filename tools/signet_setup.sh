@@ -999,6 +999,16 @@ cmd_demo_k2_subfactory() {
     detail "→ Phase 4b registers chain[N-1] with watchtower for breach defense"
     detail "→ Coop close to verify per-client deltas including the chain extension"
 
+    # FORCE_CLOSE=1 (PR-E): also broadcast the factory tree on-chain after
+    # the off-chain ceremony.  The LSP daemon's --force-close emits each
+    # signed tree TX via sendrawtransaction; the campaign harness then
+    # polls bitcoind for confirmations and runs per-client sweeps.
+    local FORCE_CLOSE_ARG=""
+    if [ "${FORCE_CLOSE:-0}" = "1" ]; then
+        FORCE_CLOSE_ARG="--force-close"
+        detail "→ FORCE_CLOSE=1: tree will be broadcast on-chain after advance"
+    fi
+
     "$SCBIN/superscalar_lsp" \
             --network "$NET" \
             --cli-path "$BTCBIN/bitcoin-cli" \
@@ -1013,6 +1023,7 @@ cmd_demo_k2_subfactory() {
             --step-blocks 1 \
             --demo \
             --test-subfactory-advance \
+            $FORCE_CLOSE_ARG \
             --db "$LSPDB" \
             --keyfile "$DATADIR/lsp.key" \
             --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
