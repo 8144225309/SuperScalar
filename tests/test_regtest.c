@@ -798,9 +798,20 @@ int test_regtest_breach_penalty_cpfp(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register old commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register old commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
     printf("  Watchtower watching commitment #0\n");
 
     /* --- BREACH: broadcast revoked commitment #0 --- */
@@ -1003,9 +1014,20 @@ int test_regtest_watchtower_mempool_detection(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
 
     /* BREACH: broadcast revoked commitment #0 — do NOT mine */
     char *commit0_hex = (char *)malloc(commit0_signed.len * 2 + 1);
@@ -1184,9 +1206,20 @@ int test_regtest_watchtower_late_detection(void) {
     memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
     tx_buf_free(&remote_commit0);
 
-    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
-                                   0, local_amt, breach_to_local_spk, 34),
-                "register commitment for watching");
+    /* Pre-build penalty bytes for oracular registration (#208 A3.2 made
+       watchtower_check fail-closed when signed_penalty_tx is NULL). */
+    tx_buf_t penalty_pre;
+    tx_buf_init(&penalty_pre, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_pre,
+                                           commit0_txid, 0, local_amt,
+                                           breach_to_local_spk, 34, 0,
+                                           wt.anchor_spk, wt.anchor_spk_len),
+                "pre-build penalty bytes");
+    TEST_ASSERT(watchtower_watch_oracular(&wt, 0, 0, commit0_txid,
+                                            0, local_amt, breach_to_local_spk, 34,
+                                            penalty_pre.data, penalty_pre.len),
+                "register commitment for watching (oracular)");
+    tx_buf_free(&penalty_pre);
 
     /* BREACH: broadcast revoked commitment #0 */
     char *commit0_hex = (char *)malloc(commit0_signed.len * 2 + 1);
