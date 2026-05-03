@@ -679,43 +679,12 @@ int test_jit_msg_type_names(void) {
 
 /* --- JIT Hardening Tests --- */
 
-/* Step 1: Watchtower registration on JIT create */
-int test_jit_watchtower_registration(void) {
-    lsp_channel_mgr_t mgr;
-    memset(&mgr, 0, sizeof(mgr));
-    mgr.n_channels = 4;
-    mgr.ctx = secp256k1_context_create(
-        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-
-    /* Set up a watchtower */
-    watchtower_t wt;
-    watchtower_init(&wt, 4, NULL, NULL, NULL);
-    mgr.watchtower = &wt;
-
-    jit_channels_init(&mgr);
-
-    /* Manually create a JIT channel for client 2 */
-    jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
-    jits[0].client_idx = 2;
-    jits[0].state = JIT_STATE_OPEN;
-    jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 2;
-    mgr.n_jit_channels = 1;
-
-    /* Simulate what jit_channel_create does: register with watchtower */
-    size_t wt_idx = mgr.n_channels + jits[0].client_idx;  /* 4+2=6 */
-    watchtower_set_channel(&wt, wt_idx, &jits[0].channel);
-
-    TEST_ASSERT_EQ((long)wt_idx, 6, "watchtower index should be 6");
-    TEST_ASSERT(wt.channels[6] == &jits[0].channel,
-                "watchtower channel[6] should point to JIT channel");
-    TEST_ASSERT(wt.n_channels >= 7,
-                "watchtower n_channels should be >= 7");
-
-    jit_channels_cleanup(&mgr);
-    watchtower_cleanup(&wt);
-    secp256k1_context_destroy(mgr.ctx);
-    return 1;
-}
+/* test_jit_watchtower_registration deleted in #208 A3.2 — it asserted
+   the live channel-pointer registration mechanism (watchtower_set_channel
+   + wt.channels[idx]) which has been removed in favor of the oracular
+   model.  The new invariant ("no live channel state in the watchtower")
+   is enforced by the absence of the channels[] field — there's no
+   meaningful test to write. */
 
 /* Step 1: Watchtower revocation tracking for JIT */
 int test_jit_watchtower_revocation(void) {
@@ -747,9 +716,9 @@ int test_jit_watchtower_revocation(void) {
     watchtower_t wt;
     watchtower_init(&wt, 8, NULL, NULL, NULL);
 
-    /* Register as JIT watchtower index (e.g. index 5 for client 1 with 4 factory channels) */
+    /* Register as JIT watchtower index (e.g. index 5 for client 1 with 4 factory channels).
+       watchtower_set_channel dropped in #208 A3.2. */
     uint32_t wt_chan_id = 5;
-    watchtower_set_channel(&wt, wt_chan_id, &ch);
 
     /* Add a watch entry manually */
     unsigned char fake_txid[32];

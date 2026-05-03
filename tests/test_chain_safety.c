@@ -225,10 +225,10 @@ int test_force_close_msg_error_wired(void)
     memset(&d, 0, sizeof(d));
     d.peer_channels = channels;
 
-    /* Init watchtower (no chain backend needed for entry counting) */
+    /* Init watchtower (no chain backend needed for entry counting).
+       watchtower_set_channel dropped in #208 A3.2. */
     watchtower_t wt;
     watchtower_init(&wt, 1, NULL, NULL, NULL);
-    watchtower_set_channel(&wt, 0, &ch);
     d.watchtower = &wt;
 
     /* The MSG_ERROR handler calls watchtower_watch_force_close(wt, 0, zero_txid, NULL, 0)
