@@ -740,7 +740,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
     /* Wire channel into client watchtower */
     if (cbd && cbd->wt) {
-        watchtower_set_channel(cbd->wt, 0, ch);
+        /* watchtower_set_channel dropped in #208 A3.1b — penalty bytes
+           are pre-built at revocation receive time. */
 
         /* Register factory STATE nodes with watchtower (first entry only).
            After a factory_advance(), old state txids should be re-registered

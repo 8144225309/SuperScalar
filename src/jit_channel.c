@@ -479,11 +479,10 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     jit->state = JIT_STATE_OPEN;
     mgr->n_jit_channels++;
 
-    /* Register JIT channel with watchtower */
-    if (mgr->watchtower) {
-        size_t wt_idx = mgr->n_channels + client_idx;
-        watchtower_set_channel(mgr->watchtower, wt_idx, &jit->channel);
-    }
+    /* JIT channel registration with watchtower: dropped in #208 A3.1b.
+       The watchtower no longer derefs live channel state at breach
+       detection — penalty TX bytes are pre-built at revocation time
+       inside watchtower_watch_revoked_commitment.  See A3 design doc. */
 
     /* Persist (transactional) */
     if (mgr->persist) {
@@ -733,9 +732,9 @@ int jit_channels_check_funding(void *mgr_ptr) {
             printf("LSP JIT: channel %08x funding confirmed (%d conf)\n",
                    jits[i].jit_channel_id, conf);
 
-            /* Register with watchtower (guaranteed non-NULL by guard at function entry) */
-            size_t wt_idx = mgr->n_channels + jits[i].client_idx;
-            watchtower_set_channel(mgr->watchtower, wt_idx, &jits[i].channel);
+            /* Watchtower channel-pointer registration dropped in
+               #208 A3.1b — penalty bytes are pre-built at revocation
+               receive time inside watchtower_watch_revoked_commitment. */
 
             /* Persist state change */
             if (mgr->persist)

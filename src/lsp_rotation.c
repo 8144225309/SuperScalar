@@ -913,12 +913,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Update watchtower channel pointers */
-    if (mgr->watchtower) {
-        for (size_t c = 0; c < mgr->n_channels; c++)
-            watchtower_set_channel(mgr->watchtower, c,
-                                    &mgr->entries[c].channel);
-    }
+    /* Watchtower channel-pointer rebind dropped in #208 A3.1b: the
+       watchtower no longer derefs live channel state — penalty TX bytes
+       are pre-built at revocation receive time inside
+       watchtower_watch_revoked_commitment. */
 
     /* Persist new channel state (transactional) */
     if (mgr->persist) {
