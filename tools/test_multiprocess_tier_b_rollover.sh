@@ -332,9 +332,27 @@ echo ""
 echo "  $PARTICIPATED / $N_CLIENTS clients logged Tier B completion"
 
 echo ""
+
+# --- PR-D phase 5: assert the SECURITY GAP path is no longer taken ---
+# After PR-D phases 3 + 4 (LSP-side dual-pool ceremony + client-side mirror)
+# every leaf advanced through Tier B rotation should produce a
+# wire-signed poison TX, so the LSP must NOT print the multi-process
+# fallback warning.  If this line fires, either a client or the LSP is
+# missing the poison ceremony — the SECURITY GAP is back open.
+echo "=== PR-D phase 5: verify NO 'SECURITY GAP' in rotation path ==="
+if grep -q "multi-process mode — skipping" "$LSP_LOG"; then
+    echo "FAIL: LSP rotation log contains SECURITY GAP fallback line(s):"
+    grep -n "multi-process mode — skipping\|SECURITY GAP" "$LSP_LOG" | head -5
+    echo "  (Tier B rotation poison wire ceremony is not closing the gap end-to-end.)"
+    exit 1
+fi
+echo "  OK: no SECURITY GAP fallback in LSP log"
+
+echo ""
 echo "=== PASS: Multi-process Tier B state-advance rollover ==="
 echo "  - $((N_CLIENTS + 1)) distinct OS processes"
 echo "  - $((STATES_PER_LAYER + 1)) leaf-0 advances driven over wire"
 echo "  - rc=-1 root rollover triggered Tier B ceremony"
 echo "  - All affected nodes re-signed for new epoch via MSG_PATH_*"
 echo "  - $PARTICIPATED / $N_CLIENTS clients confirmed completion"
+echo "  - Tier B rotation poison wire ceremony — no SECURITY GAP"
