@@ -2011,6 +2011,40 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    /* --- Step 1.5: Prepare poison sessions for each leaf where the OLD
+       state was signed (PR-D phase 3 — closes Tier B rotation Gap A
+       SECURITY GAP for multi-process LSPs).  Builds the unsigned poison
+       TX bytes + sighash on each leaf node, then initializes its
+       poison MuSig session.  Failures here downgrade individual leaves
+       to the single-process fallback in Step 10 — rotation must keep
+       going.  Watchtower still gets the OLD state's poison entry from
+       the prior advance (overlap window). */
+    int leaf_poison_prepared[FACTORY_MAX_LEAVES] = {0};
+    const uint64_t POISON_FEE_SATS = 1000;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        size_t ni = leaf_pre[lp].node_idx;
+        factory_node_t *leaf_node = &f->nodes[ni];
+        if (leaf_node->is_ps_leaf) continue;       /* PS leaves: no poison */
+        if (!leaf_pre[lp].had_old_signed) continue;
+        if (leaf_pre[lp].old_n_outputs < 2) continue;
+        size_t l_vout = (size_t)(leaf_pre[lp].old_n_outputs - 1);
+        if (!factory_session_prepare_poison_tx_leaf(
+                f, ni, leaf_pre[lp].old_txid, (uint32_t)l_vout,
+                leaf_pre[lp].old_l_amount, POISON_FEE_SATS)) {
+            fprintf(stderr,
+                    "LSP rotation: poison TX prep failed for leaf %zu — "
+                    "single-process fallback in Step 10\n", ni);
+            continue;
+        }
+        if (!factory_session_init_node_poison(f, ni)) {
+            fprintf(stderr,
+                    "LSP rotation: poison session init failed for leaf %zu\n", ni);
+            factory_session_reset_poison(f, ni);
+            continue;
+        }
+        leaf_poison_prepared[lp] = 1;
+    }
+
     /* --- Step 2: Generate LSP's nonce pool over all affected nodes
        where LSP is a signer --- */
     size_t lsp_node_count = 0;
@@ -2072,6 +2106,83 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_bundle_count++;
     }
 
+    /* --- Step 2.5: Generate LSP's poison nonce pool over all prepared
+       leaves where LSP is a signer (PR-D phase 3).  Mirrors Step 2 but
+       feeds factory_session_set_nonce_poison + builds lsp_poison_bundle
+       so the poison MuSig session runs in lockstep with the state one.
+       On any failure here, downgrade affected leaves to single-process
+       fallback in Step 10 — never abort the whole rotation. */
+    size_t lsp_poison_count = 0;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        if (factory_find_signer_slot(f, leaf_pre[lp].node_idx, 0) >= 0)
+            lsp_poison_count++;
+    }
+    musig_nonce_pool_t lsp_poison_pool;
+    int lsp_poison_pool_inited = 0;
+    secp256k1_musig_secnonce *lsp_psec_per_leaf[FACTORY_MAX_LEAVES] = {0};
+    int lsp_pslot_per_leaf[FACTORY_MAX_LEAVES];
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) lsp_pslot_per_leaf[lp] = -1;
+    wire_bundle_entry_t lsp_poison_bundle[FACTORY_MAX_LEAVES];
+    size_t lsp_poison_bundle_count = 0;
+
+    if (lsp_poison_count > 0) {
+        unsigned char lsp_seckey2[32];
+        if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey2, &lsp->lsp_keypair)) {
+            for (size_t lp = 0; lp < n_leaf_pre; lp++)
+                if (leaf_poison_prepared[lp]) {
+                    factory_session_reset_poison(f, leaf_pre[lp].node_idx);
+                    leaf_poison_prepared[lp] = 0;
+                }
+        } else if (musig_nonce_pool_generate(lsp->ctx, &lsp_poison_pool,
+                                              lsp_poison_count,
+                                              lsp_seckey2, &lsp->lsp_pubkey, NULL)) {
+            lsp_poison_pool_inited = 1;
+        } else {
+            fprintf(stderr, "LSP rotation: poison nonce pool gen failed\n");
+            for (size_t lp = 0; lp < n_leaf_pre; lp++)
+                if (leaf_poison_prepared[lp]) {
+                    factory_session_reset_poison(f, leaf_pre[lp].node_idx);
+                    leaf_poison_prepared[lp] = 0;
+                }
+        }
+        memset(lsp_seckey2, 0, 32);
+    }
+
+    if (lsp_poison_pool_inited) {
+        for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+            if (!leaf_poison_prepared[lp]) continue;
+            size_t ni = leaf_pre[lp].node_idx;
+            int pslot = factory_find_signer_slot(f, ni, 0);
+            if (pslot < 0) continue;
+            secp256k1_musig_secnonce *psec;
+            secp256k1_musig_pubnonce ppub;
+            if (!musig_nonce_pool_next(&lsp_poison_pool, &psec, &ppub)) {
+                fprintf(stderr,
+                        "LSP rotation: poison pool exhausted at leaf %zu\n", ni);
+                factory_session_reset_poison(f, ni);
+                leaf_poison_prepared[lp] = 0;
+                continue;
+            }
+            lsp_psec_per_leaf[lp] = psec;
+            lsp_pslot_per_leaf[lp] = pslot;
+            if (!factory_session_set_nonce_poison(f, ni, (size_t)pslot, &ppub)) {
+                fprintf(stderr,
+                        "LSP rotation: set_nonce_poison LSP failed for leaf %zu\n", ni);
+                factory_session_reset_poison(f, ni);
+                leaf_poison_prepared[lp] = 0;
+                continue;
+            }
+            unsigned char ser[66];
+            musig_pubnonce_serialize(lsp->ctx, ser, &ppub);
+            lsp_poison_bundle[lsp_poison_bundle_count].node_idx = (uint32_t)ni;
+            lsp_poison_bundle[lsp_poison_bundle_count].signer_slot = (uint32_t)pslot;
+            memcpy(lsp_poison_bundle[lsp_poison_bundle_count].data, ser, 66);
+            lsp_poison_bundle[lsp_poison_bundle_count].data_len = 66;
+            lsp_poison_bundle_count++;
+        }
+    }
+
     /* --- Step 3: Send STATE_ADVANCE_PROPOSE to all clients --- */
     cJSON *propose = wire_build_state_advance_propose(new_epoch, trigger_leaf_side,
                                                        lsp_nonce_bundle, lsp_bundle_count);
@@ -2085,7 +2196,9 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     cJSON_Delete(propose);
 
     /* --- Step 4: Collect PATH_NONCE_BUNDLE from each client.  Aggregate
-       into all_nonce_entries[] which we'll broadcast as PATH_ALL_NONCES. */
+       into all_nonce_entries[] which we'll broadcast as PATH_ALL_NONCES.
+       PR-D phase 3: ALSO collect optional poison_entries from each
+       client and aggregate into all_poison_nonces[] for the broadcast. */
     size_t total_slots = 0;
     for (size_t k = 0; k < n_affected; k++)
         total_slots += f->nodes[affected[k]].n_signers;
@@ -2095,9 +2208,33 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!all_nonces) return 0;
     size_t all_count = 0;
 
-    /* Seed all_nonces with LSP's own contributions */
+    /* Per-leaf poison aggregate, sized at most n_leaves * n_signers per leaf.
+       Track per-leaf which clients have contributed so we can degrade
+       leaves that didn't receive a full set of poison nonces. */
+    size_t total_poison_slots = 0;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++)
+        if (leaf_poison_prepared[lp])
+            total_poison_slots += f->nodes[leaf_pre[lp].node_idx].n_signers;
+    wire_bundle_entry_t *all_poison_nonces = NULL;
+    if (total_poison_slots > 0) {
+        all_poison_nonces = (wire_bundle_entry_t *)calloc(
+            total_poison_slots, sizeof(wire_bundle_entry_t));
+        if (!all_poison_nonces) { free(all_nonces); return 0; }
+    }
+    size_t all_poison_count = 0;
+
+    /* Seed all_nonces / all_poison_nonces with LSP's own contributions */
     for (size_t i = 0; i < lsp_bundle_count; i++)
         all_nonces[all_count++] = lsp_nonce_bundle[i];
+    for (size_t i = 0; i < lsp_poison_bundle_count; i++)
+        all_poison_nonces[all_poison_count++] = lsp_poison_bundle[i];
+
+    /* Track count of poison nonces received per leaf — when below
+       n_signers after collecting from every client, degrade that leaf. */
+    int leaf_poison_nonces_recvd[FACTORY_MAX_LEAVES] = {0};
+    for (size_t lp = 0; lp < n_leaf_pre; lp++)
+        if (leaf_poison_prepared[lp] && lsp_pslot_per_leaf[lp] >= 0)
+            leaf_poison_nonces_recvd[lp] = 1;  /* LSP contribution */
 
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t nmsg;
@@ -2106,21 +2243,21 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             fprintf(stderr, "LSP state_advance: expected PATH_NONCE_BUNDLE from client %zu, got 0x%02x\n",
                     c, nmsg.msg_type);
             if (nmsg.json) cJSON_Delete(nmsg.json);
-            free(all_nonces);
+            free(all_nonces); free(all_poison_nonces);
             return 0;
         }
         cJSON *arr = cJSON_GetObjectItem(nmsg.json, "entries");
         if (!arr) {
             fprintf(stderr, "LSP state_advance: PATH_NONCE_BUNDLE missing entries from client %zu\n", c);
             cJSON_Delete(nmsg.json);
-            free(all_nonces);
+            free(all_nonces); free(all_poison_nonces);
             return 0;
         }
         size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
         wire_bundle_entry_t *cents = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!cents) {
             cJSON_Delete(nmsg.json);
-            free(all_nonces);
+            free(all_nonces); free(all_poison_nonces);
             return 0;
         }
         size_t ne = wire_parse_bundle(arr, cents, cap, 66);
@@ -2128,34 +2265,95 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             secp256k1_musig_pubnonce pn;
             if (!musig_pubnonce_parse(lsp->ctx, &pn, cents[e].data)) {
                 fprintf(stderr, "LSP state_advance: bad pubnonce from client %zu\n", c);
-                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                free(cents); cJSON_Delete(nmsg.json);
+                free(all_nonces); free(all_poison_nonces);
                 return 0;
             }
             if (!factory_session_set_nonce(f, cents[e].node_idx,
                                             cents[e].signer_slot, &pn)) {
                 fprintf(stderr, "LSP state_advance: set_nonce client=%zu node=%u slot=%u failed\n",
                         c, cents[e].node_idx, cents[e].signer_slot);
-                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                free(cents); cJSON_Delete(nmsg.json);
+                free(all_nonces); free(all_poison_nonces);
                 return 0;
             }
             if (all_count >= total_slots) {
                 fprintf(stderr, "LSP state_advance: nonce overflow (got more than total_slots=%zu)\n",
                         total_slots);
-                free(cents); cJSON_Delete(nmsg.json); free(all_nonces);
+                free(cents); cJSON_Delete(nmsg.json);
+                free(all_nonces); free(all_poison_nonces);
                 return 0;
             }
             all_nonces[all_count++] = cents[e];
         }
         free(cents);
+
+        /* PR-D phase 3: parse optional poison_entries from this client. */
+        if (total_poison_slots > 0) {
+            wire_bundle_entry_t *pcents = calloc(total_poison_slots,
+                                                   sizeof(wire_bundle_entry_t));
+            if (!pcents) {
+                cJSON_Delete(nmsg.json);
+                free(all_nonces); free(all_poison_nonces);
+                return 0;
+            }
+            size_t np = wire_parse_poison_bundle(nmsg.json, pcents,
+                                                   total_poison_slots, 66);
+            for (size_t e = 0; e < np; e++) {
+                int lp_match = -1;
+                for (size_t lp = 0; lp < n_leaf_pre; lp++)
+                    if (leaf_poison_prepared[lp] &&
+                        leaf_pre[lp].node_idx == pcents[e].node_idx) {
+                        lp_match = (int)lp;
+                        break;
+                    }
+                if (lp_match < 0) continue;
+                secp256k1_musig_pubnonce pn;
+                if (!musig_pubnonce_parse(lsp->ctx, &pn, pcents[e].data) ||
+                    !factory_session_set_nonce_poison(f, pcents[e].node_idx,
+                                                        pcents[e].signer_slot, &pn)) {
+                    fprintf(stderr,
+                            "LSP rotation: bad poison nonce from client %zu leaf %u — "
+                            "single-process fallback for this leaf\n",
+                            c, pcents[e].node_idx);
+                    factory_session_reset_poison(f, pcents[e].node_idx);
+                    leaf_poison_prepared[lp_match] = 0;
+                    continue;
+                }
+                if (all_poison_count < total_poison_slots)
+                    all_poison_nonces[all_poison_count++] = pcents[e];
+                leaf_poison_nonces_recvd[lp_match]++;
+            }
+            free(pcents);
+        }
         cJSON_Delete(nmsg.json);
     }
 
-    /* --- Step 5: Broadcast PATH_ALL_NONCES --- */
-    cJSON *all_msg = wire_build_all_nonces(all_nonces, all_count);
+    /* Degrade any leaf where we didn't get the full set of poison nonces. */
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        size_t need = f->nodes[ni].n_signers;
+        if ((size_t)leaf_poison_nonces_recvd[lp] < need) {
+            fprintf(stderr,
+                    "LSP rotation: leaf %zu got %d/%zu poison nonces — "
+                    "single-process fallback in Step 10\n",
+                    ni, leaf_poison_nonces_recvd[lp], need);
+            factory_session_reset_poison(f, ni);
+            leaf_poison_prepared[lp] = 0;
+        }
+    }
+
+    /* --- Step 5: Broadcast PATH_ALL_NONCES (with optional poison_entries) --- */
+    cJSON *all_msg = wire_build_all_nonces_with_poison(
+        all_nonces, all_count,
+        all_poison_count > 0 ? all_poison_nonces : NULL,
+        all_poison_count);
     for (size_t i = 0; i < lsp->n_clients; i++)
         wire_send(lsp->client_fds[i], MSG_PATH_ALL_NONCES, all_msg);
     cJSON_Delete(all_msg);
     free(all_nonces);
+    free(all_poison_nonces);
 
     /* --- Step 6: Finalize sessions for all affected nodes (compute sighash,
        aggregate nonces).  Must happen AFTER all nonces are set. --- */
@@ -2163,6 +2361,19 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!factory_session_finalize_node(f, affected[k])) {
             fprintf(stderr, "LSP state_advance: finalize_node %zu failed\n", affected[k]);
             return 0;
+        }
+    }
+
+    /* PR-D phase 3: also finalize poison sessions per prepared leaf. */
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        if (!factory_session_finalize_node_poison(f, ni)) {
+            fprintf(stderr,
+                    "LSP rotation: poison finalize failed for leaf %zu — "
+                    "single-process fallback in Step 10\n", ni);
+            factory_session_reset_poison(f, ni);
+            leaf_poison_prepared[lp] = 0;
         }
     }
 
@@ -2183,6 +2394,32 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             fprintf(stderr, "LSP state_advance: set_partial_sig LSP node=%zu failed\n",
                     affected[k]);
             return 0;
+        }
+    }
+
+    /* PR-D phase 3: LSP's poison partial sigs per prepared leaf. */
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        if (lsp_pslot_per_leaf[lp] < 0 || !lsp_psec_per_leaf[lp]) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        secp256k1_musig_partial_sig ppsig;
+        if (!musig_create_partial_sig(lsp->ctx, &ppsig, lsp_psec_per_leaf[lp],
+                                        &lsp_kp,
+                                        &f->nodes[ni].poison_signing_session)) {
+            fprintf(stderr,
+                    "LSP rotation: poison create_partial_sig failed for leaf %zu — "
+                    "single-process fallback in Step 10\n", ni);
+            factory_session_reset_poison(f, ni);
+            leaf_poison_prepared[lp] = 0;
+            continue;
+        }
+        if (!factory_session_set_partial_sig_poison(f, ni,
+                                                      (size_t)lsp_pslot_per_leaf[lp],
+                                                      &ppsig)) {
+            fprintf(stderr,
+                    "LSP rotation: poison set_partial_sig LSP failed for leaf %zu\n", ni);
+            factory_session_reset_poison(f, ni);
+            leaf_poison_prepared[lp] = 0;
         }
     }
 
@@ -2221,6 +2458,36 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
         }
         free(cents);
+
+        /* PR-D phase 3: parse optional poison_entries (partial sigs). */
+        size_t poison_psig_cap = (size_t)FACTORY_MAX_LEAVES * (size_t)FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *pcents = calloc(poison_psig_cap,
+                                               sizeof(wire_bundle_entry_t));
+        if (!pcents) { cJSON_Delete(pmsg.json); return 0; }
+        size_t np = wire_parse_poison_bundle(pmsg.json, pcents,
+                                               poison_psig_cap, 32);
+        for (size_t e = 0; e < np; e++) {
+            int lp_match = -1;
+            for (size_t lp = 0; lp < n_leaf_pre; lp++)
+                if (leaf_poison_prepared[lp] &&
+                    leaf_pre[lp].node_idx == pcents[e].node_idx) {
+                    lp_match = (int)lp;
+                    break;
+                }
+            if (lp_match < 0) continue;
+            secp256k1_musig_partial_sig ppsig;
+            if (!musig_partial_sig_parse(lsp->ctx, &ppsig, pcents[e].data) ||
+                !factory_session_set_partial_sig_poison(f, pcents[e].node_idx,
+                                                          pcents[e].signer_slot, &ppsig)) {
+                fprintf(stderr,
+                        "LSP rotation: bad/rejected poison psig from client %zu leaf %u — "
+                        "single-process fallback for this leaf\n",
+                        c, pcents[e].node_idx);
+                factory_session_reset_poison(f, pcents[e].node_idx);
+                leaf_poison_prepared[lp_match] = 0;
+            }
+        }
+        free(pcents);
         cJSON_Delete(pmsg.json);
     }
 
@@ -2229,6 +2496,22 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!factory_session_complete_node(f, affected[k])) {
             fprintf(stderr, "LSP state_advance: complete_node %zu failed\n", affected[k]);
             return 0;
+        }
+    }
+
+    /* PR-D phase 3: aggregate poison sigs + finalize poison_signed_tx
+       for each prepared leaf.  After this call, leaf_node->poison_signed_tx
+       is populated and leaf_node->poison_is_signed is 1 — consumed by
+       Step 10's watchtower registration. */
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        if (!factory_session_complete_node_poison(f, ni)) {
+            fprintf(stderr,
+                    "LSP rotation: poison complete failed for leaf %zu — "
+                    "single-process fallback in Step 10\n", ni);
+            factory_session_reset_poison(f, ni);
+            leaf_poison_prepared[lp] = 0;
         }
     }
 
@@ -2250,12 +2533,28 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             tx_buf_init(&burn_tx, 256);
             uint32_t old_epoch = (new_epoch > 0) ? new_epoch - 1 : 0;
             size_t l_vout = (size_t)(leaf_pre[lp].old_n_outputs - 1);
-            /* Multi-process guard — see lsp_have_all_signer_keypairs. */
             int burn_ok = 0;
-            if (lsp_have_all_signer_keypairs(lsp->ctx, f, leaf_node)) {
+            const unsigned char *burn_data = NULL;
+            size_t burn_len = 0;
+
+            /* PR-D phase 3: prefer the wire-ceremony-signed poison TX
+               when available (multi-process path).  Falls back to the
+               single-process factory_build_burn_tx for cases where the
+               wire ceremony was downgraded (poison prep failure, missing
+               client contributions). */
+            if (leaf_poison_prepared[lp] && leaf_node->poison_is_signed &&
+                leaf_node->poison_signed_tx.len > 0) {
+                burn_data = leaf_node->poison_signed_tx.data;
+                burn_len = leaf_node->poison_signed_tx.len;
+                burn_ok = 1;
+            } else if (lsp_have_all_signer_keypairs(lsp->ctx, f, leaf_node)) {
                 burn_ok = factory_build_burn_tx(f, &burn_tx, leaf_node,
                     leaf_pre[lp].old_txid, (uint32_t)l_vout,
                     leaf_pre[lp].old_l_amount, old_epoch);
+                if (burn_ok) {
+                    burn_data = burn_tx.data;
+                    burn_len = burn_tx.len;
+                }
             } else {
                 fprintf(stderr,
                         "LSP rotation: multi-process mode — skipping "
@@ -2274,8 +2573,8 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_factory_node_with_channels(mgr->watchtower,
                 (uint32_t)ni, leaf_pre[lp].old_txid,
                 leaf_node->signed_tx.data, leaf_node->signed_tx.len,
-                burn_ok ? burn_tx.data : NULL,
-                burn_ok ? burn_tx.len : 0,
+                burn_ok ? burn_data : NULL,
+                burn_ok ? burn_len : 0,
                 leaf_ch_ids, n_leaf_ch);
             tx_buf_free(&burn_tx);
         }
