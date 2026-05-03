@@ -3297,6 +3297,34 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         return 0;
     }
 
+    /* PR-D phase 4: snapshot per-leaf OLD state BEFORE the advance
+       overwrites it, so we can drive the parallel poison MuSig
+       ceremony in lockstep with the LSP (mirrors leaf_pre[] in
+       lsp_run_state_advance). */
+    typedef struct {
+        size_t node_idx;
+        int    had_old_signed;
+        unsigned char old_txid[32];
+        uint64_t old_l_amount;
+        int    old_n_outputs;
+    } client_leaf_pre_t;
+    client_leaf_pre_t leaf_pre[FACTORY_MAX_LEAVES];
+    size_t n_leaf_pre = 0;
+    for (int li = 0; li < factory->n_leaf_nodes; li++) {
+        size_t ni = factory->leaf_node_indices[li];
+        leaf_pre[n_leaf_pre].node_idx = ni;
+        leaf_pre[n_leaf_pre].had_old_signed =
+            (factory->nodes[ni].is_signed && factory->nodes[ni].signed_tx.len > 0);
+        if (leaf_pre[n_leaf_pre].had_old_signed)
+            memcpy(leaf_pre[n_leaf_pre].old_txid, factory->nodes[ni].txid, 32);
+        leaf_pre[n_leaf_pre].old_n_outputs = factory->nodes[ni].n_outputs;
+        leaf_pre[n_leaf_pre].old_l_amount =
+            (factory->nodes[ni].n_outputs >= 2)
+            ? factory->nodes[ni].outputs[factory->nodes[ni].n_outputs - 1].amount_sats
+            : 0;
+        n_leaf_pre++;
+    }
+
     /* Advance local DW counter to root rollover.
 
        The LSP triggered Tier B because its OWN factory_advance_leaf_unsigned
@@ -3324,6 +3352,30 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         fprintf(stderr, "Client %u: state advance: never hit rc=-1 within %d steps\n",
                 my_index, max_steps);
         return 0;
+    }
+
+    /* PR-D phase 4: prepare poison sessions per leaf where OLD state was
+       signed.  Mirrors lsp_channels.c::lsp_run_state_advance Step 1.5.
+       Failures here downgrade individual leaves silently — the LSP-side
+       degradation logic already handles partial poison coverage. */
+    int leaf_poison_prepared[FACTORY_MAX_LEAVES] = {0};
+    const uint64_t POISON_FEE_SATS = 1000;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        size_t ni = leaf_pre[lp].node_idx;
+        factory_node_t *leaf_node = &factory->nodes[ni];
+        if (leaf_node->is_ps_leaf) continue;
+        if (!leaf_pre[lp].had_old_signed) continue;
+        if (leaf_pre[lp].old_n_outputs < 2) continue;
+        size_t l_vout = (size_t)(leaf_pre[lp].old_n_outputs - 1);
+        if (!factory_session_prepare_poison_tx_leaf(
+                factory, ni, leaf_pre[lp].old_txid, (uint32_t)l_vout,
+                leaf_pre[lp].old_l_amount, POISON_FEE_SATS))
+            continue;
+        if (!factory_session_init_node_poison(factory, ni)) {
+            factory_session_reset_poison(factory, ni);
+            continue;
+        }
+        leaf_poison_prepared[lp] = 1;
     }
 
     /* Determine affected nodes — every non-PS-leaf node that's built
@@ -3392,13 +3444,52 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         my_nonce_bundle[my_bundle_count].data_len = 66;
         my_bundle_count++;
     }
+
+    /* PR-D phase 4: per-leaf poison nonces.  For each prepared leaf
+       where I'm a signer, generate my poison pubnonce and append to
+       my_poison_bundle.  Track per-leaf secnonces for the partial-sig
+       step later. */
+    secp256k1_musig_secnonce my_poison_secnonce_per_leaf[FACTORY_MAX_LEAVES];
+    int my_poison_slot_per_leaf[FACTORY_MAX_LEAVES];
+    int has_my_poison_nonce[FACTORY_MAX_LEAVES];
+    wire_bundle_entry_t my_poison_bundle[FACTORY_MAX_LEAVES];
+    size_t my_poison_bundle_count = 0;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        my_poison_slot_per_leaf[lp] = -1;
+        has_my_poison_nonce[lp] = 0;
+    }
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        int pslot = factory_find_signer_slot(factory, ni, my_index);
+        if (pslot < 0) continue;
+        secp256k1_musig_pubnonce ppub;
+        if (!musig_generate_nonce(ctx, &my_poison_secnonce_per_leaf[lp], &ppub,
+                                    my_seckey, &my_pubkey,
+                                    &factory->nodes[ni].keyagg.cache)) {
+            fprintf(stderr, "Client %u: poison nonce gen failed for leaf %zu\n",
+                    my_index, ni);
+            factory_session_reset_poison(factory, ni);
+            leaf_poison_prepared[lp] = 0;
+            continue;
+        }
+        my_poison_slot_per_leaf[lp] = pslot;
+        has_my_poison_nonce[lp] = 1;
+        unsigned char pser[66];
+        musig_pubnonce_serialize(ctx, pser, &ppub);
+        my_poison_bundle[my_poison_bundle_count].node_idx = (uint32_t)ni;
+        my_poison_bundle[my_poison_bundle_count].signer_slot = (uint32_t)pslot;
+        memcpy(my_poison_bundle[my_poison_bundle_count].data, pser, 66);
+        my_poison_bundle[my_poison_bundle_count].data_len = 66;
+        my_poison_bundle_count++;
+    }
     memset(my_seckey, 0, 32);
 
-    /* Send PATH_NONCE_BUNDLE */
-    cJSON *nb = wire_build_nonce_bundle(my_nonce_bundle, my_bundle_count);
-    /* Note: wire_build_nonce_bundle wraps with key "entries"; the LSP's
-       state-advance receiver pulls the same key.  Reusing that builder
-       saves us a duplicate JSON helper. */
+    /* Send PATH_NONCE_BUNDLE (with optional poison_entries — PR-D phase 4) */
+    cJSON *nb = wire_build_nonce_bundle_with_poison(
+        my_nonce_bundle, my_bundle_count,
+        my_poison_bundle_count > 0 ? my_poison_bundle : NULL,
+        my_poison_bundle_count);
     if (!wire_send(fd, MSG_PATH_NONCE_BUNDLE, nb)) {
         fprintf(stderr, "Client %u: send PATH_NONCE_BUNDLE failed\n", my_index);
         cJSON_Delete(nb);
@@ -3447,6 +3538,35 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         }
     }
     free(all);
+
+    /* PR-D phase 4: parse optional poison_entries from PATH_ALL_NONCES
+       and feed into per-leaf poison sessions. */
+    {
+        size_t pcap = (size_t)FACTORY_MAX_LEAVES * (size_t)FACTORY_MAX_SIGNERS;
+        wire_bundle_entry_t *pall = calloc(pcap, sizeof(wire_bundle_entry_t));
+        if (!pall) { cJSON_Delete(all_msg.json); return 0; }
+        size_t np = wire_parse_poison_bundle(all_msg.json, pall, pcap, 66);
+        for (size_t e = 0; e < np; e++) {
+            int lp_match = -1;
+            for (size_t lp = 0; lp < n_leaf_pre; lp++)
+                if (leaf_poison_prepared[lp] &&
+                    leaf_pre[lp].node_idx == pall[e].node_idx) {
+                    lp_match = (int)lp;
+                    break;
+                }
+            if (lp_match < 0) continue;
+            secp256k1_musig_pubnonce pn;
+            if (!musig_pubnonce_parse(ctx, &pn, pall[e].data) ||
+                !factory_session_set_nonce_poison(factory, pall[e].node_idx,
+                                                    pall[e].signer_slot, &pn)) {
+                fprintf(stderr, "Client %u: bad poison nonce leaf=%u — degrading\n",
+                        my_index, pall[e].node_idx);
+                factory_session_reset_poison(factory, pall[e].node_idx);
+                leaf_poison_prepared[lp_match] = 0;
+            }
+        }
+        free(pall);
+    }
     cJSON_Delete(all_msg.json);
 
     /* Finalize sessions for every node we signed on */
@@ -3456,6 +3576,17 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
             fprintf(stderr, "Client %u: state_advance finalize node %zu failed\n",
                     my_index, affected[k]);
             return 0;
+        }
+    }
+
+    /* PR-D phase 4: finalize poison sessions per prepared leaf. */
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        if (!factory_session_finalize_node_poison(factory, leaf_pre[lp].node_idx)) {
+            fprintf(stderr, "Client %u: poison finalize leaf=%zu failed — degrading\n",
+                    my_index, leaf_pre[lp].node_idx);
+            factory_session_reset_poison(factory, leaf_pre[lp].node_idx);
+            leaf_poison_prepared[lp] = 0;
         }
     }
 
@@ -3483,8 +3614,39 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         my_psig_count++;
     }
 
-    /* Send PATH_PSIG_BUNDLE */
-    cJSON *pb = wire_build_psig_bundle(my_psig_bundle, my_psig_count);
+    /* PR-D phase 4: per-leaf poison partial sigs. */
+    wire_bundle_entry_t my_poison_psig_bundle[FACTORY_MAX_LEAVES];
+    size_t my_poison_psig_count = 0;
+    for (size_t lp = 0; lp < n_leaf_pre; lp++) {
+        if (!leaf_poison_prepared[lp]) continue;
+        if (!has_my_poison_nonce[lp]) continue;
+        if (my_poison_slot_per_leaf[lp] < 0) continue;
+        size_t ni = leaf_pre[lp].node_idx;
+        secp256k1_musig_partial_sig ppsig;
+        if (!musig_create_partial_sig(ctx, &ppsig, &my_poison_secnonce_per_leaf[lp],
+                                        keypair,
+                                        &factory->nodes[ni].poison_signing_session)) {
+            fprintf(stderr, "Client %u: poison create_partial_sig leaf=%zu failed\n",
+                    my_index, ni);
+            factory_session_reset_poison(factory, ni);
+            leaf_poison_prepared[lp] = 0;
+            continue;
+        }
+        unsigned char pser[32];
+        musig_partial_sig_serialize(ctx, pser, &ppsig);
+        my_poison_psig_bundle[my_poison_psig_count].node_idx = (uint32_t)ni;
+        my_poison_psig_bundle[my_poison_psig_count].signer_slot =
+            (uint32_t)my_poison_slot_per_leaf[lp];
+        memcpy(my_poison_psig_bundle[my_poison_psig_count].data, pser, 32);
+        my_poison_psig_bundle[my_poison_psig_count].data_len = 32;
+        my_poison_psig_count++;
+    }
+
+    /* Send PATH_PSIG_BUNDLE (with optional poison_entries — PR-D phase 4) */
+    cJSON *pb = wire_build_psig_bundle_with_poison(
+        my_psig_bundle, my_psig_count,
+        my_poison_psig_count > 0 ? my_poison_psig_bundle : NULL,
+        my_poison_psig_count);
     if (!wire_send(fd, MSG_PATH_PSIG_BUNDLE, pb)) {
         fprintf(stderr, "Client %u: send PATH_PSIG_BUNDLE failed\n", my_index);
         cJSON_Delete(pb);
