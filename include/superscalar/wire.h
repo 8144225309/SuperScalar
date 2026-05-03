@@ -766,6 +766,75 @@ int wire_parse_subfactory_done(const cJSON *json,
                                  int *leaf_side, int *sub_idx,
                                  uint32_t *chain_len);
 
+/* --- Multi-input sub-factory chain advance helpers (#207 phase 2c) ---
+
+   When the sub-factory has been advanced (ps_chain_len > 0) and is now
+   spending k+1 outputs of the prior chain TX, the wire ceremony needs
+   to coordinate k+1 independent MuSig2 sessions (BIP-341 sighashes
+   differ per input, so nonces and partial sigs are distinct per
+   input).  These helpers attach OPTIONAL array-form fields to the
+   existing MSG_SUBFACTORY_* messages, alongside the existing
+   single-nonce/sig fields:
+
+   - MSG_SUBFACTORY_PROPOSE optionally carries `n_inputs` + `lsp_pubnonces`
+     (array of k+1 hex 66-byte nonces).
+   - MSG_SUBFACTORY_NONCE optionally carries `pubnonces` (array of k+1
+     hex 66-byte nonces from the client) — alongside the existing single
+     `pubnonce` field for backward compat.
+   - MSG_SUBFACTORY_ALL_NONCES optionally carries `pubnonces_per_input`
+     (a 2D array indexed [signer][input] of hex 66-byte nonces).
+   - MSG_SUBFACTORY_PSIG optionally carries `partial_sigs` (array of
+     k+1 hex 32-byte partial sigs).
+
+   When n_inputs == 1, the receiver may use either the legacy single
+   field or the new arrays — they're equivalent.  When n_inputs > 1,
+   the receiver MUST use the array form (single field is undefined).
+
+   These helpers MUTATE the existing PROPOSE/NONCE/ALL_NONCES/PSIG cJSON
+   built by the legacy helpers.  Pattern:
+     cJSON *p = wire_build_subfactory_propose(..., lsp_pubnonces[0]);
+     wire_subfactory_propose_set_inputs(p, 3, lsp_pubnonces);   // adds n_inputs + lsp_pubnonces[]
+     wire_send(... MSG_SUBFACTORY_PROPOSE ...);
+
+   Receivers do:
+     int n_inp = wire_subfactory_propose_get_n_inputs(json);  // 0 if absent
+     if (n_inp > 0)
+         wire_subfactory_propose_get_pubnonces(json, lsp_pubnonces_out, max);
+     else
+         // legacy single-input — use existing wire_parse_subfactory_propose
+*/
+
+/* PROPOSE — set/get optional `n_inputs` + `lsp_pubnonces[n_inputs]`. */
+void wire_subfactory_propose_set_inputs(cJSON *propose, size_t n_inputs,
+                                          const unsigned char (*lsp_pubnonces)[66]);
+size_t wire_subfactory_propose_get_n_inputs(const cJSON *json);
+size_t wire_subfactory_propose_get_pubnonces(const cJSON *json,
+                                               unsigned char (*out)[66], size_t max);
+
+/* NONCE — set/get optional `pubnonces[n_inputs]` (client's per-input nonces). */
+void wire_subfactory_nonce_set_pubnonces(cJSON *nonce, size_t n_inputs,
+                                           const unsigned char (*pubnonces)[66]);
+size_t wire_subfactory_nonce_get_pubnonces(const cJSON *json,
+                                             unsigned char (*out)[66], size_t max);
+
+/* ALL_NONCES — set/get optional `pubnonces_per_input[n_signers][n_inputs]`. */
+void wire_subfactory_all_nonces_set_per_input(cJSON *all_nonces, size_t n_signers,
+                                                size_t n_inputs,
+                                                const unsigned char (*pubnonces)[66]);
+/* Reads back the per-input array.  out has shape [n_signers][n_inputs][66].
+   Returns the n_signers count (0 if field absent), and writes n_inputs to *n_inputs_out. */
+size_t wire_subfactory_all_nonces_get_per_input(const cJSON *json,
+                                                  unsigned char *out_flat,
+                                                  size_t max_signers,
+                                                  size_t max_inputs,
+                                                  size_t *n_inputs_out);
+
+/* PSIG — set/get optional `partial_sigs[n_inputs]`. */
+void wire_subfactory_psig_set_partial_sigs(cJSON *psig, size_t n_inputs,
+                                             const unsigned char (*partial_sigs)[32]);
+size_t wire_subfactory_psig_get_partial_sigs(const cJSON *json,
+                                                unsigned char (*out)[32], size_t max);
+
 /* --- SCID assignment for route hints (4B) --- */
 
 /* LSP → Client: SCID_ASSIGN {channel_id, scid, fee_base_msat, fee_ppm, cltv_delta} */

@@ -353,6 +353,97 @@ int test_wire_path_bundle_with_poison_round_trip(void) {
     return 1;
 }
 
+/* #207 phase 2c — multi-input sub-factory chain advance helpers.
+   Round-trip the new optional array fields on each of PROPOSE/NONCE/
+   ALL_NONCES/PSIG.  When the array fields are absent, getter functions
+   return 0 (legacy single-input path). */
+int test_wire_subfactory_multi_input_helpers_round_trip(void) {
+    /* PROPOSE: build legacy single-input first, then attach multi-input arrays. */
+    unsigned char single_nonce[66];
+    memset(single_nonce, 0xa0, 66);
+    cJSON *propose = wire_build_subfactory_propose(0, 0, 0, 50000, single_nonce);
+
+    /* No multi-input fields yet. */
+    TEST_ASSERT_EQ(wire_subfactory_propose_get_n_inputs(propose), 0,
+                    "propose w/o n_inputs returns 0");
+
+    unsigned char lsp_nonces[3][66];
+    for (int i = 0; i < 3; i++) memset(lsp_nonces[i], 0xb0 + i, 66);
+    wire_subfactory_propose_set_inputs(propose, 3, lsp_nonces);
+
+    TEST_ASSERT_EQ(wire_subfactory_propose_get_n_inputs(propose), 3,
+                    "propose n_inputs=3 after set");
+    unsigned char out_nonces[3][66] = {{0}};
+    size_t got = wire_subfactory_propose_get_pubnonces(propose, out_nonces, 3);
+    TEST_ASSERT_EQ(got, 3, "propose round-trip count");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_MEM_EQ(out_nonces[i], lsp_nonces[i], 66, "propose nonce data");
+    cJSON_Delete(propose);
+
+    /* NONCE: client per-input nonces. */
+    cJSON *nonce = wire_build_subfactory_nonce(single_nonce, NULL);
+    unsigned char client_nonces[3][66];
+    for (int i = 0; i < 3; i++) memset(client_nonces[i], 0xc0 + i, 66);
+    wire_subfactory_nonce_set_pubnonces(nonce, 3, client_nonces);
+    unsigned char nonce_out[3][66] = {{0}};
+    size_t cn = wire_subfactory_nonce_get_pubnonces(nonce, nonce_out, 3);
+    TEST_ASSERT_EQ(cn, 3, "nonce array count");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_MEM_EQ(nonce_out[i], client_nonces[i], 66, "nonce array data");
+    cJSON_Delete(nonce);
+
+    /* ALL_NONCES: per-input × per-signer 2D array.  3 signers × 3 inputs. */
+    unsigned char single_all[3][66];
+    for (int s = 0; s < 3; s++) memset(single_all[s], 0xd0 + s, 66);
+    cJSON *all = wire_build_subfactory_all_nonces(single_all, NULL, 3);
+    unsigned char per_input_flat[3 * 3 * 66];
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < 3; i++) {
+            memset(per_input_flat + (s * 3 + i) * 66, 0xe0 + s * 3 + i, 66);
+        }
+    }
+    wire_subfactory_all_nonces_set_per_input(all, 3, 3, (const unsigned char (*)[66])per_input_flat);
+
+    unsigned char out_per_input[3 * 3 * 66] = {0};
+    size_t n_inputs_out = 0;
+    size_t n_signers_out = wire_subfactory_all_nonces_get_per_input(
+        all, out_per_input, 3, 3, &n_inputs_out);
+    TEST_ASSERT_EQ(n_signers_out, 3, "all_nonces signers count");
+    TEST_ASSERT_EQ(n_inputs_out, 3, "all_nonces inputs count");
+    TEST_ASSERT(memcmp(out_per_input, per_input_flat, 3 * 3 * 66) == 0,
+                "all_nonces per-input round-trip");
+    cJSON_Delete(all);
+
+    /* PSIG: per-input partial sigs. */
+    unsigned char single_sig[32];
+    memset(single_sig, 0xf0, 32);
+    cJSON *psig = wire_build_subfactory_psig(single_sig, NULL);
+    unsigned char part_sigs[3][32];
+    for (int i = 0; i < 3; i++) memset(part_sigs[i], 0x10 + i, 32);
+    wire_subfactory_psig_set_partial_sigs(psig, 3, part_sigs);
+    unsigned char part_out[3][32] = {{0}};
+    size_t pn = wire_subfactory_psig_get_partial_sigs(psig, part_out, 3);
+    TEST_ASSERT_EQ(pn, 3, "psig partial_sigs count");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_MEM_EQ(part_out[i], part_sigs[i], 32, "psig partial sigs data");
+    cJSON_Delete(psig);
+
+    /* Backward compat: receiver that only checks legacy fields still works. */
+    cJSON *legacy_propose = wire_build_subfactory_propose(0, 0, 0, 50000, single_nonce);
+    /* No multi-input fields set. */
+    int leaf_side, sub_idx, channel_idx;
+    uint64_t delta;
+    unsigned char legacy_nonce_out[66];
+    int parse_rc = wire_parse_subfactory_propose(legacy_propose, &leaf_side, &sub_idx,
+                                                   &channel_idx, &delta, legacy_nonce_out);
+    TEST_ASSERT_EQ(parse_rc, 1, "legacy propose parse");
+    TEST_ASSERT_EQ(wire_subfactory_propose_get_n_inputs(legacy_propose), 0,
+                    "legacy has no n_inputs");
+    cJSON_Delete(legacy_propose);
+
+    return 1;
+}
+
 /* When n_poison=0 (or NULL poison_entries), the with_poison builder must
    produce JSON byte-equal to the plain builder — backward compat receivers
    parse it cleanly with no special handling. */
