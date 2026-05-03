@@ -306,6 +306,225 @@ int test_finalize_signed_tx(void) {
     return 1;
 }
 
+/* For n_inputs=1, compute_taproot_sighash_multi must match
+   compute_taproot_sighash byte-for-byte.  Anchors the multi-input variant
+   against the existing single-input implementation. */
+int test_compute_taproot_sighash_multi_matches_single_for_n1(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+
+    unsigned char prev_txid[32]; memset(prev_txid, 0xa1, 32);
+    unsigned char seckey[32];   memset(seckey, 0x07, 32);
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
+    secp256k1_xonly_pubkey xpk;
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
+
+    tx_output_t output = {0};
+    output.amount_sats = 50000;
+    build_p2tr_script_pubkey(output.script_pubkey, &xpk);
+    output.script_pubkey_len = 34;
+
+    unsigned char prev_spk[34];
+    build_p2tr_script_pubkey(prev_spk, &xpk);
+    uint64_t prev_amount = 100000;
+    uint32_t nseq = 0xFFFFFFFE;
+
+    /* Build the same TX two ways: single-input and multi-input(n=1). */
+    tx_buf_t single_buf; tx_buf_init(&single_buf, 256);
+    TEST_ASSERT(build_unsigned_tx(&single_buf, NULL, prev_txid, 0, nseq,
+                                    &output, 1),
+                "build single-input");
+
+    tx_input_t inp = {0};
+    memcpy(inp.prev_txid, prev_txid, 32);
+    inp.prev_vout = 0;
+    inp.nsequence = nseq;
+    tx_buf_t multi_buf; tx_buf_init(&multi_buf, 256);
+    TEST_ASSERT(build_unsigned_tx_multi(&multi_buf, NULL, &inp, 1, &output, 1, 2, 0),
+                "build multi-input n=1");
+
+    /* The two byte streams must be identical. */
+    TEST_ASSERT_EQ(single_buf.len, multi_buf.len, "n=1 lengths match");
+    TEST_ASSERT(memcmp(single_buf.data, multi_buf.data, single_buf.len) == 0,
+                "n=1 bytes match");
+
+    /* Both sighash functions must produce identical 32-byte output. */
+    unsigned char sh_single[32], sh_multi[32];
+    TEST_ASSERT(compute_taproot_sighash(sh_single, single_buf.data, single_buf.len,
+                                          0, prev_spk, 34, prev_amount, nseq),
+                "single-input sighash");
+
+    const unsigned char *spks[1] = { prev_spk };
+    size_t spk_lens[1] = { 34 };
+    uint64_t amounts[1] = { prev_amount };
+    uint32_t seqs[1] = { nseq };
+    TEST_ASSERT(compute_taproot_sighash_multi(sh_multi, multi_buf.data, multi_buf.len,
+                                                0, 1, spks, spk_lens, amounts, seqs),
+                "multi-input sighash n=1");
+
+    TEST_ASSERT(memcmp(sh_single, sh_multi, 32) == 0,
+                "single == multi sighash for n=1");
+
+    tx_buf_free(&single_buf);
+    tx_buf_free(&multi_buf);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* For n_inputs=3, sighashes for input_index=0..2 must all differ from
+   each other (the input_index is mixed into the preimage), and changing
+   any per-input field must change the sighash. */
+int test_compute_taproot_sighash_multi_n3_input_binding(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+
+    unsigned char seckey[32]; memset(seckey, 0x09, 32);
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
+    secp256k1_xonly_pubkey xpk;
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
+
+    tx_input_t inputs[3];
+    memset(inputs[0].prev_txid, 0xa1, 32); inputs[0].prev_vout = 0; inputs[0].nsequence = 0xFFFFFFFE;
+    memset(inputs[1].prev_txid, 0xa1, 32); inputs[1].prev_vout = 1; inputs[1].nsequence = 0xFFFFFFFE;
+    memset(inputs[2].prev_txid, 0xa1, 32); inputs[2].prev_vout = 2; inputs[2].nsequence = 0xFFFFFFFE;
+
+    tx_output_t outs[3];
+    for (int i = 0; i < 3; i++) {
+        outs[i].amount_sats = 30000 + (uint64_t)i * 1000;
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &xpk);
+        outs[i].script_pubkey_len = 34;
+    }
+
+    tx_buf_t buf; tx_buf_init(&buf, 512);
+    TEST_ASSERT(build_unsigned_tx_multi(&buf, NULL, inputs, 3, outs, 3, 2, 0),
+                "build n=3 multi");
+
+    unsigned char prev_spk[34];
+    build_p2tr_script_pubkey(prev_spk, &xpk);
+    const unsigned char *spks[3] = { prev_spk, prev_spk, prev_spk };
+    size_t spk_lens[3] = { 34, 34, 34 };
+    uint64_t amounts[3] = { 50000, 60000, 70000 };
+    uint32_t seqs[3] = { 0xFFFFFFFE, 0xFFFFFFFE, 0xFFFFFFFE };
+
+    unsigned char sh[3][32];
+    for (uint32_t i = 0; i < 3; i++) {
+        TEST_ASSERT(compute_taproot_sighash_multi(sh[i], buf.data, buf.len,
+                                                   i, 3, spks, spk_lens, amounts, seqs),
+                    "multi sighash per-input");
+    }
+    /* Each sighash must differ — input_index mixes into the preimage. */
+    TEST_ASSERT(memcmp(sh[0], sh[1], 32) != 0, "sh[0] != sh[1]");
+    TEST_ASSERT(memcmp(sh[1], sh[2], 32) != 0, "sh[1] != sh[2]");
+    TEST_ASSERT(memcmp(sh[0], sh[2], 32) != 0, "sh[0] != sh[2]");
+
+    /* Changing one prev_amount must change the sighash for ALL inputs
+       (sha_amounts is shared across inputs in the BIP-341 preimage). */
+    amounts[1] = 60001;
+    unsigned char sh2[32];
+    TEST_ASSERT(compute_taproot_sighash_multi(sh2, buf.data, buf.len,
+                                                0, 3, spks, spk_lens, amounts, seqs),
+                "sighash with bumped amount");
+    TEST_ASSERT(memcmp(sh[0], sh2, 32) != 0,
+                "amount mutation propagates to sighash");
+
+    tx_buf_free(&buf);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* finalize_signed_tx_multi must:
+   - emit segwit marker/flag
+   - attach exactly N witness records, each {1, 64, sig}
+   - place nLockTime at the end
+   - for n=1, equal finalize_signed_tx byte-for-byte */
+int test_finalize_signed_tx_multi(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    unsigned char seckey[32]; memset(seckey, 0x0b, 32);
+    secp256k1_keypair kp;
+    if (!secp256k1_keypair_create(ctx, &kp, seckey)) return 0;
+    secp256k1_xonly_pubkey xpk;
+    if (!secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp)) return 0;
+
+    /* Build n=3 unsigned multi-input tx */
+    tx_input_t inputs[3];
+    memset(inputs[0].prev_txid, 0xa1, 32); inputs[0].prev_vout = 0; inputs[0].nsequence = 0xFFFFFFFE;
+    memset(inputs[1].prev_txid, 0xa1, 32); inputs[1].prev_vout = 1; inputs[1].nsequence = 0xFFFFFFFE;
+    memset(inputs[2].prev_txid, 0xa1, 32); inputs[2].prev_vout = 2; inputs[2].nsequence = 0xFFFFFFFE;
+    tx_output_t outs[3];
+    for (int i = 0; i < 3; i++) {
+        outs[i].amount_sats = 30000;
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &xpk);
+        outs[i].script_pubkey_len = 34;
+    }
+    tx_buf_t unsigned_buf; tx_buf_init(&unsigned_buf, 512);
+    TEST_ASSERT(build_unsigned_tx_multi(&unsigned_buf, NULL, inputs, 3, outs, 3, 2, 0),
+                "build unsigned");
+
+    /* Distinct sigs per input so we can spot-check ordering */
+    unsigned char sigs[3 * 64];
+    memset(sigs + 0  * 64, 0xc1, 64);
+    memset(sigs + 1  * 64, 0xc2, 64);
+    memset(sigs + 2  * 64, 0xc3, 64);
+
+    tx_buf_t signed_buf; tx_buf_init(&signed_buf, 1024);
+    TEST_ASSERT(finalize_signed_tx_multi(&signed_buf, unsigned_buf.data,
+                                          unsigned_buf.len, 3, sigs),
+                "finalize multi");
+
+    /* nVersion + segwit marker + flag */
+    TEST_ASSERT_EQ(signed_buf.data[0], 0x02, "nVersion");
+    TEST_ASSERT_EQ(signed_buf.data[4], 0x00, "segwit marker");
+    TEST_ASSERT_EQ(signed_buf.data[5], 0x01, "segwit flag");
+
+    /* Each witness adds varint(1) + varint(64) + 64 = 66 bytes; 3 witnesses = 198 */
+    TEST_ASSERT(signed_buf.len == unsigned_buf.len + 2 + 3 * 66,
+                "signed length = unsigned + marker/flag + 3 witnesses");
+
+    /* Locate witness section: directly before the trailing 4-byte nLockTime.
+       Each witness is 66 bytes; first witness starts at signed_buf.len - 4 - 198. */
+    size_t wit_start = signed_buf.len - 4 - 3 * 66;
+    /* witness 0 */
+    TEST_ASSERT_EQ(signed_buf.data[wit_start + 0], 0x01, "wit0 stack count");
+    TEST_ASSERT_EQ(signed_buf.data[wit_start + 1], 0x40, "wit0 sig len = 64");
+    TEST_ASSERT_EQ(signed_buf.data[wit_start + 2], 0xc1, "wit0 sig byte");
+    /* witness 1 */
+    TEST_ASSERT_EQ(signed_buf.data[wit_start + 66 + 2], 0xc2, "wit1 sig byte");
+    /* witness 2 */
+    TEST_ASSERT_EQ(signed_buf.data[wit_start + 132 + 2], 0xc3, "wit2 sig byte");
+
+    /* nLockTime at end */
+    TEST_ASSERT_EQ(signed_buf.data[signed_buf.len - 4], 0x00, "nlocktime byte 0");
+
+    /* For n=1, finalize_signed_tx_multi must match finalize_signed_tx. */
+    tx_buf_t u1; tx_buf_init(&u1, 256);
+    TEST_ASSERT(build_unsigned_tx_multi(&u1, NULL, inputs, 1, outs, 3, 2, 0),
+                "build n=1");
+    unsigned char one_sig[64]; memset(one_sig, 0xee, 64);
+    tx_buf_t s_a, s_b;
+    tx_buf_init(&s_a, 512); tx_buf_init(&s_b, 512);
+    TEST_ASSERT(finalize_signed_tx(&s_a, u1.data, u1.len, one_sig),
+                "single finalize");
+    TEST_ASSERT(finalize_signed_tx_multi(&s_b, u1.data, u1.len, 1, one_sig),
+                "multi finalize n=1");
+    TEST_ASSERT_EQ(s_a.len, s_b.len, "n=1 finalize lengths match");
+    TEST_ASSERT(memcmp(s_a.data, s_b.data, s_a.len) == 0,
+                "n=1 finalize bytes match");
+
+    /* Argument validation */
+    TEST_ASSERT(!finalize_signed_tx_multi(&signed_buf, NULL, 100, 3, sigs),
+                "null tx rejected");
+    TEST_ASSERT(!finalize_signed_tx_multi(&signed_buf, unsigned_buf.data, unsigned_buf.len, 0, sigs),
+                "zero inputs rejected");
+
+    tx_buf_free(&unsigned_buf);
+    tx_buf_free(&signed_buf);
+    tx_buf_free(&u1);
+    tx_buf_free(&s_a);
+    tx_buf_free(&s_b);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* Phase C: V3/TRUC CPFP — build_unsigned_tx_v with nVersion=3 */
 int test_v3_cpfp_tx_version(void)
 {

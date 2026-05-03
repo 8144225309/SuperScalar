@@ -91,12 +91,42 @@ int compute_taproot_sighash(
     uint32_t nsequence
 );
 
+/* BIP-341 sighash (key-path, SIGHASH_DEFAULT) for a multi-input tx built by
+   build_unsigned_tx_multi.  Hashes the full prev{outpoints, amounts, scripts,
+   sequences} sets per BIP-341 §4.2 and binds to input_index.  Each per-input
+   array must have n_inputs entries.  prev_scriptpubkeys is an array of
+   pointers (so callers can pass non-contiguous SPKs without copying). */
+int compute_taproot_sighash_multi(
+    unsigned char *sighash_out32,
+    const unsigned char *unsigned_tx,
+    size_t tx_len,
+    uint32_t input_index,
+    size_t n_inputs,
+    const unsigned char * const *prev_scriptpubkeys,
+    const size_t *prev_spk_lens,
+    const uint64_t *prev_amounts,
+    const uint32_t *nsequences
+);
+
 /* Attach 64-byte Schnorr witness to unsigned tx. */
 int finalize_signed_tx(
     tx_buf_t *out,
     const unsigned char *unsigned_tx,
     size_t unsigned_tx_len,
     const unsigned char *sig64
+);
+
+/* Attach N 64-byte Schnorr witnesses (one per input) to a multi-input
+   unsigned tx built by build_unsigned_tx_multi.  Each witness is a single
+   64-byte schnorr key-path signature (SIGHASH_DEFAULT, no annex), serialized
+   in segwit format: per-input { varint(n_items=1) || varint(64) || sig64 }.
+   sig64s is a contiguous buffer of n_inputs * 64 bytes. */
+int finalize_signed_tx_multi(
+    tx_buf_t *out,
+    const unsigned char *unsigned_tx,
+    size_t unsigned_tx_len,
+    size_t n_inputs,
+    const unsigned char *sig64s
 );
 
 #endif /* SUPERSCALAR_TX_BUILDER_H */
