@@ -1580,9 +1580,8 @@ handle_message:
 
             jit_rd->state = JIT_STATE_OPEN;
 
-            /* Register JIT channel with client watchtower */
-            if (cbd && cbd->wt)
-                watchtower_set_channel(cbd->wt, 0, &jit_rd->channel);
+            /* JIT channel watchtower registration: dropped in #208 A3.2.
+               Penalty bytes pre-built at revocation receive time. */
 
             /* Persist JIT channel */
             if (cbd && cbd->db) {

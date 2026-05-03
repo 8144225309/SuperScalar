@@ -150,7 +150,11 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (ch_ids[i] < WATCHTOWER_MAX_CHANNELS) {
-                    watchtower_set_channel(&wt, ch_ids[i], ch);
+                    /* watchtower_set_channel dropped in #208 A3.2 — penalty
+                       bytes are now pre-built at revocation time inside
+                       watchtower_watch_revoked_commitment.  Tracking
+                       loaded_channels[] is still useful for the standalone
+                       daemon's own bookkeeping (channel_cleanup at exit). */
                     loaded_channels[ch_ids[i]] = ch;
                 } else {
                     channel_cleanup(ch);

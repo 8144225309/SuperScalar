@@ -775,10 +775,13 @@ int test_regtest_breach_penalty_cpfp(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* --- Client watchtower: register old commitment #0 for monitoring --- */
+    /* --- Client watchtower: register old commitment #0 for monitoring.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       below populates wt.channels[0] for tests that exercise the legacy
+       lazy-build sweep paths. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
     TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor initialized");
 
     /* Build the remote-view commitment #0 to get the correct txid */

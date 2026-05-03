@@ -2413,8 +2413,8 @@ int main(int argc, char *argv[]) {
             static watchtower_t rec_wt;
             memset(&rec_wt, 0, sizeof(rec_wt));
             watchtower_init(&rec_wt, mgr->n_channels, &rt, fee_est, &db);
-            for (size_t c = 0; c < mgr->n_channels; c++)
-                watchtower_set_channel(&rec_wt, c, &mgr->entries[c].channel);
+            /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
+               bytes are pre-built at revocation receive time. */
             mgr->watchtower = &rec_wt;
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;

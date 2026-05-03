@@ -947,7 +947,11 @@ int test_jit_multiple_watchtower_indices(void) {
         jits[i].jit_channel_id = JIT_CHANNEL_ID_BASE | (uint32_t)clients[i];
 
         size_t wt_idx = mgr.n_channels + clients[i];
-        watchtower_set_channel(&wt, wt_idx, &jits[i].channel);
+        /* watchtower_set_channel dropped in #208 A3.2 — direct field
+           write keeps the assertion below meaningful for legacy sweep
+           paths that still reach into channels[]. */
+        if (wt_idx < wt.channels_cap)
+            wt.channels[wt_idx] = &jits[i].channel;
     }
     mgr.n_jit_channels = 3;
 
