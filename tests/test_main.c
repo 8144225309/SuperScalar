@@ -931,6 +931,7 @@ extern int test_watchtower_init_empty(void);
 extern int test_watchtower_watch_no_breach(void);
 extern int test_watchtower_ready_guard(void);
 extern int test_watchtower_remove_channel(void);
+extern int test_watchtower_oracular_pre_signed(void);
 /* PR #21 Phase 4: Cooperative close */
 extern int test_chan_close_shutdown_layout(void);
 extern int test_chan_close_closing_signed_layout(void);
@@ -2751,6 +2752,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_watchtower_watch_no_breach);
     RUN_TEST(test_watchtower_ready_guard);
     RUN_TEST(test_watchtower_remove_channel);
+    RUN_TEST(test_watchtower_oracular_pre_signed);
     printf("\n=== PR #21 Phase 4: Cooperative Close ===\n");
     RUN_TEST(test_chan_close_shutdown_layout);
     RUN_TEST(test_chan_close_closing_signed_layout);

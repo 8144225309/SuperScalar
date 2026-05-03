@@ -80,6 +80,17 @@ typedef struct {
        reverts to normal watching and re-detects the breach. */
     int penalty_broadcast;        /* 1 = penalty has been broadcast */
     char penalty_txid[65];        /* hex txid of broadcast penalty */
+
+    /* Oracular path (#208 A3.1): pre-computed penalty TX bytes built by
+       the LSP at revocation time.  When non-NULL, watchtower_check
+       broadcasts these bytes directly instead of calling
+       channel_build_penalty_tx via wt->channels[].  Set by the new
+       watchtower_watch_oracular() / watchtower_watch_revoked_commitment_oracular()
+       entry points; legacy watchtower_watch() leaves these zeroed and
+       falls through to the lazy-build path.  Heap-allocated; freed by
+       watchtower_cleanup. */
+    unsigned char *signed_penalty_tx;
+    size_t         signed_penalty_tx_len;
 } watchtower_entry_t;
 
 #define WATCHTOWER_MAX_CHANNELS 64
@@ -166,6 +177,49 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                            uint64_t old_commit_num,
                                            uint64_t old_local, uint64_t old_remote,
                                            const htlc_t *old_htlcs, size_t old_n_htlcs);
+
+/* === Oracular API (#208 A3.1 — daemon-friendly) ===
+
+   The "oracular" variants accept a pre-signed penalty TX so the
+   watchtower never derefs live channel state at breach-detection time.
+   Lets the watchtower run in a separate process / on a separate host
+   that the LSP only talks to over IPC.
+
+   Use these when registering a new revocation and you have the
+   penalty TX bytes already (built by the LSP at revocation receive
+   time).  Falls back to the legacy lazy-build path automatically when
+   `signed_penalty_tx` is NULL — same call shape as the non-oracular
+   variant.  After A3.1 lands, A3.1b migrates all LSP/test callers
+   to these variants and the legacy path is removed in A3.2 (along
+   with the `channel_t **channels` field that backs it). */
+
+/* Oracular variant of watchtower_watch — accepts a pre-signed penalty
+   TX that watchtower_check will broadcast on breach detection without
+   ever consulting wt->channels[]. */
+int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
+                                uint64_t commit_num,
+                                const unsigned char *txid32,
+                                uint32_t to_local_vout,
+                                uint64_t to_local_amount,
+                                const unsigned char *to_local_spk,
+                                size_t spk_len,
+                                const unsigned char *signed_penalty_tx,
+                                size_t signed_penalty_tx_len);
+
+/* Oracular variant of watchtower_watch_revoked_commitment.
+   Same arguments as the legacy form (still takes `channel_t *ch` to
+   compute txid + to_local_spk derivation), plus pre-signed penalty TX
+   bytes.  Once A3.1b migrates all callers and A3.2 drops the legacy
+   path, the `ch` arg can be removed too. */
+void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+                                                    uint32_t channel_id,
+                                                    uint64_t old_commit_num,
+                                                    uint64_t old_local,
+                                                    uint64_t old_remote,
+                                                    const htlc_t *old_htlcs,
+                                                    size_t old_n_htlcs,
+                                                    const unsigned char *signed_penalty_tx,
+                                                    size_t signed_penalty_tx_len);
 
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);

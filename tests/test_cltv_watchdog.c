@@ -549,3 +549,54 @@ int test_watchtower_remove_channel(void)
     watchtower_cleanup(&wt);
     return 1;
 }
+
+/* ================================================================== */
+/* WT5 — A3.1 oracular registration: pre-signed penalty TX bytes are  */
+/*       stored on the entry and free'd cleanly via cleanup, with no  */
+/*       channel_t pointer required.                                   */
+/* ================================================================== */
+int test_watchtower_oracular_pre_signed(void)
+{
+    watchtower_t wt;
+    memset(&wt, 0, sizeof(wt));
+    ASSERT(watchtower_init(&wt, 0, NULL, NULL, NULL), "init");
+
+    /* Caller builds penalty TX bytes elsewhere and hands them in. */
+    unsigned char txid[32]; memset(txid, 0xAB, 32);
+    unsigned char spk[34];  memset(spk,  0x51, 34);
+    unsigned char fake_penalty[120];
+    memset(fake_penalty, 0xDE, sizeof(fake_penalty));
+
+    int r = watchtower_watch_oracular(&wt, 7, 3, txid, 0, 50000,
+                                        spk, 34,
+                                        fake_penalty, sizeof(fake_penalty));
+    ASSERT(r == 1, "oracular watch returns 1");
+    ASSERT(wt.n_entries == 1, "one entry registered");
+
+    /* Entry carries the bytes verbatim. */
+    ASSERT(wt.entries[0].signed_penalty_tx != NULL, "signed_penalty_tx populated");
+    ASSERT(wt.entries[0].signed_penalty_tx_len == sizeof(fake_penalty),
+           "len matches input");
+    ASSERT(memcmp(wt.entries[0].signed_penalty_tx, fake_penalty,
+                  sizeof(fake_penalty)) == 0,
+           "bytes match input");
+
+    /* Pointer must be a copy, not the caller's bytes. */
+    ASSERT(wt.entries[0].signed_penalty_tx != fake_penalty,
+           "stored bytes are a heap copy");
+
+    /* Remove channel — must free the heap copy with no leak. */
+    watchtower_remove_channel(&wt, 7);
+    ASSERT(wt.n_entries == 0, "entry removed");
+
+    /* NULL bytes degrades to legacy lazy-build registration (no copy). */
+    r = watchtower_watch_oracular(&wt, 8, 4, txid, 0, 60000,
+                                    spk, 34, NULL, 0);
+    ASSERT(r == 1, "oracular with NULL bytes still registers");
+    ASSERT(wt.n_entries == 1, "one entry registered (legacy mode)");
+    ASSERT(wt.entries[0].signed_penalty_tx == NULL,
+           "NULL input → NULL stored bytes");
+
+    watchtower_cleanup(&wt);
+    return 1;
+}
