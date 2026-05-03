@@ -1098,6 +1098,8 @@ extern int test_wire_framing(void);
 extern int test_wire_crypto_serialization(void);
 extern int test_wire_nonce_bundle(void);
 extern int test_wire_psig_bundle(void);
+extern int test_wire_path_bundle_with_poison_round_trip(void);
+extern int test_wire_path_bundle_no_poison_back_compat(void);
 extern int test_wire_close_unsigned(void);
 extern int test_wire_distributed_signing(void);
 extern int test_regtest_wire_factory(void);
@@ -2955,6 +2957,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_crypto_serialization);
     RUN_TEST(test_wire_nonce_bundle);
     RUN_TEST(test_wire_psig_bundle);
+    RUN_TEST(test_wire_path_bundle_with_poison_round_trip);
+    RUN_TEST(test_wire_path_bundle_no_poison_back_compat);
     RUN_TEST(test_wire_close_unsigned);
     RUN_TEST(test_wire_distributed_signing);
 

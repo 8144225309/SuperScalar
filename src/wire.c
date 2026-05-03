@@ -682,6 +682,50 @@ cJSON *wire_build_psig_bundle(const wire_bundle_entry_t *entries, size_t n) {
     return j;
 }
 
+/* Helper: build a bundle JSON with primary + optional poison_entries arrays.
+   When n_poison is 0 OR poison_entries is NULL, the poison_entries field is
+   omitted entirely so the wire bytes match the plain builder exactly
+   (backward-compat receivers parse cleanly). */
+static cJSON *build_bundle_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                         const wire_bundle_entry_t *poison_entries,
+                                         size_t n_poison,
+                                         const char *primary_key) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddItemToObject(j, primary_key, build_bundle_array(entries, n));
+    if (poison_entries && n_poison > 0)
+        cJSON_AddItemToObject(j, "poison_entries",
+                              build_bundle_array(poison_entries, n_poison));
+    return j;
+}
+
+cJSON *wire_build_nonce_bundle_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                             const wire_bundle_entry_t *poison_entries,
+                                             size_t n_poison) {
+    return build_bundle_with_poison(entries, n, poison_entries, n_poison, "entries");
+}
+
+cJSON *wire_build_all_nonces_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                           const wire_bundle_entry_t *poison_entries,
+                                           size_t n_poison) {
+    return build_bundle_with_poison(entries, n, poison_entries, n_poison, "nonces");
+}
+
+cJSON *wire_build_psig_bundle_with_poison(const wire_bundle_entry_t *entries, size_t n,
+                                            const wire_bundle_entry_t *poison_entries,
+                                            size_t n_poison) {
+    return build_bundle_with_poison(entries, n, poison_entries, n_poison, "entries");
+}
+
+size_t wire_parse_poison_bundle(const cJSON *json,
+                                  wire_bundle_entry_t *poison_entries,
+                                  size_t max_poison,
+                                  size_t data_size) {
+    if (!json || !poison_entries || max_poison == 0) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "poison_entries");
+    if (!arr) return 0;
+    return wire_parse_bundle(arr, poison_entries, max_poison, data_size);
+}
+
 cJSON *wire_build_factory_ready(const factory_t *f) {
     cJSON *j = cJSON_CreateObject();
     cJSON *arr = cJSON_CreateArray();
