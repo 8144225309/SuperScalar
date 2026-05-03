@@ -176,6 +176,9 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->n_htlc_outputs = 0;
     e->response_tx = NULL;
     e->response_tx_len = 0;
+    /* Oracular bytes start NULL — set by watchtower_watch_oracular wrapper. */
+    e->signed_penalty_tx = NULL;
+    e->signed_penalty_tx_len = 0;
 
     /* Persist if DB available */
     if (wt->db && wt->db->db) {
@@ -188,6 +191,39 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     if (wt->chain && wt->chain->register_script)
         wt->chain->register_script(wt->chain, to_local_spk, spk_len);
 
+    return 1;
+}
+
+int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
+                                uint64_t commit_num,
+                                const unsigned char *txid32,
+                                uint32_t to_local_vout,
+                                uint64_t to_local_amount,
+                                const unsigned char *to_local_spk,
+                                size_t spk_len,
+                                const unsigned char *signed_penalty_tx,
+                                size_t signed_penalty_tx_len) {
+    /* Register the entry via the legacy path so persist + script
+       registration stay identical, then attach pre-signed bytes onto
+       the just-added entry.  Falls back to legacy lazy-build path
+       transparently when caller passes NULL bytes. */
+    if (!watchtower_watch(wt, channel_id, commit_num, txid32,
+                            to_local_vout, to_local_amount,
+                            to_local_spk, spk_len))
+        return 0;
+    if (signed_penalty_tx && signed_penalty_tx_len > 0) {
+        watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
+        unsigned char *copy = malloc(signed_penalty_tx_len);
+        if (!copy) return 0;
+        memcpy(copy, signed_penalty_tx, signed_penalty_tx_len);
+        /* Defensive: free any stray pointer (shouldn't exist on a fresh
+           entry just allocated by watchtower_watch, but the swap-with-last
+           deletion pattern means we cannot universally trust slot zero-ness
+           without a memset). */
+        free(e->signed_penalty_tx);
+        e->signed_penalty_tx = copy;
+        e->signed_penalty_tx_len = signed_penalty_tx_len;
+    }
     return 1;
 }
 
@@ -363,6 +399,39 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     free(saved_htlcs);
 }
 
+void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+                                                    uint32_t channel_id,
+                                                    uint64_t old_commit_num,
+                                                    uint64_t old_local,
+                                                    uint64_t old_remote,
+                                                    const htlc_t *old_htlcs,
+                                                    size_t old_n_htlcs,
+                                                    const unsigned char *signed_penalty_tx,
+                                                    size_t signed_penalty_tx_len) {
+    /* Run the existing registration so persist + script registration +
+       HTLC parsing all stay identical.  Then attach pre-signed penalty
+       TX bytes to the new entry (the LAST one, since the legacy call
+       always pushes to wt->n_entries - 1 if successful).
+
+       If signed_penalty_tx is NULL we degrade to legacy lazy-build
+       behaviour transparently — same call shape as the non-oracular
+       form. */
+    size_t n_before = wt->n_entries;
+    watchtower_watch_revoked_commitment(wt, ch, channel_id, old_commit_num,
+                                          old_local, old_remote,
+                                          old_htlcs, old_n_htlcs);
+    if (!signed_penalty_tx || signed_penalty_tx_len == 0) return;
+    if (wt->n_entries == n_before) return;  /* legacy registration failed */
+
+    watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
+    unsigned char *copy = malloc(signed_penalty_tx_len);
+    if (!copy) return;
+    memcpy(copy, signed_penalty_tx, signed_penalty_tx_len);
+    free(e->signed_penalty_tx);
+    e->signed_penalty_tx = copy;
+    e->signed_penalty_tx_len = signed_penalty_tx_len;
+}
+
 void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)
 {
     if (wt)
@@ -434,7 +503,16 @@ int watchtower_check(watchtower_t *wt) {
                 /* Penalty safely confirmed — remove entry */
                 free(e->htlc_outputs); free(e->ptlc_outputs);
                 free(e->response_tx); free(e->burn_tx);
+                /* Oracular bytes (#208 A3.1) — free before swap-with-last */
+                free(e->signed_penalty_tx);
+                e->signed_penalty_tx = NULL;
+                e->signed_penalty_tx_len = 0;
                 wt->entries[i] = wt->entries[wt->n_entries - 1];
+                /* NULL the swap source so swap_dst's free above doesn't
+                   double-free the moved pointers when the slot is later
+                   reused via wt->n_entries++ */
+                wt->entries[wt->n_entries - 1].signed_penalty_tx = NULL;
+                wt->entries[wt->n_entries - 1].signed_penalty_tx_len = 0;
                 wt->n_entries--;
                 continue;  /* re-check swapped entry at index i */
             }
@@ -651,33 +729,52 @@ int watchtower_check(watchtower_t *wt) {
                 regtest_mine_blocks(wt->rt, 1, mine_addr);
         }
 
-        /* Find corresponding channel */
-        channel_t *ch = NULL;
-        if (e->channel_id < wt->channels_cap)
-            ch = wt->channels[e->channel_id];
-
-        if (!ch) {
-            fprintf(stderr, "Watchtower: no channel %u for penalty\n", e->channel_id);
-            i++;
-            continue;
-        }
-
+        /* Oracular fast-path (#208 A3.1): if the LSP pre-signed the penalty
+           TX at revocation time and registered via watchtower_watch_oracular
+           or watchtower_watch_revoked_commitment_oracular, broadcast those
+           bytes directly without ever consulting wt->channels[].  This is
+           the path that lets the watchtower run in a separate process. */
         tx_buf_t penalty_tx;
         tx_buf_init(&penalty_tx, 512);
-
         int use_anchor = fee_should_use_anchor(wt->fee);
-        if (!channel_build_penalty_tx(ch, &penalty_tx,
-                                        e->txid, e->to_local_vout,
-                                        e->to_local_amount,
-                                        e->to_local_spk, e->to_local_spk_len,
-                                        e->commit_num,
-                                        use_anchor ? wt->anchor_spk : NULL,
-                                        use_anchor ? wt->anchor_spk_len : 0)) {
-            fprintf(stderr, "Watchtower: build penalty tx failed for channel %u\n",
-                    e->channel_id);
-            tx_buf_free(&penalty_tx);
-            i++;
-            continue;
+        channel_t *ch = NULL;
+
+        if (e->signed_penalty_tx && e->signed_penalty_tx_len > 0) {
+            tx_buf_write_bytes(&penalty_tx, e->signed_penalty_tx,
+                                e->signed_penalty_tx_len);
+            if (penalty_tx.oom) {
+                fprintf(stderr,
+                        "Watchtower: copy oracular penalty bytes failed (OOM)\n");
+                tx_buf_free(&penalty_tx);
+                i++;
+                continue;
+            }
+        } else {
+            /* Legacy lazy-build path — derefs live channel state.  This
+               path will be removed once A3.1b migrates all callers to
+               the oracular variants. */
+            if (e->channel_id < wt->channels_cap)
+                ch = wt->channels[e->channel_id];
+
+            if (!ch) {
+                fprintf(stderr, "Watchtower: no channel %u for penalty\n", e->channel_id);
+                i++;
+                continue;
+            }
+
+            if (!channel_build_penalty_tx(ch, &penalty_tx,
+                                            e->txid, e->to_local_vout,
+                                            e->to_local_amount,
+                                            e->to_local_spk, e->to_local_spk_len,
+                                            e->commit_num,
+                                            use_anchor ? wt->anchor_spk : NULL,
+                                            use_anchor ? wt->anchor_spk_len : 0)) {
+                fprintf(stderr, "Watchtower: build penalty tx failed for channel %u\n",
+                        e->channel_id);
+                tx_buf_free(&penalty_tx);
+                i++;
+                continue;
+            }
         }
 
         /* Broadcast penalty tx */
@@ -708,9 +805,12 @@ int watchtower_check(watchtower_t *wt) {
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
            Skip CPFP tracking at sub-1-sat/vB — no anchor output was created. */
         uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
-        if (penalty_sent && use_anchor &&
+        if (ch && penalty_sent && use_anchor &&
             wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < wt->pending_cap) {
+            /* CPFP tracking still requires live channel state for csv_delay.
+               TODO A3.1b: persist csv_delay in the watchtower entry at
+               registration time so the oracular path can track CPFP too. */
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             memcpy(p->txid, penalty_txid, 64);
             p->txid[64] = '\0';
@@ -728,7 +828,14 @@ int watchtower_check(watchtower_t *wt) {
             }
         }
 
-        /* Sweep HTLC outputs via penalty txs */
+        /* Sweep HTLC outputs via penalty txs.  Skip on the oracular path
+           (ch == NULL) — A3.1b will add an HTLC-penalty oracular variant
+           that pre-builds these TXs at revocation time and stores them
+           in e->htlc_outputs[].sweep_txid alongside the main penalty. */
+        if (!ch) {
+            i++;
+            continue;
+        }
         for (size_t h = 0; h < e->n_htlc_outputs; h++) {
             /* Skip already-swept outputs (amount set to 0 after broadcast) */
             if (e->htlc_outputs[h].htlc_amount == 0) continue;
@@ -943,7 +1050,13 @@ int watchtower_check(watchtower_t *wt) {
             if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;
+                /* Oracular bytes (#208 A3.1) — free before swap-with-last */
+                free(e->signed_penalty_tx);
+                e->signed_penalty_tx = NULL;
+                e->signed_penalty_tx_len = 0;
                 wt->entries[i] = wt->entries[wt->n_entries - 1];
+                wt->entries[wt->n_entries - 1].signed_penalty_tx = NULL;
+                wt->entries[wt->n_entries - 1].signed_penalty_tx_len = 0;
                 wt->n_entries--;
                 i--;  /* recheck swapped entry */
             }
@@ -1301,6 +1414,10 @@ void watchtower_cleanup(watchtower_t *wt) {
             free(wt->entries[i].sub_channel_amounts);
             wt->entries[i].sub_channel_amounts = NULL;
         }
+        /* Oracular path bytes (#208 A3.1) — free on any entry type */
+        free(wt->entries[i].signed_penalty_tx);
+        wt->entries[i].signed_penalty_tx = NULL;
+        wt->entries[i].signed_penalty_tx_len = 0;
     }
     free(wt->entries);
     free(wt->channels);
@@ -1380,6 +1497,10 @@ void watchtower_clear_entries(watchtower_t *wt) {
             free(wt->entries[i].sub_channel_amounts);
             wt->entries[i].sub_channel_amounts = NULL;
         }
+        /* Oracular bytes (#208 A3.1) — free on any entry type */
+        free(wt->entries[i].signed_penalty_tx);
+        wt->entries[i].signed_penalty_tx = NULL;
+        wt->entries[i].signed_penalty_tx_len = 0;
     }
     wt->n_entries = 0;
 }
@@ -1430,11 +1551,17 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
                 free(wt->entries[i].response_tx);
                 free(wt->entries[i].burn_tx);
             }
+            /* Oracular bytes (#208 A3.1) — free on any entry type */
+            free(wt->entries[i].signed_penalty_tx);
+            wt->entries[i].signed_penalty_tx = NULL;
+            wt->entries[i].signed_penalty_tx_len = 0;
             wt->entries[i] = wt->entries[wt->n_entries - 1];
             /* NULL the source entry's pointers after swap */
             wt->entries[wt->n_entries - 1].htlc_outputs = NULL;
             wt->entries[wt->n_entries - 1].response_tx = NULL;
             wt->entries[wt->n_entries - 1].burn_tx = NULL;
+            wt->entries[wt->n_entries - 1].signed_penalty_tx = NULL;
+            wt->entries[wt->n_entries - 1].signed_penalty_tx_len = 0;
             wt->n_entries--;
         } else {
             i++;
