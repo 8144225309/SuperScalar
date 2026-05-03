@@ -570,12 +570,26 @@ int watchtower_check(watchtower_t *wt) {
 
         if (e->type == WATCH_SUBFACTORY_NODE) {
             /* PS sub-factory chain breach (k² shape).
-               Stale chain[N-1] confirmed; we broadcast the latest chain[N]
-               (which spends a UTXO that no longer exists on-chain after
-               the stale state confirms — but this is the same shape as
-               the FACTORY_NODE response, retained for symmetry until the
-               poison TX builder lands).  We then broadcast the poison TX
-               that distributes the stale sales-stock to clients pro-rata.
+               Stale chain[N-1] confirmed.  The recourse mechanism is the
+               poison TX (Gap A): it spends chain[N-1].sales_stock_vout and
+               distributes the sales-stock pro-rata to each non-LSP signer.
+
+               Historical note: an earlier version of this handler ALSO
+               broadcast `response_tx` (the latest chain[N]) for symmetry
+               with WATCH_FACTORY_NODE.  But response_tx and poison_tx
+               compete for the same chain[N-1].sales_stock UTXO — only one
+               can win.  After chain[N-1] confirms, response_tx
+               (chain[N]) is structurally invalid: its parent input is
+               consumed by chain[N-1]'s confirmation and bitcoind correctly
+               rejects with -25 bad-txns-inputs-missingorspent.  Poison
+               TX is the actual recourse; response_tx broadcast was always
+               a no-op when bitcoind validation actually ran (regtest tests
+               passed because they exited before broadcast was attempted).
+
+               This cleanup removes the dead response_tx broadcast.  The
+               watchtower entry's response_tx field is still populated by
+               watchtower_watch_subfactory_node for compatibility with the
+               WATCH_FACTORY_NODE shape, but is no longer broadcast here.
 
                Unlike WATCH_FACTORY_NODE we do NOT auto-settle channels —
                sub-factory clients live inside the sub-factory chain TX,
@@ -590,29 +604,6 @@ int watchtower_check(watchtower_t *wt) {
 
             char sub_resp_txid[65] = {0};
 
-            if (e->response_tx && e->response_tx_len > 0) {
-                char *resp_hex = (char *)malloc(e->response_tx_len * 2 + 1);
-                if (resp_hex) {
-                    hex_encode(e->response_tx, e->response_tx_len, resp_hex);
-                    char resp_txid[65];
-                    if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
-                        printf("  Sub-factory response tx broadcast: %s\n", resp_txid);
-                        memcpy(sub_resp_txid, resp_txid, 64);
-                        sub_resp_txid[64] = '\0';
-                        penalties_broadcast++;
-                        if (wt->db && wt->db->db)
-                            persist_log_broadcast(wt->db, resp_txid,
-                                                  "subfactory_response", resp_hex, "ok");
-                    } else {
-                        fprintf(stderr, "  Sub-factory response tx broadcast failed\n");
-                        if (wt->db && wt->db->db)
-                            persist_log_broadcast(wt->db, "?",
-                                                  "subfactory_response", resp_hex, "failed");
-                    }
-                    free(resp_hex);
-                }
-            }
-
             if (e->burn_tx && e->burn_tx_len > 0) {
                 char *poison_hex = (char *)malloc(e->burn_tx_len * 2 + 1);
                 if (poison_hex) {
@@ -620,6 +611,9 @@ int watchtower_check(watchtower_t *wt) {
                     char poison_txid[65];
                     if (wt->chain->send_raw_tx(wt->chain, poison_hex, poison_txid)) {
                         printf("  Sub-factory poison tx broadcast: %s\n", poison_txid);
+                        memcpy(sub_resp_txid, poison_txid, 64);
+                        sub_resp_txid[64] = '\0';
+                        penalties_broadcast++;
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, poison_txid,
                                                   "subfactory_poison", poison_hex, "ok");
@@ -631,6 +625,11 @@ int watchtower_check(watchtower_t *wt) {
                     }
                     free(poison_hex);
                 }
+            } else {
+                fprintf(stderr,
+                        "  Sub-factory breach detected but no poison TX "
+                        "available — degraded path (Gap A SECURITY GAP).  "
+                        "Stale sales-stock cannot be redistributed.\n");
             }
 
             e->penalty_broadcast = 1;
