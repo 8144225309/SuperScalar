@@ -2615,9 +2615,10 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
 
-                    size_t wt_idx = mgr->n_channels + jits[ji].client_idx;
-                    if (wt_idx < WATCHTOWER_MAX_CHANNELS)
-                        watchtower_set_channel(&rec_wt, wt_idx, jch);
+                    /* watchtower_set_channel dropped in #208 A3.2 — penalty
+                       bytes are pre-built at revocation receive time. JIT
+                       channel registration is no longer needed here. */
+                    (void)jch;
                 }
                 if (jit_count > 0)
                     printf("LSP recovery: loaded %zu JIT channels from DB\n",
@@ -2839,9 +2840,8 @@ accept_new_factory:
                 watchtower_set_chain_backend(&g_watchtower, &g_bip158.base);
             if (g_hd_wallet)
                 watchtower_set_wallet(&g_watchtower, &g_hd_wallet->base);
-            for (size_t _wi = 0; _wi < g_channel_mgr->n_channels; _wi++)
-                watchtower_set_channel(&g_watchtower, _wi,
-                                       &g_channel_mgr->entries[_wi].channel);
+            /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
+               bytes are pre-built at revocation receive time. */
             g_watchtower_ready = 1;
             g_ln_dispatch.watchtower  = &g_watchtower;
             g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
@@ -3590,8 +3590,8 @@ accept_new_factory:
         memset(&wt, 0, sizeof(wt));
         watchtower_init(&wt, mgr->n_channels, &rt, fee_est,
                           use_db ? &db : NULL);
-        for (size_t c = 0; c < mgr->n_channels; c++)
-            watchtower_set_channel(&wt, c, &mgr->entries[c].channel);
+        /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
+           bytes are pre-built at revocation receive time. */
         mgr->watchtower = &wt;
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
@@ -3685,8 +3685,8 @@ accept_new_factory:
                             continue;
                         }
                     }
-                    size_t wt_idx = mgr->n_channels + jits[ji].client_idx;
-                    watchtower_set_channel(&wt, wt_idx, &jits[ji].channel);
+                    /* watchtower_set_channel dropped in #208 A3.2 — penalty
+                       bytes are pre-built at revocation receive time. */
                 }
             }
             if (jit_count > 0)

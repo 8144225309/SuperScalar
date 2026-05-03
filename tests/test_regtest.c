@@ -985,10 +985,12 @@ int test_regtest_watchtower_mempool_detection(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* Register commitment #0 with watchtower */
+    /* Register commitment #0 with watchtower.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
 
     tx_buf_t remote_commit0;
     tx_buf_init(&remote_commit0, 512);
@@ -1164,10 +1166,12 @@ int test_regtest_watchtower_late_detection(void) {
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
-    /* Register commitment #0 with watchtower */
+    /* Register commitment #0 with watchtower.
+       watchtower_set_channel dropped in #208 A3.2 — direct field access
+       keeps legacy sweep paths working in tests. */
     watchtower_t wt;
     watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL);
-    watchtower_set_channel(&wt, 0, &client_ch);
+    if (wt.channels_cap > 0) wt.channels[0] = &client_ch;
 
     tx_buf_t remote_commit0;
     tx_buf_init(&remote_commit0, 512);
