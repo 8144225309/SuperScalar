@@ -233,30 +233,29 @@ MuSig2 round bundled with each state advance.
 | `lsp_subfactory_chain_advance` (k² PS chain extension) | ✅ wire-ceremony | #136 |
 | `lsp_advance_leaf` (DW per-leaf state advance) | ✅ wire-ceremony | #137 |
 | `lsp_realloc_leaf` (per-leaf fund reallocation) | ✅ wire-ceremony | #138 |
-| `lsp_run_state_advance` (Tier B root rollover) | ⏳ single-process fallback only | TODO |
+| `lsp_run_state_advance` (Tier B root rollover) | ✅ wire-ceremony (LSP+client dual-pool) | #151 + #152 |
 
-**Remaining gap — Tier B root rollover** (`lsp_run_state_advance`):
-- Triggered when a leaf's per-leaf DW counter exhausts and the root layer advances
-- Re-signs N nodes simultaneously using `MSG_PATH_*` bundle messages and nonce pools
-- Watchtower hook at `src/lsp_channels.c:2195+` still uses
-  `factory_build_burn_tx` (single-process) for each affected leaf
-- In multi-process mode the `lsp_have_all_signer_keypairs` guard skips
-  the build, registering the watchtower with `NULL` poison_tx for that
-  rotation — operators see a SECURITY GAP stderr warning per leaf
-
-**Frequency**: Tier B rotation fires roughly once per N leaf advances (the
-per-leaf DW counter exhausts after `states_per_layer` advances).  Per-leaf
-advances now have full poison TX defense, but the rare rotation event
-falls back to NULL until Tier B gets the same wire-ceremony treatment.
-
-**The 3 closed paths cover the common case** — every payment-driven state
-advance, every k² sub-factory chain extension, and every per-leaf realloc
-already produces a real signed poison TX in multi-process mode.  Mainnet
-deployments that anticipate root rollovers should still wait for Tier B.
+**All four ceremony paths now produce a real signed poison TX in
+multi-process mode.**  PR-D (#151 LSP-side `lsp_run_state_advance` +
+#152 client-side mirror) closed the last gap by adding a second
+MuSig2 round bundled into the existing `MSG_PATH_NONCE_BUNDLE` /
+`MSG_PATH_ALL_NONCES` / `MSG_PATH_PSIG_BUNDLE` messages via the
+optional `poison_entries` field (PR #149).  The integration test
+in `tools/test_multiprocess_tier_b_rollover.sh` asserts that no
+SECURITY GAP fallback line appears in the LSP log after rotation
+(see PR #153).
 
 **Single-process / signet self-tests / `--demo` deployments are
 unaffected on all 4 paths** (the in-process key availability path is
 exercised end-to-end by unit tests).
+
+**Graceful-degradation fallback retained**: if a client doesn't
+participate in the poison ceremony (e.g., legacy version mid-rotation),
+the LSP detects the missing nonces/sigs and degrades that specific leaf
+to single-process `factory_build_burn_tx` if all signer keypairs are
+available locally, or to NULL poison_tx otherwise — the rotation never
+aborts.  In normal multi-process operation with all peers on the
+post-PR-D codebase this fallback never fires.
 
 ## What's deferred to a follow-up PR
 
