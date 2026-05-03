@@ -282,48 +282,36 @@ echo "  $DETECT_LINE"
 
 echo ""
 echo "=== Verifying poison TX broadcast ==="
-# Note: in t/1242 the response_tx (chain[N]) and poison_tx both spend the
-# same chain[N-1].sales-stock UTXO — they race, only one can win.  After
-# chain[N-1] confirms (the cheat), chain[N] is INVALID (its parent input
-# vanished), so response_tx broadcast attempts will fail with sendrawtransaction
-# rejection.  The poison TX is the actual recourse mechanism: it
-# distributes the now-orphaned sales-stock to clients pro-rata.
-#
-# This harness asserts only the poison TX broadcast.  The response_tx
-# attempt is best-effort and its failure is expected (and logged in the
-# LSP daemon as "Sub-factory response tx broadcast failed").  A future PR
-# should remove the response_tx broadcast for WATCH_SUBFACTORY_NODE
-# entries entirely — see watchtower.c:573-577 for the explanatory comment.
+# Per t/1242, after chain[N-1] confirms (the cheat) the recourse is the
+# poison TX which spends chain[N-1].sales_stock and distributes pro-rata to
+# each non-LSP signer.  Earlier versions of the watchtower also tried to
+# broadcast response_tx (chain[N]) for symmetry with WATCH_FACTORY_NODE,
+# but chain[N]'s only input is chain[N-1].sales_stock — the same UTXO the
+# poison TX claims, AND it can't co-exist with the cheat being on-chain.
+# That dead path was removed in the v0.1.15 watchtower cleanup; only
+# poison_tx is broadcast now.
 if ! grep -q "Sub-factory poison tx broadcast:" "$LSP_LOG"; then
     echo "FAIL: poison_tx was not broadcast by watchtower"
-    grep -E "poison|broadcast|FAIL|BREACH|response" "$LSP_LOG" | head -40
+    grep -E "poison|broadcast|FAIL|BREACH" "$LSP_LOG" | head -40
     exit 1
 fi
 POISON_LINE=$(grep "Sub-factory poison tx broadcast:" "$LSP_LOG" | head -1)
 POISON_TXID=$(echo "$POISON_LINE" | awk '{print $NF}')
 echo "  $POISON_LINE"
 
-# response_tx broadcast is informational only (expected to fail because its
-# parent UTXO was just consumed by the cheat broadcast).
-RESP_LINE=$(grep -E "Sub-factory response tx broadcast" "$LSP_LOG" | head -1)
-echo "  response_tx attempt: ${RESP_LINE:-<not logged>}"
-
 # --- Verify broadcast_log entries via SQLite ---
 echo ""
 echo "=== Verifying broadcast_log entries ==="
 if [ -f "$LSP_DB" ]; then
-    NREP=$(sqlite3 "$LSP_DB" \
-        "SELECT COUNT(*) FROM broadcast_log WHERE source='subfactory_response';" \
-        2>/dev/null || echo 0)
     NPOI=$(sqlite3 "$LSP_DB" \
         "SELECT COUNT(*) FROM broadcast_log WHERE source='subfactory_poison';" \
         2>/dev/null || echo 0)
     NCHEAT=$(sqlite3 "$LSP_DB" \
         "SELECT COUNT(*) FROM broadcast_log WHERE source='cheat_subfactory_stale';" \
         2>/dev/null || echo 0)
-    echo "  broadcast_log rows: cheat=$NCHEAT response=$NREP poison=$NPOI"
-    # response_tx may be 0 (broadcast attempt fails post-cheat by design — see
-    # the response_tx-vs-poison comment above); poison + cheat are mandatory.
+    echo "  broadcast_log rows: cheat=$NCHEAT poison=$NPOI"
+    # response_tx broadcast removed in v0.1.15 (was structurally invalid by
+    # design — see watchtower.c WATCH_SUBFACTORY_NODE handler).
     if [ "$NPOI" -lt 1 ] || [ "$NCHEAT" -lt 1 ]; then
         echo "FAIL: missing broadcast_log entries (need cheat>=1 and poison>=1)"
         exit 1

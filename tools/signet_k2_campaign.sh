@@ -54,6 +54,32 @@ FUNDING_SATS="${FUNDING_SATS:-400000}"
 # causes false pessimism during signet-faucet windows.
 TREE_CONFIRM_TIMEOUT="${TREE_CONFIRM_TIMEOUT:-14400}"  # 4 hours
 
+# Auto-detect bitcoind RPC creds from the signet conf if env not set.
+# Avoids needing the operator to remember to override RPCUSER/RPCPASS;
+# this was the #1 setup hit in the v0.1.15 first-run signet campaign.
+SIGNET_CONF_DEFAULT=/var/lib/bitcoind-signet/bitcoin.conf
+if [ -z "${RPCUSER:-}" ] && [ -r "$SIGNET_CONF_DEFAULT" ]; then
+    detected=$(awk -F= '/^[[:space:]]*rpcuser[[:space:]]*=/  {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' \
+                   "$SIGNET_CONF_DEFAULT" 2>/dev/null)
+    [ -n "$detected" ] && export RPCUSER="$detected"
+fi
+if [ -z "${RPCPASS:-}" ] && [ -r "$SIGNET_CONF_DEFAULT" ]; then
+    detected=$(awk -F= '/^[[:space:]]*rpcpassword[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' \
+                   "$SIGNET_CONF_DEFAULT" 2>/dev/null)
+    [ -n "$detected" ] && export RPCPASS="$detected"
+fi
+if [ -z "${RPCPORT:-}" ] && [ -r "$SIGNET_CONF_DEFAULT" ]; then
+    detected=$(awk -F= '/^[[:space:]]*rpcport[[:space:]]*=/    {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' \
+                   "$SIGNET_CONF_DEFAULT" 2>/dev/null)
+    [ -n "$detected" ] && export RPCPORT="$detected"
+fi
+
+# Auto-pick a non-LN port for the LSP listener.  9735 is the canonical LN
+# port and is held by CLN on most VPS setups; the LSP daemon needs its own.
+# Default 29735 is unlikely to clash; operator can still override via
+# LSP_PORT env.
+export LSP_PORT="${LSP_PORT:-29735}"
+
 # Log everything to transcript so the operator can replay.
 exec > >(tee -a "$TRANSCRIPT") 2>&1
 
