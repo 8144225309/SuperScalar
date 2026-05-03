@@ -447,6 +447,35 @@ static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
                                     prev_amount, node->nsequence);
 }
 
+/* Per-input sighash for advanced PS sub-factory chain advance nodes (#207).
+   For ordinary single-input nodes (input_idx == 0), delegates to
+   compute_node_sighash so the existing single-input path is unchanged.
+   For multi-input nodes, builds the BIP-341 preimage from the per-input
+   prev_amounts/prev_spks captured in factory_subfactory_chain_advance_unsigned. */
+static int compute_node_sighash_input(const factory_t *f,
+                                        const factory_node_t *node,
+                                        size_t input_idx,
+                                        unsigned char *sighash_out) {
+    if (node->is_ps_leaf && node->ps_chain_len > 0 &&
+        node->type == NODE_PS_SUBFACTORY && node->ps_n_prev_outputs > 1) {
+        if (input_idx >= node->ps_n_prev_outputs) return 0;
+        const unsigned char *spks[FACTORY_MAX_OUTPUTS];
+        uint32_t seqs[FACTORY_MAX_OUTPUTS];
+        for (size_t i = 0; i < node->ps_n_prev_outputs; i++) {
+            spks[i] = node->ps_prev_spks[i];
+            seqs[i] = node->nsequence;  /* every input shares nsequence in our wire layout */
+        }
+        return compute_taproot_sighash_multi(sighash_out,
+            node->unsigned_tx.data, node->unsigned_tx.len,
+            (uint32_t)input_idx,
+            node->ps_n_prev_outputs,
+            spks, node->ps_prev_spk_lens,
+            node->ps_prev_amounts, seqs);
+    }
+    if (input_idx != 0) return 0;
+    return compute_node_sighash(f, node, sighash_out);
+}
+
 /* Forward declarations for helpers used in init/set_arity */
 static int compute_tree_depth(size_t n_clients, factory_arity_t arity);
 static int compute_leaf_count(size_t n_clients, factory_arity_t arity);
@@ -1944,11 +1973,38 @@ int factory_advance(factory_t *f) {
 
 /* Rebuild unsigned tx for a single node.
    PS leaf chain advances (ps_chain_len > 0) spend the channel output of the
-   previous chain TX (ps_prev_txid:0) rather than the parent KO's output. */
+   previous chain TX (ps_prev_txid:0) rather than the parent KO's output.
+   Advanced PS sub-factory chains (NODE_PS_SUBFACTORY + ps_n_prev_outputs > 1)
+   spend ALL k+1 outputs of the previous chain TX (#207 fix). */
 static int rebuild_node_tx(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;
     factory_node_t *node = &f->nodes[node_idx];
     unsigned char display_txid[32];
+
+    node->nsequence = node_nsequence(f, node);
+
+    /* Multi-input PS sub-factory chain advance (#207).
+       chain[N+1] consumes every chain[N] output, preserving conservation:
+       sum(prev_amounts) ≈ sum(outputs) + fee_per_tx. */
+    if (node->is_ps_leaf && node->ps_chain_len > 0 &&
+        node->type == NODE_PS_SUBFACTORY && node->ps_n_prev_outputs > 1) {
+        tx_input_t inputs[FACTORY_MAX_OUTPUTS];
+        for (size_t i = 0; i < node->ps_n_prev_outputs; i++) {
+            memcpy(inputs[i].prev_txid, node->ps_prev_txid, 32);
+            inputs[i].prev_vout  = (uint32_t)i;
+            inputs[i].nsequence  = node->nsequence;
+        }
+        if (!build_unsigned_tx_multi(&node->unsigned_tx, display_txid,
+                                       inputs, node->ps_n_prev_outputs,
+                                       node->outputs, node->n_outputs,
+                                       /*nVersion=*/2, /*nlocktime=*/0))
+            return 0;
+        memcpy(node->txid, display_txid, 32);
+        reverse_bytes(node->txid, 32);
+        node->is_built = 1;
+        node->is_signed = 0;
+        return 1;
+    }
 
     const unsigned char *input_txid;
     uint32_t input_vout;
@@ -1970,8 +2026,6 @@ static int rebuild_node_tx(factory_t *f, size_t node_idx) {
         input_txid = parent->txid;
         input_vout = node->parent_vout;
     }
-
-    node->nsequence = node_nsequence(f, node);
 
     if (!build_unsigned_tx(&node->unsigned_tx, display_txid,
                            input_txid, input_vout,
@@ -2271,6 +2325,19 @@ int factory_subfactory_chain_advance_unsigned(
     sub->ps_prev_chan_amount = sstock_amount;  /* spending the sales-stock vout */
     sub->ps_chain_len++;
 
+    /* Capture per-input prev state for the multi-input chain advance (#207).
+       chain[N+1] consumes ALL k+1 outputs of chain[N], not just sales-stock,
+       so each prev output's (amount, scriptpubkey) is needed for the BIP-341
+       sighash computation per input.  Capture BEFORE we mutate sub->outputs[]. */
+    sub->ps_n_prev_outputs = sub->n_outputs;
+    for (size_t i = 0; i < sub->n_outputs; i++) {
+        sub->ps_prev_amounts[i] = sub->outputs[i].amount_sats;
+        size_t spk_len = sub->outputs[i].script_pubkey_len;
+        if (spk_len > sizeof(sub->ps_prev_spks[i])) spk_len = sizeof(sub->ps_prev_spks[i]);
+        memcpy(sub->ps_prev_spks[i], sub->outputs[i].script_pubkey, spk_len);
+        sub->ps_prev_spk_lens[i] = spk_len;
+    }
+
     /* New state amounts: channel grows by delta, sales-stock shrinks by
        delta + fee.  Other channels untouched. */
     sub->outputs[channel_idx_in_sub].amount_sats += delta_sats;
@@ -2336,6 +2403,163 @@ int factory_session_complete_node(factory_t *f, size_t node_idx) {
                              sig))
         return 0;
 
+    node->is_signed = 1;
+    return 1;
+}
+
+/* === Per-input split-round signing helpers (#207 multi-input chain advance) === */
+
+int factory_node_uses_multi_input(const factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    const factory_node_t *node = &f->nodes[node_idx];
+    return (node->is_ps_leaf && node->ps_chain_len > 0 &&
+            node->type == NODE_PS_SUBFACTORY && node->ps_n_prev_outputs > 1);
+}
+
+/* Lazily allocate the per-input session arrays on a node.  Idempotent —
+   safe to call once per chain advance even if the previous advance left
+   stale arrays around (we free + realloc to match the new n_inputs). */
+static int ensure_input_sessions_alloc(factory_node_t *node) {
+    if (node->ps_n_prev_outputs == 0) return 0;
+    if (node->input_signing_sessions &&
+        node->n_input_sessions == node->ps_n_prev_outputs) return 1;
+
+    free(node->input_signing_sessions);
+    free(node->input_partial_sigs);
+    node->input_signing_sessions = NULL;
+    node->input_partial_sigs = NULL;
+    node->n_input_sessions = 0;
+
+    node->input_signing_sessions =
+        (musig_signing_session_t *)calloc(node->ps_n_prev_outputs,
+                                            sizeof(musig_signing_session_t));
+    if (!node->input_signing_sessions) return 0;
+
+    node->input_partial_sigs =
+        (secp256k1_musig_partial_sig *)calloc(
+            node->ps_n_prev_outputs * (size_t)FACTORY_MAX_SIGNERS,
+            sizeof(secp256k1_musig_partial_sig));
+    if (!node->input_partial_sigs) {
+        free(node->input_signing_sessions);
+        node->input_signing_sessions = NULL;
+        return 0;
+    }
+    memset(node->input_partial_sigs_received, 0,
+           sizeof(node->input_partial_sigs_received));
+    node->n_input_sessions = node->ps_n_prev_outputs;
+    return 1;
+}
+
+int factory_session_init_node_input(factory_t *f, size_t node_idx, size_t input_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->is_built) return 0;
+    if (!factory_node_uses_multi_input(f, node_idx)) return 0;
+    if (input_idx >= node->ps_n_prev_outputs) return 0;
+    if (!ensure_input_sessions_alloc(node)) return 0;
+
+    musig_session_init(&node->input_signing_sessions[input_idx],
+                        &node->keyagg, node->n_signers);
+    node->input_partial_sigs_received[input_idx] = 0;
+    return 1;
+}
+
+int factory_session_set_nonce_input(factory_t *f, size_t node_idx, size_t input_idx,
+                                      size_t signer_slot,
+                                      const secp256k1_musig_pubnonce *pubnonce) {
+    if (!f || node_idx >= f->n_nodes || !pubnonce) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return 0;
+    if (input_idx >= node->n_input_sessions) return 0;
+    if (signer_slot >= node->n_signers) return 0;
+    return musig_session_set_pubnonce(&node->input_signing_sessions[input_idx],
+                                        signer_slot, pubnonce);
+}
+
+int factory_session_finalize_node_input(factory_t *f, size_t node_idx, size_t input_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return 0;
+    if (input_idx >= node->n_input_sessions) return 0;
+
+    unsigned char sighash[32];
+    if (!compute_node_sighash_input(f, node, input_idx, sighash)) {
+        fprintf(stderr, "finalize_node_input %zu/%zu: compute_node_sighash_input failed\n",
+                node_idx, input_idx);
+        return 0;
+    }
+    const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+    int ok = musig_session_finalize_nonces(f->ctx,
+                                            &node->input_signing_sessions[input_idx],
+                                            sighash, mr, NULL);
+    if (!ok)
+        fprintf(stderr, "finalize_node_input %zu/%zu: finalize_nonces failed\n",
+                node_idx, input_idx);
+    return ok;
+}
+
+int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t input_idx,
+                                            size_t signer_slot,
+                                            const secp256k1_musig_partial_sig *psig) {
+    if (!f || node_idx >= f->n_nodes || !psig) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return 0;
+    if (input_idx >= node->n_input_sessions) return 0;
+    if (signer_slot >= (size_t)FACTORY_MAX_SIGNERS) return 0;
+    if (signer_slot >= node->n_signers) return 0;
+    secp256k1_musig_partial_sig *slot =
+        &node->input_partial_sigs[input_idx * (size_t)FACTORY_MAX_SIGNERS + signer_slot];
+    *slot = *psig;
+    node->input_partial_sigs_received[input_idx]++;
+    return 1;
+}
+
+int factory_session_complete_node_input(factory_t *f, size_t node_idx, size_t input_idx) {
+    /* Synchronization point — confirm enough partial sigs are in for this
+       input.  Per-input aggregation happens in
+       factory_session_assemble_signed_tx_multi to keep the segwit
+       finalization atomic over all inputs. */
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return 0;
+    if (input_idx >= node->n_input_sessions) return 0;
+    if (node->input_partial_sigs_received[input_idx] != (int)node->n_signers) return 0;
+    return 1;
+}
+
+int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return 0;
+    if (node->n_input_sessions == 0) return 0;
+    /* All inputs must have full partial sigs collected. */
+    for (size_t i = 0; i < node->n_input_sessions; i++) {
+        if (node->input_partial_sigs_received[i] != (int)node->n_signers) {
+            fprintf(stderr, "assemble_signed_tx_multi node=%zu input=%zu has %d/%zu sigs\n",
+                    node_idx, i, node->input_partial_sigs_received[i], node->n_signers);
+            return 0;
+        }
+    }
+
+    unsigned char *sigs64 = (unsigned char *)calloc(node->n_input_sessions, 64);
+    if (!sigs64) return 0;
+    for (size_t i = 0; i < node->n_input_sessions; i++) {
+        secp256k1_musig_partial_sig *psigs =
+            &node->input_partial_sigs[i * (size_t)FACTORY_MAX_SIGNERS];
+        if (!musig_aggregate_partial_sigs(f->ctx, sigs64 + 64 * i,
+                                            &node->input_signing_sessions[i],
+                                            psigs, node->n_signers)) {
+            free(sigs64);
+            return 0;
+        }
+    }
+    if (!finalize_signed_tx_multi(&node->signed_tx,
+                                    node->unsigned_tx.data, node->unsigned_tx.len,
+                                    node->n_input_sessions, sigs64)) {
+        free(sigs64);
+        return 0;
+    }
+    free(sigs64);
     node->is_signed = 1;
     return 1;
 }
@@ -3557,6 +3781,14 @@ void factory_free(factory_t *f) {
            (tx_buf_free is a no-op on zero-init). */
         tx_buf_free(&f->nodes[i].poison_unsigned_tx);
         tx_buf_free(&f->nodes[i].poison_signed_tx);
+        /* Multi-input chain advance per-input session arrays (#207).
+           free() is a no-op on NULL, so safe even when the multi-input
+           path was never exercised on this node. */
+        free(f->nodes[i].input_signing_sessions);
+        f->nodes[i].input_signing_sessions = NULL;
+        free(f->nodes[i].input_partial_sigs);
+        f->nodes[i].input_partial_sigs = NULL;
+        f->nodes[i].n_input_sessions = 0;
     }
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;

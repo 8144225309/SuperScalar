@@ -174,7 +174,31 @@ typedef struct {
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
     int ps_chain_len;            /* number of state advances (0 = initial state) */
     unsigned char ps_prev_txid[32];    /* txid (internal byte order) of the prior chain TX */
-    uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX */
+    uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX
+                                          (legacy 1-input shape; for multi-input PS sub-factory
+                                          chain advances see ps_prev_amounts[] below) */
+
+    /* Multi-input PS sub-factory chain advance state (#207).
+       When a NODE_PS_SUBFACTORY chain extends, the new TX consumes ALL
+       k+1 outputs of the previous chain TX (not just sales-stock).  These
+       arrays cache the per-input prev_amount + prev_scriptpubkey captured
+       before factory_subfactory_chain_advance_unsigned mutates outputs[].
+       Each index i in [0, ps_n_prev_outputs) corresponds to chain[N-1]'s
+       output i (vout i becomes input i of chain[N]).
+       Only populated when ps_chain_len > 0 && type == NODE_PS_SUBFACTORY. */
+    size_t ps_n_prev_outputs;                                     /* 0 = single-input */
+    uint64_t ps_prev_amounts[FACTORY_MAX_OUTPUTS];
+    unsigned char ps_prev_spks[FACTORY_MAX_OUTPUTS][34];
+    size_t ps_prev_spk_lens[FACTORY_MAX_OUTPUTS];
+
+    /* Per-input MuSig sessions for multi-input nodes.  Heap-allocated on
+       first factory_session_init_node_input call; freed in factory_free.
+       Length equals ps_n_prev_outputs (= n_inputs).  Only used by
+       advanced PS sub-factory nodes per #207. */
+    musig_signing_session_t *input_signing_sessions;        /* length n_input_sessions */
+    secp256k1_musig_partial_sig *input_partial_sigs;        /* length n_input_sessions * FACTORY_MAX_SIGNERS */
+    int input_partial_sigs_received[FACTORY_MAX_OUTPUTS];   /* per-input count */
+    size_t n_input_sessions;
 
     /* PS sub-factory wiring (only used when ps_subfactory_arity > 1, the
        canonical k² shape from t/1242).
@@ -537,6 +561,40 @@ int factory_sign_node(factory_t *f, size_t node_idx);
 int factory_session_init_node(factory_t *f, size_t node_idx);
 int factory_session_finalize_node(factory_t *f, size_t node_idx);
 int factory_session_complete_node(factory_t *f, size_t node_idx);
+
+/* --- Multi-input per-input split-round signing helpers (#207) ---
+   Used for advanced PS sub-factory chain extensions where the new TX
+   has k+1 inputs (one per chain[N-1] vout).  Each input gets its own
+   MuSig session because BIP-341 sighashes differ per input.  All k+1
+   sigs are then assembled into a single segwit signed_tx via
+   factory_session_assemble_signed_tx_multi.
+
+   Lifecycle for each input_idx in [0, n_inputs):
+     1. factory_session_init_node_input  — fresh session for this input
+     2. factory_session_set_nonce_input  — per-signer pubnonce
+     3. factory_session_finalize_node_input — compute per-input sighash
+        + run musig_session_finalize_nonces
+     4. factory_session_set_partial_sig_input — per-signer partial sig
+     5. factory_session_complete_node_input — aggregate to 64-byte sig
+        + store internally
+   Then once per node:
+     6. factory_session_assemble_signed_tx_multi — emit segwit signed_tx
+        with all k+1 witnesses */
+int factory_session_init_node_input(factory_t *f, size_t node_idx, size_t input_idx);
+int factory_session_set_nonce_input(factory_t *f, size_t node_idx, size_t input_idx,
+                                      size_t signer_slot,
+                                      const secp256k1_musig_pubnonce *pubnonce);
+int factory_session_finalize_node_input(factory_t *f, size_t node_idx, size_t input_idx);
+int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t input_idx,
+                                            size_t signer_slot,
+                                            const secp256k1_musig_partial_sig *psig);
+int factory_session_complete_node_input(factory_t *f, size_t node_idx, size_t input_idx);
+int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx);
+
+/* Helper: returns 1 if node_idx is an advanced PS sub-factory node that
+   uses the multi-input chain advance path (i.e. n_inputs > 1).  Used by
+   callers to dispatch between single-input and multi-input session APIs. */
+int factory_node_uses_multi_input(const factory_t *f, size_t node_idx);
 
 /* --- Wire-ceremony poison TX dual-signing helpers (closes SECURITY GAP) ---
    These mirror the per-node session helpers above but operate on the
