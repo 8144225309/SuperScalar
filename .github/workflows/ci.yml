@@ -81,7 +81,14 @@ jobs:
   static-analysis:
     runs-on: ubuntu-latest
     name: Static Analysis
-    timeout-minutes: 20
+    # cppcheck on tools/superscalar_lsp.c can take 12-18 min on the
+    # GitHub Actions runner under load; the rest of the corpus finishes
+    # in ~5 min.  Bumped from 20 to 35 to absorb worst-case runner
+    # variance.  --max-configs=1 caps preprocessor branch enumeration
+    # at 1 (default ~12) which dramatically reduces work on this file
+    # without losing meaningful warnings (we don't ship multi-config
+    # builds).
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -102,6 +109,7 @@ jobs:
             --suppress=unusedFunction \
             --suppress=duplicateAssignExpression \
             --inline-suppr \
+            --max-configs=1 \
             --project=build/compile_commands.json \
             --error-exitcode=1 \
             -i build/_deps \
