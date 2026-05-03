@@ -1987,6 +1987,147 @@ cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len
     return j;
 }
 
+/* --- Multi-input sub-factory chain advance helpers (#207 phase 2c) ---
+   See include/superscalar/wire.h for the design rationale.  All these
+   helpers MUTATE an existing PROPOSE/NONCE/ALL_NONCES/PSIG cJSON by
+   adding optional array fields alongside the legacy single-nonce/sig
+   field.  Receivers detect multi-input mode by reading n_inputs (0 if
+   absent → legacy single-input mode). */
+
+void wire_subfactory_propose_set_inputs(cJSON *propose, size_t n_inputs,
+                                          const unsigned char (*lsp_pubnonces)[66]) {
+    if (!propose || n_inputs == 0 || !lsp_pubnonces) return;
+    cJSON_AddNumberToObject(propose, "n_inputs", (double)n_inputs);
+    cJSON *arr = cJSON_AddArrayToObject(propose, "lsp_pubnonces");
+    char hex[133];
+    for (size_t i = 0; i < n_inputs; i++) {
+        hex_encode(lsp_pubnonces[i], 66, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+}
+
+size_t wire_subfactory_propose_get_n_inputs(const cJSON *json) {
+    if (!json) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    double v = ni->valuedouble;
+    if (v < 1 || v > 1024) return 0;
+    return (size_t)v;
+}
+
+size_t wire_subfactory_propose_get_pubnonces(const cJSON *json,
+                                               unsigned char (*out)[66], size_t max) {
+    if (!json || !out || max == 0) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "lsp_pubnonces");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsString(item)) return 0;
+        if (hex_decode(item->valuestring, out[i], 66) != 66) return 0;
+    }
+    return n;
+}
+
+void wire_subfactory_nonce_set_pubnonces(cJSON *nonce, size_t n_inputs,
+                                           const unsigned char (*pubnonces)[66]) {
+    if (!nonce || n_inputs == 0 || !pubnonces) return;
+    cJSON *arr = cJSON_AddArrayToObject(nonce, "pubnonces");
+    char hex[133];
+    for (size_t i = 0; i < n_inputs; i++) {
+        hex_encode(pubnonces[i], 66, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+}
+
+size_t wire_subfactory_nonce_get_pubnonces(const cJSON *json,
+                                             unsigned char (*out)[66], size_t max) {
+    if (!json || !out || max == 0) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsString(item)) return 0;
+        if (hex_decode(item->valuestring, out[i], 66) != 66) return 0;
+    }
+    return n;
+}
+
+void wire_subfactory_all_nonces_set_per_input(cJSON *all_nonces, size_t n_signers,
+                                                size_t n_inputs,
+                                                const unsigned char (*pubnonces)[66]) {
+    if (!all_nonces || n_signers == 0 || n_inputs == 0 || !pubnonces) return;
+    /* pubnonces is laid out as [signer][input], i.e. pubnonces[s * n_inputs + i]. */
+    cJSON *outer = cJSON_AddArrayToObject(all_nonces, "pubnonces_per_input");
+    char hex[133];
+    for (size_t s = 0; s < n_signers; s++) {
+        cJSON *inner = cJSON_CreateArray();
+        for (size_t i = 0; i < n_inputs; i++) {
+            hex_encode(pubnonces[s * n_inputs + i], 66, hex);
+            cJSON_AddItemToArray(inner, cJSON_CreateString(hex));
+        }
+        cJSON_AddItemToArray(outer, inner);
+    }
+}
+
+size_t wire_subfactory_all_nonces_get_per_input(const cJSON *json,
+                                                  unsigned char *out_flat,
+                                                  size_t max_signers,
+                                                  size_t max_inputs,
+                                                  size_t *n_inputs_out) {
+    if (!json || !out_flat || !n_inputs_out) return 0;
+    cJSON *outer = cJSON_GetObjectItem(json, "pubnonces_per_input");
+    if (!outer || !cJSON_IsArray(outer)) return 0;
+    size_t n_signers = (size_t)cJSON_GetArraySize(outer);
+    if (n_signers == 0 || n_signers > max_signers) return 0;
+    cJSON *first = cJSON_GetArrayItem(outer, 0);
+    if (!first || !cJSON_IsArray(first)) return 0;
+    size_t n_inputs = (size_t)cJSON_GetArraySize(first);
+    if (n_inputs == 0 || n_inputs > max_inputs) return 0;
+    for (size_t s = 0; s < n_signers; s++) {
+        cJSON *inner = cJSON_GetArrayItem(outer, (int)s);
+        if (!inner || !cJSON_IsArray(inner)) return 0;
+        if ((size_t)cJSON_GetArraySize(inner) != n_inputs) return 0;
+        for (size_t i = 0; i < n_inputs; i++) {
+            cJSON *item = cJSON_GetArrayItem(inner, (int)i);
+            if (!item || !cJSON_IsString(item)) return 0;
+            if (hex_decode(item->valuestring,
+                           out_flat + (s * n_inputs + i) * 66, 66) != 66) return 0;
+        }
+    }
+    *n_inputs_out = n_inputs;
+    return n_signers;
+}
+
+void wire_subfactory_psig_set_partial_sigs(cJSON *psig, size_t n_inputs,
+                                             const unsigned char (*partial_sigs)[32]) {
+    if (!psig || n_inputs == 0 || !partial_sigs) return;
+    cJSON *arr = cJSON_AddArrayToObject(psig, "partial_sigs");
+    char hex[65];
+    for (size_t i = 0; i < n_inputs; i++) {
+        hex_encode(partial_sigs[i], 32, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+}
+
+size_t wire_subfactory_psig_get_partial_sigs(const cJSON *json,
+                                                unsigned char (*out)[32], size_t max) {
+    if (!json || !out || max == 0) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "partial_sigs");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    size_t n = (size_t)cJSON_GetArraySize(arr);
+    if (n > max) return 0;
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, (int)i);
+        if (!item || !cJSON_IsString(item)) return 0;
+        if (hex_decode(item->valuestring, out[i], 32) != 32) return 0;
+    }
+    return n;
+}
+
 int wire_parse_subfactory_done(const cJSON *json, int *leaf_side,
                                  int *sub_idx, uint32_t *chain_len) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
