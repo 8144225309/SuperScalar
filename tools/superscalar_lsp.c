@@ -310,6 +310,7 @@ static void usage(const char *prog) {
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
         "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (works on regtest + testnet4/signet via confirmation polling; CL1)\n"
         "  --cheat-leaf [SIDE]  After --test-leaf-advance: broadcast stale pre-advance PS leaf state on SIDE (0=left default, 1=right); verify watchtower broadcasts L-stock poison TX. Tests partial-tree integrity. Works on any network (CL1).\n"
+        "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[0] when at chain[N] — validates oldest-stale poison TX still works. CL3.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1188,6 +1189,7 @@ int main(int argc, char *argv[]) {
     int test_ps_advance = 0;
     int test_leaf_advance = 0;
     int cheat_leaf_side = -1;  /* CL1 */
+    int advance_count_arg = 1;  /* CL3: number of leaf advances to drive */
     int test_dual_factory = 0;
     int test_dw_exhibition = 0;
     int test_bridge = 0;
@@ -1494,6 +1496,11 @@ int main(int argc, char *argv[]) {
                 argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
                 cheat_leaf_side = atoi(argv[++i]);
             }
+        }
+        else if (strcmp(argv[i], "--advance-count") == 0 && i + 1 < argc) {
+            /* CL3: how many leaf advances to drive in test_leaf_advance. */
+            advance_count_arg = atoi(argv[++i]);
+            if (advance_count_arg < 1) advance_count_arg = 1;
         }
         else if (strcmp(argv[i], "--kill-after-state-advance") == 0) {
             /* CL5: clean exit after first state-advance ceremony completes

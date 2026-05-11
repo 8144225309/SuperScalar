@@ -630,8 +630,24 @@
                 }
             }
 
-            /* Advance the chosen leaf (CL1: side may be overridden by --cheat-leaf) */
-            if (!factory_advance_leaf(&lsp_p->factory, cl1_cheat_side)) {
+            /* CL3: drive advance_count_arg advances (chain[0] is the pre-loop snapshot;
+               cheat path broadcasts that oldest stale state if cheat_leaf_side set). */
+            for (int ac = 0; ac < advance_count_arg; ac++) {
+                if (!factory_advance_leaf(&lsp_p->factory, cl1_cheat_side)) {
+                    fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(%d) failed at iter %d\n",
+                            cl1_cheat_side, ac);
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                if (advance_count_arg > 1)
+                    printf("  advance %d/%d done (chain_pos now %d)\n",
+                           ac + 1, advance_count_arg,
+                           lsp_p->factory.nodes[(cl1_cheat_side == 0) ? left_ni : right_ni].ps_chain_len);
+            }
+            /* Use a sentinel "false" branch to keep the original error path scoping. */
+            if (0) {
                 fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(%d) failed\n", cl1_cheat_side);
                 lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
