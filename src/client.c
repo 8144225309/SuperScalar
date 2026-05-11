@@ -6,6 +6,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/shachain.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,14 @@ static int g_nk_server_pubkey_set = 0;
 /* Optional persistence handle for PS double-spend defense (set via
    client_set_persist). NULL disables the check — only acceptable for
    in-process tests that don't exercise the attack. */
+#define CL7_TX_HEX_MAX 200000  /* upper bound for tx hex; CL7 cheat broadcast */
+
 static persist_t *g_client_persist = NULL;
+static regtest_t *g_client_chain_rt = NULL;  /* CL7: for cheat-client broadcasts */
+
+/* CL7: setter for the chain backend so client_handle_leaf_advance can
+   broadcast pre-advance leaf state when --cheat-client is set. */
+void client_set_chain_rt(regtest_t *rt) { g_client_chain_rt = rt; }
 
 void client_set_persist(persist_t *p) {
     g_client_persist = p;
@@ -3055,13 +3063,49 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
         }
     }
 
+    /* CL7: snapshot pre-advance leaf signed_tx for --cheat-client */
+    tx_buf_t cl7_cheat_tx;
+    tx_buf_init(&cl7_cheat_tx, 0);
+    {
+        const char *cheat_env = getenv("SS_CHEAT_CLIENT_SIDE");
+        if (cheat_env && atoi(cheat_env) == leaf_side &&
+            pre_had_signed && pre_leaf->signed_tx.len > 0) {
+            tx_buf_init(&cl7_cheat_tx, (int)pre_leaf->signed_tx.len);
+            memcpy(cl7_cheat_tx.data, pre_leaf->signed_tx.data,
+                   pre_leaf->signed_tx.len);
+            cl7_cheat_tx.len = pre_leaf->signed_tx.len;
+        }
+    }
+
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
         fprintf(stderr, "Client %u: leaf %d advance_unsigned failed (rc=%d)\n",
                 my_index, leaf_side, rc);
         factory_session_reset_poison(factory, pre_node_idx_c);
+        tx_buf_free(&cl7_cheat_tx);
         return 0;
     }
+
+    /* CL7: broadcast the snapshotted stale leaf state now that the advance
+       is recorded. LSP/standalone WT must respond with response_tx + L-stock
+       poison TX. Client expected to take PD revocation penalty on its own
+       channel side (anti-griefing economic disincentive). */
+    if (cl7_cheat_tx.len > 0 && g_client_chain_rt) {
+        char hex[CL7_TX_HEX_MAX];
+        char txid_str[65] = {0};
+        if (cl7_cheat_tx.len * 2 + 1 < CL7_TX_HEX_MAX) {
+            hex_encode(cl7_cheat_tx.data, cl7_cheat_tx.len, hex);
+            int sent = regtest_send_raw_tx(g_client_chain_rt, hex, txid_str);
+            fprintf(stderr, "CL7: client %u broadcast STALE leaf %d state: %s (sent=%d)\n",
+                    my_index, leaf_side, txid_str, sent);
+            if (persist && sent) {
+                persist_log_broadcast(persist, txid_str,
+                                       "cheat_client_stale", hex,
+                                       "ok");
+            }
+        }
+    }
+    tx_buf_free(&cl7_cheat_tx);
 
     size_t node_idx = factory->leaf_node_indices[leaf_side];
 
