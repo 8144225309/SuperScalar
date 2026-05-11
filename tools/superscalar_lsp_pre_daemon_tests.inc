@@ -1424,8 +1424,13 @@
             fflush(stdout);
             int rollover_pass = 1;
 
-            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1) {
-                printf("  SKIP: --test-tier-b-rollover requires --leaf-arity 1 (DW leaves)\n");
+            /* CL2-TB: enable on FACTORY_ARITY_PS (arity 3) too.
+               lsp_channels_advance_ps_leaf is a 1-line wrapper around
+               lsp_advance_leaf which works for any arity. The gate was
+               stale (predated PS arity introduction). */
+            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
+                lsp_p->factory.leaf_arity != FACTORY_ARITY_PS) {
+                printf("  SKIP: --test-tier-b-rollover requires --arity 1 (DW) or --arity 3 (PS)\n");
                 printf("TIER B ROLLOVER TEST: SKIP\n");
             } else {
                 /* Populate factory.keypairs[] for the LSP's local
