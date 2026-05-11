@@ -2228,6 +2228,11 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cheat-client") == 0 && i + 1 < argc) {
+            /* CL7: adversarial client cheat. SIDE = 0 (left) or 1 (right).
+               Sets env var read by client_handle_leaf_advance. */
+            setenv("SS_CHEAT_CLIENT_SIDE", argv[++i], 1);
+        }
         else if (strcmp(argv[i], "--fee-estimator") == 0 && i + 1 < argc)
             fee_estimator_arg = argv[++i];
         else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
@@ -2402,6 +2407,8 @@ int main(int argc, char *argv[]) {
             }
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
+            /* CL7: expose rt to client_handle_leaf_advance for cheat broadcast */
+            { extern void client_set_chain_rt(regtest_t *); client_set_chain_rt(&rt); }
             have_chain = 1;
         } else if (rpcuser && rpcpassword) {
             /* Direct HTTP JSON-RPC to bitcoind (any network) */
@@ -2516,6 +2523,8 @@ int main(int argc, char *argv[]) {
             }
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
+            /* CL7: expose rt to client_handle_leaf_advance for cheat broadcast */
+            { extern void client_set_chain_rt(regtest_t *); client_set_chain_rt(&rt); }
             have_chain = 1;
         } else if (rpcuser && rpcpassword) {
             const char *rpchost_sw = "127.0.0.1";
