@@ -224,6 +224,17 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
                                      uint64_t commitment_number);
 
 /* Return all channel ids currently stored, in ascending order. */
+/* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for
+   standalone watchtower hydration of PS state entries. */
+int persist_list_ps_leaf_chain_keys(persist_t *p,
+                                      uint32_t *factory_ids_out,
+                                      uint32_t *leaf_node_idxs_out,
+                                      size_t max, size_t *count_out);
+int persist_list_subfactory_chain_keys(persist_t *p,
+                                         uint32_t *factory_ids_out,
+                                         uint32_t *sub_node_idxs_out,
+                                         size_t max, size_t *count_out);
+
 int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
                                size_t *count_out);
 

@@ -163,6 +163,105 @@ int main(int argc, char *argv[]) {
             }
             printf("  Loaded %zu channel(s) for penalty signing\n", n_loaded);
         }
+
+    /* CL4: hydrate PS state entries from client DB.  For each chain entry
+       except the LATEST (which represents the current state, not a stale),
+       register a watchtower entry that triggers on the OLD chain[K]'s txid
+       and broadcasts chain[K+1]'s signed_tx + chain[K]'s poison TX. */
+    {
+        #define WT_PS_MAX_KEYS 64
+        #define WT_PS_MAX_CHAIN 32
+        uint32_t f_ids[WT_PS_MAX_KEYS];
+        uint32_t n_idxs[WT_PS_MAX_KEYS];
+        size_t n_keys = 0;
+        size_t n_registered = 0;
+        if (persist_list_ps_leaf_chain_keys(&db, f_ids, n_idxs,
+                                             WT_PS_MAX_KEYS, &n_keys) && n_keys > 0) {
+            for (size_t k = 0; k < n_keys; k++) {
+                tx_buf_t chain_txs[WT_PS_MAX_CHAIN];
+                unsigned char txids[WT_PS_MAX_CHAIN][32];
+                uint64_t amounts[WT_PS_MAX_CHAIN];
+                tx_buf_t poison_txs[WT_PS_MAX_CHAIN];
+                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
+                    tx_buf_init(&chain_txs[j], 0);
+                    tx_buf_init(&poison_txs[j], 0);
+                    amounts[j] = 0;
+                }
+                int chain_len = persist_load_ps_chain(&db, f_ids[k], n_idxs[k],
+                                                       chain_txs, txids, amounts,
+                                                       poison_txs, WT_PS_MAX_CHAIN);
+                for (int j = 0; j < chain_len - 1; j++) {
+                    if (chain_txs[j+1].len == 0) continue;
+                    if (watchtower_watch_factory_node(&wt, n_idxs[k],
+                                                       txids[j],
+                                                       chain_txs[j+1].data,
+                                                       chain_txs[j+1].len,
+                                                       poison_txs[j].data,
+                                                       poison_txs[j].len)) {
+                        n_registered++;
+                    }
+                }
+                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
+                    tx_buf_free(&chain_txs[j]);
+                    tx_buf_free(&poison_txs[j]);
+                }
+            }
+            printf("  Loaded %zu PS leaf chain entries for watchtower\n", n_registered);
+        }
+
+        size_t n_sub_keys = 0;
+        size_t n_sub_registered = 0;
+        if (persist_list_subfactory_chain_keys(&db, f_ids, n_idxs,
+                                                 WT_PS_MAX_KEYS, &n_sub_keys) && n_sub_keys > 0) {
+            for (size_t k = 0; k < n_sub_keys; k++) {
+                tx_buf_t chain_txs[WT_PS_MAX_CHAIN];
+                unsigned char txids[WT_PS_MAX_CHAIN][32];
+                uint64_t amounts[WT_PS_MAX_CHAIN];
+                tx_buf_t poison_txs[WT_PS_MAX_CHAIN];
+                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
+                    tx_buf_init(&chain_txs[j], 0);
+                    tx_buf_init(&poison_txs[j], 0);
+                    amounts[j] = 0;
+                }
+                uint64_t sales_stock_amounts[WT_PS_MAX_CHAIN];
+                uint64_t channel_amounts[WT_PS_MAX_CHAIN][16];
+                int n_channels_per_chain[WT_PS_MAX_CHAIN];
+                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
+                    sales_stock_amounts[j] = 0;
+                    n_channels_per_chain[j] = 0;
+                    for (int m = 0; m < 16; m++) channel_amounts[j][m] = 0;
+                }
+                int chain_len = persist_load_subfactory_chain(&db, f_ids[k], n_idxs[k],
+                                                                chain_txs, txids,
+                                                                sales_stock_amounts,
+                                                                channel_amounts,
+                                                                n_channels_per_chain,
+                                                                poison_txs, WT_PS_MAX_CHAIN);
+                (void)amounts;  /* unused for subfactory variant */
+                for (int j = 0; j < chain_len - 1; j++) {
+                    if (chain_txs[j+1].len == 0) continue;
+                    /* Use subfactory_node registration if available; falls back to
+                       factory_node which is the same backing storage shape. */
+                    if (watchtower_watch_factory_node(&wt, n_idxs[k],
+                                                       txids[j],
+                                                       chain_txs[j+1].data,
+                                                       chain_txs[j+1].len,
+                                                       poison_txs[j].data,
+                                                       poison_txs[j].len)) {
+                        n_sub_registered++;
+                    }
+                }
+                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
+                    tx_buf_free(&chain_txs[j]);
+                    tx_buf_free(&poison_txs[j]);
+                }
+            }
+            printf("  Loaded %zu PS sub-factory chain entries for watchtower\n",
+                   n_sub_registered);
+        }
+        #undef WT_PS_MAX_KEYS
+        #undef WT_PS_MAX_CHAIN
+    }
     } else {
         fprintf(stderr, "Warning: secp256k1 context creation failed — "
                         "penalty TXes cannot be built\n");

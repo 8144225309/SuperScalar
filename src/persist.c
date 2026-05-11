@@ -2024,6 +2024,52 @@ int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
     return 1;
 }
 
+
+/* CL4: list distinct (factory_id, leaf_node_idx) pairs in ps_leaf_chains.
+   Returns 1 on success; fills keys_out (caller-allocated) up to max entries. */
+int persist_list_ps_leaf_chain_keys(persist_t *p,
+                                      uint32_t *factory_ids_out,
+                                      uint32_t *leaf_node_idxs_out,
+                                      size_t max, size_t *count_out) {
+    if (!p || !p->db || !factory_ids_out || !leaf_node_idxs_out) return 0;
+    const char *sql =
+        "SELECT DISTINCT factory_id, leaf_node_idx FROM ps_leaf_chains "
+        "ORDER BY factory_id, leaf_node_idx;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    size_t count = 0;
+    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        factory_ids_out[count] = (uint32_t)sqlite3_column_int(stmt, 0);
+        leaf_node_idxs_out[count] = (uint32_t)sqlite3_column_int(stmt, 1);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
+    return 1;
+}
+
+/* CL4: same for ps_subfactory_chains. */
+int persist_list_subfactory_chain_keys(persist_t *p,
+                                         uint32_t *factory_ids_out,
+                                         uint32_t *sub_node_idxs_out,
+                                         size_t max, size_t *count_out) {
+    if (!p || !p->db || !factory_ids_out || !sub_node_idxs_out) return 0;
+    const char *sql =
+        "SELECT DISTINCT factory_id, sub_node_idx FROM ps_subfactory_chains "
+        "ORDER BY factory_id, sub_node_idx;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    size_t count = 0;
+    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        factory_ids_out[count] = (uint32_t)sqlite3_column_int(stmt, 0);
+        sub_node_idxs_out[count] = (uint32_t)sqlite3_column_int(stmt, 1);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
+    return 1;
+}
+
 /* --- Revocation secrets --- */
 
 int persist_save_revocation(persist_t *p, uint32_t channel_id,
