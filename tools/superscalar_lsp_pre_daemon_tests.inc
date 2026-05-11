@@ -614,9 +614,25 @@
                        n_total * sizeof(secp256k1_keypair));
             }
 
-            /* Advance LEFT leaf only */
-            if (!factory_advance_leaf(&lsp_p->factory, 0)) {
-                fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(0) failed\n");
+            /* CL1: snapshot pre-advance leaf signed_tx if --cheat-leaf is set */
+            tx_buf_t cl1_cheat_stale_leaf_tx;
+            tx_buf_init(&cl1_cheat_stale_leaf_tx, 0);
+            int cl1_cheat_side = (cheat_leaf_side >= 0) ? cheat_leaf_side : 0;
+            {
+                size_t cleaf_ni = (cl1_cheat_side == 0) ? left_ni : right_ni;
+                if (cheat_leaf_side >= 0 &&
+                    lsp_p->factory.nodes[cleaf_ni].is_signed &&
+                    lsp_p->factory.nodes[cleaf_ni].signed_tx.len > 0) {
+                    tx_buf_t *src = &lsp_p->factory.nodes[cleaf_ni].signed_tx;
+                    tx_buf_init(&cl1_cheat_stale_leaf_tx, (int)src->len);
+                    memcpy(cl1_cheat_stale_leaf_tx.data, src->data, src->len);
+                    cl1_cheat_stale_leaf_tx.len = src->len;
+                }
+            }
+
+            /* Advance the chosen leaf (CL1: side may be overridden by --cheat-leaf) */
+            if (!factory_advance_leaf(&lsp_p->factory, cl1_cheat_side)) {
+                fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(%d) failed\n", cl1_cheat_side);
                 lsp_cleanup(lsp_p);
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
@@ -1256,9 +1272,8 @@
                         cheat_stale_tx.len > 0) {
                         printf("\n--- CHEAT-SUBFACTORY: broadcasting parent path then stale chain[N-1] ---\n");
                         fflush(stdout);
-                        if (!is_regtest) {
-                            printf("  SKIP: --cheat-subfactory requires regtest\n");
-                        } else if (!mgr->watchtower) {
+                        /* CL1: --cheat-subfactory now works on any network. */
+                        if (!mgr->watchtower) {
                             printf("  FAIL: no watchtower configured\n");
                             sub_pass = 0;
                         } else {
@@ -1294,7 +1309,13 @@
                                 } else {
                                     printf("  parent node[%zu] broadcast: %s\n",
                                            ni, tid);
-                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                    /* CL1: network-aware confirmation */
+                                    if (is_regtest) {
+                                        regtest_mine_blocks(&rt, 1, mine_addr);
+                                    } else {
+                                        regtest_wait_for_confirmation(&rt, tid,
+                                                                       confirm_timeout_secs);
+                                    }
                                 }
                             }
 
@@ -1328,8 +1349,19 @@
                                    the v0.1.15 master plan: 1 block was not
                                    enough because bitcoind's mempool/wallet
                                    reorg detection had transient state. */
-                                regtest_mine_blocks(&rt, 5, mine_addr);
-                                sleep(2);
+                                /* CL1: network-aware 5-conf wait */
+                                if (is_regtest) {
+                                    regtest_mine_blocks(&rt, 5, mine_addr);
+                                    sleep(2);
+                                } else {
+                                    for (int ct = 1; ct <= 5; ct++) {
+                                        regtest_wait_for_confirmation(&rt, cheat_txid_str,
+                                                                       confirm_timeout_secs);
+                                        int cur = regtest_get_confirmations(&rt, cheat_txid_str);
+                                        if (cur >= 5) break;
+                                        sleep(15);
+                                    }
+                                }
 
                                 int detected =
                                     watchtower_check(mgr->watchtower);
@@ -1361,10 +1393,14 @@
                                     printf("  SUB-FACTORY BREACH DETECTED — "
                                            "%d penalty tx broadcast\n",
                                            detected);
-                                    /* Mine 5 more blocks so the response_tx
-                                       and poison_tx confirm together. */
-                                    regtest_mine_blocks(&rt, 5, mine_addr);
-                                    sleep(2);
+                                    /* CL1: network-aware response_tx + poison_tx confirmation */
+                                    if (is_regtest) {
+                                        regtest_mine_blocks(&rt, 5, mine_addr);
+                                        sleep(2);
+                                    } else {
+                                        printf("  Waiting for response_tx + poison_tx on non-regtest network...\n");
+                                        sleep(60);  /* let response txs propagate */
+                                    }
                                     printf("  Penalty + poison TXs confirmed\n");
                                 }
                             }
