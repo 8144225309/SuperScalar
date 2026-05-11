@@ -194,6 +194,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "[%ld] REORG: height %d → %d (depth %d)\n",
                     (long)time(NULL), last_height, height,
                     last_height - height);
+            /* CL6: persist reorg event for test evidence */
+            {
+                char det[128];
+                snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                         last_height, height, last_height - height);
+                persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
+            }
             watchtower_on_reorg(&wt, height, last_height);
             last_height = height;
             /* Run a watchtower check immediately after reorg */

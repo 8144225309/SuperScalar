@@ -5480,6 +5480,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         fprintf(stderr, "LSP: REORG detected — height %d → %d "
                                 "(depth %d)\n", daemon_last_height, height,
                                 daemon_last_height - height);
+                        /* CL6: persist reorg event for test evidence */
+                        if (mgr->persist) {
+                            char det[128];
+                            snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                                     daemon_last_height, height,
+                                     daemon_last_height - height);
+                            persist_log_broadcast((persist_t *)mgr->persist,
+                                                   "", "reorg_detected",
+                                                   det, "ok");
+                        }
                         /* Re-validate watchtower entries */
                         watchtower_on_reorg(mgr->watchtower, height,
                                            daemon_last_height);
@@ -5994,6 +6004,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             fprintf(stderr,
                                 "ALERT: chain reorg detected (tip %d → %d, depth %d)\n",
                                 mgr->last_known_height, hb_height, depth);
+                            /* CL6: persist reorg event for test evidence */
+                            if (mgr->persist) {
+                                char det[128];
+                                snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                                         mgr->last_known_height, hb_height, depth);
+                                persist_log_broadcast((persist_t *)mgr->persist,
+                                                       "", "reorg_detected",
+                                                       det, "ok");
+                            }
                             /* Fire chain backend reorg callback if set */
                             chain_backend_t *cbe = (chain_backend_t *)mgr->chain_be;
                             if (cbe && cbe->reorg_cb)
