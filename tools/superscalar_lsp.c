@@ -308,7 +308,8 @@ static void usage(const char *prog) {
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
-        "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (regtest only; Gap A end-to-end)\n"
+        "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (works on regtest + testnet4/signet via confirmation polling; CL1)\n"
+        "  --cheat-leaf [SIDE]  After --test-leaf-advance: broadcast stale pre-advance PS leaf state on SIDE (0=left default, 1=right); verify watchtower broadcasts L-stock poison TX. Tests partial-tree integrity. Works on any network (CL1).\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
@@ -1185,6 +1186,7 @@ int main(int argc, char *argv[]) {
     int test_dw_advance = 0;
     int test_ps_advance = 0;
     int test_leaf_advance = 0;
+    int cheat_leaf_side = -1;  /* CL1 */
     int test_dual_factory = 0;
     int test_dw_exhibition = 0;
     int test_bridge = 0;
@@ -1483,6 +1485,15 @@ int main(int argc, char *argv[]) {
             test_ps_advance = 1;
         else if (strcmp(argv[i], "--test-leaf-advance") == 0)
             test_leaf_advance = 1;
+        else if (strcmp(argv[i], "--cheat-leaf") == 0) {
+            /* CL1: PS leaf cheat; optional SIDE 0=left default, 1=right */
+            test_leaf_advance = 1;
+            cheat_leaf_side = 0;
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                cheat_leaf_side = atoi(argv[++i]);
+            }
+        }
         else if (strcmp(argv[i], "--test-dual-factory") == 0)
             test_dual_factory = 1;
         else if (strcmp(argv[i], "--test-dw-exhibition") == 0)
