@@ -310,6 +310,10 @@ static void usage(const char *prog) {
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
         "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (works on regtest + testnet4/signet via confirmation polling; CL1)\n"
         "  --cheat-leaf [SIDE]  After --test-leaf-advance: broadcast stale pre-advance PS leaf state on SIDE (0=left default, 1=right); verify watchtower broadcasts L-stock poison TX. Tests partial-tree integrity. Works on any network (CL1).\n"
+        "  --cheat-daemon-leaf [SIDE]  Same as --cheat-leaf but does NOT run LSP-internal watchtower_check; sleeps after broadcast so standalone WT can detect + respond. CL4.B.\n"
+        "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
+        "  --cheat-daemon-leaf [SIDE]  Same as --cheat-leaf but skips internal watchtower_check; sleeps so standalone WT can detect + respond. CL4.B.\n"
+        "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
         "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[0] when at chain[N] — validates oldest-stale poison TX still works. CL3.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
@@ -1496,6 +1500,40 @@ int main(int argc, char *argv[]) {
                 argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
                 cheat_leaf_side = atoi(argv[++i]);
             }
+        }
+        else if (strcmp(argv[i], "--cheat-daemon-leaf") == 0) {
+            /* CL4.B: cheat-leaf in "no internal WT" mode for standalone
+               WT testing. SS_CHEAT_DAEMON_MODE skips watchtower_check; the
+               cheat broadcast still happens. Optional SIDE 0/1, default 0. */
+            test_leaf_advance = 1;
+            cheat_leaf_side = 0;
+            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                cheat_leaf_side = atoi(argv[++i]);
+            }
+        }
+        else if (strcmp(argv[i], "--cheat-daemon-sub") == 0) {
+            /* CL4.B: --cheat-subfactory in "no internal WT" mode. */
+            test_subfactory_advance = 1;
+            cheat_subfactory_after_advance = 1;
+            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
+        }
+        else if (strcmp(argv[i], "--cheat-daemon-leaf") == 0) {
+            /* CL4.B: cheat-leaf in daemon mode (no internal WT). */
+            test_leaf_advance = 1;
+            cheat_leaf_side = 0;
+            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                cheat_leaf_side = atoi(argv[++i]);
+            }
+        }
+        else if (strcmp(argv[i], "--cheat-daemon-sub") == 0) {
+            /* CL4.B: cheat-subfactory in daemon mode. */
+            test_subfactory_advance = 1;
+            cheat_subfactory_after_advance = 1;
+            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
         }
         else if (strcmp(argv[i], "--advance-count") == 0 && i + 1 < argc) {
             /* CL3: how many leaf advances to drive in test_leaf_advance. */

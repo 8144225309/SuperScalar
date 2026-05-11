@@ -667,20 +667,109 @@
             int left_changed = (left_nseq_after != left_nseq_before);
             int right_unchanged = (right_nseq_after == right_nseq_before);
 
-            /* Force-close with the re-signed tree */
-            printf("\nBroadcasting tree with per-leaf advance on %s...\n", network);
+            int leaf_pass = 1;
+            if (cheat_leaf_side < 0) {
+                /* Normal --test-leaf-advance flow: force-close + broadcast tree */
+                printf("\nBroadcasting tree with per-leaf advance on %s...\n", network);
 
-            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
-                                                      mine_addr, is_regtest,
-                                                      confirm_timeout_secs)) {
-                fprintf(stderr, "LEAF ADVANCE TEST: tree broadcast failed\n");
-                lsp_cleanup(lsp_p);
-                memset(lsp_seckey, 0, 32);
-                secp256k1_context_destroy(ctx);
-                return 1;
+                if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
+                                                          mine_addr, is_regtest,
+                                                          confirm_timeout_secs)) {
+                    fprintf(stderr, "LEAF ADVANCE TEST: tree broadcast failed\n");
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+            } else if (cl1_cheat_stale_leaf_tx.len > 0 && mgr->watchtower) {
+                /* CL1.B + CL4.B: --cheat-leaf flow.
+                   1) broadcast parent path (root + kickoffs but NOT the
+                      cheated leaf state)
+                   2) broadcast snapshotted stale pre-advance leaf state
+                   3) (default) run watchtower_check OR (daemon mode) sleep */
+                printf("\n--- CHEAT-LEAF: broadcasting parent path then stale state ---\n");
+                fflush(stdout);
+                size_t cleaf_ni_cl1b = (cl1_cheat_side == 0) ? left_ni : right_ni;
+                (void)cleaf_ni_cl1b;
+                for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                    factory_node_t *node = &lsp_p->factory.nodes[ni];
+                    if (node->is_ps_leaf) continue;
+                    /* Skip the leaves we may not want competing with our cheat */
+                    int is_a_leaf = 0;
+                    for (int li = 0; li < lsp_p->factory.n_leaf_nodes; li++) {
+                        if (lsp_p->factory.leaf_node_indices[li] == ni) {
+                            is_a_leaf = 1; break;
+                        }
+                    }
+                    if (is_a_leaf) continue;
+                    if (node->type == NODE_PS_SUBFACTORY) continue;
+                    if (!node->is_signed || node->signed_tx.len == 0) continue;
+                    char *nh = malloc(node->signed_tx.len * 2 + 1);
+                    char tid[65] = {0};
+                    if (!nh) break;
+                    hex_encode(node->signed_tx.data, node->signed_tx.len, nh);
+                    int psent = regtest_send_raw_tx(&rt, nh, tid);
+                    if (g_db)
+                        persist_log_broadcast(g_db, psent ? tid : "?",
+                            "cheat_leaf_parent", nh, psent ? "ok" : "failed");
+                    free(nh);
+                    if (psent) {
+                        printf("  parent node[%zu] broadcast: %s\n", ni, tid);
+                        if (is_regtest) {
+                            regtest_mine_blocks(&rt, 1, mine_addr);
+                        } else {
+                            regtest_wait_for_confirmation(&rt, tid, confirm_timeout_secs);
+                        }
+                    }
+                }
+
+                char *cheat_hex = malloc(cl1_cheat_stale_leaf_tx.len * 2 + 1);
+                char cheat_txid_str[65] = {0};
+                int sent = 0;
+                if (cheat_hex) {
+                    hex_encode(cl1_cheat_stale_leaf_tx.data,
+                               cl1_cheat_stale_leaf_tx.len, cheat_hex);
+                    sent = regtest_send_raw_tx(&rt, cheat_hex, cheat_txid_str);
+                    if (g_db)
+                        persist_log_broadcast(g_db, sent ? cheat_txid_str : "?",
+                            "cheat_leaf_stale", cheat_hex, sent ? "ok" : "failed");
+                    free(cheat_hex);
+                }
+                if (!sent) {
+                    fprintf(stderr, "CHEAT-LEAF: stale broadcast failed\n");
+                    leaf_pass = 0;
+                } else {
+                    printf("  Stale pre-advance leaf broadcast: %s (side=%d)\n",
+                           cheat_txid_str, cl1_cheat_side);
+                    /* Wait for 5 confs of stale */
+                    if (is_regtest) {
+                        regtest_mine_blocks(&rt, 5, mine_addr);
+                        sleep(2);
+                    } else {
+                        for (int ct = 1; ct <= 5; ct++) {
+                            regtest_wait_for_confirmation(&rt, cheat_txid_str,
+                                                           confirm_timeout_secs);
+                            int cur = regtest_get_confirmations(&rt, cheat_txid_str);
+                            if (cur >= 5) break;
+                            sleep(15);
+                        }
+                    }
+                    /* CL4.B: daemon mode skips internal WT */
+                    if (getenv("SS_CHEAT_DAEMON_MODE")) {
+                        printf("  CL4.B daemon mode: skipping internal watchtower_check\n");
+                        printf("  CHEAT DAEMON COMPLETE\n");
+                        fflush(stdout);
+                        sleep(60);
+                    } else {
+                        int detected = watchtower_check(mgr->watchtower);
+                        printf("  watchtower_check returned: %d\n", detected);
+                        if (detected < 1) leaf_pass = 0;
+                    }
+                }
+                tx_buf_free(&cl1_cheat_stale_leaf_tx);
             }
 
-            int pass = left_changed && right_unchanged;
+            int pass = left_changed && right_unchanged && leaf_pass;
             printf("\n=== LEAF ADVANCE TEST %s ===\n", pass ? "PASSED" : "FAILED");
             printf("Left leaf nSequence %s (0x%X → 0x%X)\n",
                    left_changed ? "decreased" : "UNCHANGED", left_nseq_before, left_nseq_after);
