@@ -1372,6 +1372,42 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
 
     return -1;  /* timeout */
 }
+/* CL8: reorg-aware confirmation wait.
+   Returns 1 when txid stably has >= target_depth confirmations (verified
+   by a second poll after a delay; if conf drops more than
+   max_tolerated_reorg_depth, restart the wait). Returns 0 on timeout. */
+int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
+                                          int target_depth,
+                                          int max_tolerated_reorg_depth,
+                                          int timeout_secs) {
+    if (!rt || !txid || target_depth < 1) return 0;
+    int is_regtest = (strcmp(rt->network, "regtest") == 0);
+    int waited = 0;
+    int prev_conf = 0;
+    while (waited < timeout_secs) {
+        int cur = regtest_get_confirmations(rt, txid);
+        if (cur >= target_depth) {
+            sleep(is_regtest ? 2 : 30);
+            waited += is_regtest ? 2 : 30;
+            int recheck = regtest_get_confirmations(rt, txid);
+            if (recheck >= target_depth) return 1;
+            if (prev_conf > recheck &&
+                (prev_conf - recheck) > max_tolerated_reorg_depth) {
+                fprintf(stderr,
+                        "regtest_wait_for_stable_confirmation: reorg-induced "
+                        "drop, txid=%.16s... was=%d now=%d, restarting wait\n",
+                        txid, prev_conf, recheck);
+            }
+            prev_conf = recheck;
+            continue;
+        }
+        prev_conf = cur;
+        sleep(is_regtest ? 2 : 15);
+        waited += is_regtest ? 2 : 15;
+    }
+    return 0;
+}
+
 
 int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
                                 char *txid_out, uint32_t *vout_out,
