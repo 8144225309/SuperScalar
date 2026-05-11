@@ -2602,6 +2602,14 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     printf("LSP: state advance complete — epoch %u, %zu nodes re-signed (trigger leaf %d)\n",
            new_epoch, n_affected, trigger_leaf_side);
+
+    /* CL5: --kill-after-state-advance clean exit for restart-harness tests */
+    if (getenv("SS_KILL_AFTER_STATE_ADVANCE")) {
+        printf("CL5: SS_KILL_AFTER_STATE_ADVANCE set — clean exit after ceremony\n");
+        fflush(stdout);
+        exit(0);
+    }
+
     return 1;
 }
 
