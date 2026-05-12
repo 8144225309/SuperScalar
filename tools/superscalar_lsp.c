@@ -1519,22 +1519,6 @@ int main(int argc, char *argv[]) {
             cheat_subfactory_after_advance = 1;
             setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
         }
-        else if (strcmp(argv[i], "--cheat-daemon-leaf") == 0) {
-            /* CL4.B: cheat-leaf in daemon mode (no internal WT). */
-            test_leaf_advance = 1;
-            cheat_leaf_side = 0;
-            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
-            if (i + 1 < argc && argv[i+1][0] != '-' &&
-                argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
-                cheat_leaf_side = atoi(argv[++i]);
-            }
-        }
-        else if (strcmp(argv[i], "--cheat-daemon-sub") == 0) {
-            /* CL4.B: cheat-subfactory in daemon mode. */
-            test_subfactory_advance = 1;
-            cheat_subfactory_after_advance = 1;
-            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
-        }
         else if (strcmp(argv[i], "--advance-count") == 0 && i + 1 < argc) {
             /* CL3: how many leaf advances to drive in test_leaf_advance. */
             advance_count_arg = atoi(argv[++i]);
