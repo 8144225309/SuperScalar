@@ -94,9 +94,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Open DB read-only */
+    /* CL4.C: open DB read-write so the WT can read WAL-pending rows from a
+       concurrently-running LSP (read-only + WAL silently misses uncheckpointed
+       data) and append its own response/poison TX broadcasts to broadcast_log
+       for test verification. */
     persist_t db;
-    if (!persist_open_readonly(&db, db_path)) {
+    if (!persist_open(&db, db_path)) {
         fprintf(stderr, "Error: cannot open database '%s'\n", db_path);
         return 1;
     }
