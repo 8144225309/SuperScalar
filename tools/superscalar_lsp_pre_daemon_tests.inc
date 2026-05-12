@@ -690,37 +690,28 @@
                 printf("\n--- CHEAT-LEAF: broadcasting parent path then stale state ---\n");
                 fflush(stdout);
                 size_t cleaf_ni_cl1b = (cl1_cheat_side == 0) ? left_ni : right_ni;
-                (void)cleaf_ni_cl1b;
-                for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
-                    factory_node_t *node = &lsp_p->factory.nodes[ni];
-                    if (node->is_ps_leaf) continue;
-                    /* Skip the leaves we may not want competing with our cheat */
-                    int is_a_leaf = 0;
-                    for (int li = 0; li < lsp_p->factory.n_leaf_nodes; li++) {
-                        if (lsp_p->factory.leaf_node_indices[li] == ni) {
-                            is_a_leaf = 1; break;
-                        }
-                    }
-                    if (is_a_leaf) continue;
-                    if (node->type == NODE_PS_SUBFACTORY) continue;
-                    if (!node->is_signed || node->signed_tx.len == 0) continue;
-                    char *nh = malloc(node->signed_tx.len * 2 + 1);
-                    char tid[65] = {0};
-                    if (!nh) break;
-                    hex_encode(node->signed_tx.data, node->signed_tx.len, nh);
-                    int psent = regtest_send_raw_tx(&rt, nh, tid);
-                    if (g_db)
-                        persist_log_broadcast(g_db, psent ? tid : "?",
-                            "cheat_leaf_parent", nh, psent ? "ok" : "failed");
-                    free(nh);
-                    if (psent) {
-                        printf("  parent node[%zu] broadcast: %s\n", ni, tid);
-                        if (is_regtest) {
-                            regtest_mine_blocks(&rt, 1, mine_addr);
-                        } else {
-                            regtest_wait_for_confirmation(&rt, tid, confirm_timeout_secs);
-                        }
-                    }
+                /* CL1.C: temporarily un-mark the cheated leaf is_signed so
+                   broadcast_factory_tree_any_network SKIPS it. We will
+                   broadcast the snapshotted stale leaf state separately
+                   below. The helper handles BIP68 + getrawtransaction
+                   confirmation (pre-existing CL1.B bug fix). */
+                factory_node_t *cleaf_node_cl1c = &lsp_p->factory.nodes[cleaf_ni_cl1b];
+                int saved_is_signed = cleaf_node_cl1c->is_signed;
+                cleaf_node_cl1c->is_signed = 0;
+                int parent_tree_ok = broadcast_factory_tree_any_network(
+                    &lsp_p->factory, &rt, mine_addr, is_regtest,
+                    confirm_timeout_secs);
+                cleaf_node_cl1c->is_signed = saved_is_signed;
+                /* Record one broadcast_log entry summarizing the parent path */
+                if (g_db) {
+                    persist_log_broadcast(g_db,
+                        parent_tree_ok ? "tree_ok" : "tree_fail",
+                        "cheat_leaf_parent_tree", "",
+                        parent_tree_ok ? "ok" : "failed");
+                }
+                if (!parent_tree_ok) {
+                    fprintf(stderr, "CHEAT-LEAF: parent path broadcast failed\n");
+                    leaf_pass = 0;
                 }
 
                 char *cheat_hex = malloc(cl1_cheat_stale_leaf_tx.len * 2 + 1);
