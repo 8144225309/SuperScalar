@@ -618,8 +618,10 @@
             tx_buf_t cl1_cheat_stale_leaf_tx;
             tx_buf_init(&cl1_cheat_stale_leaf_tx, 0);
             int cl1_cheat_side = (cheat_leaf_side >= 0) ? cheat_leaf_side : 0;
+            unsigned char cl1_cheat_stale_leaf_txid[32] = {0};
             {
                 size_t cleaf_ni = (cl1_cheat_side == 0) ? left_ni : right_ni;
+                if (cheat_leaf_side >= 0) memcpy(cl1_cheat_stale_leaf_txid, lsp_p->factory.nodes[cleaf_ni].txid, 32);
                 if (cheat_leaf_side >= 0 &&
                     lsp_p->factory.nodes[cleaf_ni].is_signed &&
                     lsp_p->factory.nodes[cleaf_ni].signed_tx.len > 0) {
@@ -630,12 +632,16 @@
                 }
             }
 
-            /* CL3: drive advance_count_arg advances (chain[0] is the pre-loop snapshot;
-               cheat path broadcasts that oldest stale state if cheat_leaf_side set). */
+            /* CL1.F: use lsp_channels_advance_ps_leaf which drives the REAL wire ceremony
+               with the running client processes — produces signatures matching on-chain pubkey
+               aggregation AND registers the OLD leaf state with the LSP\u2019s watchtower internally.
+               (Was factory_advance_leaf: low-level synthetic-keypair test mode that didn't register WT
+               and produced signatures that failed on-chain validation.) */
             for (int ac = 0; ac < advance_count_arg; ac++) {
-                if (!factory_advance_leaf(&lsp_p->factory, cl1_cheat_side)) {
-                    fprintf(stderr, "LEAF ADVANCE TEST: factory_advance_leaf(%d) failed at iter %d\n",
-                            cl1_cheat_side, ac);
+                int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, cl1_cheat_side);
+                if (adv_rc != 1) {
+                    fprintf(stderr, "LEAF ADVANCE TEST: lsp_channels_advance_ps_leaf(%d) returned %d at iter %d\n",
+                            cl1_cheat_side, adv_rc, ac);
                     lsp_cleanup(lsp_p);
                     memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx);
@@ -668,6 +674,57 @@
             int right_unchanged = (right_nseq_after == right_nseq_before);
 
             int leaf_pass = 1;
+
+            /* CL1.E: register OLD leaf state with WT so cheat broadcast triggers a response.
+               factory_advance_leaf (called above) is low-level and doesn't register WT;
+               lsp_advance_leaf does, but bypasses the test-mode keypair populate. Register
+               manually here for the cheat path to work. */
+            if (cheat_leaf_side >= 0 && mgr->watchtower && cl1_cheat_stale_leaf_tx.len > 0) {
+                size_t cleaf_ni_wt = (cl1_cheat_side == 0) ? left_ni : right_ni;
+                factory_node_t *cleaf_node_wt = &lsp_p->factory.nodes[cleaf_ni_wt];
+                /* Use the OLD leaf txid snapshotted before advance (factory node's txid field). */
+                unsigned char old_leaf_txid[32];
+                memcpy(old_leaf_txid, cl1_cheat_stale_leaf_txid, 32);
+                /* Build poison TX via single-process fallback (LSP has all keypairs in test mode) */
+                tx_buf_t cl1e_burn_tx;
+                tx_buf_init(&cl1e_burn_tx, 256);
+                const unsigned char *cl1e_poison_data = NULL;
+                size_t cl1e_poison_len = 0;
+                /* For PS leaves, n_outputs is 2 pre-advance (channel + L-stock) then drops to 1 post-advance.
+                   The snapshotted state has the original n_outputs in it. We use the in-memory leaf node's
+                   current state for poison construction since the seckeys are populated. */
+                if (cleaf_node_wt->n_outputs >= 2 || cleaf_node_wt->ps_chain_len > 0) {
+                    uint32_t old_epoch = lsp_p->factory.counter.current_epoch > 0
+                                         ? lsp_p->factory.counter.current_epoch - 1 : 0;
+                    uint64_t old_l_amt = cleaf_node_wt->ps_chain_len > 0
+                                         ? cleaf_node_wt->outputs[cleaf_node_wt->n_outputs - 1].amount_sats
+                                         : 0;
+                    if (old_l_amt > 0 &&
+                        factory_build_burn_tx(&lsp_p->factory, &cl1e_burn_tx, cleaf_node_wt,
+                            old_leaf_txid, (uint32_t)(cleaf_node_wt->n_outputs - 1),
+                            old_l_amt, old_epoch)) {
+                        cl1e_poison_data = cl1e_burn_tx.data;
+                        cl1e_poison_len  = cl1e_burn_tx.len;
+                        printf("  CL1.E: built poison TX (%zu bytes) for old leaf state\n", cl1e_poison_len);
+                    } else {
+                        printf("  CL1.E: poison TX build failed; WT will register without poison\n");
+                    }
+                }
+                uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+                size_t n_leaf_ch = 0;
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    if (c == (size_t)cl1_cheat_side) leaf_ch_ids[n_leaf_ch++] = (uint32_t)c;
+                }
+                watchtower_watch_factory_node_with_channels(mgr->watchtower,
+                    (uint32_t)cleaf_ni_wt, old_leaf_txid,
+                    cleaf_node_wt->signed_tx.data, cleaf_node_wt->signed_tx.len,
+                    cl1e_poison_data, cl1e_poison_len,
+                    leaf_ch_ids, n_leaf_ch);
+                printf("  CL1.E: WT registered for old leaf node[%zu] poison_len=%zu\n",
+                       cleaf_ni_wt, cl1e_poison_len);
+                tx_buf_free(&cl1e_burn_tx);
+            }
+
             if (cheat_leaf_side < 0) {
                 /* Normal --test-leaf-advance flow: force-close + broadcast tree */
                 printf("\nBroadcasting tree with per-leaf advance on %s...\n", network);
