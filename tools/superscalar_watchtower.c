@@ -193,6 +193,33 @@ int main(int argc, char *argv[]) {
                 int chain_len = persist_load_ps_chain(&db, f_ids[k], n_idxs[k],
                                                        chain_txs, txids, amounts,
                                                        poison_txs, WT_PS_MAX_CHAIN);
+                /* CL4.D / Task #40: register the initial-state defense entry.
+                   chain[0]'s persisted signed_tx + poison_tx describe state 1
+                   (post-1st-advance signed_tx) and the poison built BEFORE
+                   the 1st advance (consumes initial state's L-stock vout).
+                   Pair them with the initial txid from ps_initial_signed_states
+                   so the WT can detect a pre-PS state broadcast and respond.
+                   This closes the standalone-WT chain_len=1 gap. */
+                if (chain_len >= 1 && chain_txs[0].len > 0) {
+                    tx_buf_t init_tx;
+                    tx_buf_init(&init_tx, 0);
+                    unsigned char init_txid_be[32] = {0};
+                    if (persist_load_ps_initial_signed_state(&db,
+                            f_ids[k], n_idxs[k], &init_tx, init_txid_be)
+                        && init_tx.len > 0) {
+                        if (watchtower_watch_factory_node(&wt, n_idxs[k],
+                                                           init_txid_be,
+                                                           chain_txs[0].data,
+                                                           chain_txs[0].len,
+                                                           poison_txs[0].data,
+                                                           poison_txs[0].len)) {
+                            n_registered++;
+                        }
+                    }
+                    tx_buf_free(&init_tx);
+                }
+                /* Existing loop: chain[j].txid -> chain[j+1].signed_tx defense
+                   for transitions between persisted advances (j >= 1 states). */
                 for (int j = 0; j < chain_len - 1; j++) {
                     if (chain_txs[j+1].len == 0) continue;
                     if (watchtower_watch_factory_node(&wt, n_idxs[k],
