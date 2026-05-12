@@ -2954,6 +2954,14 @@ int main(int argc, char *argv[]) {
                                   datadir, rpcport);
     if (!rt_ok)
         fprintf(stderr, "Client: regtest init failed (watchtower/RPC disabled)\n");
+    /* CL7.B: expose rt to client_handle_leaf_advance so --cheat-client can
+       broadcast the stale leaf state during the wire ceremony. The force-close
+       and sweep-to-local paths already set this; daemon-mode was missing it,
+       which made the CL7 hook silently no-op. */
+    if (rt_ok) {
+        extern void client_set_chain_rt(regtest_t *);
+        client_set_chain_rt(&rt);
+    }
 
     /* Fee estimator — honour --fee-estimator if provided */
     static watchtower_t client_wt;
