@@ -1373,46 +1373,36 @@
                             printf("  FAIL: no watchtower configured\n");
                             sub_pass = 0;
                         } else {
-                            /* Broadcast all non-sub-factory nodes (root,
-                               kickoff, leaf state).  This puts the
-                               sub-factory's parent UTXO on-chain so
-                               chain[N-1] can spend it. */
-                            int parent_ok = 1;
-                            for (size_t ni = 0;
-                                 ni < lsp_p->factory.n_nodes && parent_ok;
-                                 ni++) {
-                                factory_node_t *node =
-                                    &lsp_p->factory.nodes[ni];
-                                if (node->type == NODE_PS_SUBFACTORY) continue;
-                                if (!node->is_signed || node->signed_tx.len == 0)
-                                    continue;
-                                char *nh = malloc(node->signed_tx.len * 2 + 1);
-                                char tid[65] = {0};
-                                if (!nh) { parent_ok = 0; break; }
-                                hex_encode(node->signed_tx.data,
-                                           node->signed_tx.len, nh);
-                                int psent = regtest_send_raw_tx(&rt, nh, tid);
-                                if (g_db)
-                                    persist_log_broadcast(g_db,
-                                        psent ? tid : "?",
-                                        "cheat_subfactory_parent",
-                                        nh, psent ? "ok" : "failed");
-                                free(nh);
-                                if (!psent) {
-                                    printf("  WARN: parent node[%zu] broadcast "
-                                           "failed (may already be on chain)\n",
-                                           ni);
-                                } else {
-                                    printf("  parent node[%zu] broadcast: %s\n",
-                                           ni, tid);
-                                    /* CL1: network-aware confirmation */
-                                    if (is_regtest) {
-                                        regtest_mine_blocks(&rt, 1, mine_addr);
-                                    } else {
-                                        regtest_wait_for_confirmation(&rt, tid,
-                                                                       confirm_timeout_secs);
-                                    }
+                            /* CL1.D: temporarily un-mark all NODE_PS_SUBFACTORY
+                               nodes is_signed so broadcast_factory_tree_any_network
+                               SKIPS them. This puts the sub-factory parent UTXOs
+                               on-chain (so chain[N-1] can spend it). The helper
+                               handles BIP68 + getrawtransaction (fixes the bare-loop
+                               bug that affected non-regtest networks). */
+                            int saved_is_signed[FACTORY_MAX_NODES] = {0};
+                            for (size_t si = 0; si < lsp_p->factory.n_nodes; si++) {
+                                if (lsp_p->factory.nodes[si].type == NODE_PS_SUBFACTORY) {
+                                    saved_is_signed[si] = lsp_p->factory.nodes[si].is_signed;
+                                    lsp_p->factory.nodes[si].is_signed = 0;
                                 }
+                            }
+                            int parent_ok = broadcast_factory_tree_any_network(
+                                &lsp_p->factory, &rt, mine_addr, is_regtest,
+                                confirm_timeout_secs);
+                            for (size_t si = 0; si < lsp_p->factory.n_nodes; si++) {
+                                if (saved_is_signed[si]) {
+                                    lsp_p->factory.nodes[si].is_signed = saved_is_signed[si];
+                                }
+                            }
+                            if (g_db) {
+                                persist_log_broadcast(g_db,
+                                    parent_ok ? "tree_ok" : "tree_fail",
+                                    "cheat_subfactory_parent_tree", "",
+                                    parent_ok ? "ok" : "failed");
+                            }
+                            if (!parent_ok) {
+                                printf("  FAIL: parent tree broadcast failed\n");
+                                sub_pass = 0;
                             }
 
                             char *cheat_hex =
