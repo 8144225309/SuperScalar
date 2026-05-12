@@ -201,8 +201,7 @@ int main(int argc, char *argv[]) {
                    so the WT can detect a pre-PS state broadcast and respond.
                    This closes the standalone-WT chain_len=1 gap. */
                 if (chain_len >= 1 && chain_txs[0].len > 0) {
-                    tx_buf_t init_tx;
-                    tx_buf_init(&init_tx, 0);
+                    tx_buf_t init_tx = {0};
                     unsigned char init_txid_be[32] = {0};
                     if (persist_load_ps_initial_signed_state(&db,
                             f_ids[k], n_idxs[k], &init_tx, init_txid_be)
