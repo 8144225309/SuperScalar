@@ -21,10 +21,10 @@
             {
                 secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
                 all_kps[0] = lsp_kp;
-                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
                 for (int ci = 0; ci < n_clients; ci++) {
                     unsigned char ds[32];
-                    memset(ds, fill[ci], 32);
+                    memset(ds, 0, 32);
+                    ds[31] = (unsigned char)(ci + 2);
                     if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
                         fprintf(stderr, "DW ADVANCE TEST: keypair create failed\n");
                         return 1;
@@ -122,10 +122,10 @@
             secp256k1_keypair exh_kps[FACTORY_MAX_SIGNERS];
             exh_kps[0] = lsp_kp;
             {
-                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
                 for (int ci = 0; ci < n_clients; ci++) {
                     unsigned char ds[32];
-                    memset(ds, fill[ci], 32);
+                    memset(ds, 0, 32);
+                    ds[31] = (unsigned char)(ci + 2);
                     if (!secp256k1_keypair_create(ctx, &exh_kps[ci + 1], ds)) {
                         fprintf(stderr, "DW EXHIBITION: keypair create failed\n");
                         return 1;
@@ -580,10 +580,10 @@
             {
                 secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
                 all_kps[0] = lsp_kp;
-                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
                 for (int ci = 0; ci < n_clients; ci++) {
                     unsigned char ds[32];
-                    memset(ds, fill[ci], 32);
+                    memset(ds, 0, 32);
+                    ds[31] = (unsigned char)(ci + 2);
                     if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
                         fprintf(stderr, "LEAF ADVANCE TEST: keypair create failed\n");
                         return 1;
@@ -821,10 +821,10 @@
             secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
             all_kps[0] = lsp_kp;
             {
-                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
                 for (int ci = 0; ci < n_clients; ci++) {
                     unsigned char ds[32];
-                    memset(ds, fill[ci], 32);
+                    memset(ds, 0, 32);
+                    ds[31] = (unsigned char)(ci + 2);
                     if (!secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds)) {
                         fprintf(stderr, "DUAL FACTORY TEST: keypair create failed\n");
                         return 1;
