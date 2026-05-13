@@ -190,7 +190,7 @@ $SS_ASAN_ENV stdbuf -oL "$LSP_BIN" \
     --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
-    --max-conn-rate 500 --max-handshakes 64 \
+    --max-conn-rate 1000 --max-handshakes 256 \
     --demo \
     --cheat-subfactory \
     --db "$LSP_DB" \
