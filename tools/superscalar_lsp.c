@@ -1903,8 +1903,18 @@ int main(int argc, char *argv[]) {
     /* Demo mode: override lsp_balance_pct to 50 if the user didn't set it
        explicitly.  Demo payments send FROM clients which requires them to
        have a balance.  Production default is 100 (LSP retains all capacity;
-       clients earn sats by receiving payments or buying liquidity). */
+       clients earn sats by receiving payments or buying liquidity).
+
+       Print a loud warning so users testing cheat scenarios (which require
+       --lsp-balance-pct 100 to validate the trustless model) notice the
+       silent override and pass the explicit flag if needed. */
     if (demo_mode && !lsp_balance_pct_explicit) {
+        fprintf(stderr,
+            "LSP: WARNING --demo silently overrode --lsp-balance-pct\n"
+            "     to 50 (was: %u). To keep your value, pass --lsp-balance-pct\n"
+            "     EXPLICITLY on the command line. Cheat/defense tests should\n"
+            "     pass --lsp-balance-pct 100 to validate the trustless model.\n",
+            lsp_balance_pct);
         lsp_balance_pct = 50;
     }
 
