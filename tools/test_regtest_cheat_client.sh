@@ -6,10 +6,10 @@
 # its partial signature back to the LSP). LSP-internal WT must still detect
 # and defend with response_tx + poison TX.
 #
-# To trigger the WT poll at the end, the LSP is also given --cheat-leaf SIDE
-# (same side). Both attempt the stale broadcast — the same TX content, so
-# bitcoind dedupes in mempool. The CL7 marker in the client log + the WT
-# response TXs in broadcast_log together prove the adversarial-client path.
+# Gap 2 close: the LSP is honest. --watchtower-final-check (Gap 2 flag)
+# makes the LSP run watchtower_check after force-close. The CL7 marker in
+# the cheating client log + the WT response TXs in broadcast_log together
+# prove the adversarial-client path is detected by the honest LSP's WT.
 
 set -euo pipefail
 
@@ -93,7 +93,7 @@ $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 # --- LSP (also cheats on same side so watchtower_check runs at end) ---
 echo
-echo "--- LSP (--demo --test-leaf-advance --cheat-leaf $SIDE) ---"
+echo "--- LSP (--demo --test-leaf-advance --watchtower-final-check, honest LSP) ---"
 ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$LSP_BIN" \
     --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
@@ -102,7 +102,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" \
-    --demo --test-leaf-advance --cheat-leaf $SIDE \
+    --demo --test-leaf-advance --watchtower-final-check \
     --lsp-balance-pct 100 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)

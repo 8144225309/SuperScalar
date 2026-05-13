@@ -341,6 +341,7 @@ static void usage(const char *prog) {
         "  --max-connections N Max inbound connections to accept (default: %d = LSP_MAX_CLIENTS)\n"
         "  --max-conn-rate N   Max connections per IP per minute (default: 10)\n"
         "  --max-handshakes N  Max concurrent handshakes (default: 4)\n"
+        "  --watchtower-final-check Run watchtower_check after force-close in non-cheat-leaf flow. Lets pure client-cheat scenarios (CL7) be tested without requiring --cheat-leaf. (regtest only)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 100; --demo overrides to 50)\n"
@@ -1558,6 +1559,8 @@ int main(int argc, char *argv[]) {
             max_conn_rate_arg = atoi(argv[++i]);
         else if (strcmp(argv[i], "--max-handshakes") == 0 && i + 1 < argc)
             max_handshakes_arg = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--watchtower-final-check") == 0)
+            setenv("SS_WATCHTOWER_FINAL_CHECK", "1", 1);
         else if (strcmp(argv[i], "--funding-txid") == 0 && i + 1 < argc)
             funding_txid_override = argv[++i];
         else if (strcmp(argv[i], "--accept-timeout") == 0 && i + 1 < argc) {

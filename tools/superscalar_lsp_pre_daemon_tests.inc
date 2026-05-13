@@ -704,6 +704,18 @@
                     secp256k1_context_destroy(ctx);
                     return 1;
                 }
+                /* Gap 2 / --watchtower-final-check: after force-close, run
+                   watchtower_check so client-initiated cheats (CL7) are
+                   detected in the honest-LSP scenario. Without this flag,
+                   the only path that triggers a WT check is the LSP-cheats
+                   branch below, conflating LSP and client cheat semantics. */
+                if (mgr->watchtower && getenv("SS_WATCHTOWER_FINAL_CHECK")) {
+                    printf("  --watchtower-final-check: running watchtower_check on honest-LSP path\n");
+                    int detected = watchtower_check(mgr->watchtower);
+                    printf("  watchtower_check returned: %d\n", detected);
+                    if (detected >= 1)
+                        leaf_pass = 1;  /* defense fired */
+                }
             } else if (cl1_cheat_stale_leaf_tx.len > 0 && mgr->watchtower) {
                 /* CL1.B + CL4.B: --cheat-leaf flow.
                    1) broadcast parent path (root + kickoffs but NOT the
