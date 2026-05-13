@@ -1486,8 +1486,19 @@
                                     }
                                 }
 
-                                int detected =
-                                    watchtower_check(mgr->watchtower);
+                                /* CL4.F: daemon-mode skip — same as the leaf path's
+                                   SS_CHEAT_DAEMON_MODE check. Lets the standalone WT
+                                   handle detection + response instead of the in-memory WT. */
+                                int detected;
+                                if (getenv("SS_CHEAT_DAEMON_MODE")) {
+                                    printf("  CL4.F daemon mode: skipping internal watchtower_check\n");
+                                    printf("  CHEAT DAEMON COMPLETE\n");
+                                    fflush(stdout);
+                                    sleep(60);
+                                    detected = 1;  /* trust the standalone WT to fire */
+                                } else {
+                                    detected = watchtower_check(mgr->watchtower);
+                                }
 
                                 /* Count entries that the check visited and
                                    marked as broadcast (regardless of whether
