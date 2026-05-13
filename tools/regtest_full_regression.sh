@@ -13,6 +13,7 @@ RUNNERS=(
     test_regtest_cheat_daemon_leaf.sh
     test_regtest_kill_after_state_advance.sh
     test_regtest_tier_b_rollover_ps.sh
+    test_regtest_cheat_daemon_subfactory.sh
 )
 
 RESULTS=()
