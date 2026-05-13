@@ -233,7 +233,7 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
     CPID=$!
     PIDS+=("$CPID")
     echo "  client[$i] started (PID=$CPID)"
-    sleep 0.4
+    sleep 0.1
 done
 
 # --- Background block miner ---
