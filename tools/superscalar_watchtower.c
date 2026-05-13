@@ -267,6 +267,31 @@ int main(int argc, char *argv[]) {
                                                                 n_channels_per_chain,
                                                                 poison_txs, WT_PS_MAX_CHAIN);
                 (void)amounts;  /* unused for subfactory variant */
+                /* CL4.E: sub-factory analog of CL4.D / Task #40 — register the
+                   initial-state defense entry using chain[0]'s signed_tx +
+                   poison_tx paired with the pre-advance sub-factory txid from
+                   ps_initial_signed_states (saved by the v23 fix in
+                   lsp_subfactory_chain_advance). Closes the standalone-WT
+                   chain_len=1 gap for sub-factory cheats. */
+                if (chain_len >= 1 && chain_txs[0].len > 0) {
+                    tx_buf_t init_tx = {0};
+                    unsigned char init_txid_be[32] = {0};
+                    if (persist_load_ps_initial_signed_state(&db,
+                            f_ids[k], n_idxs[k], &init_tx, init_txid_be)
+                        && init_tx.len > 0) {
+                        if (watchtower_watch_factory_node(&wt, n_idxs[k],
+                                                           init_txid_be,
+                                                           chain_txs[0].data,
+                                                           chain_txs[0].len,
+                                                           poison_txs[0].data,
+                                                           poison_txs[0].len)) {
+                            n_sub_registered++;
+                        }
+                    }
+                    tx_buf_free(&init_tx);
+                }
+                /* Existing loop: chain[j].txid -> chain[j+1].signed_tx for
+                   transitions between persisted advances (j >= 1 states). */
                 for (int j = 0; j < chain_len - 1; j++) {
                     if (chain_txs[j+1].len == 0) continue;
                     /* Use subfactory_node registration if available; falls back to
