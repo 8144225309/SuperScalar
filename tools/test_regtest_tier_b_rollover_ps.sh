@@ -42,6 +42,9 @@ REGTEST_CONF="${REGTEST_CONF:-/var/lib/bitcoind-regtest/bitcoin.conf}"
 [ -f "$REGTEST_CONF" ] || REGTEST_CONF="$HOME/bitcoin-regtest/bitcoin.conf"
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
+# Source shared helpers (reorg watcher + vout audit) — must be after BCLI.
+. "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh
+
 TMPDIR=$(mktemp -d /tmp/ss-tier-b-ps.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
@@ -55,6 +58,7 @@ cleanup() {
     sleep 1
     for pid in "${PIDS[@]:-}"; do kill -9 "$pid" 2>/dev/null || true; done
     cp "$LSP_LOG" /tmp/tier_b_ps_last_lsp.log 2>/dev/null || true
+    cp "$REORG_LOG"  /tmp/tier_b_rollover_ps_last_reorg.log  2>/dev/null || true
     cp "$LSP_DB"  /tmp/tier_b_ps_last_lsp.db  2>/dev/null || true
     rm -rf "$TMPDIR"
 }
@@ -69,6 +73,11 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
 fi
 echo "  bitcoind reachable, height $($BCLI getblockcount)"
 
+
+REORG_LOG="$TMPDIR/reorg.log"
+REORG_PID=$(start_reorg_watcher "$REORG_LOG")
+PIDS+=($REORG_PID)
+echo "  reorg watcher PID=$REORG_PID logging to $REORG_LOG"
 MINER_WALLET="ss_cheat_leaf_miner"
 $BCLI -named createwallet wallet_name=$MINER_WALLET load_on_startup=false 2>&1 | head -2 || true
 $BCLI loadwallet $MINER_WALLET 2>/dev/null || true

@@ -44,6 +44,9 @@ REGTEST_CONF="${REGTEST_CONF:-/var/lib/bitcoind-regtest/bitcoin.conf}"
 [ -f "$REGTEST_CONF" ] || REGTEST_CONF="$HOME/bitcoin-regtest/bitcoin.conf"
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
+# Source shared helpers (reorg watcher + vout audit) — must be after BCLI.
+. "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh
+
 TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-leaf-regtest.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
@@ -62,6 +65,7 @@ cleanup() {
         kill -9 "$pid" 2>/dev/null || true
     done
     cp "$LSP_LOG" /tmp/cheat_daemon_leaf_last_lsp.log 2>/dev/null || true
+    cp "$REORG_LOG"  /tmp/cheat_daemon_leaf_last_reorg.log  2>/dev/null || true
     cp "$WT_LOG"  /tmp/cheat_daemon_leaf_last_wt.log  2>/dev/null || true
     cp "$LSP_DB"  /tmp/cheat_daemon_leaf_last_lsp.db  2>/dev/null || true
     for i in $(seq 0 $((N_CLIENTS - 1))); do
@@ -97,6 +101,11 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
 fi
 echo "  bitcoind reachable, chain at height $($BCLI getblockcount)"
 
+
+REORG_LOG="$TMPDIR/reorg.log"
+REORG_PID=$(start_reorg_watcher "$REORG_LOG")
+PIDS+=($REORG_PID)
+echo "  reorg watcher PID=$REORG_PID logging to $REORG_LOG"
 # Reuse the cheat-leaf miner wallet (known-good UTXO set from earlier test runs).
 # Create it on first run; load if it already exists from previous test execution.
 MINER_WALLET="ss_cheat_leaf_miner"
@@ -253,6 +262,13 @@ echo
 echo "=== penalty broadcasts ==="
 grep -E "penalty tx|response|burn|poison" "$WT_LOG" | head -10 || echo "  (none)"
 
+echo
+echo "=== reorg events ==="
+if [ -s "$REORG_LOG" ]; then
+    cat "$REORG_LOG"
+else
+    echo "  (none)"
+fi
 echo
 echo "=== Final result ==="
 if [ $WT_FIRED -eq 1 ]; then
