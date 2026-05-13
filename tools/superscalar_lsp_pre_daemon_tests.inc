@@ -1338,12 +1338,14 @@
                                sub0->signed_tx.data, sub0->signed_tx.len);
                         cheat_stale_tx.len = sub0->signed_tx.len;
                     }
-                    /* Pick delta well under sales-stock capacity.  At
-                       funding=400k with k=2 N=4 the per-output budget
-                       is ~44k after 3 fee rounds; 10k leaves comfortable
-                       headroom and exercises the cryptographic flow
-                       without bumping into dust limits. */
-                    uint64_t delta = 10000;
+                    /* Auto-scale delta to actual sales-stock budget so
+                       wider configs (N>=24 where per-output budget shrinks)
+                       don't run into 'sstock < delta + fee + dust'. Use a
+                       quarter of available stock with a 1000-sat floor so
+                       the cryptographic flow still exercises meaningfully
+                       at small N too. */
+                    uint64_t delta = sstock_before / 4;
+                    if (delta < 1000) delta = 1000;
 
                     printf("  pre-extension: chain_len=%d, ch[0]=%llu, "
                            "sales-stock=%llu, delta=%llu\n",
