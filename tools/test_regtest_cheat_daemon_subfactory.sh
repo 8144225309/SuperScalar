@@ -107,7 +107,7 @@ $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 echo
 echo "--- LSP daemon (--demo --cheat-daemon-sub) ---"
-$SS_ASAN_ENV stdbuf -oL "$LSP_BIN" \
+env $SS_ASAN_ENV stdbuf -oL "$LSP_BIN" \
     --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
     --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $FUNDING_SATS \
@@ -132,7 +132,7 @@ done
 echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    $SS_ASAN_ENV stdbuf -oL "$CLIENT_BIN" \
+    env $SS_ASAN_ENV stdbuf -oL "$CLIENT_BIN" \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --host 127.0.0.1 --port $LSP_PORT \
         --network regtest \
