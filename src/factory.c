@@ -2235,11 +2235,39 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     factory_node_t *node = &f->nodes[node_idx];
 
     /* PS leaf: chain advance, no DW counter. Same passthrough logic as the
-       signed variant — single channel output, no L-stock re-split. */
+       signed variant — single channel output, no L-stock re-split.
+
+       CL-PSTB: PS Tier B rollover — when ps_chain_len exceeds
+       states_per_layer, advance the root DW counter + epoch (analogous to
+       DW leaf exhaustion path below).  build_all_unsigned_txs rebuilds
+       every node (including the leaf) with fresh chain[0] state for the
+       new epoch; lsp_run_state_advance() re-signs every non-PS-leaf node
+       via the Tier B MuSig ceremony.  PS leaves' chain[0..N-1] history is
+       on-chain state — Tier B does not invalidate it; it produces a new
+       chain[0] starting point for the new epoch.  Closes the
+       feature gap surfaced by TS-TIER-B-PS testnet4 (the regtest test had
+       weaker PASS criteria that masked this). */
     if (node->is_ps_leaf) {
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
+        if ((uint32_t)node->ps_chain_len > f->states_per_layer) {
+            if (!dw_advance(&f->counter.layers[0]))
+                return 0;  /* fully exhausted (all root states consumed) */
+            f->counter.current_epoch++;
+            /* Reset every PS leaf's chain length for the new epoch.  The
+               on-chain chain[0..N-1] entries remain valid as historical
+               states; the in-memory chain_len resets so the next advance
+               builds chain[0] for the new epoch. */
+            for (int i = 0; i < f->n_leaf_nodes; i++) {
+                size_t li = f->leaf_node_indices[i];
+                if (f->nodes[li].is_ps_leaf)
+                    f->nodes[li].ps_chain_len = 0;
+            }
+            if (!update_l_stock_outputs(f)) return 0;
+            if (!build_all_unsigned_txs(f)) return 0;
+            return -1;  /* caller drives Tier B ceremony */
+        }
         if (node->ps_prev_chan_amount <= f->fee_per_tx) return 0;
         uint64_t out_total = node->ps_prev_chan_amount - f->fee_per_tx;
         if (out_total < CHANNEL_DUST_LIMIT_SATS) return 0;
