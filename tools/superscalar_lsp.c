@@ -3172,12 +3172,20 @@ accept_new_factory:
             }
         } else {
             double funding_btc = (double)funding_sats / 100000000.0;
-            if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
+            /* Issue #5: pass --fee-rate explicitly to bitcoind sendtoaddress
+               (Bitcoin Core 30 deprecated settxfee). */
+            if (!regtest_fund_address_with_fee_rate(&rt, fund_addr,
+                                                     funding_btc, fee_rate,
+                                                     funding_txid_hex)) {
                 fprintf(stderr, "LSP: failed to fund factory address\n");
                 lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+            printf("LSP: funding TX broadcast at fee_rate=%llu sat/kvB "
+                   "(%.4f sat/vB)\n",
+                   (unsigned long long)fee_rate,
+                   (double)fee_rate / 1000.0);
             if (is_regtest) {
                 regtest_mine_blocks(&rt, 1, mine_addr);
             } else {

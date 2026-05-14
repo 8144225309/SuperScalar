@@ -795,6 +795,60 @@ int regtest_mine_blocks(regtest_t *rt, int n, const char *address) {
     return ok;
 }
 
+/* Issue #5: fund an address with an explicit fee_rate (sat/vB).  Bitcoin
+   Core 30 deprecated settxfee; the modern way is to pass fee_rate as the
+   10th positional arg to sendtoaddress.  fee_rate_sat_kvb is sat per
+   kilo-vbyte (the LSP's --fee-rate unit); sendtoaddress fee_rate is
+   sat/vB, so conversion = sat_kvb / 1000.0.  Returns 1 on success, 0 on
+   error.  Caller-provided txid_out must be >= 65 bytes; pass NULL to
+   ignore the returned txid. */
+int regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
+                                        double btc_amount,
+                                        uint64_t fee_rate_sat_kvb,
+                                        char *txid_out) {
+    if (!rt || !address) return 0;
+    /* Positional args:
+         1. address           : "<addr>"
+         2. amount            : <btc>
+         3. comment           : ""
+         4. comment_to        : ""
+         5. subtractfeefromamount : false
+         6. replaceable       : true
+         7. conf_target       : null  (use fee_rate instead)
+         8. estimate_mode     : "unset"
+         9. avoid_reuse       : false
+        10. fee_rate (sat/vB) : <fee_rate_sat_vb> */
+    double fee_rate_sat_vb = (double)fee_rate_sat_kvb / 1000.0;
+    char params[512];
+    snprintf(params, sizeof(params),
+             "\"%s\" %.8f \"\" \"\" false true null \"unset\" false %.6f",
+             address, btc_amount, fee_rate_sat_vb);
+    char *result = regtest_exec(rt, "sendtoaddress", params);
+    if (!result) return 0;
+
+    char *start = result;
+    while (*start == '"' || *start == ' ' || *start == '\n') start++;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == '"' || *end == '\n' || *end == '\r' || *end == ' ')) {
+        *end = '\0';
+        end--;
+    }
+
+    if (strlen(start) != 64) {
+        fprintf(stderr, "regtest_fund_address_with_fee_rate: unexpected result: %s\n", start);
+        if (strstr(result, "Fee estimation failed") ||
+            strstr(result, "fallbackfee"))
+            fprintf(stderr, "  hint: set fallbackfee=0.00001 in bitcoin.conf\n");
+        free(result);
+        return 0;
+    }
+
+    if (txid_out)
+        strncpy(txid_out, start, 65);
+    free(result);
+    return 1;
+}
+
 int regtest_fund_address(regtest_t *rt, const char *address,
                          double btc_amount, char *txid_out) {
     char params[512];
