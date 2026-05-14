@@ -218,6 +218,43 @@ def collect_databases(cfg):
             "FROM client_ps_signed_inputs "
             "GROUP BY factory_id, leaf_node_idx")
         data[label]["ps_signed_inputs_by_leaf"] = rows if not err else []
+        # TX preparedness audit feeds — one query per signed-bytes-bearing
+        # table so the TX Inventory tab can build a unified "is the defense
+        # set ready" view across factory tree, channel commitments,
+        # distribution TXs and pending sweeps.
+        rows, err = query_db(path,
+            "SELECT channel_id, commitment_number, "
+            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+            "  THEN 1 ELSE 0 END AS has_bytes "
+            "FROM signed_commitments ORDER BY channel_id")
+        data[label]["signed_commitments"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT factory_id, "
+            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+            "  THEN 1 ELSE 0 END AS has_bytes "
+            "FROM distribution_txs ORDER BY factory_id")
+        data[label]["distribution_txs"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT id, sweep_type, state, source_txid, source_vout, "
+            "amount_sats, channel_id, factory_id, sweep_txid, csv_delay, "
+            "confirmed_height "
+            "FROM pending_sweeps ORDER BY id DESC LIMIT 30")
+        data[label]["pending_sweeps"] = rows if not err else []
+        # The factories table only carries funding_txid (no bytes); the
+        # bytes live in the bitcoind wallet.  Treat "txid present" as the
+        # readiness signal for the funding category.
+        rows, err = query_db(path,
+            "SELECT id, funding_amount, "
+            "CASE WHEN funding_txid IS NOT NULL AND length(funding_txid)>0 "
+            "  THEN 1 ELSE 0 END AS has_funding_bytes "
+            "FROM factories ORDER BY id")
+        data[label]["factory_funding_bytes"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT factory_id, node_index, "
+            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+            "  THEN 1 ELSE 0 END AS has_bytes "
+            "FROM tree_nodes ORDER BY factory_id, node_index")
+        data[label]["tree_nodes_bytes"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -600,7 +637,7 @@ tr:hover td{background:#1c2128}
 <div class="wrap">
 <div class="hdr">
  <h1>SuperScalar Dashboard<span class="sub">DW Factories + Timeout-Sig-Trees + Laddering</span></h1>
- <div class="tm"><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
+ <div class="tm"><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
 </div>
 <div id="dm" class="demo" style="display:none">DEMO MODE — simulated data for UI preview</div>
 <div class="tabs" id="tabs">
@@ -610,6 +647,7 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="protocol">Protocol Log</div>
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
+ <div class="tab" data-t="txinv">TX Inventory</div>
  <div class="tab" data-t="events">Events</div>
 </div>
 <div id="content"></div>
@@ -1136,6 +1174,106 @@ function rWatchtower(D){
  return h;
 }
 
+// === TAB: TX Inventory (preparedness ledger) ===
+// Renders every signed-bytes-bearing pre-signed TX the LSP holds, grouped
+// by category, plus a top-level "defense readiness" headline.  Surfaces
+// the operationally-dangerous gaps (penalty TXs, burn TXs, HTLC resolution
+// TXs) that aren't in the schema today.
+function rTxInventory(D){
+ const db=D.databases||{},lsp=db.lsp||{};
+ const facs=lsp.factories||[];
+ const tn=lsp.tree_nodes_bytes||[];
+ const fundBytes=lsp.factory_funding_bytes||[];
+ const psChain=lsp.ps_leaf_chains||[];
+ const psSub=lsp.ps_subfactory_chains||[];
+ const psInit=lsp.ps_initial_signed_states||[];
+ const sigCom=lsp.signed_commitments||[];
+ const distTx=lsp.distribution_txs||[];
+ const jits=lsp.jit_channels||[];
+ const wtPending=lsp.watchtower_pending||[];
+ const pendSweeps=lsp.pending_sweeps||[];
+ const chans=lsp.channels||[];
+
+ // Aggregate counts: expected vs actual signed
+ const fundingSigned=fundBytes.filter(r=>r.has_funding_bytes).length;
+ const fundingExpected=facs.length;
+ const treeSigned=tn.filter(r=>r.has_bytes).length;
+ const treeExpected=tn.length;
+ const psChainSigned=psChain.length;  // every row has signed_tx_hex NOT NULL
+ const psSubSigned=psSub.length;
+ const psInitSigned=psInit.length;
+ const psPoisonExpected=psChain.length+psSub.length;
+ const psPoisonHave=psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length;
+ const comSigned=sigCom.filter(r=>r.has_bytes).length;
+ const comExpected=chans.length;  // one per channel for current commitment
+ const distSigned=distTx.filter(r=>r.has_bytes).length;
+ const distExpected=facs.length;  // one per factory (inverted-timelock recovery)
+ const jitSigned=jits.length;
+ const totalSigned=fundingSigned+treeSigned+psChainSigned+psInitSigned+psSubSigned+psPoisonHave+comSigned+distSigned+jitSigned;
+ const totalExpected=fundingExpected+treeExpected+psChainSigned+(psChainSigned+psSubSigned)+psSubSigned+psPoisonExpected+comExpected+distExpected+jitSigned;
+ const readiness=totalExpected?Math.round(100*totalSigned/totalExpected):0;
+ const readyCls=readiness===100?'b ok':readiness>=80?'b i':'b w';
+
+ let h='';
+ // Defense readiness headline
+ h+=`<div class="s"><div class="st"><span>Defense Readiness</span><span class="c">unilateral-exit preparedness ledger</span></div>`;
+ h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">Signed &amp; persisted</span><span class="${readyCls}" style="font-size:14px;padding:2px 12px">${totalSigned}/${totalExpected} (${readiness}%)</span></div></div>`;
+ h+=`<p class="mu" style="margin-top:4px;font-size:11px">Counts pre-signed TXs the LSP has on disk vs the count expected for full unilateral-exit defense.  100% = every counterparty / watchtower / client can broadcast their copy of the exit/penalty/recovery chain without any further signing round.</p>`;
+ h+=`</div>`;
+
+ // Category breakdown table
+ h+=`<div class="s"><div class="st"><span>By Category</span></div>`;
+ h+=`<table><tr><th>Category</th><th>Stored in</th><th class="r">Signed</th><th class="r">Expected</th><th>Coverage</th><th>Who broadcasts</th></tr>`;
+ const cat=(name,table,signed,expected,who)=>{
+  const pct=expected?Math.round(100*signed/expected):0;
+  const cls=expected===0?'b i':pct===100?'b ok':pct>=80?'b i':pct>0?'b w':'b dn';
+  const label=expected===0?'n/a':`${signed}/${expected} (${pct}%)`;
+  h+=`<tr><td>${name}</td><td><code>${table}</code></td><td class="r">${signed}</td><td class="r">${expected}</td><td><span class="${cls}">${label}</span></td><td>${who}</td></tr>`;
+ };
+ cat('Funding TX',           'factories.funding_tx_hex',          fundingSigned, fundingExpected, 'LSP');
+ cat('Factory tree TXs',     'tree_nodes.signed_tx_hex',          treeSigned,    treeExpected,    'LSP or client');
+ cat('PS chain[0] (initial)','ps_initial_signed_states.signed_tx_hex', psInitSigned, psChainSigned+psSubSigned, 'LSP or client');
+ cat('PS leaf chain[1..N]',  'ps_leaf_chains.signed_tx_hex',      psChainSigned, psChainSigned,   'LSP or client');
+ cat('PS sub-factory chain', 'ps_subfactory_chains.signed_tx_hex',psSubSigned,   psSubSigned,     'LSP or client');
+ cat('Poison TXs (trustless)','ps_*_chains.poison_tx_hex',         psPoisonHave,  psPoisonExpected,'Watchtower');
+ cat('Channel commitments',  'signed_commitments.signed_tx_hex',  comSigned,     comExpected,     'Side holder');
+ cat('Distribution TX (recovery)','distribution_txs.signed_tx_hex',distSigned,   distExpected,    'ANY client at CLTV timeout');
+ cat('JIT channel funding',  'jit_channels.funding_tx_hex',       jitSigned,     jitSigned,       'LSP');
+ h+=`</table></div>`;
+
+ // Schema gaps (TX types that exist in protocol but have no persistent home)
+ h+=`<div class="s"><div class="st"><span>Schema gaps — pre-signed TXs that are not persisted anywhere</span><span class="c">operational risk</span></div>`;
+ h+=`<table><tr><th>TX type</th><th>Status</th><th>Risk</th></tr>`;
+ h+=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b w">in memory only</span></td><td>LSP restart loses pre-built penalty bytes; <code>watchtower_pending</code> only stores txid + anchor metadata, not the signed witness</td></tr>`;
+ h+=`<tr><td>L-stock burn TXs (OP_RETURN destruction)</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>factory_revocation_secrets</code> + <code>old_commitments</code> on need — works but no preparedness check available</td></tr>`;
+ h+=`<tr><td>HTLC success/timeout resolution TXs</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>htlcs</code> + commitment data — same as burn</td></tr>`;
+ h+=`<tr><td>Cooperative close TX</td><td><span class="b i">negotiated at close time</span></td><td>Expected — single TX, both sides online</td></tr>`;
+ h+=`<tr><td>CPFP children</td><td><span class="b i">dynamic</span></td><td>Generated by watchtower budget sweeper at broadcast time</td></tr>`;
+ h+=`</table></div>`;
+
+ // Detail: pending sweeps in flight
+ if(pendSweeps.length){
+  h+=`<div class="s"><div class="st"><span>Pending sweeps in flight</span><span class="c">${pendSweeps.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>Type</th><th>State</th><th>Source TXID:vout</th><th class="r">Amount</th><th>CH/Factory</th><th class="r">CSV</th><th>Sweep TXID</th></tr>`;
+  for(const s of pendSweeps){
+   h+=`<tr><td>${s.id}</td><td>${s.sweep_type||'?'}</td><td>${s.state}</td><td class="h">${th(s.source_txid)}:${s.source_vout}</td><td class="r">${fs(s.amount_sats)}</td><td>ch ${s.channel_id}/f ${s.factory_id}</td><td class="r">${s.csv_delay}</td><td class="h">${s.sweep_txid?th(s.sweep_txid):'—'}</td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
+
+ // Watchtower pending detail (penalty TXs in flight)
+ if(wtPending.length){
+  h+=`<div class="s"><div class="st"><span>Watchtower penalties in flight</span><span class="c">${wtPending.length}</span></div>`;
+  h+=`<table><tr><th>TXID</th><th class="r">Anchor vout</th><th class="r">Anchor amount</th><th class="r">Penalty value</th><th class="r">Mempool cycles</th><th class="r">Fee bumps</th></tr>`;
+  for(const w of wtPending){
+   h+=`<tr><td class="h">${th(w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${fs(w.penalty_value||0)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
+
+ return h;
+}
+
 // === TAB: Events ===
 function rEvents(D){
  const ev=D.events||[];
@@ -1154,8 +1292,20 @@ function render(D){
  const su=D.processes&&Object.values(D.processes).some(v=>v);
  dot.className='dot '+(au?'g':su?'y':'r');
  document.getElementById('dm').style.display=D.demo?'block':'none';
- // Update tab counts
+ // Global poison-TX coverage indicator (trustless-model dial)
  const lsp=(D.databases||{}).lsp||{};
+ const pchains=lsp.ps_leaf_chains||[],psubs=lsp.ps_subfactory_chains||[];
+ let pTot=0,pCov=0;
+ for(const r of pchains){pTot++;if(r.has_poison)pCov++;}
+ for(const r of psubs){pTot++;if(r.has_poison)pCov++;}
+ const poisonEl=document.getElementById('poison');
+ if(pTot>0){
+  const pct=Math.round(100*pCov/pTot);
+  const cls=pct===100?'b ok':pct>=80?'b i':'b w';
+  poisonEl.style.display='inline-block';
+  poisonEl.innerHTML=`<span class="${cls}" title="poison-TX coverage across PS chain entries">🛡 poison ${pCov}/${pTot} (${pct}%)</span>`;
+ } else { poisonEl.style.display='none'; }
+ // Update tab counts
  const tabCounts={channels:(lsp.channels||[]).length+(lsp.htlcs||[]).length,
   lightning:((D.cln||{}).a||{}).num_peers||0+((D.cln||{}).b||{}).num_peers||0,
   watchtower:(lsp.watchtower_count||0)+(lsp.revocation_count||0),
@@ -1168,6 +1318,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='protocol'?'show':''}" id="t-protocol">${rProtocol(D)}</div>`;
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
+ h+=`<div class="tp ${curTab==='txinv'?'show':''}" id="t-txinv">${rTxInventory(D)}</div>`;
  h+=`<div class="tp ${curTab==='events'?'show':''}" id="t-events">${rEvents(D)}</div>`;
  document.getElementById('content').innerHTML=h;
 }
