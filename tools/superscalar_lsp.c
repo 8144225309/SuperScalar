@@ -1193,7 +1193,11 @@ int main(int argc, char *argv[]) {
     int test_dw_advance = 0;
     int test_ps_advance = 0;
     int test_leaf_advance = 0;
-    int cheat_leaf_side = -1;  /* CL1 */
+    int cheat_leaf_side = -1;  /* CL1 — set by --cheat-leaf and --cheat-subfactory flags;
+                                  consumer code is in CL2/CL3 follow-ups not yet
+                                  landed on main, so suppress unused-but-set
+                                  -Werror to keep the build green until then. */
+    (void)cheat_leaf_side;
     int advance_count_arg = 1;  /* CL3: number of leaf advances to drive */
     int test_dual_factory = 0;
     int test_dw_exhibition = 0;
@@ -3213,6 +3217,16 @@ accept_new_factory:
     }
     printf("LSP: funded %llu sats, txid: %s\n",
            (unsigned long long)funding_sats, funding_txid_hex);
+    /* A2: log the funding TX broadcast.  Other broadcast paths
+       (watchtower, rotation, jit, broadcast_factory_tree) already log;
+       the factory-creation funding path was the one gap that left
+       broadcast_log empty for the happy-path run.  Placed after the
+       unified funding print so it fires regardless of which underlying
+       path actually broadcast (HD wallet / regtest RPC wallet /
+       light-client). */
+    if (g_db)
+        persist_log_broadcast(g_db, funding_txid_hex,
+                               "factory_funding", NULL, "ok");
 
     /* Get funding output details */
     unsigned char funding_txid[32];
@@ -3375,6 +3389,39 @@ accept_new_factory:
         }
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp_p->factory.n_nodes);
+
+    /* A1 (v0.1.15 fix): eagerly persist chain[0] for every PS leaf and PS
+       sub-factory at factory creation time, not just on first advance.
+       The existing on-first-advance saves in src/lsp_channels.c only fire
+       when a PS leaf actually advances; a leaf that's created but never
+       advances has its chain[0] bytes lost on LSP restart, and any
+       force-close attempt against that leaf fails with -25
+       bad-txns-inputs-missingorspent indefinitely.  This is the v0.1.15
+       signet campaign finding.  Applies to both single-client PS leaves
+       (--ps-subfactory-arity 1) and PS sub-factories (--ps-subfactory-arity
+       >= 2). */
+    if (g_db && lsp_p->factory.leaf_arity == FACTORY_ARITY_PS) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        size_t saved = 0;
+        for (size_t i = 0; i < lsp_p->factory.n_nodes; i++) {
+            factory_node_t *n = &lsp_p->factory.nodes[i];
+            int is_chain0_node = (n->is_ps_leaf || n->type == NODE_PS_SUBFACTORY);
+            if (!is_chain0_node) continue;
+            if (!n->is_signed || n->signed_tx.len == 0) continue;
+            unsigned char txid_display[32];
+            memcpy(txid_display, n->txid, 32);
+            reverse_bytes(txid_display, 32);
+            if (persist_save_ps_initial_signed_state(
+                    g_db, /* factory_id = */ 0, (uint32_t)i,
+                    txid_display,
+                    n->signed_tx.data, n->signed_tx.len)) {
+                saved++;
+            }
+        }
+        if (saved > 0)
+            printf("LSP: A1 fix: persisted chain[0] for %zu PS leaf/sub-factory node(s)\n",
+                   saved);
+    }
 
     /* Set factory lifecycle */
     {
