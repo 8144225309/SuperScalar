@@ -27,6 +27,9 @@ int   regtest_init_full(regtest_t *rt, const char *network,
                         int rpcport);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
 int   regtest_get_block_height(regtest_t *rt);
+/* Reorg-resilience helper (Issue #2): fill hash_out_buf (>= 65 bytes)
+   with the current best-block hash hex. Returns 1 on success, 0 on error. */
+int   regtest_get_best_block_hash(regtest_t *rt, char *hash_out_buf);
 
 /* Get the block hash at a given height. Writes 64 hex chars + NUL to hash_out.
    Returns 1 on success, 0 on error. */
@@ -62,6 +65,13 @@ int   regtest_get_address_scriptpubkey(regtest_t *rt, const char *address,
                                         unsigned char *spk_out, size_t *spk_len_out);
 int   regtest_mine_blocks(regtest_t *rt, int n, const char *address);
 int   regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address);
+/* Issue #5: fund an address with an explicit fee_rate (sat/kvB).  Bitcoin
+   Core 30 deprecated settxfee, so the modern path passes fee_rate as a
+   positional arg to sendtoaddress.  Returns 1 on success, 0 on error. */
+int   regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
+                                          double btc_amount,
+                                          uint64_t fee_rate_sat_kvb,
+                                          char *txid_out);
 int   regtest_fund_address(regtest_t *rt, const char *address, double btc_amount, char *txid_out);
 int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);

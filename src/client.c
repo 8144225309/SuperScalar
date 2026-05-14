@@ -1312,9 +1312,12 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     cJSON_Delete(hello);
 
-    /* Receive HELLO_ACK */
+    /* Receive HELLO_ACK.  Issue #3: LSP serial accept loop with N>=64
+       clients can take >120s (default wire timeout) before our HELLO_ACK
+       is sent.  10-minute window covers N=128 with 4s/client handshakes
+       — bounded above by lsp->accept_timeout_sec on the LSP side. */
     wire_msg_t msg;
-    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_HELLO_ACK) {
+    if (!wire_recv_timeout(fd, &msg, 600) || check_msg_error(&msg) || msg.msg_type != MSG_HELLO_ACK) {
         fprintf(stderr, "Client: expected HELLO_ACK\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);

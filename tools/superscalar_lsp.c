@@ -1903,8 +1903,18 @@ int main(int argc, char *argv[]) {
     /* Demo mode: override lsp_balance_pct to 50 if the user didn't set it
        explicitly.  Demo payments send FROM clients which requires them to
        have a balance.  Production default is 100 (LSP retains all capacity;
-       clients earn sats by receiving payments or buying liquidity). */
+       clients earn sats by receiving payments or buying liquidity).
+
+       Print a loud warning so users testing cheat scenarios (which require
+       --lsp-balance-pct 100 to validate the trustless model) notice the
+       silent override and pass the explicit flag if needed. */
     if (demo_mode && !lsp_balance_pct_explicit) {
+        fprintf(stderr,
+            "LSP: WARNING --demo silently overrode --lsp-balance-pct\n"
+            "     to 50 (was: %u). To keep your value, pass --lsp-balance-pct\n"
+            "     EXPLICITLY on the command line. Cheat/defense tests should\n"
+            "     pass --lsp-balance-pct 100 to validate the trustless model.\n",
+            lsp_balance_pct);
         lsp_balance_pct = 50;
     }
 
@@ -3162,12 +3172,20 @@ accept_new_factory:
             }
         } else {
             double funding_btc = (double)funding_sats / 100000000.0;
-            if (!regtest_fund_address(&rt, fund_addr, funding_btc, funding_txid_hex)) {
+            /* Issue #5: pass --fee-rate explicitly to bitcoind sendtoaddress
+               (Bitcoin Core 30 deprecated settxfee). */
+            if (!regtest_fund_address_with_fee_rate(&rt, fund_addr,
+                                                     funding_btc, fee_rate,
+                                                     funding_txid_hex)) {
                 fprintf(stderr, "LSP: failed to fund factory address\n");
                 lsp_cleanup(lsp_p);
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+            printf("LSP: funding TX broadcast at fee_rate=%llu sat/kvB "
+                   "(%.4f sat/vB)\n",
+                   (unsigned long long)fee_rate,
+                   (double)fee_rate / 1000.0);
             if (is_regtest) {
                 regtest_mine_blocks(&rt, 1, mine_addr);
             } else {

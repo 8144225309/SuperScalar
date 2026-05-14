@@ -272,36 +272,50 @@ int main(int argc, char *argv[]) {
                    poison_tx paired with the pre-advance sub-factory txid from
                    ps_initial_signed_states (saved by the v23 fix in
                    lsp_subfactory_chain_advance). Closes the standalone-WT
-                   chain_len=1 gap for sub-factory cheats. */
+                   chain_len=1 gap for sub-factory cheats.
+                   Issue #4: register as WATCH_SUBFACTORY_NODE so the WT
+                   breach handler skips the dead response_tx broadcast that
+                   produced bitcoind -22. */
                 if (chain_len >= 1 && chain_txs[0].len > 0) {
                     tx_buf_t init_tx = {0};
                     unsigned char init_txid_be[32] = {0};
                     if (persist_load_ps_initial_signed_state(&db,
                             f_ids[k], n_idxs[k], &init_tx, init_txid_be)
                         && init_tx.len > 0) {
-                        if (watchtower_watch_factory_node(&wt, n_idxs[k],
-                                                           init_txid_be,
-                                                           chain_txs[0].data,
-                                                           chain_txs[0].len,
-                                                           poison_txs[0].data,
-                                                           poison_txs[0].len)) {
+                        size_t n_ch0 = (size_t)n_channels_per_chain[0];
+                        if (watchtower_watch_subfactory_node(&wt, n_idxs[k],
+                                                              init_txid_be,
+                                                              chain_txs[0].data,
+                                                              chain_txs[0].len,
+                                                              poison_txs[0].data,
+                                                              poison_txs[0].len,
+                                                              channel_amounts[0],
+                                                              n_ch0,
+                                                              sales_stock_amounts[0])) {
                             n_sub_registered++;
                         }
                     }
                     tx_buf_free(&init_tx);
                 }
                 /* Existing loop: chain[j].txid -> chain[j+1].signed_tx for
-                   transitions between persisted advances (j >= 1 states). */
+                   transitions between persisted advances (j >= 1 states).
+                   Issue #4: register as WATCH_SUBFACTORY_NODE — the proper
+                   sub-factory type — so the handler broadcasts ONLY the
+                   poison TX (correct defense) and skips response_tx (which
+                   fails -22 because chain[j+1]'s parent input is consumed
+                   by chain[j]'s confirmation or by the poison TX). */
                 for (int j = 0; j < chain_len - 1; j++) {
                     if (chain_txs[j+1].len == 0) continue;
-                    /* Use subfactory_node registration if available; falls back to
-                       factory_node which is the same backing storage shape. */
-                    if (watchtower_watch_factory_node(&wt, n_idxs[k],
-                                                       txids[j],
-                                                       chain_txs[j+1].data,
-                                                       chain_txs[j+1].len,
-                                                       poison_txs[j].data,
-                                                       poison_txs[j].len)) {
+                    size_t n_ch_j = (size_t)n_channels_per_chain[j];
+                    if (watchtower_watch_subfactory_node(&wt, n_idxs[k],
+                                                          txids[j],
+                                                          chain_txs[j+1].data,
+                                                          chain_txs[j+1].len,
+                                                          poison_txs[j].data,
+                                                          poison_txs[j].len,
+                                                          channel_amounts[j],
+                                                          n_ch_j,
+                                                          sales_stock_amounts[j])) {
                         n_sub_registered++;
                     }
                 }
@@ -332,9 +346,22 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     int last_height = -1;
+    char last_hash[65] = {0};  /* Issue #2: same-height reorg detection */
 
     while (!g_shutdown) {
         int height = regtest_get_block_height(&rt);
+        char cur_hash[65] = {0};
+        regtest_get_best_block_hash(&rt, cur_hash);
+
+        int reorg_kind = 0;  /* 0=none, 1=height-decrease, 2=same-height */
+        if (last_height > 0 && height < last_height) {
+            reorg_kind = 1;
+        } else if (last_height > 0 && height == last_height &&
+                   last_hash[0] != 0 && cur_hash[0] != 0 &&
+                   strcmp(cur_hash, last_hash) != 0) {
+            reorg_kind = 2;
+        }
+
         if (height > last_height) {
             int penalties = watchtower_check(&wt);
             if (penalties > 0) {
@@ -342,20 +369,30 @@ int main(int argc, char *argv[]) {
                        (long)time(NULL), height, penalties);
             }
             last_height = height;
-        } else if (last_height > 0 && height < last_height) {
-            /* Reorg detected — re-validate all watchtower entries */
-            fprintf(stderr, "[%ld] REORG: height %d → %d (depth %d)\n",
-                    (long)time(NULL), last_height, height,
-                    last_height - height);
-            /* CL6: persist reorg event for test evidence */
+            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
+        } else if (reorg_kind > 0) {
+            /* Reorg detected — re-validate all watchtower entries.
+               Issue #2: detects both height-regression AND same-height reorgs
+               (best-block hash changed at the same height). */
+            const char *kind_str = (reorg_kind == 2) ? "SAME_HEIGHT" : "HEIGHT_REGRESSION";
+            fprintf(stderr, "[%ld] REORG (%s): height %d -> %d hash %.16s -> %.16s\n",
+                    (long)time(NULL), kind_str, last_height, height,
+                    last_hash, cur_hash);
             {
-                char det[128];
-                snprintf(det, sizeof(det), "height_%d->%d depth_%d",
-                         last_height, height, last_height - height);
+                char det[256];
+                if (reorg_kind == 2) {
+                    snprintf(det, sizeof(det),
+                             "same_height_%d hash_%.16s->%.16s",
+                             height, last_hash, cur_hash);
+                } else {
+                    snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                             last_height, height, last_height - height);
+                }
                 persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
             }
             watchtower_on_reorg(&wt, height, last_height);
             last_height = height;
+            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
             /* Run a watchtower check immediately after reorg */
             watchtower_check(&wt);
         }
