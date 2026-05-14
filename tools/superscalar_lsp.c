@@ -4077,13 +4077,27 @@ accept_new_factory:
     report_add_string(&rpt, "result", "success");
     report_close(&rpt);
 
-    /* Clean up this factory's resources */
+    /* Clean up this factory's resources.
+
+       Memory leak fix: also call lsp_channels_cleanup to free the
+       per-channel HTLC/htlc-origin/invoice arrays (entries/invoices/
+       htlc_origins from lsp_channels_init), and free the ladder_t struct
+       itself (sizeof(ladder_t) is ~192 MB inline at
+       LADDER_MAX_FACTORIES=8 since each ladder_factory_t embeds a full
+       factory_t).  Both were previously leaked on the LSP success exit
+       path — ASan flagged this in the testnet4 campaign 2026-05-14. */
     jit_channels_cleanup(mgr);
+    lsp_channels_cleanup(mgr);
     free(mgr);
     mgr = NULL;
     lsp_cleanup(lsp_p);
     free(lsp_p);
     lsp_p = NULL;
+    if (lad) {
+        ladder_free(lad);
+        free(lad);
+        lad = NULL;
+    }
 
     /* Persistent daemon: loop back for a new factory instead of exiting.
        Mark this factory as closed in DB (cooperative close already on chain).
