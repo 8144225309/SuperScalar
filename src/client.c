@@ -3343,6 +3343,8 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         fprintf(stderr, "Client %u: failed to parse STATE_ADVANCE_PROPOSE\n", my_index);
         return 0;
     }
+    fprintf(stderr, "Client %u: DEBUG state_advance trigger_leaf=%d epoch=%u n_lsp_nonces=%zu\n",
+            my_index, trigger_leaf, epoch_in, n_lsp_nonces);
 
     /* PR-D phase 4: snapshot per-leaf OLD state BEFORE the advance
        overwrites it, so we can drive the parallel poison MuSig
