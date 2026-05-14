@@ -3386,11 +3386,25 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
           1 step behind LSP). */
     int rc = 0;
     if (trigger_leaf < 0) {
-        /* Root-driven (PS Tier B): tick root counter directly. */
-        rc = factory_tick_root(factory);
+        /* Root-driven (PS Tier B): tick root counter in a loop until
+           rollover.  Mirrors the DW leaf-driven loop below — the client
+           may be N ticks behind the LSP (the LSP's rc=-1 ceremony fires
+           on its tick, but it doesn't send a per-tick PROPOSE before
+           rollover, so the client must catch up locally). */
+        int max_steps = (int)(factory->states_per_layer + 2);
+        if (max_steps < 4) max_steps = 4;
+        for (int s = 0; s < max_steps; s++) {
+            rc = factory_tick_root(factory);
+            if (rc == -1) break;
+            if (rc != 0) {
+                fprintf(stderr, "Client %u: state_advance: root tick step %d "
+                        "returned unexpected %d\n", my_index, s, rc);
+                return 0;
+            }
+        }
         if (rc != -1) {
-            fprintf(stderr, "Client %u: state_advance: root tick returned %d "
-                    "(expected -1 for rollover)\n", my_index, rc);
+            fprintf(stderr, "Client %u: state_advance: root tick never rolled "
+                    "over within %d steps\n", my_index, max_steps);
             return 0;
         }
     } else {
