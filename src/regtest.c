@@ -758,6 +758,29 @@ int regtest_get_block_height(regtest_t *rt) {
     return height;
 }
 
+/* 100% reorg resilience (Issue #2): tip-hash getter so the WT poll loop
+   can detect same-height reorgs (best-block hash changes without height
+   moving). Caller must provide hash_out_buf of size >= 65 bytes. */
+int regtest_get_best_block_hash(regtest_t *rt, char *hash_out_buf) {
+    if (!hash_out_buf) return 0;
+    hash_out_buf[0] = '\0';
+    char *result = regtest_exec(rt, "getbestblockhash", "");
+    if (!result) return 0;
+    /* Strip leading/trailing quotes and whitespace */
+    char *start = result;
+    while (*start == '"' || *start == ' ' || *start == '\n' || *start == '\r') start++;
+    size_t len = strlen(start);
+    while (len > 0 && (start[len-1] == '"' || start[len-1] == '\n' ||
+                       start[len-1] == '\r' || start[len-1] == ' ')) {
+        start[--len] = '\0';
+    }
+    if (len != 64) { free(result); return 0; }
+    memcpy(hash_out_buf, start, 64);
+    hash_out_buf[64] = '\0';
+    free(result);
+    return 1;
+}
+
 int regtest_mine_blocks(regtest_t *rt, int n, const char *address) {
     /* Only allow mining on regtest to prevent accidental mining on other networks */
     if (strcmp(rt->network, "regtest") != 0) return 0;

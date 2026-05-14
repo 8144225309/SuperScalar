@@ -332,9 +332,22 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     int last_height = -1;
+    char last_hash[65] = {0};  /* Issue #2: same-height reorg detection */
 
     while (!g_shutdown) {
         int height = regtest_get_block_height(&rt);
+        char cur_hash[65] = {0};
+        regtest_get_best_block_hash(&rt, cur_hash);
+
+        int reorg_kind = 0;  /* 0=none, 1=height-decrease, 2=same-height */
+        if (last_height > 0 && height < last_height) {
+            reorg_kind = 1;
+        } else if (last_height > 0 && height == last_height &&
+                   last_hash[0] != 0 && cur_hash[0] != 0 &&
+                   strcmp(cur_hash, last_hash) != 0) {
+            reorg_kind = 2;
+        }
+
         if (height > last_height) {
             int penalties = watchtower_check(&wt);
             if (penalties > 0) {
@@ -342,20 +355,30 @@ int main(int argc, char *argv[]) {
                        (long)time(NULL), height, penalties);
             }
             last_height = height;
-        } else if (last_height > 0 && height < last_height) {
-            /* Reorg detected — re-validate all watchtower entries */
-            fprintf(stderr, "[%ld] REORG: height %d → %d (depth %d)\n",
-                    (long)time(NULL), last_height, height,
-                    last_height - height);
-            /* CL6: persist reorg event for test evidence */
+            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
+        } else if (reorg_kind > 0) {
+            /* Reorg detected — re-validate all watchtower entries.
+               Issue #2: detects both height-regression AND same-height reorgs
+               (best-block hash changed at the same height). */
+            const char *kind_str = (reorg_kind == 2) ? "SAME_HEIGHT" : "HEIGHT_REGRESSION";
+            fprintf(stderr, "[%ld] REORG (%s): height %d -> %d hash %.16s -> %.16s\n",
+                    (long)time(NULL), kind_str, last_height, height,
+                    last_hash, cur_hash);
             {
-                char det[128];
-                snprintf(det, sizeof(det), "height_%d->%d depth_%d",
-                         last_height, height, last_height - height);
+                char det[256];
+                if (reorg_kind == 2) {
+                    snprintf(det, sizeof(det),
+                             "same_height_%d hash_%.16s->%.16s",
+                             height, last_hash, cur_hash);
+                } else {
+                    snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                             last_height, height, last_height - height);
+                }
                 persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
             }
             watchtower_on_reorg(&wt, height, last_height);
             last_height = height;
+            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
             /* Run a watchtower check immediately after reorg */
             watchtower_check(&wt);
         }
