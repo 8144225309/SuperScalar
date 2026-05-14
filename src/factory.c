@@ -2294,8 +2294,13 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
           to distinguish). */
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
-    if (!dw_counter_advance(&f->counter.layers[0]))
-        return 0;  /* fully exhausted or no-op */
+    /* Advance the root layer (layers[0]).  dw_advance ticks a single layer;
+       dw_counter_advance walks all layers + handles overall counter — not
+       what we want here.  We're mirroring the rc=-1 path in
+       factory_advance_leaf_unsigned (DW branch) which uses dw_advance on
+       layers[0] when leaf-counter exhaustion bubbles up. */
+    if (!dw_advance(&f->counter.layers[0]))
+        return 0;  /* fully exhausted */
     f->counter.current_epoch++;
     /* Reset PS leaf chain_len for the new epoch.  On-chain chain[0..N-1]
        entries remain valid historical states; the in-memory chain_len
