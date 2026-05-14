@@ -1641,20 +1641,52 @@
                 }
 
                 uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
+                int is_ps_factory = (lsp_p->factory.leaf_arity == FACTORY_ARITY_PS);
                 int n_iters = states_per_layer + 1;
-                printf("  states_per_layer=%d → driving %d leaf-0 advances "
-                       "(last one triggers rc=-1 / Tier B ceremony)\n",
-                       states_per_layer, n_iters);
 
-                for (int it = 0; it < n_iters; it++) {
-                    printf("  iter %d/%d: lsp_channels_advance_ps_leaf(0)...\n",
-                           it + 1, n_iters);
-                    fflush(stdout);
-                    int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
-                    if (rc != 1) {
-                        printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
-                        rollover_pass = 0;
-                        break;
+                if (is_ps_factory) {
+                    /* PS Tier B: root rollover is block-driven, NOT
+                       leaf-driven (PS leaves chain-extend without a
+                       counter).  Drive the root counter directly via
+                       lsp_factory_tick_root.  In production, this would
+                       be wired into a block-height polling loop.  For the
+                       test we tick the root states_per_layer+1 times
+                       (the last tick rolls over the layer). */
+                    printf("  PS factory: states_per_layer=%d → ticking root counter "
+                           "%d times (last tick triggers Tier B ceremony)\n",
+                           states_per_layer, n_iters);
+                    for (int it = 0; it < n_iters; it++) {
+                        printf("  tick %d/%d: lsp_factory_tick_root...\n",
+                               it + 1, n_iters);
+                        fflush(stdout);
+                        int rc = lsp_factory_tick_root(mgr, lsp_p);
+                        if (rc < 0) {
+                            printf("  FAIL: lsp_factory_tick_root returned %d on tick %d\n",
+                                   rc, it + 1);
+                            rollover_pass = 0;
+                            break;
+                        }
+                        /* rc=1 means rollover + ceremony complete; rc=0 means
+                           tick without rollover (root counter advanced within
+                           the layer).  Either is fine until the final tick. */
+                    }
+                } else {
+                    /* DW Tier B: leaf-counter exhaustion drives root rollover.
+                       Drive leaf-0 advances; the last one exhausts the leaf and
+                       triggers Tier B via factory_advance_leaf_unsigned rc=-1. */
+                    printf("  DW factory: states_per_layer=%d → driving %d leaf-0 advances "
+                           "(last one triggers rc=-1 / Tier B ceremony)\n",
+                           states_per_layer, n_iters);
+                    for (int it = 0; it < n_iters; it++) {
+                        printf("  iter %d/%d: lsp_channels_advance_ps_leaf(0)...\n",
+                               it + 1, n_iters);
+                        fflush(stdout);
+                        int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                        if (rc != 1) {
+                            printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
+                            rollover_pass = 0;
+                            break;
+                        }
                     }
                 }
 

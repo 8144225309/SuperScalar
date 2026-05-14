@@ -3372,33 +3372,45 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         n_leaf_pre++;
     }
 
-    /* Advance local DW counter to root rollover.
+    /* Advance local state to mirror the LSP-side rollover.
 
-       The LSP triggered Tier B because its OWN factory_advance_leaf_unsigned
-       returned -1.  The client's counter is typically ONE step behind the
-       LSP because the prior per-leaf-advance ceremony exited cleanly on
-       the LSP side at rc=-1 without sending MSG_LEAF_ADVANCE_PROPOSE
-       (the rc=-1 branch in lsp_advance_leaf hands off to Tier B
-       directly).  So the client must drive its own advance until rc=-1
-       fires too — at most one extra step in the lockstep case, but the
-       loop also handles unsynchronized recovery scenarios.  Bounded by
-       states_per_layer+2 as a safety cap. */
+       Two trigger types:
+       1. trigger_leaf == -1 (PS Tier B root-driven): LSP called factory_tick_root
+          directly because the block-height progression rolled over the root DW
+          counter.  PS leaves don't have a counter to exhaust.  Client mirrors
+          by calling factory_tick_root locally.
+       2. trigger_leaf >= 0 (DW leaf-exhaustion-driven): LSP's
+          factory_advance_leaf_unsigned returned -1 because the leaf counter
+          ran out.  Client mirrors by advancing the same leaf in a loop until
+          its own rc=-1 fires (handles unsynchronized recovery: client may be
+          1 step behind LSP). */
     int rc = 0;
-    int max_steps = (int)(factory->states_per_layer + 2);
-    if (max_steps < 4) max_steps = 4;
-    for (int s = 0; s < max_steps; s++) {
-        rc = factory_advance_leaf_unsigned(factory, trigger_leaf);
-        if (rc == -1) break;
-        if (rc != 1) {
-            fprintf(stderr, "Client %u: state_advance: advance step %d returned %d\n",
-                    my_index, s, rc);
+    if (trigger_leaf < 0) {
+        /* Root-driven (PS Tier B): tick root counter directly. */
+        rc = factory_tick_root(factory);
+        if (rc != -1) {
+            fprintf(stderr, "Client %u: state_advance: root tick returned %d "
+                    "(expected -1 for rollover)\n", my_index, rc);
             return 0;
         }
-    }
-    if (rc != -1) {
-        fprintf(stderr, "Client %u: state advance: never hit rc=-1 within %d steps\n",
-                my_index, max_steps);
-        return 0;
+    } else {
+        /* Leaf-driven (DW): drive leaf advance until rc=-1. */
+        int max_steps = (int)(factory->states_per_layer + 2);
+        if (max_steps < 4) max_steps = 4;
+        for (int s = 0; s < max_steps; s++) {
+            rc = factory_advance_leaf_unsigned(factory, trigger_leaf);
+            if (rc == -1) break;
+            if (rc != 1) {
+                fprintf(stderr, "Client %u: state_advance: advance step %d returned %d\n",
+                        my_index, s, rc);
+                return 0;
+            }
+        }
+        if (rc != -1) {
+            fprintf(stderr, "Client %u: state advance: never hit rc=-1 within %d steps\n",
+                    my_index, max_steps);
+            return 0;
+        }
     }
 
     /* PR-D phase 4: prepare poison sessions per leaf where OLD state was
