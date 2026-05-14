@@ -511,7 +511,7 @@ def collect_demo():
     parts=[{"factory_id":0,"slot":i,"pubkey":("02"if i%2==0 else"03")+_rh(64)} for i in range(5)]
     node_a_id = "02a1b2c3d4e5f678" + _rh(48)
     node_b_id = "03f9e8d7c6b5a493" + _rh(48)
-    return {
+    _DEMO_DATA = {
         "timestamp": time.strftime("%H:%M:%S"), "demo": True,
         "processes": {k:True for k in ["bitcoind","cln_a","cln_b","bridge","lsp","client"]},
         "bitcoin": {"available":True,"chain":"signet","blocks":h,"headers":h,"ibd":False,
@@ -682,7 +682,71 @@ def collect_demo():
         },
         "bridge":{"lsp_connected":True,"plugin_connected":True,"pending_inbound":1,"next_htlc_id":42,"next_request_id":17},
         "events": list(_de),
+        # Phase 1 #8: synthetic data for the new panels added since the
+        # original collect_demo() was written.  Without these, --demo mode
+        # would render empty Factory Config / PS Leaf Chains / TX
+        # Inventory / Outcomes panels.
+        "factory_config": {
+            "available": True, "pid": 12345,
+            "arity": "3", "ps_subfactory_arity": "2",
+            "clients": "4", "amount": "200000",
+            "network": "regtest", "port": "29735",
+            "lsp_balance_pct": "100",
+            "placement_mode": "sequential",
+            "economic_mode": "lsp-takes-all",
+            "routing_fee_ppm": "0",
+            "default_profit_bps": "0",
+            "active_blocks": "20", "dying_blocks": "10",
+            "step_blocks": "10", "states_per_layer": "4",
+            "fee_rate": "1000",
+            "fee_bump_after": "6", "fee_bump_max": "3",
+            "settlement_interval": "144",
+            "daemon": True, "demo": True, "cli": False,
+            "no_jit": False, "onion": False, "tor_only": False,
+            "i_accept_risk": False,
+        },
+        "tx_enrichment": {
+            ft: {"confirmations": 12, "vsize": 165, "in_mempool": False, "never_seen": False, "last_check": int(t)},
+        },
     }
+    # Inject the PS-era + TX-inventory tables into the demo lsp/client
+    # views so the new panels render against representative data.
+    _d_lsp = _DEMO_DATA["databases"]["lsp"]
+    _d_cl = _DEMO_DATA["databases"]["client"]
+    _d_lsp["ps_leaf_chains"] = [
+        {"factory_id":0, "leaf_node_idx":4, "chain_pos":1, "txid":_rh(64), "chan_amount_sats":13000, "has_poison":1},
+        {"factory_id":0, "leaf_node_idx":4, "chain_pos":2, "txid":_rh(64), "chan_amount_sats":15000, "has_poison":1},
+    ]
+    _d_lsp["ps_subfactory_chains"] = [
+        {"factory_id":0, "sub_node_idx":2, "chain_pos":1, "txid":_rh(64),
+         "sales_stock_amount_sats":11911, "channel_amounts_csv":"32111,22111", "has_poison":1},
+    ]
+    _d_lsp["ps_initial_signed_states"] = [
+        {"factory_id":0, "node_idx":i, "txid":_rh(64)} for i in [4,5,6]
+    ]
+    _d_lsp["ps_signed_inputs_by_leaf"] = [
+        {"factory_id":0, "leaf_node_idx":4, "cnt":2},
+    ]
+    _d_lsp["signed_commitments"] = []
+    _d_lsp["distribution_txs"] = []
+    _d_lsp["pending_sweeps"] = []
+    _d_lsp["factory_funding_bytes"] = [{"id":0, "funding_amount":200000, "has_funding_bytes":1}]
+    _d_lsp["tree_nodes_bytes"] = [
+        {"factory_id":0, "node_index":i, "has_bytes":1} for i in range(7)
+    ]
+    _d_lsp["ps_node_counts"] = [
+        {"factory_id":0, "ps_leaf_count":1, "subfactory_count":2},
+    ]
+    _d_lsp["channels_committed"] = [
+        {"factory_id":0, "channels_with_commits":4},
+    ]
+    _d_cl["distribution_txs"] = [
+        {"factory_id":0, "has_bytes":1},
+    ]
+    _d_cl["signed_commitments"] = [
+        {"channel_id":0, "commitment_number":3, "has_bytes":1},
+    ]
+    return _DEMO_DATA
 
 # ---------------------------------------------------------------------------
 # HTML Template (tabbed)
@@ -983,8 +1047,12 @@ function rPsChains(D){
   h+=`</div>`;return h;
  }
  // Per-leaf summary table
+ // Build a factory_id -> fee_per_tx lookup so force-close cost
+ // projection can be expressed in absolute sats.  chain_len + 1 because
+ // chain[0] (initial) must also be broadcast for chain[N] to be valid.
+ const facMap={};for(const fr of (lsp.factories||[]))facMap[fr.id]=fr;
  if(leafKeys.length){
-  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
   for(const k of leafKeys){
    const e=byLeaf[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
@@ -994,7 +1062,15 @@ function rPsChains(D){
    const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
    const sig=sigMap[`${e.factory_id}_${e.leaf_node_idx}`]||0;
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${e.entries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="h">${th(latest.txid)}</td></tr>`;
+   const fac=facMap[e.factory_id]||{};
+   // Force-close cost projection: each chain entry needs its own
+   // on-chain broadcast.  chain[0] + chain[1..N] = e.entries.length+1
+   // total TXs; fee_per_tx is the LSP's budgeted endogenous fee at
+   // factory creation.  Real cost can be higher under CPFP fee-bumps;
+   // this is the baseline operator commitment.
+   const fcTxCount=e.entries.length+(init?1:0);
+   const fcCost=fcTxCount*(fac.fee_per_tx||0);
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${e.entries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
   }
   h+=`</table>`;
  }
@@ -1005,10 +1081,10 @@ function rPsChains(D){
   const init=initMap[`${e.factory_id}_${e.leaf_node_idx}`];
   h+=`<div style="margin-top:12px"><div class="st" style="margin-bottom:4px"><span>Leaf node ${e.leaf_node_idx} (factory #${e.factory_id}) progression</span><span class="c">${e.entries.length} advances</span></div>`;
   h+=`<table><tr><th>chain_pos</th><th class="r">channel amount</th><th>poison TX</th><th>TXID</th></tr>`;
-  if(init)h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b ok">persisted</span></td><td class="h">${th(init.txid)}</td></tr>`;
+  if(init)h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b ok">persisted</span></td><td class="h">${th(init.txid)} ${txBadge(D,init.txid)}</td></tr>`;
   else h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b dn">missing</span></td><td class="mu">no row in ps_initial_signed_states</td></tr>`;
   for(const ent of e.entries){
-   h+=`<tr><td>${ent.chain_pos}</td><td class="r">${fs(ent.chan_amount_sats)}</td><td>${ent.has_poison?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td><td class="h">${th(ent.txid)}</td></tr>`;
+   h+=`<tr><td>${ent.chain_pos}</td><td class="r">${fs(ent.chan_amount_sats)}</td><td>${ent.has_poison?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td><td class="h">${th(ent.txid)} ${txBadge(D,ent.txid)}</td></tr>`;
   }
   h+=`</table></div>`;
  }
@@ -1023,7 +1099,7 @@ function rPsChains(D){
   const subKeys=Object.keys(bySub).sort();
   h+=`<div style="margin-top:14px;border-top:1px solid #30363d;padding-top:10px">`;
   h+=`<div class="st"><span>PS Sub-Factory Chains (k² wide leaves)</span><span class="c">${subKeys.length} sub-factories</span></div>`;
-  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
   for(const k of subKeys){
    const e=bySub[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
@@ -1031,7 +1107,10 @@ function rPsChains(D){
    const cov=e.entries.filter(x=>x.has_poison).length;
    const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${e.entries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="h">${th(latest.txid)}</td></tr>`;
+   const fac=facMap[e.factory_id]||{};
+   const fcTxCount=e.entries.length+1;  // chain[0] + chain[1..N]
+   const fcCost=fcTxCount*(fac.fee_per_tx||0);
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${e.entries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
   }
   h+=`</table></div>`;
  }
@@ -1093,9 +1172,9 @@ function rFactory(D){
    }
    h+=`</div>`;
   }
-  // Detail table
-  h+=`<table style="margin-top:8px"><tr><th>#</th><th>Type</th><th>Parent</th><th>Layer</th><th>Signers</th><th class="r">Input</th><th>Outputs</th><th>nSeq</th><th>TXID</th><th>Status</th></tr>`;
-  for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
+  // Detail table \u2014 Phase 1: include on-chain status badge from P3 enrichment
+  h+=`<table style="margin-top:8px"><tr><th>#</th><th>Type</th><th>Parent</th><th>Layer</th><th>Signers</th><th class="r">Input</th><th>Outputs</th><th>nSeq</th><th>TXID</th><th>On-chain</th><th>Status</th></tr>`;
+  for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${txBadge(D,n.txid)}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
   h+=`</table>`;
   h+=`</div>`;}
  // Signing Progress (MuSig2 nonce/sig collection).  D2: the table is a
@@ -1273,10 +1352,10 @@ function rWatchtower(D){
  // Old commitments table
  const oc=lsp.old_commitments||[];
  if(oc.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitments (breach detection)</span><span class="c">${oc.length}</span></div>`;
-  h+=`<table><tr><th>CH</th><th>Commit#</th><th>TXID</th><th>Vout</th><th class="r">To-Local</th></tr>`;
+  h+=`<table><tr><th>CH</th><th>Commit#</th><th>TXID</th><th>On-chain</th><th>Vout</th><th class="r">To-Local</th></tr>`;
   for(const o of oc.slice(0,15)){const jitBadge=o.channel_id>=4?' <span class="b i">JIT</span>':'';
-   h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
-  if(oc.length>15)h+=`<tr><td colspan="5" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
+   h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${txBadge(D,o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
+  if(oc.length>15)h+=`<tr><td colspan="6" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
   h+=`</table>`;}
  // Old commitment HTLCs (breach penalty HTLCs)
  const och=lsp.old_commitment_htlcs||[];
@@ -1294,16 +1373,16 @@ function rWatchtower(D){
  // Watchtower pending penalty TXs
  const wp=lsp.watchtower_pending||[];
  if(wp.length){h+=`<div class="st" style="margin-top:8px"><span>Watchtower Pending Penalties</span><span class="c">${wp.length}</span></div>`;
-  h+=`<table><tr><th>TXID</th><th class="r">Anchor Vout</th><th class="r">Anchor Amount</th><th class="r">Mempool Cycles</th><th class="r">Fee Bumps</th></tr>`;
-  for(const w of wp)h+=`<tr><td class="h">${th(w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
+  h+=`<table><tr><th>TXID</th><th>On-chain</th><th class="r">Anchor Vout</th><th class="r">Anchor Amount</th><th class="r">Mempool Cycles</th><th class="r">Fee Bumps</th></tr>`;
+  for(const w of wp)h+=`<tr><td class="h">${th(w.txid)}</td><td>${txBadge(D,w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
   h+=`</table>`;}
  h+=`</div>`;
  // Broadcast log (separate card)
  const bl=lsp.broadcast_log||[];
  if(bl.length){h+=`<div class="s"><div class="st"><span>Broadcast Log</span><span class="c">${bl.length}</span></div>`;
-  h+=`<table><tr><th>ID</th><th>TXID</th><th>Source</th><th>Result</th><th>Time</th></tr>`;
-  for(const b of bl){const rc=b.result==='success'?'b ok':'b dn';
-   h+=`<tr><td>${b.id}</td><td class="h">${th(b.txid)}</td><td>${b.source||'\u2014'}</td><td><span class="${rc}">${b.result||'?'}</span></td><td>${ta(b.broadcast_time)}</td></tr>`;}
+  h+=`<table><tr><th>ID</th><th>TXID</th><th>On-chain</th><th>Source</th><th>Result</th><th>Time</th></tr>`;
+  for(const b of bl){const rc=b.result==='success'||b.result==='ok'?'b ok':'b dn';
+   h+=`<tr><td>${b.id}</td><td class="h">${th(b.txid)}</td><td>${txBadge(D,b.txid)}</td><td>${b.source||'\u2014'}</td><td><span class="${rc}">${b.result||'?'}</span></td><td>${ta(b.broadcast_time)}</td></tr>`;}
   h+=`</table></div>`;}
  return h;
 }
@@ -1591,6 +1670,21 @@ function render(D){
   poisonEl.style.display='inline-block';
   poisonEl.innerHTML=`<span class="${cls}" title="poison-TX coverage across PS chain entries">🛡 poison ${pCov}/${pTot} (${pct}%)</span>`;
  } else { poisonEl.style.display='none'; }
+ // Phase 1: hide the Lightning Network tab when no CLN is wired.  The
+ // operator dashboard's job is the LSP + factories; end-user payment
+ // UX lives in the wallet, not here.  Tab stays hidden if both CLN A
+ // and CLN B are unavailable.  Auto-flips back to Overview if the
+ // hidden tab was currently selected.
+ const cln=D.cln||{};
+ const cnlAny=(cln.a&&cln.a.available)||(cln.b&&cln.b.available);
+ const lnTab=document.querySelector('.tab[data-t="lightning"]');
+ if(lnTab){
+  lnTab.style.display=cnlAny?'':'none';
+  if(!cnlAny&&curTab==='lightning'){
+   curTab='overview';
+   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.t==='overview'));
+  }
+ }
  // Update tab counts
  const tabCounts={channels:(lsp.channels||[]).length+(lsp.htlcs||[]).length,
   lightning:((D.cln||{}).a||{}).num_peers||0+((D.cln||{}).b||{}).num_peers||0,
