@@ -20,6 +20,13 @@ class Config:
         self.lsp_db = a.lsp_db; self.client_db = a.client_db
         self.btc_cli = a.btc_cli; self.btc_network = a.btc_network
         self.btc_rpcuser = a.btc_rpcuser; self.btc_rpcpassword = a.btc_rpcpassword
+        # P3: allow pointing bitcoin-cli at a non-default daemon (custom
+        # datadir / shifted RPC port).  Without these, the helper silently
+        # hits whatever bitcoind is on the network's default port with
+        # ~/.bitcoin/bitcoin.conf credentials, which on a shared box can
+        # be a completely different chain.
+        self.btc_datadir = getattr(a, 'btc_datadir', None)
+        self.btc_rpcport = getattr(a, 'btc_rpcport', None)
         self.cln_cli = a.cln_cli; self.cln_a_dir = a.cln_a_dir; self.cln_b_dir = a.cln_b_dir
 
 def run_cmd(args, timeout=5):
@@ -31,7 +38,9 @@ def run_cmd(args, timeout=5):
 
 def btc_cmd(cfg, *a):
     cmd = [cfg.btc_cli]
+    if cfg.btc_datadir: cmd.append("-datadir=" + cfg.btc_datadir)
     if cfg.btc_network and cfg.btc_network != "mainnet": cmd.append("-" + cfg.btc_network)
+    if cfg.btc_rpcport: cmd.append("-rpcport=" + str(cfg.btc_rpcport))
     if cfg.btc_rpcuser: cmd.append("-rpcuser=" + cfg.btc_rpcuser)
     if cfg.btc_rpcpassword: cmd.append("-rpcpassword=" + cfg.btc_rpcpassword)
     cmd.extend(a); return run_cmd(cmd)
@@ -65,6 +74,92 @@ def collect_processes(cfg):
         p[n] = pgrep_check(pat)
     if not p["bitcoind"] and cfg.btc_cli: _, p["bitcoind"] = btc_cmd(cfg, "getblockchaininfo")[1:][:1] or [False]
     return p
+
+# --- P3: on-chain TX enrichment cache ---
+# Single in-process cache shared across requests so multiple browser tabs
+# don't multiply RPC load.  Key = txid (display order).  Value =
+# {confirmations, vsize, in_mempool, last_check, never_seen}.
+# Re-check TTLs:
+#   - confs >= 6   : 5 min (catch reorgs cheaply)
+#   - confs <  6   : 30 sec (mempool / shallow churns)
+#   - never_seen   : 30 sec (might land any moment)
+_tx_cache = {}
+def _tx_should_refresh(entry, now):
+    if not entry: return True
+    age = now - entry.get("last_check", 0)
+    if entry.get("never_seen"): return age >= 30
+    confs = entry.get("confirmations", 0) or 0
+    return age >= (300 if confs >= 6 else 30)
+
+def collect_tx_enrichment(cfg, txids):
+    """Look up txid metadata via bitcoin-cli getrawtransaction with caching.
+    Returns {txid: {confirmations, vsize, in_mempool, last_check}}.
+    Caller passes a deduped txid set; we only RPC for entries past their
+    TTL.  See header comment for the TTL policy."""
+    if not cfg.btc_cli: return {}
+    now = time.time()
+    out = {}
+    for txid in txids:
+        if not txid or len(txid) != 64: continue
+        cached = _tx_cache.get(txid)
+        if not _tx_should_refresh(cached, now):
+            out[txid] = cached
+            continue
+        # RPC.  -verbose=1 returns JSON with confirmations + vsize.
+        raw, ok = btc_cmd(cfg, "getrawtransaction", txid, "1")
+        entry = {"last_check": now}
+        if ok:
+            try:
+                obj = json.loads(raw)
+                entry["confirmations"] = int(obj.get("confirmations", 0) or 0)
+                entry["vsize"] = int(obj.get("vsize", 0) or 0)
+                entry["in_mempool"] = (entry["confirmations"] == 0)
+                entry["never_seen"] = False
+            except Exception:
+                entry["never_seen"] = True
+                entry["confirmations"] = 0
+                entry["in_mempool"] = False
+                entry["vsize"] = 0
+        else:
+            # bitcoin-cli says "No such mempool or blockchain transaction"
+            # → TX never broadcast (or evicted).  Keep last_check so we
+            # don't hammer; treat as never_seen for the empty-state UI.
+            entry["never_seen"] = True
+            entry["confirmations"] = 0
+            entry["in_mempool"] = False
+            entry["vsize"] = 0
+        _tx_cache[txid] = entry
+        out[txid] = entry
+    return out
+
+def _extract_txids(databases):
+    """Collect every txid that might be worth enriching across both DBs."""
+    txids = set()
+    for db in databases.values():
+        if not isinstance(db, dict): continue
+        for r in db.get("factories", []) or []:
+            if r.get("funding_txid"): txids.add(r["funding_txid"])
+        for r in db.get("tree_nodes", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("ps_leaf_chains", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("ps_subfactory_chains", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("ps_initial_signed_states", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("jit_channels", []) or []:
+            if r.get("funding_txid"): txids.add(r["funding_txid"])
+        for r in db.get("broadcast_log", []) or []:
+            t = r.get("txid")
+            if t and t != "?": txids.add(t)
+        for r in db.get("watchtower_pending", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("old_commitments", []) or []:
+            if r.get("txid"): txids.add(r["txid"])
+        for r in db.get("pending_sweeps", []) or []:
+            if r.get("source_txid"): txids.add(r["source_txid"])
+            if r.get("sweep_txid"): txids.add(r["sweep_txid"])
+    return txids
 
 def collect_bitcoin(cfg):
     d = {"available": False}
@@ -255,6 +350,28 @@ def collect_databases(cfg):
             "  THEN 1 ELSE 0 END AS has_bytes "
             "FROM tree_nodes ORDER BY factory_id, node_index")
         data[label]["tree_nodes_bytes"] = rows if not err else []
+        # P1: count PS leaf + sub-factory nodes so we can derive correct
+        # chain[0] "expected" denominators.  Persisted schema doesn't carry
+        # is_ps_leaf as a direct column; identify via nsequence (PS leaves
+        # have nsequence = 0xFFFFFFFE = BIP-68 disabled) and via type
+        # column ("ps_subfactory" persisted from NODE_PS_SUBFACTORY).
+        rows, err = query_db(path,
+            "SELECT factory_id, "
+            "SUM(CASE WHEN nsequence = 4294967294 AND type='state' "
+            "         THEN 1 ELSE 0 END) AS ps_leaf_count, "
+            "SUM(CASE WHEN type LIKE '%subfactory%' "
+            "         THEN 1 ELSE 0 END) AS subfactory_count "
+            "FROM tree_nodes GROUP BY factory_id")
+        data[label]["ps_node_counts"] = rows if not err else []
+        # P1: how many channels have had at least one commit exchange?
+        # signed_commitments only stores rows once commitment_number > 0;
+        # at commit 0 (just opened, no payments) there's nothing to sign.
+        rows, err = query_db(path,
+            "SELECT factory_id, "
+            "SUM(CASE WHEN commitment_number > 0 THEN 1 ELSE 0 END) "
+            "  AS channels_with_commits "
+            "FROM channels GROUP BY factory_id")
+        data[label]["channels_committed"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -364,10 +481,12 @@ def collect_factory_config(cfg):
 
 def collect_all(cfg):
     if cfg.demo: return collect_demo()
+    db = collect_databases(cfg)
     return {"timestamp": time.strftime("%H:%M:%S"),
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
-        "databases": collect_databases(cfg), "cln": collect_cln(cfg),
-        "factory_config": collect_factory_config(cfg)}
+        "databases": db, "cln": collect_cln(cfg),
+        "factory_config": collect_factory_config(cfg),
+        "tx_enrichment": collect_tx_enrichment(cfg, _extract_txids(db))}
 
 # ---------------------------------------------------------------------------
 # Demo mode
@@ -648,6 +767,7 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
  <div class="tab" data-t="txinv">TX Inventory</div>
+ <div class="tab" data-t="outcomes">Outcomes</div>
  <div class="tab" data-t="events">Events</div>
 </div>
 <div id="content"></div>
@@ -923,9 +1043,17 @@ function rPsChains(D){
 function rFactory(D){
  const db=D.databases||{},lsp=db.lsp||{},facs=lsp.factories||[],parts=lsp.participants||[];
  let h=rConfig(D);
- // Factory detail
+ // P4: Factory detail — when multiple factories exist, render each in a
+ // visually-separated section.  Most data already groups by factory_id
+ // (tree_nodes, ps_*_chains, etc.); this just gives the operator a clear
+ // header anchor per factory.
+ if(facs.length>1){
+  h+=`<div class="s" style="background:#0c2d6b22;border-color:#58a6ff44"><div class="st"><span>Multi-factory deployment</span><span class="c">${facs.length} factories on this LSP</span></div>`;
+  h+=`<p class="mu" style="font-size:11px">Each factory below has its own tree, PS chains, and lifecycle.  Scroll for per-factory detail.</p></div>`;
+ }
  h+=`<div class="s"><div class="st"><span>Factory (N+1-of-N+1 MuSig2 UTXO)</span><span class="c">${facs.length}</span></div>`;
  for(const f of facs){
+  if(facs.length>1)h+=`<div style="border-top:2px solid #30363d;margin:8px 0 4px;padding-top:6px;font-weight:600;color:#58a6ff">Factory #${f.id}</div>`;
   h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">ID</span><span class="v">#${f.id}</span></div><div class="ki"><span class="k">Parties</span><span class="v">${f.n_participants} (N+1-of-N+1 MuSig2)</span></div><div class="ki"><span class="k">Funding</span><span class="v">${fs(f.funding_amount)}</span></div><div class="ki"><span class="k">State</span>${sb(f.state)}</div><div class="ki"><span class="k">Created</span><span class="v">${ta(f.created_at)} ago</span></div></div>`;
   h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">TXID</span><span class="v h">${th(f.funding_txid)}</span></div><div class="ki"><span class="k">vout</span><span class="v">${f.funding_vout??'\u2014'}</span></div><div class="ki"><span class="k">step_blocks</span><span class="v">${f.step_blocks??'\u2014'}</span></div><div class="ki"><span class="k">states/layer</span><span class="v">${f.states_per_layer??'\u2014'}</span></div><div class="ki"><span class="k">cltv_timeout</span><span class="v">${f.cltv_timeout??'\u2014'} blk</span></div><div class="ki"><span class="k">fee/tx</span><span class="v">${f.fee_per_tx!=null?f.fee_per_tx+' sat':'\u2014'}</span></div></div>`;
   // Participants
@@ -1185,6 +1313,19 @@ function rWatchtower(D){
 // by category, plus a top-level "defense readiness" headline.  Surfaces
 // the operationally-dangerous gaps (penalty TXs, burn TXs, HTLC resolution
 // TXs) that aren't in the schema today.
+// P3: render a small confirmation badge for a given txid.  Uses
+// tx_enrichment cache populated server-side.  Unknown → grey "—".
+function txBadge(D, txid){
+ if(!txid||txid==='?'||txid==='—')return '';
+ const e=(D.tx_enrichment||{})[txid];
+ if(!e)return `<span class="b" style="background:#21262d;color:#484f58;font-size:9px">unchecked</span>`;
+ if(e.never_seen)return `<span class="b dn" style="font-size:9px">not on chain</span>`;
+ if(e.in_mempool)return `<span class="b w" style="font-size:9px">mempool</span>`;
+ const c=e.confirmations||0;
+ const cls=c>=6?'b ok':c>=1?'b i':'b w';
+ return `<span class="${cls}" style="font-size:9px">${c} conf${e.vsize?` · ${e.vsize}vB`:''}</span>`;
+}
+
 function rTxInventory(D){
  const db=D.databases||{},lsp=db.lsp||{};
  const facs=lsp.factories||[];
@@ -1206,23 +1347,31 @@ function rTxInventory(D){
  const pendSweeps=lsp.pending_sweeps||[];
  const chans=lsp.channels||[];
 
- // Aggregate counts: expected vs actual signed
+ // Aggregate counts: expected vs actual signed (P1: corrected math)
  const fundingSigned=fundBytes.filter(r=>r.has_funding_bytes).length;
  const fundingExpected=facs.length;
  const treeSigned=tn.filter(r=>r.has_bytes).length;
  const treeExpected=tn.length;
- const psChainSigned=psChain.length;  // every row has signed_tx_hex NOT NULL
+ const psChainSigned=psChain.length;
  const psSubSigned=psSub.length;
  const psInitSigned=psInit.length;
+ // P1: chain[0] expected = count of PS leaf nodes + sub-factory nodes
+ // (one chain[0] origin per node), derived from tree_nodes structure.
+ const psNodeCounts=lsp.ps_node_counts||[];
+ const psInitExpected=psNodeCounts.reduce((a,r)=>a+(r.ps_leaf_count||0)+(r.subfactory_count||0),0);
  const psPoisonExpected=psChain.length+psSub.length;
  const psPoisonHave=psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length;
  const comSigned=sigCom.filter(r=>r.has_bytes).length;
- const comExpected=chans.length;  // one per channel for current commitment
+ // P1: channel commits expected = channels with commitment_number > 0,
+ // i.e. channels that have actually exchanged state.  commit-0 just-opened
+ // channels have nothing to sign yet, so they shouldn't count as missing.
+ const chansCommitted=lsp.channels_committed||[];
+ const comExpected=chansCommitted.reduce((a,r)=>a+(r.channels_with_commits||0),0);
  const distSigned=distTx.filter(r=>r.has_bytes).length;
- const distExpected=facs.length;  // one per factory (inverted-timelock recovery)
+ const distExpected=facs.length;
  const jitSigned=jits.length;
  const totalSigned=fundingSigned+treeSigned+psChainSigned+psInitSigned+psSubSigned+psPoisonHave+comSigned+distSigned+jitSigned;
- const totalExpected=fundingExpected+treeExpected+psChainSigned+(psChainSigned+psSubSigned)+psSubSigned+psPoisonExpected+comExpected+distExpected+jitSigned;
+ const totalExpected=fundingExpected+treeExpected+psChainSigned+psInitExpected+psSubSigned+psPoisonExpected+comExpected+distExpected+jitSigned;
  const readiness=totalExpected?Math.round(100*totalSigned/totalExpected):0;
  const readyCls=readiness===100?'b ok':readiness>=80?'b i':'b w';
 
@@ -1244,7 +1393,7 @@ function rTxInventory(D){
  };
  cat('Funding TX',           'factories.funding_tx_hex',          fundingSigned, fundingExpected, 'LSP');
  cat('Factory tree TXs',     'tree_nodes.signed_tx_hex',          treeSigned,    treeExpected,    'LSP or client');
- cat('PS chain[0] (initial)','ps_initial_signed_states.signed_tx_hex', psInitSigned, psChainSigned+psSubSigned, 'LSP or client');
+ cat('PS chain[0] (initial)','ps_initial_signed_states.signed_tx_hex', psInitSigned, psInitExpected, 'LSP or client');
  cat('PS leaf chain[1..N]',  'ps_leaf_chains.signed_tx_hex',      psChainSigned, psChainSigned,   'LSP or client');
  cat('PS sub-factory chain', 'ps_subfactory_chains.signed_tx_hex',psSubSigned,   psSubSigned,     'LSP or client');
  cat('Poison TXs (trustless)','ps_*_chains.poison_tx_hex',         psPoisonHave,  psPoisonExpected,'Watchtower');
@@ -1283,6 +1432,131 @@ function rTxInventory(D){
   h+=`</table></div>`;
  }
 
+ return h;
+}
+
+// === TAB: Outcomes (13-scenarios map) ===
+// Groups broadcast_log entries by source, plus cross-references readiness
+// signals (signed-but-not-broadcast TXs) so operators can see at a glance
+// which SuperScalar scenarios have fired this session, which are ready to
+// fire, and which haven't been exercised.  Sources of truth:
+//   - broadcast_log.source : free-form label written at broadcast time
+//                            (factory_funding, tree_node_N, response,
+//                             burn, poison, penalty, htlc, ptlc, cpfp,
+//                             jit_*, rotation_*, ...).
+//   - presence of signed bytes in their respective tables = "ready" tile.
+function rOutcomes(D){
+ const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
+ const log=lsp.broadcast_log||[];
+ // Build a map of source → entries
+ const bySrc={};
+ for(const r of log){
+  const s=(r.source||'unknown').toLowerCase();
+  if(!bySrc[s])bySrc[s]=[];
+  bySrc[s].push(r);
+ }
+ // Scenario definitions.  Each tile checks (a) broadcast_log entries
+ // matching one or more source prefixes, and (b) optionally a "ready"
+ // count from a persisted-bytes signal.
+ const matchAny=(prefixes)=>{
+  const out=[];
+  for(const k of Object.keys(bySrc))
+   for(const p of prefixes)
+    if(k===p||k.indexOf(p)===0){out.push(...bySrc[k]);break;}
+  return out;
+ };
+ const psChain=lsp.ps_leaf_chains||[];
+ const psSub=lsp.ps_subfactory_chains||[];
+ const distTx=(lsp.distribution_txs||[]).concat(cl.distribution_txs||[]);
+ const jits=lsp.jit_channels||[];
+ const facs=lsp.factories||[];
+ const lad=lsp.ladder_factories||[];
+ const wtPending=lsp.watchtower_pending||[];
+
+ const SCEN=[
+  {name:'Factory creation', icon:'🏭', sources:['factory_funding'],
+   readySignal:facs.length>0?facs.length+' factory(ies)':'',
+   blurb:'Funding TX broadcast that seats the factory MuSig2 UTXO on-chain.'},
+  {name:'PS leaf advance', icon:'🌿', sources:['ps_leaf'],
+   readySignal:psChain.length?psChain.length+' chain entries persisted':'',
+   blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.'},
+  {name:'PS sub-factory advance', icon:'🌳', sources:['ps_subfactory'],
+   readySignal:psSub.length?psSub.length+' sub-factory chain entries':'',
+   blurb:'lsp_subfactory_chain_advance: extends a k² sub-factory chain (wide leaves).'},
+  {name:'DW force-close (tree broadcast)', icon:'⚡', sources:['tree_node_','tree_ok','tree_fail'],
+   readySignal:'',
+   blurb:'Broadcast of the factory tree from kickoff_root to leaves — full unilateral exit.'},
+  {name:'Per-leaf advance (DW)', icon:'🎯', sources:['leaf_advance'],
+   readySignal:'',
+   blurb:'3-of-3 partial advance of one leaf without rolling the root state.'},
+  {name:'L-stock burn', icon:'🔥', sources:['burn','l_stock_burn'],
+   readySignal:'',
+   blurb:'Burn TX broadcast: OP_RETURN destroys L-stock when LSP publishes old state (deterrence).'},
+  {name:'Trustless poison redistribute', icon:'🛡', sources:['poison'],
+   readySignal:(psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length)+' poison TXs signed',
+   blurb:'Pre-signed poison TX redistributes L-stock / sales-stock to clients on cheat.'},
+  {name:'Breach + penalty', icon:'⚔', sources:['penalty','response'],
+   readySignal:wtPending.length?wtPending.length+' penalties in flight':'',
+   blurb:'Watchtower detects revoked commitment broadcast, broadcasts penalty sweep.'},
+  {name:'HTLC force-close', icon:'🪝', sources:['htlc','ptlc'],
+   readySignal:'',
+   blurb:'HTLC success/timeout TX broadcast when channel force-closes with live HTLCs.'},
+  {name:'CLTV timeout distribution', icon:'⏱', sources:['distribution'],
+   readySignal:distTx.filter(r=>r.has_bytes).length?distTx.filter(r=>r.has_bytes).length+' distribution TX(s) signed (client-side)':'',
+   blurb:'nLockTime\'d recovery TX returns funds to clients at factory CLTV timeout.'},
+  {name:'Cooperative close', icon:'🤝', sources:['coop_close','cooperative_close'],
+   readySignal:'',
+   blurb:'Single negotiated on-chain TX dissolving the factory cooperatively.'},
+  {name:'JIT channel', icon:'⚡', sources:['jit_funding','jit_close','jit_'],
+   readySignal:jits.length?jits.length+' JIT channels':'',
+   blurb:'LSP opens a standalone 2-of-2 channel from its own UTXO when leaf liquidity unavailable.'},
+  {name:'Factory rotation', icon:'🔁', sources:['rotation_','rotation'],
+   readySignal:lad.length>1?lad.length+' ladder factories':'',
+   blurb:'PTLC key turnover + dying-period migration to a fresh factory.'},
+  {name:'CPFP fee bump', icon:'⛽', sources:['cpfp'],
+   readySignal:'',
+   blurb:'CPFP child broadcast to fee-bump a stuck parent (penalty/HTLC/state TX).'},
+ ];
+
+ let h='';
+ h+=`<div class="s"><div class="st"><span>Scenario Map</span><span class="c">${SCEN.length} SuperScalar structures</span></div>`;
+ h+=`<p class="mu" style="font-size:11px;margin-bottom:10px">Each tile is one of the SuperScalar structures from the README, sourced from <code>broadcast_log.source</code> plus presence-of-signed-bytes signals.  Green = fired (has broadcast log entries) | Blue = ready (signed bytes persisted, nothing broadcast yet) | Grey = neither.</p>`;
+ // Tile grid
+ h+=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px">`;
+ for(const sc of SCEN){
+  const fired=matchAny(sc.sources);
+  let state, badge, lastTx='';
+  if(fired.length>0){
+   state='fired'; badge=`<span class="b ok">fired ${fired.length}×</span>`;
+   const latest=fired.reduce((a,b)=>(a.broadcast_time||0)>(b.broadcast_time||0)?a:b);
+   lastTx=`<div class="kv" style="margin-top:4px;gap:2px 8px"><div class="ki"><span class="k">last</span><span class="v h" style="font-size:10px">${th(latest.txid)}</span></div><div class="ki"><span class="k">at</span><span class="v" style="font-size:10px">${ta(latest.broadcast_time)} ago</span></div></div>`;
+  } else if(sc.readySignal){
+   state='ready'; badge=`<span class="b i">ready</span>`;
+   lastTx=`<div class="mu" style="font-size:10px;margin-top:4px">${sc.readySignal}</div>`;
+  } else {
+   state='inactive'; badge=`<span class="b" style="background:#21262d;color:#484f58">not fired</span>`;
+  }
+  const borderColor=state==='fired'?'#3fb950':state==='ready'?'#58a6ff':'#30363d';
+  h+=`<div style="border:1px solid ${borderColor};border-radius:6px;padding:8px 10px;background:#0d1117">`;
+  h+=`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">`;
+  h+=`<div><span style="font-size:14px;margin-right:4px">${sc.icon}</span><span style="font-weight:600;font-size:12px">${sc.name}</span></div>`;
+  h+=`<div>${badge}</div>`;
+  h+=`</div>`;
+  h+=`<div class="mu" style="font-size:10px;margin-top:4px">${sc.blurb}</div>`;
+  h+=lastTx;
+  h+=`</div>`;
+ }
+ h+=`</div></div>`;
+ // Recent broadcasts table (raw broadcast_log) + on-chain badges
+ if(log.length){
+  h+=`<div class="s"><div class="st"><span>Recent broadcasts</span><span class="c">${log.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>Source</th><th>Result</th><th>TXID</th><th>On-chain status</th><th>When</th></tr>`;
+  for(const r of log){
+   const rc=r.result==='ok'?'b ok':r.result==='failed'?'b dn':'b i';
+   h+=`<tr><td>${r.id}</td><td><code>${r.source||'?'}</code></td><td><span class="${rc}">${r.result||'?'}</span></td><td class="h">${th(r.txid)}</td><td>${txBadge(D,r.txid)}</td><td>${ta(r.broadcast_time)} ago</td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
  return h;
 }
 
@@ -1331,6 +1605,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
  h+=`<div class="tp ${curTab==='txinv'?'show':''}" id="t-txinv">${rTxInventory(D)}</div>`;
+ h+=`<div class="tp ${curTab==='outcomes'?'show':''}" id="t-outcomes">${rOutcomes(D)}</div>`;
  h+=`<div class="tp ${curTab==='events'?'show':''}" id="t-events">${rEvents(D)}</div>`;
  document.getElementById('content').innerHTML=h;
 }
@@ -1361,6 +1636,8 @@ def main():
     p.add_argument("--lsp-db",default=None); p.add_argument("--client-db",default=None)
     p.add_argument("--btc-cli",default="bitcoin-cli"); p.add_argument("--btc-network",default="signet")
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
+    p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
+    p.add_argument("--btc-rpcport",default=None,help="bitcoind RPC port (for non-default deployments)")
     p.add_argument("--cln-cli",default="lightning-cli")
     p.add_argument("--cln-a-dir",default=None); p.add_argument("--cln-b-dir",default=None)
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
