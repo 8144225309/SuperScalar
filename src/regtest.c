@@ -802,6 +802,43 @@ int regtest_mine_blocks(regtest_t *rt, int n, const char *address) {
    sat/vB, so conversion = sat_kvb / 1000.0.  Returns 1 on success, 0 on
    error.  Caller-provided txid_out must be >= 65 bytes; pass NULL to
    ignore the returned txid. */
+/* Issue #5 follow-up: query the wallet's minimum-acceptable fee_rate
+   (sat/vB). Order: paytxfee from getwalletinfo (the wallet-level floor),
+   then getmempoolinfo.minrelaytxfee (the node-wide floor). Returns 0 on
+   error or 0.0 if no min found (caller treats as 'no clamp needed'). */
+static double regtest_get_min_fee_rate_sat_vb(regtest_t *rt) {
+    /* paytxfee is in BTC/kvB; convert to sat/vB via *1e8/1000 = *1e5. */
+    char *info = regtest_exec(rt, "getwalletinfo", "");
+    if (info) {
+        const char *p = strstr(info, "\"paytxfee\"");
+        if (p) {
+            const char *colon = strchr(p, ':');
+            if (colon) {
+                double btc_per_kvb = atof(colon + 1);
+                free(info);
+                if (btc_per_kvb > 0)
+                    return btc_per_kvb * 1e5;
+            }
+        }
+        free(info);
+    }
+    char *mp = regtest_exec(rt, "getmempoolinfo", "");
+    if (mp) {
+        const char *p = strstr(mp, "\"minrelaytxfee\"");
+        if (p) {
+            const char *colon = strchr(p, ':');
+            if (colon) {
+                double btc_per_kvb = atof(colon + 1);
+                free(mp);
+                if (btc_per_kvb > 0)
+                    return btc_per_kvb * 1e5;
+            }
+        }
+        free(mp);
+    }
+    return 0.0;
+}
+
 int regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
                                         double btc_amount,
                                         uint64_t fee_rate_sat_kvb,
@@ -825,6 +862,35 @@ int regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
              address, btc_amount, fee_rate_sat_vb);
     char *result = regtest_exec(rt, "sendtoaddress", params);
     if (!result) return 0;
+
+    /* Issue #5 follow-up: if bitcoind rejects fee_rate as below the
+       wallet/node minimum, query the min, bump to min+10% headroom, and
+       retry once.  Surfaces a clear warning rather than the cryptic -6. */
+    if (strstr(result, "lower than the minimum fee rate setting") ||
+        (strstr(result, "Fee rate") && strstr(result, "lower than the minimum"))) {
+        double min_rate_sat_vb = regtest_get_min_fee_rate_sat_vb(rt);
+        if (min_rate_sat_vb > 0 && min_rate_sat_vb > fee_rate_sat_vb) {
+            double new_rate_sat_vb = min_rate_sat_vb * 1.1;
+            uint64_t new_rate_sat_kvb = (uint64_t)(new_rate_sat_vb * 1000.0 + 0.5);
+            fprintf(stderr,
+                "regtest_fund_address_with_fee_rate: WARNING --fee-rate "
+                "%.4f sat/vB (%llu sat/kvB) is below wallet/node min %.4f "
+                "sat/vB; auto-bumping to %.4f sat/vB (%llu sat/kvB) and "
+                "retrying once. Pass --fee-rate %llu or higher to avoid "
+                "the bump.\n",
+                fee_rate_sat_vb,
+                (unsigned long long)fee_rate_sat_kvb,
+                min_rate_sat_vb, new_rate_sat_vb,
+                (unsigned long long)new_rate_sat_kvb,
+                (unsigned long long)new_rate_sat_kvb);
+            free(result);
+            snprintf(params, sizeof(params),
+                     "\"%s\" %.8f \"\" \"\" false true null \"unset\" false %.6f",
+                     address, btc_amount, new_rate_sat_vb);
+            result = regtest_exec(rt, "sendtoaddress", params);
+            if (!result) return 0;
+        }
+    }
 
     char *start = result;
     while (*start == '"' || *start == ' ' || *start == '\n') start++;
