@@ -970,9 +970,15 @@ function rFactory(D){
   for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
   h+=`</table>`;
   h+=`</div>`;}
- // Signing Progress (MuSig2 nonce/sig collection)
+ // Signing Progress (MuSig2 nonce/sig collection).  D2: the table is a
+ // crash-recovery SNAPSHOT — rows are written during an in-progress
+ // ceremony and cleared on success.  Empty = no ceremony in flight = OK.
  const sp=lsp.signing_progress||[];
- if(sp.length){h+=`<div class="s"><div class="st"><span>Signing Progress (MuSig2)</span><span class="c">${sp.length} entries</span></div>`;
+ if(!sp.length){
+  h+=`<div class="s"><div class="st"><span>Signing Progress (MuSig2)</span><span class="c">no ceremony in flight</span></div>`;
+  h+=`<p class="mu">Empty by design — <code>signing_progress</code> is a crash-recovery snapshot. Rows appear during an in-progress nonce/psig round and are cleared by <code>persist_clear_signing_progress</code> on ceremony success. Empty means the last ceremony completed cleanly.</p>`;
+  h+=`</div>`;
+ } else if(sp.length){h+=`<div class="s"><div class="st"><span>Signing Progress (MuSig2)</span><span class="c">${sp.length} entries — ceremony in flight</span></div>`;
   // Group by factory_id + node_index
   const byNode={};sp.forEach(s=>{const k=s.factory_id+'_'+s.node_index;if(!byNode[k])byNode[k]=[];byNode[k].push(s);});
   h+=`<table><tr><th>Factory</th><th>Node</th><th>Slot</th><th>Nonce</th><th>Partial Sig</th><th>Updated</th></tr>`;
@@ -1182,13 +1188,19 @@ function rWatchtower(D){
 function rTxInventory(D){
  const db=D.databases||{},lsp=db.lsp||{};
  const facs=lsp.factories||[];
+ const cl=db.client||{};
  const tn=lsp.tree_nodes_bytes||[];
  const fundBytes=lsp.factory_funding_bytes||[];
  const psChain=lsp.ps_leaf_chains||[];
  const psSub=lsp.ps_subfactory_chains||[];
  const psInit=lsp.ps_initial_signed_states||[];
- const sigCom=lsp.signed_commitments||[];
- const distTx=lsp.distribution_txs||[];
+ // D1: distribution_txs and signed_commitments are persisted CLIENT-side by
+ // design (the inverted-timelock recovery TX must reach clients so they can
+ // broadcast at CLTV timeout without LSP cooperation; commitment sigs are
+ // each side's own).  Merge LSP + client views — in practice the client.db
+ // is where the rows actually live.
+ const sigCom=[...(lsp.signed_commitments||[]),...(cl.signed_commitments||[])];
+ const distTx=[...(lsp.distribution_txs||[]),...(cl.distribution_txs||[])];
  const jits=lsp.jit_channels||[];
  const wtPending=lsp.watchtower_pending||[];
  const pendSweeps=lsp.pending_sweeps||[];
@@ -1236,8 +1248,8 @@ function rTxInventory(D){
  cat('PS leaf chain[1..N]',  'ps_leaf_chains.signed_tx_hex',      psChainSigned, psChainSigned,   'LSP or client');
  cat('PS sub-factory chain', 'ps_subfactory_chains.signed_tx_hex',psSubSigned,   psSubSigned,     'LSP or client');
  cat('Poison TXs (trustless)','ps_*_chains.poison_tx_hex',         psPoisonHave,  psPoisonExpected,'Watchtower');
- cat('Channel commitments',  'signed_commitments.signed_tx_hex',  comSigned,     comExpected,     'Side holder');
- cat('Distribution TX (recovery)','distribution_txs.signed_tx_hex',distSigned,   distExpected,    'ANY client at CLTV timeout');
+ cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder');
+ cat('Distribution TX (recovery)','distribution_txs (client-side)', distSigned,   distExpected,    'ANY client at CLTV timeout');
  cat('JIT channel funding',  'jit_channels.funding_tx_hex',       jitSigned,     jitSigned,       'LSP');
  h+=`</table></div>`;
 

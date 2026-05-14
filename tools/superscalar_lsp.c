@@ -3199,6 +3199,16 @@ accept_new_factory:
     }
     printf("LSP: funded %llu sats, txid: %s\n",
            (unsigned long long)funding_sats, funding_txid_hex);
+    /* A2: log the funding TX broadcast.  Other broadcast paths
+       (watchtower, rotation, jit, broadcast_factory_tree) already log;
+       the factory-creation funding path was the one gap that left
+       broadcast_log empty for the happy-path run.  Placed after the
+       unified funding print so it fires regardless of which underlying
+       path actually broadcast (HD wallet / regtest RPC wallet /
+       light-client). */
+    if (g_db)
+        persist_log_broadcast(g_db, funding_txid_hex,
+                               "factory_funding", NULL, "ok");
 
     /* Get funding output details */
     unsigned char funding_txid[32];
