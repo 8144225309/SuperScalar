@@ -177,6 +177,47 @@ def collect_databases(cfg):
             "SELECT factory_id, COUNT(*) as cnt "
             "FROM factory_revocation_secrets GROUP BY factory_id")
         data[label]["factory_revocations_by_factory"] = rows if not err else []
+        # PS leaf chains (schema v20+): canonical pseudo-Spilman leaf state
+        # chains.  Each row is chain[N] for a given (factory_id, leaf_node_idx),
+        # with chan_amount_sats decreasing as the LSP sells liquidity into the
+        # leaf and poison_tx_hex (v22+) carrying the per-position wire-signed
+        # poison TX for the trustless watchtower defense.
+        rows, err = query_db(path,
+            "SELECT factory_id, leaf_node_idx, chain_pos, txid, "
+            "chan_amount_sats, "
+            "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
+            "  THEN 1 ELSE 0 END AS has_poison "
+            "FROM ps_leaf_chains "
+            "ORDER BY factory_id, leaf_node_idx, chain_pos")
+        data[label]["ps_leaf_chains"] = rows if not err else []
+        # PS sub-factory chains (schema v21+): k² wide-leaves shape.  Each row
+        # carries sales_stock_amount_sats + channel_amounts_csv for the
+        # per-sub-factory chain.  Empty when --ps-subfactory-arity=1.
+        rows, err = query_db(path,
+            "SELECT factory_id, sub_node_idx, chain_pos, txid, "
+            "sales_stock_amount_sats, channel_amounts_csv, "
+            "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
+            "  THEN 1 ELSE 0 END AS has_poison "
+            "FROM ps_subfactory_chains "
+            "ORDER BY factory_id, sub_node_idx, chain_pos")
+        data[label]["ps_subfactory_chains"] = rows if not err else []
+        # PS chain[0] initial signed states (schema v23+): the chain origin TX
+        # for each PS leaf / sub-factory.  Empty rows here when other PS
+        # tables are populated indicates the v0.1.15 force-close-fails-with-25
+        # bug pattern.
+        rows, err = query_db(path,
+            "SELECT factory_id, node_idx, txid "
+            "FROM ps_initial_signed_states "
+            "ORDER BY factory_id, node_idx")
+        data[label]["ps_initial_signed_states"] = rows if not err else []
+        # Client-side PS double-spend defense (schema v20+): one row per
+        # (factory_id, parent_txid, parent_vout) the client has co-signed.
+        # Aggregate per leaf to keep the dashboard payload small.
+        rows, err = query_db(path,
+            "SELECT factory_id, leaf_node_idx, COUNT(*) as cnt "
+            "FROM client_ps_signed_inputs "
+            "GROUP BY factory_id, leaf_node_idx")
+        data[label]["ps_signed_inputs_by_leaf"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -224,11 +265,72 @@ def collect_cln(cfg):
                 except: pass
     return data
 
+def collect_factory_config(cfg):
+    """Parse the LSP process cmdline to extract deployment knobs.
+    Returns the live --arity, --ps-subfactory-arity and the rest of the
+    economic/lifecycle flags so the Factory tab has an anchor for
+    'what shape am I actually looking at'."""
+    out = {"available": False}
+    try:
+        r = subprocess.run(["pgrep", "-f", "superscalar_lsp"],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode != 0: return out
+        for pid in r.stdout.strip().split("\n"):
+            if not pid.strip(): continue
+            try:
+                with open("/proc/" + pid + "/cmdline", "rb") as f:
+                    argv = f.read().decode("utf-8", "replace").split("\x00")
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            argv = [a for a in argv if a]
+            if cfg.lsp_db and cfg.lsp_db not in argv: continue
+            def flag_val(name, default=None):
+                if name in argv:
+                    i = argv.index(name)
+                    if i + 1 < len(argv) and not argv[i+1].startswith("--"):
+                        return argv[i+1]
+                return default
+            def flag_present(name): return name in argv
+            out.update({
+                "available": True, "pid": int(pid),
+                "arity": flag_val("--arity", "3"),
+                "ps_subfactory_arity": flag_val("--ps-subfactory-arity", "1"),
+                "clients": flag_val("--clients"),
+                "amount": flag_val("--amount"),
+                "network": flag_val("--network", "regtest" if flag_present("--regtest") else None),
+                "port": flag_val("--port"),
+                "lsp_balance_pct": flag_val("--lsp-balance-pct", "100"),
+                "placement_mode": flag_val("--placement-mode", "sequential"),
+                "economic_mode": flag_val("--economic-mode", "lsp-takes-all"),
+                "routing_fee_ppm": flag_val("--routing-fee-ppm", "0"),
+                "default_profit_bps": flag_val("--default-profit-bps", "0"),
+                "active_blocks": flag_val("--active-blocks"),
+                "dying_blocks": flag_val("--dying-blocks"),
+                "step_blocks": flag_val("--step-blocks", "10"),
+                "states_per_layer": flag_val("--states-per-layer", "4"),
+                "fee_rate": flag_val("--fee-rate", "1000"),
+                "fee_bump_after": flag_val("--fee-bump-after", "6"),
+                "fee_bump_max": flag_val("--fee-bump-max", "3"),
+                "settlement_interval": flag_val("--settlement-interval", "144"),
+                "daemon": flag_present("--daemon"),
+                "demo": flag_present("--demo"),
+                "cli": flag_present("--cli"),
+                "no_jit": flag_present("--no-jit"),
+                "onion": flag_present("--onion"),
+                "tor_only": flag_present("--tor-only"),
+                "i_accept_risk": flag_present("--i-accept-the-risk"),
+            })
+            return out
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
 def collect_all(cfg):
     if cfg.demo: return collect_demo()
     return {"timestamp": time.strftime("%H:%M:%S"),
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
-        "databases": collect_databases(cfg), "cln": collect_cln(cfg)}
+        "databases": collect_databases(cfg), "cln": collect_cln(cfg),
+        "factory_config": collect_factory_config(cfg)}
 
 # ---------------------------------------------------------------------------
 # Demo mode
@@ -620,10 +722,169 @@ function rOverview(D){
  return h;
 }
 
+// === Factory Configuration card (live LSP cmdline) ===
+function rConfig(D){
+ const c=D.factory_config||{};
+ if(!c.available)return '';
+ // Decode arity to a human-readable leaf-mechanism label
+ const a=String(c.arity||'?');
+ let shape;
+ if(a==='3')shape='PS canonical';
+ else if(a==='2')shape='DW arity-2 (legacy)';
+ else if(a==='1')shape='DW arity-1 (legacy)';
+ else if(a.indexOf(',')>=0)shape=`mixed [${a}]`;
+ else shape=`arity ${a}`;
+ const subk=String(c.ps_subfactory_arity||'1');
+ const wideLabel=subk==='1'?'no wide leaves':`k² wide leaves (k=${subk})`;
+ const shapeColor=a==='3'?'#3fb950':(a==='1'||a==='2')?'#d29922':'#58a6ff';
+ let h=`<div class="s"><div class="st"><span>Factory Configuration</span><span class="c">live cmdline (pid ${c.pid||'?'})</span></div>`;
+ // Headline row: the two knobs that change the protocol shape
+ h+=`<div class="kv" style="margin-bottom:8px">`;
+ h+=`<div class="ki"><span class="k">Leaf shape</span><span class="v" style="color:${shapeColor};font-weight:700">${shape}</span></div>`;
+ h+=`<div class="ki"><span class="k">Sub-factory arity</span><span class="v">${wideLabel}</span></div>`;
+ h+=`<div class="ki"><span class="k">Clients</span><span class="v">${c.clients||'—'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Funding</span><span class="v">${fs(c.amount)}</span></div>`;
+ h+=`<div class="ki"><span class="k">Network</span><span class="v">${c.network||'—'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Port</span><span class="v">${c.port||'—'}</span></div>`;
+ h+=`</div>`;
+ // Economics row
+ h+=`<div class="kv" style="margin-bottom:8px">`;
+ h+=`<div class="ki"><span class="k">LSP balance %</span><span class="v">${c.lsp_balance_pct||'?'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Placement</span><span class="v">${c.placement_mode||'?'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Economic mode</span><span class="v">${c.economic_mode||'?'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Routing fee</span><span class="v">${c.routing_fee_ppm||'0'} ppm</span></div>`;
+ h+=`<div class="ki"><span class="k">Default profit</span><span class="v">${c.default_profit_bps||'0'} bps</span></div>`;
+ h+=`<div class="ki"><span class="k">Settlement</span><span class="v">every ${c.settlement_interval||'?'} blk</span></div>`;
+ h+=`</div>`;
+ // Lifecycle + fees row
+ h+=`<div class="kv">`;
+ h+=`<div class="ki"><span class="k">Active blocks</span><span class="v">${c.active_blocks||'—'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Dying blocks</span><span class="v">${c.dying_blocks||'—'}</span></div>`;
+ h+=`<div class="ki"><span class="k">DW step blocks</span><span class="v">${c.step_blocks||'?'}</span></div>`;
+ h+=`<div class="ki"><span class="k">States/layer</span><span class="v">${c.states_per_layer||'?'}</span></div>`;
+ h+=`<div class="ki"><span class="k">Fee rate</span><span class="v">${c.fee_rate||'?'} sat/kvB</span></div>`;
+ h+=`<div class="ki"><span class="k">Fee bump</span><span class="v">after ${c.fee_bump_after||'?'}, max ${c.fee_bump_max||'?'}</span></div>`;
+ h+=`</div>`;
+ // Mode/flag badges
+ const flags=[];
+ if(c.daemon)flags.push(['daemon','b i']);
+ if(c.demo)flags.push(['demo','b i']);
+ if(c.cli)flags.push(['cli','b i']);
+ if(c.no_jit)flags.push(['no-jit','b w']);
+ if(c.onion)flags.push(['tor onion','b i']);
+ if(c.tor_only)flags.push(['tor-only','b i']);
+ if(c.i_accept_risk)flags.push(['mainnet-risk','b dn']);
+ if(flags.length){
+  h+=`<div style="margin-top:8px">`;
+  for(const[t,cls]of flags)h+=`<span class="${cls}" style="margin-right:4px">${t}</span>`;
+  h+=`</div>`;
+ }
+ h+=`</div>`;
+ return h;
+}
+
+// === PS Leaf Chains panel (canonical pseudo-Spilman state mechanism) ===
+function rPsChains(D){
+ const db=D.databases||{},lsp=db.lsp||{};
+ const chains=lsp.ps_leaf_chains||[];
+ const initial=lsp.ps_initial_signed_states||[];
+ const sigInputs=lsp.ps_signed_inputs_by_leaf||[];
+ const subChains=lsp.ps_subfactory_chains||[];
+ const tn=lsp.tree_nodes||[];
+ // Tree nodes that look like PS leaves: state nodes with nSequence = 0xFFFFFFFE
+ const psLeafNodes=tn.filter(n=>n.type==='state'&&n.nsequence===4294967294);
+ // Nothing to show if both no chains and no PS leaves in the tree
+ if(!chains.length&&!initial.length&&!subChains.length&&!psLeafNodes.length)return '';
+ // Group leaf chain rows by (factory_id, leaf_node_idx)
+ const byLeaf={};
+ for(const r of chains){
+  const k=`${r.factory_id}_${r.leaf_node_idx}`;
+  if(!byLeaf[k])byLeaf[k]={factory_id:r.factory_id,leaf_node_idx:r.leaf_node_idx,entries:[]};
+  byLeaf[k].entries.push(r);
+ }
+ // chain[0] / sig-defense lookups
+ const initMap={};for(const r of initial)initMap[`${r.factory_id}_${r.node_idx}`]=r;
+ const sigMap={};for(const r of sigInputs)sigMap[`${r.factory_id}_${r.leaf_node_idx}`]=r.cnt;
+ const leafKeys=Object.keys(byLeaf).sort();
+ let h=`<div class="s"><div class="st"><span>PS Leaf Chains</span><span class="c">${leafKeys.length||psLeafNodes.length} leaves</span></div>`;
+ // Trustless coverage headline: poison-TX presence across all PS chain entries
+ let totalPos=0,totalCovered=0;
+ for(const r of chains){totalPos++;if(r.has_poison)totalCovered++;}
+ for(const r of subChains){totalPos++;if(r.has_poison)totalCovered++;}
+ if(totalPos>0){
+  const pct=Math.round(100*totalCovered/totalPos);
+  const cls=pct===100?'b ok':pct>=80?'b i':'b w';
+  h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">Trustless poison-TX coverage</span><span class="${cls}">${totalCovered}/${totalPos} positions (${pct}%)</span></div></div>`;
+ }
+ // Empty-but-PS-leaves-exist banner (catches the v0.1.15 persistence gap)
+ if(!leafKeys.length&&psLeafNodes.length){
+  h+=`<p class="mu">No PS chain advances yet. ${psLeafNodes.length} PS leaf state nodes exist in the tree — they'll start populating <code>ps_leaf_chains</code> when leaf advances fire.</p>`;
+  if(!initial.length){
+   h+=`<p class="mu" style="color:#d29922">⚠ ${psLeafNodes.length} PS leaves but no rows in <code>ps_initial_signed_states</code>. This is the v0.1.15 force-close-fails-with-25 pattern — chain[0] bytes not persisted on advance.</p>`;
+  }
+  h+=`</div>`;return h;
+ }
+ // Per-leaf summary table
+ if(leafKeys.length){
+  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th>Latest TXID</th></tr>`;
+  for(const k of leafKeys){
+   const e=byLeaf[k];
+   e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
+   const latest=e.entries[e.entries.length-1];
+   const init=initMap[`${e.factory_id}_${e.leaf_node_idx}`];
+   const cov=e.entries.filter(x=>x.has_poison).length;
+   const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
+   const cls=pct===100?'b ok':pct>=80?'b i':'b w';
+   const sig=sigMap[`${e.factory_id}_${e.leaf_node_idx}`]||0;
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${e.entries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="h">${th(latest.txid)}</td></tr>`;
+  }
+  h+=`</table>`;
+ }
+ // Per-leaf chain detail (one mini-table per leaf showing chain[0..N])
+ for(const k of leafKeys){
+  const e=byLeaf[k];
+  e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
+  const init=initMap[`${e.factory_id}_${e.leaf_node_idx}`];
+  h+=`<div style="margin-top:12px"><div class="st" style="margin-bottom:4px"><span>Leaf node ${e.leaf_node_idx} (factory #${e.factory_id}) progression</span><span class="c">${e.entries.length} advances</span></div>`;
+  h+=`<table><tr><th>chain_pos</th><th class="r">channel amount</th><th>poison TX</th><th>TXID</th></tr>`;
+  if(init)h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b ok">persisted</span></td><td class="h">${th(init.txid)}</td></tr>`;
+  else h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b dn">missing</span></td><td class="mu">no row in ps_initial_signed_states</td></tr>`;
+  for(const ent of e.entries){
+   h+=`<tr><td>${ent.chain_pos}</td><td class="r">${fs(ent.chan_amount_sats)}</td><td>${ent.has_poison?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td><td class="h">${th(ent.txid)}</td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
+ // PS sub-factory chains (k² wide leaves)
+ if(subChains.length){
+  const bySub={};
+  for(const r of subChains){
+   const k=`${r.factory_id}_${r.sub_node_idx}`;
+   if(!bySub[k])bySub[k]={factory_id:r.factory_id,sub_node_idx:r.sub_node_idx,entries:[]};
+   bySub[k].entries.push(r);
+  }
+  const subKeys=Object.keys(bySub).sort();
+  h+=`<div style="margin-top:14px;border-top:1px solid #30363d;padding-top:10px">`;
+  h+=`<div class="st"><span>PS Sub-Factory Chains (k² wide leaves)</span><span class="c">${subKeys.length} sub-factories</span></div>`;
+  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th>Latest TXID</th></tr>`;
+  for(const k of subKeys){
+   const e=bySub[k];
+   e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
+   const latest=e.entries[e.entries.length-1];
+   const cov=e.entries.filter(x=>x.has_poison).length;
+   const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
+   const cls=pct===100?'b ok':pct>=80?'b i':'b w';
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${e.entries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="h">${th(latest.txid)}</td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
+ h+=`</div>`;
+ return h;
+}
+
 // === TAB: Factory ===
 function rFactory(D){
  const db=D.databases||{},lsp=db.lsp||{},facs=lsp.factories||[],parts=lsp.participants||[];
- let h='';
+ let h=rConfig(D);
  // Factory detail
  h+=`<div class="s"><div class="st"><span>Factory (N+1-of-N+1 MuSig2 UTXO)</span><span class="c">${facs.length}</span></div>`;
  for(const f of facs){
@@ -700,6 +961,8 @@ function rFactory(D){
     for(let s=0;s<ly.max_states;s++){const c=s<ly.current_state?'u':s===ly.current_state?'cu':'av';h+=`<div class="lc ${c}">${s}</div>`;}h+=`</div>`;}
    h+=`</div>`;}
   h+=`</div>`;}
+ // PS leaf chain panel (canonical pseudo-Spilman; populated on leaf advance)
+ h+=rPsChains(D);
  return h;
 }
 
