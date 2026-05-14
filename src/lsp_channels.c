@@ -6341,6 +6341,41 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
     return lsp_advance_leaf(mgr, lsp, leaf_side);
 }
 
+/* Tick the factory's root counter forward (PS Tier B production trigger).
+   For PS factories, leaf advances are chain extension and don't drive root
+   state — root must be ticked by an external time/block source.  When the
+   root counter rolls over, drives the Tier B ceremony to re-sign every
+   non-PS-leaf node for the new epoch.
+
+   Caller wires this into a block-driven polling loop (e.g., every
+   step_blocks blocks, or based on observed block height progression).
+
+   Returns:
+     1 = ceremony completed (epoch advanced + non-PS-leaf nodes re-signed),
+     0 = nothing to do (no rollover this tick),
+    -1 = ceremony failed (caller may retry next tick). */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+    int rc = factory_tick_root(f);
+    if (rc != -1) {
+        return 0;
+    }
+    printf("LSP: root counter rolled over to epoch %u — running Tier B ceremony\n",
+           f->counter.current_epoch);
+    /* trigger_leaf = -1 signals to client_handle_state_advance that this is
+       a root-driven rollover (no specific leaf was advanced). */
+    int sa_rc = lsp_run_state_advance(mgr, lsp, -1);
+    if (sa_rc) {
+        printf("LSP: Tier B ceremony complete for epoch %u\n",
+               f->counter.current_epoch);
+        return 1;
+    }
+    fprintf(stderr, "LSP: Tier B ceremony failed for epoch %u\n",
+            f->counter.current_epoch);
+    return -1;
+}
+
 /* PR-B (v22): post-recovery watchtower rehydration.
 
    For every PS leaf with chain_len >= 2, look up chain[N-1].txid (the

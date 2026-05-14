@@ -501,6 +501,14 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
 
+/* Tick the root DW counter forward (PS Tier B trigger).  For PS factories,
+   leaf advances are chain extension (no counter) — root rollover is driven
+   by block-height progression instead.  Caller (LSP) wires this into a
+   block-polling loop and runs Tier B on rc=-1.
+   Returns -1 on epoch rollover (trees rebuilt; run Tier B);
+   0 otherwise (no rollover or fully exhausted). */
+int factory_tick_root(factory_t *f);
+
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
 
    Drives the canonical "buy liquidity from sales-stock" operation:

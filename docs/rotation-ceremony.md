@@ -211,6 +211,66 @@ multi-process test.  Both compose: 14 nodes re-signed for the new
 epoch via bundled MuSig over 5 separate OS processes, and the
 post-rollover tree confirms on regtest.
 
+## PS factory variant (block-driven root rollover)
+
+The Tier B mechanism above was designed for DW factories: leaf-counter
+exhaustion drives root rollover.  PS factories don't have a leaf-level
+counter — leaves chain-extend (chain[0]→chain[1]→...) so leaf events
+don't tick anything at the root layer.
+
+For PS factories, root rollover is **block-driven** instead.  The root
+DW counter is a finite state space sized by `step_blocks` ×
+`states_per_layer`, and it must advance over time as block height
+progresses so the factory eventually reaches expiry.
+
+### Trigger
+
+- `src/factory.c::factory_tick_root(f)` — advance root DW counter; on
+  rollover, increment `current_epoch`, reset every PS leaf's
+  `ps_chain_len` to 0 (chain history is on-chain state of the OLD
+  epoch), rebuild every node's unsigned TX, return -1.  Caller drives
+  Tier B.
+- `src/lsp_channels.c::lsp_factory_tick_root(mgr, lsp)` — LSP-side
+  helper that ties `factory_tick_root` + `lsp_run_state_advance(-1)`.
+
+### Wire compatibility with the existing ceremony
+
+The existing `lsp_run_state_advance` + `client_handle_state_advance`
+flow is reused unchanged.  The only addition is a special value
+`trigger_leaf == -1` in `MSG_STATE_ADVANCE_PROPOSE`:
+
+- `trigger_leaf >= 0` (existing): client mirrors LSP by driving the
+  same leaf advance in a loop until its own `factory_advance_leaf_unsigned`
+  returns -1.
+- `trigger_leaf == -1` (NEW for PS): client calls `factory_tick_root`
+  locally to mirror the LSP's root-counter advance.
+
+After local rollover, both sides converge on the same `affected[] =
+non-PS-leaf nodes` set and the rest of the ceremony (PATH_NONCE_BUNDLE
+→ PATH_ALL_NONCES → PATH_PSIG_BUNDLE → PATH_SIGN_DONE) is identical to
+the DW case.
+
+### Production wiring
+
+The LSP daemon should call `lsp_factory_tick_root` from a block-driven
+polling loop — e.g., when observed block height crosses
+`factory_start_height + (current_state + 1) * step_blocks`.  This call
+is idempotent: returns 0 when no rollover is due, 1 when ceremony
+completes for an epoch advance, -1 on ceremony failure (retry next
+tick).
+
+### Test driver
+
+`tools/superscalar_lsp_pre_daemon_tests.inc::test_tier_b_rollover`
+detects PS vs DW factory and dispatches:
+
+- DW (`--arity 1`): drives `lsp_channels_advance_ps_leaf` in a loop
+  (existing).
+- PS (`--arity 3`): drives `lsp_factory_tick_root` in a loop (NEW).
+
+Both paths produce identical end states: every non-PS-leaf node
+re-signed with `signed_tx` for the new epoch.
+
 ## Cross-references
 
 - Tier A (single-process): `src/factory.c::factory_advance` (PR #112)

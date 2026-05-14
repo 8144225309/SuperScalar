@@ -506,4 +506,11 @@ int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
    leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
 int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
+
+/* Tick the factory's root counter forward (PS Tier B trigger).
+   For PS factories, root rollover is block-driven (leaves chain-extend).
+   On rollover, drives Tier B ceremony to re-sign every non-PS-leaf node
+   for the new epoch.  Returns 1 = ceremony complete, 0 = no rollover,
+   -1 = ceremony failed.  See src/lsp_channels.c for caller wiring. */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

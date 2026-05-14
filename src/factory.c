@@ -2299,6 +2299,50 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     return 1;
 }
 
+/* Tick the root DW counter forward.  Used by PS factories to drive
+   epoch rollover from block-height progression (instead of leaf-counter
+   exhaustion, which PS leaves don't have — they chain-extend instead).
+
+   The caller wires this into a block-driven polling loop:
+     - Every step_blocks blocks of progression, call factory_tick_root.
+     - On rc=-1 return, run the Tier B ceremony (lsp_run_state_advance).
+
+   For DW factories the equivalent rollover is triggered by leaf-counter
+   exhaustion in factory_advance_leaf_unsigned (rc=-1 from there).  Both
+   paths converge on the same Tier B ceremony.
+
+   Returns:
+     -1 = root counter rolled over; non-PS-leaf trees rebuilt; caller
+          must run Tier B to re-sign every non-PS-leaf node for the
+          new epoch.  PS leaves' ps_chain_len resets to 0 (their
+          on-chain chain history from the OLD epoch is preserved as
+          historical state; the NEW epoch starts fresh chain[0]).
+      0 = no rollover (root counter advanced within current epoch, or
+          fully exhausted — caller should check current_epoch + state
+          to distinguish). */
+int factory_tick_root(factory_t *f) {
+    if (!f) return 0;
+    /* Advance the root layer (layers[0]).  dw_advance ticks a single layer;
+       dw_counter_advance walks all layers + handles overall counter — not
+       what we want here.  We're mirroring the rc=-1 path in
+       factory_advance_leaf_unsigned (DW branch) which uses dw_advance on
+       layers[0] when leaf-counter exhaustion bubbles up. */
+    if (!dw_advance(&f->counter.layers[0]))
+        return 0;  /* fully exhausted */
+    f->counter.current_epoch++;
+    /* Reset PS leaf chain_len for the new epoch.  On-chain chain[0..N-1]
+       entries remain valid historical states; the in-memory chain_len
+       resets so the next leaf advance builds chain[0] for the new epoch. */
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        size_t li = f->leaf_node_indices[i];
+        if (f->nodes[li].is_ps_leaf)
+            f->nodes[li].ps_chain_len = 0;
+    }
+    if (!update_l_stock_outputs(f)) return 0;
+    if (!build_all_unsigned_txs(f)) return 0;
+    return -1;
+}
+
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242).
 
    "Buy liquidity from sales-stock" operation: client at
