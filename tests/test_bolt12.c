@@ -249,13 +249,17 @@ int test_offer_decode_bad_checksum(void)
  * v23=ps_initial_signed_states for force-close-after-advance chain history,
  * v24=epoch column on ps_leaf_chains / ps_initial_signed_states / ps_subfactory_chains (F2),
  * v25=signed_penalty_tx_hex on old_commitments (closes restart-loses-defense gap),
- * v26=signing_rounds journal + signing_round_participants (C3 ceremony forensics)) */
+ * v26=signing_rounds journal + signing_round_participants (C3 ceremony forensics),
+ * v27=watchtower_pending.fb_* columns (fee-bump escalation persist; PR-C-1),
+ * v28=force_close_watches + force_close_htlcs (PR-C-2),
+ * v29=reorg_events + breach_detections (observability; PR-C-6),
+ * v30=old_commitment_ptlcs (PR-PTLC-1 schema groundwork)) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 26, "schema version is 26 (v26 adds signing_rounds journal for ceremony forensics — C3)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 30, "schema version is 30 (v30 adds old_commitment_ptlcs — PR-PTLC-1)");
     persist_close(&p);
     return 1;
 }

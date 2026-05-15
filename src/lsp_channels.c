@@ -1466,6 +1466,20 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    /* C3 (Tier 1): journal the ceremony at start; success-update at the
+       final return below.  Error returns leave the row in flight for the
+       startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)f->leaf_node_indices[leaf_side],
+                                           "leaf_advance",
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
     /* Capture old state BEFORE advancing (for watchtower burn-tx and PS persist).
        For PS: n_outputs flips 2→1 after the first advance so we must record the
        old L-stock vout and amount here, not after. */
@@ -1917,6 +1931,14 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         printf("LSP: DW leaf %d advanced (node %zu), DW state %u\n",
                leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
     free(poison_snapshot);
+
+    /* C3 (Tier 1): journal ceremony success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)f->n_participants,
+                                          (uint32_t)f->n_participants,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
@@ -2136,6 +2158,15 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_bundle_count++;
     }
 
+    /* C3 Tier 2 (PR-C-4): record LSP-side nonce contribution once
+       (slot 0).  Per-node hooks aren't useful here — Tier 1's
+       signing_round row aggregates the whole ceremony; the participant
+       row marks "LSP completed its nonce generation". */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_nonce(
+            (persist_t *)mgr->persist, c3_round_id, /* signer_slot = */ 0);
+    }
+
     /* --- Step 2.5: Generate LSP's poison nonce pool over all prepared
        leaves where LSP is a signer (PR-D phase 3).  Mirrors Step 2 but
        feeds factory_session_set_nonce_poison + builds lsp_poison_bundle
@@ -2275,6 +2306,13 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (nmsg.json) cJSON_Delete(nmsg.json);
             free(all_nonces); free(all_poison_nonces);
             return 0;
+        }
+        /* C3 Tier 2 (PR-C-4): client c's nonce bundle arrived.  Clients
+           are slots 1..n_clients (LSP is slot 0). */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_nonce(
+                (persist_t *)mgr->persist, c3_round_id,
+                /* signer_slot = */ (uint32_t)(c + 1));
         }
         cJSON *arr = cJSON_GetObjectItem(nmsg.json, "entries");
         if (!arr) {
@@ -2427,6 +2465,13 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    /* C3 Tier 2 (PR-C-4): LSP completed its own psigs for all affected nodes. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_psig(
+            (persist_t *)mgr->persist, c3_round_id,
+            /* signer_slot = */ 0, "verified");
+    }
+
     /* PR-D phase 3: LSP's poison partial sigs per prepared leaf. */
     for (size_t lp = 0; lp < n_leaf_pre; lp++) {
         if (!leaf_poison_prepared[lp]) continue;
@@ -2460,6 +2505,12 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             pmsg.msg_type != MSG_PATH_PSIG_BUNDLE) {
             fprintf(stderr, "LSP state_advance: expected PATH_PSIG_BUNDLE from client %zu, got 0x%02x\n",
                     c, pmsg.msg_type);
+            /* C3 Tier 2: record this client's psig as missing/rejected. */
+            if (mgr->persist && c3_round_id > 0) {
+                persist_save_signing_round_participant_psig(
+                    (persist_t *)mgr->persist, c3_round_id,
+                    (uint32_t)(c + 1), "rejected");
+            }
             if (pmsg.json) cJSON_Delete(pmsg.json);
             return 0;
         }
@@ -2472,22 +2523,41 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         wire_bundle_entry_t *cents = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!cents) { cJSON_Delete(pmsg.json); return 0; }
         size_t ne = wire_parse_bundle(arr, cents, cap, 32);
+        int psig_ok = 1;
         for (size_t e = 0; e < ne; e++) {
             secp256k1_musig_partial_sig psig;
             if (!musig_partial_sig_parse(lsp->ctx, &psig, cents[e].data)) {
                 fprintf(stderr, "LSP state_advance: bad psig from client %zu\n", c);
+                psig_ok = 0;
                 free(cents); cJSON_Delete(pmsg.json);
+                if (mgr->persist && c3_round_id > 0) {
+                    persist_save_signing_round_participant_psig(
+                        (persist_t *)mgr->persist, c3_round_id,
+                        (uint32_t)(c + 1), "rejected");
+                }
                 return 0;
             }
             if (!factory_session_set_partial_sig(f, cents[e].node_idx,
                                                   cents[e].signer_slot, &psig)) {
                 fprintf(stderr, "LSP state_advance: set_partial_sig client=%zu node=%u slot=%u failed\n",
                         c, cents[e].node_idx, cents[e].signer_slot);
+                psig_ok = 0;
                 free(cents); cJSON_Delete(pmsg.json);
+                if (mgr->persist && c3_round_id > 0) {
+                    persist_save_signing_round_participant_psig(
+                        (persist_t *)mgr->persist, c3_round_id,
+                        (uint32_t)(c + 1), "rejected");
+                }
                 return 0;
             }
         }
         free(cents);
+        /* C3 Tier 2 (PR-C-4): all of client c's psigs parsed + accepted. */
+        if (psig_ok && mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_psig(
+                (persist_t *)mgr->persist, c3_round_id,
+                (uint32_t)(c + 1), "verified");
+        }
 
         /* PR-D phase 3: parse optional poison_entries (partial sigs). */
         size_t poison_psig_cap = (size_t)FACTORY_MAX_LEAVES * (size_t)FACTORY_MAX_SIGNERS;
@@ -2721,6 +2791,20 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
+
+    /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
+       flight for the startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)node_idx,
+                                           "leaf_realloc",
+                                           f->counter.current_epoch,
+                                           (uint32_t)node->n_signers,
+                                           &c3_round_id);
+    }
+    (void)c3_round_id;  /* finalized at success return below */
 
     if (node->n_signers < 2) {
         fprintf(stderr, "LSP realloc: leaf node %zu has %zu signers, need >= 2\n",
@@ -3124,6 +3208,13 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("%s%lu", i ? "," : "", (unsigned long)amounts[i]);
     printf("]\n");
 
+    /* C3 (Tier 1): journal success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)node->n_signers,
+                                          (uint32_t)node->n_signers,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
@@ -3159,6 +3250,20 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* k clients on this sub-factory (LSP is signer 0). */
     size_t n_clients_in_sub = sub->n_signers - 1;
     if (n_clients_in_sub == 0) return 0;
+
+    /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
+       flight for the startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)sub_node_i,
+                                           "sub_factory_advance",
+                                           f->counter.current_epoch,
+                                           (uint32_t)sub->n_signers,
+                                           &c3_round_id);
+    }
+    (void)c3_round_id;  /* finalized at success return below */
 
     /* v23 fix: on FIRST advance only, persist chain[0] (the initial
        signed state) so force-close after advance can broadcast the full
@@ -3616,6 +3721,14 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     printf("LSP: sub-factory %d.%d chain extended to len %d (client[%d]+=%llu sats)\n",
            leaf_side, sub_idx_in_leaf, sub->ps_chain_len,
            channel_idx_in_sub, (unsigned long long)delta_sats);
+
+    /* C3 (Tier 1): journal success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)sub->n_signers,
+                                          (uint32_t)sub->n_signers,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
