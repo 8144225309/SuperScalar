@@ -839,6 +839,7 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="channels">Channels & HTLCs</div>
  <div class="tab" data-t="payments">Payments</div>
  <div class="tab" data-t="protocol">Protocol Log</div>
+ <div class="tab" data-t="ceremonies">Ceremonies</div>
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
  <div class="tab" data-t="defense">Defense Status</div>
@@ -2126,6 +2127,137 @@ function rDefenseStatus(D){
  return h;
 }
 
+// === TAB: Ceremonies (signing rounds journal, reconstructed from wire_messages) ===
+// The LSP doesn't currently persist a signing_rounds journal (only the
+// signing_progress snapshot which is cleared on success).  But the
+// wire_messages protocol log contains every signing-round message and
+// can be reconstructed into per-ceremony entries client-side.  Phase 1
+// of C3.
+//
+// Each ceremony spans a known sequence of wire-message types between a
+// canonical start and end marker.  Messages are clustered into
+// ceremonies by (a) ceremony-type membership and (b) time-proximity, so
+// multi-client broadcasts of the same message (e.g. 4× FACTORY_PROPOSE
+// sent to each client at the same timestamp) collapse into one ceremony
+// entry.
+function rCeremonies(D){
+ const db=D.databases||{},lsp=db.lsp||{};
+ const wm=(lsp.wire_messages||[]).slice().sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)||(a.id||0)-(b.id||0));
+ // Map: msg_name -> {type, role: 'start' | 'mid' | 'end'}
+ const MAP={
+  // Factory creation: FACTORY_PROPOSE → NONCE_BUNDLE → ALL_NONCES → PSIG_BUNDLE → FACTORY_READY
+  FACTORY_PROPOSE: {type:'Factory creation',     role:'start',icon:'🏭'},
+  NONCE_BUNDLE:    {type:'Factory creation',     role:'mid'  ,icon:'🏭'},
+  ALL_NONCES:      {type:'Factory creation',     role:'mid'  ,icon:'🏭'},
+  PSIG_BUNDLE:     {type:'Factory creation',     role:'mid'  ,icon:'🏭'},
+  FACTORY_READY:   {type:'Factory creation',     role:'end'  ,icon:'🏭'},
+  // Sub-factory chain advance
+  SUBFACTORY_PROPOSE:    {type:'Sub-factory advance', role:'start',icon:'🌳'},
+  SUBFACTORY_NONCE:      {type:'Sub-factory advance', role:'mid'  ,icon:'🌳'},
+  SUBFACTORY_ALL_NONCES: {type:'Sub-factory advance', role:'mid'  ,icon:'🌳'},
+  SUBFACTORY_PSIG:       {type:'Sub-factory advance', role:'mid'  ,icon:'🌳'},
+  SUBFACTORY_DONE:       {type:'Sub-factory advance', role:'end'  ,icon:'🌳'},
+  // Per-leaf advance (PS or DW)
+  LEAF_ADVANCE_PROPOSE: {type:'Leaf advance',        role:'start',icon:'🌿'},
+  LEAF_ADVANCE_PSIG:    {type:'Leaf advance',        role:'mid'  ,icon:'🌿'},
+  LEAF_ADVANCE_DONE:    {type:'Leaf advance',        role:'end'  ,icon:'🌿'},
+  // Tier B rollover (root-driven path signing)
+  PATH_NONCE_BUNDLE: {type:'Tier B rollover',        role:'start',icon:'🔁'},
+  PATH_ALL_NONCES:   {type:'Tier B rollover',        role:'mid'  ,icon:'🔁'},
+  PATH_PSIG_BUNDLE:  {type:'Tier B rollover',        role:'mid'  ,icon:'🔁'},
+  PATH_SIGN_DONE:    {type:'Tier B rollover',        role:'end'  ,icon:'🔁'},
+  // Channel setup (basepoint exchange + initial commit)
+  CHANNEL_BASEPOINTS: {type:'Channel setup',         role:'start',icon:'🔗'},
+  CHANNEL_NONCES:     {type:'Channel setup',         role:'mid'  ,icon:'🔗'},
+  CHANNEL_READY:      {type:'Channel setup',         role:'end'  ,icon:'🔗'},
+  // PTLC key turnover (assisted exit, factory rotation)
+  PTLC_PRESIG:       {type:'PTLC key turnover',      role:'start',icon:'🔑'},
+  PTLC_ADAPTED_SIG:  {type:'PTLC key turnover',      role:'mid'  ,icon:'🔑'},
+  PTLC_COMPLETE:     {type:'PTLC key turnover',      role:'end'  ,icon:'🔑'},
+ };
+ // Group messages into ceremonies.  Algorithm:
+ //   - Walk chronologically.
+ //   - For each message known to MAP, either start a new ceremony or
+ //     extend the current one if the type matches and the time gap is
+ //     small (< 60s — ceremonies don't typically span minutes).
+ //   - When a new ceremony of a different type starts, close the current
+ //     one (with whatever end-marker it saw, or mark in-progress).
+ const MAX_GAP_SEC=60;
+ const ceremonies=[];
+ let cur=null;
+ const closeCur=()=>{if(cur){ceremonies.push(cur); cur=null;}};
+ for(const m of wm){
+  const cls=MAP[m.msg_name];
+  if(!cls)continue; // skip PING/PONG/etc.
+  if(cur && (cur.type!==cls.type || (m.timestamp-cur.last_ts)>MAX_GAP_SEC)){
+   closeCur();
+  }
+  if(!cur){
+   cur={
+    type:cls.type, icon:cls.icon,
+    first_ts:m.timestamp, last_ts:m.timestamp,
+    peers:new Set(), msg_names:new Set(),
+    msg_count:0, saw_end:false,
+    first_msg:m.msg_name, last_msg:m.msg_name,
+    first_id:m.id, last_id:m.id,
+   };
+  }
+  cur.last_ts=m.timestamp;
+  cur.last_msg=m.msg_name;
+  cur.last_id=m.id;
+  cur.peers.add(m.peer||'?');
+  cur.msg_names.add(m.msg_name);
+  cur.msg_count++;
+  if(cls.role==='end')cur.saw_end=true;
+ }
+ closeCur();
+
+ // Sort newest first
+ ceremonies.reverse();
+
+ // Aggregates
+ const total=ceremonies.length;
+ const complete=ceremonies.filter(c=>c.saw_end).length;
+ const inProgress=total-complete;
+ const ceremonyTypes={};
+ for(const c of ceremonies){ceremonyTypes[c.type]=(ceremonyTypes[c.type]||0)+1;}
+
+ let h='';
+ h+=`<div class="s"><div class="st"><span>Signing Rounds — Ceremony Journal</span><span class="c">reconstructed from wire_messages</span></div>`;
+ h+=`<p class="mu" style="font-size:11px;margin-bottom:8px">Reconstructed from <code>wire_messages</code> by grouping consecutive signing-related messages within ${MAX_GAP_SEC}s windows.  Will be replaced by direct <code>signing_rounds</code> query when the LSP-side schema add lands (currently the LSP only persists in-progress snapshot via <code>signing_progress</code>, cleared on success).</p>`;
+ if(total===0){
+  h+=`<p class="mu">No ceremonies detected. <code>wire_messages</code> may be empty or only contain non-signing traffic (PING/PONG, HELLO, etc.).</p>`;
+  h+=`</div>`;
+  return h;
+ }
+ // Summary row
+ h+=`<div class="kv" style="margin-bottom:8px">`;
+ h+=`<div class="ki"><span class="k">Total ceremonies</span><span class="v">${total}</span></div>`;
+ h+=`<div class="ki"><span class="k">Completed</span><span class="b ok">${complete}</span></div>`;
+ if(inProgress>0)h+=`<div class="ki"><span class="k">In progress / no end marker</span><span class="b w">${inProgress}</span></div>`;
+ for(const[t,c]of Object.entries(ceremonyTypes))h+=`<div class="ki"><span class="k">${t}</span><span class="v">${c}</span></div>`;
+ h+=`</div>`;
+ h+=`</div>`;
+
+ // Detail table
+ h+=`<div class="s"><div class="st"><span>Ceremony detail</span><span class="c">${total} entries (newest first)</span></div>`;
+ h+=`<table><tr><th>#</th><th>Type</th><th>Started</th><th class="r">Duration</th><th class="r">Peers</th><th class="r">Messages</th><th>Pattern</th><th>Outcome</th></tr>`;
+ for(let i=0;i<ceremonies.length;i++){
+  const c=ceremonies[i];
+  const duration=c.last_ts-c.first_ts;
+  const durStr=duration<1?'< 1s':duration<60?`${duration}s`:`${Math.floor(duration/60)}m${duration%60}s`;
+  const outcomeCls=c.saw_end?'b ok':'b w';
+  const outcomeText=c.saw_end?'success':'no end marker';
+  const peerList=Array.from(c.peers).filter(p=>p!=='unknown'&&p!=='?').join(', ')||Array.from(c.peers).join(', ');
+  const pattern=`${c.first_msg} → … → ${c.last_msg}`;
+  h+=`<tr><td>${total-i}</td><td><span style="font-size:14px;margin-right:4px">${c.icon}</span>${c.type}</td><td>${ta(c.first_ts)} ago</td><td class="r">${durStr}</td><td class="r" title="${peerList}">${c.peers.size}</td><td class="r">${c.msg_count}</td><td style="font-size:10px"><code>${pattern}</code></td><td><span class="${outcomeCls}">${outcomeText}</span></td></tr>`;
+ }
+ h+=`</table>`;
+ h+=`<p class="mu" style="font-size:10px;margin-top:6px">Duration is <code>last_ts - first_ts</code> across the ceremony's messages.  Peer count is distinct peers seen; multi-client broadcasts (e.g. one <code>FACTORY_PROPOSE</code> per client) are collapsed.  "no end marker" means the ceremony's canonical terminal message (e.g. <code>FACTORY_READY</code>) was not seen — could be in-flight, aborted, or pruned from the message log.</p>`;
+ h+=`</div>`;
+ return h;
+}
+
 // === TAB: Events ===
 function rEvents(D){
  const ev=D.events||[];
@@ -2186,6 +2318,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='channels'?'show':''}" id="t-channels">${rChannels(D)}</div>`;
  h+=`<div class="tp ${curTab==='payments'?'show':''}" id="t-payments">${rPayments(D)}</div>`;
  h+=`<div class="tp ${curTab==='protocol'?'show':''}" id="t-protocol">${rProtocol(D)}</div>`;
+ h+=`<div class="tp ${curTab==='ceremonies'?'show':''}" id="t-ceremonies">${rCeremonies(D)}</div>`;
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
  h+=`<div class="tp ${curTab==='defense'?'show':''}" id="t-defense">${rDefenseStatus(D)}</div>`;
