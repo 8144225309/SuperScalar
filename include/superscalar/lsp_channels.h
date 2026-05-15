@@ -363,6 +363,17 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             int trigger_leaf_side);
 
+/* F1: Persist chain[0] for every PS leaf and PS sub-factory node in the
+   factory.  Idempotent (uses INSERT OR REPLACE under the hood).  Called
+   from two sites:
+     - Factory creation (tools/superscalar_lsp.c) — initial chain[0] save.
+     - After a root-driven Tier B ceremony (lsp_run_state_advance with
+       trigger_leaf_side == -1) — saves the new epoch's chain[0].
+   `persist` is persist_t* (typed as void* to avoid header dependency).
+   Returns number of rows persisted (>=0); 0 may indicate no PS nodes,
+   not an error. */
+int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
+
 /* PS k² sub-factory chain extension ceremony driver (Gap E followup
    Phase 2b, t/1242).  Drives the multi-party MuSig signing of a new
    sub-factory state when the LSP "sells liquidity from sales-stock":

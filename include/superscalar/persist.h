@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 23
+#define PERSIST_SCHEMA_VERSION 24
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -71,6 +71,7 @@ int persist_has_factory(persist_t *p, uint32_t factory_id);
    no preceding stale state to poison). */
 int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint32_t leaf_node_idx, int chain_pos,
+                                 uint32_t epoch,
                                  const unsigned char *txid_display,
                                  const unsigned char *signed_tx, size_t signed_tx_len,
                                  uint64_t chan_amount_sats,
@@ -102,6 +103,7 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
    poison TX was signed for this advance. */
 int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           uint32_t sub_node_idx, int chain_pos,
+                                          uint32_t epoch,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx, size_t signed_tx_len,
                                           uint64_t sales_stock_amount_sats,
@@ -145,6 +147,7 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
    factory advance hung indefinitely on -25 errors). */
 int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
                                           uint32_t node_idx,
+                                          uint32_t epoch,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx,
                                           size_t signed_tx_len);

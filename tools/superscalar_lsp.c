@@ -344,7 +344,8 @@ static void usage(const char *prog) {
         "  --watchtower-final-check Run watchtower_check after force-close in non-cheat-leaf flow. Lets pure client-cheat scenarios (CL7) be tested without requiring --cheat-leaf. (regtest only)\n"
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
-        "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 100; --demo overrides to 50)\n"
+        "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 100)\n"
+        "                    Note: pass 50 with --demo if you want clients to have a balance to send payments from.\n"
         "  --placement-mode M  Client placement: sequential, inward, outward, timezone-cluster (default: timezone-cluster)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
         "  --default-profit-bps N  Default profit share basis points per client (default: 0)\n"
@@ -1904,22 +1905,18 @@ int main(int argc, char *argv[]) {
 
     /* --- BIP39 Test placeholder (moved after key init) --- */
 
-    /* Demo mode: override lsp_balance_pct to 50 if the user didn't set it
-       explicitly.  Demo payments send FROM clients which requires them to
-       have a balance.  Production default is 100 (LSP retains all capacity;
-       clients earn sats by receiving payments or buying liquidity).
-
-       Print a loud warning so users testing cheat scenarios (which require
-       --lsp-balance-pct 100 to validate the trustless model) notice the
-       silent override and pass the explicit flag if needed. */
-    if (demo_mode && !lsp_balance_pct_explicit) {
+    /* No --demo override of lsp_balance_pct.  The production-safe default
+       (100 = LSP retains all capacity) applies to demo mode too — silently
+       handing 50% of the funding to clients was a footgun: cheat/defense
+       tests that forgot to pass --lsp-balance-pct 100 explicitly would
+       invisibly run with the wrong economics.  If you want demo payments
+       from clients (which requires them to have a balance), pass
+       --lsp-balance-pct 50 explicitly. */
+    if (demo_mode && !lsp_balance_pct_explicit && lsp_balance_pct == 100) {
         fprintf(stderr,
-            "LSP: WARNING --demo silently overrode --lsp-balance-pct\n"
-            "     to 50 (was: %u). To keep your value, pass --lsp-balance-pct\n"
-            "     EXPLICITLY on the command line. Cheat/defense tests should\n"
-            "     pass --lsp-balance-pct 100 to validate the trustless model.\n",
-            lsp_balance_pct);
-        lsp_balance_pct = 50;
+            "LSP: --demo with default --lsp-balance-pct 100 — clients will\n"
+            "     have 0 sats and any demo payment FROM a client will fail.\n"
+            "     Pass --lsp-balance-pct 50 if you want demo payments to work.\n");
     }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
@@ -3401,25 +3398,9 @@ accept_new_factory:
        (--ps-subfactory-arity 1) and PS sub-factories (--ps-subfactory-arity
        >= 2). */
     if (g_db && lsp_p->factory.leaf_arity == FACTORY_ARITY_PS) {
-        extern void reverse_bytes(unsigned char *, size_t);
-        size_t saved = 0;
-        for (size_t i = 0; i < lsp_p->factory.n_nodes; i++) {
-            factory_node_t *n = &lsp_p->factory.nodes[i];
-            int is_chain0_node = (n->is_ps_leaf || n->type == NODE_PS_SUBFACTORY);
-            if (!is_chain0_node) continue;
-            if (!n->is_signed || n->signed_tx.len == 0) continue;
-            unsigned char txid_display[32];
-            memcpy(txid_display, n->txid, 32);
-            reverse_bytes(txid_display, 32);
-            if (persist_save_ps_initial_signed_state(
-                    g_db, /* factory_id = */ 0, (uint32_t)i,
-                    txid_display,
-                    n->signed_tx.data, n->signed_tx.len)) {
-                saved++;
-            }
-        }
+        int saved = lsp_persist_ps_chain0_all(g_db, &lsp_p->factory);
         if (saved > 0)
-            printf("LSP: A1 fix: persisted chain[0] for %zu PS leaf/sub-factory node(s)\n",
+            printf("LSP: A1 fix: persisted chain[0] for %d PS leaf/sub-factory node(s)\n",
                    saved);
     }
 

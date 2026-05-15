@@ -55,7 +55,13 @@ echo "  Starting at height $START_HEIGHT"
 # without needing a real LSP run upstream.
 sqlite3 "$WT_DB" "CREATE TABLE broadcast_log (id INTEGER PRIMARY KEY, txid TEXT, source TEXT, raw_hex TEXT, result TEXT, broadcast_time DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
 
-# Start the WT
+# Start the WT.  ASAN_OPTIONS/LD_PRELOAD are required because the binary
+# is built with -fsanitize=address; without preloading libasan.so.8 first,
+# ASan aborts immediately with "runtime does not come first in initial
+# library list".  Other tests (cheat_daemon_leaf, etc.) already do this;
+# this test was missing it, which caused WT to die ~immediately and the
+# test to falsely report "WT did not log SAME_HEIGHT reorg".
+ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$WT_BIN" \
     --network regtest \
     --db "$WT_DB" \

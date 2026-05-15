@@ -3451,14 +3451,20 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
         leaf_poison_prepared[lp] = 1;
     }
 
-    /* Determine affected nodes — every non-PS-leaf node that's built
-       and not yet signed (i.e., what factory_advance_leaf_unsigned
-       just rebuilt). */
+    /* Determine affected nodes — every non-PS-leaf node that's built and
+       not yet signed (i.e., what factory_advance_leaf_unsigned just rebuilt).
+
+       F1: On a ROOT-DRIVEN Tier B (trigger_leaf == -1), every PS leaf got a
+       fresh unsigned chain[0] for the new epoch from build_all_unsigned_txs
+       and must be included here so the client signs alongside the LSP.
+       Without this, the LSP's affected set includes PS leaves but the client
+       wouldn't generate matching nonces/partials, hanging the ceremony.
+       Must match the LSP-side filter in lsp_run_state_advance. */
     size_t affected[FACTORY_MAX_NODES];
     size_t n_affected = 0;
     for (size_t i = 0; i < factory->n_nodes; i++) {
         const factory_node_t *n = &factory->nodes[i];
-        if (n->is_ps_leaf) continue;
+        if (n->is_ps_leaf && trigger_leaf != -1) continue;
         if (!n->is_built) continue;
         if (n->is_signed) continue;
         affected[n_affected++] = i;

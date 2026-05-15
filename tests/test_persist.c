@@ -90,6 +90,7 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(persist_save_ps_chain_entry(
                         &db, factory_id, sub_node_idx, i,
+                        /* epoch */ 0,
                         txids[i],
                         signed_txs[i], signed_tx_lens[i],
                         sstock_amounts[i],
@@ -188,6 +189,7 @@ int test_persist_ps_subfactory_chain_v21_round_trip(void) {
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(persist_save_subfactory_chain_entry(
                         &db, factory_id, sub_node_idx, i,
+                        /* epoch */ 0,
                         txids[i],
                         signed_txs[i], signed_tx_lens[i],
                         sstock_amounts[i],
@@ -288,6 +290,7 @@ int test_persist_ps_leaf_chain_v22_poison_round_trip(void) {
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(persist_save_ps_chain_entry(
                         &db, factory_id, leaf_node_idx, i,
+                        /* epoch */ 0,
                         txids[i],
                         signed_txs[i], 32,
                         100000 - (uint64_t)i * 1000,
@@ -359,6 +362,7 @@ int test_persist_ps_subfactory_chain_v22_poison_round_trip(void) {
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(persist_save_subfactory_chain_entry(
                         &db, factory_id, sub_node_idx, i,
+                        /* epoch */ 0,
                         txids[i],
                         signed_txs[i], signed_tx_lens[i],
                         sstock_amounts[i],
@@ -430,10 +434,12 @@ int test_persist_ps_initial_signed_state_round_trip(void) {
     memset(tx_b, 0x20, sizeof(tx_b));
 
     TEST_ASSERT(persist_save_ps_initial_signed_state(
-                    &db, factory_id, node_idx_a, txid_a, tx_a, sizeof(tx_a)),
+                    &db, factory_id, node_idx_a, /* epoch */ 0,
+                    txid_a, tx_a, sizeof(tx_a)),
                 "save A");
     TEST_ASSERT(persist_save_ps_initial_signed_state(
-                    &db, factory_id, node_idx_b, txid_b, tx_b, sizeof(tx_b)),
+                    &db, factory_id, node_idx_b, /* epoch */ 0,
+                    txid_b, tx_b, sizeof(tx_b)),
                 "save B");
 
     /* Reload A and verify */
@@ -464,7 +470,8 @@ int test_persist_ps_initial_signed_state_round_trip(void) {
     unsigned char tx_a2[80];
     memset(tx_a2, 0x42, sizeof(tx_a2));
     TEST_ASSERT(persist_save_ps_initial_signed_state(
-                    &db, factory_id, node_idx_a, txid_a, tx_a2, sizeof(tx_a2)),
+                    &db, factory_id, node_idx_a, /* epoch */ 0,
+                    txid_a, tx_a2, sizeof(tx_a2)),
                 "re-save A overwrites");
     tx_buf_t out_a2 = {0};
     TEST_ASSERT(persist_load_ps_initial_signed_state(

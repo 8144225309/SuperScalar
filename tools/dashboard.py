@@ -277,9 +277,12 @@ def collect_databases(cfg):
         # with chan_amount_sats decreasing as the LSP sells liquidity into the
         # leaf and poison_tx_hex (v22+) carrying the per-position wire-signed
         # poison TX for the trustless watchtower defense.
+        # F2: include epoch column (v24+).  COALESCE handles older DBs where
+        # ALTER TABLE may have failed silently and rows lack the field.
         rows, err = query_db(path,
             "SELECT factory_id, leaf_node_idx, chain_pos, txid, "
             "chan_amount_sats, "
+            "COALESCE(epoch, 0) AS epoch, "
             "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
             "  THEN 1 ELSE 0 END AS has_poison "
             "FROM ps_leaf_chains "
@@ -291,6 +294,7 @@ def collect_databases(cfg):
         rows, err = query_db(path,
             "SELECT factory_id, sub_node_idx, chain_pos, txid, "
             "sales_stock_amount_sats, channel_amounts_csv, "
+            "COALESCE(epoch, 0) AS epoch, "
             "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
             "  THEN 1 ELSE 0 END AS has_poison "
             "FROM ps_subfactory_chains "
@@ -301,7 +305,8 @@ def collect_databases(cfg):
         # tables are populated indicates the v0.1.15 force-close-fails-with-25
         # bug pattern.
         rows, err = query_db(path,
-            "SELECT factory_id, node_idx, txid "
+            "SELECT factory_id, node_idx, txid, "
+            "COALESCE(epoch, 0) AS epoch "
             "FROM ps_initial_signed_states "
             "ORDER BY factory_id, node_idx")
         data[label]["ps_initial_signed_states"] = rows if not err else []
@@ -1052,25 +1057,33 @@ function rPsChains(D){
  // chain[0] (initial) must also be broadcast for chain[N] to be valid.
  const facMap={};for(const fr of (lsp.factories||[]))facMap[fr.id]=fr;
  if(leafKeys.length){
-  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Epoch</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
   for(const k of leafKeys){
    const e=byLeaf[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
-   const latest=e.entries[e.entries.length-1];
+   // F2: filter to CURRENT epoch only.  After a Tier B rollover the table
+   // can contain entries from prior epochs which are no longer broadcastable
+   // (their parent UTXO was replaced by the re-signed root) — counting them
+   // inflates the force-close cost.  Pre-F2 DBs have epoch=0 everywhere
+   // (no rollover concept), so max-epoch = 0 = no filtering.
+   const curEpoch=Math.max(0,...e.entries.map(x=>x.epoch||0));
+   const curEntries=e.entries.filter(x=>(x.epoch||0)===curEpoch);
+   const latest=curEntries.length?curEntries[curEntries.length-1]:e.entries[e.entries.length-1];
    const init=initMap[`${e.factory_id}_${e.leaf_node_idx}`];
-   const cov=e.entries.filter(x=>x.has_poison).length;
-   const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
+   const cov=curEntries.filter(x=>x.has_poison).length;
+   const pct=curEntries.length?Math.round(100*cov/curEntries.length):0;
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
    const sig=sigMap[`${e.factory_id}_${e.leaf_node_idx}`]||0;
    const fac=facMap[e.factory_id]||{};
-   // Force-close cost projection: each chain entry needs its own
-   // on-chain broadcast.  chain[0] + chain[1..N] = e.entries.length+1
-   // total TXs; fee_per_tx is the LSP's budgeted endogenous fee at
-   // factory creation.  Real cost can be higher under CPFP fee-bumps;
-   // this is the baseline operator commitment.
-   const fcTxCount=e.entries.length+(init?1:0);
+   // Force-close cost projection: each chain entry needs its own on-chain
+   // broadcast.  chain[0] + chain[1..N] = curEntries.length+1 total TXs;
+   // fee_per_tx is the LSP's budgeted endogenous fee at factory creation.
+   // Real cost can be higher under CPFP fee-bumps; this is the baseline
+   // operator commitment for the CURRENT epoch.
+   const fcTxCount=curEntries.length+(init?1:0);
    const fcCost=fcTxCount*(fac.fee_per_tx||0);
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${e.entries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
+   const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
   }
   h+=`</table>`;
  }
@@ -1099,18 +1112,22 @@ function rPsChains(D){
   const subKeys=Object.keys(bySub).sort();
   h+=`<div style="margin-top:14px;border-top:1px solid #30363d;padding-top:10px">`;
   h+=`<div class="st"><span>PS Sub-Factory Chains (k² wide leaves)</span><span class="c">${subKeys.length} sub-factories</span></div>`;
-  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Epoch</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
   for(const k of subKeys){
    const e=bySub[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
-   const latest=e.entries[e.entries.length-1];
-   const cov=e.entries.filter(x=>x.has_poison).length;
-   const pct=e.entries.length?Math.round(100*cov/e.entries.length):0;
+   // F2: filter to current epoch (matches leaf-level treatment above).
+   const curEpoch=Math.max(0,...e.entries.map(x=>x.epoch||0));
+   const curEntries=e.entries.filter(x=>(x.epoch||0)===curEpoch);
+   const latest=curEntries.length?curEntries[curEntries.length-1]:e.entries[e.entries.length-1];
+   const cov=curEntries.filter(x=>x.has_poison).length;
+   const pct=curEntries.length?Math.round(100*cov/curEntries.length):0;
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
    const fac=facMap[e.factory_id]||{};
-   const fcTxCount=e.entries.length+1;  // chain[0] + chain[1..N]
+   const fcTxCount=curEntries.length+1;  // chain[0] + chain[1..N]
    const fcCost=fcTxCount*(fac.fee_per_tx||0);
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${e.entries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${e.entries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
+   const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
   }
   h+=`</table></div>`;
  }

@@ -2322,13 +2322,33 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
           to distinguish). */
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
-    /* Advance the root layer (layers[0]).  dw_advance ticks a single layer;
-       dw_counter_advance walks all layers + handles overall counter — not
-       what we want here.  We're mirroring the rc=-1 path in
-       factory_advance_leaf_unsigned (DW branch) which uses dw_advance on
-       layers[0] when leaf-counter exhaustion bubbles up. */
-    if (!dw_advance(&f->counter.layers[0]))
-        return 0;  /* fully exhausted */
+    /* F7: invert the trigger semantics.  A "tick" represents one step_blocks
+       worth of block-height progression.  Two cases:
+
+       (a) layer[0] still has room to advance (current_state < max-1):
+           advance it, return 0.  No rollover yet — we're still within the
+           current epoch's lifecycle window.
+
+       (b) layer[0] is already at max state (wrap point): time to ROLL OVER.
+           Reset all layers to state 0, bump current_epoch, reset PS leaf
+           chain_len, rebuild the tree, return -1.  Caller (lsp_factory_tick_root
+           or client_handle_state_advance) then drives the Tier B ceremony.
+
+       The pre-PR-F7 logic ran the body of case (b) only when dw_advance
+       returned TRUE, which meant: any layer[0] tick = one rollover.  That
+       worked for k=1 PS (3 DW layers, layer[0] usually starts at 0 after
+       the odometer pre-advance) but BROKE for k>=2 sub-factory shapes
+       where tree_depth=0 → n_layers=1.  In the k>=2 case, the demo-mode
+       odometer pre-advance fills the single layer to max, so factory_tick_root
+       never saw an advance succeed and never rolled over.  Confirmed regtest
+       2026-05-15: k=2 with --ps-subfactory-arity 2 failed with "epoch did
+       not advance" after 3 ticks.  The new semantics fix this. */
+    if (dw_advance(&f->counter.layers[0]))
+        return 0;  /* (a) advanced within current epoch — no rollover */
+
+    /* (b) layer[0] was at max — ROLL OVER */
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        f->counter.layers[i].current_state = 0;
     f->counter.current_epoch++;
     /* Reset PS leaf chain_len for the new epoch.  On-chain chain[0..N-1]
        entries remain valid historical states; the in-memory chain_len
@@ -3862,6 +3882,10 @@ void factory_free(factory_t *f) {
         f->nodes[i].input_partial_sigs = NULL;
         f->nodes[i].n_input_sessions = 0;
     }
+    /* F4: factory-level distribution TX buffer (populated by
+       factory_build_distribution_tx_unsigned).  tx_buf_free is a no-op
+       when never initialized. */
+    tx_buf_free(&f->dist_unsigned_tx);
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
 }
@@ -3875,5 +3899,13 @@ void factory_detach_txbufs(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));
         memset(&f->nodes[i].signed_tx, 0, sizeof(tx_buf_t));
+        /* F4: also detach poison and dist buffers — same shared-pointer
+           problem as unsigned_tx/signed_tx if they were allocated before
+           the struct copy.  Without this, a tx_buf_free on dist_unsigned_tx
+           in factory_free runs twice on the same address (once via
+           lsp_cleanup, once via ladder_free) → double-free abort. */
+        memset(&f->nodes[i].poison_unsigned_tx, 0, sizeof(tx_buf_t));
+        memset(&f->nodes[i].poison_signed_tx, 0, sizeof(tx_buf_t));
     }
+    memset(&f->dist_unsigned_tx, 0, sizeof(tx_buf_t));
 }

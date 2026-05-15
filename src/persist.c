@@ -337,7 +337,9 @@ static const char *SCHEMA_SQL =
     "  sweep_txid TEXT DEFAULT '',"
     "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
     ");"
-    /* v19: pseudo-Spilman leaf chain history for ordered force-close TX publication */
+    /* v19: pseudo-Spilman leaf chain history for ordered force-close TX
+       publication.  v24 (F2) adds epoch column via ALTER TABLE migration
+       (see below); fresh DBs created at v24+ include it from the start. */
     "CREATE TABLE IF NOT EXISTS ps_leaf_chains ("
     "  factory_id INTEGER NOT NULL,"
     "  leaf_node_idx INTEGER NOT NULL,"
@@ -345,6 +347,7 @@ static const char *SCHEMA_SQL =
     "  txid TEXT NOT NULL,"
     "  signed_tx_hex TEXT NOT NULL,"
     "  chan_amount_sats INTEGER NOT NULL,"
+    "  epoch INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
     ");";
 
@@ -894,8 +897,30 @@ int persist_open(persist_t *p, const char *path) {
             "  node_idx INTEGER NOT NULL,"
             "  txid TEXT NOT NULL,"
             "  signed_tx_hex TEXT NOT NULL,"
+            "  epoch INTEGER NOT NULL DEFAULT 0,"  /* v24 (F2) */
             "  PRIMARY KEY (factory_id, node_idx)"
             ");",
+            NULL, NULL, NULL);
+    }
+
+    /* v24 (F2): tag PS chain rows with the epoch they belong to.  The
+       dashboard's force-close cost computation needs this to filter out
+       historical-epoch rows after a Tier B rollover (without the column,
+       the cost inflates monotonically across rollovers).
+
+       Additive ALTER TABLE ADD COLUMN — existing rows get epoch=0, which
+       is correct (they were saved on epoch-0 LSPs that didn't have a
+       rollover concept).  Rollover code (lsp_run_state_advance) writes
+       the current factory epoch on each new row going forward. */
+    if (db_version < 24) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_leaf_chains ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_initial_signed_states ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_subfactory_chains ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
     }
 
@@ -1092,6 +1117,7 @@ int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
    single-process advance). */
 int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint32_t leaf_node_idx, int chain_pos,
+                                 uint32_t epoch,
                                  const unsigned char *txid_display,
                                  const unsigned char *signed_tx, size_t signed_tx_len,
                                  uint64_t chan_amount_sats,
@@ -1117,8 +1143,8 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
     sqlite3_stmt *stmt;
     const char *sql =
         "INSERT OR REPLACE INTO ps_leaf_chains "
-        "(factory_id, leaf_node_idx, chain_pos, txid, signed_tx_hex, chan_amount_sats, poison_tx_hex) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+        "(factory_id, leaf_node_idx, chain_pos, txid, signed_tx_hex, chan_amount_sats, poison_tx_hex, epoch) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         free(tx_hex);
         free(poison_hex);
@@ -1134,6 +1160,7 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
         sqlite3_bind_text(stmt, 7, poison_hex, -1, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(stmt, 7);
+    sqlite3_bind_int(stmt, 8, (int)epoch);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1221,6 +1248,7 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
 
 int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           uint32_t sub_node_idx, int chain_pos,
+                                          uint32_t epoch,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx, size_t signed_tx_len,
                                           uint64_t sales_stock_amount_sats,
@@ -1261,8 +1289,8 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
     const char *sql =
         "INSERT OR REPLACE INTO ps_subfactory_chains "
         "(factory_id, sub_node_idx, chain_pos, txid, signed_tx_hex, "
-        " sales_stock_amount_sats, channel_amounts_csv, poison_tx_hex) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+        " sales_stock_amount_sats, channel_amounts_csv, poison_tx_hex, epoch) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         free(tx_hex);
         free(poison_hex);
@@ -1279,6 +1307,7 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
         sqlite3_bind_text(stmt, 8, poison_hex, -1, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(stmt, 8);
+    sqlite3_bind_int(stmt, 9, (int)epoch);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1383,6 +1412,7 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
 
 int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
                                           uint32_t node_idx,
+                                          uint32_t epoch,
                                           const unsigned char *txid_display,
                                           const unsigned char *signed_tx,
                                           size_t signed_tx_len) {
@@ -1399,8 +1429,8 @@ int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
     sqlite3_stmt *stmt;
     const char *sql =
         "INSERT OR REPLACE INTO ps_initial_signed_states "
-        "(factory_id, node_idx, txid, signed_tx_hex) "
-        "VALUES (?, ?, ?, ?);";
+        "(factory_id, node_idx, txid, signed_tx_hex, epoch) "
+        "VALUES (?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         free(tx_hex);
         return 0;
@@ -1409,6 +1439,7 @@ int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
     sqlite3_bind_int(stmt, 2, (int)node_idx);
     sqlite3_bind_text(stmt, 3, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 4, tx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, (int)epoch);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
