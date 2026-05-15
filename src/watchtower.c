@@ -175,6 +175,48 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             p->csv_delay = pending_csv_delays[i];
             p->start_height = pending_start_heights[i];
         }
+
+        /* v28 (PR-C-2): Load force-close watches.  Reconstruct
+           WATCH_FORCE_CLOSE entries directly into wt->entries (they have no
+           re-build-from-state recovery path like factory_node has). */
+        #define WT_FC_MAX_WATCHES 64
+        #define WT_FC_MAX_HTLCS_TOTAL 256
+        uint32_t fc_channels[WT_FC_MAX_WATCHES];
+        unsigned char fc_txids[WT_FC_MAX_WATCHES][32];
+        watchtower_htlc_t fc_htlcs[WT_FC_MAX_HTLCS_TOTAL];
+        size_t fc_n_per[WT_FC_MAX_WATCHES];
+        size_t n_fc = persist_load_force_close_watches(db,
+            fc_channels, fc_txids, fc_htlcs, fc_n_per,
+            WT_FC_MAX_WATCHES, WT_FC_MAX_HTLCS_TOTAL);
+
+        size_t htlc_cursor = 0;
+        for (size_t w = 0; w < n_fc && wt->n_entries < wt->entries_cap; w++) {
+            watchtower_entry_t *e = &wt->entries[wt->n_entries++];
+            memset(e, 0, sizeof(*e));
+            e->type = WATCH_FORCE_CLOSE;
+            e->channel_id = fc_channels[w];
+            memcpy(e->txid, fc_txids[w], 32);
+            e->registered_height = 0;  /* late-arrival mode after restart */
+
+            if (fc_n_per[w] > 0) {
+                e->htlc_outputs = calloc(fc_n_per[w], sizeof(watchtower_htlc_t));
+                if (e->htlc_outputs) {
+                    memcpy(e->htlc_outputs, &fc_htlcs[htlc_cursor],
+                           fc_n_per[w] * sizeof(watchtower_htlc_t));
+                    e->n_htlc_outputs   = fc_n_per[w];
+                    e->htlc_outputs_cap = fc_n_per[w];
+
+                    /* Re-register HTLC scripts on the chain backend so BIP 158
+                       scanning picks up timeouts post-restart. */
+                    if (wt->chain && wt->chain->register_script) {
+                        for (size_t h = 0; h < fc_n_per[w]; h++)
+                            wt->chain->register_script(wt->chain,
+                                                       e->htlc_outputs[h].htlc_spk, 34);
+                    }
+                }
+            }
+            htlc_cursor += fc_n_per[w];
+        }
     }
 
     return 1;
@@ -1544,6 +1586,16 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     if (wt->chain && wt->chain->register_script)
         for (size_t i = 0; i < n_htlcs; i++)
             wt->chain->register_script(wt->chain, htlcs[i].htlc_spk, 34);
+
+    /* v28 (PR-C-2): persist so the entry survives LSP restart.  Unlike
+       commitment / factory_node / subfactory_node entries, force-close
+       watches have no rebuild-from-state recovery path. */
+    if (wt->db && wt->db->db) {
+        int64_t row_id = -1;
+        persist_save_force_close(wt->db, channel_id, commitment_txid,
+                                   (const struct watchtower_htlc *)htlcs,
+                                   n_htlcs, &row_id);
+    }
     return 1;
 }
 
