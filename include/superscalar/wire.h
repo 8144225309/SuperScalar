@@ -134,6 +134,15 @@
 #define WIRE_MAX_FRAME_SIZE     (16 * 1024 * 1024) /* 16 MB; needed for ALL_NONCES at N=64+ */
 #define WIRE_DEFAULT_TIMEOUT_SEC 120
 
+/* Ceremony stage recv timeouts (LSP-side, multi-client serial processing).
+   Bumped from prior magic numbers (30s / 60s) after TS-K2-N8 N=8 client
+   leaf-advance hit 'got 0x00' on testnet4 under load.  Failure mode was
+   ceremony stages timing out at 30s under ASan-padded build + testnet4
+   latency + 8-client serial processing.  These values give headroom while
+   still bounding worst-case ceremony duration. */
+#define WIRE_CEREMONY_RECV_TIMEOUT_SEC      120  /* per-client recv */
+#define WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC    180  /* multi-bundle (whole tree) recv */
+
 /* --- Wire frame: [uint32 len][uint8 type][JSON payload] --- */
 
 typedef struct {
