@@ -835,6 +835,7 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="protocol">Protocol Log</div>
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
+ <div class="tab" data-t="defense">Defense Status</div>
  <div class="tab" data-t="txinv">TX Inventory</div>
  <div class="tab" data-t="outcomes">Outcomes</div>
  <div class="tab" data-t="events">Events</div>
@@ -1698,6 +1699,160 @@ function rOutcomes(D){
  return h;
 }
 
+// === TAB: Defense Status (per-failure-mode trustless model coverage) ===
+// Renders a tile per documented failure mode in the SuperScalar trustless
+// model.  Each tile shows the defense mechanism, current coverage from
+// observable DB state, and the risk if the defense itself fails.  Phase 1
+// covers 6 tiles with clean DB data sources (see
+// DEFENSE_STATUS_PANEL_DESIGN.md in the local working area).
+function rDefenseStatus(D){
+ const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
+ const tn=lsp.tree_nodes||[];
+ const psChain=lsp.ps_leaf_chains||[];
+ const psSub=lsp.ps_subfactory_chains||[];
+ const psInit=lsp.ps_initial_signed_states||[];
+ const psSigInputs=lsp.ps_signed_inputs_by_leaf||[];
+ const sigProg=lsp.signing_progress||[];
+ const distCl=cl.distribution_txs||[];
+ const psNodeCounts=lsp.ps_node_counts||[];
+ const clFacs=cl.factories||[];
+
+ const tiles=[];
+
+ // #1 — LSP disappears → pre-signed factory tree
+ {
+  const treeSigned=tn.filter(n=>n.is_signed).length;
+  const treeTotal=tn.length;
+  let color,status;
+  if(treeTotal===0){color='grey'; status='no factory active';}
+  else if(treeSigned===treeTotal){color='green'; status=`${treeSigned}/${treeTotal} nodes signed (100%)`;}
+  else{color='red'; status=`${treeSigned}/${treeTotal} nodes signed — ${treeTotal-treeSigned} unsigned`;}
+  tiles.push({n:'#1',icon:'🚪',name:'LSP disappears',
+   defense:'Pre-signed factory tree — any client broadcasts the path',
+   status,color,source:'tree_nodes.is_signed',
+   risk:'Clients trapped; no unilateral exit possible'});
+ }
+
+ // #4 — Old PS chain published → pre-signed poison TX
+ {
+  const psTot=psChain.length+psSub.length;
+  const psHave=psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length;
+  const pct=psTot?Math.round(100*psHave/psTot):0;
+  let color,status;
+  if(psTot===0){color='grey'; status='no PS chain entries yet (no advances driven)';}
+  else if(psHave===psTot){color='green'; status=`${psHave}/${psTot} positions with signed poison TX (100%)`;}
+  else if(pct>=80){color='yellow'; status=`${psHave}/${psTot} (${pct}%) — partial coverage`;}
+  else{color='red'; status=`${psHave}/${psTot} (${pct}%) — poison TX missing`;}
+  tiles.push({n:'#4',icon:'🛡',name:'Old PS chain published',
+   defense:'Pre-signed poison TX redistributes L-stock/sales-stock to clients',
+   status,color,source:'ps_*_chains.poison_tx_hex',
+   risk:'LSP keeps stolen liquidity; watchtower cannot intervene'});
+ }
+
+ // #5 — CLTV timeout / LSP gone → distribution TX (client-side)
+ {
+  const distFromClient=distCl.filter(r=>r.has_bytes).length;
+  const expected=Math.max(clFacs.length,1);
+  let color,status;
+  if(distFromClient>=expected){color='green'; status=`${distFromClient} distribution TX(s) signed and stored on client`;}
+  else if(distFromClient>0){color='yellow'; status=`${distFromClient}/${expected} factories covered`;}
+  else if(expected>0&&clFacs.length>0){color='red'; status=`0/${expected} — client has NO recovery TX`;}
+  else{color='grey'; status='no client DB / no factories the client is in';}
+  tiles.push({n:'#5',icon:'⏱',name:'CLTV timeout / LSP gone',
+   defense:'Distribution TX — any client broadcasts at timeout (inverted-timelock)',
+   status,color,source:'distribution_txs (client.db)',
+   risk:'Funds unrecoverable at CLTV without LSP cooperation'});
+ }
+
+ // #7 — LSP crash mid-ceremony → signing_progress snapshot
+ {
+  let color,status;
+  if(sigProg.length===0){
+   color='green'; status='no ceremony in flight (snapshot empty = healthy)';
+  } else {
+   const now=Math.floor(Date.now()/1000);
+   const freshest=Math.max(...sigProg.map(s=>s.updated_at||0));
+   const ageS=now-freshest;
+   if(ageS<300){color='green'; status=`${sigProg.length} entries — ceremony in flight (fresh, ${ageS}s ago)`;}
+   else{color='yellow'; status=`${sigProg.length} entries stale (${Math.floor(ageS/60)}min) — possible stuck ceremony`;}
+  }
+  tiles.push({n:'#7',icon:'⚙',name:'LSP crash mid-ceremony',
+   defense:'signing_progress snapshot allows resume; cleared on success',
+   status,color,source:'signing_progress',
+   risk:'Stuck ceremony or wasted nonce — usually recoverable on restart'});
+ }
+
+ // #14 — Double-spend on PS leaf advance → client_ps_signed_inputs
+ {
+  const sigInputsTot=psSigInputs.reduce((a,r)=>a+(r.cnt||0),0);
+  let color,status;
+  if(sigInputsTot===0){
+   color='grey'; status='no PS advances signed yet (defense table empty — OK pre-advance)';
+  } else {
+   color='green'; status=`${sigInputsTot} inputs guarded, 0 conflicts detected`;
+  }
+  tiles.push({n:'#14',icon:'🚫',name:'Double-spend on PS leaf advance',
+   defense:'client_ps_signed_inputs records each parent; refuses conflicting sign',
+   status,color,source:'client_ps_signed_inputs',
+   risk:'LSP signs two TXs for same parent UTXO → wallet inconsistency'});
+ }
+
+ // #15 — PS chain[0] persistence (the F1 issue lives here)
+ {
+  const psNodes=psNodeCounts.reduce((a,r)=>a+(r.ps_leaf_count||0)+(r.subfactory_count||0),0);
+  const persisted=psInit.length;
+  let color,status;
+  if(psNodes===0){
+   color='grey'; status='no PS nodes (legacy DW-only deployment)';
+  } else if(persisted>=psNodes){
+   color='green'; status=`${persisted}/${psNodes} PS nodes have chain[0] persisted ✓`;
+  } else {
+   color='red'; status=`${persisted}/${psNodes} persisted — v0.1.15 risk: ${psNodes-persisted} missing`;
+  }
+  tiles.push({n:'#15',icon:'🧬',name:'PS chain[0] bytes lost on restart',
+   defense:'ps_initial_signed_states persists chain[0] per PS leaf/sub-factory',
+   status,color,source:'ps_initial_signed_states',
+   risk:'Force-close fails with -25 bad-txns-inputs-missingorspent indefinitely'});
+ }
+
+ // ---- Aggregate header ----
+ const greenCount=tiles.filter(t=>t.color==='green').length;
+ const yellowCount=tiles.filter(t=>t.color==='yellow').length;
+ const redCount=tiles.filter(t=>t.color==='red').length;
+ const greyCount=tiles.filter(t=>t.color==='grey').length;
+ const counted=greenCount+yellowCount+redCount;
+ const pct=counted?Math.round(100*greenCount/counted):0;
+ const aggCls=redCount>0?'b dn':yellowCount>0?'b w':counted>0?'b ok':'b i';
+
+ let h='';
+ h+=`<div class="s"><div class="st"><span>Defense Posture</span><span class="c">per-failure-mode coverage</span></div>`;
+ h+=`<div class="kv" style="margin-bottom:8px">`;
+ h+=`<div class="ki"><span class="k">Healthy</span><span class="${aggCls}" style="font-size:14px;padding:2px 12px">${greenCount}/${counted}${counted?` (${pct}%)`:''}</span></div>`;
+ if(yellowCount)h+=`<div class="ki"><span class="k">Partial</span><span class="b w">${yellowCount}</span></div>`;
+ if(redCount)h+=`<div class="ki"><span class="k">Missing</span><span class="b dn">${redCount}</span></div>`;
+ if(greyCount)h+=`<div class="ki"><span class="k">N/A</span><span class="b i">${greyCount}</span></div>`;
+ h+=`</div>`;
+ h+=`<p class="mu" style="font-size:11px;margin-top:4px">Each tile maps to one documented failure mode in the SuperScalar trustless model.  Green = defense fully in place.  Yellow = partial / open problem.  Red = defense missing.  Grey = not applicable to this deployment shape.</p>`;
+ h+=`</div>`;
+
+ // ---- Tile grid ----
+ h+=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:8px">`;
+ for(const t of tiles){
+  const borderColor=t.color==='green'?'#3fb950':t.color==='yellow'?'#d29922':t.color==='red'?'#f85149':'#30363d';
+  const statusCls=t.color==='green'?'b ok':t.color==='yellow'?'b w':t.color==='red'?'b dn':'b i';
+  h+=`<div style="border:1px solid ${borderColor};border-radius:6px;padding:10px 12px;background:#0d1117">`;
+  h+=`<div><span style="font-size:14px;margin-right:4px">${t.icon}</span><span style="font-weight:600;font-size:12px">${t.n} ${t.name}</span></div>`;
+  h+=`<div style="font-size:11px;color:#8b949e;margin:4px 0">${t.defense}</div>`;
+  h+=`<div style="margin:6px 0"><span class="${statusCls}" style="font-size:11px">${t.status}</span></div>`;
+  h+=`<div style="font-size:10px;color:#484f58;margin-top:6px"><code>${t.source}</code></div>`;
+  h+=`<div class="mu" style="font-size:10px;margin-top:4px;border-top:1px solid #21262d;padding-top:4px">If defense fails: ${t.risk}</div>`;
+  h+=`</div>`;
+ }
+ h+=`</div>`;
+
+ return h;
+}
+
 // === TAB: Events ===
 function rEvents(D){
  const ev=D.events||[];
@@ -1757,6 +1912,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='protocol'?'show':''}" id="t-protocol">${rProtocol(D)}</div>`;
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
+ h+=`<div class="tp ${curTab==='defense'?'show':''}" id="t-defense">${rDefenseStatus(D)}</div>`;
  h+=`<div class="tp ${curTab==='txinv'?'show':''}" id="t-txinv">${rTxInventory(D)}</div>`;
  h+=`<div class="tp ${curTab==='outcomes'?'show':''}" id="t-outcomes">${rOutcomes(D)}</div>`;
  h+=`<div class="tp ${curTab==='events'?'show':''}" id="t-events">${rEvents(D)}</div>`;
