@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 26
+#define PERSIST_SCHEMA_VERSION 27
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -616,20 +616,33 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out);
 
 /* --- Watchtower pending entry persistence --- */
 
-/* Save a pending penalty entry (for CPFP bump tracking across restarts). */
+/* Save a pending penalty entry (for CPFP bump tracking across restarts).
+   v27: fb_start_block / fb_deadline_block / fb_budget_sat / fb_start_feerate
+   carry the htlc_fee_bump_t escalation schedule so a mid-escalation restart
+   can resume the linear fee schedule instead of rebasing from zero. */
 int persist_save_pending(persist_t *p, const char *txid,
                            uint32_t anchor_vout, uint64_t anchor_amount,
                            int cycles_in_mempool, int bump_count,
                            uint64_t penalty_value, uint32_t csv_delay,
-                           uint32_t start_height);
+                           uint32_t start_height,
+                           uint32_t fb_start_block,
+                           uint32_t fb_deadline_block,
+                           uint64_t fb_budget_sat,
+                           uint64_t fb_start_feerate);
 
-/* Load all pending entries. Returns count loaded. */
+/* Load all pending entries. Returns count loaded.
+   v27: fb_* arrays may be NULL (legacy callers); when non-NULL they are
+   populated with the persisted htlc_fee_bump_t escalation schedule. */
 size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
                               uint32_t *vouts_out, uint64_t *amounts_out,
                               int *cycles_out, int *bumps_out,
                               uint64_t *penalty_values_out,
                               uint32_t *csv_delays_out,
                               uint32_t *start_heights_out,
+                              uint32_t *fb_start_blocks_out,
+                              uint32_t *fb_deadline_blocks_out,
+                              uint64_t *fb_budget_sats_out,
+                              uint64_t *fb_start_feerates_out,
                               size_t max_entries);
 
 /* Delete a pending entry by txid (e.g., after confirmation). */

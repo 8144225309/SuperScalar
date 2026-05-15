@@ -4033,3 +4033,60 @@ int test_persist_signing_rounds_round_trip(void)
     persist_close(&db);
     return 1;
 }
+
+/* v27 (PR-C-1) fee-bump escalation persist round-trip. */
+int test_persist_pending_fee_bump_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    const char *txid = "aa11bb22cc33dd44ee55ff66"
+                       "0011223344556677889900aa"
+                       "bbccddeeff001122334455660011";
+    TEST_ASSERT(persist_save_pending(&db, txid,
+                                       /* anchor_vout    */ 1,
+                                       /* anchor_amount  */ 330,
+                                       /* cycles         */ 3,
+                                       /* bump_count     */ 12345,
+                                       /* penalty_value  */ 100000,
+                                       /* csv_delay      */ 144,
+                                       /* start_height   */ 800000,
+                                       /* fb_start_block */ 800005,
+                                       /* fb_deadline    */ 800500,
+                                       /* fb_budget_sat  */ 50000,
+                                       /* fb_start_fr    */ 5000),
+                "save pending with fee-bump fields");
+
+    char txids[4][65];
+    uint32_t vouts[4];
+    uint64_t amts[4];
+    int cycles[4];
+    int bumps[4];
+    uint64_t pvals[4];
+    uint32_t csvs[4];
+    uint32_t starts[4];
+    uint32_t fb_starts[4];
+    uint32_t fb_deadlines[4];
+    uint64_t fb_budgets[4];
+    uint64_t fb_frs[4];
+
+    size_t n = persist_load_pending(&db, txids, vouts, amts, cycles, bumps,
+                                      pvals, csvs, starts,
+                                      fb_starts, fb_deadlines, fb_budgets, fb_frs,
+                                      4);
+    TEST_ASSERT_EQ((int)n, 1, "exactly 1 row loaded");
+    TEST_ASSERT(strncmp(txids[0], txid, 64) == 0, "txid round-trips");
+    TEST_ASSERT_EQ((int)fb_starts[0], 800005, "fb_start_block round-trips");
+    TEST_ASSERT_EQ((int)fb_deadlines[0], 800500, "fb_deadline_block round-trips");
+    TEST_ASSERT_EQ((long long)fb_budgets[0], 50000LL, "fb_budget_sat round-trips");
+    TEST_ASSERT_EQ((long long)fb_frs[0], 5000LL, "fb_start_feerate round-trips");
+
+    /* NULL-safe out-pointers: legacy callers pass NULL for fb_* and still work. */
+    size_t n2 = persist_load_pending(&db, txids, vouts, amts, cycles, bumps,
+                                       pvals, csvs, starts,
+                                       NULL, NULL, NULL, NULL, 4);
+    TEST_ASSERT_EQ((int)n2, 1, "NULL fb_* out-pointers do not crash");
+
+    persist_close(&db);
+    return 1;
+}

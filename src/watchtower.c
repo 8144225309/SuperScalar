@@ -143,9 +143,15 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
         uint64_t pending_penalty_values[WATCHTOWER_MAX_PENDING];
         uint32_t pending_csv_delays[WATCHTOWER_MAX_PENDING];
         uint32_t pending_start_heights[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_fb_start_blocks[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_fb_deadlines[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_fb_budgets[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_fb_start_feerates[WATCHTOWER_MAX_PENDING];
         size_t n_loaded = persist_load_pending(db, pending_txids,
             pending_vouts, pending_amounts, pending_cycles, pending_bumps,
             pending_penalty_values, pending_csv_delays, pending_start_heights,
+            pending_fb_start_blocks, pending_fb_deadlines,
+            pending_fb_budgets, pending_fb_start_feerates,
             WATCHTOWER_MAX_PENDING);
         for (size_t i = 0; i < n_loaded && wt->n_pending < wt->pending_cap; i++) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
@@ -156,6 +162,15 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             p->cycles_in_mempool = pending_cycles[i];
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             p->fee_bump.last_bump_block = (uint32_t)pending_bumps[i];
+            /* v27: resume escalation schedule.  tx_vsize is constant
+               WATCHTOWER_CPFP_CHILD_VSIZE (not persisted); pre-v27 rows
+               load as zeros and re-initialize at next bump check. */
+            p->fee_bump.start_block    = pending_fb_start_blocks[i];
+            p->fee_bump.deadline_block = pending_fb_deadlines[i];
+            p->fee_bump.budget_sat     = pending_fb_budgets[i];
+            p->fee_bump.start_feerate  = pending_fb_start_feerates[i];
+            p->fee_bump.tx_vsize       = WATCHTOWER_CPFP_CHILD_VSIZE;
+            p->fee_bump.last_feerate   = 0;  /* re-derived from RBF state */
             p->penalty_value = pending_penalty_values[i];
             p->csv_delay = pending_csv_delays[i];
             p->start_height = pending_start_heights[i];
@@ -877,9 +892,13 @@ int watchtower_check(watchtower_t *wt) {
             p->cycles_in_mempool = 0;
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             if (wt->db && wt->db->db) {
+                /* fee_bump is freshly memset above — escalation schedule
+                   not yet initialised; persist zeros so a restart-then-
+                   first-bump path still calls htlc_fee_bump_init normally. */
                 persist_save_pending(wt->db, p->txid, p->anchor_vout,
                                        p->anchor_amount, 0, 0,
-                                       p->penalty_value, p->csv_delay, p->start_height);
+                                       p->penalty_value, p->csv_delay, p->start_height,
+                                       0, 0, 0, 0);
             }
         }
 
@@ -1170,11 +1189,17 @@ int watchtower_check(watchtower_t *wt) {
                         printf("  CPFP child broadcast (feerate %llu): %s\n",
                                (unsigned long long)fr, cpfp_txid);
                         if (wt->db && wt->db->db) {
+                            /* v27: persist the escalation schedule so a
+                               mid-bump restart resumes instead of rebasing. */
                             persist_save_pending(wt->db, p->txid,
                                 p->anchor_vout, p->anchor_amount,
                                 p->cycles_in_mempool,
                                 (int)p->fee_bump.last_bump_block,
-                                p->penalty_value, p->csv_delay, p->start_height);
+                                p->penalty_value, p->csv_delay, p->start_height,
+                                p->fee_bump.start_block,
+                                p->fee_bump.deadline_block,
+                                p->fee_bump.budget_sat,
+                                p->fee_bump.start_feerate);
                             persist_log_broadcast(wt->db, cpfp_txid,
                                                   "cpfp", cpfp_hex, "ok");
                         }
@@ -1331,7 +1356,8 @@ int watchtower_add_pending_tx(watchtower_t *wt,
     if (wt->db && wt->db->db)
         persist_save_pending(wt->db, p->txid, p->anchor_vout,
                                p->anchor_amount, 0, 0,
-                               p->penalty_value, p->csv_delay, p->start_height);
+                               p->penalty_value, p->csv_delay, p->start_height,
+                               0, 0, 0, 0);
     return 1;
 }
 

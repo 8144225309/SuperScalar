@@ -246,7 +246,11 @@ static const char *SCHEMA_SQL =
     "  bump_count INTEGER NOT NULL DEFAULT 0,"
     "  penalty_value INTEGER NOT NULL DEFAULT 0,"
     "  csv_delay INTEGER NOT NULL DEFAULT 144,"
-    "  start_height INTEGER NOT NULL DEFAULT 0"
+    "  start_height INTEGER NOT NULL DEFAULT 0,"
+    "  fb_start_block INTEGER NOT NULL DEFAULT 0,"
+    "  fb_deadline_block INTEGER NOT NULL DEFAULT 0,"
+    "  fb_budget_sat INTEGER NOT NULL DEFAULT 0,"
+    "  fb_start_feerate INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS jit_channels ("
     "  jit_channel_id INTEGER PRIMARY KEY,"
@@ -983,6 +987,32 @@ int persist_open(persist_t *p, const char *path) {
             "  partial_sig_status TEXT,"
             "  PRIMARY KEY (round_id, signer_slot)"
             ");",
+            NULL, NULL, NULL);
+    }
+
+    /* v27 (PR-C-1): fee-bump escalation schedule persistence.
+
+       Before v27, watchtower_pending only stored bump_count (mapped to
+       fee_bump.last_bump_block).  On LSP restart mid-escalation, the
+       loader memset the rest of htlc_fee_bump_t to zero — losing
+       start_block / deadline_block / budget_sat / start_feerate.  The
+       linear fee schedule then rebased from cur_height, risking
+       over-bump (burn budget) or under-bump (miss CSV deadline and let
+       the cheater win).  Additive ALTERs with default 0 — pre-v27 rows
+       still trigger htlc_fee_bump_init at next bump check (legacy
+       rebase-from-zero), but new rows resume their schedule. */
+    if (db_version < 27) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN fb_start_block INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN fb_deadline_block INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN fb_budget_sat INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE watchtower_pending ADD COLUMN fb_start_feerate INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
     }
 
@@ -4145,13 +4175,19 @@ int persist_save_pending(persist_t *p, const char *txid,
                            uint32_t anchor_vout, uint64_t anchor_amount,
                            int cycles_in_mempool, int bump_count,
                            uint64_t penalty_value, uint32_t csv_delay,
-                           uint32_t start_height) {
+                           uint32_t start_height,
+                           uint32_t fb_start_block,
+                           uint32_t fb_deadline_block,
+                           uint64_t fb_budget_sat,
+                           uint64_t fb_start_feerate) {
     if (!p || !p->db || !txid) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO watchtower_pending "
-        "(txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, penalty_value, csv_delay, start_height) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+        "(txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, "
+        " penalty_value, csv_delay, start_height, "
+        " fb_start_block, fb_deadline_block, fb_budget_sat, fb_start_feerate) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -4165,6 +4201,10 @@ int persist_save_pending(persist_t *p, const char *txid,
     sqlite3_bind_int64(stmt, 6, (sqlite3_int64)penalty_value);
     sqlite3_bind_int(stmt, 7, (int)csv_delay);
     sqlite3_bind_int(stmt, 8, (int)start_height);
+    sqlite3_bind_int(stmt, 9, (int)fb_start_block);
+    sqlite3_bind_int(stmt, 10, (int)fb_deadline_block);
+    sqlite3_bind_int64(stmt, 11, (sqlite3_int64)fb_budget_sat);
+    sqlite3_bind_int64(stmt, 12, (sqlite3_int64)fb_start_feerate);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -4177,11 +4217,17 @@ size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
                               uint64_t *penalty_values_out,
                               uint32_t *csv_delays_out,
                               uint32_t *start_heights_out,
+                              uint32_t *fb_start_blocks_out,
+                              uint32_t *fb_deadline_blocks_out,
+                              uint64_t *fb_budget_sats_out,
+                              uint64_t *fb_start_feerates_out,
                               size_t max_entries) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, penalty_value, csv_delay, start_height "
+        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count, "
+        "       penalty_value, csv_delay, start_height, "
+        "       fb_start_block, fb_deadline_block, fb_budget_sat, fb_start_feerate "
         "FROM watchtower_pending ORDER BY txid;";
 
     sqlite3_stmt *stmt;
@@ -4209,6 +4255,14 @@ size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
             csv_delays_out[count] = (uint32_t)sqlite3_column_int(stmt, 6);
         if (start_heights_out)
             start_heights_out[count] = (uint32_t)sqlite3_column_int(stmt, 7);
+        if (fb_start_blocks_out)
+            fb_start_blocks_out[count] = (uint32_t)sqlite3_column_int(stmt, 8);
+        if (fb_deadline_blocks_out)
+            fb_deadline_blocks_out[count] = (uint32_t)sqlite3_column_int(stmt, 9);
+        if (fb_budget_sats_out)
+            fb_budget_sats_out[count] = (uint64_t)sqlite3_column_int64(stmt, 10);
+        if (fb_start_feerates_out)
+            fb_start_feerates_out[count] = (uint64_t)sqlite3_column_int64(stmt, 11);
         count++;
     }
 
