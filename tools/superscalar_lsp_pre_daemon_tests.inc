@@ -1765,6 +1765,50 @@
                             else
                                 rollover_pass = 0;
                         }
+
+                        /* F1 deep check: drive ONE PS leaf advance after rollover.
+                           If the new chain[0] is a valid spending point, the
+                           advance ceremony will produce a signed chain[1] that
+                           spends it.  This is the production scenario: clients
+                           continue advancing after a Tier B without any user
+                           visible interruption.
+
+                           Skip for k>=2 sub-factory shape: the top-level leaf
+                           is a sub-factory node which uses lsp_subfactory_chain_advance
+                           (multi-input, "buy liquidity from sales-stock"), not the
+                           simple 1-client lsp_channels_advance_ps_leaf path.  F1's
+                           in-memory effect (PS leaves signed + chain[0] persisted)
+                           is already verified above for both shapes. */
+                        int is_subfactory_shape =
+                            (lsp_p->factory.ps_subfactory_arity > 1);
+                        if (is_ps_factory && rollover_pass && !is_subfactory_shape) {
+                            printf("  F1: driving 1 PS leaf advance on leaf 0 to "
+                                   "verify new chain[0] is spendable...\n");
+                            fflush(stdout);
+                            int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                            if (adv_rc != 1) {
+                                printf("  FAIL (F1): post-rollover leaf advance "
+                                       "returned %d (expected 1) — new chain[0] "
+                                       "is not a valid spending point\n", adv_rc);
+                                rollover_pass = 0;
+                            } else {
+                                size_t leaf0_ni = lsp_p->factory.leaf_node_indices[0];
+                                int new_chain_len = lsp_p->factory.nodes[leaf0_ni].ps_chain_len;
+                                if (new_chain_len != 1) {
+                                    printf("  FAIL (F1): post-rollover advance left "
+                                           "ps_chain_len at %d (expected 1)\n",
+                                           new_chain_len);
+                                    rollover_pass = 0;
+                                } else {
+                                    printf("  F1: post-rollover advance PASS "
+                                           "(leaf 0 chain_len 0 -> 1)\n");
+                                }
+                            }
+                        } else if (is_ps_factory && rollover_pass && is_subfactory_shape) {
+                            printf("  F1: skipping post-rollover advance deep check "
+                                   "for k>=2 sub-factory shape (uses "
+                                   "lsp_subfactory_chain_advance, not the leaf path)\n");
+                        }
                     }
                 }
 
