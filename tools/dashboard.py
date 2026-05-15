@@ -272,6 +272,46 @@ def collect_databases(cfg):
             "payment_hash, cltv_expiry "
             "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
         data[label]["old_commitment_htlcs"] = rows if not err else []
+        # PR #181 Phase A consumer: count old_commitments rows with persisted
+        # penalty TX bytes vs total rows.  Column was added in schema v25
+        # (old_commitments.signed_penalty_tx_hex).  If column is missing
+        # (pre-#181 LSP), the first query errors and we fall back to
+        # total-only — persisted reads 0 which surfaces as "not yet
+        # persisted" in the UI.
+        rows, err = query_db(path,
+            "SELECT COUNT(*) AS total, "
+            "COUNT(CASE WHEN signed_penalty_tx_hex IS NOT NULL "
+            "  AND length(signed_penalty_tx_hex) > 0 THEN 1 END) AS persisted "
+            "FROM old_commitments")
+        if err:
+            rows, err = query_db(path,
+                "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitments")
+        data[label]["old_commitments_coverage"] = (rows[0] if rows else
+            {"total": 0, "persisted": 0})
+        # PR #181 Phase B consumer: signing_rounds journal summary.  Table
+        # was added in schema v26.  Empty (table missing) on pre-#181 LSPs
+        # — graceful: row stays as the defaults, UI shows the
+        # journal-not-yet-available copy.
+        rows, err = query_db(path,
+            "SELECT COUNT(*) AS total, "
+            "COUNT(CASE WHEN result = 'success' THEN 1 END) AS success, "
+            "COUNT(CASE WHEN result = 'timeout' THEN 1 END) AS timeout, "
+            "COUNT(CASE WHEN result = 'aborted_crash' THEN 1 END) AS crashed, "
+            "COUNT(CASE WHEN completed_at IS NULL THEN 1 END) AS in_flight, "
+            "COUNT(DISTINCT ceremony_type) AS types "
+            "FROM signing_rounds")
+        data[label]["signing_rounds_summary"] = (rows[0] if rows and not err
+            else {"total": 0, "success": 0, "timeout": 0, "crashed": 0,
+                  "in_flight": 0, "types": 0})
+        # Recent signing rounds for the Overview ledger.  Same graceful
+        # fallback as the summary.
+        rows, err = query_db(path,
+            "SELECT id, factory_id, node_idx, ceremony_type, epoch, "
+            "started_at, completed_at, n_participants, "
+            "nonces_collected, partial_sigs_collected, "
+            "result, result_txid, error_detail "
+            "FROM signing_rounds ORDER BY started_at DESC LIMIT 20")
+        data[label]["signing_rounds_recent"] = rows if not err else []
         # Factory revocation secrets — per-epoch flat revocation
         rows, err = query_db(path,
             "SELECT factory_id, COUNT(*) as cnt "
@@ -1019,6 +1059,35 @@ function rOverview(D){
   h+=`<div class="kv">`;
   for(const c of idc)h+=`<div class="ki"><span class="k">${c.name}</span><span class="v">${c.value}</span></div>`;
   h+=`</div></div>`;}
+ // PR #181 Phase B consumer: signing_rounds journal summary.  Renders
+ // when the table exists (schema v26+); silent against pre-#181 LSPs
+ // where total=0 from the graceful-fallback collector.
+ const srs=lsp.signing_rounds_summary||{};
+ const srRecent=lsp.signing_rounds_recent||[];
+ if((srs.total||0)>0){
+  h+=`<div class="s"><div class="st"><span>Signing Rounds Journal</span><span class="c">${srs.total} ceremonies across ${srs.types} type(s)</span></div>`;
+  h+=`<div class="kv" style="margin-bottom:8px">`;
+  h+=`<div class="ki"><span class="k">Success</span><span class="b ok">${srs.success||0}</span></div>`;
+  if(srs.in_flight)h+=`<div class="ki"><span class="k">In flight</span><span class="b w">${srs.in_flight}</span></div>`;
+  if(srs.timeout)h+=`<div class="ki"><span class="k">Timeout</span><span class="b w">${srs.timeout}</span></div>`;
+  if(srs.crashed)h+=`<div class="ki"><span class="k">Crashed</span><span class="b dn">${srs.crashed}</span></div>`;
+  h+=`</div>`;
+  if(srRecent.length){
+   h+=`<table><tr><th>ID</th><th>Type</th><th>Factory</th><th>Node</th><th class="r">Epoch</th><th class="r">Parts</th><th class="r">Nonces</th><th class="r">PSigs</th><th>Started</th><th>Duration</th><th>Result</th></tr>`;
+   for(const r of srRecent){
+    const dur=(r.completed_at&&r.started_at)?(r.completed_at-r.started_at)+'s':(r.completed_at?'—':'in flight');
+    let resCls='b w', resText=r.result||'pending';
+    if(r.result==='success')resCls='b ok';
+    else if(r.result==='timeout')resCls='b w';
+    else if(r.result==='aborted_crash')resCls='b dn';
+    else if(!r.result)resCls='b i';
+    const err=r.error_detail?` <span class="mu" title="${(r.error_detail||'').replace(/"/g,'&quot;')}">⚠</span>`:'';
+    h+=`<tr><td>${r.id}</td><td>${r.ceremony_type||'?'}</td><td>#${r.factory_id??'—'}</td><td>${r.node_idx??'—'}</td><td class="r">${r.epoch??'—'}</td><td class="r">${r.n_participants??'—'}</td><td class="r">${r.nonces_collected??'—'}</td><td class="r">${r.partial_sigs_collected??'—'}</td><td>${ta(r.started_at)} ago</td><td>${dur}</td><td><span class="${resCls}">${resText}</span>${err}</td></tr>`;
+   }
+   h+=`</table>`;
+  }
+  h+=`</div>`;
+ }
  // Channels summary
  const chs=lsp.channels||[];
  h+=`<div class="s"><div class="st"><span>Channels</span><span class="c">${chs.length}</span></div>`;
@@ -1827,9 +1896,27 @@ function rTxInventory(D){
  h+=`</table></div>`;
 
  // Schema gaps (TX types that exist in protocol but have no persistent home)
+ // PR #181 closed the penalty-TX gap (schema v25: old_commitments
+ // .signed_penalty_tx_hex).  The row below reads live coverage from the
+ // new column when present and degrades to "in memory only" against
+ // pre-#181 LSPs (column missing → persisted reads 0).
+ const ocov=lsp.old_commitments_coverage||{total:0,persisted:0};
+ const ocPersist=ocov.persisted||0, ocTot=ocov.total||0;
+ let penRow;
+ if(ocTot===0){
+  penRow=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b i">n/a yet</span></td><td>No revoked commitments to defend against in the current data.  Once revocations arrive, the LSP persists penalty bytes to <code>old_commitments.signed_penalty_tx_hex</code> (schema v25).</td></tr>`;
+ } else if(ocPersist===0){
+  penRow=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b w">in memory only (${ocTot} entries)</span></td><td>Pre-#181 LSP build: <code>old_commitments.signed_penalty_tx_hex</code> column missing.  After upgrade, broadcast bytes survive LSP restart instead of needing reconstruction.</td></tr>`;
+ } else if(ocPersist===ocTot){
+  penRow=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b ok">persisted ✓ (${ocPersist}/${ocTot})</span></td><td>Schema v25 active: every revoked commitment has its signed penalty TX bytes on disk.  Survives LSP restart without rebuild from secrets.</td></tr>`;
+ } else {
+  const pct=Math.round(100*ocPersist/ocTot);
+  penRow=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b w">partial: ${ocPersist}/${ocTot} (${pct}%)</span></td><td>Some entries persisted, ${ocTot-ocPersist} still in memory only — likely a mix of pre-upgrade entries and new ones.  Will normalize as old entries age out / get re-registered.</td></tr>`;
+ }
  h+=`<div class="s"><div class="st"><span>Schema gaps — pre-signed TXs that are not persisted anywhere</span><span class="c">operational risk</span></div>`;
  h+=`<table><tr><th>TX type</th><th>Status</th><th>Risk</th></tr>`;
- h+=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b w">in memory only</span></td><td>LSP restart loses pre-built penalty bytes; <code>watchtower_pending</code> only stores txid + anchor metadata, not the signed witness</td></tr>`;
+ h+=penRow;
+ h+=`<tr><td>HTLC sweep TXs (per-output penalty)</td><td><span class="b i">lazy-built per-cycle</span></td><td>Different lifecycle from the commitment penalty above — built per watchtower cycle inside <code>watchtower_check()</code>, not pre-built at registration.  Persistence would require moving the build to registration time first (LSP-side refactor, intentionally deferred per PR #181).</td></tr>`;
  h+=`<tr><td>L-stock burn TXs (OP_RETURN destruction)</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>factory_revocation_secrets</code> + <code>old_commitments</code> on need — works but no preparedness check available</td></tr>`;
  h+=`<tr><td>HTLC success/timeout resolution TXs</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>htlcs</code> + commitment data — same as burn</td></tr>`;
  h+=`<tr><td>Cooperative close TX</td><td><span class="b i">negotiated at close time</span></td><td>Expected — single TX, both sides online</td></tr>`;
