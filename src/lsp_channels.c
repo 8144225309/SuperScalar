@@ -1466,6 +1466,20 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    /* C3 (Tier 1): journal the ceremony at start; success-update at the
+       final return below.  Error returns leave the row in flight for the
+       startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)f->leaf_node_indices[leaf_side],
+                                           "leaf_advance",
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
     /* Capture old state BEFORE advancing (for watchtower burn-tx and PS persist).
        For PS: n_outputs flips 2→1 after the first advance so we must record the
        old L-stock vout and amount here, not after. */
@@ -1917,6 +1931,14 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         printf("LSP: DW leaf %d advanced (node %zu), DW state %u\n",
                leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
     free(poison_snapshot);
+
+    /* C3 (Tier 1): journal ceremony success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)f->n_participants,
+                                          (uint32_t)f->n_participants,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
@@ -2770,6 +2792,20 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
 
+    /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
+       flight for the startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)node_idx,
+                                           "leaf_realloc",
+                                           f->counter.current_epoch,
+                                           (uint32_t)node->n_signers,
+                                           &c3_round_id);
+    }
+    (void)c3_round_id;  /* finalized at success return below */
+
     if (node->n_signers < 2) {
         fprintf(stderr, "LSP realloc: leaf node %zu has %zu signers, need >= 2\n",
                 node_idx, node->n_signers);
@@ -3172,6 +3208,13 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("%s%lu", i ? "," : "", (unsigned long)amounts[i]);
     printf("]\n");
 
+    /* C3 (Tier 1): journal success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)node->n_signers,
+                                          (uint32_t)node->n_signers,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
@@ -3207,6 +3250,20 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* k clients on this sub-factory (LSP is signer 0). */
     size_t n_clients_in_sub = sub->n_signers - 1;
     if (n_clients_in_sub == 0) return 0;
+
+    /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
+       flight for the startup sweep to mark aborted_crash. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)sub_node_i,
+                                           "sub_factory_advance",
+                                           f->counter.current_epoch,
+                                           (uint32_t)sub->n_signers,
+                                           &c3_round_id);
+    }
+    (void)c3_round_id;  /* finalized at success return below */
 
     /* v23 fix: on FIRST advance only, persist chain[0] (the initial
        signed state) so force-close after advance can broadcast the full
@@ -3664,6 +3721,14 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     printf("LSP: sub-factory %d.%d chain extended to len %d (client[%d]+=%llu sats)\n",
            leaf_side, sub_idx_in_leaf, sub->ps_chain_len,
            channel_idx_in_sub, (unsigned long long)delta_sats);
+
+    /* C3 (Tier 1): journal success. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)sub->n_signers,
+                                          (uint32_t)sub->n_signers,
+                                          "success", NULL, NULL);
+    }
     return 1;
 }
 
