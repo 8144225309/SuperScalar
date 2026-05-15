@@ -3581,6 +3581,14 @@ accept_new_factory:
         mgr->economic_mode = (economic_mode_t)economic_mode_arg;
         mgr->default_profit_bps = default_profit_bps;
         mgr->settlement_interval_blocks = settlement_interval;
+        /* Persist pointer MUST be set BEFORE lsp_channels_init so the
+           channel_set_persist() calls inside it pick up the live DB.
+           Without this, channels stay with persist_db=NULL and every
+           subsequent persist_save_revocation / persist_save_old_commitment_htlc
+           silently no-ops — the gap reported by the dashboard team in the
+           regtest validation of --demo --payments 4 (revocation_secrets
+           and old_commitment_htlcs both empty despite wire activity). */
+        mgr->persist = use_db ? &db : NULL;
         if (!lsp_channels_init(mgr, ctx, &lsp_p->factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(lsp_p);
@@ -3617,8 +3625,10 @@ accept_new_factory:
             }
         }
 
-        /* Set persistence pointer (Phase 23) */
-        mgr->persist = use_db ? &db : NULL;
+        /* mgr->persist was set above, before lsp_channels_init, so
+           channel_set_persist() calls inside it picked up the live DB.
+           (Previously assigned here, after init — that left channels with
+           persist_db=NULL and silently dropped revocation/HTLC saves.) */
 
         /* Set configurable confirmation timeout */
         mgr->confirm_timeout_secs = confirm_timeout_secs;
