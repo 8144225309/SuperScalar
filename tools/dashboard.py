@@ -139,30 +139,29 @@ def collect_tx_enrichment(cfg, txids):
 def _extract_txids(databases):
     """Collect every txid that might be worth enriching across both DBs."""
     txids = set()
+    # Defensive iterator: skip any row that isn't a dict (handles edge
+    # cases where the LSP DB is in a half-initialized state during
+    # startup races — saw 'str' rows leak in when persist_open errored
+    # partway through, which crashed _extract_txids and 500'd the API).
+    def each(rows, key, skip_q=False):
+        for r in (rows or []):
+            if not isinstance(r, dict): continue
+            v = r.get(key)
+            if v and (not skip_q or v != "?"):
+                txids.add(v)
     for db in databases.values():
         if not isinstance(db, dict): continue
-        for r in db.get("factories", []) or []:
-            if r.get("funding_txid"): txids.add(r["funding_txid"])
-        for r in db.get("tree_nodes", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("ps_leaf_chains", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("ps_subfactory_chains", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("ps_initial_signed_states", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("jit_channels", []) or []:
-            if r.get("funding_txid"): txids.add(r["funding_txid"])
-        for r in db.get("broadcast_log", []) or []:
-            t = r.get("txid")
-            if t and t != "?": txids.add(t)
-        for r in db.get("watchtower_pending", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("old_commitments", []) or []:
-            if r.get("txid"): txids.add(r["txid"])
-        for r in db.get("pending_sweeps", []) or []:
-            if r.get("source_txid"): txids.add(r["source_txid"])
-            if r.get("sweep_txid"): txids.add(r["sweep_txid"])
+        each(db.get("factories"),               "funding_txid")
+        each(db.get("tree_nodes"),              "txid")
+        each(db.get("ps_leaf_chains"),          "txid")
+        each(db.get("ps_subfactory_chains"),    "txid")
+        each(db.get("ps_initial_signed_states"),"txid")
+        each(db.get("jit_channels"),            "funding_txid")
+        each(db.get("broadcast_log"),           "txid", skip_q=True)
+        each(db.get("watchtower_pending"),      "txid")
+        each(db.get("old_commitments"),         "txid")
+        each(db.get("pending_sweeps"),          "source_txid")
+        each(db.get("pending_sweeps"),          "sweep_txid")
     return txids
 
 def collect_bitcoin(cfg):
@@ -225,7 +224,13 @@ def collect_databases(cfg):
             ("htlcs", "SELECT * FROM htlcs ORDER BY id DESC LIMIT 50"),
         ]:
             rows, err = query_db(path, sql)
-            data[label][key] = rows if not err else {"error": err}
+            # Always assign a list on error (matches the pattern used by
+            # every other collector query below).  Earlier this was
+            # `{"error": err}` which left downstream iterators (e.g.,
+            # _extract_txids) walking a dict's keys as if they were rows —
+            # crashed the entire /api/status response when client.db
+            # lacked an LSP-only table like `factories` or `participants`.
+            data[label][key] = rows if not err else []
         for key, sql in [
             ("watchtower_count", "SELECT COUNT(*) as c FROM old_commitments"),
             ("revocation_count", "SELECT COUNT(*) as c FROM revocation_secrets"),
