@@ -27,6 +27,11 @@ class Config:
         # be a completely different chain.
         self.btc_datadir = getattr(a, 'btc_datadir', None)
         self.btc_rpcport = getattr(a, 'btc_rpcport', None)
+        # Forward-compat with PR #179: accept --lsp-wallet here on main so the
+        # systemd unit can pass it consistently regardless of which branch is
+        # deployed.  This branch parses the value but doesn't use it (the
+        # wallet-UTXO collector and tile land with #179 stacked on #174).
+        self.lsp_wallet = getattr(a, 'lsp_wallet', None)
         self.cln_cli = a.cln_cli; self.cln_a_dir = a.cln_a_dir; self.cln_b_dir = a.cln_b_dir
 
 def run_cmd(args, timeout=5):
@@ -1911,6 +1916,10 @@ def main():
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
     p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
     p.add_argument("--btc-rpcport",default=None,help="bitcoind RPC port (for non-default deployments)")
+    # Forward-compat: see Config.lsp_wallet comment.  PR #179 wires this into a
+    # collect_wallet_utxos() call + the Defense-Status #13 tile; on main it's
+    # accepted but unused so the systemd unit can pass it across all branches.
+    p.add_argument("--lsp-wallet",default=None,help="LSP bitcoind wallet name (used by #179 wallet-UTXO tile)")
     p.add_argument("--cln-cli",default="lightning-cli")
     p.add_argument("--cln-a-dir",default=None); p.add_argument("--cln-b-dir",default=None)
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
