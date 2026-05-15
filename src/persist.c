@@ -122,6 +122,23 @@ static const char *SCHEMA_SQL =
     "  sweep_txid TEXT NOT NULL DEFAULT '',"
     "  PRIMARY KEY (force_close_id, htlc_vout)"
     ");"
+    /* v29 (PR-C-6): watchtower observability tables */
+    "CREATE TABLE IF NOT EXISTS reorg_events ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  timestamp INTEGER NOT NULL,"
+    "  old_tip INTEGER NOT NULL,"
+    "  new_tip INTEGER NOT NULL,"
+    "  n_entries_reset INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS breach_detections ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  timestamp INTEGER NOT NULL,"
+    "  channel_id INTEGER NOT NULL,"
+    "  expected_commit_num INTEGER NOT NULL,"
+    "  txid_seen TEXT NOT NULL,"
+    "  height_seen INTEGER NOT NULL,"
+    "  response_txid TEXT"
+    ");"
     "CREATE TABLE IF NOT EXISTS wire_messages ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  timestamp INTEGER NOT NULL,"
@@ -1060,6 +1077,37 @@ int persist_open(persist_t *p, const char *path) {
             "  cltv_expiry INTEGER NOT NULL,"
             "  sweep_txid TEXT NOT NULL DEFAULT '',"
             "  PRIMARY KEY (force_close_id, htlc_vout)"
+            ");",
+            NULL, NULL, NULL);
+    }
+
+    /* v29 (PR-C-6): watchtower observability tables.
+
+       reorg_events: one row per chain reorg, with the count of in-memory
+       watch entries whose penalty_broadcast flag was reset.  Append-only.
+       breach_detections: one row per stale-state confirmation observed
+       on-chain, with the breached commitment txid and the (optional)
+       response/penalty txid we broadcast.  Forensics + security audit
+       value; not load-bearing for correctness. */
+    if (db_version < 29) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS reorg_events ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  timestamp INTEGER NOT NULL,"
+            "  old_tip INTEGER NOT NULL,"
+            "  new_tip INTEGER NOT NULL,"
+            "  n_entries_reset INTEGER NOT NULL"
+            ");",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS breach_detections ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  timestamp INTEGER NOT NULL,"
+            "  channel_id INTEGER NOT NULL,"
+            "  expected_commit_num INTEGER NOT NULL,"
+            "  txid_seen TEXT NOT NULL,"
+            "  height_seen INTEGER NOT NULL,"
+            "  response_txid TEXT"
             ");",
             NULL, NULL, NULL);
     }
@@ -4487,6 +4535,64 @@ int persist_delete_force_close(persist_t *p, int64_t row_id) {
             -1, &stmt, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE);
+}
+
+/* --- v29: Watchtower observability — reorg + breach detection (PR-C-6) --- */
+
+#include <time.h>
+
+int persist_log_reorg_event(persist_t *p,
+                              int new_tip, int old_tip,
+                              int n_entries_reset) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO reorg_events "
+            "(timestamp, old_tip, new_tip, n_entries_reset) "
+            "VALUES (?, ?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int(stmt, 2, old_tip);
+    sqlite3_bind_int(stmt, 3, new_tip);
+    sqlite3_bind_int(stmt, 4, n_entries_reset);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE);
+}
+
+int persist_log_breach_detection(persist_t *p,
+                                   uint32_t channel_id,
+                                   uint64_t expected_commit_num,
+                                   const unsigned char *txid_seen32,
+                                   int height_seen,
+                                   const char *response_txid_hex) {
+    if (!p || !p->db || !txid_seen32) return 0;
+
+    char txid_hex[65];
+    hex_encode(txid_seen32, 32, txid_hex);
+    txid_hex[64] = '\0';
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT INTO breach_detections "
+            "(timestamp, channel_id, expected_commit_num, txid_seen, "
+            " height_seen, response_txid) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)expected_commit_num);
+    sqlite3_bind_text(stmt, 4, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, height_seen);
+    if (response_txid_hex)
+        sqlite3_bind_text(stmt, 6, response_txid_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 6);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE);

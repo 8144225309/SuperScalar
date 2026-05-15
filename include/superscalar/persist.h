@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 28
+#define PERSIST_SCHEMA_VERSION 29
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -691,6 +691,29 @@ size_t persist_load_force_close_watches(persist_t *p,
 /* Delete a force-close watch by row id (called after the HTLC sweep set
    has fully confirmed and the entry is removed from the in-memory table). */
 int persist_delete_force_close(persist_t *p, int64_t row_id);
+
+/* --- v29: Watchtower observability — reorg + breach detection logs (PR-C-6) ---
+   Forensic / audit trail.  Append-only.  Not load-bearing for correctness. */
+
+/* Append one row to reorg_events.  Called from watchtower_on_reorg with
+   the count of in-memory entries whose penalty_broadcast was reset.
+   Returns 1 on success, 0 on error or DB unavailable. */
+int persist_log_reorg_event(persist_t *p,
+                              int new_tip, int old_tip,
+                              int n_entries_reset);
+
+/* Append one row to breach_detections.  Called at the moment the
+   watchtower detects a stale-state confirmation and broadcasts a
+   penalty / response TX.  txid_seen32 is the on-chain breach TX
+   (raw 32 bytes); response_txid_hex is the penalty/response TX hex
+   string we broadcast (may be NULL if broadcast hadn't happened).
+   Returns 1 on success, 0 on error or DB unavailable. */
+int persist_log_breach_detection(persist_t *p,
+                                   uint32_t channel_id,
+                                   uint64_t expected_commit_num,
+                                   const unsigned char *txid_seen32,
+                                   int height_seen,
+                                   const char *response_txid_hex);
 
 /* --- JIT Channel persistence (Gap #2) --- */
 
