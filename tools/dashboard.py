@@ -27,10 +27,9 @@ class Config:
         # be a completely different chain.
         self.btc_datadir = getattr(a, 'btc_datadir', None)
         self.btc_rpcport = getattr(a, 'btc_rpcport', None)
-        # Forward-compat with PR #179: accept --lsp-wallet here on main so the
-        # systemd unit can pass it consistently regardless of which branch is
-        # deployed.  This branch parses the value but doesn't use it (the
-        # wallet-UTXO collector and tile land with #179 stacked on #174).
+        # Defense-Status #13 wallet UTXO tile: name of the LSP's bitcoind
+        # wallet so listunspent can be scoped to it.  Leave None to fall
+        # back to the default wallet (or skip the tile entirely).
         self.lsp_wallet = getattr(a, 'lsp_wallet', None)
         self.cln_cli = a.cln_cli; self.cln_a_dir = a.cln_a_dir; self.cln_b_dir = a.cln_b_dir
 
@@ -184,6 +183,35 @@ def collect_bitcoin(cfg):
         try: d["balance"] = float(out)
         except: pass
     return d
+
+def collect_wallet_utxos(cfg):
+    """Defense-Status #13 source: query the LSP wallet's UTXOs via
+    bitcoin-cli listunspent so the dashboard can compare available
+    pre-split outputs against the worst-case mass-CPFP need."""
+    out = {"available": False, "configured": bool(cfg.lsp_wallet),
+        "wallet": cfg.lsp_wallet or None}
+    if not cfg.btc_cli: return out
+    args = ["listunspent"]
+    if cfg.lsp_wallet:
+        raw, ok = btc_cmd(cfg, "-rpcwallet=" + cfg.lsp_wallet, *args)
+    else:
+        # Fall back to default wallet (may fail on multi-wallet setups
+        # where bitcoind requires explicit -rpcwallet=NAME).
+        raw, ok = btc_cmd(cfg, *args)
+    if not ok:
+        out["error"] = "listunspent failed"
+        return out
+    try:
+        utxos = json.loads(raw)
+        amounts = [int(round(float(u.get("amount", 0)) * 1e8)) for u in utxos]
+        out.update({"available": True,
+            "count": len(utxos),
+            "total_sats": sum(amounts),
+            "min_sats": min(amounts) if amounts else 0,
+            "max_sats": max(amounts) if amounts else 0})
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 def collect_databases(cfg):
     data = {"lsp": {}, "client": {}}
@@ -536,6 +564,7 @@ def collect_all(cfg):
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
         "databases": db, "cln": collect_cln(cfg),
         "factory_config": collect_factory_config(cfg),
+        "wallet_utxos": collect_wallet_utxos(cfg),
         "tx_enrichment": collect_tx_enrichment(cfg, _extract_txids(db))}
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2246,74 @@ function rDefenseStatus(D){
    risk:'Force-close fails with -25 bad-txns-inputs-missingorspent indefinitely'});
  }
 
+ // #8 — Fee-spike CPFP defense (Phase 2 partial)
+ // watchtower_pending tracks each broadcast penalty/sweep TX along with
+ // its current cycles_in_mempool and bump_count.  A pending sweep that
+ // has been sitting in the mempool for many cycles without ever being
+ // bumped is the signature of a deadline-aware bump loop that's not
+ // executing — exactly the case where a fee-spike could let an old
+ // state win the DW race.
+ {
+  const wp=lsp.watchtower_pending||[];
+  let color,status;
+  if(wp.length===0){
+   color='grey'; status='no pending sweeps (nothing to fee-bump right now)';
+  } else {
+   const stuck=wp.filter(w=>(w.cycles_in_mempool||0)>6 && (w.bump_count||0)===0);
+   if(stuck.length===0){
+    color='green';
+    const bumped=wp.filter(w=>(w.bump_count||0)>0).length;
+    status=`${wp.length} pending sweep(s), all progressing (${bumped} bumped)`;
+   } else {
+    color='red';
+    status=`${stuck.length}/${wp.length} sweep(s) stuck >6 cycles with NO fee bump`;
+   }
+  }
+  tiles.push({n:'#8',icon:'⛽',name:'Fee-spike CPFP defense',
+   defense:'P2A + CPFP child + deadline-aware budget sweeper re-bumps per block',
+   status,color,source:'watchtower_pending (cycles_in_mempool, bump_count)',
+   risk:'Stuck TX loses DW race; old state confirms; cheater succeeds'});
+ }
+
+ // #13 — LSP wallet UTXO budget for mass-CPFP (Phase 2 partial)
+ // The defense against fee spikes during a mass force-close is for the
+ // LSP wallet to hold many small pre-split UTXOs so each in-flight
+ // factory can attach a CPFP child without contention.  When the wallet
+ // is consolidated into one large UTXO, only one CPFP child can be
+ // attached at a time and the rest of the closes stall.  Approach A
+ // (this implementation): server queries `bitcoin-cli listunspent` and
+ // the tile compares the result to the worst-case need.
+ {
+  const wu=D.wallet_utxos||{};
+  const facCount=(lsp.factories||[]).filter(f=>f.state!=='closed').length;
+  // Worst-case: one CPFP child per active factory + 1 buffer slot.
+  // If we have no observed factories yet, default to 1 so the tile
+  // still has a non-zero target instead of dividing by zero.
+  const worstCase=Math.max(facCount,1);
+  let color,status;
+  if(!wu.available){
+   color='grey';
+   status=wu.configured ? `listunspent failed for wallet "${wu.wallet}" (locked or missing?)` : 'no --lsp-wallet configured (cannot query)';
+  } else {
+   const count=wu.count||0;
+   const margin=worstCase>0?count/worstCase:0;
+   if(margin>=2){
+    color='green';
+    status=`${count} UTXO(s) ≥ 2× worst-case need (${worstCase} active factor${worstCase===1?'y':'ies'})`;
+   } else if(margin>=1){
+    color='yellow';
+    status=`${count} UTXO(s) vs. need ${worstCase} — at margin, consider pre-splitting`;
+   } else {
+    color='red';
+    status=`${count} UTXO(s) < ${worstCase} worst-case CPFP slots needed`;
+   }
+  }
+  tiles.push({n:'#13',icon:'💰',name:'LSP wallet UTXO budget',
+   defense:'Pre-split wallet UTXOs allow one CPFP child per in-flight close',
+   status,color,source:'bitcoin-cli listunspent',
+   risk:'Mass force-close exhausts CPFP slots; later TXs stall, lose DW race'});
+ }
+
  // ---- Aggregate header ----
  const greenCount=tiles.filter(t=>t.color==='green').length;
  const yellowCount=tiles.filter(t=>t.color==='yellow').length;
@@ -2488,10 +2585,7 @@ def main():
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
     p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
     p.add_argument("--btc-rpcport",default=None,help="bitcoind RPC port (for non-default deployments)")
-    # Forward-compat: see Config.lsp_wallet comment.  PR #179 wires this into a
-    # collect_wallet_utxos() call + the Defense-Status #13 tile; on main it's
-    # accepted but unused so the systemd unit can pass it across all branches.
-    p.add_argument("--lsp-wallet",default=None,help="LSP bitcoind wallet name (used by #179 wallet-UTXO tile)")
+    p.add_argument("--lsp-wallet",default=None,help="LSP bitcoind wallet name (enables Defense Status #13 wallet-UTXO tile)")
     p.add_argument("--cln-cli",default="lightning-cli")
     p.add_argument("--cln-a-dir",default=None); p.add_argument("--cln-b-dir",default=None)
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
