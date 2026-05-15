@@ -4176,6 +4176,74 @@ int test_persist_force_close_round_trip(void)
     return 1;
 }
 
+/* v30 (PR-PTLC-1) old_commitment_ptlcs round-trip — schema groundwork. */
+int test_persist_old_commitment_ptlcs_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Save two PTLC outputs on commitment (channel=4, commit_num=2). */
+    watchtower_htlc_t p0, p1;
+    memset(&p0, 0, sizeof(p0));
+    p0.htlc_vout   = 2;
+    p0.htlc_amount = 11000;
+    memset(p0.htlc_spk, 0x60, 34);
+    p0.direction   = HTLC_OFFERED;
+    memset(p0.payment_hash, 0xAA, 32);  /* xonly form of payment_point */
+    p0.cltv_expiry = 800200;
+
+    memset(&p1, 0, sizeof(p1));
+    p1.htlc_vout   = 3;
+    p1.htlc_amount = 22000;
+    memset(p1.htlc_spk, 0x61, 34);
+    p1.direction   = HTLC_RECEIVED;
+    memset(p1.payment_hash, 0xBB, 32);
+    p1.cltv_expiry = 800300;
+
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p0), "save ptlc 0");
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p1), "save ptlc 1");
+
+    /* A different channel — confirm scope. */
+    watchtower_htlc_t p2;
+    memset(&p2, 0, sizeof(p2));
+    p2.htlc_vout   = 2;
+    p2.htlc_amount = 99000;
+    memset(p2.htlc_spk, 0x70, 34);
+    p2.direction   = HTLC_OFFERED;
+    memset(p2.payment_hash, 0xCC, 32);
+    p2.cltv_expiry = 800400;
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 9, 1, &p2), "save ptlc on different channel");
+
+    /* Load back channel=4 commit=2 — should be exactly 2 rows. */
+    watchtower_htlc_t out[4];
+    size_t n = persist_load_old_commitment_ptlcs(&db, 4, 2, out, 4);
+    TEST_ASSERT_EQ((int)n, 2, "2 PTLCs loaded for channel 4, commit 2");
+    TEST_ASSERT_EQ((int)out[0].htlc_vout,   2,       "ptlc 0 vout");
+    TEST_ASSERT_EQ((long long)out[0].htlc_amount, 11000LL, "ptlc 0 amount");
+    TEST_ASSERT_EQ((int)out[0].direction,    HTLC_OFFERED, "ptlc 0 direction");
+    TEST_ASSERT((unsigned char)out[0].payment_hash[0] == 0xAA, "ptlc 0 payment_point round-trips");
+    TEST_ASSERT_EQ((int)out[0].cltv_expiry, 800200, "ptlc 0 cltv");
+    TEST_ASSERT_EQ((int)out[1].htlc_vout,   3,       "ptlc 1 vout");
+    TEST_ASSERT_EQ((int)out[1].direction,    HTLC_RECEIVED, "ptlc 1 direction");
+
+    /* Load channel=9 commit=1 — should be exactly 1 row. */
+    size_t n2 = persist_load_old_commitment_ptlcs(&db, 9, 1, out, 4);
+    TEST_ASSERT_EQ((int)n2, 1, "1 PTLC on channel 9 commit 1");
+    TEST_ASSERT_EQ((long long)out[0].htlc_amount, 99000LL, "channel 9 ptlc amount");
+
+    /* Load nonexistent — 0 rows. */
+    size_t n3 = persist_load_old_commitment_ptlcs(&db, 9, 99, out, 4);
+    TEST_ASSERT_EQ((int)n3, 0, "no PTLCs for nonexistent commit_num");
+
+    /* Idempotent save (INSERT OR REPLACE on same key). */
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p0), "idempotent save");
+    n = persist_load_old_commitment_ptlcs(&db, 4, 2, out, 4);
+    TEST_ASSERT_EQ((int)n, 2, "still 2 PTLCs after idempotent save");
+
+    persist_close(&db);
+    return 1;
+}
+
 /* v29 (PR-C-6) observability tables append-only smoke test. */
 int test_persist_observability_tables(void)
 {

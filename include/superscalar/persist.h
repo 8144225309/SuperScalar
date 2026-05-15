@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 29
+#define PERSIST_SCHEMA_VERSION 30
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -452,6 +452,25 @@ int persist_save_old_commitment_htlc(persist_t *p, uint32_t channel_id,
 /* Load HTLC output metadata for an old commitment. Returns count loaded. */
 size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
     uint64_t commit_num, watchtower_htlc_t *htlcs_out, size_t max_htlcs);
+
+/* --- v30 (PR-PTLC-1): PTLC output metadata persistence ---
+   Parallel to old_commitment_htlcs.  Stores PTLC outputs on revoked
+   commitments so the watchtower can sweep them after restart.  The
+   payment_point is stored as xonly (32-byte) form — same encoding as
+   embedded in the PTLC tapscript on the on-chain commitment TX
+   (channel.c:799-805).  watchtower_htlc_t struct is reused (PTLC and
+   HTLC outputs share the same in-memory layout per watchtower.h:55-58). */
+
+/* Save PTLC output metadata for an old commitment. */
+int persist_save_old_commitment_ptlc(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, const watchtower_htlc_t *ptlc);
+
+/* Load PTLC output metadata for an old commitment. Returns count loaded.
+   Caller must initialize ptlcs_out[].direction to PTLC_OFFERED/RECEIVED
+   externally if it matters — this loader uses the same htlc_direction_t
+   enum stored in the row. */
+size_t persist_load_old_commitment_ptlcs(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, watchtower_htlc_t *ptlcs_out, size_t max_ptlcs);
 
 /* --- Wire message logging (Phase 22) --- */
 
