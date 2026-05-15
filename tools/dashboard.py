@@ -827,6 +827,7 @@ tr:hover td{background:#1c2128}
  <div class="tab active" data-t="overview">Overview</div>
  <div class="tab" data-t="factory">Factory</div>
  <div class="tab" data-t="channels">Channels & HTLCs</div>
+ <div class="tab" data-t="payments">Payments</div>
  <div class="tab" data-t="protocol">Protocol Log</div>
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
@@ -1304,6 +1305,142 @@ function rChannels(D){
  return h;
 }
 
+// === TAB: Payments ===
+// Reconstructs payment-level activity from HTLC tables: groups by payment_hash
+// to detect MPP (multi-part), surfaces forwarding through htlc_origins, and
+// rolls up per-channel volume/success.  No server-side schema changes —
+// reads tables already queried by collect_databases.
+function rPayments(D){
+ const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
+ const htlcs=lsp.htlcs||[];
+ const oldHtlcs=lsp.old_commitment_htlcs||[];
+ const origins=lsp.htlc_origins||[];
+ const invoices=lsp.invoice_registry||[];
+ const clInvoices=cl.client_invoices||[];
+ const chans=lsp.channels||[];
+ // Group HTLCs (live + historical) by payment_hash
+ const byHash={};
+ const noteHash=(ph)=>{if(!byHash[ph])byHash[ph]={hash:ph,htlcs:[],historical:[],origins:[],invoices:[]};return byHash[ph];};
+ for(const x of htlcs){if(x.payment_hash)noteHash(x.payment_hash).htlcs.push(x);}
+ for(const x of oldHtlcs){if(x.payment_hash)noteHash(x.payment_hash).historical.push(x);}
+ for(const o of origins){if(o.payment_hash)noteHash(o.payment_hash).origins.push(o);}
+ for(const iv of invoices){if(iv.payment_hash)noteHash(iv.payment_hash).invoices.push(iv);}
+ const payments=Object.values(byHash);
+ const allHtlcs=htlcs.concat(oldHtlcs);
+ // Empty state
+ if(!payments.length && !allHtlcs.length){
+  let h='';
+  h+=`<div class="s"><div class="st"><span>Payments</span><span class="c">no HTLC traffic yet</span></div>`;
+  h+=`<p class="mu">No HTLCs have flowed through this LSP yet.  Drive payments via the cheat-engine campaign (<code>superscalar_client --send DEST:AMT:PREIMAGE</code>) or restart the LSP with <code>--demo</code> to populate.  Once HTLCs are present this tab groups them by <code>payment_hash</code> to surface MPP splits, forwarding, and per-channel rollups.</p>`;
+  h+=`</div>`;
+  return h;
+ }
+ // Aggregate counts
+ const stateCounts={};
+ for(const x of allHtlcs)stateCounts[x.state||'unknown']=(stateCounts[x.state||'unknown']||0)+1;
+ const totalAmt=allHtlcs.reduce((a,x)=>a+(x.amount||0),0);
+ const succN=(stateCounts.fulfilled||0);
+ const failN=(stateCounts.failed||0);
+ const activeN=(stateCounts.active||0)+(stateCounts.offered||0)+(stateCounts.received||0)+(stateCounts.pending||0);
+ // Per-channel rollup
+ const byChan={};
+ for(const x of allHtlcs){
+  const cid=x.channel_id;if(cid==null)continue;
+  if(!byChan[cid])byChan[cid]={cid,sent:0,recv:0,vol_out:0,vol_in:0,succ:0,fail:0,total:0};
+  const r=byChan[cid];r.total++;
+  if(x.direction==='offered'){r.sent++;r.vol_out+=(x.amount||0);}
+  else if(x.direction==='received'){r.recv++;r.vol_in+=(x.amount||0);}
+  if(x.state==='fulfilled')r.succ++;
+  if(x.state==='failed')r.fail++;
+ }
+ let h='';
+ // Summary card
+ h+=`<div class="s"><div class="st"><span>Payment Activity</span><span class="c">${payments.length} unique payment(s), ${allHtlcs.length} HTLC(s) tracked</span></div>`;
+ h+=`<div class="kv">`;
+ h+=`<div class="ki"><span class="k">Total HTLCs</span><span class="v">${allHtlcs.length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Unique payments</span><span class="v">${payments.length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Volume routed</span><span class="v">${fs(totalAmt)}</span></div>`;
+ if(activeN)h+=`<div class="ki"><span class="k">In-flight</span><span class="b w">${activeN}</span></div>`;
+ if(succN)h+=`<div class="ki"><span class="k">Fulfilled</span><span class="b ok">${succN}</span></div>`;
+ if(failN)h+=`<div class="ki"><span class="k">Failed</span><span class="b dn">${failN}</span></div>`;
+ h+=`<div class="ki"><span class="k">Open invoices</span><span class="v">${invoices.filter(i=>i.active).length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Bridge forwards</span><span class="v">${origins.length}</span></div>`;
+ h+=`</div></div>`;
+ // Per-channel breakdown
+ if(Object.keys(byChan).length){
+  h+=`<div class="s"><div class="st"><span>Per-Channel Activity</span></div>`;
+  h+=`<table><tr><th>CH</th><th class="r">HTLCs</th><th class="r">Sent</th><th class="r">Recv</th><th class="r">Vol out</th><th class="r">Vol in</th><th class="r">Success</th></tr>`;
+  const cks=Object.keys(byChan).sort((a,b)=>parseInt(a)-parseInt(b));
+  for(const k of cks){const c=byChan[k];
+   const rate=c.total?Math.round(100*c.succ/c.total):0;
+   const cls=rate>=95?'b ok':rate>=80?'b i':rate>0?'b w':'b';
+   h+=`<tr><td>${c.cid}</td><td class="r">${c.total}</td><td class="r">${c.sent}</td><td class="r">${c.recv}</td><td class="r">${fs(c.vol_out)}</td><td class="r">${fs(c.vol_in)}</td><td class="r"><span class="${cls}" style="font-size:9px">${c.succ}/${c.total} (${rate}%)</span></td></tr>`;
+  }
+  h+=`</table></div>`;
+ }
+ // Per-payment table (MPP-aware)
+ if(payments.length){
+  // Sort: in-flight first, then by HTLC count (MPP) descending
+  const stateOrder={offered:0,received:0,active:0,pending:0,fulfilled:1,failed:2};
+  payments.sort((a,b)=>{
+   const al=a.htlcs.concat(a.historical),bl=b.htlcs.concat(b.historical);
+   const ast=(al[0]||{}).state||'',bst=(bl[0]||{}).state||'';
+   const ao=stateOrder[ast]??3,bo=stateOrder[bst]??3;
+   if(ao!==bo)return ao-bo;
+   return bl.length-al.length;
+  });
+  h+=`<div class="s"><div class="st"><span>Payments</span><span class="c">${payments.length}, sorted in-flight first</span></div>`;
+  h+=`<table><tr><th>Payment Hash</th><th class="r">HTLCs</th><th class="r">Amount</th><th>Direction</th><th>Origin</th><th>State</th><th class="r">CLTV</th></tr>`;
+  for(const p of payments.slice(0,50)){
+   const all=p.htlcs.concat(p.historical);
+   const amt=all.reduce((a,x)=>a+(x.amount||0),0);
+   const states=new Set(all.map(x=>x.state).filter(x=>x));
+   const dirs=new Set(all.map(x=>x.direction).filter(x=>x));
+   const cltvs=all.map(x=>x.cltv_expiry).filter(x=>x);
+   const mppBadge=all.length>1?`<span class="b i" style="font-size:9px" title="multi-part payment">${all.length} parts</span>`:`${all.length}`;
+   let origin='—';
+   if(p.invoices.length)origin=`<span title="LSP-issued invoice">invoice (inbound)</span>`;
+   else if(p.origins.length)origin=`<span title="forwarded via htlc_origins">bridge forward</span>`;
+   else if(dirs.has('offered')&&!dirs.has('received'))origin='outbound (LSP-paid)';
+   else if(dirs.has('received')&&!dirs.has('offered'))origin='inbound';
+   const dir=dirs.size===1?Array.from(dirs)[0]:dirs.size>1?'mixed':'—';
+   let stateText,stateCls;
+   if(states.size===0){stateText='—';stateCls='b';}
+   else if(states.size===1){stateText=Array.from(states)[0];stateCls=stateText==='fulfilled'?'b ok':stateText==='failed'?'b dn':'b w';}
+   else{stateText=`${states.size} states`;stateCls='b w';}
+   h+=`<tr><td class="h">${th(p.hash)}</td><td class="r">${mppBadge}</td><td class="r">${fs(amt)}</td><td>${dir}</td><td>${origin}</td><td><span class="${stateCls}" style="font-size:9px">${stateText}</span></td><td class="r">${cltvs.length?Math.max.apply(null,cltvs):'—'}</td></tr>`;
+  }
+  if(payments.length>50)h+=`<tr><td colspan="7" class="mu">… and ${payments.length-50} more</td></tr>`;
+  h+=`</table></div>`;
+ }
+ // LSP forwarding stats
+ if(origins.length){
+  const active=origins.filter(o=>o.active).length;
+  const done=origins.length-active;
+  const fwdPayments=payments.filter(p=>p.origins.length>0);
+  let fwdVol=0;
+  for(const p of fwdPayments)fwdVol+=p.htlcs.concat(p.historical).reduce((a,x)=>a+(x.amount||0),0);
+  h+=`<div class="s"><div class="st"><span>LSP Forwarding</span><span class="c">${origins.length} bridge record(s)</span></div>`;
+  h+=`<div class="kv">`;
+  h+=`<div class="ki"><span class="k">Active forwards</span><span class="b w">${active}</span></div>`;
+  h+=`<div class="ki"><span class="k">Completed</span><span class="b ok">${done}</span></div>`;
+  h+=`<div class="ki"><span class="k">Unique fwd payments</span><span class="v">${fwdPayments.length}</span></div>`;
+  h+=`<div class="ki"><span class="k">Volume forwarded</span><span class="v">${fs(fwdVol)}</span></div>`;
+  h+=`</div></div>`;
+ }
+ // Client-side invoice ledger (when available)
+ if(clInvoices.length){
+  const paid=clInvoices.filter(i=>i.state==='paid').length;
+  const open=clInvoices.length-paid;
+  h+=`<div class="s"><div class="st"><span>Client Invoice Ledger</span><span class="c">${clInvoices.length} invoice(s)</span></div>`;
+  h+=`<div class="kv">`;
+  h+=`<div class="ki"><span class="k">Open</span><span class="b w">${open}</span></div>`;
+  h+=`<div class="ki"><span class="k">Paid</span><span class="b ok">${paid}</span></div>`;
+  h+=`</div></div>`;
+ }
+ return h;
+}
+
 // === TAB: Protocol Log ===
 function rProtocol(D){
  const db=D.databases||{},lsp=db.lsp||{},msgs=lsp.wire_messages||[];
@@ -1737,6 +1874,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='overview'?'show':''}" id="t-overview">${rOverview(D)}</div>`;
  h+=`<div class="tp ${curTab==='factory'?'show':''}" id="t-factory">${rFactory(D)}</div>`;
  h+=`<div class="tp ${curTab==='channels'?'show':''}" id="t-channels">${rChannels(D)}</div>`;
+ h+=`<div class="tp ${curTab==='payments'?'show':''}" id="t-payments">${rPayments(D)}</div>`;
  h+=`<div class="tp ${curTab==='protocol'?'show':''}" id="t-protocol">${rProtocol(D)}</div>`;
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
