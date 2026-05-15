@@ -26,6 +26,22 @@ LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
 N_CLIENTS="${N_CLIENTS:-4}"
+# F1 sub-factory variant: pass --ps-subfactory-arity K via env to test
+# k² PS sub-factory shape Tier B rollover.  Default 0 = don't pass the flag
+# (= k=1, single-PS-leaf shape).  Set to 2 or 4 for the wide-leaf shape.
+PS_SUB_ARITY="${PS_SUB_ARITY:-0}"
+# F1 broadcast variant: FORCE_CLOSE=1 adds --force-close so the LSP broadcasts
+# the full tree (root + internals + PS leaves' NEW chain[0]) on-chain after
+# Tier B fires.  Proves F1's persisted chain[0] bytes are broadcastable —
+# the strongest possible regtest validation of F1 short of a real
+# unilateral exit.
+FORCE_CLOSE="${FORCE_CLOSE:-0}"
+EXTRA_LSP_FLAGS=""
+[ "$PS_SUB_ARITY" -gt 0 ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --ps-subfactory-arity $PS_SUB_ARITY"
+[ "$FORCE_CLOSE" = "1" ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --force-close"
+TMPSUFFIX=""
+[ "$PS_SUB_ARITY" -gt 0 ] && TMPSUFFIX="-k${PS_SUB_ARITY}"
+[ "$FORCE_CLOSE" = "1" ] && TMPSUFFIX="${TMPSUFFIX}-fc"
 
 FUNDING_SATS=100000
 LSP_PORT=29956
@@ -49,7 +65,7 @@ BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 # Source shared helpers (reorg watcher + vout audit) — must be after BCLI.
 . "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh
 
-TMPDIR=$(mktemp -d /tmp/ss-tier-b-ps.XXXXXX)
+TMPDIR=$(mktemp -d /tmp/ss-tier-b-ps${TMPSUFFIX}.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 
@@ -100,6 +116,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --wallet $MINER_WALLET --db "$LSP_DB" \
     --demo --test-tier-b-rollover \
     --lsp-balance-pct 100 \
+    $EXTRA_LSP_FLAGS \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 
@@ -163,8 +180,24 @@ PASS=1
 [ "$PS_CHAIN0_ROWS" -lt 1 ] && { echo "  FAIL (F1): expected >=1 ps_initial_signed_states row after rollover, saw $PS_CHAIN0_ROWS"; PASS=0; }
 [ "$F1_PERSIST" -lt 1 ] && { echo "  FAIL (F1): missing 'Tier B F1: persisted ...' log line — post-ceremony persist did not fire"; PASS=0; }
 [ "$TIER_B_PASS" -lt 1 ] && { echo "  FAIL: TIER B ROLLOVER TEST did not PASS — check .inc verifications"; PASS=0; }
+
+# F1 force-close broadcast variant: if FORCE_CLOSE=1, also verify the LSP
+# broadcast and confirmed the entire tree (including the NEW epoch's
+# signed chain[0]) on-chain.  This is the strongest regtest proof that
+# F1's persisted bytes are broadcastable.
+if [ "$FORCE_CLOSE" = "1" ]; then
+    FC_COMPLETE=$(grep -c "FORCE CLOSE COMPLETE" "$LSP_LOG" 2>/dev/null || true)
+    FC_COMPLETE="${FC_COMPLETE:-0}"
+    echo "  FORCE CLOSE markers          : $FC_COMPLETE"
+    [ "$FC_COMPLETE" -lt 1 ] && { echo "  FAIL (F1 broadcast): force-close did not complete — chain[0] broadcast failed"; PASS=0; }
+fi
+
 if [ $PASS = 1 ]; then
-    echo "  PASS: CL2-TB gate accepts arity 3, F1 chain[0] persist verified ($PS_CHAIN0_ROWS rows)"
+    if [ "$FORCE_CLOSE" = "1" ]; then
+        echo "  PASS: F1 chain[0] persist + force-close broadcast verified"
+    else
+        echo "  PASS: CL2-TB gate accepts arity 3, F1 chain[0] persist verified ($PS_CHAIN0_ROWS rows)"
+    fi
     exit 0
 else
     tail -30 "$LSP_LOG"
