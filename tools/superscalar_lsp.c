@@ -3364,11 +3364,34 @@ accept_new_factory:
                 /* Brief pause for clients to stabilize */
                 sleep(5);
             }
-            if (lsp_run_factory_creation(lsp_p,
+            /* C3 (Tier 1): journal each factory_creation attempt.  Per-attempt
+               row so retries show up as separate journal entries.  Wrapped
+               here at the caller because lsp_run_factory_creation's signature
+               doesn't have persist access — wrapping is the minimal-diff way.  */
+            int64_t c3_round_id = -1;
+            if (g_db) {
+                persist_save_signing_round_start(g_db,
+                                                   /* factory_id */ 0,
+                                                   /* node_idx */ 0,
+                                                   "factory_creation",
+                                                   lsp_p->factory.counter.current_epoch,
+                                                   (uint32_t)(lsp_p->n_clients + 1),
+                                                   &c3_round_id);
+            }
+            int fc_rc = lsp_run_factory_creation(lsp_p,
                                           funding_txid, funding_vout,
                                           funding_amount,
                                           fund_spk, 34,
-                                          step_blocks, states_per_layer, cltv_timeout)) {
+                                          step_blocks, states_per_layer, cltv_timeout);
+            if (g_db && c3_round_id > 0) {
+                persist_save_signing_round_done(g_db, c3_round_id,
+                                                  (uint32_t)(lsp_p->n_clients + 1),
+                                                  (uint32_t)(lsp_p->n_clients + 1),
+                                                  fc_rc ? "success" : "error",
+                                                  NULL,
+                                                  fc_rc ? NULL : "factory_creation returned 0");
+            }
+            if (fc_rc) {
                 creation_ok = 1;
                 break;
             }
