@@ -246,8 +246,19 @@ def collect_databases(cfg):
         rows, err = query_db(path,
             "SELECT * FROM tree_nodes ORDER BY factory_id, node_index")
         data[label]["tree_nodes"] = rows if not err else []
+        # Wire-messages query: filter out PING/PONG heartbeats and raise the
+        # limit.  Without this, an LSP that's been alive a few minutes fills
+        # the entire "latest 100" window with PING/PONG (the LSP emits one
+        # of each per ~5s heartbeat).  Result: the Ceremonies reconstructed
+        # view goes blank because FACTORY_PROPOSE / NONCE_BUNDLE / etc.
+        # have fallen off the window, and the Protocol Log shows nothing
+        # but heartbeat noise.  Filtering at query time keeps the operationally
+        # interesting messages visible.  200-row limit gives headroom for
+        # multi-factory deployments without bloating the API payload.
         rows, err = query_db(path,
-            "SELECT * FROM wire_messages ORDER BY id DESC LIMIT 100")
+            "SELECT * FROM wire_messages "
+            "WHERE msg_name NOT IN ('PING','PONG') "
+            "ORDER BY id DESC LIMIT 200")
         data[label]["wire_messages"] = rows if not err else []
         rows, err = query_db(path,
             "SELECT * FROM ladder_factories ORDER BY factory_id")
