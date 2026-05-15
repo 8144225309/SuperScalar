@@ -246,13 +246,14 @@ int test_offer_decode_bad_checksum(void)
  * v5=hd_utxos.reserved, ..., v20=client_ps_signed_inputs,
  * v21=ps_subfactory_chains with per-channel amounts,
  * v22=poison_tx_hex on ps_leaf_chains + ps_subfactory_chains,
- * v23=ps_initial_signed_states for force-close-after-advance chain history) */
+ * v23=ps_initial_signed_states for force-close-after-advance chain history,
+ * v24=epoch column on ps_leaf_chains / ps_initial_signed_states / ps_subfactory_chains (F2)) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 23, "schema version is 23 (v23 persists chain[0] for force-close history)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 24, "schema version is 24 (v24 adds epoch column for post-Tier-B dashboard cost accuracy, F2)");
     persist_close(&p);
     return 1;
 }
