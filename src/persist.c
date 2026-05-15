@@ -105,6 +105,21 @@ static const char *SCHEMA_SQL =
     "  cltv_expiry INTEGER NOT NULL,"
     "  PRIMARY KEY (channel_id, commit_num, htlc_vout)"
     ");"
+    /* v30 (PR-PTLC-1): parallel to old_commitment_htlcs for PTLC outputs.
+       payment_point stores xonly form (32 raw bytes / 64 hex chars) — the
+       same encoding that channel_build_commitment_tx_impl uses to derive
+       the PTLC tapscript SPK (see channel.c:799-805 in threat model). */
+    "CREATE TABLE IF NOT EXISTS old_commitment_ptlcs ("
+    "  channel_id INTEGER NOT NULL,"
+    "  commit_num INTEGER NOT NULL,"
+    "  ptlc_vout INTEGER NOT NULL,"
+    "  ptlc_amount INTEGER NOT NULL,"
+    "  ptlc_spk TEXT NOT NULL,"
+    "  direction INTEGER NOT NULL,"
+    "  payment_point TEXT NOT NULL,"
+    "  cltv_expiry INTEGER NOT NULL,"
+    "  PRIMARY KEY (channel_id, commit_num, ptlc_vout)"
+    ");"
     /* v28 (PR-C-2): force-close watch persistence */
     "CREATE TABLE IF NOT EXISTS force_close_watches ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -1108,6 +1123,29 @@ int persist_open(persist_t *p, const char *path) {
             "  txid_seen TEXT NOT NULL,"
             "  height_seen INTEGER NOT NULL,"
             "  response_txid TEXT"
+            ");",
+            NULL, NULL, NULL);
+    }
+
+    /* v30 (PR-PTLC-1): old_commitment_ptlcs table for PTLC breach-defense
+       persistence.  Mirrors old_commitment_htlcs schema; payment_point uses
+       the same xonly (32-byte) encoding as channel.c:799-805 — the form
+       embedded in the PTLC tapscript on the commitment TX.  Populates
+       e->ptlc_outputs at watchtower restart so the sweep loop at
+       watchtower.c:947-985 (currently unreachable, see PTLC_THREAT_MODEL.md)
+       has live data to act on once the producer-side wiring lands. */
+    if (db_version < 30) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS old_commitment_ptlcs ("
+            "  channel_id INTEGER NOT NULL,"
+            "  commit_num INTEGER NOT NULL,"
+            "  ptlc_vout INTEGER NOT NULL,"
+            "  ptlc_amount INTEGER NOT NULL,"
+            "  ptlc_spk TEXT NOT NULL,"
+            "  direction INTEGER NOT NULL,"
+            "  payment_point TEXT NOT NULL,"
+            "  cltv_expiry INTEGER NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num, ptlc_vout)"
             ");",
             NULL, NULL, NULL);
     }
@@ -3012,6 +3050,82 @@ size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
         const char *hash_hex = (const char *)sqlite3_column_text(stmt, 4);
         if (hash_hex)
             hex_decode(hash_hex, h->payment_hash, 32);
+
+        h->cltv_expiry = (uint32_t)sqlite3_column_int(stmt, 5);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- v30 (PR-PTLC-1): PTLC output persistence (mirrors HTLC pair above) --- */
+
+int persist_save_old_commitment_ptlc(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, const watchtower_htlc_t *ptlc) {
+    if (!p || !p->db || !ptlc) return 0;
+
+    char spk_hex[69], point_hex[65];
+    hex_encode(ptlc->htlc_spk, 34, spk_hex);
+    /* payment_hash[32] holds the xonly form of the PTLC's payment_point */
+    hex_encode(ptlc->payment_hash, 32, point_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO old_commitment_ptlcs "
+        "(channel_id, commit_num, ptlc_vout, ptlc_amount, ptlc_spk, "
+        " direction, payment_point, cltv_expiry) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_int(stmt, 3, (int)ptlc->htlc_vout);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)ptlc->htlc_amount);
+    sqlite3_bind_text(stmt, 5, spk_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, (int)ptlc->direction);
+    sqlite3_bind_text(stmt, 7, point_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 8, (int)ptlc->cltv_expiry);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_old_commitment_ptlcs(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, watchtower_htlc_t *ptlcs_out, size_t max_ptlcs) {
+    if (!p || !p->db || !ptlcs_out) return 0;
+
+    const char *sql =
+        "SELECT ptlc_vout, ptlc_amount, ptlc_spk, direction, payment_point, cltv_expiry "
+        "FROM old_commitment_ptlcs WHERE channel_id = ? AND commit_num = ? "
+        "ORDER BY ptlc_vout ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_ptlcs) {
+        watchtower_htlc_t *h = &ptlcs_out[count];
+        h->htlc_vout = (uint32_t)sqlite3_column_int(stmt, 0);
+        h->htlc_amount = (uint64_t)sqlite3_column_int64(stmt, 1);
+
+        const char *spk_hex = (const char *)sqlite3_column_text(stmt, 2);
+        if (spk_hex)
+            hex_decode(spk_hex, h->htlc_spk, 34);
+
+        h->direction = (htlc_direction_t)sqlite3_column_int(stmt, 3);
+
+        /* payment_hash[32] holds xonly form of PTLC payment_point */
+        const char *point_hex = (const char *)sqlite3_column_text(stmt, 4);
+        if (point_hex)
+            hex_decode(point_hex, h->payment_hash, 32);
 
         h->cltv_expiry = (uint32_t)sqlite3_column_int(stmt, 5);
         count++;
