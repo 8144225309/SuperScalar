@@ -1895,6 +1895,11 @@ extern int test_rotation_readiness_none_connected(void);
 extern int test_rotation_readiness_partial(void);
 
 static void run_unit_tests(void) {
+    /* Task #104: tests opt in to real PTLC creation; production build leaves
+       this off so the gate refuses meaningful channel_add_ptlc calls. */
+    extern void ptlc_safety_set_enabled(int);
+    ptlc_safety_set_enabled(1);
+
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
     RUN_TEST(test_dw_delay_for_state);
