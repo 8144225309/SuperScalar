@@ -1632,10 +1632,13 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
     /* Step 5: Wait for LEAF_ADVANCE_PSIG from client */
     wire_msg_t psig_msg;
-    if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side], &psig_msg, 30) ||
-        psig_msg.msg_type != MSG_LEAF_ADVANCE_PSIG) {
-        fprintf(stderr, "LSP: expected LEAF_ADVANCE_PSIG from client %d, got 0x%02x\n",
-                leaf_side, psig_msg.msg_type);
+    int psig_rc = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side],
+                                                &psig_msg, WIRE_CEREMONY_RECV_TIMEOUT_SEC);
+    if (!psig_rc || psig_msg.msg_type != MSG_LEAF_ADVANCE_PSIG) {
+        const char *why = !psig_rc ? "recv timeout / peer EOF"
+                                    : "wrong message type";
+        fprintf(stderr, "LSP: expected LEAF_ADVANCE_PSIG from client %d, got 0x%02x (%s)\n",
+                leaf_side, psig_msg.msg_type, why);
         if (psig_msg.json) cJSON_Delete(psig_msg.json);
         memset(lsp_seckey, 0, 32);
         return 0;
@@ -2299,9 +2302,10 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t nmsg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &nmsg, 60) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &nmsg,
+                                          WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC) ||
             nmsg.msg_type != MSG_PATH_NONCE_BUNDLE) {
-            fprintf(stderr, "LSP state_advance: expected PATH_NONCE_BUNDLE from client %zu, got 0x%02x\n",
+            fprintf(stderr, "LSP state_advance: expected PATH_NONCE_BUNDLE from client %zu, got 0x%02x (recv timeout/peer EOF or wrong type)\n",
                     c, nmsg.msg_type);
             if (nmsg.json) cJSON_Delete(nmsg.json);
             free(all_nonces); free(all_poison_nonces);
@@ -2501,9 +2505,10 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* --- Step 8: Collect PATH_PSIG_BUNDLE from each client --- */
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t pmsg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg, 60) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
+                                          WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC) ||
             pmsg.msg_type != MSG_PATH_PSIG_BUNDLE) {
-            fprintf(stderr, "LSP state_advance: expected PATH_PSIG_BUNDLE from client %zu, got 0x%02x\n",
+            fprintf(stderr, "LSP state_advance: expected PATH_PSIG_BUNDLE from client %zu, got 0x%02x (recv timeout/peer EOF or wrong type)\n",
                     c, pmsg.msg_type);
             /* C3 Tier 2: record this client's psig as missing/rejected. */
             if (mgr->persist && c3_round_id > 0) {
@@ -2952,9 +2957,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     for (size_t ci = 0; ci < n_clients; ci++) {
         size_t fd_idx = (size_t)(clients[ci] - 1);
         wire_msg_t nonce_msg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &nonce_msg, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &nonce_msg,
+                                          WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
             nonce_msg.msg_type != MSG_LEAF_REALLOC_NONCE) {
-            fprintf(stderr, "LSP realloc: expected REALLOC_NONCE from client %u, got 0x%02x\n",
+            fprintf(stderr, "LSP realloc: expected REALLOC_NONCE from client %u, got 0x%02x (recv timeout/peer EOF or wrong type)\n",
                     clients[ci], nonce_msg.msg_type);
             if (nonce_msg.json) cJSON_Delete(nonce_msg.json);
             memset(lsp_seckey, 0, 32);
@@ -3080,9 +3086,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     for (size_t ci = 0; ci < n_clients; ci++) {
         size_t fd_idx = (size_t)(clients[ci] - 1);
         wire_msg_t psig_msg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &psig_msg, 30) ||
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx], &psig_msg,
+                                          WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
             psig_msg.msg_type != MSG_LEAF_REALLOC_PSIG) {
-            fprintf(stderr, "LSP realloc: expected REALLOC_PSIG from client %u, got 0x%02x\n",
+            fprintf(stderr, "LSP realloc: expected REALLOC_PSIG from client %u, got 0x%02x (recv timeout/peer EOF or wrong type)\n",
                     clients[ci], psig_msg.msg_type);
             if (psig_msg.json) cJSON_Delete(psig_msg.json);
             factory_session_reset_poison(f, node_idx);
@@ -3419,7 +3426,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_msg_t nmsg;
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
-                                            &nmsg, 30) ||
+                                            &nmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
             nmsg.msg_type != MSG_SUBFACTORY_NONCE) {
             fprintf(stderr, "LSP subfactory advance: expected SUBFACTORY_NONCE "
                     "from client %u, got 0x%02x\n",
@@ -3546,7 +3553,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_msg_t pmsg;
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
-                                            &pmsg, 30) ||
+                                            &pmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
             pmsg.msg_type != MSG_SUBFACTORY_PSIG) {
             fprintf(stderr, "LSP subfactory advance: expected SUBFACTORY_PSIG "
                     "from client %u, got 0x%02x\n",
