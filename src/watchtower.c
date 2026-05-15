@@ -93,6 +93,25 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->n_htlc_outputs = 0;
                 e->response_tx = NULL;
                 e->response_tx_len = 0;
+                e->signed_penalty_tx = NULL;
+                e->signed_penalty_tx_len = 0;
+
+                /* v25 restart-defense load: pull the pre-built penalty TX
+                   bytes if they were persisted.  Without this, the oracular
+                   fast-path skips broadcast post-restart and the channel goes
+                   undefended.  rc=0 (row exists, column empty) is the legacy
+                   fallback path — leaves signed_penalty_tx NULL and channel_t
+                   re-attaches later via watchtower_set_channel. */
+                if (db && db->db) {
+                    unsigned char *bytes = NULL;
+                    size_t blen = 0;
+                    if (persist_load_old_commitment_witness(db, (uint32_t)c,
+                            commit_nums[i], &bytes, &blen) == 1
+                        && bytes && blen > 0) {
+                        e->signed_penalty_tx = bytes;
+                        e->signed_penalty_tx_len = blen;
+                    }
+                }
 
                 /* Load persisted HTLC output data for this commitment */
                 if (db && db->db) {
@@ -218,6 +237,14 @@ int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
         free(e->signed_penalty_tx);
         e->signed_penalty_tx = copy;
         e->signed_penalty_tx_len = signed_penalty_tx_len;
+        /* v25: persist the pre-built bytes so they survive LSP restart.
+           Without this, the restart loader can't reattach the bytes, the
+           oracular fast-path skips broadcast, and the channel goes
+           undefended. */
+        if (wt->db && wt->db->db)
+            persist_save_old_commitment_witness(wt->db, channel_id, commit_num,
+                                                  signed_penalty_tx,
+                                                  signed_penalty_tx_len);
     }
     return 1;
 }
@@ -341,6 +368,13 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                             free(just_added->signed_penalty_tx);
                             just_added->signed_penalty_tx = copy;
                             just_added->signed_penalty_tx_len = penalty.len;
+                            /* v25: persist so LSP restart can reattach.  Without
+                               this, oracular fast-path post-restart sees NULL
+                               and skips broadcast. */
+                            if (wt->db && wt->db->db)
+                                persist_save_old_commitment_witness(
+                                    wt->db, channel_id, old_commit_num,
+                                    penalty.data, penalty.len);
                         }
                     }
                     tx_buf_free(&penalty);
@@ -455,6 +489,12 @@ void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *c
     free(e->signed_penalty_tx);
     e->signed_penalty_tx = copy;
     e->signed_penalty_tx_len = signed_penalty_tx_len;
+    /* v25: persist so LSP restart can reattach.  See companion calls in
+       watchtower_watch_oracular and watchtower_watch_revoked_commitment. */
+    if (wt->db && wt->db->db)
+        persist_save_old_commitment_witness(wt->db, channel_id, old_commit_num,
+                                              signed_penalty_tx,
+                                              signed_penalty_tx_len);
 }
 
 void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)

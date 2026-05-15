@@ -247,13 +247,15 @@ int test_offer_decode_bad_checksum(void)
  * v21=ps_subfactory_chains with per-channel amounts,
  * v22=poison_tx_hex on ps_leaf_chains + ps_subfactory_chains,
  * v23=ps_initial_signed_states for force-close-after-advance chain history,
- * v24=epoch column on ps_leaf_chains / ps_initial_signed_states / ps_subfactory_chains (F2)) */
+ * v24=epoch column on ps_leaf_chains / ps_initial_signed_states / ps_subfactory_chains (F2),
+ * v25=signed_penalty_tx_hex on old_commitments (closes restart-loses-defense gap),
+ * v26=signing_rounds journal + signing_round_participants (C3 ceremony forensics)) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 24, "schema version is 24 (v24 adds epoch column for post-Tier-B dashboard cost accuracy, F2)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 26, "schema version is 26 (v26 adds signing_rounds journal for ceremony forensics — C3)");
     persist_close(&p);
     return 1;
 }

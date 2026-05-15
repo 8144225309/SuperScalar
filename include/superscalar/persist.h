@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 24
+#define PERSIST_SCHEMA_VERSION 26
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -339,6 +339,105 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       unsigned char (*spks)[34],
                                       size_t *spk_lens,
                                       size_t max_entries);
+
+/* --- Pre-signed penalty TX persistence (v25) ---
+
+   Closes a critical restart-time defense gap: watchtower_watch_revoked_commitment
+   (and its variants) pre-builds the penalty TX bytes at registration time and
+   stashes them in watchtower_entry_t.signed_penalty_tx (heap).  The restart
+   loader at watchtower.c:60-115 re-creates the entries from old_commitments
+   but never reloads signed_penalty_tx.  At broadcast time, the oracular
+   fast-path skips the entry with "no signed_penalty_tx — skipping" and the
+   channel goes undefended.
+
+   These two functions persist the pre-built bytes to a new column on
+   old_commitments and reload them at restart.  Same key as the parent row:
+   (factory_id implicitly via channel_id, commit_num).  Empty/missing bytes
+   degrade gracefully to the legacy lazy-build path (which requires channel_t
+   present — not available on the oracular path). */
+
+/* Persist the pre-built signed penalty TX bytes for a given (channel, commit_num).
+   Idempotent (UPDATE).  Returns 1 on success, 0 on DB error.  Safe to call
+   with NULL/zero bytes — treated as a no-op. */
+int persist_save_old_commitment_witness(persist_t *p, uint32_t channel_id,
+                                          uint64_t commit_num,
+                                          const unsigned char *signed_penalty_tx,
+                                          size_t signed_penalty_tx_len);
+
+/* Load the pre-built signed penalty TX bytes for a given (channel, commit_num).
+   *out_bytes is malloc()'d on success — caller must free().
+   Returns 1 if bytes were loaded (out_bytes / out_len populated),
+   0 if the row exists but the column is empty (degrade to legacy path),
+  -1 on DB error or missing row. */
+int persist_load_old_commitment_witness(persist_t *p, uint32_t channel_id,
+                                          uint64_t commit_num,
+                                          unsigned char **out_bytes,
+                                          size_t *out_len);
+
+/* --- v26: signing_rounds journal (C3, ceremony forensics) ---
+
+   Each MuSig2/Tier-B ceremony writes a row at start and updates at end.
+   Tier 2 (per-signer participation) is a future extension; this version
+   is parent-only (Tier 1) to keep the initial PR scope tight.
+
+   See C3_LSP_SCHEMA_HANDOFF.md for the full design.  Tables:
+
+     signing_rounds(id PK, factory_id, node_idx, ceremony_type, epoch,
+                    started_at, completed_at, n_participants,
+                    nonces_collected, partial_sigs_collected,
+                    result, result_txid, error_detail)
+
+     signing_round_participants(round_id, signer_slot, pubnonce_received_at,
+                                partial_sig_received_at, partial_sig_status)
+
+   ceremony_type values: 'factory_creation' | 'leaf_advance' |
+                         'sub_factory_advance' | 'leaf_realloc' |
+                         'tier_b_rollover'
+   result values:        'success' | 'timeout' | 'abort' | 'aborted_crash' | 'error'
+
+   All writes are guarded by if (mgr->persist) { ... }: a DB write failure
+   does NOT abort the ceremony itself.  persist_sweep_incomplete_signing_rounds
+   is called once at LSP startup to mark in-flight rows from a crashed
+   previous run as 'aborted_crash'. */
+
+/* Start a ceremony row.  Returns 1 on success and writes the row id into
+   *out_row_id (use as the round_id parameter to participant/done calls).
+   0 on DB error — caller should NOT abort the ceremony. */
+int persist_save_signing_round_start(persist_t *p,
+                                       uint32_t factory_id,
+                                       uint32_t node_idx,
+                                       const char *ceremony_type,
+                                       uint32_t epoch,
+                                       uint32_t n_participants,
+                                       int64_t *out_row_id);
+
+/* Optional Tier 2: log per-signer pubnonce receipt timestamp.  Idempotent
+   (UPDATE).  No-op if round_id <= 0 or persist is NULL.  Returns 1 on success. */
+int persist_save_signing_round_participant_nonce(persist_t *p,
+                                                   int64_t round_id,
+                                                   uint32_t signer_slot);
+
+/* Optional Tier 2: log per-signer partial-sig receipt + verification status.
+   Status values: 'received' | 'verified' | 'invalid'.  Idempotent. */
+int persist_save_signing_round_participant_psig(persist_t *p,
+                                                  int64_t round_id,
+                                                  uint32_t signer_slot,
+                                                  const char *status);
+
+/* Finalize a ceremony row.  result must be one of the documented values.
+   result_txid may be NULL.  error_detail may be NULL for success. */
+int persist_save_signing_round_done(persist_t *p,
+                                      int64_t round_id,
+                                      uint32_t nonces_collected,
+                                      uint32_t partial_sigs_collected,
+                                      const char *result,
+                                      const char *result_txid,
+                                      const char *error_detail);
+
+/* Crash-recovery sweep: mark any row with completed_at IS NULL as
+   'aborted_crash'.  Called once at LSP startup right after persist_open.
+   Returns number of rows swept (>= 0); 0 is normal on a clean restart. */
+int persist_sweep_incomplete_signing_rounds(persist_t *p);
 
 /* --- Old commitment HTLC outputs (watchtower) --- */
 
