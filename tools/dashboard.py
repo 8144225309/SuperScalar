@@ -1197,7 +1197,49 @@ function rFactory(D){
    h+=`<div class="kv" style="margin-top:4px"><div class="ki"><span class="k">Node ${entries[0].node_index}</span><span class="v">nonces ${nn}/${tot}</span></div><div class="ki"><span class="k">sigs</span><span class="v">${ns}/${tot}</span></div><div style="flex:1">${prog(ns/tot*100,ns===tot?'pg':'po')}</div></div>`;}
   h+=`</div>`;}
  // Protocol + DW
- const proto=D.factory_protocol,dw=D.dw_state;
+ // F3b: in real mode, build a dw_state-shaped object from the live
+ // lsp.dw_counter_state + factory row + bitcoin tip so the existing
+ // DW state widget (which was originally written for demo mode) can
+ // render against real factory data.  Demo mode populates D.dw_state
+ // directly; real mode populates lsp.dw_counter_state via the
+ // collect_databases query.  Fall back to demo shape when present
+ // (so demo mode keeps rendering unchanged).
+ const proto=D.factory_protocol;
+ let dw=D.dw_state;
+ if(!dw){
+  const dwc=(lsp.dw_counter_state||[])[0];
+  const fac0=(lsp.factories||[])[0];
+  const lf0=(lsp.ladder_factories||[]).find(r=>r.factory_id===(fac0&&fac0.id))||{};
+  if(dwc&&fac0){
+   const spl=fac0.states_per_layer||0;
+   const nl=dwc.n_layers||0;
+   const layerStates=(dwc.layer_states||'').split(',').map(s=>parseInt(s,10)||0);
+   const layers=[];
+   for(let i=0;i<nl;i++){
+    layers.push({
+     index:i,
+     current_state:layerStates[i]||0,
+     max_states:spl,
+     // step_blocks per layer = base × states_per_layer^layer_index
+     step_blocks:(fac0.step_blocks||0)*Math.pow(spl||1,i),
+    });
+   }
+   const cb=lf0.created_block||0;
+   const ab=lf0.active_blocks||0;
+   const db_=cb+ab;
+   dw={
+    n_layers:nl,
+    states_per_layer:spl,
+    total_epochs:Math.pow(spl||1,nl),
+    current_epoch:dwc.current_epoch||0,
+    layers:layers,
+    created_block:cb,
+    cltv_timeout:fac0.cltv_timeout||db_,
+    dying_block:db_,
+    current_block:(D.bitcoin&&D.bitcoin.blocks)||cb,
+   };
+  }
+ }
  if(proto||dw){h+=`<div class="g2">`;
   if(proto){h+=`<div class="s"><div class="st">Creation Protocol (4 rounds)</div><div class="pr">`;
    for(let i=0;i<proto.phases.length;i++){if(i)h+=`<span class="pa">\u25B6</span>`;
