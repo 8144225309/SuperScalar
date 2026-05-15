@@ -2158,6 +2158,15 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_bundle_count++;
     }
 
+    /* C3 Tier 2 (PR-C-4): record LSP-side nonce contribution once
+       (slot 0).  Per-node hooks aren't useful here — Tier 1's
+       signing_round row aggregates the whole ceremony; the participant
+       row marks "LSP completed its nonce generation". */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_nonce(
+            (persist_t *)mgr->persist, c3_round_id, /* signer_slot = */ 0);
+    }
+
     /* --- Step 2.5: Generate LSP's poison nonce pool over all prepared
        leaves where LSP is a signer (PR-D phase 3).  Mirrors Step 2 but
        feeds factory_session_set_nonce_poison + builds lsp_poison_bundle
@@ -2297,6 +2306,13 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (nmsg.json) cJSON_Delete(nmsg.json);
             free(all_nonces); free(all_poison_nonces);
             return 0;
+        }
+        /* C3 Tier 2 (PR-C-4): client c's nonce bundle arrived.  Clients
+           are slots 1..n_clients (LSP is slot 0). */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_nonce(
+                (persist_t *)mgr->persist, c3_round_id,
+                /* signer_slot = */ (uint32_t)(c + 1));
         }
         cJSON *arr = cJSON_GetObjectItem(nmsg.json, "entries");
         if (!arr) {
@@ -2449,6 +2465,13 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    /* C3 Tier 2 (PR-C-4): LSP completed its own psigs for all affected nodes. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_psig(
+            (persist_t *)mgr->persist, c3_round_id,
+            /* signer_slot = */ 0, "verified");
+    }
+
     /* PR-D phase 3: LSP's poison partial sigs per prepared leaf. */
     for (size_t lp = 0; lp < n_leaf_pre; lp++) {
         if (!leaf_poison_prepared[lp]) continue;
@@ -2482,6 +2505,12 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             pmsg.msg_type != MSG_PATH_PSIG_BUNDLE) {
             fprintf(stderr, "LSP state_advance: expected PATH_PSIG_BUNDLE from client %zu, got 0x%02x\n",
                     c, pmsg.msg_type);
+            /* C3 Tier 2: record this client's psig as missing/rejected. */
+            if (mgr->persist && c3_round_id > 0) {
+                persist_save_signing_round_participant_psig(
+                    (persist_t *)mgr->persist, c3_round_id,
+                    (uint32_t)(c + 1), "rejected");
+            }
             if (pmsg.json) cJSON_Delete(pmsg.json);
             return 0;
         }
@@ -2494,22 +2523,41 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         wire_bundle_entry_t *cents = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!cents) { cJSON_Delete(pmsg.json); return 0; }
         size_t ne = wire_parse_bundle(arr, cents, cap, 32);
+        int psig_ok = 1;
         for (size_t e = 0; e < ne; e++) {
             secp256k1_musig_partial_sig psig;
             if (!musig_partial_sig_parse(lsp->ctx, &psig, cents[e].data)) {
                 fprintf(stderr, "LSP state_advance: bad psig from client %zu\n", c);
+                psig_ok = 0;
                 free(cents); cJSON_Delete(pmsg.json);
+                if (mgr->persist && c3_round_id > 0) {
+                    persist_save_signing_round_participant_psig(
+                        (persist_t *)mgr->persist, c3_round_id,
+                        (uint32_t)(c + 1), "rejected");
+                }
                 return 0;
             }
             if (!factory_session_set_partial_sig(f, cents[e].node_idx,
                                                   cents[e].signer_slot, &psig)) {
                 fprintf(stderr, "LSP state_advance: set_partial_sig client=%zu node=%u slot=%u failed\n",
                         c, cents[e].node_idx, cents[e].signer_slot);
+                psig_ok = 0;
                 free(cents); cJSON_Delete(pmsg.json);
+                if (mgr->persist && c3_round_id > 0) {
+                    persist_save_signing_round_participant_psig(
+                        (persist_t *)mgr->persist, c3_round_id,
+                        (uint32_t)(c + 1), "rejected");
+                }
                 return 0;
             }
         }
         free(cents);
+        /* C3 Tier 2 (PR-C-4): all of client c's psigs parsed + accepted. */
+        if (psig_ok && mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_psig(
+                (persist_t *)mgr->persist, c3_round_id,
+                (uint32_t)(c + 1), "verified");
+        }
 
         /* PR-D phase 3: parse optional poison_entries (partial sigs). */
         size_t poison_psig_cap = (size_t)FACTORY_MAX_LEAVES * (size_t)FACTORY_MAX_SIGNERS;
