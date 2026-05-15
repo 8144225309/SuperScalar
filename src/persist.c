@@ -88,6 +88,10 @@ static const char *SCHEMA_SQL =
     "  to_local_vout INTEGER NOT NULL,"
     "  to_local_amount INTEGER NOT NULL,"
     "  to_local_spk TEXT NOT NULL,"
+    /* v25: pre-built penalty TX bytes (hex).  Persisted at registration
+       time so the watchtower can broadcast after a process restart.
+       Default '' (empty) preserves legacy lazy-build fallback. */
+    "  signed_penalty_tx_hex TEXT NOT NULL DEFAULT '',"
     "  PRIMARY KEY (channel_id, commit_num)"
     ");"
     "CREATE TABLE IF NOT EXISTS old_commitment_htlcs ("
@@ -921,6 +925,64 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
         sqlite3_exec(p->db,
             "ALTER TABLE ps_subfactory_chains ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
+    /* v25: persist pre-built penalty TX bytes on old_commitments.
+
+       Before this column, watchtower_watch_revoked_commitment built the
+       penalty TX in memory at registration time but never persisted the
+       bytes.  On LSP restart, the entry was re-created from old_commitments
+       with signed_penalty_tx = NULL, and the oracular fast-path skipped
+       broadcast ("entry %u has no signed_penalty_tx — skipping").
+       Channel went undefended.
+
+       Additive ALTER TABLE ADD COLUMN with empty-string default — existing
+       rows degrade to the legacy lazy-build path (which requires channel_t
+       to be present; works for in-memory entries but fails on oracular).
+       Code-side defense: watchtower restart loader now also queries this
+       column and reassigns e->signed_penalty_tx. */
+    if (db_version < 25) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE old_commitments ADD COLUMN signed_penalty_tx_hex TEXT NOT NULL DEFAULT '';",
+            NULL, NULL, NULL);
+    }
+
+    /* v26 (C3): signing_rounds journal — record each MuSig2/Tier-B ceremony's
+       start, per-signer participation, and final outcome.  Supports operator
+       forensics ("which client timed out?") and crash recovery ("was a
+       ceremony in flight when we restarted?"). */
+    if (db_version < 26) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS signing_rounds ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  factory_id INTEGER NOT NULL,"
+            "  node_idx INTEGER NOT NULL,"
+            "  ceremony_type TEXT NOT NULL,"
+            "  epoch INTEGER NOT NULL DEFAULT 0,"
+            "  started_at INTEGER NOT NULL,"
+            "  completed_at INTEGER,"
+            "  n_participants INTEGER NOT NULL,"
+            "  nonces_collected INTEGER NOT NULL DEFAULT 0,"
+            "  partial_sigs_collected INTEGER NOT NULL DEFAULT 0,"
+            "  result TEXT,"
+            "  result_txid TEXT,"
+            "  error_detail TEXT"
+            ");",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "CREATE INDEX IF NOT EXISTS idx_signing_rounds_factory_started "
+            "ON signing_rounds(factory_id, started_at DESC);",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS signing_round_participants ("
+            "  round_id INTEGER NOT NULL REFERENCES signing_rounds(id) ON DELETE CASCADE,"
+            "  signer_slot INTEGER NOT NULL,"
+            "  pubnonce_received_at INTEGER,"
+            "  partial_sig_received_at INTEGER,"
+            "  partial_sig_status TEXT,"
+            "  PRIMARY KEY (round_id, signer_slot)"
+            ");",
             NULL, NULL, NULL);
     }
 
@@ -2547,6 +2609,214 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- v25: pre-built penalty TX bytes (closes restart-loses-defense gap) --- */
+
+int persist_save_old_commitment_witness(persist_t *p, uint32_t channel_id,
+                                          uint64_t commit_num,
+                                          const unsigned char *signed_penalty_tx,
+                                          size_t signed_penalty_tx_len) {
+    if (!p || !p->db) return 0;
+    if (!signed_penalty_tx || signed_penalty_tx_len == 0) return 1;  /* no-op */
+
+    char *hex = malloc(signed_penalty_tx_len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(signed_penalty_tx, signed_penalty_tx_len, hex);
+
+    const char *sql =
+        "UPDATE old_commitments SET signed_penalty_tx_hex = ? "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(hex);
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)commit_num);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_load_old_commitment_witness(persist_t *p, uint32_t channel_id,
+                                          uint64_t commit_num,
+                                          unsigned char **out_bytes,
+                                          size_t *out_len) {
+    if (!p || !p->db || !out_bytes || !out_len) return -1;
+    *out_bytes = NULL;
+    *out_len = 0;
+
+    const char *sql =
+        "SELECT signed_penalty_tx_hex FROM old_commitments "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (!hex || hex[0] == '\0') {
+            result = 0;  /* row exists, column empty — legacy/lazy fallback */
+        } else {
+            size_t hex_len = strlen(hex);
+            size_t byte_len = hex_len / 2;
+            unsigned char *bytes = malloc(byte_len);
+            if (!bytes) {
+                result = -1;
+            } else {
+                int decoded = hex_decode(hex, bytes, byte_len);
+                if (decoded > 0) {
+                    *out_bytes = bytes;
+                    *out_len = (size_t)decoded;
+                    result = 1;
+                } else {
+                    free(bytes);
+                    result = -1;
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* --- v26 (C3): signing_rounds journal --- */
+
+int persist_save_signing_round_start(persist_t *p,
+                                       uint32_t factory_id,
+                                       uint32_t node_idx,
+                                       const char *ceremony_type,
+                                       uint32_t epoch,
+                                       uint32_t n_participants,
+                                       int64_t *out_row_id) {
+    if (!p || !p->db || !ceremony_type || !out_row_id) return 0;
+    *out_row_id = -1;
+
+    const char *sql =
+        "INSERT INTO signing_rounds "
+        "(factory_id, node_idx, ceremony_type, epoch, started_at, n_participants) "
+        "VALUES (?, ?, ?, ?, strftime('%s','now'), ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+    sqlite3_bind_text(stmt, 3, ceremony_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, (int)epoch);
+    sqlite3_bind_int(stmt, 5, (int)n_participants);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    if (ok)
+        *out_row_id = sqlite3_last_insert_rowid(p->db);
+    return ok ? 1 : 0;
+}
+
+int persist_save_signing_round_participant_nonce(persist_t *p,
+                                                   int64_t round_id,
+                                                   uint32_t signer_slot) {
+    if (!p || !p->db || round_id <= 0) return 0;
+    /* UPSERT: insert if missing, update timestamp if present */
+    const char *sql =
+        "INSERT INTO signing_round_participants "
+        "(round_id, signer_slot, pubnonce_received_at) "
+        "VALUES (?, ?, strftime('%s','now')) "
+        "ON CONFLICT(round_id, signer_slot) "
+        "DO UPDATE SET pubnonce_received_at = strftime('%s','now');";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, round_id);
+    sqlite3_bind_int(stmt, 2, (int)signer_slot);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok ? 1 : 0;
+}
+
+int persist_save_signing_round_participant_psig(persist_t *p,
+                                                  int64_t round_id,
+                                                  uint32_t signer_slot,
+                                                  const char *status) {
+    if (!p || !p->db || round_id <= 0 || !status) return 0;
+    const char *sql =
+        "INSERT INTO signing_round_participants "
+        "(round_id, signer_slot, partial_sig_received_at, partial_sig_status) "
+        "VALUES (?, ?, strftime('%s','now'), ?) "
+        "ON CONFLICT(round_id, signer_slot) "
+        "DO UPDATE SET partial_sig_received_at = strftime('%s','now'), "
+        "              partial_sig_status = excluded.partial_sig_status;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, round_id);
+    sqlite3_bind_int(stmt, 2, (int)signer_slot);
+    sqlite3_bind_text(stmt, 3, status, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok ? 1 : 0;
+}
+
+int persist_save_signing_round_done(persist_t *p,
+                                      int64_t round_id,
+                                      uint32_t nonces_collected,
+                                      uint32_t partial_sigs_collected,
+                                      const char *result,
+                                      const char *result_txid,
+                                      const char *error_detail) {
+    if (!p || !p->db || round_id <= 0 || !result) return 0;
+    const char *sql =
+        "UPDATE signing_rounds SET "
+        "  completed_at = strftime('%s','now'), "
+        "  nonces_collected = ?, "
+        "  partial_sigs_collected = ?, "
+        "  result = ?, "
+        "  result_txid = ?, "
+        "  error_detail = ? "
+        "WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)nonces_collected);
+    sqlite3_bind_int(stmt, 2, (int)partial_sigs_collected);
+    sqlite3_bind_text(stmt, 3, result, -1, SQLITE_TRANSIENT);
+    if (result_txid)
+        sqlite3_bind_text(stmt, 4, result_txid, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 4);
+    if (error_detail)
+        sqlite3_bind_text(stmt, 5, error_detail, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 5);
+    sqlite3_bind_int64(stmt, 6, round_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok ? 1 : 0;
+}
+
+int persist_sweep_incomplete_signing_rounds(persist_t *p) {
+    if (!p || !p->db) return 0;
+    const char *sql =
+        "UPDATE signing_rounds SET "
+        "  completed_at = strftime('%s','now'), "
+        "  result = 'aborted_crash', "
+        "  error_detail = 'LSP restarted while ceremony in flight' "
+        "WHERE completed_at IS NULL;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    int changes = sqlite3_changes(p->db);
+    sqlite3_finalize(stmt);
+    return ok ? changes : 0;
 }
 
 /* --- Old commitment HTLC outputs (watchtower) --- */

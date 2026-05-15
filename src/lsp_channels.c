@@ -1947,6 +1947,25 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     factory_t *f = &lsp->factory;
     if (!mgr || !lsp) return 0;
 
+    /* C3 (Tier 1): journal the ceremony.  We log a start row now and update
+       at the success exit below.  Error returns leave the row in flight;
+       persist_sweep_incomplete_signing_rounds at next LSP startup will mark
+       them aborted_crash — operator forensics see the ceremony attempted +
+       didn't finish.  row_id<=0 disables the journal calls (DB unavailable). */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        const char *ctype = (trigger_leaf_side == -1)
+                            ? "tier_b_rollover"
+                            : "tier_b_rollover";  /* same — leaf-driven Tier B */
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id = */ 0,
+                                           /* node_idx = */ 0,
+                                           ctype,
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
     /* Capture pre-advance leaf-node state for watchtower overlap window:
        the OLD signed_tx + OLD txid + OLD L-stock vout/amount become the
        parameters used to register a NEW poison/burn TX after the
@@ -2630,6 +2649,17 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("CL5: SS_KILL_AFTER_STATE_ADVANCE set — clean exit after ceremony\n");
         fflush(stdout);
         exit(0);
+    }
+
+    /* C3 (Tier 1): journal success.  Error returns above leave the row in
+       flight; sweep at next startup marks them aborted_crash. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)n_affected,
+                                          (uint32_t)n_affected,
+                                          "success",
+                                          NULL,
+                                          NULL);
     }
 
     return 1;

@@ -2019,6 +2019,16 @@ int main(int argc, char *argv[]) {
         g_db = &db;
         printf("LSP: persistence enabled (%s)\n", db_path);
 
+        /* C3 (Tier 1) crash-recovery sweep: mark any signing_rounds rows
+           with completed_at IS NULL as 'aborted_crash'.  These are
+           ceremonies that were in flight when a previous LSP instance
+           died — operator forensics needs them classified as crash-aborted
+           rather than dangling "in progress" forever. */
+        int swept = persist_sweep_incomplete_signing_rounds(&db);
+        if (swept > 0)
+            printf("LSP: C3 crash sweep: marked %d signing_rounds row(s) as aborted_crash\n",
+                   swept);
+
         /* Wire message logging (Phase 22) */
         wire_set_log_callback(lsp_wire_log_cb, &db);
     }

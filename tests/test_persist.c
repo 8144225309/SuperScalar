@@ -3877,3 +3877,159 @@ int test_persist_ps_defense_independent_inputs(void) {
     persist_close(&db);
     return 1;
 }
+
+/* v25 round-trip: persist + reload pre-built penalty TX bytes on old_commitments.
+   Closes the restart-loses-defense gap (watchtower.c:60-115). */
+int test_persist_old_commitment_witness_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    uint32_t channel_id = 7;
+    uint64_t commit_num = 42;
+    unsigned char txid[32]; memset(txid, 0xAB, 32);
+    unsigned char spk[34];  memset(spk, 0xCD, 34);
+
+    /* Parent row must exist for the UPDATE to land. */
+    TEST_ASSERT(persist_save_old_commitment(&db, channel_id, commit_num,
+                                              txid, 0, 100000, spk, 34),
+                "save old_commitments parent row");
+
+    /* Pre-1: row exists but column is empty.  Load returns 0 (degrade
+       to legacy lazy-build). */
+    unsigned char *got_bytes = NULL;
+    size_t got_len = 0;
+    int rc = persist_load_old_commitment_witness(&db, channel_id, commit_num,
+                                                   &got_bytes, &got_len);
+    TEST_ASSERT_EQ(rc, 0, "empty column returns 0 (legacy fallback)");
+    TEST_ASSERT(got_bytes == NULL, "empty load returns NULL bytes");
+    TEST_ASSERT(got_len == 0, "empty load returns 0 len");
+
+    /* Save real bytes and round-trip. */
+    unsigned char penalty[200];
+    for (size_t i = 0; i < sizeof(penalty); i++) penalty[i] = (unsigned char)(i * 7 + 3);
+    TEST_ASSERT(persist_save_old_commitment_witness(&db, channel_id, commit_num,
+                                                      penalty, sizeof(penalty)),
+                "save witness bytes");
+
+    /* Reload + verify exact byte match. */
+    got_bytes = NULL;
+    got_len = 0;
+    rc = persist_load_old_commitment_witness(&db, channel_id, commit_num,
+                                              &got_bytes, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load witness bytes succeeds");
+    TEST_ASSERT(got_bytes != NULL, "loaded bytes non-NULL");
+    TEST_ASSERT_EQ(got_len, sizeof(penalty), "loaded len matches saved");
+    TEST_ASSERT(memcmp(got_bytes, penalty, sizeof(penalty)) == 0,
+                "loaded bytes match saved");
+    free(got_bytes);
+
+    /* Idempotent re-save replaces. */
+    unsigned char penalty2[150];
+    memset(penalty2, 0x42, sizeof(penalty2));
+    TEST_ASSERT(persist_save_old_commitment_witness(&db, channel_id, commit_num,
+                                                      penalty2, sizeof(penalty2)),
+                "re-save witness bytes (UPDATE)");
+    got_bytes = NULL;
+    got_len = 0;
+    rc = persist_load_old_commitment_witness(&db, channel_id, commit_num,
+                                              &got_bytes, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "reload after re-save");
+    TEST_ASSERT_EQ(got_len, sizeof(penalty2), "re-saved len");
+    TEST_ASSERT(memcmp(got_bytes, penalty2, sizeof(penalty2)) == 0,
+                "re-saved bytes match");
+    free(got_bytes);
+
+    /* Save with NULL/zero is a safe no-op. */
+    TEST_ASSERT(persist_save_old_commitment_witness(&db, channel_id, commit_num,
+                                                      NULL, 0),
+                "save NULL is safe no-op (returns 1)");
+
+    /* Missing row → returns -1. */
+    rc = persist_load_old_commitment_witness(&db, 999, 999, &got_bytes, &got_len);
+    TEST_ASSERT_EQ(rc, -1, "missing row returns -1");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* v26 (C3) signing_rounds journal round-trip: start → done → sweep. */
+int test_persist_signing_rounds_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Round 1: success path (start → participant updates → done). */
+    int64_t round1 = -1;
+    TEST_ASSERT(persist_save_signing_round_start(&db, 0, 5,
+                                                   "leaf_advance", 1, 4,
+                                                   &round1),
+                "start round 1");
+    TEST_ASSERT(round1 > 0, "round 1 row id > 0");
+
+    /* Tier 2 participant calls — just confirm they do not fail. */
+    TEST_ASSERT(persist_save_signing_round_participant_nonce(&db, round1, 0),
+                "participant 0 nonce");
+    TEST_ASSERT(persist_save_signing_round_participant_nonce(&db, round1, 1),
+                "participant 1 nonce");
+    TEST_ASSERT(persist_save_signing_round_participant_psig(&db, round1, 0, "verified"),
+                "participant 0 psig verified");
+    TEST_ASSERT(persist_save_signing_round_participant_psig(&db, round1, 1, "verified"),
+                "participant 1 psig verified");
+
+    TEST_ASSERT(persist_save_signing_round_done(&db, round1, 4, 4,
+                                                  "success",
+                                                  "deadbeef00000000000000000000000000000000000000000000000000000000",
+                                                  NULL),
+                "round 1 done success");
+
+    /* Round 2: leave in flight, then sweep — should be marked aborted_crash. */
+    int64_t round2 = -1;
+    TEST_ASSERT(persist_save_signing_round_start(&db, 0, 5,
+                                                   "tier_b_rollover", 2, 5,
+                                                   &round2),
+                "start round 2");
+    TEST_ASSERT(round2 > round1, "round 2 row id > round 1");
+
+    /* Round 3: explicit timeout. */
+    int64_t round3 = -1;
+    TEST_ASSERT(persist_save_signing_round_start(&db, 0, 7,
+                                                   "leaf_advance", 2, 4,
+                                                   &round3),
+                "start round 3");
+    TEST_ASSERT(persist_save_signing_round_done(&db, round3, 4, 3,
+                                                  "timeout", NULL,
+                                                  "client 3 did not respond"),
+                "round 3 done timeout");
+
+    /* Sweep: round 2 should be marked aborted_crash (it has completed_at IS NULL).
+       Rounds 1 and 3 are already finalized — should be untouched. */
+    int swept = persist_sweep_incomplete_signing_rounds(&db);
+    TEST_ASSERT_EQ(swept, 1, "sweep marked exactly 1 in-flight row");
+
+    /* Verify round 2 is now aborted_crash; rounds 1 and 3 are unchanged. */
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT id, result FROM signing_rounds ORDER BY id ASC;";
+    TEST_ASSERT(sqlite3_prepare_v2(db.db, sql, -1, &stmt, NULL) == SQLITE_OK,
+                "prepare select");
+    int n_rows = 0;
+    char results[3][32] = {{0}};
+    while (sqlite3_step(stmt) == SQLITE_ROW && n_rows < 3) {
+        const char *r = (const char *)sqlite3_column_text(stmt, 1);
+        if (r) strncpy(results[n_rows], r, 31);
+        n_rows++;
+    }
+    sqlite3_finalize(stmt);
+    TEST_ASSERT_EQ(n_rows, 3, "3 rows present");
+    TEST_ASSERT(strcmp(results[0], "success") == 0, "row 1 is success");
+    TEST_ASSERT(strcmp(results[1], "aborted_crash") == 0, "row 2 is aborted_crash");
+    TEST_ASSERT(strcmp(results[2], "timeout") == 0, "row 3 is timeout");
+
+    /* Sweep again is idempotent — no rows to update. */
+    int swept2 = persist_sweep_incomplete_signing_rounds(&db);
+    TEST_ASSERT_EQ(swept2, 0, "second sweep finds nothing");
+
+    persist_close(&db);
+    return 1;
+}
