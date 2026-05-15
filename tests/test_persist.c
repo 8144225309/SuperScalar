@@ -4033,3 +4033,263 @@ int test_persist_signing_rounds_round_trip(void)
     persist_close(&db);
     return 1;
 }
+
+/* v27 (PR-C-1) fee-bump escalation persist round-trip. */
+int test_persist_pending_fee_bump_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    const char *txid = "aa11bb22cc33dd44ee55ff66"
+                       "0011223344556677889900aa"
+                       "bbccddeeff001122334455660011";
+    TEST_ASSERT(persist_save_pending(&db, txid,
+                                       /* anchor_vout    */ 1,
+                                       /* anchor_amount  */ 330,
+                                       /* cycles         */ 3,
+                                       /* bump_count     */ 12345,
+                                       /* penalty_value  */ 100000,
+                                       /* csv_delay      */ 144,
+                                       /* start_height   */ 800000,
+                                       /* fb_start_block */ 800005,
+                                       /* fb_deadline    */ 800500,
+                                       /* fb_budget_sat  */ 50000,
+                                       /* fb_start_fr    */ 5000),
+                "save pending with fee-bump fields");
+
+    char txids[4][65];
+    uint32_t vouts[4];
+    uint64_t amts[4];
+    int cycles[4];
+    int bumps[4];
+    uint64_t pvals[4];
+    uint32_t csvs[4];
+    uint32_t starts[4];
+    uint32_t fb_starts[4];
+    uint32_t fb_deadlines[4];
+    uint64_t fb_budgets[4];
+    uint64_t fb_frs[4];
+
+    size_t n = persist_load_pending(&db, txids, vouts, amts, cycles, bumps,
+                                      pvals, csvs, starts,
+                                      fb_starts, fb_deadlines, fb_budgets, fb_frs,
+                                      4);
+    TEST_ASSERT_EQ((int)n, 1, "exactly 1 row loaded");
+    TEST_ASSERT(strncmp(txids[0], txid, 64) == 0, "txid round-trips");
+    TEST_ASSERT_EQ((int)fb_starts[0], 800005, "fb_start_block round-trips");
+    TEST_ASSERT_EQ((int)fb_deadlines[0], 800500, "fb_deadline_block round-trips");
+    TEST_ASSERT_EQ((long long)fb_budgets[0], 50000LL, "fb_budget_sat round-trips");
+    TEST_ASSERT_EQ((long long)fb_frs[0], 5000LL, "fb_start_feerate round-trips");
+
+    /* NULL-safe out-pointers: legacy callers pass NULL for fb_* and still work. */
+    size_t n2 = persist_load_pending(&db, txids, vouts, amts, cycles, bumps,
+                                       pvals, csvs, starts,
+                                       NULL, NULL, NULL, NULL, 4);
+    TEST_ASSERT_EQ((int)n2, 1, "NULL fb_* out-pointers do not crash");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* v28 (PR-C-2) force-close watch persistence round-trip. */
+int test_persist_force_close_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Build two watches.  Watch A has 2 HTLCs, watch B has 1. */
+    unsigned char txid_a[32], txid_b[32];
+    memset(txid_a, 0xAA, 32);
+    memset(txid_b, 0xBB, 32);
+
+    watchtower_htlc_t htlcs_a[2];
+    memset(htlcs_a, 0, sizeof(htlcs_a));
+    htlcs_a[0].htlc_vout   = 2;
+    htlcs_a[0].htlc_amount = 100000;
+    memset(htlcs_a[0].htlc_spk, 0x51, 34);
+    htlcs_a[0].direction   = HTLC_OFFERED;
+    memset(htlcs_a[0].payment_hash, 0xCC, 32);
+    htlcs_a[0].cltv_expiry = 800500;
+
+    htlcs_a[1].htlc_vout   = 3;
+    htlcs_a[1].htlc_amount = 50000;
+    memset(htlcs_a[1].htlc_spk, 0x52, 34);
+    htlcs_a[1].direction   = HTLC_RECEIVED;
+    memset(htlcs_a[1].payment_hash, 0xDD, 32);
+    htlcs_a[1].cltv_expiry = 800400;
+
+    watchtower_htlc_t htlcs_b[1];
+    memset(htlcs_b, 0, sizeof(htlcs_b));
+    htlcs_b[0].htlc_vout   = 1;
+    htlcs_b[0].htlc_amount = 75000;
+    memset(htlcs_b[0].htlc_spk, 0x53, 34);
+    htlcs_b[0].direction   = HTLC_OFFERED;
+    memset(htlcs_b[0].payment_hash, 0xEE, 32);
+    htlcs_b[0].cltv_expiry = 800600;
+    strcpy(htlcs_b[0].sweep_txid,
+           "deadbeef00000000000000000000000000000000000000000000000000000000");
+
+    int64_t row_a = -1, row_b = -1;
+    TEST_ASSERT(persist_save_force_close(&db, 7, txid_a,
+                  (const struct watchtower_htlc *)htlcs_a, 2, &row_a),
+                "save watch A");
+    TEST_ASSERT(row_a > 0, "row_a > 0");
+    TEST_ASSERT(persist_save_force_close(&db, 11, txid_b,
+                  (const struct watchtower_htlc *)htlcs_b, 1, &row_b),
+                "save watch B");
+    TEST_ASSERT(row_b > row_a, "row_b > row_a");
+
+    /* Load back */
+    uint32_t channels[4];
+    unsigned char txids[4][32];
+    watchtower_htlc_t loaded_htlcs[8];
+    size_t n_per[4];
+    size_t n_watches = persist_load_force_close_watches(&db,
+        channels, txids, loaded_htlcs, n_per, 4, 8);
+    TEST_ASSERT_EQ((int)n_watches, 2, "loaded 2 watches");
+
+    /* Watch A round-trips */
+    TEST_ASSERT_EQ((int)channels[0], 7,            "watch A channel_id");
+    TEST_ASSERT_EQ((int)n_per[0],    2,            "watch A has 2 HTLCs");
+    TEST_ASSERT(memcmp(txids[0], txid_a, 32) == 0, "watch A txid round-trips");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[0].htlc_amount, 100000LL, "htlc A0 amount");
+    TEST_ASSERT_EQ((int)loaded_htlcs[0].cltv_expiry,        800500,  "htlc A0 cltv");
+    TEST_ASSERT_EQ((int)loaded_htlcs[0].direction,          HTLC_OFFERED, "htlc A0 dir");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[1].htlc_amount, 50000LL,  "htlc A1 amount");
+
+    /* Watch B round-trips */
+    TEST_ASSERT_EQ((int)channels[1], 11,           "watch B channel_id");
+    TEST_ASSERT_EQ((int)n_per[1],    1,            "watch B has 1 HTLC");
+    TEST_ASSERT(memcmp(txids[1], txid_b, 32) == 0, "watch B txid round-trips");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[2].htlc_amount, 75000LL,  "htlc B0 amount");
+    TEST_ASSERT(strncmp(loaded_htlcs[2].sweep_txid, "deadbeef", 8) == 0,
+                "sweep_txid round-trips");
+
+    /* Delete watch A, confirm only B remains. */
+    TEST_ASSERT(persist_delete_force_close(&db, row_a), "delete watch A");
+    size_t n_after = persist_load_force_close_watches(&db,
+        channels, txids, loaded_htlcs, n_per, 4, 8);
+    TEST_ASSERT_EQ((int)n_after, 1, "1 watch after delete");
+    TEST_ASSERT_EQ((int)channels[0], 11, "remaining watch is B");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* v30 (PR-PTLC-1) old_commitment_ptlcs round-trip — schema groundwork. */
+int test_persist_old_commitment_ptlcs_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Save two PTLC outputs on commitment (channel=4, commit_num=2). */
+    watchtower_htlc_t p0, p1;
+    memset(&p0, 0, sizeof(p0));
+    p0.htlc_vout   = 2;
+    p0.htlc_amount = 11000;
+    memset(p0.htlc_spk, 0x60, 34);
+    p0.direction   = HTLC_OFFERED;
+    memset(p0.payment_hash, 0xAA, 32);  /* xonly form of payment_point */
+    p0.cltv_expiry = 800200;
+
+    memset(&p1, 0, sizeof(p1));
+    p1.htlc_vout   = 3;
+    p1.htlc_amount = 22000;
+    memset(p1.htlc_spk, 0x61, 34);
+    p1.direction   = HTLC_RECEIVED;
+    memset(p1.payment_hash, 0xBB, 32);
+    p1.cltv_expiry = 800300;
+
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p0), "save ptlc 0");
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p1), "save ptlc 1");
+
+    /* A different channel — confirm scope. */
+    watchtower_htlc_t p2;
+    memset(&p2, 0, sizeof(p2));
+    p2.htlc_vout   = 2;
+    p2.htlc_amount = 99000;
+    memset(p2.htlc_spk, 0x70, 34);
+    p2.direction   = HTLC_OFFERED;
+    memset(p2.payment_hash, 0xCC, 32);
+    p2.cltv_expiry = 800400;
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 9, 1, &p2), "save ptlc on different channel");
+
+    /* Load back channel=4 commit=2 — should be exactly 2 rows. */
+    watchtower_htlc_t out[4];
+    size_t n = persist_load_old_commitment_ptlcs(&db, 4, 2, out, 4);
+    TEST_ASSERT_EQ((int)n, 2, "2 PTLCs loaded for channel 4, commit 2");
+    TEST_ASSERT_EQ((int)out[0].htlc_vout,   2,       "ptlc 0 vout");
+    TEST_ASSERT_EQ((long long)out[0].htlc_amount, 11000LL, "ptlc 0 amount");
+    TEST_ASSERT_EQ((int)out[0].direction,    HTLC_OFFERED, "ptlc 0 direction");
+    TEST_ASSERT((unsigned char)out[0].payment_hash[0] == 0xAA, "ptlc 0 payment_point round-trips");
+    TEST_ASSERT_EQ((int)out[0].cltv_expiry, 800200, "ptlc 0 cltv");
+    TEST_ASSERT_EQ((int)out[1].htlc_vout,   3,       "ptlc 1 vout");
+    TEST_ASSERT_EQ((int)out[1].direction,    HTLC_RECEIVED, "ptlc 1 direction");
+
+    /* Load channel=9 commit=1 — should be exactly 1 row. */
+    size_t n2 = persist_load_old_commitment_ptlcs(&db, 9, 1, out, 4);
+    TEST_ASSERT_EQ((int)n2, 1, "1 PTLC on channel 9 commit 1");
+    TEST_ASSERT_EQ((long long)out[0].htlc_amount, 99000LL, "channel 9 ptlc amount");
+
+    /* Load nonexistent — 0 rows. */
+    size_t n3 = persist_load_old_commitment_ptlcs(&db, 9, 99, out, 4);
+    TEST_ASSERT_EQ((int)n3, 0, "no PTLCs for nonexistent commit_num");
+
+    /* Idempotent save (INSERT OR REPLACE on same key). */
+    TEST_ASSERT(persist_save_old_commitment_ptlc(&db, 4, 2, &p0), "idempotent save");
+    n = persist_load_old_commitment_ptlcs(&db, 4, 2, out, 4);
+    TEST_ASSERT_EQ((int)n, 2, "still 2 PTLCs after idempotent save");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* v29 (PR-C-6) observability tables append-only smoke test. */
+int test_persist_observability_tables(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* reorg_events: 3 rows */
+    TEST_ASSERT(persist_log_reorg_event(&db, 100, 105, 2), "reorg 1");
+    TEST_ASSERT(persist_log_reorg_event(&db, 200, 202, 0), "reorg 2 (no-op reset)");
+    TEST_ASSERT(persist_log_reorg_event(&db, 300, 310, 5), "reorg 3");
+
+    sqlite3_stmt *stmt;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT count(*), max(n_entries_reset) FROM reorg_events;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare count");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step row");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 0), 3, "3 reorg rows");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 1), 5, "max n_entries_reset = 5");
+    sqlite3_finalize(stmt);
+
+    /* breach_detections: 2 rows, one with response txid + one without */
+    unsigned char txid_a[32], txid_b[32];
+    memset(txid_a, 0xAB, 32);
+    memset(txid_b, 0xCD, 32);
+    TEST_ASSERT(persist_log_breach_detection(&db, 7, 3, txid_a, 800000,
+                  "fffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefff"),
+                "breach with response");
+    TEST_ASSERT(persist_log_breach_detection(&db, 9, 0, txid_b, 800100, NULL),
+                "breach without response");
+
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT count(*), sum(CASE WHEN response_txid IS NULL THEN 1 ELSE 0 END) "
+        "FROM breach_detections;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare breach count");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step breach row");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 0), 2, "2 breach rows");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 1), 1, "1 breach with NULL response");
+    sqlite3_finalize(stmt);
+
+    /* NULL DB safety */
+    TEST_ASSERT(persist_log_reorg_event(NULL, 100, 105, 0) == 0, "NULL db reorg returns 0");
+    TEST_ASSERT(persist_log_breach_detection(NULL, 1, 0, txid_a, 0, NULL) == 0,
+                "NULL db breach returns 0");
+    TEST_ASSERT(persist_log_breach_detection(&db, 1, 0, NULL, 0, NULL) == 0,
+                "NULL txid returns 0");
+
+    persist_close(&db);
+    return 1;
+}

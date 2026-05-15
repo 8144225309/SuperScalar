@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 26
+#define PERSIST_SCHEMA_VERSION 30
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -453,6 +453,25 @@ int persist_save_old_commitment_htlc(persist_t *p, uint32_t channel_id,
 size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
     uint64_t commit_num, watchtower_htlc_t *htlcs_out, size_t max_htlcs);
 
+/* --- v30 (PR-PTLC-1): PTLC output metadata persistence ---
+   Parallel to old_commitment_htlcs.  Stores PTLC outputs on revoked
+   commitments so the watchtower can sweep them after restart.  The
+   payment_point is stored as xonly (32-byte) form — same encoding as
+   embedded in the PTLC tapscript on the on-chain commitment TX
+   (channel.c:799-805).  watchtower_htlc_t struct is reused (PTLC and
+   HTLC outputs share the same in-memory layout per watchtower.h:55-58). */
+
+/* Save PTLC output metadata for an old commitment. */
+int persist_save_old_commitment_ptlc(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, const watchtower_htlc_t *ptlc);
+
+/* Load PTLC output metadata for an old commitment. Returns count loaded.
+   Caller must initialize ptlcs_out[].direction to PTLC_OFFERED/RECEIVED
+   externally if it matters — this loader uses the same htlc_direction_t
+   enum stored in the row. */
+size_t persist_load_old_commitment_ptlcs(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, watchtower_htlc_t *ptlcs_out, size_t max_ptlcs);
+
 /* --- Wire message logging (Phase 22) --- */
 
 /* Log a wire message to the wire_messages table. */
@@ -616,24 +635,104 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out);
 
 /* --- Watchtower pending entry persistence --- */
 
-/* Save a pending penalty entry (for CPFP bump tracking across restarts). */
+/* Save a pending penalty entry (for CPFP bump tracking across restarts).
+   v27: fb_start_block / fb_deadline_block / fb_budget_sat / fb_start_feerate
+   carry the htlc_fee_bump_t escalation schedule so a mid-escalation restart
+   can resume the linear fee schedule instead of rebasing from zero. */
 int persist_save_pending(persist_t *p, const char *txid,
                            uint32_t anchor_vout, uint64_t anchor_amount,
                            int cycles_in_mempool, int bump_count,
                            uint64_t penalty_value, uint32_t csv_delay,
-                           uint32_t start_height);
+                           uint32_t start_height,
+                           uint32_t fb_start_block,
+                           uint32_t fb_deadline_block,
+                           uint64_t fb_budget_sat,
+                           uint64_t fb_start_feerate);
 
-/* Load all pending entries. Returns count loaded. */
+/* Load all pending entries. Returns count loaded.
+   v27: fb_* arrays may be NULL (legacy callers); when non-NULL they are
+   populated with the persisted htlc_fee_bump_t escalation schedule. */
 size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
                               uint32_t *vouts_out, uint64_t *amounts_out,
                               int *cycles_out, int *bumps_out,
                               uint64_t *penalty_values_out,
                               uint32_t *csv_delays_out,
                               uint32_t *start_heights_out,
+                              uint32_t *fb_start_blocks_out,
+                              uint32_t *fb_deadline_blocks_out,
+                              uint64_t *fb_budget_sats_out,
+                              uint64_t *fb_start_feerates_out,
                               size_t max_entries);
 
 /* Delete a pending entry by txid (e.g., after confirmation). */
 int persist_delete_pending(persist_t *p, const char *txid);
+
+/* --- v28: Force-close watch persistence (PR-C-2) ---
+   Restart-restore for WATCH_FORCE_CLOSE entries.  Unlike WATCH_COMMITMENT
+   (rebuilt from old_commitments) and WATCH_FACTORY_NODE / WATCH_SUBFACTORY_NODE
+   (rebuilt from in-memory factory state via lsp_channels_rehydrate_*),
+   force-close watches have no recovery path today.  Two-table layout:
+   force_close_watches (one row per channel) + force_close_htlcs
+   (one row per HTLC to sweep). */
+
+/* opaque watchtower_htlc layout — declared in watchtower.h.  We expose only
+   the fields the persist layer needs to round-trip. */
+struct watchtower_htlc;
+
+/* Save a force-close watch (channel + HTLC sweep set).
+   commitment_txid32 is 32 raw bytes.  htlcs/n_htlcs are the per-HTLC sweep
+   targets.  out_row_id receives the autoincrement PK (used by delete).
+   INSERT-then-cascade-INSERT — caller must be prepared for two-step write
+   (transactional safety provided by the SQLite default txn). */
+int persist_save_force_close(persist_t *p, uint32_t channel_id,
+                                const unsigned char *commitment_txid32,
+                                const struct watchtower_htlc *htlcs,
+                                size_t n_htlcs,
+                                int64_t *out_row_id);
+
+/* Load all force-close watches.  out parameters mirror the in-memory
+   watchtower_entry_t shape so the loader in watchtower_init can rebuild
+   entries directly:
+     channel_ids_out / commitment_txids_out (32-byte raw)  — one per watch
+     htlcs_out                                              — flat array of all HTLCs
+     n_htlcs_per_watch_out                                  — count per watch
+   Caller-allocated arrays.  max_watches limits the top-level count;
+   max_htlcs_total limits the HTLCs across all watches.  Returns number of
+   watches loaded (0 on no rows or error). */
+size_t persist_load_force_close_watches(persist_t *p,
+                                          uint32_t *channel_ids_out,
+                                          unsigned char (*commitment_txids_out)[32],
+                                          struct watchtower_htlc *htlcs_out,
+                                          size_t *n_htlcs_per_watch_out,
+                                          size_t max_watches,
+                                          size_t max_htlcs_total);
+
+/* Delete a force-close watch by row id (called after the HTLC sweep set
+   has fully confirmed and the entry is removed from the in-memory table). */
+int persist_delete_force_close(persist_t *p, int64_t row_id);
+
+/* --- v29: Watchtower observability — reorg + breach detection logs (PR-C-6) ---
+   Forensic / audit trail.  Append-only.  Not load-bearing for correctness. */
+
+/* Append one row to reorg_events.  Called from watchtower_on_reorg with
+   the count of in-memory entries whose penalty_broadcast was reset.
+   Returns 1 on success, 0 on error or DB unavailable. */
+int persist_log_reorg_event(persist_t *p,
+                              int new_tip, int old_tip,
+                              int n_entries_reset);
+
+/* Append one row to breach_detections.  Called at the moment the
+   watchtower detects a stale-state confirmation and broadcasts a
+   penalty / response TX.  txid_seen32 is the on-chain breach TX
+   (raw 32 bytes); response_txid_hex is the penalty/response TX hex
+   string we broadcast (may be NULL if broadcast hadn't happened).
+   Returns 1 on success, 0 on error or DB unavailable. */
+int persist_log_breach_detection(persist_t *p,
+                                   uint32_t channel_id,
+                                   uint64_t expected_commit_num,
+                                   const unsigned char *txid_seen32,
+                                   int height_seen,
+                                   const char *response_txid_hex);
 
 /* --- JIT Channel persistence (Gap #2) --- */
 

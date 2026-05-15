@@ -15,6 +15,32 @@
 /* Minimum capacity for PTLC array growth */
 #define PTLC_INIT_CAP 8
 
+/* PTLC safety gate (task #104).
+
+   PTLC machinery (channel ops, wire protocol, watchtower sweep loop, ptlcs
+   persistence table) is built — but the breach-defense feed is incomplete:
+   nothing populates watchtower_entry_t.ptlc_outputs, so the sweep loop at
+   watchtower.c:947 is unreachable.  Until the Phase 0 audit (task #103)
+   confirms the full threat surface and the breach-defense PRs land, refuse
+   any production attempt to create a real PTLC output.
+
+   Today's call surface is benign — ptlc_commit_add_and_sign + the
+   meaningful overload of channel_add_ptlc are only invoked from tests.
+   This gate is defense in depth against future refactors accidentally
+   wiring a production callsite.
+
+   Tests opt in by setting ptlc_safety_set_enabled(1) at start of the test
+   that needs to exercise real PTLCs. */
+static int g_ptlc_safety_enabled = 0;
+
+void ptlc_safety_set_enabled(int enabled) {
+    g_ptlc_safety_enabled = enabled ? 1 : 0;
+}
+
+int ptlc_safety_is_enabled(void) {
+    return g_ptlc_safety_enabled;
+}
+
 static uint16_t rd16_be(const unsigned char *b)
 {
     return ((uint16_t)b[0] << 8) | b[1];
@@ -26,6 +52,16 @@ int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
                       uint32_t cltv_expiry, uint64_t *id_out)
 {
     if (!ch) return 0;
+
+    /* Safety gate (task #104): refuse real PTLCs in production until breach
+       defense lands.  Degenerate calls (amount=0 AND point=NULL) used by the
+       inbound wire dispatch for pre_sig storage still pass through, since
+       they create no on-chain output value. */
+    if (!g_ptlc_safety_enabled && (amount_sats > 0 || point != NULL)) {
+        fprintf(stderr,
+            "channel_add_ptlc: refused (PTLC support gated; see task #104 / Phase 0 audit)\n");
+        return 0;
+    }
 
     /* Grow array if needed */
     if (ch->n_ptlcs >= ch->ptlcs_cap) {

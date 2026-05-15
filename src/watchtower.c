@@ -143,9 +143,15 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
         uint64_t pending_penalty_values[WATCHTOWER_MAX_PENDING];
         uint32_t pending_csv_delays[WATCHTOWER_MAX_PENDING];
         uint32_t pending_start_heights[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_fb_start_blocks[WATCHTOWER_MAX_PENDING];
+        uint32_t pending_fb_deadlines[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_fb_budgets[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_fb_start_feerates[WATCHTOWER_MAX_PENDING];
         size_t n_loaded = persist_load_pending(db, pending_txids,
             pending_vouts, pending_amounts, pending_cycles, pending_bumps,
             pending_penalty_values, pending_csv_delays, pending_start_heights,
+            pending_fb_start_blocks, pending_fb_deadlines,
+            pending_fb_budgets, pending_fb_start_feerates,
             WATCHTOWER_MAX_PENDING);
         for (size_t i = 0; i < n_loaded && wt->n_pending < wt->pending_cap; i++) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
@@ -156,9 +162,60 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             p->cycles_in_mempool = pending_cycles[i];
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             p->fee_bump.last_bump_block = (uint32_t)pending_bumps[i];
+            /* v27: resume escalation schedule.  tx_vsize is constant
+               WATCHTOWER_CPFP_CHILD_VSIZE (not persisted); pre-v27 rows
+               load as zeros and re-initialize at next bump check. */
+            p->fee_bump.start_block    = pending_fb_start_blocks[i];
+            p->fee_bump.deadline_block = pending_fb_deadlines[i];
+            p->fee_bump.budget_sat     = pending_fb_budgets[i];
+            p->fee_bump.start_feerate  = pending_fb_start_feerates[i];
+            p->fee_bump.tx_vsize       = WATCHTOWER_CPFP_CHILD_VSIZE;
+            p->fee_bump.last_feerate   = 0;  /* re-derived from RBF state */
             p->penalty_value = pending_penalty_values[i];
             p->csv_delay = pending_csv_delays[i];
             p->start_height = pending_start_heights[i];
+        }
+
+        /* v28 (PR-C-2): Load force-close watches.  Reconstruct
+           WATCH_FORCE_CLOSE entries directly into wt->entries (they have no
+           re-build-from-state recovery path like factory_node has). */
+        #define WT_FC_MAX_WATCHES 64
+        #define WT_FC_MAX_HTLCS_TOTAL 256
+        uint32_t fc_channels[WT_FC_MAX_WATCHES];
+        unsigned char fc_txids[WT_FC_MAX_WATCHES][32];
+        watchtower_htlc_t fc_htlcs[WT_FC_MAX_HTLCS_TOTAL];
+        size_t fc_n_per[WT_FC_MAX_WATCHES];
+        size_t n_fc = persist_load_force_close_watches(db,
+            fc_channels, fc_txids, fc_htlcs, fc_n_per,
+            WT_FC_MAX_WATCHES, WT_FC_MAX_HTLCS_TOTAL);
+
+        size_t htlc_cursor = 0;
+        for (size_t w = 0; w < n_fc && wt->n_entries < wt->entries_cap; w++) {
+            watchtower_entry_t *e = &wt->entries[wt->n_entries++];
+            memset(e, 0, sizeof(*e));
+            e->type = WATCH_FORCE_CLOSE;
+            e->channel_id = fc_channels[w];
+            memcpy(e->txid, fc_txids[w], 32);
+            e->registered_height = 0;  /* late-arrival mode after restart */
+
+            if (fc_n_per[w] > 0) {
+                e->htlc_outputs = calloc(fc_n_per[w], sizeof(watchtower_htlc_t));
+                if (e->htlc_outputs) {
+                    memcpy(e->htlc_outputs, &fc_htlcs[htlc_cursor],
+                           fc_n_per[w] * sizeof(watchtower_htlc_t));
+                    e->n_htlc_outputs   = fc_n_per[w];
+                    e->htlc_outputs_cap = fc_n_per[w];
+
+                    /* Re-register HTLC scripts on the chain backend so BIP 158
+                       scanning picks up timeouts post-restart. */
+                    if (wt->chain && wt->chain->register_script) {
+                        for (size_t h = 0; h < fc_n_per[w]; h++)
+                            wt->chain->register_script(wt->chain,
+                                                       e->htlc_outputs[h].htlc_spk, 34);
+                    }
+                }
+            }
+            htlc_cursor += fc_n_per[w];
         }
     }
 
@@ -707,6 +764,16 @@ int watchtower_check(watchtower_t *wt) {
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
             memcpy(e->penalty_txid, factory_resp_txid, 65);
+
+            /* v29 (PR-C-6): observability — record this breach detection.
+               Only fired when we *actually broadcast* a response TX
+               (not just when we saw the stale state). */
+            if (wt->db && wt->db->db) {
+                int height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                persist_log_breach_detection(wt->db, e->channel_id,
+                    e->commit_num, e->txid, height, factory_resp_txid);
+            }
+
             i++;
             continue;
         }
@@ -877,9 +944,13 @@ int watchtower_check(watchtower_t *wt) {
             p->cycles_in_mempool = 0;
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
             if (wt->db && wt->db->db) {
+                /* fee_bump is freshly memset above — escalation schedule
+                   not yet initialised; persist zeros so a restart-then-
+                   first-bump path still calls htlc_fee_bump_init normally. */
                 persist_save_pending(wt->db, p->txid, p->anchor_vout,
                                        p->anchor_amount, 0, 0,
-                                       p->penalty_value, p->csv_delay, p->start_height);
+                                       p->penalty_value, p->csv_delay, p->start_height,
+                                       0, 0, 0, 0);
             }
         }
 
@@ -1170,11 +1241,17 @@ int watchtower_check(watchtower_t *wt) {
                         printf("  CPFP child broadcast (feerate %llu): %s\n",
                                (unsigned long long)fr, cpfp_txid);
                         if (wt->db && wt->db->db) {
+                            /* v27: persist the escalation schedule so a
+                               mid-bump restart resumes instead of rebasing. */
                             persist_save_pending(wt->db, p->txid,
                                 p->anchor_vout, p->anchor_amount,
                                 p->cycles_in_mempool,
                                 (int)p->fee_bump.last_bump_block,
-                                p->penalty_value, p->csv_delay, p->start_height);
+                                p->penalty_value, p->csv_delay, p->start_height,
+                                p->fee_bump.start_block,
+                                p->fee_bump.deadline_block,
+                                p->fee_bump.budget_sat,
+                                p->fee_bump.start_feerate);
                             persist_log_broadcast(wt->db, cpfp_txid,
                                                   "cpfp", cpfp_hex, "ok");
                         }
@@ -1331,7 +1408,8 @@ int watchtower_add_pending_tx(watchtower_t *wt,
     if (wt->db && wt->db->db)
         persist_save_pending(wt->db, p->txid, p->anchor_vout,
                                p->anchor_amount, 0, 0,
-                               p->penalty_value, p->csv_delay, p->start_height);
+                               p->penalty_value, p->csv_delay, p->start_height,
+                               0, 0, 0, 0);
     return 1;
 }
 
@@ -1518,6 +1596,16 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     if (wt->chain && wt->chain->register_script)
         for (size_t i = 0; i < n_htlcs; i++)
             wt->chain->register_script(wt->chain, htlcs[i].htlc_spk, 34);
+
+    /* v28 (PR-C-2): persist so the entry survives LSP restart.  Unlike
+       commitment / factory_node / subfactory_node entries, force-close
+       watches have no rebuild-from-state recovery path. */
+    if (wt->db && wt->db->db) {
+        int64_t row_id = -1;
+        persist_save_force_close(wt->db, channel_id, commitment_txid,
+                                   (const struct watchtower_htlc *)htlcs,
+                                   n_htlcs, &row_id);
+    }
     return 1;
 }
 
@@ -1565,6 +1653,7 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
     fprintf(stderr, "Watchtower: reorg detected (%d → %d), re-validating %zu entries\n",
             old_tip, new_tip, wt->n_entries);
 
+    int n_reset = 0;
     /* Reset penalty_broadcast for entries whose penalty tx vanished */
     for (size_t i = 0; i < wt->n_entries; i++) {
         watchtower_entry_t *e = &wt->entries[i];
@@ -1577,6 +1666,7 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
                     e->penalty_txid);
             e->penalty_broadcast = 0;
             e->penalty_txid[0] = '\0';
+            n_reset++;
         }
     }
 
@@ -1593,6 +1683,10 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
     /* Mark stale entries in database so they survive restarts */
     if (wt->db && wt->db->db)
         persist_mark_reorg_stale(wt->db, new_tip);
+
+    /* v29 (PR-C-6): observability — record this reorg event for forensics. */
+    if (wt->db && wt->db->db)
+        persist_log_reorg_event(wt->db, new_tip, old_tip, n_reset);
 }
 
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {

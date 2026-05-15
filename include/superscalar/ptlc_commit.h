@@ -5,7 +5,16 @@
 #include "peer_mgr.h"
 #include <secp256k1.h>
 
-/* Add a PTLC to a channel's PTLC list. Returns 1 on success. */
+/* PTLC safety gate (task #104).
+   Default: disabled.  Tests that create real PTLCs (amount>0 or point!=NULL)
+   must call ptlc_safety_set_enabled(1) at start.  Production never sets
+   this until the Phase 0 audit (task #103) + breach-defense PR lands. */
+void ptlc_safety_set_enabled(int enabled);
+int  ptlc_safety_is_enabled(void);
+
+/* Add a PTLC to a channel's PTLC list. Returns 1 on success.
+   Refused with stderr message + return 0 if ptlc_safety_is_enabled()==0
+   and the call would create a real PTLC (amount_sats>0 or point!=NULL). */
 int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
                       uint64_t amount_sats,
                       const secp256k1_pubkey *point,
