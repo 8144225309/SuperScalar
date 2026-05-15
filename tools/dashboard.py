@@ -27,6 +27,11 @@ class Config:
         # be a completely different chain.
         self.btc_datadir = getattr(a, 'btc_datadir', None)
         self.btc_rpcport = getattr(a, 'btc_rpcport', None)
+        # Forward-compat with PR #179: accept --lsp-wallet here on main so the
+        # systemd unit can pass it consistently regardless of which branch is
+        # deployed.  This branch parses the value but doesn't use it (the
+        # wallet-UTXO collector and tile land with #179 stacked on #174).
+        self.lsp_wallet = getattr(a, 'lsp_wallet', None)
         self.cln_cli = a.cln_cli; self.cln_a_dir = a.cln_a_dir; self.cln_b_dir = a.cln_b_dir
 
 def run_cmd(args, timeout=5):
@@ -825,7 +830,7 @@ tr:hover td{background:#1c2128}
 <div class="wrap">
 <div class="hdr">
  <h1>SuperScalar Dashboard<span class="sub">DW Factories + Timeout-Sig-Trees + Laddering</span></h1>
- <div class="tm"><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
+ <div class="tm"><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
 </div>
 <div id="dm" class="demo" style="display:none">DEMO MODE — simulated data for UI preview</div>
 <div class="tabs" id="tabs">
@@ -846,12 +851,83 @@ tr:hover td{background:#1c2128}
 
 <script>
 const R=5000;let curTab='overview';
+// Polish PR: module-scope state for cross-render filter/UI persistence.
+//   pf*    — Protocol-log filter inputs (item 1)
+//   facSel — Per-factory isolation selector (item 4)
+//   _D     — Last full API payload, exposed for the export button (item 5)
+//   _hist  — Rolling-window samples for the sparklines (item 2)
+let pfMsg='', pfDir='all', pfPeer='';
+let facSel='all';
+let _D=null;
+let _hist={sigStates:[],wtEntries:[],htlcCount:[],fwdActive:[]};
+const _HIST_MAX=60; // ~5 minutes at the 5s refresh tick
 document.getElementById('tabs').addEventListener('click',e=>{
     const t=e.target.closest('.tab'); if(!t)return;
     document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
     t.classList.add('active'); curTab=t.dataset.t;
     document.querySelectorAll('.tp').forEach(x=>x.classList.toggle('show',x.id==='t-'+curTab));
 });
+// Polish item 1 helper: filter wire-message rows in-place (no re-render needed
+// — preserves keyboard focus on the input).  Reads current values from the
+// DOM, mirrors them back into pf* so the next auto-refresh restores them.
+function applyProtoFilter(){
+ const me=document.getElementById('pf-msg'), de=document.getElementById('pf-dir'), pe=document.getElementById('pf-peer');
+ if(me)pfMsg=me.value; if(de)pfDir=de.value; if(pe)pfPeer=pe.value;
+ const rows=document.querySelectorAll('#proto-rows tr[data-msg]');
+ const mU=pfMsg.toUpperCase(), pL=pfPeer.toLowerCase();
+ let shown=0;
+ rows.forEach(r=>{
+  const name=(r.dataset.msg||'').toUpperCase();
+  const dir=r.dataset.dir||'';
+  const peer=(r.dataset.peer||'').toLowerCase();
+  const hide=(pfMsg && !name.includes(mU)) ||
+             (pfDir!=='all' && dir!==pfDir) ||
+             (pfPeer && !peer.includes(pL));
+  r.style.display=hide?'none':'';
+  if(!hide)shown++;
+ });
+ const cnt=document.getElementById('proto-cnt');
+ if(cnt)cnt.textContent=rows.length===shown?`${rows.length}`:`${shown} of ${rows.length}`;
+}
+// Polish item 5 helper: download the current API payload as JSON for
+// incident response — operator pastes it to another operator or attaches it
+// to a ticket.  Uses the cached _D rather than re-fetching so the snapshot
+// matches what's currently on screen.
+function exportSnapshot(){
+ if(!_D){alert('no data yet');return;}
+ const ts=new Date().toISOString().replace(/[:.]/g,'-');
+ const blob=new Blob([JSON.stringify(_D,null,2)],{type:'application/json'});
+ const url=URL.createObjectURL(blob);
+ const a=document.createElement('a'); a.href=url; a.download=`superscalar-snapshot-${ts}.json`;
+ document.body.appendChild(a); a.click(); a.remove();
+ setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+// Polish item 2 helper: render a tiny inline sparkline from a numeric array.
+// Pure SVG, no library — values normalized to the series' own min/max.
+function spark(vals,w,hgt,col){
+ if(!vals||vals.length<2)return '';
+ w=w||80; hgt=hgt||18; col=col||'#58a6ff';
+ const mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals);
+ const range=mx-mn||1;
+ const pts=vals.map((v,i)=>{
+  const x=(i/(vals.length-1))*w;
+  const y=hgt-((v-mn)/range)*(hgt-2)-1;
+  return `${x.toFixed(1)},${y.toFixed(1)}`;
+ }).join(' ');
+ return `<svg width="${w}" height="${hgt}" style="vertical-align:middle"><polyline fill="none" stroke="${col}" stroke-width="1.2" points="${pts}"/></svg>`;
+}
+// Polish item 2: feed the rolling history buffers from a fresh payload.
+function pushHistory(D){
+ const lsp=(D.databases||{}).lsp||{};
+ const tn=lsp.tree_nodes||[];
+ const sigStates=tn.filter(n=>n.is_signed).length;
+ const wtEntries=lsp.watchtower_count||0;
+ const htlcCount=(lsp.htlcs||[]).length;
+ const fwdActive=(lsp.htlc_origins||[]).filter(o=>o.active).length;
+ const push=(k,v)=>{_hist[k].push(v); if(_hist[k].length>_HIST_MAX)_hist[k].shift();};
+ push('sigStates',sigStates); push('wtEntries',wtEntries);
+ push('htlcCount',htlcCount); push('fwdActive',fwdActive);
+}
 
 // Helpers
 const bg=(ok,y,n)=>ok?`<span class="b ok">${y||'OK'}</span>`:`<span class="b dn">${n||'DOWN'}</span>`;
@@ -890,6 +966,26 @@ function rOverview(D){
   if(bt.ibd)h+=`<div class="ki"><span class="b w">Syncing</span><span class="v">${(bt.verification*100).toFixed(1)}%</span></div>`;
   h+=`</div>`;}
  h+=`</div>`;
+ // Polish item 2: Trends panel.  Rolling-window in-memory sparklines for a
+ // few operationally-interesting counts.  Each series is appended once per
+ // render() tick (~5s), capped at _HIST_MAX samples (~5 minutes).  Pure
+ // SVG, no library — useful for spotting growth or shrinkage at a glance.
+ const tr=_hist;
+ if((tr.sigStates||[]).length>1){
+  const cell=(label,arr,col,fmt)=>{
+   const cur=arr[arr.length-1]||0, prev=arr[0]||0, delta=cur-prev;
+   const dCls=delta>0?'b ok':delta<0?'b dn':'b i';
+   const dStr=delta>0?`+${delta}`:`${delta}`;
+   return `<div class="ki" style="min-width:130px"><span class="k">${label}</span><span class="v">${(fmt||String)(cur)} ${spark(arr,80,18,col)} <span class="${dCls}" style="font-size:9px;margin-left:2px">${dStr}</span></span></div>`;
+  };
+  h+=`<div class="s"><div class="st"><span>Trends</span><span class="c">last ${tr.sigStates.length} ticks (~${Math.round(tr.sigStates.length*5/60)} min)</span></div>`;
+  h+=`<div class="kv">`;
+  h+=cell('Signed tree states', tr.sigStates, '#3fb950');
+  h+=cell('Watchtower entries', tr.wtEntries, '#58a6ff');
+  h+=cell('HTLCs in flight',    tr.htlcCount, '#f0883e');
+  h+=cell('Active forwards',    tr.fwdActive, '#d29922');
+  h+=`</div></div>`;
+ }
  // Factory summary
  const facs=lsp.factories||[];
  h+=`<div class="s"><div class="st"><span>Factory Summary</span><span class="c">${facs.length}</span></div>`;
@@ -1015,11 +1111,14 @@ function rConfig(D){
 // === PS Leaf Chains panel (canonical pseudo-Spilman state mechanism) ===
 function rPsChains(D){
  const db=D.databases||{},lsp=db.lsp||{};
- const chains=lsp.ps_leaf_chains||[];
- const initial=lsp.ps_initial_signed_states||[];
- const sigInputs=lsp.ps_signed_inputs_by_leaf||[];
- const subChains=lsp.ps_subfactory_chains||[];
- const tn=lsp.tree_nodes||[];
+ // Polish item 4: honor the rFactory per-factory isolation selector by
+ // filtering every PS-related collection on factory_id when facSel != 'all'.
+ const fOK=r=>facSel==='all'||String(r.factory_id)===facSel;
+ const chains=(lsp.ps_leaf_chains||[]).filter(fOK);
+ const initial=(lsp.ps_initial_signed_states||[]).filter(fOK);
+ const sigInputs=(lsp.ps_signed_inputs_by_leaf||[]).filter(fOK);
+ const subChains=(lsp.ps_subfactory_chains||[]).filter(fOK);
+ const tn=(lsp.tree_nodes||[]).filter(fOK);
  // Tree nodes that look like PS leaves: state nodes with nSequence = 0xFFFFFFFE
  const psLeafNodes=tn.filter(n=>n.type==='state'&&n.nsequence===4294967294);
  // Nothing to show if both no chains and no PS leaves in the tree
@@ -1141,17 +1240,36 @@ function rPsChains(D){
 function rFactory(D){
  const db=D.databases||{},lsp=db.lsp||{},facs=lsp.factories||[],parts=lsp.participants||[];
  let h=rConfig(D);
+ // Polish item 4: per-factory isolation selector.  When the deployment has
+ // multiple factories, today the Factory tab renders all of them stacked.
+ // This selector lets the operator narrow the view to one at a time
+ // without changing any data — just hides the others.  Filter is applied
+ // downstream by checking facSel.  rPsChains() reads facSel from
+ // module-scope too.  Default 'all' preserves prior behavior.
+ const facsAll=facs;
+ const facsView=(facSel==='all')?facs:facs.filter(f=>String(f.id)===facSel);
+ if(facsAll.length>1){
+  h+=`<div class="s" style="background:#0c2d6b22;border-color:#58a6ff44"><div class="st"><span>Factory isolation</span><span class="c">${facsAll.length} factories on this LSP</span></div>`;
+  h+=`<div style="display:flex;gap:8px;align-items:center;font-size:11px;margin-top:4px">`;
+  h+=`<span class="mu">view:</span>`;
+  h+=`<select id="fac-sel" onchange="facSel=this.value;refresh()" style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:4px 8px;border-radius:4px;font-family:inherit;font-size:11px">`;
+  h+=`<option value="all"${facSel==='all'?' selected':''}>all factories (${facsAll.length})</option>`;
+  for(const f of facsAll)h+=`<option value="${f.id}"${facSel===String(f.id)?' selected':''}>Factory #${f.id} (${f.n_participants||'?'} parties)</option>`;
+  h+=`</select>`;
+  if(facSel!=='all')h+=`<span class="mu">showing only Factory #${facSel} — tree, PS chains, participants all filtered</span>`;
+  h+=`</div></div>`;
+ }
  // P4: Factory detail — when multiple factories exist, render each in a
  // visually-separated section.  Most data already groups by factory_id
  // (tree_nodes, ps_*_chains, etc.); this just gives the operator a clear
  // header anchor per factory.
- if(facs.length>1){
-  h+=`<div class="s" style="background:#0c2d6b22;border-color:#58a6ff44"><div class="st"><span>Multi-factory deployment</span><span class="c">${facs.length} factories on this LSP</span></div>`;
-  h+=`<p class="mu" style="font-size:11px">Each factory below has its own tree, PS chains, and lifecycle.  Scroll for per-factory detail.</p></div>`;
+ if(facsAll.length>1 && facSel==='all'){
+  h+=`<div class="s" style="background:#0c2d6b22;border-color:#58a6ff44"><div class="st"><span>Multi-factory deployment</span><span class="c">${facsAll.length} factories on this LSP</span></div>`;
+  h+=`<p class="mu" style="font-size:11px">Each factory below has its own tree, PS chains, and lifecycle.  Scroll for per-factory detail, or pick one from the isolation selector above.</p></div>`;
  }
- h+=`<div class="s"><div class="st"><span>Factory (N+1-of-N+1 MuSig2 UTXO)</span><span class="c">${facs.length}</span></div>`;
- for(const f of facs){
-  if(facs.length>1)h+=`<div style="border-top:2px solid #30363d;margin:8px 0 4px;padding-top:6px;font-weight:600;color:#58a6ff">Factory #${f.id}</div>`;
+ h+=`<div class="s"><div class="st"><span>Factory (N+1-of-N+1 MuSig2 UTXO)</span><span class="c">${facsView.length}${facSel!=='all'?` of ${facsAll.length}`:''}</span></div>`;
+ for(const f of facsView){
+  if(facsView.length>1)h+=`<div style="border-top:2px solid #30363d;margin:8px 0 4px;padding-top:6px;font-weight:600;color:#58a6ff">Factory #${f.id}</div>`;
   h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">ID</span><span class="v">#${f.id}</span></div><div class="ki"><span class="k">Parties</span><span class="v">${f.n_participants} (N+1-of-N+1 MuSig2)</span></div><div class="ki"><span class="k">Funding</span><span class="v">${fs(f.funding_amount)}</span></div><div class="ki"><span class="k">State</span>${sb(f.state)}</div><div class="ki"><span class="k">Created</span><span class="v">${ta(f.created_at)} ago</span></div></div>`;
   h+=`<div class="kv" style="margin-bottom:8px"><div class="ki"><span class="k">TXID</span><span class="v h">${th(f.funding_txid)}</span></div><div class="ki"><span class="k">vout</span><span class="v">${f.funding_vout??'\u2014'}</span></div><div class="ki"><span class="k">step_blocks</span><span class="v">${f.step_blocks??'\u2014'}</span></div><div class="ki"><span class="k">states/layer</span><span class="v">${f.states_per_layer??'\u2014'}</span></div><div class="ki"><span class="k">cltv_timeout</span><span class="v">${f.cltv_timeout??'\u2014'} blk</span></div><div class="ki"><span class="k">fee/tx</span><span class="v">${f.fee_per_tx!=null?f.fee_per_tx+' sat':'\u2014'}</span></div></div>`;
   // Participants
@@ -1161,17 +1279,17 @@ function rFactory(D){
    for(const p of fp)h+=`<tr><td>${p.slot}</td><td>${roles[p.slot]||'Client '+(p.slot)}</td><td class="pk">${p.pubkey}</td></tr>`;
    h+=`</table>`;}
  }
- if(!facs.length)h+=`<p class="mu">No factories</p>`;
+ if(!facsView.length)h+=`<p class="mu">${facsAll.length?`Factory #${facSel} not found in current data`:'No factories'}</p>`;
  h+=`</div>`;
- // Departed Clients (Phase 23)
- const dep=lsp.departed_clients||[];
+ // Departed Clients (Phase 23) — filtered by selector
+ const dep=(lsp.departed_clients||[]).filter(d=>facSel==='all'||String(d.factory_id)===facSel);
  if(dep.length){h+=`<div class="s"><div class="st"><span>Departed Clients</span><span class="c">${dep.length}</span></div>`;
   h+=`<table><tr><th>Factory</th><th>Client Idx</th><th>Extracted Key</th><th>Departed</th></tr>`;
   for(const d of dep)h+=`<tr><td>#${d.factory_id}</td><td>${d.client_idx}</td><td class="h">${th(d.extracted_key)}</td><td>${ta(d.departed_at)}</td></tr>`;
   h+=`</table></div>`;}
- // Tree nodes visualization
- const tn=lsp.tree_nodes||[];
- if(tn.length){h+=`<div class="s"><div class="st"><span>Timeout-Sig-Tree Nodes</span><span class="c">${tn.length}</span></div>`;
+ // Tree nodes visualization — filter to selected factory if isolation is active
+ const tn=(lsp.tree_nodes||[]).filter(n=>facSel==='all'||String(n.factory_id)===facSel);
+ if(tn.length){h+=`<div class="s"><div class="st"><span>Timeout-Sig-Tree Nodes</span><span class="c">${tn.length}${facSel!=='all'?` (Factory #${facSel} only)`:''}</span></div>`;
   // Group by factory
   const byF={};tn.forEach(n=>{if(!byF[n.factory_id])byF[n.factory_id]=[];byF[n.factory_id].push(n);});
   for(const[fid,nodes]of Object.entries(byF)){
@@ -1475,16 +1593,34 @@ function rProtocol(D){
   if(n==='ERROR')return'color:#f85149';
   return'color:#8b949e';
  };
- h+=`<div class="s"><div class="st"><span>Wire Messages (recent)</span><span class="c">${msgs.length}</span></div>`;
+ h+=`<div class="s"><div class="st"><span>Wire Messages</span><span class="c" id="proto-cnt">${msgs.length}</span></div>`;
+ // Polish item 1: filter inputs that toggle row visibility in-place (no
+ // re-render \u2014 preserves keyboard focus across the 5s auto-refresh).
+ const inp='background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:4px 8px;border-radius:4px;font-family:inherit;font-size:11px';
+ h+=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;font-size:11px">`;
+ h+=`<span class="mu">filter:</span>`;
+ h+=`<input id="pf-msg" type="text" placeholder="msg name (e.g. NONCE)" value="${(pfMsg||'').replace(/"/g,'&quot;')}" style="${inp};width:200px" oninput="applyProtoFilter()">`;
+ h+=`<select id="pf-dir" style="${inp}" onchange="applyProtoFilter()">`;
+ for(const opt of [['all','any direction'],['sent','sent only'],['received','received only']]){
+  h+=`<option value="${opt[0]}"${pfDir===opt[0]?' selected':''}>${opt[1]}</option>`;
+ }
+ h+=`</select>`;
+ h+=`<input id="pf-peer" type="text" placeholder="peer" value="${(pfPeer||'').replace(/"/g,'&quot;')}" style="${inp};width:120px" oninput="applyProtoFilter()">`;
+ if(pfMsg||pfDir!=='all'||pfPeer){
+  h+=`<button onclick="pfMsg='';pfDir='all';pfPeer='';document.getElementById('pf-msg').value='';document.getElementById('pf-dir').value='all';document.getElementById('pf-peer').value='';applyProtoFilter()" style="${inp};cursor:pointer">clear</button>`;
+ }
+ h+=`</div>`;
  if(!msgs.length)h+=`<p class="mu">No wire messages logged yet. Messages appear when LSP/client communicate with --db enabled.</p>`;
- else{h+=`<table><tr><th>Time</th><th>Dir</th><th>Type</th><th>Peer</th><th>Payload</th></tr>`;
+ else{h+=`<table><thead><tr><th>Time</th><th>Dir</th><th>Type</th><th>Peer</th><th>Payload</th></tr></thead><tbody id="proto-rows">`;
   for(const m of msgs){
    const arrow=m.direction==='sent'?'\u2192':'\u2190';
    const dirC=m.direction==='sent'?'color:#f0883e':'color:#3fb950';
    const ts2=m.timestamp?new Date(m.timestamp*1000).toLocaleTimeString():'\u2014';
    const pay=(m.payload_summary||'').length>80?(m.payload_summary.slice(0,80)+'\u2026'):m.payload_summary||'';
-   h+=`<tr><td style="white-space:nowrap">${ts2}</td><td style="${dirC};font-weight:600">${arrow} ${m.direction||'?'}</td><td style="${catColor(m.msg_name)};font-weight:600">${m.msg_name||'0x'+((m.msg_type||0).toString(16))}</td><td>${m.peer||'\u2014'}</td><td class="h" style="font-size:10px;max-width:300px;overflow:hidden;text-overflow:ellipsis" title="${(m.payload_summary||'').replace(/"/g,'&quot;')}">${pay}</td></tr>`;}
-  h+=`</table>`;}
+   const peerAttr=(m.peer||'').replace(/"/g,'&quot;');
+   const nameAttr=(m.msg_name||'').replace(/"/g,'&quot;');
+   h+=`<tr data-msg="${nameAttr}" data-dir="${m.direction||''}" data-peer="${peerAttr}"><td style="white-space:nowrap">${ts2}</td><td style="${dirC};font-weight:600">${arrow} ${m.direction||'?'}</td><td style="${catColor(m.msg_name)};font-weight:600">${m.msg_name||'0x'+((m.msg_type||0).toString(16))}</td><td>${m.peer||'\u2014'}</td><td class="h" style="font-size:10px;max-width:300px;overflow:hidden;text-overflow:ellipsis" title="${(m.payload_summary||'').replace(/"/g,'&quot;')}">${pay}</td></tr>`;}
+  h+=`</tbody></table>`;}
  h+=`</div>`;
  return h;
 }
@@ -2002,6 +2138,8 @@ function rEvents(D){
 
 // === Main render ===
 function render(D){
+ _D=D;             // expose latest payload for exportSnapshot()
+ pushHistory(D);   // feed sparkline buffers
  document.getElementById('ts').textContent=D.timestamp||'--:--:--';
  const dot=document.getElementById('dot');
  const au=D.processes&&Object.values(D.processes).every(v=>v);
@@ -2055,6 +2193,10 @@ function render(D){
  h+=`<div class="tp ${curTab==='outcomes'?'show':''}" id="t-outcomes">${rOutcomes(D)}</div>`;
  h+=`<div class="tp ${curTab==='events'?'show':''}" id="t-events">${rEvents(D)}</div>`;
  document.getElementById('content').innerHTML=h;
+ // Polish item 1 re-application: rProtocol just rebuilt the rows, so re-apply
+ // the saved filter values so the user's filter persists across the 5s
+ // auto-refresh without them having to retype.
+ if(curTab==='protocol')applyProtoFilter();
 }
 async function refresh(){try{const r=await fetch('/api/status');if(r.ok)render(await r.json());}catch(e){}}
 refresh();setInterval(refresh,R);
@@ -2085,6 +2227,10 @@ def main():
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
     p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
     p.add_argument("--btc-rpcport",default=None,help="bitcoind RPC port (for non-default deployments)")
+    # Forward-compat: see Config.lsp_wallet comment.  PR #179 wires this into a
+    # collect_wallet_utxos() call + the Defense-Status #13 tile; on main it's
+    # accepted but unused so the systemd unit can pass it across all branches.
+    p.add_argument("--lsp-wallet",default=None,help="LSP bitcoind wallet name (used by #179 wallet-UTXO tile)")
     p.add_argument("--cln-cli",default="lightning-cli")
     p.add_argument("--cln-a-dir",default=None); p.add_argument("--cln-b-dir",default=None)
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
