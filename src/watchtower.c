@@ -764,6 +764,16 @@ int watchtower_check(watchtower_t *wt) {
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
             memcpy(e->penalty_txid, factory_resp_txid, 65);
+
+            /* v29 (PR-C-6): observability — record this breach detection.
+               Only fired when we *actually broadcast* a response TX
+               (not just when we saw the stale state). */
+            if (wt->db && wt->db->db) {
+                int height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                persist_log_breach_detection(wt->db, e->channel_id,
+                    e->commit_num, e->txid, height, factory_resp_txid);
+            }
+
             i++;
             continue;
         }
@@ -1643,6 +1653,7 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
     fprintf(stderr, "Watchtower: reorg detected (%d → %d), re-validating %zu entries\n",
             old_tip, new_tip, wt->n_entries);
 
+    int n_reset = 0;
     /* Reset penalty_broadcast for entries whose penalty tx vanished */
     for (size_t i = 0; i < wt->n_entries; i++) {
         watchtower_entry_t *e = &wt->entries[i];
@@ -1655,6 +1666,7 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
                     e->penalty_txid);
             e->penalty_broadcast = 0;
             e->penalty_txid[0] = '\0';
+            n_reset++;
         }
     }
 
@@ -1671,6 +1683,10 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip) {
     /* Mark stale entries in database so they survive restarts */
     if (wt->db && wt->db->db)
         persist_mark_reorg_stale(wt->db, new_tip);
+
+    /* v29 (PR-C-6): observability — record this reorg event for forensics. */
+    if (wt->db && wt->db->db)
+        persist_log_reorg_event(wt->db, new_tip, old_tip, n_reset);
 }
 
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {

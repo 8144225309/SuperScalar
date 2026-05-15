@@ -1179,6 +1179,7 @@ extern int test_persist_old_commitment_witness_round_trip(void);
 extern int test_persist_signing_rounds_round_trip(void);
 extern int test_persist_pending_fee_bump_round_trip(void);
 extern int test_persist_force_close_round_trip(void);
+extern int test_persist_observability_tables(void);
 extern int test_persist_channel_round_trip(void);
 extern int test_persist_revocation_round_trip(void);
 extern int test_persist_watchtower_hydrate_round_trip(void);
@@ -2988,6 +2989,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_signing_rounds_round_trip);
     RUN_TEST(test_persist_pending_fee_bump_round_trip);
     RUN_TEST(test_persist_force_close_round_trip);
+    RUN_TEST(test_persist_observability_tables);
     RUN_TEST(test_persist_channel_round_trip);
     RUN_TEST(test_persist_revocation_round_trip);
     RUN_TEST(test_persist_watchtower_hydrate_round_trip);

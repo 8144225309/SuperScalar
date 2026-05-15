@@ -4175,3 +4175,53 @@ int test_persist_force_close_round_trip(void)
     persist_close(&db);
     return 1;
 }
+
+/* v29 (PR-C-6) observability tables append-only smoke test. */
+int test_persist_observability_tables(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* reorg_events: 3 rows */
+    TEST_ASSERT(persist_log_reorg_event(&db, 100, 105, 2), "reorg 1");
+    TEST_ASSERT(persist_log_reorg_event(&db, 200, 202, 0), "reorg 2 (no-op reset)");
+    TEST_ASSERT(persist_log_reorg_event(&db, 300, 310, 5), "reorg 3");
+
+    sqlite3_stmt *stmt;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT count(*), max(n_entries_reset) FROM reorg_events;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare count");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step row");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 0), 3, "3 reorg rows");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 1), 5, "max n_entries_reset = 5");
+    sqlite3_finalize(stmt);
+
+    /* breach_detections: 2 rows, one with response txid + one without */
+    unsigned char txid_a[32], txid_b[32];
+    memset(txid_a, 0xAB, 32);
+    memset(txid_b, 0xCD, 32);
+    TEST_ASSERT(persist_log_breach_detection(&db, 7, 3, txid_a, 800000,
+                  "fffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefffeeefff"),
+                "breach with response");
+    TEST_ASSERT(persist_log_breach_detection(&db, 9, 0, txid_b, 800100, NULL),
+                "breach without response");
+
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT count(*), sum(CASE WHEN response_txid IS NULL THEN 1 ELSE 0 END) "
+        "FROM breach_detections;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare breach count");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step breach row");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 0), 2, "2 breach rows");
+    TEST_ASSERT_EQ(sqlite3_column_int(stmt, 1), 1, "1 breach with NULL response");
+    sqlite3_finalize(stmt);
+
+    /* NULL DB safety */
+    TEST_ASSERT(persist_log_reorg_event(NULL, 100, 105, 0) == 0, "NULL db reorg returns 0");
+    TEST_ASSERT(persist_log_breach_detection(NULL, 1, 0, txid_a, 0, NULL) == 0,
+                "NULL db breach returns 0");
+    TEST_ASSERT(persist_log_breach_detection(&db, 1, 0, NULL, 0, NULL) == 0,
+                "NULL txid returns 0");
+
+    persist_close(&db);
+    return 1;
+}
