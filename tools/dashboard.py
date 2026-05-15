@@ -2436,6 +2436,42 @@ function rDefenseStatus(D){
 // entry.
 function rCeremonies(D){
  const db=D.databases||{},lsp=db.lsp||{};
+ // PR #182 collector exposes the new signing_rounds journal (schema v26
+ // from PR #181).  When available, render it as the primary source for
+ // ceremony types the LSP team has actually hooked.  The wire_messages
+ // reconstruction below stays as the universal fallback — only Tier B
+ // is hooked in #181 today, so reconstruction still handles factory
+ // creation, leaf advance, sub-factory advance, and leaf realloc until
+ // the LSP team's 4 follow-up hooks land.
+ const srs=lsp.signing_rounds_summary||{};
+ const srRecent=lsp.signing_rounds_recent||[];
+ const srAvail=(srs.total||0)>0;
+ let h='';
+ if(srAvail){
+  h+=`<div class="s" style="border-color:#3fb95044;background:#0c2d6b18"><div class="st"><span>Direct Journal (signing_rounds)</span><span class="c">${srs.total} ceremon${srs.total===1?'y':'ies'} × ${srs.types} type(s)</span></div>`;
+  h+=`<p class="mu" style="font-size:11px;margin:4px 0">Authoritative source for hooked ceremony types: PR #181 added the <code>signing_rounds</code> table (schema v26) plus per-participant timing + result.  Tier B is hooked today; the other 4 ceremony types still come from the wire_messages reconstruction below until LSP team lands their follow-up hooks.</p>`;
+  h+=`<div class="kv" style="margin-bottom:8px">`;
+  h+=`<div class="ki"><span class="k">Success</span><span class="b ok">${srs.success||0}</span></div>`;
+  if(srs.in_flight)h+=`<div class="ki"><span class="k">In flight</span><span class="b w">${srs.in_flight}</span></div>`;
+  if(srs.timeout)h+=`<div class="ki"><span class="k">Timeout</span><span class="b w">${srs.timeout}</span></div>`;
+  if(srs.crashed)h+=`<div class="ki"><span class="k">Crashed (LSP died mid-round)</span><span class="b dn">${srs.crashed}</span></div>`;
+  h+=`</div>`;
+  if(srRecent.length){
+   h+=`<table><tr><th>ID</th><th>Type</th><th>Factory</th><th>Node</th><th class="r">Epoch</th><th class="r">Parts</th><th class="r">Nonces</th><th class="r">PSigs</th><th>Started</th><th>Duration</th><th>Result TXID</th><th>Result</th></tr>`;
+   for(const r of srRecent){
+    const dur=(r.completed_at&&r.started_at)?(r.completed_at-r.started_at)+'s':(r.completed_at?'—':'in flight');
+    let resCls='b w', resText=r.result||'pending';
+    if(r.result==='success')resCls='b ok';
+    else if(r.result==='timeout')resCls='b w';
+    else if(r.result==='aborted_crash')resCls='b dn';
+    else if(!r.result)resCls='b i';
+    const err=r.error_detail?` <span class="mu" title="${(r.error_detail||'').replace(/"/g,'&quot;')}">⚠</span>`:'';
+    h+=`<tr><td>${r.id}</td><td>${r.ceremony_type||'?'}</td><td>#${r.factory_id??'—'}</td><td>${r.node_idx??'—'}</td><td class="r">${r.epoch??'—'}</td><td class="r">${r.n_participants??'—'}</td><td class="r">${r.nonces_collected??'—'}</td><td class="r">${r.partial_sigs_collected??'—'}</td><td>${ta(r.started_at)} ago</td><td>${dur}</td><td class="h">${th(r.result_txid)} ${r.result_txid?txBadge(D,r.result_txid):''}</td><td><span class="${resCls}">${resText}</span>${err}</td></tr>`;
+   }
+   h+=`</table>`;
+  }
+  h+=`</div>`;
+ }
  const wm=(lsp.wire_messages||[]).slice().sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)||(a.id||0)-(b.id||0));
  // Map: msg_name -> {type, role: 'start' | 'mid' | 'end'}
  const MAP={
@@ -2516,9 +2552,8 @@ function rCeremonies(D){
  const ceremonyTypes={};
  for(const c of ceremonies){ceremonyTypes[c.type]=(ceremonyTypes[c.type]||0)+1;}
 
- let h='';
- h+=`<div class="s"><div class="st"><span>Signing Rounds — Ceremony Journal</span><span class="c">reconstructed from wire_messages</span></div>`;
- h+=`<p class="mu" style="font-size:11px;margin-bottom:8px">Reconstructed from <code>wire_messages</code> by grouping consecutive signing-related messages within ${MAX_GAP_SEC}s windows.  Will be replaced by direct <code>signing_rounds</code> query when the LSP-side schema add lands (currently the LSP only persists in-progress snapshot via <code>signing_progress</code>, cleared on success).</p>`;
+ h+=`<div class="s"><div class="st"><span>Signing Rounds — Reconstructed Journal</span><span class="c">${srAvail?'fallback for unhooked ceremony types':'reconstructed from wire_messages'}</span></div>`;
+ h+=`<p class="mu" style="font-size:11px;margin-bottom:8px">Reconstructed from <code>wire_messages</code> by grouping consecutive signing-related messages within ${MAX_GAP_SEC}s windows.  ${srAvail?'PR #181 added a direct <code>signing_rounds</code> table — Tier B ceremonies are now shown above from that authoritative source.  The 4 other ceremony types (factory_creation, leaf_advance, sub_factory_advance, leaf_realloc) continue to use this reconstructed view until the LSP team hooks them.':'Will move to a direct query when the LSP team hooks more ceremony types into the <code>signing_rounds</code> journal (schema v26 from PR #181).'}</p>`;
  if(total===0){
   h+=`<p class="mu">No ceremonies detected. <code>wire_messages</code> may be empty or only contain non-signing traffic (PING/PONG, HELLO, etc.).</p>`;
   h+=`</div>`;
