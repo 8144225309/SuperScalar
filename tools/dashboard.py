@@ -2314,6 +2314,38 @@ function rDefenseStatus(D){
    risk:'Mass force-close exhausts CPFP slots; later TXs stall, lose DW race'});
  }
 
+ // #2 — Channel breach (counterparty publishes revoked commitment).
+ // Defense is the pre-signed penalty TX.  PR #181 added persistence for
+ // the bytes (old_commitments.signed_penalty_tx_hex, schema v25); PR
+ // #182 added the collector.  This tile lights up when both have
+ // landed; until then it shows grey ("data source pending").
+ {
+  const ocov=lsp.old_commitments_coverage||{};
+  const tot=ocov.total||0, per=ocov.persisted||0;
+  let color, status;
+  if(ocov.total===undefined){
+   color='grey';
+   status='data source pending (waiting on dashboard collector — PR #182)';
+  } else if(tot===0){
+   color='grey';
+   status='no revoked commitments to defend against yet';
+  } else if(per===tot){
+   color='green';
+   status=`${per}/${tot} entries with signed penalty TX bytes on disk`;
+  } else if(per===0){
+   color='yellow';
+   status=`${tot} revoked commitment(s) — penalty bytes in memory only (pre-PR #181 LSP build)`;
+  } else {
+   const pct=Math.round(100*per/tot);
+   color='yellow';
+   status=`${per}/${tot} (${pct}%) persisted — ${tot-per} still in memory`;
+  }
+  tiles.push({n:'#2',icon:'⚔',name:'Channel breach (revoked commit)',
+   defense:'Pre-signed penalty TX sweeps both outputs using revocation secret',
+   status,color,source:'old_commitments.signed_penalty_tx_hex',
+   risk:'Cheater wins disputed balance if LSP restarts before broadcast'});
+ }
+
  // ---- Aggregate header ----
  const greenCount=tiles.filter(t=>t.color==='green').length;
  const yellowCount=tiles.filter(t=>t.color==='yellow').length;
@@ -2348,6 +2380,43 @@ function rDefenseStatus(D){
   h+=`</div>`;
  }
  h+=`</div>`;
+
+ // ---- Failure-mode taxonomy reference ----
+ // Operators see numbered tiles (#1, #4, #5, ...) and reasonably wonder
+ // "what about #2, #3, #6 — are those also defended?  forgotten?  not
+ // surfaced for a reason?"  This expandable section documents every
+ // failure mode in the 15-mode SuperScalar trustless taxonomy, marking
+ // which are surfaced as tiles above and explaining the rationale for
+ // each one that isn't.
+ const surfaced=new Set(tiles.map(t=>t.n));
+ const taxonomy=[
+  {n:'#1', name:'LSP disappears',                              status:'tile above'},
+  {n:'#2', name:'Channel breach (revoked commit)',             status:'tile above'},
+  {n:'#3', name:'Old DW state published (legacy)',             status:'skipped — n/a on canonical PS (arity=3) deployments; tile would always show grey'},
+  {n:'#4', name:'Old PS chain state published',                status:'tile above'},
+  {n:'#5', name:'CLTV timeout, LSP gone',                      status:'tile above'},
+  {n:'#6', name:'HTLC times out / preimage not received',      status:'skipped — built on-demand, no preparedness check available'},
+  {n:'#7', name:'LSP crash mid-ceremony',                      status:'tile above'},
+  {n:'#8', name:'Mempool fee spike during force-close',        status:'tile above'},
+  {n:'#9', name:'Reorg invalidates penalty confirmation',      status:'skipped — needs deeper bitcoind enrichment; informational only'},
+  {n:'#10',name:'Concurrent ceremonies / state-update race',   status:'skipped — JIT is both defense and normal mechanism; no clean signal'},
+  {n:'#11',name:'Client disappears mid-assisted-exit',         status:'skipped — known open protocol problem; no defense available to verify'},
+  {n:'#12',name:'Miner collusion on DW challenge',             status:'skipped — theoretical risk with low practical likelihood'},
+  {n:'#13',name:'Mass-close exhausts LSP CPFP UTXOs',          status:'tile above'},
+  {n:'#14',name:'Double-spend on PS leaf advance',             status:'tile above'},
+  {n:'#15',name:'PS chain[0] bytes lost on restart',           status:'tile above'},
+ ];
+ h+=`<details style="margin-top:12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 12px">`;
+ h+=`<summary style="cursor:pointer;font-size:11px;color:#58a6ff">Full 15-mode taxonomy reference — what's surfaced, what isn't, and why</summary>`;
+ h+=`<p class="mu" style="font-size:11px;margin:6px 0">The SuperScalar trustless model documents 15 failure modes.  This panel surfaces ${tiles.length} as live tiles.  The rest are either not applicable to the current deployment shape, informational-only (no observable defense state), or known open problems.</p>`;
+ h+=`<table style="font-size:11px"><tr><th>#</th><th>Failure mode</th><th>Coverage</th></tr>`;
+ for(const t of taxonomy){
+  const shown=surfaced.has(t.n);
+  const badge=shown?'<span class="b ok" style="font-size:9px">surfaced</span>':'<span class="b i" style="font-size:9px">not surfaced</span>';
+  h+=`<tr><td>${t.n}</td><td>${t.name}</td><td>${badge} <span class="mu">${t.status}</span></td></tr>`;
+ }
+ h+=`</table>`;
+ h+=`</details>`;
 
  return h;
 }
