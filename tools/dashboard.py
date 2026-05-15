@@ -1185,8 +1185,7 @@ function rPsChains(D){
    const fcTxCount=curEntries.length+(init?1:0);
    const fcCost=fcTxCount*(fac.fee_per_tx||0);
    const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
-  }
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
   h+=`</table>`;
  }
  // Per-leaf chain detail (one mini-table per leaf showing chain[0..N])
@@ -1196,10 +1195,10 @@ function rPsChains(D){
   const init=initMap[`${e.factory_id}_${e.leaf_node_idx}`];
   h+=`<div style="margin-top:12px"><div class="st" style="margin-bottom:4px"><span>Leaf node ${e.leaf_node_idx} (factory #${e.factory_id}) progression</span><span class="c">${e.entries.length} advances</span></div>`;
   h+=`<table><tr><th>chain_pos</th><th class="r">channel amount</th><th>poison TX</th><th>TXID</th></tr>`;
-  if(init)h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b ok">persisted</span></td><td class="h">${th(init.txid)} ${txBadge(D,init.txid)}</td></tr>`;
+  if(init)h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b ok">persisted</span></td><td class="h">${th(init.txid)} ${txBadge(D,init.txid,'reserve')}</td></tr>`;
   else h+=`<tr><td>0 (initial)</td><td class="r">—</td><td><span class="b dn">missing</span></td><td class="mu">no row in ps_initial_signed_states</td></tr>`;
   for(const ent of e.entries){
-   h+=`<tr><td>${ent.chain_pos}</td><td class="r">${fs(ent.chan_amount_sats)}</td><td>${ent.has_poison?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td><td class="h">${th(ent.txid)} ${txBadge(D,ent.txid)}</td></tr>`;
+   h+=`<tr><td>${ent.chain_pos}</td><td class="r">${fs(ent.chan_amount_sats)}</td><td>${ent.has_poison?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td><td class="h">${th(ent.txid)} ${txBadge(D,ent.txid,'reserve')}</td></tr>`;
   }
   h+=`</table></div>`;
  }
@@ -1229,8 +1228,7 @@ function rPsChains(D){
    const fcTxCount=curEntries.length+1;  // chain[0] + chain[1..N]
    const fcCost=fcTxCount*(fac.fee_per_tx||0);
    const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid)}</td></tr>`;
-  }
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
   h+=`</table></div>`;
  }
  h+=`</div>`;
@@ -1312,7 +1310,7 @@ function rFactory(D){
   }
   // Detail table \u2014 Phase 1: include on-chain status badge from P3 enrichment
   h+=`<table style="margin-top:8px"><tr><th>#</th><th>Type</th><th>Parent</th><th>Layer</th><th>Signers</th><th class="r">Input</th><th>Outputs</th><th>nSeq</th><th>TXID</th><th>On-chain</th><th>Status</th></tr>`;
-  for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${txBadge(D,n.txid)}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
+  for(const n of tn){h+=`<tr><td>${n.node_index}</td><td>${n.type}</td><td>${n.parent_index>=0?n.parent_index:'\u2014'}</td><td>${n.dw_layer_index>=0?n.dw_layer_index:'\u2014'}</td><td>[${n.signer_indices}] (${n.n_signers})</td><td class="r">${fs(n.input_amount)}</td><td>${n.output_amounts}</td><td>${n.nsequence===4294967295?'final':n.nsequence}</td><td class="h">${th(n.txid)}</td><td>${txBadge(D,n.txid,'reserve')}</td><td>${n.is_signed?'<span class="b ok">signed</span>':'<span class="b dn">unsigned</span>'}</td></tr>`;}
   h+=`</table>`;
   h+=`</div>`;}
  // Signing Progress (MuSig2 nonce/sig collection).  D2: the table is a
@@ -1728,11 +1726,24 @@ function rWatchtower(D){
 // TXs) that aren't in the schema today.
 // P3: render a small confirmation badge for a given txid.  Uses
 // tx_enrichment cache populated server-side.  Unknown → grey "—".
-function txBadge(D, txid){
+// P1: 'expected' parameter — distinguishes TXs we *expect* to broadcast
+// (funding, jit, broadcast_log entries, watchtower-pending penalty bumps —
+// "not on chain" = real warning) from TXs that are pre-signed *defense*
+// kept in reserve (factory tree, PS chains, poison TXs — "not on chain"
+// is the normal happy-path state, so render neutral instead of red).
+// Default 'broadcast' preserves the original red-when-missing semantics
+// for callers that haven't migrated.
+function txBadge(D, txid, expected){
  if(!txid||txid==='?'||txid==='—')return '';
  const e=(D.tx_enrichment||{})[txid];
+ expected = expected || 'broadcast';
  if(!e)return `<span class="b" style="background:#21262d;color:#484f58;font-size:9px">unchecked</span>`;
- if(e.never_seen)return `<span class="b dn" style="font-size:9px">not on chain</span>`;
+ if(e.never_seen){
+  if(expected==='reserve'){
+   return `<span class="b i" style="font-size:9px" title="signed and persisted on disk; not broadcast (held in reserve for unilateral exit)">signed, in reserve</span>`;
+  }
+  return `<span class="b dn" style="font-size:9px">not on chain</span>`;
+ }
  if(e.in_mempool)return `<span class="b w" style="font-size:9px">mempool</span>`;
  const c=e.confirmations||0;
  const cls=c>=6?'b ok':c>=1?'b i':'b w';
@@ -1886,24 +1897,46 @@ function rOutcomes(D){
  const lad=lsp.ladder_factories||[];
  const wtPending=lsp.watchtower_pending||[];
 
+ // P2: tile applicability per current deployment shape.  PS leaf advance
+ // is k=1-only (in k≥2 sub-factories carry the chains); PS sub-factory
+ // advance is k≥2-only.  DW-specific scenarios (per-leaf DW advance,
+ // L-stock burn) are arity-1/-2 legacy.  Tiles that don't apply show
+ // as 'n/a (different arity)' instead of generic 'not fired' so
+ // operators don't read greyness as "something is broken."
+ const fc=D.factory_config||{};
+ const arityStr=String(fc.arity||'?');
+ const subArity=parseInt(fc.ps_subfactory_arity)||1;
+ const isPSCanon=arityStr==='3';
+ const isDWLegacy=arityStr==='1'||arityStr==='2';
+ const isWide=isPSCanon && subArity>=2;
+ const isNarrow=isPSCanon && subArity===1;
+
  const SCEN=[
   {name:'Factory creation', icon:'🏭', sources:['factory_funding'],
    readySignal:facs.length>0?facs.length+' factory(ies)':'',
    blurb:'Funding TX broadcast that seats the factory MuSig2 UTXO on-chain.'},
   {name:'PS leaf advance', icon:'🌿', sources:['ps_leaf'],
    readySignal:psChain.length?psChain.length+' chain entries persisted':'',
+   applicable:isPSCanon&&isNarrow,
+   notApplicableNote:isWide?'k≥2 deployment uses sub-factory advances instead':isDWLegacy?'DW legacy deployment (arity 1/2) — leaves use decrementing nSequence, not PS chains':'',
    blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.'},
   {name:'PS sub-factory advance', icon:'🌳', sources:['ps_subfactory'],
    readySignal:psSub.length?psSub.length+' sub-factory chain entries':'',
+   applicable:isWide,
+   notApplicableNote:isNarrow?'k=1 deployment uses leaf advances instead (no sub-factories present)':isDWLegacy?'DW legacy deployment (arity 1/2) — no PS chains':'',
    blurb:'lsp_subfactory_chain_advance: extends a k² sub-factory chain (wide leaves).'},
   {name:'DW force-close (tree broadcast)', icon:'⚡', sources:['tree_node_','tree_ok','tree_fail'],
    readySignal:'',
    blurb:'Broadcast of the factory tree from kickoff_root to leaves — full unilateral exit.'},
   {name:'Per-leaf advance (DW)', icon:'🎯', sources:['leaf_advance'],
    readySignal:'',
+   applicable:isDWLegacy,
+   notApplicableNote:isPSCanon?'PS canonical (arity 3) — leaves use PS chain advance, not DW state':'',
    blurb:'3-of-3 partial advance of one leaf without rolling the root state.'},
   {name:'L-stock burn', icon:'🔥', sources:['burn','l_stock_burn'],
    readySignal:'',
+   applicable:isDWLegacy,
+   notApplicableNote:isPSCanon?'PS canonical — uses poison TX (tile below) instead of shachain burn':'',
    blurb:'Burn TX broadcast: OP_RETURN destroys L-stock when LSP publishes old state (deterrence).'},
   {name:'Trustless poison redistribute', icon:'🛡', sources:['poison'],
    readySignal:(psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length)+' poison TXs signed',
@@ -1933,13 +1966,20 @@ function rOutcomes(D){
 
  let h='';
  h+=`<div class="s"><div class="st"><span>Scenario Map</span><span class="c">${SCEN.length} SuperScalar structures</span></div>`;
- h+=`<p class="mu" style="font-size:11px;margin-bottom:10px">Each tile is one of the SuperScalar structures from the README, sourced from <code>broadcast_log.source</code> plus presence-of-signed-bytes signals.  Green = fired (has broadcast log entries) | Blue = ready (signed bytes persisted, nothing broadcast yet) | Grey = neither.</p>`;
+ h+=`<p class="mu" style="font-size:11px;margin-bottom:10px">Each tile is one of the SuperScalar structures from the README, sourced from <code>broadcast_log.source</code> plus presence-of-signed-bytes signals.  Green = fired | Blue = ready (signed bytes persisted, nothing broadcast yet) | Grey = neither | Dimmed = not applicable to this deployment's leaf shape.</p>`;
  // Tile grid
  h+=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px">`;
  for(const sc of SCEN){
+  // P2: skip-or-not-applicable check.  If sc.applicable is defined and
+  // false, render a 'n/a' tile (dimmer than 'not fired') with the
+  // deployment-shape reason in the body.
+  const isNA = sc.applicable !== undefined && !sc.applicable;
   const fired=matchAny(sc.sources);
   let state, badge, lastTx='';
-  if(fired.length>0){
+  if(isNA){
+   state='na'; badge=`<span class="b" style="background:#0d1117;color:#484f58;border:1px solid #21262d">n/a for this deployment</span>`;
+   if(sc.notApplicableNote)lastTx=`<div class="mu" style="font-size:10px;margin-top:4px;font-style:italic">${sc.notApplicableNote}</div>`;
+  } else if(fired.length>0){
    state='fired'; badge=`<span class="b ok">fired ${fired.length}×</span>`;
    const latest=fired.reduce((a,b)=>(a.broadcast_time||0)>(b.broadcast_time||0)?a:b);
    lastTx=`<div class="kv" style="margin-top:4px;gap:2px 8px"><div class="ki"><span class="k">last</span><span class="v h" style="font-size:10px">${th(latest.txid)}</span></div><div class="ki"><span class="k">at</span><span class="v" style="font-size:10px">${ta(latest.broadcast_time)} ago</span></div></div>`;
@@ -1949,8 +1989,9 @@ function rOutcomes(D){
   } else {
    state='inactive'; badge=`<span class="b" style="background:#21262d;color:#484f58">not fired</span>`;
   }
-  const borderColor=state==='fired'?'#3fb950':state==='ready'?'#58a6ff':'#30363d';
-  h+=`<div style="border:1px solid ${borderColor};border-radius:6px;padding:8px 10px;background:#0d1117">`;
+  const borderColor=state==='fired'?'#3fb950':state==='ready'?'#58a6ff':state==='na'?'#21262d':'#30363d';
+  const tileOpacity=state==='na'?'0.55':'1';
+  h+=`<div style="border:1px solid ${borderColor};border-radius:6px;padding:8px 10px;background:#0d1117;opacity:${tileOpacity}">`;
   h+=`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">`;
   h+=`<div><span style="font-size:14px;margin-right:4px">${sc.icon}</span><span style="font-weight:600;font-size:12px">${sc.name}</span></div>`;
   h+=`<div>${badge}</div>`;
