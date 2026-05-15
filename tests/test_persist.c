@@ -4090,3 +4090,88 @@ int test_persist_pending_fee_bump_round_trip(void)
     persist_close(&db);
     return 1;
 }
+
+/* v28 (PR-C-2) force-close watch persistence round-trip. */
+int test_persist_force_close_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Build two watches.  Watch A has 2 HTLCs, watch B has 1. */
+    unsigned char txid_a[32], txid_b[32];
+    memset(txid_a, 0xAA, 32);
+    memset(txid_b, 0xBB, 32);
+
+    watchtower_htlc_t htlcs_a[2];
+    memset(htlcs_a, 0, sizeof(htlcs_a));
+    htlcs_a[0].htlc_vout   = 2;
+    htlcs_a[0].htlc_amount = 100000;
+    memset(htlcs_a[0].htlc_spk, 0x51, 34);
+    htlcs_a[0].direction   = HTLC_OFFERED;
+    memset(htlcs_a[0].payment_hash, 0xCC, 32);
+    htlcs_a[0].cltv_expiry = 800500;
+
+    htlcs_a[1].htlc_vout   = 3;
+    htlcs_a[1].htlc_amount = 50000;
+    memset(htlcs_a[1].htlc_spk, 0x52, 34);
+    htlcs_a[1].direction   = HTLC_RECEIVED;
+    memset(htlcs_a[1].payment_hash, 0xDD, 32);
+    htlcs_a[1].cltv_expiry = 800400;
+
+    watchtower_htlc_t htlcs_b[1];
+    memset(htlcs_b, 0, sizeof(htlcs_b));
+    htlcs_b[0].htlc_vout   = 1;
+    htlcs_b[0].htlc_amount = 75000;
+    memset(htlcs_b[0].htlc_spk, 0x53, 34);
+    htlcs_b[0].direction   = HTLC_OFFERED;
+    memset(htlcs_b[0].payment_hash, 0xEE, 32);
+    htlcs_b[0].cltv_expiry = 800600;
+    strcpy(htlcs_b[0].sweep_txid,
+           "deadbeef00000000000000000000000000000000000000000000000000000000");
+
+    int64_t row_a = -1, row_b = -1;
+    TEST_ASSERT(persist_save_force_close(&db, 7, txid_a,
+                  (const struct watchtower_htlc *)htlcs_a, 2, &row_a),
+                "save watch A");
+    TEST_ASSERT(row_a > 0, "row_a > 0");
+    TEST_ASSERT(persist_save_force_close(&db, 11, txid_b,
+                  (const struct watchtower_htlc *)htlcs_b, 1, &row_b),
+                "save watch B");
+    TEST_ASSERT(row_b > row_a, "row_b > row_a");
+
+    /* Load back */
+    uint32_t channels[4];
+    unsigned char txids[4][32];
+    watchtower_htlc_t loaded_htlcs[8];
+    size_t n_per[4];
+    size_t n_watches = persist_load_force_close_watches(&db,
+        channels, txids, loaded_htlcs, n_per, 4, 8);
+    TEST_ASSERT_EQ((int)n_watches, 2, "loaded 2 watches");
+
+    /* Watch A round-trips */
+    TEST_ASSERT_EQ((int)channels[0], 7,            "watch A channel_id");
+    TEST_ASSERT_EQ((int)n_per[0],    2,            "watch A has 2 HTLCs");
+    TEST_ASSERT(memcmp(txids[0], txid_a, 32) == 0, "watch A txid round-trips");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[0].htlc_amount, 100000LL, "htlc A0 amount");
+    TEST_ASSERT_EQ((int)loaded_htlcs[0].cltv_expiry,        800500,  "htlc A0 cltv");
+    TEST_ASSERT_EQ((int)loaded_htlcs[0].direction,          HTLC_OFFERED, "htlc A0 dir");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[1].htlc_amount, 50000LL,  "htlc A1 amount");
+
+    /* Watch B round-trips */
+    TEST_ASSERT_EQ((int)channels[1], 11,           "watch B channel_id");
+    TEST_ASSERT_EQ((int)n_per[1],    1,            "watch B has 1 HTLC");
+    TEST_ASSERT(memcmp(txids[1], txid_b, 32) == 0, "watch B txid round-trips");
+    TEST_ASSERT_EQ((long long)loaded_htlcs[2].htlc_amount, 75000LL,  "htlc B0 amount");
+    TEST_ASSERT(strncmp(loaded_htlcs[2].sweep_txid, "deadbeef", 8) == 0,
+                "sweep_txid round-trips");
+
+    /* Delete watch A, confirm only B remains. */
+    TEST_ASSERT(persist_delete_force_close(&db, row_a), "delete watch A");
+    size_t n_after = persist_load_force_close_watches(&db,
+        channels, txids, loaded_htlcs, n_per, 4, 8);
+    TEST_ASSERT_EQ((int)n_after, 1, "1 watch after delete");
+    TEST_ASSERT_EQ((int)channels[0], 11, "remaining watch is B");
+
+    persist_close(&db);
+    return 1;
+}

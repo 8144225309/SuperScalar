@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 27
+#define PERSIST_SCHEMA_VERSION 28
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -647,6 +647,50 @@ size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
 
 /* Delete a pending entry by txid (e.g., after confirmation). */
 int persist_delete_pending(persist_t *p, const char *txid);
+
+/* --- v28: Force-close watch persistence (PR-C-2) ---
+   Restart-restore for WATCH_FORCE_CLOSE entries.  Unlike WATCH_COMMITMENT
+   (rebuilt from old_commitments) and WATCH_FACTORY_NODE / WATCH_SUBFACTORY_NODE
+   (rebuilt from in-memory factory state via lsp_channels_rehydrate_*),
+   force-close watches have no recovery path today.  Two-table layout:
+   force_close_watches (one row per channel) + force_close_htlcs
+   (one row per HTLC to sweep). */
+
+/* opaque watchtower_htlc layout — declared in watchtower.h.  We expose only
+   the fields the persist layer needs to round-trip. */
+struct watchtower_htlc;
+
+/* Save a force-close watch (channel + HTLC sweep set).
+   commitment_txid32 is 32 raw bytes.  htlcs/n_htlcs are the per-HTLC sweep
+   targets.  out_row_id receives the autoincrement PK (used by delete).
+   INSERT-then-cascade-INSERT — caller must be prepared for two-step write
+   (transactional safety provided by the SQLite default txn). */
+int persist_save_force_close(persist_t *p, uint32_t channel_id,
+                                const unsigned char *commitment_txid32,
+                                const struct watchtower_htlc *htlcs,
+                                size_t n_htlcs,
+                                int64_t *out_row_id);
+
+/* Load all force-close watches.  out parameters mirror the in-memory
+   watchtower_entry_t shape so the loader in watchtower_init can rebuild
+   entries directly:
+     channel_ids_out / commitment_txids_out (32-byte raw)  — one per watch
+     htlcs_out                                              — flat array of all HTLCs
+     n_htlcs_per_watch_out                                  — count per watch
+   Caller-allocated arrays.  max_watches limits the top-level count;
+   max_htlcs_total limits the HTLCs across all watches.  Returns number of
+   watches loaded (0 on no rows or error). */
+size_t persist_load_force_close_watches(persist_t *p,
+                                          uint32_t *channel_ids_out,
+                                          unsigned char (*commitment_txids_out)[32],
+                                          struct watchtower_htlc *htlcs_out,
+                                          size_t *n_htlcs_per_watch_out,
+                                          size_t max_watches,
+                                          size_t max_htlcs_total);
+
+/* Delete a force-close watch by row id (called after the HTLC sweep set
+   has fully confirmed and the entry is removed from the in-memory table). */
+int persist_delete_force_close(persist_t *p, int64_t row_id);
 
 /* --- JIT Channel persistence (Gap #2) --- */
 

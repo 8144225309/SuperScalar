@@ -105,6 +105,23 @@ static const char *SCHEMA_SQL =
     "  cltv_expiry INTEGER NOT NULL,"
     "  PRIMARY KEY (channel_id, commit_num, htlc_vout)"
     ");"
+    /* v28 (PR-C-2): force-close watch persistence */
+    "CREATE TABLE IF NOT EXISTS force_close_watches ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  channel_id INTEGER NOT NULL,"
+    "  commitment_txid TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS force_close_htlcs ("
+    "  force_close_id INTEGER NOT NULL REFERENCES force_close_watches(id) ON DELETE CASCADE,"
+    "  htlc_vout INTEGER NOT NULL,"
+    "  htlc_amount INTEGER NOT NULL,"
+    "  htlc_spk TEXT NOT NULL,"
+    "  direction INTEGER NOT NULL,"
+    "  payment_hash TEXT NOT NULL,"
+    "  cltv_expiry INTEGER NOT NULL,"
+    "  sweep_txid TEXT NOT NULL DEFAULT '',"
+    "  PRIMARY KEY (force_close_id, htlc_vout)"
+    ");"
     "CREATE TABLE IF NOT EXISTS wire_messages ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  timestamp INTEGER NOT NULL,"
@@ -1013,6 +1030,37 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
         sqlite3_exec(p->db,
             "ALTER TABLE watchtower_pending ADD COLUMN fb_start_feerate INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
+    /* v28 (PR-C-2): force-close watch persistence.
+
+       Closes the restart gap for WATCH_FORCE_CLOSE entries identified in
+       the Phase C audit.  Force-close watches are the only entry type
+       without a recovery path (commitment entries are loaded from
+       old_commitments; factory_node / subfactory_node are rebuilt in
+       lsp_channels_rehydrate_watchtower_from_chains).  Two-table layout
+       mirrors old_commitments + old_commitment_htlcs. */
+    if (db_version < 28) {
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS force_close_watches ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  channel_id INTEGER NOT NULL,"
+            "  commitment_txid TEXT NOT NULL"
+            ");",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "CREATE TABLE IF NOT EXISTS force_close_htlcs ("
+            "  force_close_id INTEGER NOT NULL REFERENCES force_close_watches(id) ON DELETE CASCADE,"
+            "  htlc_vout INTEGER NOT NULL,"
+            "  htlc_amount INTEGER NOT NULL,"
+            "  htlc_spk TEXT NOT NULL,"
+            "  direction INTEGER NOT NULL,"
+            "  payment_hash TEXT NOT NULL,"
+            "  cltv_expiry INTEGER NOT NULL,"
+            "  sweep_txid TEXT NOT NULL DEFAULT '',"
+            "  PRIMARY KEY (force_close_id, htlc_vout)"
+            ");",
             NULL, NULL, NULL);
     }
 
@@ -4284,6 +4332,164 @@ int persist_delete_pending(persist_t *p, const char *txid) {
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+/* --- v28: Force-close watch persistence (PR-C-2) --- */
+
+#include "superscalar/watchtower.h"  /* for watchtower_htlc_t */
+
+int persist_save_force_close(persist_t *p, uint32_t channel_id,
+                                const unsigned char *commitment_txid32,
+                                const struct watchtower_htlc *htlcs,
+                                size_t n_htlcs,
+                                int64_t *out_row_id) {
+    if (!p || !p->db || !commitment_txid32) return 0;
+    if (n_htlcs > 0 && !htlcs) return 0;
+
+    char txid_hex[65];
+    hex_encode(commitment_txid32, 32, txid_hex);
+    txid_hex[64] = '\0';
+
+    sqlite3_stmt *stmt;
+    const char *sql_top =
+        "INSERT INTO force_close_watches (channel_id, commitment_txid) VALUES (?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql_top, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_text(stmt, 2, txid_hex, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return 0;
+
+    int64_t row_id = sqlite3_last_insert_rowid(p->db);
+    if (out_row_id) *out_row_id = row_id;
+
+    /* Insert HTLC rows */
+    const char *sql_htlc =
+        "INSERT INTO force_close_htlcs "
+        "(force_close_id, htlc_vout, htlc_amount, htlc_spk, direction, "
+        " payment_hash, cltv_expiry, sweep_txid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+    for (size_t i = 0; i < n_htlcs; i++) {
+        const watchtower_htlc_t *h = (const watchtower_htlc_t *)&htlcs[i];
+        char spk_hex[69];
+        hex_encode(h->htlc_spk, 34, spk_hex);
+        spk_hex[68] = '\0';
+        char ph_hex[65];
+        hex_encode(h->payment_hash, 32, ph_hex);
+        ph_hex[64] = '\0';
+
+        if (sqlite3_prepare_v2(p->db, sql_htlc, -1, &stmt, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+        sqlite3_bind_int(stmt, 2, (int)h->htlc_vout);
+        sqlite3_bind_int64(stmt, 3, (sqlite3_int64)h->htlc_amount);
+        sqlite3_bind_text(stmt, 4, spk_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 5, (int)h->direction);
+        sqlite3_bind_text(stmt, 6, ph_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 7, (int)h->cltv_expiry);
+        sqlite3_bind_text(stmt, 8, h->sweep_txid[0] ? h->sweep_txid : "", -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) return 0;
+    }
+    return 1;
+}
+
+size_t persist_load_force_close_watches(persist_t *p,
+                                          uint32_t *channel_ids_out,
+                                          unsigned char (*commitment_txids_out)[32],
+                                          struct watchtower_htlc *htlcs_out,
+                                          size_t *n_htlcs_per_watch_out,
+                                          size_t max_watches,
+                                          size_t max_htlcs_total) {
+    if (!p || !p->db) return 0;
+
+    /* Pass 1: read the top-level watches.  Keep id+ordinal so pass 2 can
+       attach HTLCs back to the right slot. */
+    int64_t row_ids[256];
+    size_t n_watches = 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT id, channel_id, commitment_txid FROM force_close_watches ORDER BY id;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && n_watches < max_watches && n_watches < 256) {
+        row_ids[n_watches] = sqlite3_column_int64(stmt, 0);
+        if (channel_ids_out)
+            channel_ids_out[n_watches] = (uint32_t)sqlite3_column_int(stmt, 1);
+        if (commitment_txids_out) {
+            const char *thex = (const char *)sqlite3_column_text(stmt, 2);
+            if (thex)
+                hex_decode(thex, commitment_txids_out[n_watches], 32);
+        }
+        if (n_htlcs_per_watch_out)
+            n_htlcs_per_watch_out[n_watches] = 0;
+        n_watches++;
+    }
+    sqlite3_finalize(stmt);
+
+    /* Pass 2: HTLCs, distributed back to their watch slot. */
+    size_t htlc_cursor = 0;
+    for (size_t w = 0; w < n_watches; w++) {
+        if (sqlite3_prepare_v2(p->db,
+                "SELECT htlc_vout, htlc_amount, htlc_spk, direction, "
+                "       payment_hash, cltv_expiry, sweep_txid "
+                "FROM force_close_htlcs WHERE force_close_id = ? "
+                "ORDER BY htlc_vout;",
+                -1, &stmt, NULL) != SQLITE_OK) {
+            return n_watches;
+        }
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_ids[w]);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW && htlc_cursor < max_htlcs_total) {
+            if (htlcs_out) {
+                watchtower_htlc_t *h = (watchtower_htlc_t *)&htlcs_out[htlc_cursor];
+                memset(h, 0, sizeof(*h));
+                h->htlc_vout   = (uint32_t)sqlite3_column_int(stmt, 0);
+                h->htlc_amount = (uint64_t)sqlite3_column_int64(stmt, 1);
+                const char *spk_hex_s = (const char *)sqlite3_column_text(stmt, 2);
+                if (spk_hex_s) hex_decode(spk_hex_s, h->htlc_spk, 34);
+                h->direction = (htlc_direction_t)sqlite3_column_int(stmt, 3);
+                const char *ph_hex_s = (const char *)sqlite3_column_text(stmt, 4);
+                if (ph_hex_s) hex_decode(ph_hex_s, h->payment_hash, 32);
+                h->cltv_expiry = (uint32_t)sqlite3_column_int(stmt, 5);
+                const char *sw = (const char *)sqlite3_column_text(stmt, 6);
+                if (sw && sw[0]) {
+                    strncpy(h->sweep_txid, sw, 64);
+                    h->sweep_txid[64] = '\0';
+                }
+            }
+            if (n_htlcs_per_watch_out)
+                n_htlcs_per_watch_out[w]++;
+            htlc_cursor++;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return n_watches;
+}
+
+int persist_delete_force_close(persist_t *p, int64_t row_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    /* Cascade: delete HTLCs first (FK ON DELETE CASCADE only fires when
+       pragma is set; do it explicitly to be portable). */
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM force_close_htlcs WHERE force_close_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM force_close_watches WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE);
 }
 
 /* --- JIT Channel persistence (Gap #2) --- */
