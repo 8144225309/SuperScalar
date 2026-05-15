@@ -14,6 +14,17 @@ void secure_zero(void *ptr, size_t len) {
 }
 
 void tx_buf_init(tx_buf_t *buf, size_t initial_cap) {
+    /* F3: malloc(0) returns a valid 1-byte pointer on glibc that callers
+       must free.  Skip the allocation when cap is 0 — tx_buf_ensure uses
+       realloc which handles NULL data correctly, and tx_buf_free of a
+       NULL data pointer is also safe. */
+    if (initial_cap == 0) {
+        buf->data = NULL;
+        buf->len = 0;
+        buf->cap = 0;
+        buf->oom = 0;
+        return;
+    }
     buf->data = (unsigned char *)malloc(initial_cap);
     buf->oom = 0;
     if (!buf->data) { buf->len = 0; buf->cap = 0; buf->oom = 1; return; }

@@ -3862,6 +3862,10 @@ void factory_free(factory_t *f) {
         f->nodes[i].input_partial_sigs = NULL;
         f->nodes[i].n_input_sessions = 0;
     }
+    /* F4: factory-level distribution TX buffer (populated by
+       factory_build_distribution_tx_unsigned).  tx_buf_free is a no-op
+       when never initialized. */
+    tx_buf_free(&f->dist_unsigned_tx);
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
 }
@@ -3875,5 +3879,13 @@ void factory_detach_txbufs(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));
         memset(&f->nodes[i].signed_tx, 0, sizeof(tx_buf_t));
+        /* F4: also detach poison and dist buffers — same shared-pointer
+           problem as unsigned_tx/signed_tx if they were allocated before
+           the struct copy.  Without this, a tx_buf_free on dist_unsigned_tx
+           in factory_free runs twice on the same address (once via
+           lsp_cleanup, once via ladder_free) → double-free abort. */
+        memset(&f->nodes[i].poison_unsigned_tx, 0, sizeof(tx_buf_t));
+        memset(&f->nodes[i].poison_signed_tx, 0, sizeof(tx_buf_t));
     }
+    memset(&f->dist_unsigned_tx, 0, sizeof(tx_buf_t));
 }

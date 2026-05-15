@@ -1496,6 +1496,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         persist_save_ps_initial_signed_state(
             (persist_t *)mgr->persist, /* factory_id = */ 0,
             (uint32_t)pre_node_idx,
+            f->counter.current_epoch,
             chain0_txid_display,
             f->nodes[pre_node_idx].signed_tx.data,
             f->nodes[pre_node_idx].signed_tx.len);
@@ -1888,6 +1889,7 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
                 (persist_t *)mgr->persist, 0,
                 (uint32_t)node_idx,
                 leaf_node->ps_chain_len - 1,
+                f->counter.current_epoch,
                 txid_display,
                 leaf_node->signed_tx.data, leaf_node->signed_tx.len,
                 leaf_node->outputs[0].amount_sats,
@@ -1983,13 +1985,22 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint32_t new_epoch = f->counter.current_epoch;
 
-    /* Determine affected nodes: every non-PS-leaf node was rebuilt.  We
-       re-sign every node where !is_ps_leaf && is_built && !is_signed. */
+    /* Determine affected nodes.  Normally every non-PS-leaf node was rebuilt
+       and needs re-signing.  PS leaves are skipped because in the standard
+       leaf-driven Tier B (DW counter exhaustion on one leaf), PS leaves
+       elsewhere in the tree don't change.
+
+       Exception (F1): on a ROOT-DRIVEN Tier B rollover (trigger_leaf_side
+       == -1, signalling that factory_tick_root advanced the root counter),
+       every PS leaf got a FRESH unsigned chain[0] for the new epoch from
+       build_all_unsigned_txs and MUST be re-signed.  Without this, PS leaves
+       sit with an unsigned chain[0] indefinitely until the next user-driven
+       leaf advance — channels are unforce-closeable in that window. */
     size_t affected[FACTORY_MAX_NODES];
     size_t n_affected = 0;
     for (size_t i = 0; i < f->n_nodes; i++) {
         const factory_node_t *n = &f->nodes[i];
-        if (n->is_ps_leaf) continue;
+        if (n->is_ps_leaf && trigger_leaf_side != -1) continue;
         if (!n->is_built) continue;
         if (n->is_signed) continue;
         affected[n_affected++] = i;
@@ -2594,6 +2605,17 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
     }
 
+    /* --- Step 11.5 (F1): Persist new-epoch chain[0] for every PS leaf and
+       PS sub-factory node.  Only fires on root-driven Tier B (the only path
+       that re-signs PS leaves in this ceremony).  Without this, force-close
+       after rollover can't reconstruct chain[0] from the database. */
+    if (trigger_leaf_side == -1 && mgr->persist) {
+        int saved = lsp_persist_ps_chain0_all(mgr->persist, f);
+        if (saved > 0)
+            printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
+                   saved);
+    }
+
     /* --- Step 12: Broadcast PATH_SIGN_DONE --- */
     cJSON *done = wire_build_path_sign_done(new_epoch);
     for (size_t i = 0; i < lsp->n_clients; i++)
@@ -2611,6 +2633,44 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     return 1;
+}
+
+/* F1: Persist chain[0] for every PS leaf and PS sub-factory node.
+
+   Called from:
+   - tools/superscalar_lsp.c after factory creation (initial chain[0] save).
+   - lsp_run_state_advance after a root-driven Tier B (new-epoch chain[0]).
+
+   is_ps_leaf is set on both single-PS-leaf nodes (k=1) and PS sub-factory
+   nodes (k>=2, see factory.c:1138), so a single flag check covers both.
+
+   The save is idempotent (INSERT OR REPLACE) so callers can save uncondi-
+   tionally; for root-driven Tier B the new row simply replaces the old
+   epoch's row, since both are keyed by (factory_id, node_idx).
+
+   Returns the number of rows persisted. */
+int lsp_persist_ps_chain0_all(void *persist, factory_t *f) {
+    if (!persist || !f) return 0;
+    if (f->leaf_arity != FACTORY_ARITY_PS) return 0;
+    extern void reverse_bytes(unsigned char *, size_t);
+    persist_t *p = (persist_t *)persist;
+    int saved = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *n = &f->nodes[i];
+        if (!n->is_ps_leaf) continue;
+        if (!n->is_signed || n->signed_tx.len == 0) continue;
+        unsigned char txid_display[32];
+        memcpy(txid_display, n->txid, 32);
+        reverse_bytes(txid_display, 32);
+        if (persist_save_ps_initial_signed_state(
+                p, /* factory_id = */ 0, (uint32_t)i,
+                f->counter.current_epoch,
+                txid_display,
+                n->signed_tx.data, n->signed_tx.len)) {
+            saved++;
+        }
+    }
+    return saved;
 }
 
 /* Cooperatively redistribute output amounts on an arity-2 leaf (3-of-3).
@@ -3085,6 +3145,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         persist_save_ps_initial_signed_state(
             (persist_t *)mgr->persist, /* factory_id = */ 0,
             (uint32_t)sub_node_i,
+            f->counter.current_epoch,
             chain0_txid_display,
             sub->signed_tx.data, sub->signed_tx.len);
     }
@@ -3464,6 +3525,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             (persist_t *)mgr->persist, /* factory_id = */ 0,
             (uint32_t)sub_node_i,
             sub->ps_chain_len - 1,
+            f->counter.current_epoch,
             txid_display,
             sub->signed_tx.data, sub->signed_tx.len,
             sub->outputs[sstock_vout].amount_sats,

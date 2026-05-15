@@ -141,21 +141,30 @@ echo
 echo "=== Tier-B test outcome ==="
 grep -E "TIER B ROLLOVER TEST:|SKIP:|states_per_layer|PS leaf.*advanced" "$LSP_LOG" | head -15
 
-PS_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM ps_leaf_chains;" 2>/dev/null || echo 0)
-ADV_COUNT=$(grep -cE "PS leaf.*advanced" "$LSP_LOG" 2>/dev/null || echo 0)
-SKIP=$(grep -c "SKIP: --test-tier-b-rollover" "$LSP_LOG" 2>/dev/null || echo 0)
+PS_CHAIN0_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM ps_initial_signed_states;" 2>/dev/null || echo 0)
+SKIP=$(grep -c "SKIP: --test-tier-b-rollover" "$LSP_LOG" 2>/dev/null || true)
+F1_PERSIST=$(grep -c "Tier B F1: persisted new-epoch chain" "$LSP_LOG" 2>/dev/null || true)
+TIER_B_PASS=$(grep -c "TIER B ROLLOVER TEST: PASS" "$LSP_LOG" 2>/dev/null || true)
+# grep -c with no matches returns 1 with output "0"; under set -e we coerce
+# the fallback above so the value is always populated.  Belt-and-suspenders:
+PS_CHAIN0_ROWS="${PS_CHAIN0_ROWS:-0}"
+SKIP="${SKIP:-0}"
+F1_PERSIST="${F1_PERSIST:-0}"
+TIER_B_PASS="${TIER_B_PASS:-0}"
 
 echo
-echo "  ps_leaf_chains rows : $PS_ROWS"
-echo "  advance count       : $ADV_COUNT"
-echo "  SKIP markers        : $SKIP"
+echo "  ps_initial_signed_states rows : $PS_CHAIN0_ROWS"
+echo "  SKIP markers                  : $SKIP"
+echo "  F1 persist log lines          : $F1_PERSIST"
+echo "  TIER B test PASS              : $TIER_B_PASS"
 
 PASS=1
-[ "${SKIP:-0}" -gt 0 ] && { echo "  FAIL: CL2-TB gate still skips arity 3 (saw SKIP marker)"; PASS=0; }
-[ "${ADV_COUNT:-0}" -lt 3 ] && { echo "  FAIL: expected >=3 PS leaf advances, saw $ADV_COUNT"; PASS=0; }
-[ "${PS_ROWS:-0}" -lt 3 ] && { echo "  FAIL: expected >=3 ps_leaf_chains rows, saw $PS_ROWS"; PASS=0; }
+[ "$SKIP" -gt 0 ] && { echo "  FAIL: CL2-TB gate still skips arity 3 (saw SKIP marker)"; PASS=0; }
+[ "$PS_CHAIN0_ROWS" -lt 1 ] && { echo "  FAIL (F1): expected >=1 ps_initial_signed_states row after rollover, saw $PS_CHAIN0_ROWS"; PASS=0; }
+[ "$F1_PERSIST" -lt 1 ] && { echo "  FAIL (F1): missing 'Tier B F1: persisted ...' log line — post-ceremony persist did not fire"; PASS=0; }
+[ "$TIER_B_PASS" -lt 1 ] && { echo "  FAIL: TIER B ROLLOVER TEST did not PASS — check .inc verifications"; PASS=0; }
 if [ $PASS = 1 ]; then
-    echo "  PASS: CL2-TB gate accepts arity 3, $ADV_COUNT PS advances persisted"
+    echo "  PASS: CL2-TB gate accepts arity 3, F1 chain[0] persist verified ($PS_CHAIN0_ROWS rows)"
     exit 0
 else
     tail -30 "$LSP_LOG"

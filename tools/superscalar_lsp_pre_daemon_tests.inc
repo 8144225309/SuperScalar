@@ -1701,24 +1701,70 @@
                         printf("  epoch advanced %u → %u (rc=-1 / Tier B ceremony fired)\n",
                                epoch_before, epoch_after);
 
-                        /* Verify every non-PS-leaf node is signed for the new epoch */
+                        /* Verify every non-PS-leaf node is signed for the new epoch.
+                           F1: for PS factories, also verify PS leaves are signed
+                           (post-rollover chain[0]).  PS leaves used to be excluded
+                           from root-driven Tier B; F1 includes them so force-close
+                           can broadcast the new epoch's chain[0]. */
                         int all_signed = 1;
-                        size_t n_checked = 0;
+                        size_t n_checked = 0, n_ps_checked = 0;
                         for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
                             const factory_node_t *node = &lsp_p->factory.nodes[ni];
-                            if (node->is_ps_leaf) continue;
                             if (!node->is_built) continue;
-                            n_checked++;
+                            if (node->is_ps_leaf) {
+                                if (!is_ps_factory) continue;  /* skip on DW */
+                                n_ps_checked++;
+                            } else {
+                                n_checked++;
+                            }
                             if (!node->is_signed || node->signed_tx.len == 0) {
-                                printf("  FAIL: node %zu not signed after Tier B ceremony\n", ni);
+                                printf("  FAIL: %s node %zu not signed after Tier B ceremony\n",
+                                       node->is_ps_leaf ? "PS-leaf" : "internal", ni);
                                 all_signed = 0;
                             }
                         }
-                        if (all_signed)
-                            printf("  all %zu non-PS-leaf nodes signed after Tier B\n",
-                                   n_checked);
-                        else
+                        if (all_signed) {
+                            printf("  all %zu internal + %zu PS-leaf nodes signed after Tier B\n",
+                                   n_checked, n_ps_checked);
+                        } else {
                             rollover_pass = 0;
+                        }
+
+                        /* F1: verify PS chain[0] was persisted for the new epoch.
+                           After rollover the new chain[0] bytes should be in
+                           ps_initial_signed_states (replacing the old epoch's row). */
+                        if (is_ps_factory && rollover_pass && use_db) {
+                            int n_ps_persisted = 0, n_ps_mismatch = 0;
+                            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                                const factory_node_t *node = &lsp_p->factory.nodes[ni];
+                                if (!node->is_ps_leaf) continue;
+                                if (!node->is_signed) continue;
+                                tx_buf_t loaded;
+                                unsigned char loaded_txid_be[32];
+                                if (persist_load_ps_initial_signed_state(
+                                        &db, 0, (uint32_t)ni,
+                                        &loaded, loaded_txid_be)) {
+                                    n_ps_persisted++;
+                                    if (loaded.len != node->signed_tx.len ||
+                                        memcmp(loaded.data, node->signed_tx.data,
+                                               loaded.len) != 0) {
+                                        printf("  FAIL: PS node %zu chain[0] persisted bytes "
+                                               "differ from in-memory signed_tx (stale row?)\n", ni);
+                                        n_ps_mismatch++;
+                                    }
+                                    tx_buf_free(&loaded);
+                                } else {
+                                    printf("  FAIL: PS node %zu chain[0] not in "
+                                           "ps_initial_signed_states after Tier B\n", ni);
+                                    n_ps_mismatch++;
+                                }
+                            }
+                            if (n_ps_mismatch == 0)
+                                printf("  F1: %d PS chain[0] rows persisted for new epoch\n",
+                                       n_ps_persisted);
+                            else
+                                rollover_pass = 0;
+                        }
                     }
                 }
 
