@@ -2646,9 +2646,17 @@
              * Custom broadcast loop: for each PS leaf we must broadcast
              * the saved chain[0] TX (pre-advance) before the current
              * signed_tx (chain[1]), because chain[1]->input is chain[0]:0.
-             * Non-leaf nodes (the root/kickoff TX) are broadcast normally. */
+             * Non-leaf nodes (the root/kickoff TX) are broadcast normally.
+             *
+             * #117 fix (2026-05-15): the old loop called regtest_mine_blocks(&rt, 1, ...)
+             * between broadcasts.  That helper has a hard regtest-only guard
+             * (src/regtest.c:786) and silently no-ops on testnet4/signet, so
+             * the next CSV-locked child TX broadcast hit "non-BIP68-final".
+             * Use broadcast_one_signed_tx instead — same helper the production
+             * LSP force-close path uses (tools/superscalar_lsp.c:715), which
+             * properly waits for the parent's BIP68 maturity on non-regtest. */
             if (psa_pass) {
-                printf("\nBroadcasting PS factory tree (%zu nodes + saved chain[0]s) on regtest...\n",
+                printf("\nBroadcasting PS factory tree (%zu nodes + saved chain[0]s)...\n",
                        psa_f->n_nodes);
                 for (size_t i = 0; i < psa_f->n_nodes && psa_pass; i++) {
                     factory_node_t *n = &psa_f->nodes[i];
@@ -2666,46 +2674,31 @@
                     /* PS leaf with prior chain state: broadcast saved chain[0] first */
                     if (leaf_idx >= 0 && n->ps_chain_len > 0
                         && pre_signed_tx[leaf_idx] && pre_signed_tx_len[leaf_idx] > 0) {
-                        char *hex0 = malloc(pre_signed_tx_len[leaf_idx] * 2 + 1);
-                        if (!hex0) { psa_pass = 0; break; }
-                        hex_encode(pre_signed_tx[leaf_idx], pre_signed_tx_len[leaf_idx], hex0);
-                        char txid0[65] = {0};
-                        int ok0 = regtest_send_raw_tx(&rt, hex0, txid0);
-                        free(hex0);
-                        if (!ok0) {
-                            fprintf(stderr, "PS ADVANCE TEST: leaf %d chain[0] broadcast failed\n",
-                                    leaf_idx);
+                        char label0[64];
+                        snprintf(label0, sizeof(label0),
+                                 "ps_advance_leaf_%d_chain0", leaf_idx);
+                        if (!broadcast_one_signed_tx(&rt, mine_addr, is_regtest,
+                                confirm_timeout_secs,
+                                pre_signed_tx[leaf_idx], pre_signed_tx_len[leaf_idx],
+                                n->nsequence, label0, NULL)) {
+                            fprintf(stderr, "PS ADVANCE TEST: leaf %d chain[0] "
+                                    "broadcast failed\n", leaf_idx);
                             psa_pass = 0;
                             break;
                         }
-                        regtest_mine_blocks(&rt, 1, mine_addr);
-                        printf("  leaf[%d] chain[0] broadcast: %s (mined 1 block)\n",
-                               leaf_idx, txid0);
                     }
 
                     /* Broadcast this node's current signed_tx */
-                    char *tx_hex = malloc(n->signed_tx.len * 2 + 1);
-                    if (!tx_hex) { psa_pass = 0; break; }
-                    hex_encode(n->signed_tx.data, n->signed_tx.len, tx_hex);
-                    char txid_cur[65] = {0};
-                    int okN = regtest_send_raw_tx(&rt, tx_hex, txid_cur);
-                    free(tx_hex);
-                    if (!okN) {
+                    char label_n[64];
+                    snprintf(label_n, sizeof(label_n), "ps_advance_node_%zu", i);
+                    if (!broadcast_one_signed_tx(&rt, mine_addr, is_regtest,
+                            confirm_timeout_secs,
+                            n->signed_tx.data, n->signed_tx.len,
+                            n->nsequence, label_n, n->txid)) {
                         fprintf(stderr, "PS ADVANCE TEST: node %zu broadcast failed\n", i);
                         psa_pass = 0;
                         break;
                     }
-                    regtest_mine_blocks(&rt, 1, mine_addr);
-
-                    unsigned char disp[32];
-                    memcpy(disp, n->txid, 32);
-                    reverse_bytes(disp, 32);
-                    char disp_hex[65];
-                    hex_encode(disp, 32, disp_hex);
-                    const char *role = (leaf_idx >= 0 && n->ps_chain_len > 0)
-                                         ? " (chain[1])" : "";
-                    printf("  node[%zu] broadcast: %s%s (mined 1 block)\n",
-                           i, disp_hex, role);
                 }
                 printf("All %zu factory nodes + PS chain TXs confirmed on-chain.\n",
                        psa_f->n_nodes);
