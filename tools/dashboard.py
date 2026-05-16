@@ -2052,7 +2052,7 @@ function rWatchtower(D){
  if(oc.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitments (breach detection)</span><span class="c">${oc.length}</span></div>`;
   h+=`<table><tr><th>CH</th><th>Commit#</th><th>TXID</th><th>On-chain</th><th>Vout</th><th class="r">To-Local</th></tr>`;
   for(const o of oc.slice(0,15)){const jitBadge=o.channel_id>=4?' <span class="b i">JIT</span>':'';
-   h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${txBadge(D,o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
+   h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${txBadge(D,o.txid,'reserve')}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
   if(oc.length>15)h+=`<tr><td colspan="6" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
   h+=`</table>`;}
  // Old commitment HTLCs (breach penalty HTLCs)
