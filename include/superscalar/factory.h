@@ -534,6 +534,23 @@ int factory_subfactory_chain_advance_unsigned(
     factory_t *f, int leaf_side, int sub_idx_in_leaf,
     int channel_idx_in_sub, uint64_t delta_sats);
 
+/* Reset in-memory sub-factory chain advance state on chain reorg.
+
+   Walks f->nodes[] for NODE_PS_SUBFACTORY entries and zeroes any node
+   whose ps_chain_len > 0 (i.e., has been advanced).  After the reset,
+   force-close falls back to chain[0] (the v23/PR #144 path), which spends
+   the factory leaf output directly and is unaffected by reorg of chain[N]
+   parent UTXOs.
+
+   The on-disk ps_subfactory_chains rows are preserved for forensics
+   (operator audit, dashboard observability) — only the in-memory state
+   is reset.  This is a conservative response: a deep reorg of a confirmed
+   chain[N-1] invalidates chain[N]'s prev-output reference, so signing or
+   broadcasting chain[N] from the divergent in-memory state would fail.
+
+   Returns the count of sub-factories reset (for observability). */
+int factory_reset_all_subfactory_chains(factory_t *f);
+
 /* Compute the factory_early_warning_time (blocks) per BLIP-56.
    This is the worst-case blocks needed for full unilateral close from
    the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */

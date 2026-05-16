@@ -5818,6 +5818,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         /* Re-validate watchtower entries */
                         watchtower_on_reorg(mgr->watchtower, height,
                                            daemon_last_height);
+                        /* Drop in-memory sub-factory chain advance state.
+                           A reorg of chain[N-1] would invalidate chain[N]'s
+                           prev-output reference; resetting forces force-close
+                           to fall back to chain[0] (v23/PR #144 path), which
+                           spends the factory leaf output directly. DB rows
+                           in ps_subfactory_chains are preserved for forensics. */
+                        {
+                            int n_sub_reset =
+                                factory_reset_all_subfactory_chains(&lsp->factory);
+                            if (n_sub_reset > 0)
+                                fprintf(stderr,
+                                    "LSP reorg: reset chain advance state for "
+                                    "%d sub-factory(s); force-close falls back "
+                                    "to chain[0]\n", n_sub_reset);
+                        }
                         /* Immediate watchtower check to re-detect breaches */
                         watchtower_check(mgr->watchtower);
                         /* Re-run factory recovery to re-broadcast lost TXs */
