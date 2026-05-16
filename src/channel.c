@@ -1560,6 +1560,43 @@ int channel_verify_and_aggregate_commitment_sig(
     if (!musig_aggregate_partial_sigs(ch->ctx, full_sig64_out, &session, sigs, 2))
         return 0;
 
+    /* SF-CH #154 diagnostic: env-gated dump of the channel-commit sign
+       context.  On Mode 3 / Mode 4 the LSP-side aggregate succeeds but
+       bitcoind rejects the broadcast with "Invalid Schnorr signature".
+       That divergence has to be in (sighash, funding_keyagg) — i.e.,
+       either ch->funding_spk doesn't match the on-chain funding output,
+       or the keyagg differs from what the funding-output was locked to.
+       The dump emits every input bitcoind would compute its sighash over
+       so we can compare ch->funding_spk hex with `gettxout <funding>`,
+       and the final aggregated sig vs witness on the failing broadcast. */
+    static int sf_ch_dump = -1;
+    if (sf_ch_dump < 0)
+        sf_ch_dump = (getenv("SUPERSCALAR_DUMP_SIGHASH") != NULL) ? 1 : 0;
+    if (sf_ch_dump) {
+        fprintf(stderr, "[DUMP_SIGHASH_CHAN] cn=%llu signer_idx=%d "
+                "local=%llu remote=%llu n_htlcs=%zu funding_amount=%llu "
+                "funding_spk_len=%zu funding_spk=",
+                (unsigned long long)ch->commitment_number,
+                ch->local_funding_signer_idx,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                ch->n_htlcs,
+                (unsigned long long)ch->funding_amount,
+                ch->funding_spk_len);
+        for (size_t b = 0; b < ch->funding_spk_len; b++)
+            fprintf(stderr, "%02x", ch->funding_spk[b]);
+        fprintf(stderr, " funding_txid=");
+        for (int b = 31; b >= 0; b--)  /* display order */
+            fprintf(stderr, "%02x", ch->funding_txid[b]);
+        fprintf(stderr, " funding_vout=%u sighash=", ch->funding_vout);
+        for (size_t b = 0; b < 32; b++)
+            fprintf(stderr, "%02x", sighash[b]);
+        fprintf(stderr, " agg_sig=");
+        for (size_t b = 0; b < 64; b++)
+            fprintf(stderr, "%02x", full_sig64_out[b]);
+        fprintf(stderr, "\n");
+    }
+
     ch->remote_nonce_next++;
     return 1;
 }
