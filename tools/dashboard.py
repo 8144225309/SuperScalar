@@ -594,6 +594,55 @@ def collect_factory_config(cfg):
             return out
     except Exception as e:
         out["error"] = str(e)
+
+    # Fallback: no live LSP process found.  Derive what we can from the
+    # lsp.db so Outcomes / Defense Status / TX Inventory can still tell
+    # whether this is a PS-canonical or DW-legacy deployment, and at
+    # what k.  Without this, opening the dashboard against a saved DB
+    # (post-LSP-exit, or a copy from another machine) shows every PS-
+    # specific tile as "not applicable to ? arity" — wrong.
+    try:
+        if cfg.lsp_db and os.path.exists(str(cfg.lsp_db)):
+            rows, _ = query_db(cfg.lsp_db,
+                "SELECT n_participants, leaf_arity, step_blocks, "
+                "states_per_layer, cltv_timeout, funding_amount "
+                "FROM factories ORDER BY id LIMIT 1")
+            if rows:
+                f = rows[0]
+                # Derive ps_subfactory_arity from `ps_subfactory_chains`
+                # presence — the persisted `tree_nodes.type` column only
+                # stores "kickoff"/"state" for DW tree nodes, not the
+                # NODE_PS_SUBFACTORY child rows.  But the existence of any
+                # row in ps_subfactory_chains is sufficient evidence that
+                # this is a k≥2 deployment.  Approximate k as
+                # sqrt(n_clients) per the k² shape spec (k=2 ↔ 4 clients,
+                # k=3 ↔ 9, k=4 ↔ 16).  Falls back to k=1 when no
+                # sub-factory rows exist.
+                n_clients = max(0, (f.get("n_participants") or 1) - 1)
+                psub_rows, _ = query_db(cfg.lsp_db,
+                    "SELECT COUNT(*) AS n FROM ps_subfactory_chains")
+                has_subfactory = bool(psub_rows) and (psub_rows[0].get("n") or 0) > 0
+                if has_subfactory and n_clients >= 4:
+                    # k² ≈ n_clients, so k ≈ round(sqrt(n_clients)).  Clamp
+                    # to [2, 15] (the protocol's documented bounds).
+                    import math
+                    psk = max(2, min(15, round(math.sqrt(n_clients))))
+                else:
+                    psk = 1
+                out.update({
+                    "available": True,
+                    "derived_from_db": True,
+                    "pid": None,
+                    "arity": str(f.get("leaf_arity", 3) or 3),
+                    "ps_subfactory_arity": str(psk),
+                    "clients": str(max(0, (f.get("n_participants") or 1) - 1)),
+                    "step_blocks": str(f.get("step_blocks") or ""),
+                    "states_per_layer": str(f.get("states_per_layer") or ""),
+                    "cltv_timeout": str(f.get("cltv_timeout") or ""),
+                    "amount": str(f.get("funding_amount") or ""),
+                })
+    except Exception as e:
+        out.setdefault("error", str(e))
     return out
 
 def derive_events(db):
@@ -2238,6 +2287,7 @@ function rTxInventory(D){
 function rOutcomes(D){
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  const log=lsp.broadcast_log||[];
+ const sr=lsp.signing_rounds_recent||[];
  // Build a map of source → entries
  const bySrc={};
  for(const r of log){
@@ -2245,14 +2295,30 @@ function rOutcomes(D){
   if(!bySrc[s])bySrc[s]=[];
   bySrc[s].push(r);
  }
+ // Index signing_rounds by ceremony_type so scenarios with ceremony-only
+ // evidence (Tier B rollover, PS sub-factory advance, PS leaf advance)
+ // can light up.  Without this, signing-only ceremonies that don't write
+ // a broadcast_log row leave their Outcomes tile grey even though the
+ // ceremony succeeded — verified via test-tier-b (tier_b_rollover ran
+ // successfully, broadcast_log had only funding+coop_close, tile stayed
+ // grey).
+ const byCer={};
+ for(const r of sr){
+  const t=(r.ceremony_type||'').toLowerCase();
+  if(!byCer[t])byCer[t]=[];
+  byCer[t].push(r);
+ }
  // Scenario definitions.  Each tile checks (a) broadcast_log entries
- // matching one or more source prefixes, and (b) optionally a "ready"
- // count from a persisted-bytes signal.
- const matchAny=(prefixes)=>{
+ // matching one or more source prefixes, (b) optionally a "ready"
+ // count from a persisted-bytes signal, and (c) optionally a list of
+ // ceremony_type values to match against signing_rounds_recent.
+ const matchAny=(prefixes,ceremonies)=>{
   const out=[];
   for(const k of Object.keys(bySrc))
-   for(const p of prefixes)
+   for(const p of prefixes||[])
     if(k===p||k.indexOf(p)===0){out.push(...bySrc[k]);break;}
+  for(const c of (ceremonies||[]))
+   if(byCer[c]) out.push(...byCer[c]);
   return out;
  };
  const psChain=lsp.ps_leaf_chains||[];
@@ -2282,19 +2348,22 @@ function rOutcomes(D){
    readySignal:facs.length>0?facs.length+' factory(ies)':'',
    blurb:'Funding TX broadcast that seats the factory MuSig2 UTXO on-chain.'},
   {name:'PS leaf advance', icon:'🌿', sources:['ps_advance_leaf','ps_advance_node','ps_advance_pass','ps_advance_fail','ps_leaf'],
+   ceremonies:['leaf_advance'],
    readySignal:psChain.length?psChain.length+' chain entries persisted':'',
    applicable:isPSCanon&&isNarrow,
    notApplicableNote:isWide?'k≥2 deployment uses sub-factory advances instead':isDWLegacy?'DW legacy deployment (arity 1/2) — leaves use decrementing nSequence, not PS chains':'',
-   blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.  --test-ps-advance writes broadcast_log rows with source=ps_advance_{node_N,leaf_N_chain0,pass,fail}.'},
+   blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.  --test-ps-advance writes broadcast_log rows with source=ps_advance_{node_N,leaf_N_chain0,pass,fail}; signing_rounds gets a leaf_advance row per chain extension.'},
   {name:'PS sub-factory advance', icon:'🌳', sources:['ps_subfactory','sub_factory_advance','subfactory_advance'],
+   ceremonies:['sub_factory_advance','subfactory_advance'],
    readySignal:psSub.length?psSub.length+' sub-factory chain entries':'',
    applicable:isWide,
    notApplicableNote:isNarrow?'k=1 deployment uses leaf advances instead (no sub-factories present)':isDWLegacy?'DW legacy deployment (arity 1/2) — no PS chains':'',
-   blurb:'lsp_subfactory_chain_advance: extends a k² sub-factory chain (wide leaves).'},
+   blurb:'lsp_subfactory_chain_advance: extends a k² sub-factory chain (wide leaves).  Evidence is ceremony-only (no broadcast) — relies on signing_rounds.sub_factory_advance + ps_subfactory_chains rows.'},
   {name:'DW force-close (tree broadcast)', icon:'⚡', sources:['tree_node_','tree_ok','tree_fail'],
    readySignal:'',
    blurb:'Broadcast of the factory tree from kickoff_root to leaves — full unilateral exit.'},
   {name:'Per-leaf advance (DW)', icon:'🎯', sources:['leaf_advance'],
+   ceremonies:['leaf_advance'],
    readySignal:'',
    applicable:isDWLegacy,
    notApplicableNote:isPSCanon?'PS canonical (arity 3) — leaves use PS chain advance, not DW state':'',
@@ -2323,8 +2392,13 @@ function rOutcomes(D){
    readySignal:jits.length?jits.length+' JIT channels':'',
    blurb:'LSP opens a standalone 2-of-2 channel from its own UTXO when leaf liquidity unavailable.'},
   {name:'Factory rotation', icon:'🔁', sources:['rotation_','rotation'],
+   ceremonies:['rotation'],
    readySignal:lad.length>1?lad.length+' ladder factories':'',
    blurb:'PTLC key turnover + dying-period migration to a fresh factory.'},
+  {name:'Tier B rollover', icon:'🌀', sources:['tier_b','tier_b_rollover'],
+   ceremonies:['tier_b_rollover'],
+   readySignal:'',
+   blurb:'Root state re-sign to advance the DW counter past states_per_layer.  Ceremony-only — no broadcast — surfaced via signing_rounds.tier_b_rollover.'},
   {name:'CPFP fee bump', icon:'⛽', sources:['cpfp'],
    readySignal:'',
    blurb:'CPFP child broadcast to fee-bump a stuck parent (penalty/HTLC/state TX).'},
@@ -2340,7 +2414,7 @@ function rOutcomes(D){
   // false, render a 'n/a' tile (dimmer than 'not fired') with the
   // deployment-shape reason in the body.
   const isNA = sc.applicable !== undefined && !sc.applicable;
-  const fired=matchAny(sc.sources);
+  const fired=matchAny(sc.sources, sc.ceremonies);
   let state, badge, lastTx='';
   if(isNA){
    state='na'; badge=`<span class="b" style="background:#0d1117;color:#484f58;border:1px solid #21262d">n/a for this deployment</span>`;
