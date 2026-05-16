@@ -857,6 +857,16 @@ commit_tx_done:
 int channel_build_commitment_tx(const channel_t *ch,
                                   tx_buf_t *unsigned_tx_out,
                                   unsigned char *txid_out32) {
+    /* R5 (mainnet pre-flight): refuse to build a commit TX if the funding
+       UTXO has been reorged out.  Any commit TX we'd build spends the
+       funding UTXO — broadcasting it would fail with -25 (missingorspent).
+       Channel is FROZEN until lsp_channels_revalidate_funding() observes
+       the funding TX re-confirmed. */
+    if (ch->funding_pending_reorg) {
+        fprintf(stderr, "channel_build_commitment_tx: refused — funding UTXO "
+                "pending reorg\n");
+        return 0;
+    }
     return channel_build_commitment_tx_impl(ch, unsigned_tx_out, txid_out32, NULL);
 }
 
@@ -1588,6 +1598,16 @@ static void channel_compact_htlcs(channel_t *ch) {
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
+    /* R5 (mainnet pre-flight): reject new HTLCs when the channel's funding
+       UTXO has been reorged out.  Channel is FROZEN (LN-aligned): commit
+       TX would spend a UTXO that doesn't exist on the active chain.  Flag
+       clears when lsp_channels_revalidate_funding() observes the funding
+       TX re-confirmed (or stays set until operator intervention). */
+    if (ch->funding_pending_reorg) {
+        fprintf(stderr, "channel_add_htlc: refused — funding UTXO pending "
+                "reorg (waiting for re-confirmation)\n");
+        return 0;
+    }
     if (ch->n_htlcs >= MAX_HTLCS)
         return 0;
 
