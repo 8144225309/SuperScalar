@@ -2792,6 +2792,53 @@ int lsp_persist_ps_chain0_all(void *persist, factory_t *f) {
     return saved;
 }
 
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
+   against the active chain.  Sets ch->funding_pending_reorg = 1 when the
+   funding TX is no longer findable (reorged out); clears the flag back to
+   0 when a confirmed observation returns.  Mirrors jit_channels_revalidate
+   _funding() (src/jit_channel.c:752) for the factory-channel case.
+
+   Returns the number of channels whose flag state changed (toggled either
+   direction).  Caller may persist or notify clients on a non-zero return.
+
+   Intended call sites (separate PRs will wire these up):
+     1. Daemon startup recovery (one-shot scan, like jit_channels_*)
+     2. R1's reorg handler in lsp_run_state_advance (defense after watchtower_on_reorg)
+     3. Periodic heartbeat (cheap defense)
+*/
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    extern void reverse_bytes(unsigned char *, size_t);
+    int changed = 0;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        /* Compute display-order hex txid for the chain query. */
+        unsigned char disp[32];
+        memcpy(disp, ch->funding_txid, 32);
+        reverse_bytes(disp, 32);
+        char txid_hex[65];
+        hex_encode(disp, 32, txid_hex);
+        txid_hex[64] = '\0';
+        int conf = regtest_get_confirmations(mgr->watchtower->rt, txid_hex);
+        if (conf < 0 && !ch->funding_pending_reorg) {
+            fprintf(stderr,
+                "LSP revalidate: channel %zu funding %.16s... not on chain — "
+                "FREEZING (funding_pending_reorg=1)\n", c, txid_hex);
+            ch->funding_pending_reorg = 1;
+            changed++;
+        } else if (conf >= 1 && ch->funding_pending_reorg) {
+            fprintf(stderr,
+                "LSP revalidate: channel %zu funding %.16s... back on chain "
+                "(%d confs) — UNFREEZING (funding_pending_reorg=0)\n",
+                c, txid_hex, conf);
+            ch->funding_pending_reorg = 0;
+            changed++;
+        }
+    }
+    return changed;
+}
+
 /* Cooperatively redistribute output amounts on an arity-2 leaf (3-of-3).
    LSP proposes new amounts; both clients agree via 2-round MuSig2 ceremony. */
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,

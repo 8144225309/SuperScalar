@@ -377,6 +377,14 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    not an error. */
 int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
 
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
+   against the active chain.  Sets ch->funding_pending_reorg=1 when the
+   funding TX has been reorged out; clears it back to 0 when re-confirmed.
+   LN-aligned: channel is FROZEN (HTLCs + force-close refused), not
+   abandoned — re-confirmation re-enables it.
+   Returns the number of channels whose flag state changed. */
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr);
+
 /* PS k² sub-factory chain extension ceremony driver (Gap E followup
    Phase 2b, t/1242).  Drives the multi-party MuSig signing of a new
    sub-factory state when the LSP "sells liquidity from sales-stock":

@@ -157,6 +157,18 @@ typedef struct {
        Prevents premature HTLC failure when height goes backward during reorg. */
     uint32_t      last_htlc_check_height;
 
+    /* R5 (mainnet pre-flight): set to 1 when a reorg has dropped the funding
+       UTXO this channel depends on (factory leaf state TX or original funding
+       TX, depending on factory shape).  While this flag is set:
+         - channel_add_htlc refuses to add new HTLCs
+         - channel_build_commitment_tx refuses (no valid commit can spend
+           a UTXO that doesn't exist)
+       LN-aligned semantics: channel is FROZEN, not abandoned.  If the funding
+       UTXO re-confirms on the new chain, the flag clears and operation
+       resumes.  Cleared by lsp_channels_revalidate_funding() when the
+       channel's funding_txid is observed confirmed again. */
+    int           funding_pending_reorg;
+
     /* Dynamic commitment: negotiated channel type (BOLT #2 PR #880) */
     uint32_t      channel_type_bits;         /* feature bits from channel_type TLV */
 
