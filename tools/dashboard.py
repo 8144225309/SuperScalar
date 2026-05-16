@@ -864,7 +864,7 @@ a{color:#58a6ff;text-decoration:none}
 .dot.y{background:#d29922;box-shadow:0 0 6px #d2992288}
 .demo{background:#1a1040;border:1px solid #6e40c9;border-radius:6px;padding:5px 16px;margin:8px 0;color:#d2a8ff;font-size:11px;text-align:center}
 /* Tabs */
-.tabs{display:flex;gap:2px;border-bottom:2px solid #21262d;margin:10px 0 12px 0;overflow-x:auto}
+.tabs{display:flex;flex-wrap:wrap;gap:2px;border-bottom:2px solid #21262d;margin:10px 0 12px 0}
 .tab{padding:7px 16px;cursor:pointer;color:#8b949e;font-size:12px;font-weight:600;border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap;transition:color .15s}
 .tab:hover{color:#c9d1d9}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
@@ -930,7 +930,6 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="defense">Defense Status</div>
  <div class="tab" data-t="txinv">TX Inventory</div>
  <div class="tab" data-t="outcomes">Outcomes</div>
- <div class="tab" data-t="events">Events</div>
 </div>
 <div id="content"></div>
 </div>
@@ -1028,7 +1027,18 @@ const fm=v=>{if(v==null)return'\u2014';let n=Number(v);if(typeof v==='string'&&v
 const th=h=>{if(!h||h==='?'||h==='null'||h==='None')return'\u2014';return h.length>22?h.slice(0,10)+'\u2026'+h.slice(-10):h;};
 const ts=h=>{if(!h||h==='?')return'\u2014';return h.length>16?h.slice(0,8)+'\u2026':h;};
 const bar=(l,r)=>{const t=l+r;if(!t)return'';const p=Math.round(l/t*100);return`<div class="b4"><div class="l" style="width:${p}%"></div><div class="rm" style="width:${100-p}%"></div></div>`;};
-const ta=ts=>{if(!ts)return'\u2014';const d=Math.floor(Date.now()/1000)-ts;if(d<60)return d+'s';if(d<3600)return Math.floor(d/60)+'m';if(d<86400)return Math.floor(d/3600)+'h';return Math.floor(d/86400)+'d';};
+const ta=ts=>{
+ // Defensive: LSP currently inserts the literal string '%s' into some
+ // created_at columns (printf placeholder never substituted \u2014 invoice
+ // registry hit by this).  Number('%s') is NaN; arithmetic propagates;
+ // result was rendered as "NaNd".  Coerce + NaN-check first so the
+ // dashboard degrades to "\u2014" instead of "NaNd".
+ const t=Number(ts);
+ if(!t||!Number.isFinite(t))return'\u2014';
+ const d=Math.floor(Date.now()/1000)-t;
+ if(d<60)return d+'s';if(d<3600)return Math.floor(d/60)+'m';
+ if(d<86400)return Math.floor(d/3600)+'h';return Math.floor(d/86400)+'d';
+};
 const prog=(p,c)=>`<div class="pt"><div class="pf ${c||'pg'}" style="width:${Math.min(100,Math.max(0,p))}%"></div></div>`;
 
 // === TAB: Overview ===
@@ -1694,6 +1704,22 @@ function rPayments(D){
 function rProtocol(D){
  const db=D.databases||{},lsp=db.lsp||{},msgs=lsp.wire_messages||[];
  let h='';
+ // Events section (formerly the standalone Events tab — merged here so the
+ // operator log is in one place).  Auto-hides when D.events is empty (the
+ // typical production case where only --demo populates the synthetic
+ // event stream).  Wire-level firehose continues below; this is the
+ // narrative summary layer.
+ const ev=D.events||[];
+ if(ev.length){
+  h+=`<div class="s"><div class="st"><span>Events</span><span class="c">${ev.length} recent</span></div>`;
+  h+=`<div class="el">`;
+  for(const e of ev.slice().reverse()){
+   h+=`<div class="ew"><span class="et">${e.time}</span><span class="em">${e.msg}</span></div>`;
+  }
+  h+=`</div>`;
+  h+=`<p class="mu" style="font-size:10px;margin-top:4px">Narrative summaries.  See raw wire messages below for the protocol-level view.</p>`;
+  h+=`</div>`;
+ }
  const catColor=(name)=>{
   const n=(name||'').toUpperCase();
   if(n.startsWith('CHANNEL')||n.startsWith('UPDATE')||n.startsWith('COMMITMENT')||n.startsWith('REVOKE'))return'color:#3fb950';
@@ -2603,16 +2629,6 @@ function rCeremonies(D){
  return h;
 }
 
-// === TAB: Events ===
-function rEvents(D){
- const ev=D.events||[];
- let h=`<div class="s"><div class="st"><span>Event Log</span><span class="c">${ev.length}</span></div>`;
- if(!ev.length)h+=`<p class="mu">No events yet. Events appear as the system operates.</p>`;
- else{h+=`<div class="el">`;for(const e of ev.slice().reverse())h+=`<div class="ew"><span class="et">${e.time}</span><span class="em">${e.msg}</span></div>`;h+=`</div>`;}
- h+=`</div>`;
- return h;
-}
-
 // === Main render ===
 function render(D){
  _D=D;             // expose latest payload for exportSnapshot()
@@ -2654,8 +2670,14 @@ function render(D){
  // Update tab counts
  const tabCounts={channels:(lsp.channels||[]).length+(lsp.htlcs||[]).length,
   lightning:((D.cln||{}).a||{}).num_peers||0+((D.cln||{}).b||{}).num_peers||0,
-  watchtower:(lsp.watchtower_count||0)+(lsp.revocation_count||0),
-  events:(D.events||[]).length};
+  watchtower:(lsp.watchtower_count||0)+(lsp.revocation_count||0)};
+ // Events tab was merged into Protocol Log — redirect stale curTab so
+ // operators with persisted tab state from a prior session don't see a
+ // blank page (the 'events' tab markup no longer exists).
+ if(curTab==='events'){
+  curTab='protocol';
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.t==='protocol'));
+ }
  // Render all tabs (hidden, shown via CSS)
  let h='';
  h+=`<div class="tp ${curTab==='overview'?'show':''}" id="t-overview">${rOverview(D)}</div>`;
@@ -2669,7 +2691,6 @@ function render(D){
  h+=`<div class="tp ${curTab==='defense'?'show':''}" id="t-defense">${rDefenseStatus(D)}</div>`;
  h+=`<div class="tp ${curTab==='txinv'?'show':''}" id="t-txinv">${rTxInventory(D)}</div>`;
  h+=`<div class="tp ${curTab==='outcomes'?'show':''}" id="t-outcomes">${rOutcomes(D)}</div>`;
- h+=`<div class="tp ${curTab==='events'?'show':''}" id="t-events">${rEvents(D)}</div>`;
  document.getElementById('content').innerHTML=h;
  // Polish item 1 re-application: rProtocol just rebuilt the rows, so re-apply
  // the saved filter values so the user's filter persists across the 5s
