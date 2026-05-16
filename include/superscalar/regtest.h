@@ -114,6 +114,15 @@ void regtest_faucet_health_report(void);
 int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
                                     int timeout_secs);
 
+/* CL8: reorg-aware confirmation wait.
+   Returns 1 when txid stably has >= target_depth confirmations (verified
+   by a second poll after a delay; if conf drops more than
+   max_tolerated_reorg_depth, restart the wait). Returns 0 on timeout. */
+int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
+                                          int target_depth,
+                                          int max_tolerated_reorg_depth,
+                                          int timeout_secs);
+
 /* Find a wallet UTXO suitable for CPFP bump funding.
    Locks the selected UTXO via lockunspent so concurrent callers cannot
    pick the same coin.  Call regtest_release_utxo() after broadcast.

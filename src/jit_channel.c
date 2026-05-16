@@ -279,7 +279,12 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
                           mgr->confirm_timeout_secs : 7200;
         int confirmed = 0;
         for (int attempt = 0; attempt < 2; attempt++) {
-            if (regtest_wait_for_confirmation(rt, fund_txid_hex, jit_timeout) >= 1) {
+            /* R2 (mainnet pre-flight): reorg-resilient confirmation wait —
+               re-verifies after a delay and restarts on reorg-induced drop. */
+            if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
+                                                      /*target_depth=*/1,
+                                                      /*max_reorg_depth=*/3,
+                                                      jit_timeout) >= 1) {
                 confirmed = 1;
                 break;
             }

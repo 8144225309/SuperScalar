@@ -450,7 +450,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                         continue;
                     }
                 } else {
-                    if (regtest_wait_for_confirmation(rt, rc_txid, rot_timeout) >= 1) {
+                    /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+                    if (regtest_wait_for_stable_confirmation(rt, rc_txid,
+                                                              /*target_depth=*/1,
+                                                              /*max_reorg_depth=*/3,
+                                                              rot_timeout) >= 1) {
                         confirmed = 1; break;
                     }
                     if (regtest_is_in_mempool(rt, rc_txid)) {
@@ -546,7 +550,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                     continue;
                 }
             } else {
-                if (regtest_wait_for_confirmation(rt, fund_txid_hex, rot_timeout) >= 1) {
+                /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+                if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
+                                                          /*target_depth=*/1,
+                                                          /*max_reorg_depth=*/3,
+                                                          rot_timeout) >= 1) {
                     confirmed = 1; break;
                 }
                 if (regtest_is_in_mempool(rt, fund_txid_hex)) {
