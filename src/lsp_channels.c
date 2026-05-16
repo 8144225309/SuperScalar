@@ -2822,10 +2822,28 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         txid_hex[64] = '\0';
         int conf = regtest_get_confirmations(mgr->watchtower->rt, txid_hex);
         int new_state = -1;
-        if (conf < 0 && !ch->funding_pending_reorg) {
+        /* R5 #128: proactive mempool-expiry freeze.  If the TX is in
+           mempool but unconfirmed (conf == 0) AND it has been there
+           longer than the network-specific threshold, treat it as
+           effectively reorged-out.  Pairs with the reactive `conf < 0`
+           freeze below — together they catch "evicted already" and
+           "about to be evicted". */
+        int mempool_age_freeze = 0;
+        if (conf == 0) {
+            int age = regtest_get_mempool_entry_seconds_ago(
+                mgr->watchtower->rt, txid_hex);
+            int threshold = regtest_network_mempool_freeze_seconds(
+                mgr->watchtower->rt);
+            if (age >= threshold)
+                mempool_age_freeze = 1;
+        }
+        if ((conf < 0 || mempool_age_freeze) && !ch->funding_pending_reorg) {
             fprintf(stderr,
-                "LSP revalidate: channel %zu funding %.16s... not on chain — "
-                "FREEZING (funding_pending_reorg=1)\n", c, txid_hex);
+                "LSP revalidate: channel %zu funding %.16s... %s — "
+                "FREEZING (funding_pending_reorg=1)\n",
+                c, txid_hex,
+                mempool_age_freeze ? "stale in mempool past timeout"
+                                   : "not on chain");
             ch->funding_pending_reorg = 1;
             changed++;
             new_state = 1;

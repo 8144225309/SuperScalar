@@ -1496,6 +1496,49 @@ int regtest_network_safe_confirmation_depth(const regtest_t *rt) {
     return 6;  /* unknown network → conservative */
 }
 
+/* R5 #128: per-network mempool-expiry freeze timeout.  When a funding TX
+   has been sitting unconfirmed in bitcoind's mempool for longer than this,
+   treat it as effectively reorged-out and freeze the channel proactively.
+   Pairs with the existing R5 reactive check (conf == -1 → freeze) so we
+   catch both "evicted already" and "about to be evicted" states. */
+int regtest_network_mempool_freeze_seconds(const regtest_t *rt) {
+    if (!rt) return 7 * 86400;
+    if (strcmp(rt->network, "regtest") == 0) return 60;
+    if (strcmp(rt->network, "signet") == 0)  return 2 * 3600;
+    if (strcmp(rt->network, "testnet4") == 0) return 24 * 3600;
+    if (strcmp(rt->network, "testnet") == 0)  return 24 * 3600;
+    if (strcmp(rt->network, "mainnet") == 0)  return 7 * 86400;
+    return 7 * 86400;
+}
+
+/* Returns seconds elapsed since bitcoind first saw the TX in its mempool,
+   or -1 if the TX is not in mempool (already confirmed, evicted, or never
+   seen).  Uses getmempoolentry which returns a "time" field (Unix epoch).
+   Note: bitcoind's mempool entry time RESETS on bitcoind restart, so this
+   is a best-effort signal — not a durable persistence-grade timer. */
+int regtest_get_mempool_entry_seconds_ago(regtest_t *rt, const char *txid) {
+    if (!rt || !txid) return -1;
+    char params[80];
+    snprintf(params, sizeof(params), "\"%s\"", txid);
+    char *result = regtest_exec(rt, "getmempoolentry", params);
+    if (!result) return -1;
+    cJSON *j = cJSON_Parse(result);
+    free(result);
+    if (!j) return -1;
+    int seconds_ago = -1;
+    cJSON *t = cJSON_GetObjectItem(j, "time");
+    if (t && cJSON_IsNumber(t)) {
+        time_t now = time(NULL);
+        time_t entry_time = (time_t)t->valuedouble;
+        if (entry_time > 0 && now > entry_time)
+            seconds_ago = (int)(now - entry_time);
+        else
+            seconds_ago = 0;
+    }
+    cJSON_Delete(j);
+    return seconds_ago;
+}
+
 int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
                                 char *txid_out, uint32_t *vout_out,
                                 uint64_t *amount_out,

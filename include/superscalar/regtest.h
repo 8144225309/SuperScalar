@@ -137,6 +137,22 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
    target_depth. */
 int regtest_network_safe_confirmation_depth(const regtest_t *rt);
 
+/* R5 #128: per-network mempool-expiry freeze threshold in seconds.
+
+     regtest               -> 60       (short for tests; tune via override)
+     signet                -> 7200     (2h — fast-fee network)
+     testnet4 / testnet    -> 86400    (24h — TRUC eviction window safety)
+     mainnet               -> 604800   (7 days — conservative)
+
+   When a funding TX has been in bitcoind's mempool longer than this, the
+   LSP treats it as effectively reorged-out and freezes the channel —
+   complementing the R5 reactive check that handles "already evicted". */
+int regtest_network_mempool_freeze_seconds(const regtest_t *rt);
+
+/* Returns seconds since bitcoind first saw txid in mempool, or -1 if not
+   in mempool.  Uses getmempoolentry; bitcoind-restart resets the timer. */
+int regtest_get_mempool_entry_seconds_ago(regtest_t *rt, const char *txid);
+
 /* Find a wallet UTXO suitable for CPFP bump funding.
    Locks the selected UTXO via lockunspent so concurrent callers cannot
    pick the same coin.  Call regtest_release_utxo() after broadcast.
