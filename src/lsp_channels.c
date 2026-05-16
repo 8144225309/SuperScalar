@@ -2806,7 +2806,7 @@ int lsp_persist_ps_chain0_all(void *persist, factory_t *f) {
      2. R1's reorg handler in lsp_run_state_advance (defense after watchtower_on_reorg)
      3. Periodic heartbeat (cheap defense)
 */
-int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
     extern void hex_encode(const unsigned char *, size_t, char *);
     extern void reverse_bytes(unsigned char *, size_t);
@@ -2821,12 +2821,14 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
         hex_encode(disp, 32, txid_hex);
         txid_hex[64] = '\0';
         int conf = regtest_get_confirmations(mgr->watchtower->rt, txid_hex);
+        int new_state = -1;
         if (conf < 0 && !ch->funding_pending_reorg) {
             fprintf(stderr,
                 "LSP revalidate: channel %zu funding %.16s... not on chain — "
                 "FREEZING (funding_pending_reorg=1)\n", c, txid_hex);
             ch->funding_pending_reorg = 1;
             changed++;
+            new_state = 1;
             /* v31: persist the toggle so a restart mid-reorg reloads frozen. */
             if (mgr->persist)
                 persist_update_channel_funding_reorg(
@@ -2838,9 +2840,24 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
                 c, txid_hex, conf);
             ch->funding_pending_reorg = 0;
             changed++;
+            new_state = 0;
             if (mgr->persist)
                 persist_update_channel_funding_reorg(
                     (persist_t *)mgr->persist, (uint32_t)c, 0);
+        }
+        /* R5 wire: notify the client so it mirrors the freeze state.
+           Best-effort: client may be offline; the LSP-side flag is still
+           authoritative.  A reconnect can resync via the next revalidate
+           cycle if this message was missed. */
+        if (new_state >= 0 && lsp && lsp->client_fds &&
+            c < lsp->n_clients && lsp->client_fds[c] >= 0) {
+            cJSON *j = cJSON_CreateObject();
+            if (j) {
+                cJSON_AddNumberToObject(j, "frozen", new_state);
+                cJSON_AddStringToObject(j, "funding_txid", txid_hex);
+                wire_send(lsp->client_fds[c], MSG_FUNDING_REORG, j);
+                cJSON_Delete(j);
+            }
         }
     }
     return changed;
@@ -5846,7 +5863,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            channel.c gates add_htlc/build_commitment behind
                            that flag so a reorged-out funding TX cannot ship
                            an HTLC that has no on-chain backing. */
-                        int frz = lsp_channels_revalidate_funding(mgr);
+                        int frz = lsp_channels_revalidate_funding(mgr, lsp);
                         if (frz)
                             fprintf(stderr, "LSP: reorg revalidate flipped "
                                     "funding_pending_reorg on %d channel(s)\n",
@@ -6419,7 +6436,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 cbe->reorg_cb(hb_height, mgr->last_known_height,
                                               cbe->reorg_cb_ctx);
                             /* R5: revalidate factory channels' funding UTXOs. */
-                            int hb_frz = lsp_channels_revalidate_funding(mgr);
+                            int hb_frz = lsp_channels_revalidate_funding(mgr, lsp);
                             if (hb_frz)
                                 fprintf(stderr, "LSP: heartbeat revalidate "
                                         "flipped funding_pending_reorg on %d "

@@ -382,8 +382,10 @@ int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
    funding TX has been reorged out; clears it back to 0 when re-confirmed.
    LN-aligned: channel is FROZEN (HTLCs + force-close refused), not
    abandoned — re-confirmation re-enables it.
+   When `lsp` is non-NULL, sends MSG_FUNDING_REORG to lsp->client_fds[slot]
+   on every flip so the client mirrors the freeze state.
    Returns the number of channels whose flag state changed. */
-int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr);
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* PS k² sub-factory chain extension ceremony driver (Gap E followup
    Phase 2b, t/1242).  Drives the multi-party MuSig signing of a new

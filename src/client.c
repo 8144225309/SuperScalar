@@ -126,8 +126,16 @@ static void client_send_error(int fd, const char *reason) {
     cJSON_Delete(err);
 }
 
+/* Client-side mirror of LSP's funding_pending_reorg flag.  When MSG_FUNDING_
+   REORG arrives, we set this so future cooperative ops / add-htlc paths can
+   check it and refuse.  Best-effort: LSP-side state is authoritative; this
+   is just a UX hint so the client doesn't try to do anything that'll be
+   rejected anyway. */
+static int g_client_funding_pending_reorg = 0;
+
 /* Wrapper around wire_recv_timeout that transparently handles
-   MSG_PING (responds with MSG_PONG) and MSG_PONG (discards).
+   MSG_PING (responds with MSG_PONG), MSG_PONG (discards), and
+   MSG_FUNDING_REORG (updates local freeze mirror, discards).
    Returns 1 on a real (non-keepalive) message, 0 on failure. */
 static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
     for (;;) {
@@ -145,6 +153,24 @@ static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
             if (msg->json) cJSON_Delete(msg->json);
             msg->json = NULL;
             continue;  /* discard pong, wait for real message */
+        }
+        if (msg->msg_type == MSG_FUNDING_REORG) {
+            int frozen = 0;
+            const char *txid_hex = "?";
+            if (msg->json) {
+                cJSON *fr = cJSON_GetObjectItem(msg->json, "frozen");
+                if (fr && cJSON_IsNumber(fr)) frozen = fr->valueint;
+                cJSON *tx = cJSON_GetObjectItem(msg->json, "funding_txid");
+                if (tx && cJSON_IsString(tx)) txid_hex = tx->valuestring;
+            }
+            g_client_funding_pending_reorg = frozen ? 1 : 0;
+            fprintf(stderr, "Client: MSG_FUNDING_REORG funding=%.16s "
+                    "frozen=%d (LSP says funding %s)\n",
+                    txid_hex, frozen,
+                    frozen ? "reorged out" : "back on chain");
+            if (msg->json) cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;  /* notification, wait for next real message */
         }
         return 1;  /* real message */
     }

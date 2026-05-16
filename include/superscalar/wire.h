@@ -128,6 +128,12 @@
 #define MSG_SUBFACTORY_PSIG         0x76  /* Client → LSP: client partial sig */
 #define MSG_SUBFACTORY_DONE         0x77  /* LSP → sub clients: chain extension complete */
 
+/* R5 mainnet pre-flight: funding-UTXO reorg notification.
+   LSP → Client.  Sent when lsp_channels_revalidate_funding observes the
+   funding TX has dropped off chain (frozen=1) or returned (frozen=0).
+   Payload: { "frozen": 0|1, "funding_txid": "<display-hex>" } */
+#define MSG_FUNDING_REORG       0x78
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
