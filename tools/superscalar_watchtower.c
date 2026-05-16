@@ -353,28 +353,34 @@ int main(int argc, char *argv[]) {
         char cur_hash[65] = {0};
         regtest_get_best_block_hash(&rt, cur_hash);
 
-        int reorg_kind = 0;  /* 0=none, 1=height-decrease, 2=same-height */
+        /* R6 (mainnet pre-flight): mirror the LSP daemon-loop detection
+           (PR #201).  Standalone WT had SAME_HEIGHT + HEIGHT_REGRESSION but
+           missed FORWARD_REORG (competing longer chain wins; tip advances
+           but block at last_height is no longer canonical).  Detect by
+           re-querying the block hash at last_height. */
+        int reorg_kind = 0;  /* 0=none, 1=height-decrease, 2=same-height, 3=forward */
         if (last_height > 0 && height < last_height) {
             reorg_kind = 1;
         } else if (last_height > 0 && height == last_height &&
                    last_hash[0] != 0 && cur_hash[0] != 0 &&
                    strcmp(cur_hash, last_hash) != 0) {
             reorg_kind = 2;
+        } else if (last_height > 0 && height > last_height && last_hash[0]) {
+            char prev_hash_now[65] = {0};
+            if (regtest_get_block_hash(&rt, last_height,
+                                        prev_hash_now, sizeof(prev_hash_now)) &&
+                prev_hash_now[0] &&
+                strcmp(prev_hash_now, last_hash) != 0) {
+                reorg_kind = 3;
+            }
         }
 
-        if (height > last_height) {
-            int penalties = watchtower_check(&wt);
-            if (penalties > 0) {
-                printf("[%ld] Block %d: %d penalty tx(s) broadcast!\n",
-                       (long)time(NULL), height, penalties);
-            }
-            last_height = height;
-            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
-        } else if (reorg_kind > 0) {
-            /* Reorg detected — re-validate all watchtower entries.
-               Issue #2: detects both height-regression AND same-height reorgs
-               (best-block hash changed at the same height). */
-            const char *kind_str = (reorg_kind == 2) ? "SAME_HEIGHT" : "HEIGHT_REGRESSION";
+        if (reorg_kind > 0) {
+            /* Reorg detected — re-validate all watchtower entries. */
+            const char *kind_str =
+                (reorg_kind == 3) ? "FORWARD_REORG" :
+                (reorg_kind == 2) ? "SAME_HEIGHT"   :
+                                     "HEIGHT_REGRESSION";
             fprintf(stderr, "[%ld] REORG (%s): height %d -> %d hash %.16s -> %.16s\n",
                     (long)time(NULL), kind_str, last_height, height,
                     last_hash, cur_hash);
@@ -384,6 +390,10 @@ int main(int argc, char *argv[]) {
                     snprintf(det, sizeof(det),
                              "same_height_%d hash_%.16s->%.16s",
                              height, last_hash, cur_hash);
+                } else if (reorg_kind == 3) {
+                    snprintf(det, sizeof(det),
+                             "forward_reorg height_%d->%d hash_%.16s->%.16s",
+                             last_height, height, last_hash, cur_hash);
                 } else {
                     snprintf(det, sizeof(det), "height_%d->%d depth_%d",
                              last_height, height, last_height - height);
@@ -395,6 +405,14 @@ int main(int argc, char *argv[]) {
             if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
             /* Run a watchtower check immediately after reorg */
             watchtower_check(&wt);
+        } else if (height > last_height) {
+            int penalties = watchtower_check(&wt);
+            if (penalties > 0) {
+                printf("[%ld] Block %d: %d penalty tx(s) broadcast!\n",
+                       (long)time(NULL), height, penalties);
+            }
+            last_height = height;
+            if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
         }
 
         /* Heartbeat */
