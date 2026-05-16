@@ -5840,6 +5840,17 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     "%d sub-factory(s); force-close falls back "
                                     "to chain[0]\n", n_sub_reset);
                         }
+                        /* R5 (mainnet pre-flight): revalidate each factory
+                           channel's funding UTXO.  Sets funding_pending_reorg
+                           on channels whose funding TX is no longer on chain;
+                           channel.c gates add_htlc/build_commitment behind
+                           that flag so a reorged-out funding TX cannot ship
+                           an HTLC that has no on-chain backing. */
+                        int frz = lsp_channels_revalidate_funding(mgr);
+                        if (frz)
+                            fprintf(stderr, "LSP: reorg revalidate flipped "
+                                    "funding_pending_reorg on %d channel(s)\n",
+                                    frz);
                         /* Immediate watchtower check to re-detect breaches */
                         watchtower_check(mgr->watchtower);
                         /* Re-run factory recovery to re-broadcast lost TXs */
@@ -6407,6 +6418,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             if (cbe && cbe->reorg_cb)
                                 cbe->reorg_cb(hb_height, mgr->last_known_height,
                                               cbe->reorg_cb_ctx);
+                            /* R5: revalidate factory channels' funding UTXOs. */
+                            int hb_frz = lsp_channels_revalidate_funding(mgr);
+                            if (hb_frz)
+                                fprintf(stderr, "LSP: heartbeat revalidate "
+                                        "flipped funding_pending_reorg on %d "
+                                        "channel(s)\n", hb_frz);
                         }
                         if (hb_height > mgr->last_known_height)
                             mgr->last_known_height = hb_height;
