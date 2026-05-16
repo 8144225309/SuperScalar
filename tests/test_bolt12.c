@@ -253,13 +253,14 @@ int test_offer_decode_bad_checksum(void)
  * v27=watchtower_pending.fb_* columns (fee-bump escalation persist; PR-C-1),
  * v28=force_close_watches + force_close_htlcs (PR-C-2),
  * v29=reorg_events + breach_detections (observability; PR-C-6),
- * v30=old_commitment_ptlcs (PR-PTLC-1 schema groundwork)) */
+ * v30=old_commitment_ptlcs (PR-PTLC-1 schema groundwork),
+ * v31=channels.funding_pending_reorg (R5 follow-up — persist freeze state)) */
 int test_persist_schema_v3(void)
 {
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 30, "schema version is 30 (v30 adds old_commitment_ptlcs — PR-PTLC-1)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 31, "schema version is 31 (v31 adds channels.funding_pending_reorg — R5 follow-up)");
     persist_close(&p);
     return 1;
 }

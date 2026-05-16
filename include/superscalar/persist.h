@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 30
+#define PERSIST_SCHEMA_VERSION 31
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -225,6 +225,12 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
                                      uint64_t local_amount,
                                      uint64_t remote_amount,
                                      uint64_t commitment_number);
+
+/* v31 (R5): persist funding_pending_reorg toggle so a restart mid-reorg
+   reloads the channel in its frozen state.  Called from
+   lsp_channels_revalidate_funding when the flag flips. */
+int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                            int funding_pending_reorg);
 
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for

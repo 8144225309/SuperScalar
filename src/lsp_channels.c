@@ -2827,6 +2827,10 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
                 "FREEZING (funding_pending_reorg=1)\n", c, txid_hex);
             ch->funding_pending_reorg = 1;
             changed++;
+            /* v31: persist the toggle so a restart mid-reorg reloads frozen. */
+            if (mgr->persist)
+                persist_update_channel_funding_reorg(
+                    (persist_t *)mgr->persist, (uint32_t)c, 1);
         } else if (conf >= 1 && ch->funding_pending_reorg) {
             fprintf(stderr,
                 "LSP revalidate: channel %zu funding %.16s... back on chain "
@@ -2834,6 +2838,9 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr) {
                 c, txid_hex, conf);
             ch->funding_pending_reorg = 0;
             changed++;
+            if (mgr->persist)
+                persist_update_channel_funding_reorg(
+                    (persist_t *)mgr->persist, (uint32_t)c, 0);
         }
     }
     return changed;
