@@ -791,14 +791,26 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         return 0;
     }
 
-    /* Confirm it */
+    /* Confirm it.
+       R2 (mainnet pre-flight): use the stable-confirmation variant so we
+       re-verify after a delay and restart the wait if a reorg drops the
+       TX between confirmation and the recheck.  target_depth=1 preserves
+       the prior shallow-confirmation semantics; max_tolerated_reorg_depth=3
+       is a conservative threshold for restart-on-drop. */
     if (is_regtest) {
         regtest_mine_blocks(rt, 1, mine_addr);
     } else {
-        printf("  %s broadcast OK (txid=%.16s...), waiting for confirmation...\n",
+        printf("  %s broadcast OK (txid=%.16s...), waiting for stable confirmation...\n",
                log_source, txid_out);
         fflush(stdout);
-        regtest_wait_for_confirmation(rt, txid_out, confirm_timeout);
+        if (!regtest_wait_for_stable_confirmation(rt, txid_out,
+                                                    /*target_depth=*/1,
+                                                    /*max_reorg_depth=*/3,
+                                                    confirm_timeout)) {
+            fprintf(stderr,
+                    "  %s confirmation wait timed out or stuck on reorg — "
+                    "downstream may need to re-broadcast\n", log_source);
+        }
     }
 
     if (display_txid_internal_be) {
@@ -4075,8 +4087,12 @@ accept_new_factory:
     if (is_regtest) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
-        printf("LSP: waiting for close tx confirmation on %s...\n", network);
-        regtest_wait_for_confirmation(&rt, close_txid, confirm_timeout_secs);
+        printf("LSP: waiting for stable close tx confirmation on %s...\n", network);
+        /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+        regtest_wait_for_stable_confirmation(&rt, close_txid,
+                                              /*target_depth=*/1,
+                                              /*max_reorg_depth=*/3,
+                                              confirm_timeout_secs);
     }
     tx_buf_free(&close_tx);
 
