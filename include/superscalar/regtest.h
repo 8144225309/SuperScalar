@@ -123,6 +123,20 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
                                           int max_tolerated_reorg_depth,
                                           int timeout_secs);
 
+/* R3: Per-network safe confirmation depth — the number of confirmations
+   beyond which a reorg becoming canonical is operationally negligible.
+
+     regtest               -> 1   (controlled chain, no real reorgs)
+     signet / testnet4     -> 3   (light competitive, daily small reorgs)
+     testnet (legacy)      -> 3
+     mainnet               -> 6   (industry default; ~1h of finality)
+
+   Used by JIT funding, factory rotation, and coop close — paths where
+   we depend on the TX being final before progressing to the next user-
+   facing step.  Pass to regtest_wait_for_stable_confirmation as
+   target_depth. */
+int regtest_network_safe_confirmation_depth(const regtest_t *rt);
+
 /* Find a wallet UTXO suitable for CPFP bump funding.
    Locks the selected UTXO via lockunspent so concurrent callers cannot
    pick the same coin.  Call regtest_release_utxo() after broadcast.

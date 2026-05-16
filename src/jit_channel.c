@@ -277,12 +277,13 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     } else {
         int jit_timeout = mgr->confirm_timeout_secs > 0 ?
                           mgr->confirm_timeout_secs : 7200;
+        int safe_depth = regtest_network_safe_confirmation_depth(rt);
         int confirmed = 0;
         for (int attempt = 0; attempt < 2; attempt++) {
-            /* R2 (mainnet pre-flight): reorg-resilient confirmation wait —
-               re-verifies after a delay and restarts on reorg-induced drop. */
+            /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
+               confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
             if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
-                                                      /*target_depth=*/1,
+                                                      safe_depth,
                                                       /*max_reorg_depth=*/3,
                                                       jit_timeout) >= 1) {
                 confirmed = 1;
