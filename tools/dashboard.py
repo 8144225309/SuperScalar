@@ -310,10 +310,16 @@ def collect_databases(cfg):
             "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
             "FROM watchtower_pending ORDER BY bump_count DESC")
         data[label]["watchtower_pending"] = rows if not err else []
-        # Old commitment HTLCs — HTLCs attached to old (revoked) commitments
+        # Old commitment HTLCs — HTLCs attached to old (revoked) commitments.
+        # Schema uses htlc_vout/htlc_amount and integer direction (0=offered,
+        # 1=received per htlc_direction_t).  Alias to match the live htlcs
+        # row shape (htlc_index, amount, string direction) so rPayments and
+        # the per-channel rollup can consume both lists uniformly without
+        # special-casing the historical table.
         rows, err = query_db(path,
-            "SELECT channel_id, commit_num, htlc_index, direction, amount, "
-            "payment_hash, cltv_expiry "
+            "SELECT channel_id, commit_num, htlc_vout AS htlc_index, "
+            "CASE direction WHEN 0 THEN 'offered' ELSE 'received' END AS direction, "
+            "htlc_amount AS amount, payment_hash, cltv_expiry "
             "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
         data[label]["old_commitment_htlcs"] = rows if not err else []
         # PR #181 Phase A consumer: count old_commitments rows with persisted
