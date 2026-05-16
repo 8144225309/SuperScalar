@@ -290,6 +290,38 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
                                   const unsigned char *commitment_txid,
                                   const watchtower_htlc_t *htlcs, size_t n_htlcs);
 
+/* SF-W #148: extract force-close HTLC sweep info from a channel.
+
+   On honest force-close (BOLT-1 ERROR / BOLT-2 §2.3.1) the peer broadcasts
+   THEIR latest commitment TX.  From the LSP's perspective that's the
+   "remote commitment" — the version the LSP holds for the peer's side.
+   The LSP knows what that TX looks like because it co-signed it.
+
+   This helper builds the remote-view commit TX via
+   channel_build_commitment_tx_for_remote, parses HTLC output positions
+   (vouts 2..n) + their P2TR SPKs from the TX bytes, and zips in HTLC
+   metadata (direction, payment_hash, cltv_expiry) from ch->htlcs[].
+
+   Direction semantics: ch->htlcs[i] uses LSP-side view (OFFERED = LSP
+   is sender).  On the REMOTE commit, that HTLC appears in the swapped
+   role (LSP-offered = remote-received).  We keep LSP-side direction in
+   the watchtower entry; the sweep logic at watchtower.c:967+ interprets
+   it correctly per channel role.
+
+   Sub-dust HTLCs (< CHANNEL_DUST_LIMIT_SATS) are trimmed from the commit
+   TX per BOLT #3 §3 and skipped here.
+
+   On success: *commit_txid_out32 filled (32 bytes internal byte order),
+   htlcs_out populated with up to htlcs_max active non-dust HTLC entries,
+   *n_htlcs_out = count.  Returns 1.  On failure: returns 0, no buffers
+   touched.  Caller should pass NULL/0 to watchtower_watch_force_close
+   when this returns 0 (registers the channel but no HTLC list). */
+int watchtower_build_force_close_htlcs(const channel_t *ch,
+                                         unsigned char *commit_txid_out32,
+                                         watchtower_htlc_t *htlcs_out,
+                                         size_t htlcs_max,
+                                         size_t *n_htlcs_out);
+
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
 

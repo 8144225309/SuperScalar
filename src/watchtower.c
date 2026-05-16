@@ -1586,7 +1586,13 @@ void watchtower_cleanup(watchtower_t *wt) {
 int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
                                   const unsigned char *commitment_txid,
                                   const watchtower_htlc_t *htlcs, size_t n_htlcs) {
-    if (!wt || !commitment_txid || n_htlcs == 0) return 0;
+    /* SF-W #148: n_htlcs == 0 is VALID — register the channel for FC
+       observability even when there are no HTLCs to sweep (closing a clean
+       channel with no in-flight HTLCs).  Previously this case was rejected
+       and the BOLT-1 ERROR handler ended up with no watchtower coverage.
+       htlcs may be NULL when n_htlcs is 0. */
+    if (!wt || !commitment_txid) return 0;
+    if (n_htlcs > 0 && !htlcs) return 0;
 
     /* Grow entries if needed */
     if (wt->n_entries >= wt->entries_cap) {
@@ -1604,17 +1610,23 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     e->channel_id = channel_id;
     memcpy(e->txid, commitment_txid, 32);
 
-    /* Copy HTLC outputs */
-    e->htlc_outputs = malloc(n_htlcs * sizeof(watchtower_htlc_t));
-    if (!e->htlc_outputs) return 0;
-    memcpy(e->htlc_outputs, htlcs, n_htlcs * sizeof(watchtower_htlc_t));
-    e->n_htlc_outputs = n_htlcs;
-    e->htlc_outputs_cap = n_htlcs;
+    /* Copy HTLC outputs (skip allocation if n_htlcs == 0). */
+    if (n_htlcs > 0) {
+        e->htlc_outputs = malloc(n_htlcs * sizeof(watchtower_htlc_t));
+        if (!e->htlc_outputs) return 0;
+        memcpy(e->htlc_outputs, htlcs, n_htlcs * sizeof(watchtower_htlc_t));
+        e->n_htlc_outputs = n_htlcs;
+        e->htlc_outputs_cap = n_htlcs;
+    } else {
+        e->htlc_outputs = NULL;
+        e->n_htlc_outputs = 0;
+        e->htlc_outputs_cap = 0;
+    }
 
     wt->n_entries++;
 
     /* Register HTLC scripts with chain backend */
-    if (wt->chain && wt->chain->register_script)
+    if (n_htlcs > 0 && wt->chain && wt->chain->register_script)
         for (size_t i = 0; i < n_htlcs; i++)
             wt->chain->register_script(wt->chain, htlcs[i].htlc_spk, 34);
 
@@ -1627,6 +1639,104 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
                                    (const struct watchtower_htlc *)htlcs,
                                    n_htlcs, &row_id);
     }
+    return 1;
+}
+
+int watchtower_build_force_close_htlcs(const channel_t *ch,
+                                         unsigned char *commit_txid_out32,
+                                         watchtower_htlc_t *htlcs_out,
+                                         size_t htlcs_max,
+                                         size_t *n_htlcs_out) {
+    if (!ch || !commit_txid_out32 || !n_htlcs_out) return 0;
+    *n_htlcs_out = 0;
+
+    /* Build the remote-view commit TX.  On BOLT-1 ERROR force-close, the
+       peer broadcasts THEIR latest commit (BOLT-2 §2.3.1).  From LSP's
+       perspective that's channel_build_commitment_tx_for_remote.  The
+       builder also flips HTLC directions in the temp copy of ch->htlcs[]
+       (channel.c:906-911) and rebuilds the tapscripts in the swapped
+       role.  We KEEP the LSP-side direction in our entry to match the
+       breach path's convention (watchtower.c:479 / .c:975). */
+    tx_buf_t commit;
+    memset(&commit, 0, sizeof(commit));
+    tx_buf_init(&commit, 512);
+    if (!channel_build_commitment_tx_for_remote(ch, &commit, commit_txid_out32)) {
+        tx_buf_free(&commit);
+        return 0;
+    }
+
+    /* Parse commit TX bytes:
+       [nVersion 4][varint n_in=1][input 41][varint n_out][outputs][nLockTime 4]
+       Input: [prev_txid 32][prev_vout 4][scriptSig_len varint=0][nSequence 4]
+       Output: [amount 8][varint spk_len][spk] */
+    if (commit.len < 4 + 1 + 41 + 1 + 4) {
+        tx_buf_free(&commit);
+        return 0;
+    }
+    size_t ofs = 4;             /* skip nVersion */
+    if (commit.data[ofs] != 1) { /* n_inputs varint — commit always 1 */
+        tx_buf_free(&commit);
+        return 0;
+    }
+    ofs += 1 + 41;              /* skip n_inputs + 1 input */
+    if (ofs >= commit.len) {
+        tx_buf_free(&commit);
+        return 0;
+    }
+    uint8_t n_outputs = commit.data[ofs];
+    ofs += 1;
+
+    /* Skip vout 0 (to_local) and vout 1 (to_remote) — both 34-byte P2TR. */
+    for (int v = 0; v < 2 && v < (int)n_outputs; v++) {
+        if (ofs + 9 > commit.len) {
+            tx_buf_free(&commit);
+            return 0;
+        }
+        uint8_t slen = commit.data[ofs + 8];
+        ofs += 8 + 1 + slen;
+    }
+
+    /* Iterate HTLC vouts (2..n_outputs-1) in parallel with ch->htlcs[]
+       active+non-dust entries.  channel_build_commitment_tx_impl iterates
+       ch->htlcs[] in array order — that's the order we replay here. */
+    size_t htlc_idx = 0;
+    size_t n_out = 0;
+    for (size_t v = 2; v < (size_t)n_outputs && n_out < htlcs_max; v++) {
+        /* Advance past inactive/dust HTLCs. */
+        while (htlc_idx < ch->n_htlcs &&
+               (ch->htlcs[htlc_idx].state != HTLC_STATE_ACTIVE ||
+                ch->htlcs[htlc_idx].amount_sats < CHANNEL_DUST_LIMIT_SATS))
+            htlc_idx++;
+        if (htlc_idx >= ch->n_htlcs) break;
+
+        if (ofs + 9 > commit.len) break;
+        uint64_t amount = 0;
+        for (int b = 0; b < 8; b++)
+            amount |= ((uint64_t)commit.data[ofs + b]) << (b * 8);
+        uint8_t slen = commit.data[ofs + 8];
+        if (slen != 34 || ofs + 9 + 34 > commit.len) {
+            ofs += 8 + 1 + slen;
+            htlc_idx++;
+            continue;
+        }
+
+        watchtower_htlc_t *wh = &htlcs_out[n_out];
+        memset(wh, 0, sizeof(*wh));
+        wh->htlc_vout = (uint32_t)v;
+        wh->htlc_amount = amount;
+        memcpy(wh->htlc_spk, &commit.data[ofs + 9], 34);
+        /* LSP-side direction (matches breach-path convention). */
+        wh->direction = ch->htlcs[htlc_idx].direction;
+        memcpy(wh->payment_hash, ch->htlcs[htlc_idx].payment_hash, 32);
+        wh->cltv_expiry = ch->htlcs[htlc_idx].cltv_expiry;
+        n_out++;
+
+        ofs += 8 + 1 + 34;
+        htlc_idx++;
+    }
+
+    tx_buf_free(&commit);
+    *n_htlcs_out = n_out;
     return 1;
 }
 
