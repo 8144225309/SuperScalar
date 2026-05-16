@@ -681,13 +681,37 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
     }
     case BOLT1_MSG_ERROR: { /* error (type 17 / MSG_ERROR) — force-close + watchtower */
         /* Peer is force-closing this channel (BOLT #2 §2.3.1).
-         * Register the channel for HTLC sweep monitoring via the watchtower. */
+         * Register the channel for HTLC sweep monitoring via the watchtower.
+         *
+         * SF-W #148: pre-fix this passed (zero_txid, NULL, 0) — watchtower
+         * registered no HTLCs and returned 0 (no-op).  Now: build the LSP's
+         * view of the peer's commit TX (what the peer will broadcast),
+         * compute its txid, extract HTLC output positions + SPKs, pass to
+         * the watchtower so HTLC sweep can fire on CLTV.  Fallback to the
+         * old behavior (zero txid, empty htlcs) only if commit-TX build
+         * fails — watchtower still gets a placeholder entry. */
         if (d->watchtower && d->peer_channels && peer_idx >= 0) {
             channel_t *fc_ch = d->peer_channels[peer_idx];
             if (fc_ch) {
-                unsigned char zero_txid[32] = {0};
-                watchtower_watch_force_close(d->watchtower, (uint32_t)peer_idx,
-                                             zero_txid, NULL, 0);
+                unsigned char commit_txid[32] = {0};
+                /* CHANNEL_MAX_HTLCS isn't exposed; use the practical bound
+                   that a single commit TX could have a handful of HTLCs.
+                   32 is the BOLT-2 max_accepted_htlcs default ceiling. */
+                watchtower_htlc_t fc_htlcs[32];
+                size_t n_fc_htlcs = 0;
+                int extracted = watchtower_build_force_close_htlcs(
+                    fc_ch, commit_txid, fc_htlcs,
+                    sizeof(fc_htlcs) / sizeof(fc_htlcs[0]),
+                    &n_fc_htlcs);
+                if (!extracted) {
+                    memset(commit_txid, 0, 32);
+                    n_fc_htlcs = 0;
+                }
+                watchtower_watch_force_close(d->watchtower,
+                                              (uint32_t)peer_idx,
+                                              commit_txid,
+                                              n_fc_htlcs > 0 ? fc_htlcs : NULL,
+                                              n_fc_htlcs);
             }
         }
         return MSG_ERROR;
