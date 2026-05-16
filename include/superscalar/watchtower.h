@@ -47,6 +47,16 @@ typedef struct {
     unsigned char to_local_spk[34];
     size_t to_local_spk_len;
 
+    /* v32 (SF-WTC #149): channel CSV delay captured at watchtower-entry
+       registration time.  Pre-fix the CPFP tracking loop (watchtower.c
+       around line 940) read csv_delay from live channel state, gating on
+       `ch != NULL`.  Oracular / standalone watchtowers have ch == NULL,
+       so CPFP-bump escalation was silently skipped.  Persisting csv_delay
+       on the entry lets oracular paths drive CPFP without needing live
+       channel access.  Defaults to 0 = "unset" for older DBs; the CPFP
+       site falls back to `ch->to_self_delay` or CHANNEL_DEFAULT_CSV_DELAY. */
+    uint32_t csv_delay;
+
     /* HTLC outputs on the breached commitment (for penalty sweep) */
     watchtower_htlc_t *htlc_outputs;
     size_t n_htlc_outputs;

@@ -64,10 +64,12 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             uint64_t amounts[WATCHTOWER_MAX_WATCH];
             unsigned char spks[WATCHTOWER_MAX_WATCH][34];
             size_t spk_lens[WATCHTOWER_MAX_WATCH];
+            uint32_t csv_delays[WATCHTOWER_MAX_WATCH];
 
             size_t loaded = persist_load_old_commitments(
                 db, (uint32_t)c, commit_nums, txids, vouts, amounts,
-                spks, spk_lens, wt->entries_cap - wt->n_entries);
+                spks, spk_lens, csv_delays,
+                wt->entries_cap - wt->n_entries);
 
             for (size_t i = 0; i < loaded && wt->n_entries < wt->entries_cap; i++) {
                 watchtower_entry_t *e = &wt->entries[wt->n_entries++];
@@ -83,6 +85,9 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
                 e->to_local_spk_len = spk_lens[i];
+                /* v32 (SF-WTC #149): hydrate csv_delay so oracular CPFP can
+                   read it after restart without live channel state. */
+                e->csv_delay = csv_delays[i];
 
                 /* Re-register the watched script with the chain backend so
                    BIP 158 scanning resumes correctly after a process restart. */
@@ -244,6 +249,10 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->to_local_amount = to_local_amount;
     memcpy(e->to_local_spk, to_local_spk, spk_len);
     e->to_local_spk_len = spk_len;
+    /* v32 (SF-WTC): unset by default; populated post-watch by callers that
+       have live channel access (watchtower_watch_revoked_commitment etc.),
+       or hydrated from DB at restart by persist_load_watchtower_entries. */
+    e->csv_delay = 0;
     e->n_htlc_outputs = 0;
     e->response_tx = NULL;
     e->response_tx_len = 0;
@@ -399,6 +408,16 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 watchtower_watch(wt, channel_id, old_commit_num,
                                    old_txid, 0, old_remote,
                                    to_local_spk, 34);
+
+                /* v32 SF-WTC #149: stamp csv_delay on the entry just registered
+                   (in-memory + DB) so the oracular CPFP path can drive escalation
+                   without needing live channel access at bump time. */
+                if (wt->n_entries > 0) {
+                    wt->entries[wt->n_entries - 1].csv_delay = ch->to_self_delay;
+                    if (wt->db && wt->db->db)
+                        persist_save_old_commitment_csv_delay(
+                            wt->db, channel_id, old_commit_num, ch->to_self_delay);
+                }
 
                 /* #208 A3.1b — pre-build the penalty TX bytes at registration
                    time and attach to the entry we just created.  After this
@@ -925,21 +944,23 @@ int watchtower_check(watchtower_t *wt) {
 
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
-           Skip CPFP tracking at sub-1-sat/vB — no anchor output was created. */
+           Skip CPFP tracking at sub-1-sat/vB — no anchor output was created.
+           SF-WTC #149: dropped `ch &&` gate.  csv_delay now sourced from
+           e->csv_delay (persisted at watch-registration), falling back to
+           live ch->to_self_delay for legacy entries pre v32, and to the
+           hard default if neither is available. */
         uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
-        if (ch && penalty_sent && use_anchor &&
+        if (penalty_sent && use_anchor &&
             wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < wt->pending_cap) {
-            /* CPFP tracking still requires live channel state for csv_delay.
-               TODO A3.1b: persist csv_delay in the watchtower entry at
-               registration time so the oracular path can track CPFP too. */
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             memcpy(p->txid, penalty_txid, 64);
             p->txid[64] = '\0';
             p->anchor_vout = 1;
             p->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
             p->penalty_value = e->to_local_amount;
-            p->csv_delay = ch->to_self_delay;
+            p->csv_delay = (e->csv_delay > 0) ? e->csv_delay
+                          : (ch ? ch->to_self_delay : CHANNEL_DEFAULT_CSV_DELAY);
             p->start_height = cur_height;
             p->cycles_in_mempool = 0;
             memset(&p->fee_bump, 0, sizeof(p->fee_bump));
