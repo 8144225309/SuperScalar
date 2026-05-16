@@ -52,6 +52,11 @@ int persist_in_transaction(const persist_t *p);
    Called by factory_recovery_scan() when all leaf TXs are confirmed. */
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id);
 
+/* SF-WAL #157: force a passive WAL checkpoint so external SQLite readers
+   (dashboard) see committed writes within heartbeat-tick granularity.
+   Best-effort; never blocks. */
+int persist_wal_checkpoint(persist_t *p);
+
 /* Save factory metadata (funding info, participants, step_blocks, etc.).
    factory_id is caller-assigned (typically 0 for single-factory PoC). */
 int persist_save_factory(persist_t *p, const factory_t *f,

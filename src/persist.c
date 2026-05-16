@@ -1365,6 +1365,20 @@ int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
     return rc == SQLITE_DONE ? 1 : 0;
 }
 
+/* SF-WAL #157: force a passive WAL checkpoint so external readers (dashboard)
+   see committed writes within heartbeat granularity instead of waiting for
+   sqlite's autocheckpoint to fire.  PASSIVE mode never blocks writers; it
+   just copies as much WAL as possible to the main DB.  Returns 1 on success,
+   0 if no DB attached.  Safe to call any time. */
+int persist_wal_checkpoint(persist_t *p) {
+    if (!p || !p->db) return 0;
+    /* Best-effort: ignore return code (checkpoint can return SQLITE_BUSY
+       under writer contention; that's fine — next tick will retry). */
+    sqlite3_wal_checkpoint_v2(p->db, NULL, SQLITE_CHECKPOINT_PASSIVE,
+                              NULL, NULL);
+    return 1;
+}
+
 /* Save one PS leaf chain entry (called on each PS leaf advance).
    chain_pos: 0-based position in the chain (equal to old ps_chain_len before advance).
    signed_tx / signed_tx_len: the signed TX being stored.
