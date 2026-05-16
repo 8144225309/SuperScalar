@@ -1694,7 +1694,54 @@ int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
     return 1;
 }
 
+/* When SUPERSCALAR_DUMP_SIGHASH=1 is set in the environment, emit the full
+   per-node signing context to stderr after every factory_sign_all.  Used to
+   pin down #114 (TS-DW-ADVANCE invalid Schnorr sig on testnet4) — the
+   regtest-vs-testnet4 diff has to live in one of these fields, and dumping
+   them is cheaper than another printf bisection round. */
+static void debug_dump_node_signing(const factory_t *f, size_t i,
+                                     const factory_node_t *node,
+                                     const unsigned char *sig64) {
+    const unsigned char *prev_spk = NULL;
+    size_t prev_spk_len = 0;
+    uint64_t prev_amount = 0;
+    if (node->is_ps_leaf && node->ps_chain_len > 0) {
+        size_t vout = (node->type == NODE_PS_SUBFACTORY) ? (node->n_outputs - 1) : 0;
+        prev_spk = node->outputs[vout].script_pubkey;
+        prev_spk_len = node->outputs[vout].script_pubkey_len;
+        prev_amount = node->ps_prev_chan_amount;
+    } else if (node->parent_index < 0) {
+        prev_spk = f->funding_spk;
+        prev_spk_len = f->funding_spk_len;
+        prev_amount = f->funding_amount_sats;
+    } else {
+        const factory_node_t *parent = &f->nodes[node->parent_index];
+        prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+        prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+        prev_amount = parent->outputs[node->parent_vout].amount_sats;
+    }
+    fprintf(stderr, "[DUMP_SIGHASH] node=%zu parent=%d/%u nseq=0x%08x "
+            "prev_amount=%llu prev_spk_len=%zu prev_spk=",
+            i, node->parent_index, node->parent_vout, node->nsequence,
+            (unsigned long long)prev_amount, prev_spk_len);
+    for (size_t b = 0; b < prev_spk_len; b++)
+        fprintf(stderr, "%02x", prev_spk[b]);
+    fprintf(stderr, " sig=");
+    for (size_t b = 0; b < 64; b++) fprintf(stderr, "%02x", sig64[b]);
+    fprintf(stderr, " unsigned_tx_len=%zu unsigned_tx=", node->unsigned_tx.len);
+    for (size_t b = 0; b < node->unsigned_tx.len; b++)
+        fprintf(stderr, "%02x", node->unsigned_tx.data[b]);
+    fprintf(stderr, " signed_tx_len=%zu signed_tx=", node->signed_tx.len);
+    for (size_t b = 0; b < node->signed_tx.len; b++)
+        fprintf(stderr, "%02x", node->signed_tx.data[b]);
+    fprintf(stderr, "\n");
+}
+
 int factory_sessions_complete(factory_t *f) {
+    static int dump_enabled = -1;
+    if (dump_enabled < 0)
+        dump_enabled = (getenv("SUPERSCALAR_DUMP_SIGHASH") != NULL) ? 1 : 0;
+
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
 
@@ -1712,6 +1759,9 @@ int factory_sessions_complete(factory_t *f) {
             return 0;
 
         node->is_signed = 1;
+
+        if (dump_enabled)
+            debug_dump_node_signing(f, i, node, sig);
     }
     return 1;
 }
