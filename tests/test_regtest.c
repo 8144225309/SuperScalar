@@ -23,6 +23,17 @@ extern void reverse_bytes(unsigned char *data, size_t len);
     } \
 } while(0)
 
+/* Same as TEST_ASSERT but jumps to a 'fail' label so the caller can run
+   cleanup before returning.  Used by tests that allocate heap resources
+   (factory_t, snapshot hex buffers) which the early-return TEST_ASSERT
+   would leak.  Fix for #140 (test_regtest_ps_*_close 24.6 MB leak). */
+#define TEST_ASSERT_GOTO(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        goto fail; \
+    } \
+} while(0)
+
 static const unsigned char lsp_seckey[32] = {
     0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
     0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
@@ -1577,11 +1588,13 @@ static int ps_publish_backbone(regtest_t *rt, factory_t *f,
 int test_regtest_ps_basic_close(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    factory_t *f = NULL;
+    int rc = 0;
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  SKIP: bitcoind not available\n");
-        secp256k1_context_destroy(ctx);
-        return 1;  /* soft-skip so CI doesn't fail without regtest */
+        rc = 1;  /* soft-skip so CI doesn't fail without regtest */
+        goto fail;
     }
     regtest_create_wallet(&rt, "ps_basic");
     char mine_addr[128];
@@ -1589,38 +1602,40 @@ int test_regtest_ps_basic_close(void) {
     if (!regtest_fund_from_faucet(&rt, 1.0))
         regtest_mine_blocks(&rt, 101, mine_addr);
 
-    factory_t *f = calloc(1, sizeof(factory_t));
-    TEST_ASSERT(f, "alloc factory");
+    f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];
-    TEST_ASSERT(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
+    TEST_ASSERT_GOTO(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
                 "fund PS factory");
 
     /* Publish backbone then initial PS leaf state (chain_pos=0). */
-    TEST_ASSERT(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
+    TEST_ASSERT_GOTO(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
 
     size_t leaf_st = f->leaf_node_indices[0];
     char leaf_txid[65];
-    TEST_ASSERT(ps_bcast_node(&rt, f, leaf_st, leaf_txid), "PS state[0] broadcast");
+    TEST_ASSERT_GOTO(ps_bcast_node(&rt, f, leaf_st, leaf_txid),
+                "PS state[0] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  PS leaf state[0] confirmed: %s\n", leaf_txid);
 
     int conf = regtest_get_confirmations(&rt, leaf_txid);
-    TEST_ASSERT(conf > 0, "PS leaf state[0] on-chain");
+    TEST_ASSERT_GOTO(conf > 0, "PS leaf state[0] on-chain");
 
     /* Verify the channel output (vout 0) exists with expected amount. */
     uint64_t chan_amt = 0;
     unsigned char chan_spk[34]; size_t chan_spk_len = 0;
-    TEST_ASSERT(regtest_get_tx_output(&rt, leaf_txid, 0,
+    TEST_ASSERT_GOTO(regtest_get_tx_output(&rt, leaf_txid, 0,
                                       &chan_amt, chan_spk, &chan_spk_len),
                 "channel output exists");
-    TEST_ASSERT(chan_spk_len == 34, "channel output is P2TR");
+    TEST_ASSERT_GOTO(chan_spk_len == 34, "channel output is P2TR");
     printf("  Channel output: %lu sats  confirmations=%d\n",
            (unsigned long)chan_amt, conf);
-
-    factory_free(f); free(f);
+    rc = 1;
+fail:
+    if (f) { factory_free(f); free(f); }
     secp256k1_context_destroy(ctx);
-    return 1;
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1632,11 +1647,15 @@ int test_regtest_ps_basic_close(void) {
 int test_regtest_ps_chain_close(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    factory_t *f = NULL;
+    char *chain0_hex = NULL;
+    char *chain1_hex = NULL;
+    int rc = 0;
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  SKIP: bitcoind not available\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
+        rc = 1;
+        goto fail;
     }
     regtest_create_wallet(&rt, "ps_chain");
     char mine_addr[128];
@@ -1644,70 +1663,78 @@ int test_regtest_ps_chain_close(void) {
     if (!regtest_fund_from_faucet(&rt, 1.0))
         regtest_mine_blocks(&rt, 101, mine_addr);
 
-    factory_t *f = calloc(1, sizeof(factory_t));
-    TEST_ASSERT(f, "alloc factory");
+    f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];
-    TEST_ASSERT(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
+    TEST_ASSERT_GOTO(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
                 "fund PS factory");
 
     /* Snapshot chain_pos=0 before advancing. */
-    char *chain0_hex = ps_snap_leaf(f, 0);
-    TEST_ASSERT(chain0_hex, "snapshot chain[0]");
+    chain0_hex = ps_snap_leaf(f, 0);
+    TEST_ASSERT_GOTO(chain0_hex, "snapshot chain[0]");
 
     /* Capture initial channel amount before any advance. */
     size_t leaf_st0 = f->leaf_node_indices[0];
     uint64_t initial_channel = f->nodes[leaf_st0].outputs[0].amount_sats;
 
     /* Advance once → chain_pos=1. */
-    TEST_ASSERT(factory_advance_leaf(f, 0), "advance to chain[1]");
-    char *chain1_hex = ps_snap_leaf(f, 0);
-    TEST_ASSERT(chain1_hex, "snapshot chain[1]");
+    TEST_ASSERT_GOTO(factory_advance_leaf(f, 0), "advance to chain[1]");
+    chain1_hex = ps_snap_leaf(f, 0);
+    TEST_ASSERT_GOTO(chain1_hex, "snapshot chain[1]");
 
     /* Advance again → chain_pos=2 (latest, stays in f->nodes). */
-    TEST_ASSERT(factory_advance_leaf(f, 0), "advance to chain[2]");
+    TEST_ASSERT_GOTO(factory_advance_leaf(f, 0), "advance to chain[2]");
     printf("  PS leaf advanced to chain_pos=%d\n",
            f->nodes[f->leaf_node_indices[0]].ps_chain_len);
 
     /* Publish backbone (root KO, root state, leaf KO). */
-    TEST_ASSERT(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
+    TEST_ASSERT_GOTO(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
 
     /* Broadcast chain[0] (initial leaf state, spends leaf KO). */
     char c0_txid[65], c1_txid[65];
-    TEST_ASSERT(regtest_send_raw_tx(&rt, chain0_hex, c0_txid), "chain[0] broadcast");
+    TEST_ASSERT_GOTO(regtest_send_raw_tx(&rt, chain0_hex, c0_txid),
+                "chain[0] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[0] confirmed: %s\n", c0_txid);
-    TEST_ASSERT(regtest_get_confirmations(&rt, c0_txid) > 0, "chain[0] on-chain");
+    TEST_ASSERT_GOTO(regtest_get_confirmations(&rt, c0_txid) > 0,
+                "chain[0] on-chain");
 
     /* Broadcast chain[1] (spends chain[0] vout 0). */
-    TEST_ASSERT(regtest_send_raw_tx(&rt, chain1_hex, c1_txid), "chain[1] broadcast");
+    TEST_ASSERT_GOTO(regtest_send_raw_tx(&rt, chain1_hex, c1_txid),
+                "chain[1] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[1] confirmed: %s\n", c1_txid);
-    TEST_ASSERT(regtest_get_confirmations(&rt, c1_txid) > 0, "chain[1] on-chain");
+    TEST_ASSERT_GOTO(regtest_get_confirmations(&rt, c1_txid) > 0,
+                "chain[1] on-chain");
 
     /* Broadcast chain[2] (latest, spends chain[1] vout 0). */
     char c2_bcast_txid[65];
-    TEST_ASSERT(ps_bcast_node(&rt, f, f->leaf_node_indices[0], c2_bcast_txid),
+    TEST_ASSERT_GOTO(ps_bcast_node(&rt, f, f->leaf_node_indices[0], c2_bcast_txid),
                 "chain[2] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[2] confirmed: %s\n", c2_bcast_txid);
-    TEST_ASSERT(regtest_get_confirmations(&rt, c2_bcast_txid) > 0, "chain[2] on-chain");
+    TEST_ASSERT_GOTO(regtest_get_confirmations(&rt, c2_bcast_txid) > 0,
+                "chain[2] on-chain");
 
     /* Verify the final channel output (vout 0) carries the correct amount. */
     uint64_t final_amt = 0; unsigned char final_spk[34]; size_t fsl = 0;
-    TEST_ASSERT(regtest_get_tx_output(&rt, c2_bcast_txid, 0,
+    TEST_ASSERT_GOTO(regtest_get_tx_output(&rt, c2_bcast_txid, 0,
                                       &final_amt, final_spk, &fsl),
                 "chain[2] channel output exists");
     uint64_t expected_amt = initial_channel - 2 * f->fee_per_tx;
     printf("  Final channel output: %lu sats  expected=%lu  P2TR=%d\n",
            (unsigned long)final_amt, (unsigned long)expected_amt, fsl == 34);
-    TEST_ASSERT(fsl == 34, "final output is P2TR");
-    TEST_ASSERT(final_amt == expected_amt, "chain[2] amount = initial_channel - 2*fee");
-
-    free(chain0_hex); free(chain1_hex);
-    factory_free(f); free(f);
+    TEST_ASSERT_GOTO(fsl == 34, "final output is P2TR");
+    TEST_ASSERT_GOTO(final_amt == expected_amt,
+                "chain[2] amount = initial_channel - 2*fee");
+    rc = 1;
+fail:
+    free(chain0_hex);
+    free(chain1_hex);
+    if (f) { factory_free(f); free(f); }
     secp256k1_context_destroy(ctx);
-    return 1;
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1724,11 +1751,15 @@ int test_regtest_ps_chain_close(void) {
 int test_regtest_ps_old_state_response(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    factory_t *f = NULL;
+    char *chain0_hex = NULL;
+    char *chain1_hex = NULL;
+    int rc = 0;
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  SKIP: bitcoind not available\n");
-        secp256k1_context_destroy(ctx);
-        return 1;
+        rc = 1;
+        goto fail;
     }
     regtest_create_wallet(&rt, "ps_recovery");
     char mine_addr[128];
@@ -1736,59 +1767,61 @@ int test_regtest_ps_old_state_response(void) {
     if (!regtest_fund_from_faucet(&rt, 1.0))
         regtest_mine_blocks(&rt, 101, mine_addr);
 
-    factory_t *f = calloc(1, sizeof(factory_t));
-    TEST_ASSERT(f, "alloc factory");
+    f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];
-    TEST_ASSERT(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
+    TEST_ASSERT_GOTO(ps_fund_factory(&rt, ctx, f, kps, mine_addr, fund_txid),
                 "fund PS factory");
 
     /* Snapshot chain_pos=0 before any advance. */
-    char *chain0_hex = ps_snap_leaf(f, 0);
-    TEST_ASSERT(chain0_hex, "snapshot chain[0]");
+    chain0_hex = ps_snap_leaf(f, 0);
+    TEST_ASSERT_GOTO(chain0_hex, "snapshot chain[0]");
 
     /* First advance → chain_pos=1 (this is the "old" state the attacker publishes). */
-    TEST_ASSERT(factory_advance_leaf(f, 0), "advance to chain[1]");
-    char *chain1_hex = ps_snap_leaf(f, 0);
-    TEST_ASSERT(chain1_hex, "snapshot chain[1]");
+    TEST_ASSERT_GOTO(factory_advance_leaf(f, 0), "advance to chain[1]");
+    chain1_hex = ps_snap_leaf(f, 0);
+    TEST_ASSERT_GOTO(chain1_hex, "snapshot chain[1]");
 
     /* Second advance → chain_pos=2 (latest, honest party's state). */
-    TEST_ASSERT(factory_advance_leaf(f, 0), "advance to chain[2]");
+    TEST_ASSERT_GOTO(factory_advance_leaf(f, 0), "advance to chain[2]");
 
     /* Publish factory backbone. */
-    TEST_ASSERT(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
+    TEST_ASSERT_GOTO(ps_publish_backbone(&rt, f, 0, mine_addr), "backbone");
 
     /* Both parties broadcast chain[0] (required to unlock chain[1]). */
     char c0_txid[65];
-    TEST_ASSERT(regtest_send_raw_tx(&rt, chain0_hex, c0_txid), "chain[0] broadcast");
+    TEST_ASSERT_GOTO(regtest_send_raw_tx(&rt, chain0_hex, c0_txid),
+                "chain[0] broadcast");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[0] confirmed: %s\n", c0_txid);
 
     /* ATTACKER publishes chain[1] (intermediate/old state, not the latest). */
     char c1_txid[65];
-    TEST_ASSERT(regtest_send_raw_tx(&rt, chain1_hex, c1_txid),
+    TEST_ASSERT_GOTO(regtest_send_raw_tx(&rt, chain1_hex, c1_txid),
                 "attacker broadcasts chain[1]");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[1] confirmed (attacker published old state): %s\n", c1_txid);
-    TEST_ASSERT(regtest_get_confirmations(&rt, c1_txid) > 0, "chain[1] on-chain");
+    TEST_ASSERT_GOTO(regtest_get_confirmations(&rt, c1_txid) > 0,
+                "chain[1] on-chain");
 
     /* HONEST PARTY responds: broadcasts chain[2] spending chain[1]'s output.
        Unlike DW, this is NOT a double-spend — chain[2] spends chain[1]'s
        channel output (vout 0), which is now a fresh UTXO on the blockchain. */
     char c2_txid[65];
-    TEST_ASSERT(ps_bcast_node(&rt, f, f->leaf_node_indices[0], c2_txid),
+    TEST_ASSERT_GOTO(ps_bcast_node(&rt, f, f->leaf_node_indices[0], c2_txid),
                 "honest party broadcasts chain[2]");
     regtest_mine_blocks(&rt, 1, mine_addr);
     printf("  chain[2] confirmed (honest party recovered latest state): %s\n",
            c2_txid);
-    TEST_ASSERT(regtest_get_confirmations(&rt, c2_txid) > 0,
+    TEST_ASSERT_GOTO(regtest_get_confirmations(&rt, c2_txid) > 0,
                 "chain[2] on-chain — honest party wins");
 
     /* Verify chain[2]'s channel output (vout 0) exists — these are the correct funds. */
     uint64_t final_amt = 0; unsigned char spk[34]; size_t sl = 0;
-    TEST_ASSERT(regtest_get_tx_output(&rt, c2_txid, 0, &final_amt, spk, &sl),
+    TEST_ASSERT_GOTO(regtest_get_tx_output(&rt, c2_txid, 0, &final_amt, spk, &sl),
                 "chain[2] channel output");
-    TEST_ASSERT(sl == 34, "P2TR channel output");
+    TEST_ASSERT_GOTO(sl == 34, "P2TR channel output");
     printf("  Honest party holds channel output: %lu sats\n",
            (unsigned long)final_amt);
 
@@ -1798,9 +1831,11 @@ int test_regtest_ps_old_state_response(void) {
        vout 0 was correctly identified as the input. */
     printf("  PS security verified: old-state publication enables honest-party recovery\n");
     printf("  (Unlike DW: no double-spend trap; attacker cannot steal funds)\n");
-
-    free(chain0_hex); free(chain1_hex);
-    factory_free(f); free(f);
+    rc = 1;
+fail:
+    free(chain0_hex);
+    free(chain1_hex);
+    if (f) { factory_free(f); free(f); }
     secp256k1_context_destroy(ctx);
-    return 1;
+    return rc;
 }
