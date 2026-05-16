@@ -2446,6 +2446,21 @@ int factory_subfactory_chain_advance_unsigned(
     return 1;
 }
 
+int factory_reset_all_subfactory_chains(factory_t *f) {
+    if (!f) return 0;
+    int n_reset = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->type != NODE_PS_SUBFACTORY) continue;
+        if (node->ps_chain_len == 0) continue;
+        node->ps_chain_len = 0;
+        node->ps_n_prev_outputs = 0;
+        memset(node->ps_prev_txid, 0, 32);
+        n_reset++;
+    }
+    return n_reset;
+}
+
 /* --- Per-node split-round signing helpers --- */
 
 int factory_session_init_node(factory_t *f, size_t node_idx) {
