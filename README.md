@@ -1,6 +1,6 @@
 # SuperScalar
 
-[![CI](https://github.com/8144225309/SuperScalar/workflows/CI/badge.svg)](https://github.com/8144225309/SuperScalar/actions)
+[![CI](https://github.com/8144225309/SuperScalar/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/8144225309/SuperScalar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/8144225309/SuperScalar)](https://github.com/8144225309/SuperScalar/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
