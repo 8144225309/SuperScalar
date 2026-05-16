@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 31
+#define PERSIST_SCHEMA_VERSION 32
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
@@ -336,7 +336,16 @@ int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
                                   const unsigned char *to_local_spk,
                                   size_t spk_len);
 
-/* Load old commitments for a channel. Returns count loaded. */
+/* v32 (SF-WTC #149): stamp csv_delay on an existing old_commitments row.
+   Called from watchtower_watch_revoked_commitment (where ch->to_self_delay
+   is in scope) immediately after persist_save_old_commitment.  Lets the
+   oracular CPFP escalation read csv_delay back without live channel state. */
+int persist_save_old_commitment_csv_delay(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t csv_delay);
+
+/* Load old commitments for a channel. Returns count loaded.
+   csv_delays parameter (v32+) may be NULL for legacy callers; 0 = unset. */
 size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       uint64_t *commit_nums,
                                       unsigned char (*txids)[32],
@@ -344,6 +353,7 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       uint64_t *amounts,
                                       unsigned char (*spks)[34],
                                       size_t *spk_lens,
+                                      uint32_t *csv_delays,
                                       size_t max_entries);
 
 /* --- Pre-signed penalty TX persistence (v25) ---

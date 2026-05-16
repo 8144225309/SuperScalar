@@ -815,7 +815,7 @@ int test_persist_old_commitments(void) {
     size_t spk_lens[16];
 
     size_t count = persist_load_old_commitments(&db, 0, commit_nums,
-        loaded_txids, vouts, amounts, loaded_spks, spk_lens, 16);
+        loaded_txids, vouts, amounts, loaded_spks, spk_lens, NULL, 16);
     TEST_ASSERT_EQ(count, 2, "loaded 2 entries");
     TEST_ASSERT_EQ(commit_nums[0], 5, "commit_num 0");
     TEST_ASSERT_EQ(commit_nums[1], 6, "commit_num 1");
@@ -828,7 +828,7 @@ int test_persist_old_commitments(void) {
 
     /* Load for different channel — should be empty */
     count = persist_load_old_commitments(&db, 1, commit_nums,
-        loaded_txids, vouts, amounts, loaded_spks, spk_lens, 16);
+        loaded_txids, vouts, amounts, loaded_spks, spk_lens, NULL, 16);
     TEST_ASSERT_EQ(count, 0, "no entries for channel 1");
 
     persist_close(&db);

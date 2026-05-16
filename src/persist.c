@@ -98,6 +98,10 @@ static const char *SCHEMA_SQL =
        time so the watchtower can broadcast after a process restart.
        Default '' (empty) preserves legacy lazy-build fallback. */
     "  signed_penalty_tx_hex TEXT NOT NULL DEFAULT '',"
+    /* v32 (SF-WTC #149): channel CSV delay captured at entry registration.
+       Lets the oracular CPFP path drive fee escalation without needing
+       live channel state.  0 = unset (legacy entries) → caller falls back. */
+    "  csv_delay INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (channel_id, commit_num)"
     ");"
     "CREATE TABLE IF NOT EXISTS old_commitment_htlcs ("
@@ -1163,6 +1167,17 @@ int persist_open(persist_t *p, const char *path) {
     if (db_version < 31) {
         sqlite3_exec(p->db,
             "ALTER TABLE channels ADD COLUMN funding_pending_reorg "
+            "INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
+    /* v32 (SF-WTC #149): persist channel CSV delay on watchtower entries so
+       the oracular CPFP escalation path can compute deadlines without live
+       channel access.  0 = unset (legacy) → caller falls back to ch state
+       or CHANNEL_DEFAULT_CSV_DELAY. */
+    if (db_version < 32) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE old_commitments ADD COLUMN csv_delay "
             "INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
     }
@@ -2744,6 +2759,9 @@ int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
     hex_encode(txid32, 32, txid_hex);
     hex_encode(to_local_spk, spk_len, spk_hex);
 
+    /* csv_delay defaults to 0 here (= unset).  Stamping with the live
+       channel value happens via persist_save_old_commitment_csv_delay
+       from the caller that has channel context (#149). */
     const char *sql =
         "INSERT OR REPLACE INTO old_commitments "
         "(channel_id, commit_num, txid, to_local_vout, to_local_amount, to_local_spk) "
@@ -2765,6 +2783,32 @@ int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+/* v32 (SF-WTC #149): update only the csv_delay column on an existing
+   old_commitments row.  Called from watchtower_watch_revoked_commitment
+   right after the row is inserted so the oracular CPFP path can read it
+   back without live channel state. */
+int persist_save_old_commitment_csv_delay(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t csv_delay) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "UPDATE old_commitments SET csv_delay = ? "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)csv_delay);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)commit_num);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       uint64_t *commit_nums,
                                       unsigned char (*txids)[32],
@@ -2772,11 +2816,13 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       uint64_t *amounts,
                                       unsigned char (*spks)[34],
                                       size_t *spk_lens,
+                                      uint32_t *csv_delays,
                                       size_t max_entries) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT commit_num, txid, to_local_vout, to_local_amount, to_local_spk "
+        "SELECT commit_num, txid, to_local_vout, to_local_amount, to_local_spk, "
+        "       csv_delay "
         "FROM old_commitments WHERE channel_id = ? ORDER BY commit_num ASC;";
 
     sqlite3_stmt *stmt;
@@ -2805,6 +2851,10 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
             int decoded = hex_decode(spk_hex_str, spks[count], 34);
             spk_lens[count] = decoded > 0 ? (size_t)decoded : 0;
         }
+
+        /* v32 (SF-WTC): csv_delay column; 0 means unset on legacy entries. */
+        if (csv_delays)
+            csv_delays[count] = (uint32_t)sqlite3_column_int(stmt, 5);
 
         count++;
     }
