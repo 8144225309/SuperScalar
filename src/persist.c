@@ -54,7 +54,13 @@ static const char *SCHEMA_SQL =
     "  commitment_number INTEGER DEFAULT 0,"
     "  funding_txid TEXT,"
     "  funding_vout INTEGER,"
-    "  state TEXT DEFAULT 'open'"
+    "  state TEXT DEFAULT 'open',"
+    /* v31: R5 funding_pending_reorg.  1 when revalidate_funding observed
+       that the funding TX is no longer on chain — channel is FROZEN until
+       the funding comes back.  Persisted so an LSP restart mid-reorg
+       reloads the frozen state instead of re-allowing add_htlc on a UTXO
+       bitcoind no longer knows about. */
+    "  funding_pending_reorg INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS revocation_secrets ("
     "  channel_id INTEGER NOT NULL,"
@@ -1150,6 +1156,17 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v31 (R5 follow-up): persist channel funding_pending_reorg across LSP
+       restart.  Without this column, an LSP that restarts mid-reorg would
+       come back with the in-memory flag cleared (default 0) and re-accept
+       add_htlc on a funding UTXO that bitcoind no longer knows about. */
+    if (db_version < 31) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE channels ADD COLUMN funding_pending_reorg "
+            "INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -2172,8 +2189,9 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
         "INSERT OR REPLACE INTO channels "
         "(id, factory_id, slot, local_amount, remote_amount, funding_amount, "
         " commitment_number, funding_txid, funding_vout, state, "
-        " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?);";
+        " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
+        " funding_pending_reorg) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2191,6 +2209,7 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int(stmt, 10, (int)ch->to_self_delay);
     sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
     sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
+    sqlite3_bind_int(stmt, 13, ch->funding_pending_reorg);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2235,6 +2254,25 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return 1;
+}
+
+int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                            int funding_pending_reorg) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "UPDATE channels SET funding_pending_reorg = ? WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, funding_pending_reorg);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
@@ -4260,11 +4298,14 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
     out_ch->remote_amount = remote_amt;
     out_ch->commitment_number = cn;
 
-    /* Load per-channel config (to_self_delay, fee_rate, use_revocation_leaf).
-       Schema v18 added these columns; older DBs get the migration defaults. */
+    /* Load per-channel config (to_self_delay, fee_rate, use_revocation_leaf,
+       funding_pending_reorg).  Schema v18 added the first three; v31 added
+       the reorg flag.  Older DBs get the migration defaults (all zero/
+       sentinel). */
     {
         const char *cfg_sql =
-            "SELECT to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf "
+            "SELECT to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
+            "       funding_pending_reorg "
             "FROM channels WHERE id = ?;";
         sqlite3_stmt *cfg_stmt;
         if (sqlite3_prepare_v2(p->db, cfg_sql, -1, &cfg_stmt, NULL) == SQLITE_OK) {
@@ -4273,16 +4314,19 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
                 out_ch->to_self_delay = (uint32_t)sqlite3_column_int(cfg_stmt, 0);
                 out_ch->fee_rate_sat_per_kvb = (uint64_t)sqlite3_column_int64(cfg_stmt, 1);
                 out_ch->use_revocation_leaf = sqlite3_column_int(cfg_stmt, 2);
+                out_ch->funding_pending_reorg = sqlite3_column_int(cfg_stmt, 3);
             } else {
                 out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
                 out_ch->fee_rate_sat_per_kvb = 1000;
                 out_ch->use_revocation_leaf = 0;
+                out_ch->funding_pending_reorg = 0;
             }
             sqlite3_finalize(cfg_stmt);
         } else {
             out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
             out_ch->fee_rate_sat_per_kvb = 1000;
             out_ch->use_revocation_leaf = 0;
+            out_ch->funding_pending_reorg = 0;
         }
     }
 
