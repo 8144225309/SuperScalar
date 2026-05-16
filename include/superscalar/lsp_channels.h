@@ -159,8 +159,11 @@ typedef struct {
     time_t last_heartbeat;              /* timestamp of last heartbeat output */
     time_t daemon_start_time;           /* timestamp when daemon loop started */
 
-    /* Reorg detection (height decrease → stale cached state) */
+    /* Reorg detection (R1).  height_regress is the simplest case; the tip
+       hash catches same-height and forward reorgs that height-only checks
+       miss (mainnet pre-flight). */
     int32_t last_known_height;          /* highest block height ever observed */
+    char    last_known_tip_hash[65];    /* best-block hash @ last_known_height */
 
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */

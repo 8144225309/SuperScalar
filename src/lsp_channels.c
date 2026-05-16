@@ -5706,20 +5706,64 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    watchtower_check is deferred to once per 60s (below). */
                 if (mgr->watchtower && mgr->watchtower->rt) {
                     int height = regtest_get_block_height(mgr->watchtower->rt);
-                /* Reorg detection: height decreased since last check */
+                /* Reorg detection (R1): catches three kinds of reorg the daemon
+                   must react to.  Tracking just height — the prior implementation
+                   — missed (2) and (3), which are the common cases when a
+                   competing chain wins.
+                     1. HEIGHT_REGRESSION: tip went backward.
+                     2. SAME_HEIGHT:       tip stayed at last height but hash changed.
+                     3. FORWARD_REORG:     tip advanced but the block we knew at
+                                           last_height is no longer canonical —
+                                           a fork beneath our last tip became active. */
                 {
                     static int32_t daemon_last_height = 0;
+                    static char    daemon_last_tip_hash[65] = {0};
+                    char cur_tip_hash[65] = {0};
+                    regtest_get_best_block_hash(mgr->watchtower->rt, cur_tip_hash);
+
+                    int reorg_kind = 0;
+                    const char *reorg_kind_str = "";
                     if (daemon_last_height > 0 && height > 0 &&
                         height < daemon_last_height) {
-                        fprintf(stderr, "LSP: REORG detected — height %d → %d "
-                                "(depth %d)\n", daemon_last_height, height,
-                                daemon_last_height - height);
+                        reorg_kind = 1;
+                        reorg_kind_str = "HEIGHT_REGRESSION";
+                    } else if (daemon_last_height > 0 && height == daemon_last_height &&
+                               daemon_last_tip_hash[0] && cur_tip_hash[0] &&
+                               strcmp(cur_tip_hash, daemon_last_tip_hash) != 0) {
+                        reorg_kind = 2;
+                        reorg_kind_str = "SAME_HEIGHT";
+                    } else if (daemon_last_height > 0 && height > daemon_last_height &&
+                               daemon_last_tip_hash[0]) {
+                        char prev_hash_now[65] = {0};
+                        if (regtest_get_block_hash(mgr->watchtower->rt,
+                                                    daemon_last_height,
+                                                    prev_hash_now,
+                                                    sizeof(prev_hash_now)) &&
+                            prev_hash_now[0] &&
+                            strcmp(prev_hash_now, daemon_last_tip_hash) != 0) {
+                            reorg_kind = 3;
+                            reorg_kind_str = "FORWARD_REORG";
+                        }
+                    }
+
+                    if (reorg_kind) {
+                        int depth_proxy = (reorg_kind == 1)
+                            ? (daemon_last_height - height) : 0;
+                        fprintf(stderr, "LSP: REORG detected (%s) — "
+                                "height %d → %d (depth %d) hash %.16s → %.16s\n",
+                                reorg_kind_str, daemon_last_height, height,
+                                depth_proxy,
+                                daemon_last_tip_hash[0] ? daemon_last_tip_hash : "?",
+                                cur_tip_hash[0] ? cur_tip_hash : "?");
                         /* CL6: persist reorg event for test evidence */
                         if (mgr->persist) {
-                            char det[128];
-                            snprintf(det, sizeof(det), "height_%d->%d depth_%d",
+                            char det[256];
+                            snprintf(det, sizeof(det),
+                                     "%s height_%d->%d hash_%.16s->%.16s",
+                                     reorg_kind_str,
                                      daemon_last_height, height,
-                                     daemon_last_height - height);
+                                     daemon_last_tip_hash[0] ? daemon_last_tip_hash : "?",
+                                     cur_tip_hash[0] ? cur_tip_hash : "?");
                             persist_log_broadcast((persist_t *)mgr->persist,
                                                    "", "reorg_detected",
                                                    det, "ok");
@@ -5737,6 +5781,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                     }
                     if (height > 0) daemon_last_height = height;
+                    if (cur_tip_hash[0]) memcpy(daemon_last_tip_hash, cur_tip_hash, 65);
                 }
                 if (height > 0) {
                     for (size_t c = 0; c < mgr->n_channels; c++) {
@@ -6231,18 +6276,59 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     const char *fstate_str = "?";
                     if (mgr->watchtower && mgr->watchtower->rt) {
                         hb_height = regtest_get_block_height(mgr->watchtower->rt);
-                        /* Reorg detection: tip decreased since last check */
+                        /* Reorg detection (R1): same three-kind scheme as the
+                           main loop's check above — height-regress, same-height,
+                           and forward-reorg.  Uses mgr->last_known_tip_hash to
+                           catch the latter two (mainnet pre-flight). */
+                        char hb_cur_hash[65] = {0};
+                        regtest_get_best_block_hash(mgr->watchtower->rt, hb_cur_hash);
+
+                        int hb_reorg_kind = 0;
+                        const char *hb_reorg_str = "";
                         if (mgr->last_known_height > 0 && hb_height > 0 &&
                             hb_height < mgr->last_known_height) {
-                            int depth = mgr->last_known_height - hb_height;
+                            hb_reorg_kind = 1;
+                            hb_reorg_str = "HEIGHT_REGRESSION";
+                        } else if (mgr->last_known_height > 0 &&
+                                   hb_height == mgr->last_known_height &&
+                                   mgr->last_known_tip_hash[0] && hb_cur_hash[0] &&
+                                   strcmp(hb_cur_hash, mgr->last_known_tip_hash) != 0) {
+                            hb_reorg_kind = 2;
+                            hb_reorg_str = "SAME_HEIGHT";
+                        } else if (mgr->last_known_height > 0 &&
+                                   hb_height > mgr->last_known_height &&
+                                   mgr->last_known_tip_hash[0]) {
+                            char hb_prev_now[65] = {0};
+                            if (regtest_get_block_hash(mgr->watchtower->rt,
+                                                        mgr->last_known_height,
+                                                        hb_prev_now,
+                                                        sizeof(hb_prev_now)) &&
+                                hb_prev_now[0] &&
+                                strcmp(hb_prev_now, mgr->last_known_tip_hash) != 0) {
+                                hb_reorg_kind = 3;
+                                hb_reorg_str = "FORWARD_REORG";
+                            }
+                        }
+
+                        if (hb_reorg_kind) {
+                            int depth_proxy = (hb_reorg_kind == 1)
+                                ? (mgr->last_known_height - hb_height) : 0;
                             fprintf(stderr,
-                                "ALERT: chain reorg detected (tip %d → %d, depth %d)\n",
-                                mgr->last_known_height, hb_height, depth);
+                                "ALERT: chain reorg detected (%s) tip %d → %d "
+                                "(depth %d) hash %.16s → %.16s\n",
+                                hb_reorg_str, mgr->last_known_height, hb_height,
+                                depth_proxy,
+                                mgr->last_known_tip_hash[0] ? mgr->last_known_tip_hash : "?",
+                                hb_cur_hash[0] ? hb_cur_hash : "?");
                             /* CL6: persist reorg event for test evidence */
                             if (mgr->persist) {
-                                char det[128];
-                                snprintf(det, sizeof(det), "height_%d->%d depth_%d",
-                                         mgr->last_known_height, hb_height, depth);
+                                char det[256];
+                                snprintf(det, sizeof(det),
+                                         "%s height_%d->%d hash_%.16s->%.16s",
+                                         hb_reorg_str,
+                                         mgr->last_known_height, hb_height,
+                                         mgr->last_known_tip_hash[0] ? mgr->last_known_tip_hash : "?",
+                                         hb_cur_hash[0] ? hb_cur_hash : "?");
                                 persist_log_broadcast((persist_t *)mgr->persist,
                                                        "", "reorg_detected",
                                                        det, "ok");
@@ -6255,6 +6341,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                         if (hb_height > mgr->last_known_height)
                             mgr->last_known_height = hb_height;
+                        if (hb_cur_hash[0])
+                            memcpy(mgr->last_known_tip_hash, hb_cur_hash, 65);
                         factory_state_t fs = factory_get_state(
                             &lsp->factory, (uint32_t)hb_height);
                         fstate_str = (fs == FACTORY_ACTIVE) ? "ACTIVE" :
