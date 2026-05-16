@@ -294,11 +294,28 @@ def collect_databases(cfg):
             "commitment_number, created_at, target_factory_id "
             "FROM jit_channels ORDER BY jit_channel_id")
         data[label]["jit_channels"] = rows if not err else []
-        # Broadcast log — TX broadcast history for operators
+        # Broadcast log — TX broadcast history for operators.
+        # LIMIT 200: a 16-client force-close broadcasts ~62 tree TXes plus
+        # funding + close + sweeps, which the prior LIMIT 50 truncated on
+        # the funding-end (so the Events derivation lost the "Factory funded"
+        # bookend).  200 matches the wire_messages limit used elsewhere.
         rows, err = query_db(path,
             "SELECT id, txid, source, result, broadcast_time "
-            "FROM broadcast_log ORDER BY id DESC LIMIT 50")
+            "FROM broadcast_log ORDER BY id DESC LIMIT 200")
         data[label]["broadcast_log"] = rows if not err else []
+        # Reorg events (schema v29) — tip regressions detected by the daemon
+        # loop / standalone watchtower.  Feeds the Events narrative.
+        rows, err = query_db(path,
+            "SELECT id, timestamp, old_tip, new_tip, n_entries_reset "
+            "FROM reorg_events ORDER BY id DESC LIMIT 50")
+        data[label]["reorg_events"] = rows if not err else []
+        # Breach detections (schema v29) — counterparty broadcast a revoked
+        # commit; watchtower responded (or is about to).  Feeds Events.
+        rows, err = query_db(path,
+            "SELECT id, timestamp, channel_id, expected_commit_num, "
+            "txid_seen, height_seen, response_txid "
+            "FROM breach_detections ORDER BY id DESC LIMIT 50")
+        data[label]["breach_detections"] = rows if not err else []
         # Signing progress — per-signer nonce/sig collection status
         rows, err = query_db(path,
             "SELECT factory_id, node_index, signer_slot, has_nonce, "
@@ -579,6 +596,90 @@ def collect_factory_config(cfg):
         out["error"] = str(e)
     return out
 
+def derive_events(db):
+    """Synthesize the narrative Events feed from real lsp.db rows.
+
+    The Events section in rProtocol consumes D.events with shape
+    {time:"HH:MM:SS", msg:"..."}.  Without this function, only the
+    synthetic --demo collector populates events; production runs render
+    an empty section that auto-hides, leaving operators without the
+    narrative layer that summarizes broadcast_log / signing_rounds /
+    reorg_events / breach_detections.
+
+    Sources are bounded by their own LIMIT clauses in collect_databases,
+    so the merged feed is capped at the union.  Ascending order matches
+    the renderer's .slice().reverse() (newest at top)."""
+    if not db or "lsp" not in db: return []
+    lsp = db.get("lsp") or {}
+    events = []
+    def _push(ts, msg):
+        try:
+            t = int(ts)
+            tstr = time.strftime("%H:%M:%S", time.localtime(t)) if t > 0 else "??:??:??"
+        except (ValueError, TypeError):
+            t = 0; tstr = "??:??:??"
+        events.append({"time": tstr, "msg": msg, "_ts": t})
+
+    for row in (lsp.get("broadcast_log") or []):
+        if not isinstance(row, dict): continue
+        source = row.get("source", "") or ""
+        txid = (row.get("txid", "") or "")[:16]
+        result = row.get("result", "ok") or "ok"
+        ts = row.get("broadcast_time", 0)
+        tag = "" if result == "ok" else f" [{result}]"
+        if source == "factory_funding":
+            _push(ts, f"Factory funded ({txid}…){tag}")
+        elif source == "cooperative_close":
+            _push(ts, f"Cooperative close confirmed ({txid}…){tag}")
+        elif source.startswith("tree_node_"):
+            n = source[len("tree_node_"):]
+            _push(ts, f"Tree node {n} broadcast ({txid}…){tag}")
+        elif source.startswith("penalty"):
+            _push(ts, f"Penalty TX broadcast ({txid}…){tag}")
+        elif source == "reorg_detected":
+            pass  # surfaced via reorg_events with richer detail
+        elif source:
+            _push(ts, f"Broadcast: {source} ({txid}…){tag}")
+
+    for row in (lsp.get("signing_rounds_recent") or []):
+        if not isinstance(row, dict): continue
+        ctype = row.get("ceremony_type", "?") or "?"
+        result = row.get("result", "") or ""
+        n_part = row.get("n_participants", 0)
+        started = row.get("started_at", 0) or 0
+        completed = row.get("completed_at", started) or started
+        try:
+            duration = max(0, int(completed) - int(started))
+        except (ValueError, TypeError):
+            duration = 0
+        if result == "success":
+            _push(completed, f"{ctype}: {n_part} signers, {duration}s")
+        else:
+            tag = result.upper() if result else "ABORTED"
+            _push(completed or started, f"{ctype} {tag}: {n_part} signers")
+
+    for row in (lsp.get("reorg_events") or []):
+        if not isinstance(row, dict): continue
+        ts = row.get("timestamp", 0)
+        old_tip = row.get("old_tip", 0) or 0
+        new_tip = row.get("new_tip", 0) or 0
+        depth = abs(old_tip - new_tip)
+        n_reset = row.get("n_entries_reset", 0)
+        _push(ts, f"Reorg: tip {old_tip}→{new_tip} (depth {depth}), {n_reset} entries reset")
+
+    for row in (lsp.get("breach_detections") or []):
+        if not isinstance(row, dict): continue
+        ts = row.get("timestamp", 0)
+        cid = row.get("channel_id", "?")
+        commit = row.get("expected_commit_num", "?")
+        resp = (row.get("response_txid", "") or "")
+        resp_str = f"penalty {resp[:16]}…" if resp else "pending"
+        _push(ts, f"Breach detected on channel {cid} (commit {commit}); {resp_str}")
+
+    events.sort(key=lambda e: e.get("_ts", 0))
+    for e in events: e.pop("_ts", None)
+    return events[-50:]
+
 def collect_all(cfg):
     if cfg.demo: return collect_demo()
     db = collect_databases(cfg)
@@ -587,7 +688,8 @@ def collect_all(cfg):
         "databases": db, "cln": collect_cln(cfg),
         "factory_config": collect_factory_config(cfg),
         "wallet_utxos": collect_wallet_utxos(cfg),
-        "tx_enrichment": collect_tx_enrichment(cfg, _extract_txids(db))}
+        "tx_enrichment": collect_tx_enrichment(cfg, _extract_txids(db)),
+        "events": derive_events(db)}
 
 # ---------------------------------------------------------------------------
 # Demo mode
