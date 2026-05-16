@@ -794,6 +794,37 @@ int lsp_channels_auto_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return rebalanced;
 }
 
+/* Try a demo payment; skip cleanly if the sender's local_amount is too low
+   to fund it.  Returns 1 on success or graceful skip, 0 only on real error.
+   Pre-#131 the demo hardcoded 1000–2000 sats; with --lsp-balance-pct 100
+   and the #119 dust guard, clients start with local_amount=546 which can't
+   cover any of the original amounts.  Skipping is the right behavior — the
+   demo's job is to exercise routes that fit current capacity, not to fail
+   the LSP startup when small balances make it impossible. */
+static int demo_try_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                             size_t from, size_t to, uint64_t amount,
+                             int payment_num) {
+    if (from >= mgr->n_channels || to >= mgr->n_channels) return 1;
+    uint64_t sender_local = mgr->entries[from].channel.local_amount;
+    if (sender_local < amount) {
+        printf("--- Payment %d: Client %zu -> Client %zu (%llu sats) "
+               "SKIPPED (sender local=%llu < %llu) ---\n",
+               payment_num, from + 1, to + 1,
+               (unsigned long long)amount,
+               (unsigned long long)sender_local,
+               (unsigned long long)amount);
+        return 1;  /* graceful skip, not a failure */
+    }
+    printf("--- Payment %d: Client %zu -> Client %zu (%llu sats) ---\n",
+           payment_num, from + 1, to + 1, (unsigned long long)amount);
+    if (!lsp_channels_initiate_payment(mgr, lsp, from, to, amount)) {
+        fprintf(stderr, "LSP demo: payment %d failed\n", payment_num);
+        return 0;
+    }
+    lsp_channels_print_balances(mgr);
+    return 1;
+}
+
 int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
@@ -810,60 +841,16 @@ int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     if (mgr->n_channels >= 4) {
         /* 4-client demo: cross-payment circuit */
-        printf("--- Payment 1: Client 1 -> Client 2 (1,000 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 1000)) {
-            fprintf(stderr, "LSP demo: payment 1 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 2: Client 3 -> Client 1 (1,500 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 2, 0, 1500)) {
-            fprintf(stderr, "LSP demo: payment 2 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 3: Client 4 -> Client 3 (2,000 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 3, 2, 2000)) {
-            fprintf(stderr, "LSP demo: payment 3 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 4: Client 2 -> Client 4 (1,000 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 1, 3, 1000)) {
-            fprintf(stderr, "LSP demo: payment 4 failed\n");
-            return 0;
-        }
+        if (!demo_try_payment(mgr, lsp, 0, 1, 1000, 1)) return 0;
+        if (!demo_try_payment(mgr, lsp, 2, 0, 1500, 2)) return 0;
+        if (!demo_try_payment(mgr, lsp, 3, 2, 2000, 3)) return 0;
+        if (!demo_try_payment(mgr, lsp, 1, 3, 1000, 4)) return 0;
     } else if (mgr->n_channels >= 2) {
         /* 2-client demo: back-and-forth payments */
-        printf("--- Payment 1: Client 1 -> Client 2 (1,000 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 1000)) {
-            fprintf(stderr, "LSP demo: payment 1 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 2: Client 2 -> Client 1 (1,500 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 1, 0, 1500)) {
-            fprintf(stderr, "LSP demo: payment 2 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 3: Client 1 -> Client 2 (2,000 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 2000)) {
-            fprintf(stderr, "LSP demo: payment 3 failed\n");
-            return 0;
-        }
-        lsp_channels_print_balances(mgr);
-
-        printf("--- Payment 4: Client 2 -> Client 1 (600 sats) ---\n");
-        if (!lsp_channels_initiate_payment(mgr, lsp, 1, 0, 600)) {
-            fprintf(stderr, "LSP demo: payment 4 failed\n");
-            return 0;
-        }
+        if (!demo_try_payment(mgr, lsp, 0, 1, 1000, 1)) return 0;
+        if (!demo_try_payment(mgr, lsp, 1, 0, 1500, 2)) return 0;
+        if (!demo_try_payment(mgr, lsp, 0, 1, 2000, 3)) return 0;
+        if (!demo_try_payment(mgr, lsp, 1, 0,  600, 4)) return 0;
     } else if (mgr->n_channels == 1) {
         printf("Only 1 channel — no inter-client payments possible.\n");
     }
