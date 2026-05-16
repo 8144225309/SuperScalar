@@ -1053,9 +1053,14 @@ int test_rotation_context_save_restore(void) {
     lsp_channels_cleanup(&mgr);
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec_local, 4), "reinit mgr");
 
-    /* Verify fields are zeroed */
+    /* Verify field reset semantics after re-init.  persist is in the
+       init preservation set (the caller is expected to attach the live
+       persist_t before init so channel_set_persist() inside init picks
+       it up — see lsp_channels_init comment).  bridge_fd resets to -1,
+       ladder stays zeroed (not in the preservation set). */
     TEST_ASSERT_EQ(mgr.bridge_fd, -1, "bridge_fd reset to -1");
-    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, 0, "persist zeroed");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, (long)(uintptr_t)0xCAFEBABE,
+                    "persist preserved through reinit");
     TEST_ASSERT_EQ((long)(uintptr_t)mgr.ladder, 0, "ladder zeroed");
     TEST_ASSERT_EQ(mgr.rot_auto_rotate, 0, "rot_auto_rotate zeroed");
 
