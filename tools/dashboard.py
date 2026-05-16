@@ -620,9 +620,34 @@ def derive_events(db):
             t = 0; tstr = "??:??:??"
         events.append({"time": tstr, "msg": msg, "_ts": t})
 
+    # Two-pass over broadcast_log: tree_node_* rows collapse into one summary
+    # event ("Force-close: N/M tree nodes confirmed").  Without collapsing, a
+    # 16-client force-close produces ~62 tree-node events that crowd out
+    # factory_funding / cooperative_close from the 50-event cap.
+    tree_total = 0; tree_ok = 0; tree_fail = 0
+    tree_first_ts = 0; tree_last_ts = 0
     for row in (lsp.get("broadcast_log") or []):
         if not isinstance(row, dict): continue
         source = row.get("source", "") or ""
+        if not source.startswith("tree_node_"): continue
+        tree_total += 1
+        if (row.get("result") or "ok") == "ok":
+            tree_ok += 1
+        else:
+            tree_fail += 1
+        ts = int(row.get("broadcast_time", 0) or 0)
+        if ts > 0:
+            if tree_first_ts == 0 or ts < tree_first_ts: tree_first_ts = ts
+            if ts > tree_last_ts: tree_last_ts = ts
+    if tree_total > 0:
+        msg = f"Force-close: {tree_ok}/{tree_total} tree nodes confirmed"
+        if tree_fail > 0: msg += f" ({tree_fail} failed)"
+        _push(tree_last_ts or tree_first_ts, msg)
+
+    for row in (lsp.get("broadcast_log") or []):
+        if not isinstance(row, dict): continue
+        source = row.get("source", "") or ""
+        if source.startswith("tree_node_"): continue  # collapsed above
         txid = (row.get("txid", "") or "")[:16]
         result = row.get("result", "ok") or "ok"
         ts = row.get("broadcast_time", 0)
@@ -631,11 +656,12 @@ def derive_events(db):
             _push(ts, f"Factory funded ({txid}…){tag}")
         elif source == "cooperative_close":
             _push(ts, f"Cooperative close confirmed ({txid}…){tag}")
-        elif source.startswith("tree_node_"):
-            n = source[len("tree_node_"):]
-            _push(ts, f"Tree node {n} broadcast ({txid}…){tag}")
         elif source.startswith("penalty"):
             _push(ts, f"Penalty TX broadcast ({txid}…){tag}")
+        elif source.startswith("breach_revoked"):
+            _push(ts, f"Breach attempt: {source} ({txid}…){tag}")
+        elif source.startswith("htlc_"):
+            _push(ts, f"HTLC TX: {source} ({txid}…){tag}")
         elif source == "reorg_detected":
             pass  # surfaced via reorg_events with richer detail
         elif source:
@@ -676,14 +702,57 @@ def derive_events(db):
         resp_str = f"penalty {resp[:16]}…" if resp else "pending"
         _push(ts, f"Breach detected on channel {cid} (commit {commit}); {resp_str}")
 
+    # State-mismatch detector: surface a warning event when factories.state
+    # claims "active" but broadcast_log shows terminal-close activity
+    # (cooperative_close, tree_node_*, force_close_*).  Today the LSP-side
+    # state machine doesn't bump factories.state on close, so an operator
+    # reading the Factory tab sees stale "active" with no indication that
+    # the factory has been swept on-chain.  This emits a single forensic
+    # event so the mismatch is visible until the LSP fixes the column.
+    facs = lsp.get("factories") or []
+    bl = lsp.get("broadcast_log") or []
+    has_terminal = any(
+        (r.get("source") or "").startswith(("cooperative_close", "tree_node_",
+                                              "force_close", "penalty"))
+        and (r.get("result") or "ok") == "ok"
+        for r in bl if isinstance(r, dict)
+    )
+    if facs and has_terminal:
+        active_facs = [f for f in facs if isinstance(f, dict)
+                       and (f.get("state") or "").lower() == "active"]
+        for f in active_facs:
+            ts = max((int(r.get("broadcast_time", 0) or 0) for r in bl
+                      if isinstance(r, dict)), default=0)
+            _push(ts, f"⚠ Factory {f.get('id', '?')} state=active but on-chain close detected (LSP state-machine gap)")
+
     events.sort(key=lambda e: e.get("_ts", 0))
     for e in events: e.pop("_ts", None)
     return events[-50:]
+
+def _db_freshness(cfg):
+    """Sample mtime + ISO timestamp of lsp.db and client.db so the UI can
+    detect a stale browser fetch (operator looks at the page after a wipe
+    + restart, sees old data, doesn't realize the tab cached an earlier
+    /api/status response).  Times are unix seconds; renderer can compute
+    'now - api_ts' to flag staleness."""
+    out = {"api_ts": int(time.time()),
+           "api_time": time.strftime("%H:%M:%S")}
+    for label, path in (("lsp_db_mtime", cfg.lsp_db),
+                         ("client_db_mtime", cfg.client_db)):
+        try:
+            if path and os.path.exists(str(path)):
+                out[label] = int(os.path.getmtime(str(path)))
+            else:
+                out[label] = 0
+        except OSError:
+            out[label] = 0
+    return out
 
 def collect_all(cfg):
     if cfg.demo: return collect_demo()
     db = collect_databases(cfg)
     return {"timestamp": time.strftime("%H:%M:%S"),
+        "freshness": _db_freshness(cfg),
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
         "databases": db, "cln": collect_cln(cfg),
         "factory_config": collect_factory_config(cfg),
@@ -1023,7 +1092,7 @@ tr:hover td{background:#1c2128}
 <div class="wrap">
 <div class="hdr">
  <h1>SuperScalar Dashboard<span class="sub">DW Factories + Timeout-Sig-Trees + Laddering</span></h1>
- <div class="tm"><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
+ <div class="tm"><span id="stale" title="data staleness: server payload age" style="display:none;background:#bb800922;color:#d29922;border:1px solid #bb800966;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:6px">—</span><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
 </div>
 <div id="dm" class="demo" style="display:none">DEMO MODE — simulated data for UI preview</div>
 <div class="tabs" id="tabs">
@@ -1956,6 +2025,30 @@ function rWatchtower(D){
   h+=`<table><tr><th>TXID</th><th>On-chain</th><th class="r">Anchor Vout</th><th class="r">Anchor Amount</th><th class="r">Mempool Cycles</th><th class="r">Fee Bumps</th></tr>`;
   for(const w of wp)h+=`<tr><td class="h">${th(w.txid)}</td><td>${txBadge(D,w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
   h+=`</table>`;}
+ // Breach detections (schema v29 PR #189): rows the watchtower wrote when
+ // it observed a stale commitment broadcast and responded with penalty TX.
+ // Authoritative breach-response record — distinct from old_commitments
+ // (the catalog of "would-be-cheats" we have penalty bytes for).
+ const bd=lsp.breach_detections||[];
+ if(bd.length){h+=`<div class="st" style="margin-top:8px"><span>Detected Breaches</span><span class="c">${bd.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>CH</th><th>Commit#</th><th>Stale TXID</th><th>Height</th><th>Response</th><th>When</th></tr>`;
+  for(const r of bd){
+   const resp=r.response_txid?`<span class="b ok" style="font-size:9px" title="penalty broadcast: ${r.response_txid}">penalty broadcast</span>`:`<span class="b w" style="font-size:9px">pending</span>`;
+   h+=`<tr><td>${r.id}</td><td>${r.channel_id}</td><td>${r.expected_commit_num}</td><td class="h">${th(r.txid_seen)}</td><td class="r">${r.height_seen}</td><td>${resp}</td><td>${ta(r.timestamp)}</td></tr>`;
+  }
+  h+=`</table>`;}
+ // Reorg events (schema v29 PR #189): chain reorg detections + entries-reset
+ // counts.  Useful for forensic correlation when an operator asks "did a
+ // reorg invalidate any of the state we're watching?"
+ const reorgs=lsp.reorg_events||[];
+ if(reorgs.length){h+=`<div class="st" style="margin-top:8px"><span>Reorg Events</span><span class="c">${reorgs.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th class="r">Old tip</th><th class="r">New tip</th><th class="r">Depth</th><th class="r">Entries reset</th><th>When</th></tr>`;
+  for(const r of reorgs){
+   const depth=Math.abs((r.old_tip||0)-(r.new_tip||0));
+   const dcls=depth>=6?'b dn':depth>=2?'b w':'b i';
+   h+=`<tr><td>${r.id}</td><td class="r">${r.old_tip}</td><td class="r">${r.new_tip}</td><td class="r"><span class="${dcls}" style="font-size:9px">${depth}</span></td><td class="r">${r.n_entries_reset}</td><td>${ta(r.timestamp)}</td></tr>`;
+  }
+  h+=`</table>`;}
  h+=`</div>`;
  // Broadcast log (separate card)
  const bl=lsp.broadcast_log||[];
@@ -2057,11 +2150,12 @@ function rTxInventory(D){
  // Category breakdown table
  h+=`<div class="s"><div class="st"><span>By Category</span></div>`;
  h+=`<table><tr><th>Category</th><th>Stored in</th><th class="r">Signed</th><th class="r">Expected</th><th>Coverage</th><th>Who broadcasts</th></tr>`;
- const cat=(name,table,signed,expected,who)=>{
+ const cat=(name,table,signed,expected,who,note)=>{
   const pct=expected?Math.round(100*signed/expected):0;
   const cls=expected===0?'b i':pct===100?'b ok':pct>=80?'b i':pct>0?'b w':'b dn';
   const label=expected===0?'n/a':`${signed}/${expected} (${pct}%)`;
-  h+=`<tr><td>${name}</td><td><code>${table}</code></td><td class="r">${signed}</td><td class="r">${expected}</td><td><span class="${cls}">${label}</span></td><td>${who}</td></tr>`;
+  const noteHtml=note?` <span class="mu" style="font-size:9px" title="${note}">ⓘ</span>`:'';
+  h+=`<tr><td>${name}${noteHtml}</td><td><code>${table}</code></td><td class="r">${signed}</td><td class="r">${expected}</td><td><span class="${cls}">${label}</span></td><td>${who}</td></tr>`;
  };
  cat('Funding TX',           'factories.funding_tx_hex',          fundingSigned, fundingExpected, 'LSP');
  cat('Factory tree TXs',     'tree_nodes.signed_tx_hex',          treeSigned,    treeExpected,    'LSP or client');
@@ -2069,7 +2163,13 @@ function rTxInventory(D){
  cat('PS leaf chain[1..N]',  'ps_leaf_chains.signed_tx_hex',      psChainSigned, psChainSigned,   'LSP or client');
  cat('PS sub-factory chain', 'ps_subfactory_chains.signed_tx_hex',psSubSigned,   psSubSigned,     'LSP or client');
  cat('Poison TXs (trustless)','ps_*_chains.poison_tx_hex',         psPoisonHave,  psPoisonExpected,'Watchtower');
- cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder');
+ // Channel commitments: signed_commitments is PRIMARY KEY (channel_id) on
+ // the client side, so each client's DB holds exactly one row (the latest
+ // signed commit for THAT client's channel).  The dashboard reads a single
+ // --client-db, so it can only see one client's row out of N — not a
+ // signing failure, just a single-client view.  Multi-client.db aggregation
+ // would close the gap (separate PR).
+ cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder', `Per-client schema (PRIMARY KEY channel_id) — dashboard reads one --client-db, so this shows 1-of-N until multi-POV PR lands. Not a signing failure.`);
  cat('Distribution TX (recovery)','distribution_txs (client-side)', distSigned,   distExpected,    'ANY client at CLTV timeout');
  cat('JIT channel funding',  'jit_channels.funding_tx_hex',       jitSigned,     jitSigned,       'LSP');
  h+=`</table></div>`;
@@ -2181,12 +2281,12 @@ function rOutcomes(D){
   {name:'Factory creation', icon:'🏭', sources:['factory_funding'],
    readySignal:facs.length>0?facs.length+' factory(ies)':'',
    blurb:'Funding TX broadcast that seats the factory MuSig2 UTXO on-chain.'},
-  {name:'PS leaf advance', icon:'🌿', sources:['ps_leaf'],
+  {name:'PS leaf advance', icon:'🌿', sources:['ps_advance_leaf','ps_advance_node','ps_advance_pass','ps_advance_fail','ps_leaf'],
    readySignal:psChain.length?psChain.length+' chain entries persisted':'',
    applicable:isPSCanon&&isNarrow,
    notApplicableNote:isWide?'k≥2 deployment uses sub-factory advances instead':isDWLegacy?'DW legacy deployment (arity 1/2) — leaves use decrementing nSequence, not PS chains':'',
-   blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.'},
-  {name:'PS sub-factory advance', icon:'🌳', sources:['ps_subfactory'],
+   blurb:'lsp_leaf_chain_advance: extends a PS leaf chain[N]→chain[N+1] when liquidity is sold.  --test-ps-advance writes broadcast_log rows with source=ps_advance_{node_N,leaf_N_chain0,pass,fail}.'},
+  {name:'PS sub-factory advance', icon:'🌳', sources:['ps_subfactory','sub_factory_advance','subfactory_advance'],
    readySignal:psSub.length?psSub.length+' sub-factory chain entries':'',
    applicable:isWide,
    notApplicableNote:isNarrow?'k=1 deployment uses leaf advances instead (no sub-factories present)':isDWLegacy?'DW legacy deployment (arity 1/2) — no PS chains':'',
@@ -2297,6 +2397,28 @@ function rDefenseStatus(D){
  const distCl=cl.distribution_txs||[];
  const psNodeCounts=lsp.ps_node_counts||[];
  const clFacs=cl.factories||[];
+
+ // Terminal-state detection: render a banner above the tiles when the
+ // factory has been closed on-chain.  The live-monitoring tiles below
+ // are still rendered so operators can see the forensic state, but the
+ // banner makes it clear the underlying factory is no longer active.
+ // Trigger: any of cooperative_close / tree_node_* / penalty / breach
+ // appears in broadcast_log with result=ok.  (factories.state can't be
+ // trusted today — LSP doesn't bump it; see PR #219 mismatch warning.)
+ const bl=lsp.broadcast_log||[];
+ let terminalKind='';
+ for(const r of bl){
+  const s=(r.source||'');
+  if((r.result||'ok')!=='ok') continue;
+  if(s==='cooperative_close'){terminalKind='cooperative close'; break;}
+  if(s.startsWith('tree_node_')){terminalKind=terminalKind||'force-close';}
+  if(s.startsWith('penalty')){terminalKind=terminalKind||'penalty (breach response)';}
+  if(s.startsWith('breach_revoked')){terminalKind=terminalKind||'breach attempt';}
+ }
+ let terminalBanner='';
+ if(terminalKind){
+  terminalBanner=`<div class="s" style="border-color:#8b949e44;background:#21262d22;margin-bottom:8px"><div class="st"><span style="color:#8b949e">⏷ Factory in terminal state: ${terminalKind}</span><span class="c">live-monitor tiles below are historical</span></div><p class="mu" style="font-size:11px;margin:4px 0">Tiles reflect the protocol's defense readiness at the moment of close; they will not change further.  See Payments / Protocol Log / Channels tabs for forensic detail.</p></div>`;
+ }
 
  const tiles=[];
 
@@ -2506,6 +2628,7 @@ function rDefenseStatus(D){
  const aggCls=redCount>0?'b dn':yellowCount>0?'b w':counted>0?'b ok':'b i';
 
  let h='';
+ h+=terminalBanner;
  h+=`<div class="s"><div class="st"><span>Defense Posture</span><span class="c">per-failure-mode coverage</span></div>`;
  h+=`<div class="kv" style="margin-bottom:8px">`;
  h+=`<div class="ki"><span class="k">Healthy</span><span class="${aggCls}" style="font-size:14px;padding:2px 12px">${greenCount}/${counted}${counted?` (${pct}%)`:''}</span></div>`;
@@ -2742,6 +2865,25 @@ function render(D){
  _D=D;             // expose latest payload for exportSnapshot()
  pushHistory(D);   // feed sparkline buffers
  document.getElementById('ts').textContent=D.timestamp||'--:--:--';
+ // Staleness badge: flag when the browser is showing a payload older than
+ // 30s (auto-refresh is 5s, so 30s means the tab is detached / fetching is
+ // failing) OR when the lsp.db has been written to more recently than the
+ // payload was generated (race: payload built mid-write).  Operators saw
+ // this when wiping + restarting a test — old data lingers in the tab.
+ const fresh=D.freshness||{};
+ const stale=document.getElementById('stale');
+ if(fresh.api_ts){
+  const age=Math.floor(Date.now()/1000)-fresh.api_ts;
+  if(age>=30){
+   stale.textContent='⚠ payload '+age+'s old';
+   stale.style.display='inline-block';
+  } else if(fresh.lsp_db_mtime && fresh.lsp_db_mtime>fresh.api_ts+2){
+   stale.textContent='⚠ lsp.db newer than payload';
+   stale.style.display='inline-block';
+  } else {
+   stale.style.display='none';
+  }
+ }
  const dot=document.getElementById('dot');
  const au=D.processes&&Object.values(D.processes).every(v=>v);
  const su=D.processes&&Object.values(D.processes).some(v=>v);
