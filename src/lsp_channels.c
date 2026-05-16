@@ -158,14 +158,24 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32) return 0;
     if (n_clients == 0) return 0;
 
-    /* Preserve fee policy set before init (caller may configure these) */
+    /* Preserve fields set before init (caller may configure these).
+       mgr->persist MUST survive the memset so channel_set_persist() below
+       can attach the live DB to each channel — without it, every
+       channel-level persist (revocation_secrets, old_commitment_htlcs)
+       silently no-ops, and lsp_run_state_advance's Step 11 (DW counter
+       persist) and Step 11.5 (F1 chain[0] re-persist) skip the if guard.
+       Caller (tools/superscalar_lsp.c:3591) sets mgr->persist before
+       this call; PR-DASH-PERSIST (#196) added that ordering but didn't
+       extend the memset preservation set. */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     void *saved_fee = mgr->fee;
+    void *saved_persist = mgr->persist;
     memset(mgr, 0, sizeof(*mgr));
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
     mgr->fee = saved_fee;
+    mgr->persist = saved_persist;
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
     mgr->bridge_fd = -1;
@@ -311,10 +321,13 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
     if (n_clients == 0) return 0;
 
-    /* Preserve fields set before init (caller may configure these) */
+    /* Preserve fields set before init (caller may configure these).
+       Mirror of lsp_channels_init — see comment there for why mgr->persist
+       must survive the memset. */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     void *saved_fee2 = mgr->fee;
+    void *saved_persist = mgr->persist;
     economic_mode_t saved_econ = mgr->economic_mode;
     uint16_t saved_profit_bps = mgr->default_profit_bps;
     uint32_t saved_settle_interval = mgr->settlement_interval_blocks;
@@ -322,6 +335,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
     mgr->fee = saved_fee2;
+    mgr->persist = saved_persist;
     mgr->economic_mode = saved_econ;
     mgr->default_profit_bps = saved_profit_bps;
     mgr->settlement_interval_blocks = saved_settle_interval;
