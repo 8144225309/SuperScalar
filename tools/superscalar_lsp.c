@@ -4087,10 +4087,13 @@ accept_new_factory:
     if (is_regtest) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
-        printf("LSP: waiting for stable close tx confirmation on %s...\n", network);
-        /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+        int safe_depth = regtest_network_safe_confirmation_depth(&rt);
+        printf("LSP: waiting for close tx to reach %d confirmations on %s...\n",
+               safe_depth, network);
+        /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
+           confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
         regtest_wait_for_stable_confirmation(&rt, close_txid,
-                                              /*target_depth=*/1,
+                                              safe_depth,
                                               /*max_reorg_depth=*/3,
                                               confirm_timeout_secs);
     }

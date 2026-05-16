@@ -1485,6 +1485,16 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
     return 0;
 }
 
+/* R3: per-network safe confirmation depth — see header for rationale. */
+int regtest_network_safe_confirmation_depth(const regtest_t *rt) {
+    if (!rt) return 6;  /* conservative default */
+    if (strcmp(rt->network, "regtest") == 0) return 1;
+    if (strcmp(rt->network, "signet") == 0)  return 3;
+    if (strcmp(rt->network, "testnet4") == 0) return 3;
+    if (strcmp(rt->network, "testnet") == 0)  return 3;
+    if (strcmp(rt->network, "mainnet") == 0)  return 6;
+    return 6;  /* unknown network → conservative */
+}
 
 int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
                                 char *txid_out, uint32_t *vout_out,

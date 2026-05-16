@@ -450,9 +450,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                         continue;
                     }
                 } else {
-                    /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+                    /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
+                       confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
+                    int safe_depth_close = regtest_network_safe_confirmation_depth(rt);
                     if (regtest_wait_for_stable_confirmation(rt, rc_txid,
-                                                              /*target_depth=*/1,
+                                                              safe_depth_close,
                                                               /*max_reorg_depth=*/3,
                                                               rot_timeout) >= 1) {
                         confirmed = 1; break;
@@ -550,9 +552,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                     continue;
                 }
             } else {
-                /* R2 (mainnet pre-flight): reorg-resilient confirmation wait. */
+                /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
+                   confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
+                int safe_depth_fund = regtest_network_safe_confirmation_depth(rt);
                 if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
-                                                          /*target_depth=*/1,
+                                                          safe_depth_fund,
                                                           /*max_reorg_depth=*/3,
                                                           rot_timeout) >= 1) {
                     confirmed = 1; break;
