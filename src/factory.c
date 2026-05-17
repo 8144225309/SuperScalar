@@ -2408,6 +2408,18 @@ int factory_tick_root(factory_t *f) {
         if (f->nodes[li].is_ps_leaf)
             f->nodes[li].ps_chain_len = 0;
     }
+    /* SF-G #144: also reset NODE_PS_SUBFACTORY chain state on rollover.
+       The leaf-loop above only covers is_ps_leaf nodes (parent of the
+       sub-factory ladder); the sub-factory nodes themselves are
+       NODE_PS_SUBFACTORY type and indexed via f->n_nodes, not
+       leaf_node_indices.  Without this, a sub-factory that advanced in
+       epoch N keeps ps_chain_len > 0 into epoch N+1, and the next
+       chain-advance in the new epoch builds chain[N+1] off stale state
+       (now invalid because the parent leaf-output epoch is different).
+       Same helper as the reorg path (factory_reset_all_subfactory_chains)
+       — clears ps_chain_len, ps_n_prev_outputs, ps_prev_txid, and
+       ps_chain_confirmed_height. */
+    factory_reset_all_subfactory_chains(f);
     if (!update_l_stock_outputs(f)) return 0;
     if (!build_all_unsigned_txs(f)) return 0;
     return -1;
