@@ -538,56 +538,119 @@ def _collect_one_db(path):
     return out
 
 
+def _merge_client_dbs(dbs):
+    """Merge multiple client.db dicts into one aggregate.  Used only by
+    the explicit View All POV (operator audit mode) — never the default.
+
+    Merge rules: list-typed feeds concatenate; scalar counters sum;
+    dict-typed feeds (old_commitments_coverage) sum their numeric inner
+    fields; booleans are OR'd."""
+    merged = {}
+    for per in dbs:
+        if per.get("error"):
+            continue
+        for k, v in per.items():
+            existing = merged.get(k)
+            if isinstance(v, list):
+                if existing is None:
+                    merged[k] = list(v)
+                else:
+                    existing.extend(v)
+            elif isinstance(v, bool):
+                merged[k] = bool(existing) or v
+            elif isinstance(v, (int, float)):
+                merged[k] = (existing or 0) + v
+            elif isinstance(v, dict):
+                target = existing if isinstance(existing, dict) else {}
+                for ik, iv in v.items():
+                    if isinstance(iv, bool):
+                        target[ik] = bool(target.get(ik)) or iv
+                    elif isinstance(iv, (int, float)):
+                        target[ik] = target.get(ik, 0) + iv
+                    else:
+                        target.setdefault(ik, iv)
+                merged[k] = target
+            else:
+                if existing in (None, ""):
+                    merged[k] = v
+    return merged
+
+
 def collect_databases(cfg, selected_pov=None):
-    """Read lsp.db (singular) + the SELECTED client.db and return a
-    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id}
-    dict.
+    """Read lsp.db + render the SELECTED POV.  Returns
+    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id,
+     "pov_mode": "lsp"|"client"|"view_all"}.
 
-    Multi-client invocations (operator/audit) populate `povs` with one
-    entry per --client-db, plus an "lsp" entry for the LSP-only view.
-    `client` holds ONLY the selected POV's data — never an aggregate
-    across users.  This was an intentional pivot from the earlier merge
-    design: aggregating client.dbs leaks who-saw-what across user
-    boundaries even for operators, and the goal here is "switch between
-    POVs," not "fuse them."
+    POV semantics:
+      lsp        — render lsp.db panels; client-side panels show "n/a from
+                   LSP POV" placeholders.  data["client"] is empty.
+      client_N   — render what client_N could see from their own client.db
+                   alone; LSP-internal panels show "n/a from client POV"
+                   placeholders.  data["client"] = collect_one_db(client_N).
+      view_all   — operator audit mode.  Render everything: lsp.db plus
+                   ALL client.dbs merged into data["client"].  Only
+                   available when N>1 --client-db.
 
-    Single --client-db invocations: `povs` has just that one entry, the
-    UI doesn't render a switcher, behavior is unchanged from
-    pre-multi-client-db days.
+    Defaults: N=0 → lsp (no choice).  N=1 → client_0 (production end-user
+    case — they want to see their own data, not the LSP's).  N>1 → lsp
+    (operator starts with the LSP's authoritative view).
 
-    `selected_pov` is "lsp" (LSP-only) or "client_N" (Nth --client-db
-    in argv order).  Defaults to the first client when --client-db was
-    given, else "lsp"."""
+    pov_mode is the COARSE label the JS uses to scope panels: "lsp" for
+    the LSP-only POV, "client" for any per-client POV, "view_all" for
+    the aggregated audit view.  Cleaner for the panel guards than
+    string-matching on selected_pov.id."""
     data = {"lsp": _collect_one_db(cfg.lsp_db), "client": {}}
 
-    # Build POV menu.  Each entry: {"id", "label", "source"}.
+    # Build POV menu.  Each entry: {"id", "label", "source", "mode"}.
+    # "mode" is what the JS guards key off; it collapses N client POVs
+    # into one "client" label so panel scope rules stay simple.
     povs = []
     if cfg.client_dbs:
-        # Show "LSP-only" as an explicit option when multiple clients exist
-        # (operator's first instinct is often "look at the LSP's truth
-        # before drilling into a specific client's POV").  Single-client
-        # case skips this — that's the only entry anyway.
+        # LSP-only POV: always available when at least one client is
+        # configured (so operator can compare "LSP truth" vs "client view"
+        # by toggling).  Single-client case omits this to keep the
+        # production end-user dashboard uncluttered.
         if len(cfg.client_dbs) > 1:
-            povs.append({"id": "lsp", "label": "LSP-only view (no client data)",
-                         "source": None})
+            povs.append({"id": "lsp", "label": "LSP POV",
+                         "source": None, "mode": "lsp"})
         for i, cdb in enumerate(cfg.client_dbs):
             base = os.path.basename(str(cdb))
-            label = base if len(cfg.client_dbs) > 1 else "Client"
-            povs.append({"id": f"client_{i}", "label": label, "source": cdb})
+            label = base if len(cfg.client_dbs) > 1 else f"Client ({base})"
+            povs.append({"id": f"client_{i}", "label": label,
+                         "source": cdb, "mode": "client"})
+        # View All only meaningful with more than one client.
+        if len(cfg.client_dbs) > 1:
+            povs.append({"id": "view_all",
+                         "label": "View All (operator — all clients merged)",
+                         "source": None, "mode": "view_all"})
     data["povs"] = povs
 
     if not povs:
         data["client"]["error"] = "not configured"
-        data["selected_pov"] = None
+        data["selected_pov"] = "lsp"
+        data["pov_mode"] = "lsp"
         return data
 
-    # Resolve selected POV.  Falls back to first entry if the caller asked
-    # for an unknown id (browser cached an id that no longer exists, etc.).
-    selected = next((p for p in povs if p["id"] == selected_pov), povs[0])
+    # Default selection: client_0 when there's just one client (production
+    # end-user case wants their POV).  LSP-first when multiple clients
+    # (operator audit case starts on the authoritative LSP view).
+    default_id = "client_0" if len(cfg.client_dbs) == 1 else "lsp"
+    selected = next((p for p in povs if p["id"] == selected_pov),
+                    next((p for p in povs if p["id"] == default_id), povs[0]))
     data["selected_pov"] = selected["id"]
-    if selected["source"]:
+    data["pov_mode"] = selected["mode"]
+
+    if selected["mode"] == "view_all":
+        # Aggregate all client.dbs.  Documented as explicit opt-in operator
+        # mode in the UI — the dropdown label spells out "operator — all
+        # clients merged" so this is never how an end-user dashboard would
+        # render by default.
+        per_dbs = [_collect_one_db(cdb) for cdb in cfg.client_dbs]
+        data["client"] = _merge_client_dbs(per_dbs)
+        data["client"]["_view_all_sources"] = [str(c) for c in cfg.client_dbs]
+    elif selected["source"]:
         data["client"] = _collect_one_db(selected["source"])
-    # else: LSP-only — data["client"] stays empty.
+    # else (mode == "lsp"): data["client"] stays empty.
     return data
 
 def collect_cln(cfg):
@@ -1716,6 +1779,13 @@ function rPsChains(D){
 
 // === TAB: Factory ===
 function rFactory(D){
+ // Factory tab renders the LSP's view of the tree topology — every node
+ // signed, every PS chain entry, every ladder factory, the DW counter
+ // state.  A real client holds only their leaf path + their PS chain;
+ // they don't have the full tree.  V1 hides the tab for client POV.
+ // Future work: a "client view" mode could surface just the leaf path
+ // from the client's own tree_nodes copies in client.db.
+ if(!isLSPVisible())return naPanel("Factory tab renders the LSP's full tree topology (every node signed, every PS chain entry, every ladder factory).  A real client only holds their own leaf path through the tree — not the aggregate.  Future client view mode will surface just that subset.");
  const db=D.databases||{},lsp=db.lsp||{},facs=lsp.factories||[],parts=lsp.participants||[];
  let h=rConfig(D);
  // Polish item 4: per-factory isolation selector.  When the deployment has
@@ -2075,6 +2145,12 @@ function rPayments(D){
 
 // === TAB: Protocol Log ===
 function rProtocol(D){
+ // wire_messages is the LSP's full P2P protocol log — every NOISE message
+ // it exchanged with every client.  A real client only sees their own
+ // exchanges, not the LSP's full firehose.  Likewise the Events feed is
+ // derived from lsp.db (broadcast_log, breach_detections, etc.) which
+ // clients don't hold.  Hide for client POV.
+ if(!isLSPVisible())return naPanel("Protocol Log shows the LSP's full NOISE wire-message firehose (all clients' exchanges) plus the events feed derived from lsp.db.  Real clients only see their own exchanges, not the LSP's aggregate log.");
  const db=D.databases||{},lsp=db.lsp||{},msgs=lsp.wire_messages||[];
  let h='';
  // Events section (formerly the standalone Events tab — merged here so the
@@ -2182,6 +2258,12 @@ function rLightning(D){
 
 // === TAB: Watchtower ===
 function rWatchtower(D){
+ // Watchtower is LSP-internal: tracks every client's old_commitments,
+ // detected breaches, reorg events, pending penalty TXs in mempool,
+ // and the broadcast log.  A real client has no visibility into ANY of
+ // this — they only know about their own channel state.  Surface that
+ // honestly: client POV → placeholder; LSP / View All → real content.
+ if(!isLSPVisible())return naPanel("Watchtower is LSP-internal — it tracks every client's revoked commitments, breach detections across all channels, pending penalty TXs, and the full broadcast log.  Real clients have no visibility into other clients' state or the LSP's response chain.");
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  let h='';
  h+=`<div class="s"><div class="st">Watchtower + Revocations</div>`;
@@ -2448,6 +2530,11 @@ function rTxInventory(D){
 //                             jit_*, rotation_*, ...).
 //   - presence of signed bytes in their respective tables = "ready" tile.
 function rOutcomes(D){
+ // Outcomes scenarios + Recent Broadcasts are sourced from lsp.db's
+ // broadcast_log, signing_rounds_recent, and breach_detections — all
+ // LSP-side aggregates a real client doesn't hold.  Hide for client
+ // POV.
+ if(!isLSPVisible())return naPanel("Outcomes tiles fire off lsp.db sources (broadcast_log, signing_rounds, breach_detections) — the LSP's aggregate view of which protocol scenarios have exercised across all clients.  Real clients only know about events on their own channel.");
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  const log=lsp.broadcast_log||[];
  const sr=lsp.signing_rounds_recent||[];
@@ -2643,6 +2730,13 @@ function rOutcomes(D){
 // covers 6 tiles with clean DB data sources (see
 // DEFENSE_STATUS_PANEL_DESIGN.md in the local working area).
 function rDefenseStatus(D){
+ // Defense Status tiles compute almost entirely from lsp.db (tree_nodes,
+ // ps_chains, signing_progress, watchtower_pending, wallet UTXO from
+ // bitcoind).  V1 of the POV scoping hides the whole tab for client
+ // POVs.  Future work: surface a client-relevant subset (their poison
+ // TX presence, their distribution TX, their channel commit count) as
+ // a leaner tile grid.
+ if(!isLSPVisible())return naPanel("Defense Status aggregates pre-signed TX coverage across every client and the LSP's wallet.  Most tiles read lsp.db which a real client does not hold.  A future client view of this tab would surface just the tiles a single user can verify from their own client.db (their poison TX, their distribution TX, their channel commit).");
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  const tn=lsp.tree_nodes||[];
  const psChain=lsp.ps_leaf_chains||[];
@@ -2964,6 +3058,11 @@ function rDefenseStatus(D){
 // sent to each client at the same timestamp) collapse into one ceremony
 // entry.
 function rCeremonies(D){
+ // Ceremonies (signing_rounds journal + reconstructed-from-wire view)
+ // are LSP-internal.  A client participates in their own ceremonies but
+ // doesn't persist the LSP's journal table or see other clients'
+ // rounds.  Hide for client POV.
+ if(!isLSPVisible())return naPanel("Ceremonies are LSP-internal bookkeeping — the signing_rounds journal logs every ceremony across every client.  A real client only knows about ceremonies they participated in (their own commitment signing, their leaf advance), not the aggregate.");
  const db=D.databases||{},lsp=db.lsp||{};
  // PR #182 collector exposes the new signing_rounds journal (schema v26
  // from PR #181).  When available, render it as the primary source for
@@ -3205,10 +3304,21 @@ function render(D){
 }
 // POV switcher state (operator-mode only).  Lives at module scope so it
 // survives between refreshes.  Empty string = let the server pick the
-// default (first --client-db, or "lsp" when none).  Updated by setPov()
-// from the dropdown change handler.
+// default (LSP when N>1, the one client when N=1, none when N=0).
+// Updated by setPov() from the dropdown change handler.
 let curPov='';
-function setPov(p){curPov=p;refresh();}
+let povMode='lsp';  // 'lsp' | 'client' | 'view_all' — mirrors D.pov_mode
+async function setPov(p){curPov=p;await refresh();}
+// Panel-scope guards.  Each tab's render function checks these at the
+// top and either renders content or returns naPanel().  The principle:
+// render only what THIS POV would actually have visibility into.  Real
+// clients don't see lsp.db (wire_messages, breach_detections, etc.); LSP
+// POV has no per-client client.db rows.  View All sees everything.
+function isLSPVisible(){return povMode==='lsp'||povMode==='view_all';}
+function isClientVisible(){return povMode==='client'||povMode==='view_all';}
+function naPanel(why){
+ return `<div class="s" style="opacity:0.6"><div class="st"><span style="color:#8b949e">— Not visible in this POV —</span></div><p class="mu" style="font-size:11px;margin-top:4px">${why}  Switch POV in the header dropdown to view.</p></div>`;
+}
 function renderPovSelector(D){
  const sel=document.getElementById('povsel');
  const povs=(D.databases&&D.databases.povs)||[];
@@ -3223,11 +3333,15 @@ function renderPovSelector(D){
   sel.dataset.sig=sig;
  }
  sel.style.display='inline-block';
- // Mirror server-resolved selection back into curPov so the next refresh
- // sends the right ?pov= even if the user landed on a fallback.
- curPov=active;
+ // Don't mirror server-resolved selection back into curPov.  A stale
+ // setInterval refresh that fired BEFORE the user clicked the dropdown
+ // can land AFTER the user's selection; its response carries the old
+ // resolved POV, and copying it back to curPov resets the user's choice.
+ // The dropdown's `selected` attribute already reflects the server's
+ // resolved value, so the UI stays consistent — curPov only needs to
+ // mirror what the USER explicitly picked, which setPov() handles.
 }
-async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();renderPovSelector(D);render(D);}}catch(e){}}
+async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();povMode=(D.databases&&D.databases.pov_mode)||'lsp';renderPovSelector(D);render(D);}}catch(e){}}
 refresh();setInterval(refresh,R);
 </script></body></html>"""
 
