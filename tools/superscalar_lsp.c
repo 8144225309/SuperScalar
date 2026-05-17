@@ -378,6 +378,10 @@ static void usage(const char *prog) {
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
+        "  --enable-ptlc-unsafe Enable PTLC channel ops (opt-in for testnet4/regtest;\n"
+        "                      watchtower PTLC sweep is wired via SF-W-PTLC, but the\n"
+        "                      feed only fires when PTLCs actually flow through\n"
+        "                      these channels)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -1407,6 +1411,13 @@ int main(int argc, char *argv[]) {
             test_turnover = 1;
         else if (strcmp(argv[i], "--test-rotation") == 0)
             test_rotation = 1;
+        else if (strcmp(argv[i], "--enable-ptlc-unsafe") == 0) {
+            /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops.
+               Default-off in production (mainnet should still gate). */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            printf("LSP: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+        }
         else if (strcmp(argv[i], "--test-partial-rotation") == 0)
             test_partial_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)

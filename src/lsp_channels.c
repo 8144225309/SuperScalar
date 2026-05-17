@@ -1111,6 +1111,19 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (old_sender_n_htlcs > 0 && !old_sender_htlcs) return 0;
     if (old_sender_n_htlcs > 0)
         memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
+    /* SF-W-PTLC: capture PTLC state alongside HTLC so the watchtower can
+       sweep PTLC outputs on breach. No-op when n_ptlcs == 0 (current
+       SuperScalar wire-protocol channels); defensive for future
+       channel-level PTLC ops. */
+    size_t old_sender_n_ptlcs = sender_ch->n_ptlcs;
+    ptlc_t *old_sender_ptlcs = old_sender_n_ptlcs > 0
+        ? malloc(old_sender_n_ptlcs * sizeof(ptlc_t)) : NULL;
+    if (old_sender_n_ptlcs > 0 && !old_sender_ptlcs) {
+        free(old_sender_htlcs);
+        return 0;
+    }
+    if (old_sender_n_ptlcs > 0)
+        memcpy(old_sender_ptlcs, sender_ch->ptlcs, old_sender_n_ptlcs * sizeof(ptlc_t));
 
     /* Add HTLC to sender's channel (offered from client = received by LSP) */
     uint64_t new_htlc_id;
@@ -1123,6 +1136,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
         cJSON_Delete(fail);
         free(old_sender_htlcs);
+        free(old_sender_ptlcs);
         return 1;  /* not a protocol error, just a payment failure */
     }
 
@@ -1133,6 +1147,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
             fprintf(stderr, "LSP: create partial sig failed for sender %zu\n", sender_idx);
             free(old_sender_htlcs);
+            free(old_sender_ptlcs);
             return 0;
         }
         cJSON *cs = wire_build_commitment_signed(
@@ -1141,6 +1156,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_send(lsp->client_fds[sender_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
             free(old_sender_htlcs);
+            free(old_sender_ptlcs);
             return 0;
         }
         cJSON_Delete(cs);
@@ -1161,6 +1177,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             fprintf(stderr, "LSP: expected REVOKE_AND_ACK from sender %zu\n", sender_idx);
             free(old_sender_htlcs);
+            free(old_sender_ptlcs);
             return 0;
         }
         /* Parse and verify revocation secret */
@@ -1176,6 +1193,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 secure_zero(rev_secret, 32);
                 cJSON_Delete(ack_msg.json);
                 free(old_sender_htlcs);
+                free(old_sender_ptlcs);
                 return 0;
             }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
@@ -1183,7 +1201,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 (uint32_t)sender_idx, old_cn,
                 old_sender_local, old_sender_remote,
                 old_sender_htlcs, old_sender_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                old_sender_ptlcs, old_sender_n_ptlcs);
             /* Store next per-commitment point from peer */
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
@@ -1219,6 +1237,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
     free(old_sender_htlcs);
+    free(old_sender_ptlcs);
 
     /* Persist sender channel balance + HTLC atomically (crash-state protection) */
     if (mgr->persist) {
