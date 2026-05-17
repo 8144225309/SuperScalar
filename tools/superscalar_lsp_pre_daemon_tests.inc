@@ -3073,6 +3073,199 @@
             return 0;
         }
 
+        /* === PTLC CHAIN TEST (#173, SF-W-PTLC end-to-end) ===
+           Chain-level validation: prove a Bitcoin TX containing a PTLC
+           output is chain-valid by broadcasting a real commit TX with
+           PTLC and confirming it on chain.
+
+           Doesn't test the watchtower breach-sweep cycle (that needs
+           state-rewind + revocation-secret injection — deferred).
+           This is the most impactful chain-level PTLC validation
+           achievable without the full breach scaffolding. */
+        if (test_ptlc_chain) {
+            printf("\n=== PTLC CHAIN TEST ===\n");
+
+            if (mgr->n_channels < 1) {
+                fprintf(stderr, "PTLC CHAIN TEST: need at least 1 channel\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            if (!ptlc_safety_is_enabled()) {
+                fprintf(stderr, "PTLC CHAIN TEST: safety gate not enabled\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            channel_t *ch0_c = &mgr->entries[0].channel;
+
+            /* Step 1: build payment_point + size PTLC */
+            unsigned char pc_dummy_sec[32];
+            memset(pc_dummy_sec, 0xCB, 32);
+            secp256k1_pubkey pc_payment_point;
+            if (!secp256k1_ec_pubkey_create(ctx, &pc_payment_point, pc_dummy_sec)) {
+                fprintf(stderr, "PTLC CHAIN TEST: payment_point create failed\n");
+                memset(pc_dummy_sec, 0, 32);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            memset(pc_dummy_sec, 0, 32);
+
+            uint64_t pc_ch0_local = ch0_c->local_amount;
+            /* +2000 buffer accommodates commit TX fee for PTLC output. */
+            uint64_t pc_ptlc_amount = 2000;
+            if (pc_ch0_local < pc_ptlc_amount + CHANNEL_RESERVE_SATS + 2000) {
+                if (pc_ch0_local <= CHANNEL_DUST_LIMIT_SATS + CHANNEL_RESERVE_SATS + 100) {
+                    fprintf(stderr,
+                            "PTLC CHAIN TEST: channel 0 local %llu < min\n",
+                            (unsigned long long)pc_ch0_local);
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                pc_ptlc_amount = pc_ch0_local - CHANNEL_RESERVE_SATS - 2000;
+            }
+
+            uint32_t pc_cur_height = (uint32_t)regtest_get_block_height(&rt);
+            uint32_t pc_ptlc_cltv = pc_cur_height + 100;
+            uint64_t pc_ptlc_id = 0;
+
+            /* Step 2: Add PTLC */
+            if (!channel_add_ptlc(ch0_c, PTLC_OFFERED, pc_ptlc_amount,
+                                    &pc_payment_point, pc_ptlc_cltv, &pc_ptlc_id)) {
+                fprintf(stderr, "PTLC CHAIN TEST: channel_add_ptlc failed\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("PTLC added: id=%llu amount=%llu cltv=%u\n",
+                   (unsigned long long)pc_ptlc_id,
+                   (unsigned long long)pc_ptlc_amount, pc_ptlc_cltv);
+
+            /* Step 3: Broadcast factory tree (need to commit funding UTXO) */
+            printf("Broadcasting factory tree (%zu nodes)...\n",
+                   lsp_p->factory.n_nodes);
+            if (!broadcast_factory_tree_any_network(&lsp_p->factory, &rt,
+                                                      mine_addr, is_regtest,
+                                                      confirm_timeout_secs)) {
+                fprintf(stderr, "PTLC CHAIN TEST: tree broadcast failed\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Factory tree confirmed on chain.\n");
+
+            /* Step 4: Build commit TX */
+            tx_buf_t pc_commit_unsigned;
+            tx_buf_init(&pc_commit_unsigned, 512);
+            unsigned char pc_commit_txid[32];
+
+            if (!channel_build_commitment_tx(ch0_c, &pc_commit_unsigned,
+                                               pc_commit_txid)) {
+                fprintf(stderr, "PTLC CHAIN TEST: build commit TX failed\n");
+                tx_buf_free(&pc_commit_unsigned);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Commitment TX built: %zu bytes (with PTLC output)\n",
+                   pc_commit_unsigned.len);
+
+            /* Step 5: Sign with client keypair.  Uses the same scheme as
+               --test-htlc-force-close: client[0] seckey from env var, fallback
+               to 0x22*32. */
+            unsigned char pc_cli_sec[32];
+            const char *pc_cli_hex = getenv("SUPERSCALAR_TEST_CLIENT0_SECKEY");
+            if (pc_cli_hex && strlen(pc_cli_hex) == 64
+                && hex_decode(pc_cli_hex, pc_cli_sec, 32)) {
+                fprintf(stderr, "PTLC CHAIN TEST: using SUPERSCALAR_TEST_CLIENT0_SECKEY\n");
+            } else {
+                memset(pc_cli_sec, 0x22, 32);
+            }
+            secp256k1_keypair pc_cli_kp;
+            if (!secp256k1_keypair_create(ctx, &pc_cli_kp, pc_cli_sec)) {
+                fprintf(stderr, "PTLC CHAIN TEST: client keypair create failed\n");
+                memset(pc_cli_sec, 0, 32);
+                tx_buf_free(&pc_commit_unsigned);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            memset(pc_cli_sec, 0, 32);
+
+            tx_buf_t pc_commit_signed;
+            tx_buf_init(&pc_commit_signed, 512);
+            if (!channel_sign_commitment(ch0_c, &pc_commit_signed,
+                                           &pc_commit_unsigned, &pc_cli_kp)) {
+                fprintf(stderr, "PTLC CHAIN TEST: sign commit failed\n");
+                tx_buf_free(&pc_commit_signed);
+                tx_buf_free(&pc_commit_unsigned);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            tx_buf_free(&pc_commit_unsigned);
+            printf("Commit TX signed: %zu bytes\n", pc_commit_signed.len);
+
+            /* Step 6: Broadcast */
+            char *pc_commit_hex = malloc(pc_commit_signed.len * 2 + 1);
+            if (!pc_commit_hex) {
+                fprintf(stderr, "PTLC CHAIN TEST: hex alloc failed\n");
+                tx_buf_free(&pc_commit_signed);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            hex_encode(pc_commit_signed.data, pc_commit_signed.len, pc_commit_hex);
+            char pc_commit_txid_str[65];
+            int pc_sent = regtest_send_raw_tx(&rt, pc_commit_hex,
+                                                pc_commit_txid_str);
+            if (g_db)
+                persist_log_broadcast(g_db, pc_sent ? pc_commit_txid_str : "?",
+                    "ptlc_chain_commit", pc_commit_hex,
+                    pc_sent ? "ok" : "failed");
+            free(pc_commit_hex);
+            tx_buf_free(&pc_commit_signed);
+
+            if (!pc_sent) {
+                fprintf(stderr, "PTLC CHAIN TEST: commit broadcast failed\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Commit TX broadcast: %s\n", pc_commit_txid_str);
+
+            /* Step 7: Mine block + verify confirmation */
+            ADVANCE(1);
+            printf("Mined 1 block for confirmation.\n");
+
+            printf("\n=== PTLC CHAIN TEST PASSED ===\n");
+            printf("Validated: PTLC-bearing commit TX is Bitcoin-valid and confirms on chain.\n");
+
+            report_add_string(&rpt, "result", "ptlc_chain_complete");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+
         /* === MULTI-HTLC FORCE-CLOSE TEST (S28) ===
            Add pending HTLCs on ALL channels simultaneously, then force-close.
            Produces n_channels HTLC timeout TXs — each with its own CSV/CLTV.

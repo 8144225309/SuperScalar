@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <inttypes.h>
 
 /* Minimum capacity for PTLC array growth */
 #define PTLC_INIT_CAP 8
@@ -63,11 +64,58 @@ int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
         return 0;
     }
 
+    /* #182: deduct amount + per-PTLC commit fee from the sender. Mirrors
+       channel_add_htlc balance accounting; without this the commit TX
+       outputs exceed funding and broadcast fails with bad-txns-in-belowout. */
+    if (amount_sats > 0) {
+        if (dir == PTLC_OFFERED) {
+            if (ch->local_amount < amount_sats + CHANNEL_RESERVE_SATS) {
+                fprintf(stderr,
+                    "channel_add_ptlc: refused OFFERED — local %" PRIu64
+                    " < amount %" PRIu64 " + reserve %d\n",
+                    ch->local_amount, amount_sats, CHANNEL_RESERVE_SATS);
+                return 0;
+            }
+            ch->local_amount -= amount_sats;
+        } else { /* PTLC_RECEIVED */
+            if (ch->remote_amount < amount_sats + CHANNEL_RESERVE_SATS) {
+                fprintf(stderr,
+                    "channel_add_ptlc: refused RECEIVED — remote %" PRIu64
+                    " < amount %" PRIu64 " + reserve %d\n",
+                    ch->remote_amount, amount_sats, CHANNEL_RESERVE_SATS);
+                return 0;
+            }
+            ch->remote_amount -= amount_sats;
+        }
+    }
+    /* Per-PTLC commit fee — same 43 vB shape as HTLCs. */
+    uint64_t per_ptlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
+    if (amount_sats > 0 && *funder_bal < per_ptlc_fee) {
+        /* Rollback amount deduction. */
+        if (dir == PTLC_OFFERED) ch->local_amount += amount_sats;
+        else ch->remote_amount += amount_sats;
+        fprintf(stderr,
+            "channel_add_ptlc: refused — funder_bal %" PRIu64
+            " < per_ptlc_fee %" PRIu64 "\n",
+            *funder_bal, per_ptlc_fee);
+        return 0;
+    }
+    if (amount_sats > 0) *funder_bal -= per_ptlc_fee;
+
     /* Grow array if needed */
     if (ch->n_ptlcs >= ch->ptlcs_cap) {
         size_t new_cap = ch->ptlcs_cap ? ch->ptlcs_cap * 2 : PTLC_INIT_CAP;
         ptlc_t *new_arr = (ptlc_t *)realloc(ch->ptlcs, new_cap * sizeof(ptlc_t));
-        if (!new_arr) return 0;
+        if (!new_arr) {
+            /* Rollback. */
+            if (amount_sats > 0) {
+                if (dir == PTLC_OFFERED) ch->local_amount += amount_sats;
+                else ch->remote_amount += amount_sats;
+                *funder_bal += per_ptlc_fee;
+            }
+            return 0;
+        }
         ch->ptlcs = new_arr;
         ch->ptlcs_cap = new_cap;
     }
@@ -79,6 +127,7 @@ int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
     p->amount_sats = amount_sats;
     p->cltv_expiry = cltv_expiry;
     p->id          = ch->next_ptlc_id++;
+    p->fee_at_add  = amount_sats > 0 ? per_ptlc_fee : 0;
     if (point) p->payment_point = *point;
 
     if (id_out) *id_out = p->id;
@@ -91,11 +140,24 @@ int channel_settle_ptlc(channel_t *ch, uint64_t ptlc_id,
 {
     if (!ch) return 0;
     for (size_t i = 0; i < ch->n_ptlcs; i++) {
-        if (ch->ptlcs[i].id == ptlc_id) {
+        ptlc_t *p = &ch->ptlcs[i];
+        if (p->id == ptlc_id && p->state == PTLC_STATE_ACTIVE) {
+            /* #182: credit recipient + refund fee to funder. */
+            if (p->amount_sats > 0) {
+                if (p->direction == PTLC_OFFERED) {
+                    /* Local offered → remote receives. */
+                    ch->remote_amount += p->amount_sats;
+                } else {
+                    ch->local_amount += p->amount_sats;
+                }
+                uint64_t *funder_bal = ch->funder_is_local
+                    ? &ch->local_amount : &ch->remote_amount;
+                *funder_bal += p->fee_at_add;
+            }
             if (adapted_sig64)
-                memcpy(ch->ptlcs[i].adapted_sig, adapted_sig64, 64);
-            ch->ptlcs[i].has_adapted_sig = (adapted_sig64 != NULL);
-            ch->ptlcs[i].state = PTLC_STATE_SETTLED;
+                memcpy(p->adapted_sig, adapted_sig64, 64);
+            p->has_adapted_sig = (adapted_sig64 != NULL);
+            p->state = PTLC_STATE_SETTLED;
             return 1;
         }
     }
@@ -106,8 +168,20 @@ int channel_fail_ptlc(channel_t *ch, uint64_t ptlc_id)
 {
     if (!ch) return 0;
     for (size_t i = 0; i < ch->n_ptlcs; i++) {
-        if (ch->ptlcs[i].id == ptlc_id) {
-            ch->ptlcs[i].state = PTLC_STATE_FAILED;
+        ptlc_t *p = &ch->ptlcs[i];
+        if (p->id == ptlc_id && p->state == PTLC_STATE_ACTIVE) {
+            /* #182: refund amount to original sender + fee to funder. */
+            if (p->amount_sats > 0) {
+                if (p->direction == PTLC_OFFERED) {
+                    ch->local_amount += p->amount_sats;
+                } else {
+                    ch->remote_amount += p->amount_sats;
+                }
+                uint64_t *funder_bal = ch->funder_is_local
+                    ? &ch->local_amount : &ch->remote_amount;
+                *funder_bal += p->fee_at_add;
+            }
+            p->state = PTLC_STATE_FAILED;
             return 1;
         }
     }

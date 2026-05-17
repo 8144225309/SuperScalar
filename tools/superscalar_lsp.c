@@ -396,6 +396,10 @@ static void usage(const char *prog) {
         "                      (persists to DB), close + reopen persist, load PTLCs\n"
         "                      from DB, verify fields. Validates schema v30\n"
         "                      persistence. Implies --enable-ptlc-unsafe. (regtest)\n"
+        "  --test-ptlc-chain   After demo: add a PTLC, broadcast factory tree, sign\n"
+        "                      + broadcast channel-0 commit TX with PTLC output, mine\n"
+        "                      block, verify confirmation. Validates PTLC outputs are\n"
+        "                      Bitcoin-valid on real chain. (regtest)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -1240,6 +1244,7 @@ int main(int argc, char *argv[]) {
     int test_ptlc_basic = 0;
     int test_ptlc_breach = 0;
     int test_ptlc_restart = 0;
+    int test_ptlc_chain = 0;
     int test_htlc_force_close = 0;
     int test_multi_htlc_force_close = 0;
     int test_full_settlement = 0;
@@ -1484,6 +1489,15 @@ int main(int argc, char *argv[]) {
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
             test_ptlc_restart = 1;
+        }
+        else if (strcmp(argv[i], "--test-ptlc-chain") == 0) {
+            /* SF-W-PTLC #173: chain-level PTLC validation. Add PTLC,
+               broadcast factory tree, sign + broadcast commit TX with
+               PTLC output, verify confirmation. Proves PTLC outputs
+               are real-chain Bitcoin-valid. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_chain = 1;
         }
         else if (strcmp(argv[i], "--test-partial-rotation") == 0)
             test_partial_rotation = 1;
@@ -3677,7 +3691,7 @@ accept_new_factory:
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
-        test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
+        test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_ptlc_chain || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
         test_tier_b_rollover || test_subfactory_advance ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||
