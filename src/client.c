@@ -133,6 +133,18 @@ static void client_send_error(int fd, const char *reason) {
    rejected anyway. */
 static int g_client_funding_pending_reorg = 0;
 
+/* SF-followup #145: client-side mirror of LSP's factory_reset_all_subfactory_
+   chains call from #208's reorg handler.  When MSG_FUNDING_REORG arrives with
+   frozen=1 the LSP has already reset its in-memory ps_chain_len for advanced
+   sub-factories; the client must do the same so subsequent recovery /
+   force-close paths don't reference invalid chain[N] state whose parent
+   chain[N-1] is no longer on chain.  Set at the entry of client_run_with_
+   channels / client_run_reconnect to point at the active factory_t, cleared
+   on exit.  When NULL (pre-factory bootstrap), the reorg notification is
+   recorded in the freeze flag but no reset happens (there's nothing to
+   reset). */
+static factory_t *g_client_active_factory = NULL;
+
 /* Wrapper around wire_recv_timeout that transparently handles
    MSG_PING (responds with MSG_PONG), MSG_PONG (discards), and
    MSG_FUNDING_REORG (updates local freeze mirror, discards).
@@ -168,6 +180,20 @@ static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
                     "frozen=%d (LSP says funding %s)\n",
                     txid_hex, frozen,
                     frozen ? "reorged out" : "back on chain");
+            /* SF-followup #145: mirror LSP-side reset from PR #208.  When the
+               funding is reported reorged out, any in-memory sub-factory
+               chain advance state is stale and must not be referenced by
+               subsequent operations.  Reset only on frozen=1; the unfreeze
+               path (frozen=0, funding back on chain) leaves the now-empty
+               chain in place — caller can re-advance from chain[0] if
+               desired. */
+            if (frozen && g_client_active_factory) {
+                int n_reset = factory_reset_all_subfactory_chains(
+                    g_client_active_factory);
+                if (n_reset > 0)
+                    fprintf(stderr, "Client: reset ps_chain_len on %d "
+                            "sub-factor(ies) after funding reorg\n", n_reset);
+            }
             if (msg->json) cJSON_Delete(msg->json);
             msg->json = NULL;
             continue;  /* notification, wait for next real message */
@@ -1577,7 +1603,9 @@ int client_run_with_channels(secp256k1_context *ctx,
                 "%llu sats.\n", (unsigned long long)funding_amount);
     }
 
-    /* Build factory locally (heap — factory_t is ~3MB) */
+    /* Build factory locally (heap — factory_t is ~3MB).
+       SF-followup #145: factory ptr is registered with g_client_active_factory
+       once it's initialized below, so MSG_FUNDING_REORG can find it. */
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
@@ -1587,6 +1615,10 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
+    /* SF-followup #145: register active factory so MSG_FUNDING_REORG handler
+       can reset sub-factory chain state.  Cleared at all factory_free paths
+       below. */
+    g_client_active_factory = factory;
 
     /* Log the economic terms the client is about to sign.  The client
        should review these before proceeding — once the tree is signed,
@@ -2177,6 +2209,9 @@ int client_run_reconnect(secp256k1_context *ctx,
         free(factory);
         return 0;
     }
+    /* SF-followup #145: register active factory for MSG_FUNDING_REORG reset
+       (mirror of LSP-side #208). */
+    g_client_active_factory = factory;
 
     /* 2. Determine my_index by matching pubkey against factory->pubkeys[] */
     uint32_t my_index = 0;
