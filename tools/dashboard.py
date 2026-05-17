@@ -538,56 +538,132 @@ def _collect_one_db(path):
     return out
 
 
+def _merge_client_dbs(dbs):
+    """Merge multiple client.db dicts into one aggregate.  Used only by
+    the explicit View All POV (operator audit mode) — never the default.
+
+    Merge rules: list-typed feeds concatenate; scalar counters sum;
+    dict-typed feeds (old_commitments_coverage) sum their numeric inner
+    fields; booleans are OR'd."""
+    merged = {}
+    for per in dbs:
+        if per.get("error"):
+            continue
+        for k, v in per.items():
+            existing = merged.get(k)
+            if isinstance(v, list):
+                if existing is None:
+                    merged[k] = list(v)
+                else:
+                    existing.extend(v)
+            elif isinstance(v, bool):
+                merged[k] = bool(existing) or v
+            elif isinstance(v, (int, float)):
+                merged[k] = (existing or 0) + v
+            elif isinstance(v, dict):
+                target = existing if isinstance(existing, dict) else {}
+                for ik, iv in v.items():
+                    if isinstance(iv, bool):
+                        target[ik] = bool(target.get(ik)) or iv
+                    elif isinstance(iv, (int, float)):
+                        target[ik] = target.get(ik, 0) + iv
+                    else:
+                        target.setdefault(ik, iv)
+                merged[k] = target
+            else:
+                if existing in (None, ""):
+                    merged[k] = v
+    return merged
+
+
 def collect_databases(cfg, selected_pov=None):
-    """Read lsp.db (singular) + the SELECTED client.db and return a
-    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id}
-    dict.
+    """Read lsp.db + render the SELECTED POV.  Returns
+    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id,
+     "pov_mode": "lsp"|"client"|"view_all"}.
 
-    Multi-client invocations (operator/audit) populate `povs` with one
-    entry per --client-db, plus an "lsp" entry for the LSP-only view.
-    `client` holds ONLY the selected POV's data — never an aggregate
-    across users.  This was an intentional pivot from the earlier merge
-    design: aggregating client.dbs leaks who-saw-what across user
-    boundaries even for operators, and the goal here is "switch between
-    POVs," not "fuse them."
+    POV semantics:
+      lsp        — render lsp.db panels; client-side panels show "n/a from
+                   LSP POV" placeholders.  data["client"] is empty.
+      client_N   — render what client_N could see from their own client.db
+                   alone; LSP-internal panels show "n/a from client POV"
+                   placeholders.  data["client"] = collect_one_db(client_N).
+      view_all   — operator audit mode.  Render everything: lsp.db plus
+                   ALL client.dbs merged into data["client"].  Only
+                   available when N>1 --client-db.
 
-    Single --client-db invocations: `povs` has just that one entry, the
-    UI doesn't render a switcher, behavior is unchanged from
-    pre-multi-client-db days.
+    Defaults: N=0 → lsp (no choice).  N=1 → client_0 (production end-user
+    case — they want to see their own data, not the LSP's).  N>1 → lsp
+    (operator starts with the LSP's authoritative view).
 
-    `selected_pov` is "lsp" (LSP-only) or "client_N" (Nth --client-db
-    in argv order).  Defaults to the first client when --client-db was
-    given, else "lsp"."""
-    data = {"lsp": _collect_one_db(cfg.lsp_db), "client": {}}
+    pov_mode is the COARSE label the JS uses to scope panels: "lsp" for
+    the LSP-only POV, "client" for any per-client POV, "view_all" for
+    the aggregated audit view.  Cleaner for the panel guards than
+    string-matching on selected_pov.id."""
+    # lsp.db is OPTIONAL.  A trustless end-user runs the dashboard with
+    # only their own --client-db; the LSP doesn't expose its lsp.db to
+    # clients (and shouldn't — read access to lsp.db would let one client
+    # see other clients' state).  When --lsp-db isn't reachable the
+    # dashboard skips LSP-side feeds; client-only panels render from
+    # client.db alone.
+    has_lsp = bool(cfg.lsp_db) and os.path.exists(str(cfg.lsp_db))
+    data = {"lsp": _collect_one_db(cfg.lsp_db) if has_lsp else {"error": "not configured"},
+            "client": {}}
+    data["client_only_mode"] = not has_lsp
 
-    # Build POV menu.  Each entry: {"id", "label", "source"}.
+    # Build POV menu.  Each entry: {"id", "label", "source", "mode"}.
+    # "mode" is what the JS guards key off; it collapses N client POVs
+    # into one "client" label so panel scope rules stay simple.
     povs = []
     if cfg.client_dbs:
-        # Show "LSP-only" as an explicit option when multiple clients exist
-        # (operator's first instinct is often "look at the LSP's truth
-        # before drilling into a specific client's POV").  Single-client
-        # case skips this — that's the only entry anyway.
-        if len(cfg.client_dbs) > 1:
-            povs.append({"id": "lsp", "label": "LSP-only view (no client data)",
-                         "source": None})
+        # LSP-only POV: only available when --lsp-db is reachable AND
+        # there are multiple client.dbs (operator audit).  Skipped in
+        # production end-user mode and in client-only mode.
+        if has_lsp and len(cfg.client_dbs) > 1:
+            povs.append({"id": "lsp", "label": "LSP POV",
+                         "source": None, "mode": "lsp"})
         for i, cdb in enumerate(cfg.client_dbs):
             base = os.path.basename(str(cdb))
-            label = base if len(cfg.client_dbs) > 1 else "Client"
-            povs.append({"id": f"client_{i}", "label": label, "source": cdb})
+            label = base if len(cfg.client_dbs) > 1 else f"Client ({base})"
+            povs.append({"id": f"client_{i}", "label": label,
+                         "source": cdb, "mode": "client"})
+        # View All only meaningful with multiple client.dbs AND lsp.db
+        # (so we have both sides to merge).
+        if has_lsp and len(cfg.client_dbs) > 1:
+            povs.append({"id": "view_all",
+                         "label": "View All (operator — all clients merged)",
+                         "source": None, "mode": "view_all"})
     data["povs"] = povs
 
     if not povs:
         data["client"]["error"] = "not configured"
-        data["selected_pov"] = None
+        data["selected_pov"] = "lsp"
+        data["pov_mode"] = "lsp"
         return data
 
-    # Resolve selected POV.  Falls back to first entry if the caller asked
-    # for an unknown id (browser cached an id that no longer exists, etc.).
-    selected = next((p for p in povs if p["id"] == selected_pov), povs[0])
+    # Default selection: client_0 when there's just one client (production
+    # end-user case wants their POV).  LSP-first when multiple clients +
+    # lsp.db (operator audit case starts on the authoritative LSP view).
+    # In client-only mode (no lsp.db), default is the first client.
+    if len(cfg.client_dbs) == 1 or not has_lsp:
+        default_id = "client_0"
+    else:
+        default_id = "lsp"
+    selected = next((p for p in povs if p["id"] == selected_pov),
+                    next((p for p in povs if p["id"] == default_id), povs[0]))
     data["selected_pov"] = selected["id"]
-    if selected["source"]:
+    data["pov_mode"] = selected["mode"]
+
+    if selected["mode"] == "view_all":
+        # Aggregate all client.dbs.  Documented as explicit opt-in operator
+        # mode in the UI — the dropdown label spells out "operator — all
+        # clients merged" so this is never how an end-user dashboard would
+        # render by default.
+        per_dbs = [_collect_one_db(cdb) for cdb in cfg.client_dbs]
+        data["client"] = _merge_client_dbs(per_dbs)
+        data["client"]["_view_all_sources"] = [str(c) for c in cfg.client_dbs]
+    elif selected["source"]:
         data["client"] = _collect_one_db(selected["source"])
-    # else: LSP-only — data["client"] stays empty.
+    # else (mode == "lsp"): data["client"] stays empty.
     return data
 
 def collect_cln(cfg):
@@ -1463,18 +1539,19 @@ function rOverview(D){
   h+=`<div class="kv">`;
   for(const d of dwc)h+=`<div class="ki"><span class="k">Factory #${d.factory_id}</span><span class="v">epoch=${d.current_epoch} layers=${d.n_layers} states=[${d.layer_states}]</span></div>`;
   h+=`</div></div>`;}
- // ID Counters (Phase 23)
- const idc=lsp.id_counters||[];
- if(idc.length){h+=`<div class="s"><div class="st"><span>ID Counters</span><span class="c">${idc.length}</span></div>`;
-  h+=`<div class="kv">`;
-  for(const c of idc)h+=`<div class="ki"><span class="k">${c.name}</span><span class="v">${c.value}</span></div>`;
-  h+=`</div></div>`;}
- // PR #181 Phase B consumer: signing_rounds journal summary.  Renders
- // when the table exists (schema v26+); silent against pre-#181 LSPs
- // where total=0 from the graceful-fallback collector.
+ // ID Counters (Phase 23) — LSP-internal schema bookkeeping.
+ if(isLSPVisible()){
+  const idc=lsp.id_counters||[];
+  if(idc.length){h+=`<div class="s"><div class="st"><span>ID Counters</span><span class="c">${idc.length}</span></div>`;
+   h+=`<div class="kv">`;
+   for(const c of idc)h+=`<div class="ki"><span class="k">${c.name}</span><span class="v">${c.value}</span></div>`;
+   h+=`</div></div>`;}
+ }
+ // PR #181 Phase B consumer: signing_rounds journal summary.  LSP-internal
+ // aggregate across every client's ceremonies — hide for client POV.
  const srs=lsp.signing_rounds_summary||{};
  const srRecent=lsp.signing_rounds_recent||[];
- if((srs.total||0)>0){
+ if(isLSPVisible() && (srs.total||0)>0){
   h+=`<div class="s"><div class="st"><span>Signing Rounds Journal</span><span class="c">${srs.total} ceremonies across ${srs.types} type(s)</span></div>`;
   h+=`<div class="kv" style="margin-bottom:8px">`;
   h+=`<div class="ki"><span class="k">Success</span><span class="b ok">${srs.success||0}</span></div>`;
@@ -1498,8 +1575,12 @@ function rOverview(D){
   }
   h+=`</div>`;
  }
- // Channels summary
- const chs=lsp.channels||[];
+ // Channels summary \u2014 per-POV source.  In client POV, cl.channels holds
+ // only that client's own channel row, so the operator sees what one
+ // user would: just their channel.
+ const ovIsClient=povMode==='client';
+ const cl=db.client||{};
+ const chs=(ovIsClient?cl.channels:lsp.channels)||[];
  h+=`<div class="s"><div class="st"><span>Channels</span><span class="c">${chs.length}</span></div>`;
  if(!chs.length)h+=`<p class="mu">No channels</p>`;
  else{h+=`<table><tr><th>CH</th><th>Slot</th><th class="r">Local</th><th class="r">Remote</th><th style="min-width:60px">Bal</th><th class="r">Commits</th><th>State</th></tr>`;
@@ -1507,8 +1588,8 @@ function rOverview(D){
    h+=`<tr><td>${c.id}</td><td>${c.slot??'\u2014'}</td><td class="r">${fs(l)}</td><td class="r">${fs(r)}</td><td>${bar(l,r)}</td><td class="r">${c.commitment_number??'?'}</td><td>${sb(c.state)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
- // JIT Channels summary
- const jits=lsp.jit_channels||[];
+ // JIT Channels summary \u2014 same per-POV source.
+ const jits=(ovIsClient?cl.jit_channels:lsp.jit_channels)||[];
  h+=`<div class="s"><div class="st"><span>JIT Channels</span><span class="c">${jits.length}</span></div>`;
  if(!jits.length)h+=`<p class="mu">No active JIT channels</p>`;
  else{h+=`<table><tr><th>JIT ID</th><th>Client</th><th>State</th><th>Funding TXID</th><th class="r">Amount</th><th class="r">Local</th><th class="r">Remote</th><th>Created</th></tr>`;
@@ -1516,14 +1597,18 @@ function rOverview(D){
    h+=`<tr><td>0x${(j.jit_channel_id||0).toString(16)}</td><td>${j.client_idx}</td><td>${sb(j.state)}</td><td class="h">${th(j.funding_txid)}</td><td class="r">${fs(j.funding_amount)}</td><td class="r">${fs(j.local_amount)}</td><td class="r">${fs(j.remote_amount)}</td><td>${ta(j.created_at)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
- // CLN summary
- h+=`<div class="g2">`;
- for(const[k,lb]of[['a','CLN Node A'],['b','CLN Node B']]){
-  const n=cln[k]||{}; h+=`<div class="s"><div class="st">${lb}</div>`;
-  if(!n.available)h+=`<p class="mu">Unavailable</p>`;
-  else{h+=`<div class="kv"><div class="ki"><span class="k">ID</span><span class="v h">${th(n.id)}</span></div><div class="ki"><span class="k">Peers</span><span class="v">${n.num_peers||0}</span></div><div class="ki"><span class="k">Channels</span><span class="v">${n.num_channels||0}</span></div></div>`;}
-  h+=`</div>`;}
- h+=`</div>`;
+ // CLN summary — LSP-side infrastructure.  A real client doesn't know
+ // about the LSP's CLN nodes (they only interact via Lightning routing
+ // through their own LN node, if any).  Hide in client POV.
+ if(isLSPVisible()){
+  h+=`<div class="g2">`;
+  for(const[k,lb]of[['a','CLN Node A'],['b','CLN Node B']]){
+   const n=cln[k]||{}; h+=`<div class="s"><div class="st">${lb}</div>`;
+   if(!n.available)h+=`<p class="mu">Unavailable</p>`;
+   else{h+=`<div class="kv"><div class="ki"><span class="k">ID</span><span class="v h">${th(n.id)}</span></div><div class="ki"><span class="k">Peers</span><span class="v">${n.num_peers||0}</span></div><div class="ki"><span class="k">Channels</span><span class="v">${n.num_channels||0}</span></div></div>`;}
+   h+=`</div>`;}
+  h+=`</div>`;
+ }
  return h;
 }
 
@@ -1716,6 +1801,13 @@ function rPsChains(D){
 
 // === TAB: Factory ===
 function rFactory(D){
+ // Factory tab renders the LSP's view of the tree topology — every node
+ // signed, every PS chain entry, every ladder factory, the DW counter
+ // state.  A real client holds only their leaf path + their PS chain;
+ // they don't have the full tree.  V1 hides the tab for client POV.
+ // Future work: a "client view" mode could surface just the leaf path
+ // from the client's own tree_nodes copies in client.db.
+ if(!isLSPVisible())return naPanel("Factory tab renders the LSP's full tree topology (every node signed, every PS chain entry, every ladder factory).  A real client only holds their own leaf path through the tree — not the aggregate.  Future client view mode will surface just that subset.");
  const db=D.databases||{},lsp=db.lsp||{},facs=lsp.factories||[],parts=lsp.participants||[];
  let h=rConfig(D);
  // Polish item 4: per-factory isolation selector.  When the deployment has
@@ -1876,9 +1968,19 @@ function rFactory(D){
 
 // === TAB: Channels & HTLCs ===
 function rChannels(D){
- const db=D.databases||{},lsp=db.lsp||{},chs=lsp.channels||[],htlcs=lsp.htlcs||[];
- const revMap={};(lsp.revocations_by_channel||[]).forEach(r=>revMap[r.channel_id]=r.cnt);
- const nMap={};(lsp.nonce_pools||[]).forEach(n=>{if(!nMap[n.channel_id])nMap[n.channel_id]={};nMap[n.channel_id][n.side]=n.next_index;});
+ const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
+ // Per-POV source switching.  In client POV the client.db holds only that
+ // client's own channel + their HTLCs + their JIT — render from cl.* so
+ // the tab is faithful to what a single user actually has visibility
+ // into.  LSP POV / View All keep the LSP's authoritative aggregate.
+ // Invoice Registry and HTLC Origins are LSP-internal feeds (the LSP's
+ // view of which client invoices map to bridge HTLCs); only render those
+ // in LSP / View All.
+ const isClient=povMode==='client';
+ const chs=(isClient?cl.channels:lsp.channels)||[];
+ const htlcs=(isClient?cl.htlcs:lsp.htlcs)||[];
+ const revMap={};((isClient?cl.revocations_by_channel:lsp.revocations_by_channel)||[]).forEach(r=>revMap[r.channel_id]=r.cnt);
+ const nMap={};((isClient?cl.nonce_pools:lsp.nonce_pools)||[]).forEach(n=>{if(!nMap[n.channel_id])nMap[n.channel_id]={};nMap[n.channel_id][n.side]=n.next_index;});
  let h='';
  h+=`<div class="s"><div class="st"><span>Channels (LSP \u2194 Clients)</span><span class="c">${chs.length}</span></div>`;
  if(!chs.length)h+=`<p class="mu">No channels</p>`;
@@ -1887,8 +1989,9 @@ function rChannels(D){
    h+=`<tr><td>${c.id}</td><td>${c.slot??'\u2014'}</td><td class="r">${fs(l)}</td><td class="r">${fs(rm)}</td><td class="r">${fs(c.funding_amount)}</td><td>${bar(l,rm)}</td><td class="r">${c.commitment_number??'?'}</td><td class="r">${revMap[c.id]??0}</td><td>${np.local??'?'} / ${np.remote??'?'}</td><td>${sb(c.state)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
- // JIT Channels detail
- const jits=lsp.jit_channels||[];
+ // JIT Channels detail — also per-POV: client.db only knows about JIT
+ // channels the client is a counterparty to.
+ const jits=(isClient?cl.jit_channels:lsp.jit_channels)||[];
  h+=`<div class="s"><div class="st"><span>JIT Channels (Standalone 2-of-2)</span><span class="c">${jits.length}</span></div>`;
  if(!jits.length)h+=`<p class="mu">No JIT channels</p>`;
  else{h+=`<table><tr><th>JIT ID</th><th>Client</th><th>State</th><th>Funding TXID</th><th class="r">Amount</th><th class="r">Local</th><th class="r">Remote</th><th style="min-width:60px">Balance</th><th class="r">Commits</th><th>Target</th><th>Created</th></tr>`;
@@ -1914,7 +2017,7 @@ function rChannels(D){
  // extracted from the adapted signature) \u2014 column count is smaller as
  // a result.  Section is parallel to HTLCs above so operators can
  // compare HTLC vs PTLC activity at a glance.
- const ptlcs=lsp.ptlcs||[];
+ const ptlcs=(isClient?cl.ptlcs:lsp.ptlcs)||[];
  h+=`<div class="s"><div class="st"><span>PTLCs</span><span class="c h-ptlc">point-locked (Taproot)</span><span class="c">${ptlcs.length}</span></div>`;
  if(!ptlcs.length)h+=`<p class="mu">No PTLCs</p>`;
  else{h+=`<table><tr><th>CH</th><th>#</th><th>Dir</th><th class="r">Amount</th><th>State</th><th class="r">CLTV</th><th>Payment Point</th></tr>`;
@@ -1922,18 +2025,35 @@ function rChannels(D){
    h+=`<tr><td>${x.channel_id}</td><td>${x.ptlc_id??'\u2014'}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td>${sb(x.state)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td><td class="h">${th(x.payment_point)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
- // Invoice Registry (Phase 23)
- const invReg=lsp.invoice_registry||[];
- if(invReg.length){h+=`<div class="s"><div class="st"><span>Invoice Registry</span><span class="c">${invReg.length}</span></div>`;
-  h+=`<table><tr><th>ID</th><th>Dest</th><th class="r">Amount (msat)</th><th>Bridge HTLC</th><th>Active</th><th>Payment Hash</th><th>Created</th></tr>`;
-  for(const iv of invReg)h+=`<tr><td>${iv.id}</td><td>Client ${iv.dest_client}</td><td class="r">${iv.amount_msat?.toLocaleString()??'\u2014'}</td><td>${iv.bridge_htlc_id||'\u2014'}</td><td>${iv.active?'\u2705':'\u274C'}</td><td class="h">${th(iv.payment_hash)}</td><td>${ta(iv.created_at)}</td></tr>`;
-  h+=`</table></div>`;}
- // HTLC Origins (Phase 23)
- const htlcOrig=lsp.htlc_origins||[];
- if(htlcOrig.length){h+=`<div class="s"><div class="st"><span>HTLC Origins</span><span class="c">${htlcOrig.length}</span></div>`;
-  h+=`<table><tr><th>ID</th><th>Bridge HTLC</th><th>Request</th><th>Sender</th><th>Sender HTLC</th><th>Active</th><th>Payment Hash</th></tr>`;
-  for(const o of htlcOrig)h+=`<tr><td>${o.id}</td><td>${o.bridge_htlc_id||'\u2014'}</td><td>${o.request_id||'\u2014'}</td><td>${o.sender_idx}</td><td>${o.sender_htlc_id||'\u2014'}</td><td>${o.active?'\u2705':'\u274C'}</td><td class="h">${th(o.payment_hash)}</td></tr>`;
-  h+=`</table></div>`;}
+  // Invoice Registry (LSP-side mapping of client invoices \u2194 bridge HTLCs).
+ // Clients hold their own invoices via cl.client_invoices below; the
+ // registry that maps them to bridge HTLCs is LSP-internal \u2014 only render
+ // in LSP / View All.
+ if(isLSPVisible()){
+  const invReg=lsp.invoice_registry||[];
+  if(invReg.length){h+=`<div class="s"><div class="st"><span>Invoice Registry</span><span class="c">${invReg.length}</span></div>`;
+   h+=`<table><tr><th>ID</th><th>Dest</th><th class="r">Amount (msat)</th><th>Bridge HTLC</th><th>Active</th><th>Payment Hash</th><th>Created</th></tr>`;
+   for(const iv of invReg)h+=`<tr><td>${iv.id}</td><td>Client ${iv.dest_client}</td><td class="r">${iv.amount_msat?.toLocaleString()??'\u2014'}</td><td>${iv.bridge_htlc_id||'\u2014'}</td><td>${iv.active?'\u2705':'\u274C'}</td><td class="h">${th(iv.payment_hash)}</td><td>${ta(iv.created_at)}</td></tr>`;
+   h+=`</table></div>`;}
+ }
+ // Client-side invoice table (cl.client_invoices) \u2014 visible in client +
+ // View All POVs.  In production end-user mode this is the only invoice
+ // section that should render (each user only knows about their own).
+ if(isClientVisible()){
+  const ci=cl.client_invoices||[];
+  if(ci.length){h+=`<div class="s"><div class="st"><span>My Invoices</span><span class="c">${ci.length}</span></div>`;
+   h+=`<table><tr><th>ID</th><th class="r">Amount (msat)</th><th>Payment Hash</th><th>Created</th></tr>`;
+   for(const iv of ci)h+=`<tr><td>${iv.id}</td><td class="r">${iv.amount_msat?.toLocaleString()??'\u2014'}</td><td class="h">${th(iv.payment_hash)}</td><td>${ta(iv.created_at)}</td></tr>`;
+   h+=`</table></div>`;}
+ }
+ // HTLC Origins is LSP-internal forwarding metadata.
+ if(isLSPVisible()){
+  const htlcOrig=lsp.htlc_origins||[];
+  if(htlcOrig.length){h+=`<div class="s"><div class="st"><span>HTLC Origins</span><span class="c">${htlcOrig.length}</span></div>`;
+   h+=`<table><tr><th>ID</th><th>Bridge HTLC</th><th>Request</th><th>Sender</th><th>Sender HTLC</th><th>Active</th><th>Payment Hash</th></tr>`;
+   for(const o of htlcOrig)h+=`<tr><td>${o.id}</td><td>${o.bridge_htlc_id||'\u2014'}</td><td>${o.request_id||'\u2014'}</td><td>${o.sender_idx}</td><td>${o.sender_htlc_id||'\u2014'}</td><td>${o.active?'\u2705':'\u274C'}</td><td class="h">${th(o.payment_hash)}</td></tr>`;
+   h+=`</table></div>`;}
+ }
  return h;
 }
 
@@ -2075,6 +2195,12 @@ function rPayments(D){
 
 // === TAB: Protocol Log ===
 function rProtocol(D){
+ // wire_messages is the LSP's full P2P protocol log — every NOISE message
+ // it exchanged with every client.  A real client only sees their own
+ // exchanges, not the LSP's full firehose.  Likewise the Events feed is
+ // derived from lsp.db (broadcast_log, breach_detections, etc.) which
+ // clients don't hold.  Hide for client POV.
+ if(!isLSPVisible())return naPanel("Protocol Log shows the LSP's full NOISE wire-message firehose (all clients' exchanges) plus the events feed derived from lsp.db.  Real clients only see their own exchanges, not the LSP's aggregate log.");
  const db=D.databases||{},lsp=db.lsp||{},msgs=lsp.wire_messages||[];
  let h='';
  // Events section (formerly the standalone Events tab — merged here so the
@@ -2182,6 +2308,12 @@ function rLightning(D){
 
 // === TAB: Watchtower ===
 function rWatchtower(D){
+ // Watchtower is LSP-internal: tracks every client's old_commitments,
+ // detected breaches, reorg events, pending penalty TXs in mempool,
+ // and the broadcast log.  A real client has no visibility into ANY of
+ // this — they only know about their own channel state.  Surface that
+ // honestly: client POV → placeholder; LSP / View All → real content.
+ if(!isLSPVisible())return naPanel("Watchtower is LSP-internal — it tracks every client's revoked commitments, breach detections across all channels, pending penalty TXs, and the full broadcast log.  Real clients have no visibility into other clients' state or the LSP's response chain.");
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  let h='';
  h+=`<div class="s"><div class="st">Watchtower + Revocations</div>`;
@@ -2448,6 +2580,11 @@ function rTxInventory(D){
 //                             jit_*, rotation_*, ...).
 //   - presence of signed bytes in their respective tables = "ready" tile.
 function rOutcomes(D){
+ // Outcomes scenarios + Recent Broadcasts are sourced from lsp.db's
+ // broadcast_log, signing_rounds_recent, and breach_detections — all
+ // LSP-side aggregates a real client doesn't hold.  Hide for client
+ // POV.
+ if(!isLSPVisible())return naPanel("Outcomes tiles fire off lsp.db sources (broadcast_log, signing_rounds, breach_detections) — the LSP's aggregate view of which protocol scenarios have exercised across all clients.  Real clients only know about events on their own channel.");
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  const log=lsp.broadcast_log||[];
  const sr=lsp.signing_rounds_recent||[];
@@ -2643,6 +2780,21 @@ function rOutcomes(D){
 // covers 6 tiles with clean DB data sources (see
 // DEFENSE_STATUS_PANEL_DESIGN.md in the local working area).
 function rDefenseStatus(D){
+ // Per-tile POV scoping.  Each push uses scope='client'|'lsp'|'shared' to
+ // mark whether a real client could verify the defense from their own
+ // client.db (vs needing lsp.db internals).  Client POV renders only
+ // 'client' + 'shared' tiles; LSP/View All render everything.  Mapping
+ // (per SuperScalar trustless-model spec):
+ //
+ //   #1  LSP disappears                  → client (factory tree TXs they hold)
+ //   #4  Old PS chain published          → client (their pre-signed poison TX)
+ //   #5  CLTV timeout / LSP gone         → client (their distribution TX)
+ //   #14 Double-spend on PS leaf advance → client (client_ps_signed_inputs)
+ //   #2  Channel breach                  → lsp    (watchtower runs LSP-side)
+ //   #7  LSP crash mid-ceremony          → lsp    (signing_progress table)
+ //   #15 PS chain[0] bytes lost          → lsp    (LSP persistence concern)
+ //   #8  Fee-spike CPFP defense          → lsp    (LSP wallet CPFP budget)
+ //   #13 LSP wallet UTXO budget          → lsp    (LSP wallet)
  const db=D.databases||{},lsp=db.lsp||{},cl=db.client||{};
  const tn=lsp.tree_nodes||[];
  const psChain=lsp.ps_leaf_chains||[];
@@ -2688,7 +2840,7 @@ function rDefenseStatus(D){
   else{color='red'; status=`${treeSigned}/${treeTotal} nodes signed — ${treeTotal-treeSigned} unsigned`;}
   tiles.push({n:'#1',icon:'🚪',name:'LSP disappears',
    defense:'Pre-signed factory tree — any client broadcasts the path',
-   status,color,source:'tree_nodes.is_signed',
+   status,color,source:'tree_nodes.is_signed',scope:'client',
    risk:'Clients trapped; no unilateral exit possible'});
  }
 
@@ -2704,7 +2856,7 @@ function rDefenseStatus(D){
   else{color='red'; status=`${psHave}/${psTot} (${pct}%) — poison TX missing`;}
   tiles.push({n:'#4',icon:'🛡',name:'Old PS chain published',
    defense:'Pre-signed poison TX redistributes L-stock/sales-stock to clients',
-   status,color,source:'ps_*_chains.poison_tx_hex',
+   status,color,source:'ps_*_chains.poison_tx_hex',scope:'client',
    risk:'LSP keeps stolen liquidity; watchtower cannot intervene'});
  }
 
@@ -2719,7 +2871,7 @@ function rDefenseStatus(D){
   else{color='grey'; status='no client DB / no factories the client is in';}
   tiles.push({n:'#5',icon:'⏱',name:'CLTV timeout / LSP gone',
    defense:'Distribution TX — any client broadcasts at timeout (inverted-timelock)',
-   status,color,source:'distribution_txs (client.db)',
+   status,color,source:'distribution_txs (client.db)',scope:'client',
    risk:'Funds unrecoverable at CLTV without LSP cooperation'});
  }
 
@@ -2737,7 +2889,7 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#7',icon:'⚙',name:'LSP crash mid-ceremony',
    defense:'signing_progress snapshot allows resume; cleared on success',
-   status,color,source:'signing_progress',
+   status,color,source:'signing_progress',scope:'lsp',
    risk:'Stuck ceremony or wasted nonce — usually recoverable on restart'});
  }
 
@@ -2752,7 +2904,7 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#14',icon:'🚫',name:'Double-spend on PS leaf advance',
    defense:'client_ps_signed_inputs records each parent; refuses conflicting sign',
-   status,color,source:'client_ps_signed_inputs',
+   status,color,source:'client_ps_signed_inputs',scope:'client',
    risk:'LSP signs two TXs for same parent UTXO → wallet inconsistency'});
  }
 
@@ -2770,7 +2922,7 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#15',icon:'🧬',name:'PS chain[0] bytes lost on restart',
    defense:'ps_initial_signed_states persists chain[0] per PS leaf/sub-factory',
-   status,color,source:'ps_initial_signed_states',
+   status,color,source:'ps_initial_signed_states',scope:'lsp',
    risk:'Force-close fails with -25 bad-txns-inputs-missingorspent indefinitely'});
  }
 
@@ -2799,7 +2951,7 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#8',icon:'⛽',name:'Fee-spike CPFP defense',
    defense:'P2A + CPFP child + deadline-aware budget sweeper re-bumps per block',
-   status,color,source:'watchtower_pending (cycles_in_mempool, bump_count)',
+   status,color,source:'watchtower_pending (cycles_in_mempool, bump_count)',scope:'lsp',
    risk:'Stuck TX loses DW race; old state confirms; cheater succeeds'});
  }
 
@@ -2838,7 +2990,7 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#13',icon:'💰',name:'LSP wallet UTXO budget',
    defense:'Pre-split wallet UTXOs allow one CPFP child per in-flight close',
-   status,color,source:'bitcoin-cli listunspent',
+   status,color,source:'bitcoin-cli listunspent',scope:'lsp',
    risk:'Mass force-close exhausts CPFP slots; later TXs stall, lose DW race'});
  }
 
@@ -2870,15 +3022,25 @@ function rDefenseStatus(D){
   }
   tiles.push({n:'#2',icon:'⚔',name:'Channel breach (revoked commit)',
    defense:'Pre-signed penalty TX sweeps both outputs using revocation secret',
-   status,color,source:'old_commitments.signed_penalty_tx_hex',
+   status,color,source:'old_commitments.signed_penalty_tx_hex',scope:'lsp',
    risk:'Cheater wins disputed balance if LSP restarts before broadcast'});
  }
 
+ // Filter tiles by POV.  Client POV sees only 'client'-scoped + 'shared'
+ // tiles (failure modes a single user can verify from their own
+ // client.db: factory tree path, their poison TX, their distribution TX,
+ // their double-spend defense).  LSP / View All see everything.
+ const visibleTiles=tiles.filter(t=>{
+  if(t.scope==='shared')return true;
+  if(t.scope==='client')return isClientVisible();
+  return isLSPVisible();  // default + 'lsp'
+ });
+
  // ---- Aggregate header ----
- const greenCount=tiles.filter(t=>t.color==='green').length;
- const yellowCount=tiles.filter(t=>t.color==='yellow').length;
- const redCount=tiles.filter(t=>t.color==='red').length;
- const greyCount=tiles.filter(t=>t.color==='grey').length;
+ const greenCount=visibleTiles.filter(t=>t.color==='green').length;
+ const yellowCount=visibleTiles.filter(t=>t.color==='yellow').length;
+ const redCount=visibleTiles.filter(t=>t.color==='red').length;
+ const greyCount=visibleTiles.filter(t=>t.color==='grey').length;
  const counted=greenCount+yellowCount+redCount;
  const pct=counted?Math.round(100*greenCount/counted):0;
  const aggCls=redCount>0?'b dn':yellowCount>0?'b w':counted>0?'b ok':'b i';
@@ -2897,7 +3059,7 @@ function rDefenseStatus(D){
 
  // ---- Tile grid ----
  h+=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:8px">`;
- for(const t of tiles){
+ for(const t of visibleTiles){
   const borderColor=t.color==='green'?'#3fb950':t.color==='yellow'?'#d29922':t.color==='red'?'#f85149':'#30363d';
   const statusCls=t.color==='green'?'b ok':t.color==='yellow'?'b w':t.color==='red'?'b dn':'b i';
   h+=`<div style="border:1px solid ${borderColor};border-radius:6px;padding:10px 12px;background:#0d1117">`;
@@ -2911,12 +3073,11 @@ function rDefenseStatus(D){
  h+=`</div>`;
 
  // ---- Failure-mode taxonomy reference ----
- // Operators see numbered tiles (#1, #4, #5, ...) and reasonably wonder
- // "what about #2, #3, #6 — are those also defended?  forgotten?  not
- // surfaced for a reason?"  This expandable section documents every
- // failure mode in the 15-mode SuperScalar trustless taxonomy, marking
- // which are surfaced as tiles above and explaining the rationale for
- // each one that isn't.
+ // Operator orientation panel covering the full 15-mode trustless model.
+ // Clients don't need the full taxonomy — they only care about the
+ // failure modes they themselves can defend against — so hide for
+ // client POV.
+ if(isLSPVisible()){
  const surfaced=new Set(tiles.map(t=>t.n));
  const taxonomy=[
   {n:'#1', name:'LSP disappears',                              status:'tile above'},
@@ -2946,6 +3107,7 @@ function rDefenseStatus(D){
  }
  h+=`</table>`;
  h+=`</details>`;
+ }  // end isLSPVisible() guard for taxonomy reference
 
  return h;
 }
@@ -2964,6 +3126,11 @@ function rDefenseStatus(D){
 // sent to each client at the same timestamp) collapse into one ceremony
 // entry.
 function rCeremonies(D){
+ // Ceremonies (signing_rounds journal + reconstructed-from-wire view)
+ // are LSP-internal.  A client participates in their own ceremonies but
+ // doesn't persist the LSP's journal table or see other clients'
+ // rounds.  Hide for client POV.
+ if(!isLSPVisible())return naPanel("Ceremonies are LSP-internal bookkeeping — the signing_rounds journal logs every ceremony across every client.  A real client only knows about ceremonies they participated in (their own commitment signing, their leaf advance), not the aggregate.");
  const db=D.databases||{},lsp=db.lsp||{};
  // PR #182 collector exposes the new signing_rounds journal (schema v26
  // from PR #181).  When available, render it as the primary source for
@@ -3205,10 +3372,29 @@ function render(D){
 }
 // POV switcher state (operator-mode only).  Lives at module scope so it
 // survives between refreshes.  Empty string = let the server pick the
-// default (first --client-db, or "lsp" when none).  Updated by setPov()
-// from the dropdown change handler.
+// default (LSP when N>1, the one client when N=1, none when N=0).
+// Updated by setPov() from the dropdown change handler.
 let curPov='';
-function setPov(p){curPov=p;refresh();}
+let povMode='lsp';  // 'lsp' | 'client' | 'view_all' — mirrors D.pov_mode
+let clientOnlyMode=false;  // mirrors D.databases.client_only_mode
+async function setPov(p){curPov=p;await refresh();}
+// Panel-scope guards.  Each tab's render function checks these at the
+// top and either renders content or returns naPanel().  The principle:
+// render only what THIS POV would actually have visibility into.  Real
+// clients don't see lsp.db (wire_messages, breach_detections, etc.); LSP
+// POV has no per-client client.db rows.  View All sees everything.
+function isLSPVisible(){return povMode==='lsp'||povMode==='view_all';}
+function isClientVisible(){return povMode==='client'||povMode==='view_all';}
+function naPanel(why){
+ // Client-only mode (dashboard launched without --lsp-db, the trustless
+ // production end-user case): the dropdown doesn't even offer an LSP
+ // POV.  Adjust the hint text so users aren't told to "switch POV" when
+ // no such switch exists.
+ const hint = clientOnlyMode
+   ? '  This dashboard is running in client-only mode (no --lsp-db reachable) — these panels are intentionally hidden.'
+   : '  Switch POV in the header dropdown to view.';
+ return `<div class="s" style="opacity:0.6"><div class="st"><span style="color:#8b949e">— Not visible in this POV —</span></div><p class="mu" style="font-size:11px;margin-top:4px">${why}${hint}</p></div>`;
+}
 function renderPovSelector(D){
  const sel=document.getElementById('povsel');
  const povs=(D.databases&&D.databases.povs)||[];
@@ -3223,11 +3409,15 @@ function renderPovSelector(D){
   sel.dataset.sig=sig;
  }
  sel.style.display='inline-block';
- // Mirror server-resolved selection back into curPov so the next refresh
- // sends the right ?pov= even if the user landed on a fallback.
- curPov=active;
+ // Don't mirror server-resolved selection back into curPov.  A stale
+ // setInterval refresh that fired BEFORE the user clicked the dropdown
+ // can land AFTER the user's selection; its response carries the old
+ // resolved POV, and copying it back to curPov resets the user's choice.
+ // The dropdown's `selected` attribute already reflects the server's
+ // resolved value, so the UI stays consistent — curPov only needs to
+ // mirror what the USER explicitly picked, which setPov() handles.
 }
-async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();renderPovSelector(D);render(D);}}catch(e){}}
+async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();povMode=(D.databases&&D.databases.pov_mode)||'lsp';clientOnlyMode=!!(D.databases&&D.databases.client_only_mode);renderPovSelector(D);render(D);}}catch(e){}}
 refresh();setInterval(refresh,R);
 </script></body></html>"""
 
