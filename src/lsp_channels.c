@@ -3366,6 +3366,35 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("%s%lu", i ? "," : "", (unsigned long)amounts[i]);
     printf("]\n");
 
+    /* SF-C #143: refresh channel funding state for every channel whose
+       funding output lives on this reallocated leaf.  After the realloc,
+       node->txid is the new state TX and node->outputs[i].amount_sats
+       reflects the new allocation.  Without this, commitment signatures
+       built from entry->channel.funding_* would still point at the
+       pre-realloc state, breaking on-chain spend on the rare paths that
+       reach broadcast (cheat-leaf, lstock-buy followups). */
+    {
+        int n_refreshed = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, c, &c_node, &c_vout)) continue;
+            if (c_node != node_idx) continue;
+            if (c_vout >= node->n_outputs) continue;
+            channel_t *ch = &mgr->entries[c].channel;
+            channel_update_funding(ch,
+                                    node->txid,
+                                    c_vout,
+                                    node->outputs[c_vout].amount_sats,
+                                    node->outputs[c_vout].script_pubkey,
+                                    node->outputs[c_vout].script_pubkey_len);
+            n_refreshed++;
+        }
+        if (n_refreshed > 0)
+            printf("LSP: refreshed funding state on %d channel(s) after "
+                   "leaf %d realloc\n", n_refreshed, leaf_side);
+    }
+
     /* C3 (Tier 1): journal success. */
     if (mgr->persist && c3_round_id > 0) {
         persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
@@ -3908,6 +3937,36 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     printf("LSP: sub-factory %d.%d chain extended to len %d (client[%d]+=%llu sats)\n",
            leaf_side, sub_idx_in_leaf, sub->ps_chain_len,
            channel_idx_in_sub, (unsigned long long)delta_sats);
+
+    /* SF-C #143: refresh channel funding state for every channel whose
+       funding output lives on this sub-factory.  After the chain advance,
+       sub->txid points at the new chain[N] TX and sub->outputs[i].amount_sats
+       reflects the post-advance per-channel allocation.  Without this
+       update, subsequent commitment signatures would still reference the
+       pre-advance (now-replaced) funding output — splice-equivalent
+       semantics per ZmnSCPxj's Optech Deep Dive note "Poon-Dryja for the
+       effectively infinite number of updates for all the payments". */
+    {
+        int n_refreshed = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, c, &c_node, &c_vout)) continue;
+            if (c_node != (size_t)sub_node_i) continue;
+            channel_t *ch = &mgr->entries[c].channel;
+            channel_update_funding(ch,
+                                    sub->txid,
+                                    c_vout,
+                                    sub->outputs[c_vout].amount_sats,
+                                    sub->outputs[c_vout].script_pubkey,
+                                    sub->outputs[c_vout].script_pubkey_len);
+            n_refreshed++;
+        }
+        if (n_refreshed > 0)
+            printf("LSP: refreshed funding state on %d channel(s) after "
+                   "sub-factory %d.%d advance\n",
+                   n_refreshed, leaf_side, sub_idx_in_leaf);
+    }
 
     /* C3 (Tier 1): journal success. */
     if (mgr->persist && c3_round_id > 0) {
