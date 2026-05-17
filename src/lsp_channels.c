@@ -1477,11 +1477,23 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             uint32_t wt_chan_id = dest_is_jit ?
                 (uint32_t)(mgr->n_channels + dest_idx) : (uint32_t)dest_idx;
+            /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+               No-op today (n_ptlcs == 0 at all current callsites); defensive
+               for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+            size_t old_dest_n_ptlcs = dest_ch->n_ptlcs;
+            ptlc_t *old_dest_ptlcs = NULL;
+            if (old_dest_n_ptlcs > 0) {
+                old_dest_ptlcs = malloc(old_dest_n_ptlcs * sizeof(ptlc_t));
+                if (old_dest_ptlcs)
+                    memcpy(old_dest_ptlcs, dest_ch->ptlcs,
+                           old_dest_n_ptlcs * sizeof(ptlc_t));
+            }
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 wt_chan_id, old_cn,
                 old_dest_local, old_dest_remote,
                 old_dest_htlcs, old_dest_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                /* SF-W-PTLC #171: thread PTLC snapshot */ old_dest_ptlcs, old_dest_n_ptlcs);
+            free(old_dest_ptlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -4187,11 +4199,23 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = ch->commitment_number - 1;
             channel_receive_revocation(ch, old_cn, rev_secret);
+            /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+               No-op today (n_ptlcs == 0 at all current callsites); defensive
+               for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+            size_t old_ch_n_ptlcs = ch->n_ptlcs;
+            ptlc_t *old_ch_ptlcs = NULL;
+            if (old_ch_n_ptlcs > 0) {
+                old_ch_ptlcs = malloc(old_ch_n_ptlcs * sizeof(ptlc_t));
+                if (old_ch_ptlcs)
+                    memcpy(old_ch_ptlcs, ch->ptlcs,
+                           old_ch_n_ptlcs * sizeof(ptlc_t));
+            }
             watchtower_watch_revoked_commitment(mgr->watchtower, ch,
                 (uint32_t)client_idx, old_cn,
                 old_ch_local, old_ch_remote,
                 old_ch_htlcs, old_ch_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                /* SF-W-PTLC #171: thread PTLC snapshot */ old_ch_ptlcs, old_ch_n_ptlcs);
+            free(old_ch_ptlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
@@ -4313,11 +4337,23 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
+                    /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+                       No-op today (n_ptlcs == 0 at all current callsites); defensive
+                       for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+                    size_t old_sender_n_ptlcs = sender_ch->n_ptlcs;
+                    ptlc_t *old_sender_ptlcs = NULL;
+                    if (old_sender_n_ptlcs > 0) {
+                        old_sender_ptlcs = malloc(old_sender_n_ptlcs * sizeof(ptlc_t));
+                        if (old_sender_ptlcs)
+                            memcpy(old_sender_ptlcs, sender_ch->ptlcs,
+                                   old_sender_n_ptlcs * sizeof(ptlc_t));
+                    }
                     watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)s, old_cn,
                         old_sender_local, old_sender_remote,
                         old_sender_htlcs, old_sender_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                        /* SF-W-PTLC #171: thread PTLC snapshot */ old_sender_ptlcs, old_sender_n_ptlcs);
+                    free(old_sender_ptlcs);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -4745,11 +4781,23 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                         continue;
                     }
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                    /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+                       No-op today (n_ptlcs == 0 at all current callsites); defensive
+                       for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+                    size_t old_dest_n_ptlcs = dest_ch->n_ptlcs;
+                    ptlc_t *old_dest_ptlcs = NULL;
+                    if (old_dest_n_ptlcs > 0) {
+                        old_dest_ptlcs = malloc(old_dest_n_ptlcs * sizeof(ptlc_t));
+                        if (old_dest_ptlcs)
+                            memcpy(old_dest_ptlcs, dest_ch->ptlcs,
+                                   old_dest_n_ptlcs * sizeof(ptlc_t));
+                    }
                     watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)reconnected_idx, old_cn,
                         old_dest_local, old_dest_remote,
                         old_dest_htlcs, old_dest_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                        /* SF-W-PTLC #171: thread PTLC snapshot */ old_dest_ptlcs, old_dest_n_ptlcs);
+                    free(old_dest_ptlcs);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);

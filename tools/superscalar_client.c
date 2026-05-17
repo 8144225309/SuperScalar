@@ -636,11 +636,23 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
            Use local channel index 0 (not the LSP's factory-wide rev_chan_id)
            because the client watchtower has only one channel at index 0. */
         if (cbd && cbd->wt) {
+            /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+               No-op today (n_ptlcs == 0 at all current callsites); defensive
+               for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+            size_t old_n_ptlcs = ch->n_ptlcs;
+            ptlc_t *old_ptlcs = NULL;
+            if (old_n_ptlcs > 0) {
+                old_ptlcs = malloc(old_n_ptlcs * sizeof(ptlc_t));
+                if (old_ptlcs)
+                    memcpy(old_ptlcs, ch->ptlcs,
+                           old_n_ptlcs * sizeof(ptlc_t));
+            }
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
                 old_local, old_remote,
                 old_htlcs, old_n_htlcs,
-                /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                /* SF-W-PTLC #171: thread PTLC snapshot */ old_ptlcs, old_n_ptlcs);
+            free(old_ptlcs);
         }
 
         /* Store LSP's next per-commitment point */
@@ -1205,9 +1217,21 @@ handle_message:
                                              ? cbd->pending_wt_htlcs : NULL;
                     size_t wt_n_htlcs = cbd->pending_wt_valid
                                         ? cbd->pending_wt_n_htlcs : 0;
+                    /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
+                       No-op today (n_ptlcs == 0 at all current callsites); defensive
+                       for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
+                    size_t wt_n_ptlcs = ch->n_ptlcs;
+                    ptlc_t *wt_ptlcs = NULL;
+                    if (wt_n_ptlcs > 0) {
+                        wt_ptlcs = malloc(wt_n_ptlcs * sizeof(ptlc_t));
+                        if (wt_ptlcs)
+                            memcpy(wt_ptlcs, ch->ptlcs,
+                                   wt_n_ptlcs * sizeof(ptlc_t));
+                    }
                     watchtower_watch_revoked_commitment(cbd->wt, ch,
                         0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs,
-                        /* SF-W-PTLC */ NULL, 0);
+                        /* SF-W-PTLC #171: thread PTLC snapshot */ wt_ptlcs, wt_n_ptlcs);
+                    free(wt_ptlcs);
                     cbd->pending_wt_valid = 0;
                 }
                 /* Persist new remote PCP */
