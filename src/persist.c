@@ -1182,6 +1182,28 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v33 (#146): height-aware sub-factory chain reset.  Before this,
+       factory_reset_all_subfactory_chains (PR #208) wiped EVERY advanced
+       sub-factory's in-memory state on any reorg, regardless of depth —
+       even a 1-block reorg that doesn't affect previously-confirmed
+       chain[N] entries would clobber them.  Adding confirmed_height (block
+       height at which this chain entry was observed confirmed) and
+       reorg_stale (1 = this entry's confirmation was reorged out) lets
+       the reset logic only zero entries whose confirmation is actually
+       gone.  Both default to 0/0 for backward compatibility — legacy
+       rows behave like the pre-#146 reset-everything path until they're
+       refreshed by the next observation. */
+    if (db_version < 33) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_subfactory_chains ADD COLUMN confirmed_height "
+            "INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE ps_subfactory_chains ADD COLUMN reorg_stale "
+            "INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
