@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *, size_t);
@@ -1645,8 +1646,10 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                 "reorg (waiting for re-confirmation)\n");
         return 0;
     }
-    if (ch->n_htlcs >= MAX_HTLCS)
+    if (ch->n_htlcs >= MAX_HTLCS) {
+        fprintf(stderr, "channel_add_htlc: refused — at MAX_HTLCS=%d\n", MAX_HTLCS);
         return 0;
+    }
 
     /* Grow htlc array if at capacity (up to MAX_HTLCS) */
     if (ch->n_htlcs >= ch->htlcs_cap) {
@@ -1654,27 +1657,50 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                          ? DEFAULT_HTLCS_CAP : ch->htlcs_cap * 2;
         if (new_cap > MAX_HTLCS) new_cap = MAX_HTLCS;
         htlc_t *tmp = realloc(ch->htlcs, new_cap * sizeof(htlc_t));
-        if (!tmp) return 0;
+        if (!tmp) {
+            fprintf(stderr, "channel_add_htlc: refused — realloc(%zu * %zu) failed\n",
+                    new_cap, sizeof(htlc_t));
+            return 0;
+        }
         ch->htlcs = tmp;
         ch->htlcs_cap = new_cap;
     }
 
     /* Reject HTLC amount below dust */
-    if (amount_sats < CHANNEL_DUST_LIMIT_SATS)
+    if (amount_sats < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "channel_add_htlc: refused — amount %" PRIu64
+                " < dust limit %d\n", amount_sats, CHANNEL_DUST_LIMIT_SATS);
         return 0;
+    }
 
     /* Check sufficient balance from offerer + reserve */
     if (direction == HTLC_OFFERED) {
-        if (amount_sats > ch->local_amount)
+        if (amount_sats > ch->local_amount) {
+            fprintf(stderr, "channel_add_htlc: refused — OFFERED amount %" PRIu64
+                    " > local_amount %" PRIu64 "\n", amount_sats, ch->local_amount);
             return 0;
-        if (ch->local_amount - amount_sats < CHANNEL_RESERVE_SATS)
+        }
+        if (ch->local_amount - amount_sats < CHANNEL_RESERVE_SATS) {
+            fprintf(stderr, "channel_add_htlc: refused — OFFERED local_amount %" PRIu64
+                    " - amount %" PRIu64 " = %" PRIu64 " < reserve %d\n",
+                    ch->local_amount, amount_sats,
+                    ch->local_amount - amount_sats, CHANNEL_RESERVE_SATS);
             return 0;
+        }
         ch->local_amount -= amount_sats;
     } else {
-        if (amount_sats > ch->remote_amount)
+        if (amount_sats > ch->remote_amount) {
+            fprintf(stderr, "channel_add_htlc: refused — RECEIVED amount %" PRIu64
+                    " > remote_amount %" PRIu64 "\n", amount_sats, ch->remote_amount);
             return 0;
-        if (ch->remote_amount - amount_sats < CHANNEL_RESERVE_SATS)
+        }
+        if (ch->remote_amount - amount_sats < CHANNEL_RESERVE_SATS) {
+            fprintf(stderr, "channel_add_htlc: refused — RECEIVED remote_amount %" PRIu64
+                    " - amount %" PRIu64 " = %" PRIu64 " < reserve %d\n",
+                    ch->remote_amount, amount_sats,
+                    ch->remote_amount - amount_sats, CHANNEL_RESERVE_SATS);
             return 0;
+        }
         ch->remote_amount -= amount_sats;
     }
 
@@ -1682,6 +1708,9 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
     uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
     if (*funder_bal < per_htlc_fee) {
+        fprintf(stderr, "channel_add_htlc: refused — funder_bal %" PRIu64
+                " < per_htlc_fee %" PRIu64 " (fee_rate %" PRIu64 " sat/kvB)\n",
+                *funder_bal, per_htlc_fee, ch->fee_rate_sat_per_kvb);
         /* Rollback HTLC amount deduction */
         if (direction == HTLC_OFFERED) ch->local_amount += amount_sats;
         else ch->remote_amount += amount_sats;
