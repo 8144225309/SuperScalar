@@ -2593,6 +2593,243 @@
             return 0;
         }
 
+        /* === PTLC BREACH TEST (#108, SF-W-PTLC Phase 3b) ===
+           Validate the watchtower PTLC feed end-to-end at the LSP entry
+           point.  Add a PTLC, snapshot the channel state with it, call
+           watchtower_watch_revoked_commitment with the snapshot, verify
+           the resulting entry has populated ptlc_outputs, then build a
+           PTLC penalty TX from the entry data.
+
+           Does NOT broadcast a cheat TX or wait for chain-level sweep
+           detection — the broadcast variant is for the testnet4 deliverable
+           and #173 (regtest end-to-end).  This scaffold validates that
+           the entire production code path produces correct artifacts. */
+        if (test_ptlc_breach) {
+            printf("\n=== PTLC BREACH TEST ===\n");
+
+            if (mgr->n_channels < 1) {
+                fprintf(stderr, "PTLC BREACH TEST: need at least 1 channel\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            if (!ptlc_safety_is_enabled()) {
+                fprintf(stderr, "PTLC BREACH TEST: safety gate not enabled\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            watchtower_t *ptlc_wt = mgr->watchtower;
+            if (!ptlc_wt) {
+                fprintf(stderr, "PTLC BREACH TEST: lsp watchtower is NULL\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            channel_t *ch0_p = &mgr->entries[0].channel;
+
+            /* Step 1: Build payment_point + size PTLC under channel
+               constraints (mirror of BASIC scaffold sizing). */
+            unsigned char br_dummy_sec[32];
+            memset(br_dummy_sec, 0xCE, 32);
+            secp256k1_pubkey br_payment_point;
+            if (!secp256k1_ec_pubkey_create(ctx, &br_payment_point, br_dummy_sec)) {
+                fprintf(stderr, "PTLC BREACH TEST: payment_point create failed\n");
+                memset(br_dummy_sec, 0, 32);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            memset(br_dummy_sec, 0, 32);
+
+            uint64_t br_ch0_local = ch0_p->local_amount;
+            uint64_t br_ptlc_amount = 1500;
+            if (br_ch0_local < br_ptlc_amount + CHANNEL_RESERVE_SATS + 100) {
+                if (br_ch0_local <= CHANNEL_DUST_LIMIT_SATS + CHANNEL_RESERVE_SATS + 100) {
+                    fprintf(stderr,
+                            "PTLC BREACH TEST: channel 0 local %llu < min %d\n",
+                            (unsigned long long)br_ch0_local,
+                            CHANNEL_DUST_LIMIT_SATS + CHANNEL_RESERVE_SATS + 100);
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                br_ptlc_amount = br_ch0_local - CHANNEL_RESERVE_SATS - 100;
+            }
+
+            uint32_t br_cur_height = (uint32_t)regtest_get_block_height(&rt);
+            uint32_t br_ptlc_cltv = br_cur_height + 40;
+            uint64_t br_ptlc_id = 0;
+
+            /* Step 2: Add PTLC to channel 0. */
+            if (!channel_add_ptlc(ch0_p, PTLC_OFFERED, br_ptlc_amount,
+                                    &br_payment_point, br_ptlc_cltv, &br_ptlc_id)) {
+                fprintf(stderr, "PTLC BREACH TEST: channel_add_ptlc failed\n");
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("PTLC added: id=%llu amount=%llu cltv=%u\n",
+                   (unsigned long long)br_ptlc_id,
+                   (unsigned long long)br_ptlc_amount, br_ptlc_cltv);
+
+            /* Step 3: Snapshot channel state WITH the PTLC.  This is the
+               "old/revoked" state we'll register with the watchtower. */
+            uint64_t br_old_commit_num = ch0_p->commitment_number;
+            uint64_t br_old_local = ch0_p->local_amount;
+            uint64_t br_old_remote = ch0_p->remote_amount;
+
+            size_t br_old_n_htlcs = ch0_p->n_htlcs;
+            htlc_t *br_old_htlcs = NULL;
+            if (br_old_n_htlcs > 0) {
+                br_old_htlcs = malloc(br_old_n_htlcs * sizeof(htlc_t));
+                if (!br_old_htlcs) {
+                    fprintf(stderr, "PTLC BREACH TEST: htlc snapshot alloc failed\n");
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                memcpy(br_old_htlcs, ch0_p->htlcs,
+                       br_old_n_htlcs * sizeof(htlc_t));
+            }
+
+            size_t br_old_n_ptlcs = ch0_p->n_ptlcs;
+            ptlc_t *br_old_ptlcs = NULL;
+            if (br_old_n_ptlcs > 0) {
+                br_old_ptlcs = malloc(br_old_n_ptlcs * sizeof(ptlc_t));
+                if (!br_old_ptlcs) {
+                    fprintf(stderr, "PTLC BREACH TEST: ptlc snapshot alloc failed\n");
+                    free(br_old_htlcs);
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                memcpy(br_old_ptlcs, ch0_p->ptlcs,
+                       br_old_n_ptlcs * sizeof(ptlc_t));
+            }
+
+            /* Step 4: Register old state with watchtower.  The feed should
+               populate entry->ptlc_outputs from br_old_ptlcs. */
+            size_t br_entries_before = ptlc_wt->n_entries;
+            watchtower_watch_revoked_commitment(ptlc_wt, ch0_p,
+                0, /* channel_id */
+                br_old_commit_num, br_old_local, br_old_remote,
+                br_old_htlcs, br_old_n_htlcs,
+                br_old_ptlcs, br_old_n_ptlcs);
+
+            /* Step 5: Verify entry registered + ptlc_outputs populated. */
+            if (ptlc_wt->n_entries != br_entries_before + 1) {
+                fprintf(stderr,
+                        "PTLC BREACH TEST: expected n_entries=%zu, got %zu\n",
+                        br_entries_before + 1, ptlc_wt->n_entries);
+                free(br_old_htlcs);
+                free(br_old_ptlcs);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            watchtower_entry_t *br_entry =
+                &ptlc_wt->entries[ptlc_wt->n_entries - 1];
+
+            if (br_entry->n_ptlc_outputs != br_old_n_ptlcs) {
+                fprintf(stderr,
+                        "PTLC BREACH TEST: entry n_ptlc_outputs %zu != %zu\n",
+                        br_entry->n_ptlc_outputs, br_old_n_ptlcs);
+                free(br_old_htlcs);
+                free(br_old_ptlcs);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            if (br_entry->ptlc_outputs[0].htlc_amount != br_ptlc_amount) {
+                fprintf(stderr,
+                        "PTLC BREACH TEST: entry ptlc amount %llu != %llu\n",
+                        (unsigned long long)br_entry->ptlc_outputs[0].htlc_amount,
+                        (unsigned long long)br_ptlc_amount);
+                free(br_old_htlcs);
+                free(br_old_ptlcs);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            if (br_entry->ptlc_outputs[0].cltv_expiry != br_ptlc_cltv) {
+                fprintf(stderr,
+                        "PTLC BREACH TEST: entry cltv %u != %u\n",
+                        br_entry->ptlc_outputs[0].cltv_expiry, br_ptlc_cltv);
+                free(br_old_htlcs);
+                free(br_old_ptlcs);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Watchtower entry registered: type=%d ch_id=%u "
+                   "commit_num=%llu n_ptlc_outputs=%zu\n",
+                   (int)br_entry->type, br_entry->channel_id,
+                   (unsigned long long)br_entry->commit_num,
+                   br_entry->n_ptlc_outputs);
+            printf("  PTLC[0]: vout=%u amount=%llu cltv=%u\n",
+                   br_entry->ptlc_outputs[0].htlc_vout,
+                   (unsigned long long)br_entry->ptlc_outputs[0].htlc_amount,
+                   br_entry->ptlc_outputs[0].cltv_expiry);
+
+            /* Step 6: Attempt to build a PTLC penalty TX from the entry.
+               In production, channel_build_ptlc_penalty_tx is called by
+               watchtower_check on breach detection; it requires a stored
+               revocation secret for the old commitment (received via the
+               peer's revoke_and_ack message).  In this scaffold there is
+               no peer revocation flow — channel_add_ptlc + in-memory
+               state does not deposit a revocation secret — so the build
+               is expected to fail with "missing revocation secret".  We
+               attempt it anyway so the scaffold exercises the code path
+               and surfaces any other regressions (e.g., crash in P2TR
+               script reconstruction over `payment_hash`).  The feed
+               itself is validated by Step 5 entry-field assertions. */
+            tx_buf_t br_penalty;
+            tx_buf_init(&br_penalty, 512);
+            int br_penalty_ok = channel_build_ptlc_penalty_tx(ch0_p, &br_penalty,
+                    br_entry->txid,
+                    br_entry->ptlc_outputs[0].htlc_vout,
+                    br_entry->ptlc_outputs[0].htlc_amount,
+                    br_entry->ptlc_outputs[0].htlc_spk, 34,
+                    br_old_commit_num, /* old_commitment_num */
+                    0, /* ptlc_index */
+                    NULL, 0 /* anchor_spk */);
+            printf("PTLC penalty TX build: %s (%zu bytes) "
+                   "[expected fail in scaffold: no peer revocation]\n",
+                   br_penalty_ok ? "succeeded" : "refused",
+                   br_penalty.len);
+            tx_buf_free(&br_penalty);
+
+            free(br_old_htlcs);
+            free(br_old_ptlcs);
+
+            printf("\n=== PTLC BREACH TEST PASSED ===\n");
+
+            report_add_string(&rpt, "result", "ptlc_breach_complete");
+            report_close(&rpt);
+            jit_channels_cleanup(mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+
         /* === MULTI-HTLC FORCE-CLOSE TEST (S28) ===
            Add pending HTLCs on ALL channels simultaneously, then force-close.
            Produces n_channels HTLC timeout TXs — each with its own CSV/CLTV.
