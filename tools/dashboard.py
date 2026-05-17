@@ -788,14 +788,24 @@ def _db_freshness(cfg):
     detect a stale browser fetch (operator looks at the page after a wipe
     + restart, sees old data, doesn't realize the tab cached an earlier
     /api/status response).  Times are unix seconds; renderer can compute
-    'now - api_ts' to flag staleness."""
+    'now - api_ts' to flag staleness.
+
+    WAL mode: the main .db file's mtime only updates on checkpoint (default
+    every ~1000 pages / ~4MB).  Active writes between checkpoints land in
+    .db-wal whose mtime advances per fsync.  Sampling .db alone makes the
+    dashboard report "quiet DB" during heavy ceremony bursts — exactly when
+    the operator most wants the real signal.  Take max(.db, .db-wal); skip
+    .db-shm because reader connections (including the dashboard's own
+    read-only open) touch -shm, which would make every fetch look fresh."""
     out = {"api_ts": int(time.time()),
            "api_time": time.strftime("%H:%M:%S")}
     for label, path in (("lsp_db_mtime", cfg.lsp_db),
                          ("client_db_mtime", cfg.client_db)):
         try:
             if path and os.path.exists(str(path)):
-                out[label] = int(os.path.getmtime(str(path)))
+                paths = [str(path), str(path) + "-wal"]
+                mtimes = [os.path.getmtime(p) for p in paths if os.path.exists(p)]
+                out[label] = int(max(mtimes)) if mtimes else 0
             else:
                 out[label] = 0
         except OSError:
