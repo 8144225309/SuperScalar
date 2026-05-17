@@ -22,6 +22,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/lsp_fund.h"
@@ -382,6 +383,10 @@ static void usage(const char *prog) {
         "                      watchtower PTLC sweep is wired via SF-W-PTLC, but the\n"
         "                      feed only fires when PTLCs actually flow through\n"
         "                      these channels)\n"
+        "  --test-ptlc-basic   After demo: add a PTLC to channel 0, verify commitment\n"
+        "                      TX includes PTLC output, fail PTLC, cooperative close.\n"
+        "                      Validates LSP-side PTLC machinery end-to-end on real\n"
+        "                      chain. Implies --enable-ptlc-unsafe. (regtest/testnet4)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -1223,6 +1228,7 @@ int main(int argc, char *argv[]) {
                                         0 = disabled (default for backward compat) */
     int force_close = 0;
     int test_burn = 0;
+    int test_ptlc_basic = 0;
     int test_htlc_force_close = 0;
     int test_multi_htlc_force_close = 0;
     int test_full_settlement = 0;
@@ -1417,6 +1423,13 @@ int main(int argc, char *argv[]) {
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
             printf("LSP: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+        }
+        else if (strcmp(argv[i], "--test-ptlc-basic") == 0) {
+            /* SF-W-PTLC Phase 3a (#107): validate LSP-side PTLC happy path
+               on real chain. Implies --enable-ptlc-unsafe. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_basic = 1;
         }
         else if (strcmp(argv[i], "--test-partial-rotation") == 0)
             test_partial_rotation = 1;
@@ -3610,7 +3623,7 @@ accept_new_factory:
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
-        test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
+        test_ptlc_basic || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
         test_tier_b_rollover || test_subfactory_advance ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||

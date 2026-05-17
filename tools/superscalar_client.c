@@ -2102,8 +2102,7 @@ int main(int argc, char *argv[]) {
             /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops */
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
-            printf("Client: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)
-");
+            printf("Client: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
         }
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];
