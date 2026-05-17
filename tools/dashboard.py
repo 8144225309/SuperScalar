@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse, json, os, random, sqlite3, subprocess, sys, time
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------------------------------------------------------------------------
@@ -17,7 +18,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 class Config:
     def __init__(self, a):
         self.port = a.port; self.demo = getattr(a,'demo',False)
-        self.lsp_db = a.lsp_db; self.client_db = a.client_db
+        self.lsp_db = a.lsp_db
+        # Multi-client-db: --client-db is action='append', so a.client_db is
+        # None or a list of paths.  Normalize to a list, and keep client_db as
+        # a back-compat shim pointing at the first entry (None if no paths)
+        # for the handful of call sites that only need one POV (e.g. the
+        # legacy demo collector).  All real collectors should iterate
+        # client_dbs to merge views across all clients of one LSP.
+        self.client_dbs = list(a.client_db) if a.client_db else []
+        self.client_db = self.client_dbs[0] if self.client_dbs else None
         self.btc_cli = a.btc_cli; self.btc_network = a.btc_network
         self.btc_rpcuser = a.btc_rpcuser; self.btc_rpcpassword = a.btc_rpcpassword
         # P3: allow pointing bitcoin-cli at a non-default daemon (custom
@@ -212,288 +221,350 @@ def collect_wallet_utxos(cfg):
         out["error"] = str(e)
     return out
 
-def collect_databases(cfg):
-    data = {"lsp": {}, "client": {}}
-    for label, path in [("lsp", cfg.lsp_db), ("client", cfg.client_db)]:
-        if not path or not os.path.exists(str(path)):
-            data[label]["error"] = "not configured"; continue
-        for key, sql in [
-            ("factories", "SELECT * FROM factories ORDER BY id DESC LIMIT 5"),
-            ("participants", "SELECT * FROM factory_participants ORDER BY factory_id, slot"),
-            ("channels", "SELECT * FROM channels ORDER BY id"),
-            ("htlcs", "SELECT * FROM htlcs ORDER BY id DESC LIMIT 50"),
-        ]:
-            rows, err = query_db(path, sql)
-            # Always assign a list on error (matches the pattern used by
-            # every other collector query below).  Earlier this was
-            # `{"error": err}` which left downstream iterators (e.g.,
-            # _extract_txids) walking a dict's keys as if they were rows —
-            # crashed the entire /api/status response when client.db
-            # lacked an LSP-only table like `factories` or `participants`.
-            data[label][key] = rows if not err else []
-        for key, sql in [
-            ("watchtower_count", "SELECT COUNT(*) as c FROM old_commitments"),
-            ("revocation_count", "SELECT COUNT(*) as c FROM revocation_secrets"),
-        ]:
-            rows, err = query_db(path, sql)
-            data[label][key] = rows[0]["c"] if (not err and rows) else 0
+def _collect_one_db(path):
+    """Read all interesting tables from one .db (lsp.db or one client.db).
+    Returns a dict keyed by table-feed name.  Tables that don't exist on
+    this side (e.g. client.db lacks LSP-only tables like factory_participants)
+    are caught at the query_db level and return [].
+
+    Refactored out of collect_databases so the client side can iterate over
+    multiple --client-db inputs and merge views — critical for "1/N coverage"
+    tiles like TX Inventory channel commitments, which previously could only
+    see one client's row.  Single-DB call sites remain a one-liner."""
+    out = {}
+    if not path or not os.path.exists(str(path)):
+        out["error"] = "not configured"
+        return out
+    for key, sql in [
+        ("factories", "SELECT * FROM factories ORDER BY id DESC LIMIT 5"),
+        ("participants", "SELECT * FROM factory_participants ORDER BY factory_id, slot"),
+        ("channels", "SELECT * FROM channels ORDER BY id"),
+        ("htlcs", "SELECT * FROM htlcs ORDER BY id DESC LIMIT 50"),
+    ]:
+        rows, err = query_db(path, sql)
+        # Always assign a list on error (matches the pattern used by
+        # every other collector query below).  Earlier this was
+        # `{"error": err}` which left downstream iterators (e.g.,
+        # _extract_txids) walking a dict's keys as if they were rows —
+        # crashed the entire /api/status response when client.db
+        # lacked an LSP-only table like `factories` or `participants`.
+        out[key] = rows if not err else []
+    for key, sql in [
+        ("watchtower_count", "SELECT COUNT(*) as c FROM old_commitments"),
+        ("revocation_count", "SELECT COUNT(*) as c FROM revocation_secrets"),
+    ]:
+        rows, err = query_db(path, sql)
+        out[key] = rows[0]["c"] if (not err and rows) else 0
+    rows, err = query_db(path,
+        "SELECT channel_id, commit_num, txid, to_local_amount, to_local_vout "
+        "FROM old_commitments ORDER BY channel_id, commit_num DESC LIMIT 30")
+    out["old_commitments"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT channel_id, COUNT(*) as cnt FROM revocation_secrets GROUP BY channel_id")
+    out["revocations_by_channel"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT channel_id, side, next_index FROM nonce_pools ORDER BY channel_id, side")
+    out["nonce_pools"] = rows if not err else []
+    # Phase 22: new tables
+    rows, err = query_db(path,
+        "SELECT * FROM tree_nodes ORDER BY factory_id, node_index")
+    out["tree_nodes"] = rows if not err else []
+    # Wire-messages query: filter out PING/PONG heartbeats and raise the
+    # limit.  Without this, an LSP that's been alive a few minutes fills
+    # the entire "latest 100" window with PING/PONG (the LSP emits one
+    # of each per ~5s heartbeat).  Result: the Ceremonies reconstructed
+    # view goes blank because FACTORY_PROPOSE / NONCE_BUNDLE / etc.
+    # have fallen off the window, and the Protocol Log shows nothing
+    # but heartbeat noise.  Filtering at query time keeps the operationally
+    # interesting messages visible.  200-row limit gives headroom for
+    # multi-factory deployments without bloating the API payload.
+    rows, err = query_db(path,
+        "SELECT * FROM wire_messages "
+        "WHERE msg_name NOT IN ('PING','PONG') "
+        "ORDER BY id DESC LIMIT 200")
+    out["wire_messages"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM ladder_factories ORDER BY factory_id")
+    out["ladder_factories"] = rows if not err else []
+    # Phase 23: persistence hardening tables
+    rows, err = query_db(path,
+        "SELECT * FROM dw_counter_state ORDER BY factory_id")
+    out["dw_counter_state"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM departed_clients ORDER BY factory_id, client_idx")
+    out["departed_clients"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM invoice_registry ORDER BY id DESC LIMIT 50")
+    out["invoice_registry"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM htlc_origins ORDER BY id DESC LIMIT 50")
+    out["htlc_origins"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM client_invoices ORDER BY id DESC LIMIT 50")
+    out["client_invoices"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT * FROM id_counters ORDER BY name")
+    out["id_counters"] = rows if not err else []
+    # JIT Channels (Gap #2 hardening)
+    rows, err = query_db(path,
+        "SELECT jit_channel_id, client_idx, state, funding_txid, "
+        "funding_vout, funding_amount, local_amount, remote_amount, "
+        "commitment_number, created_at, target_factory_id "
+        "FROM jit_channels ORDER BY jit_channel_id")
+    out["jit_channels"] = rows if not err else []
+    # Broadcast log — TX broadcast history for operators.
+    # LIMIT 200: a 16-client force-close broadcasts ~62 tree TXes plus
+    # funding + close + sweeps, which the prior LIMIT 50 truncated on
+    # the funding-end (so the Events derivation lost the "Factory funded"
+    # bookend).  200 matches the wire_messages limit used elsewhere.
+    # reorg_stale (schema v29) — broadcast_log rows whose enclosing block
+    # was invalidated by a tip regression.  Surfacing this lets operators
+    # tell apart "TX failed" from "TX confirmed then orphaned" — same
+    # txid, very different recovery actions.
+    rows, err = query_db(path,
+        "SELECT id, txid, source, result, broadcast_time, "
+        "COALESCE(reorg_stale, 0) AS reorg_stale "
+        "FROM broadcast_log ORDER BY id DESC LIMIT 200")
+    out["broadcast_log"] = rows if not err else []
+    # Reorg events (schema v29) — tip regressions detected by the daemon
+    # loop / standalone watchtower.  Feeds the Events narrative.
+    rows, err = query_db(path,
+        "SELECT id, timestamp, old_tip, new_tip, n_entries_reset "
+        "FROM reorg_events ORDER BY id DESC LIMIT 50")
+    out["reorg_events"] = rows if not err else []
+    # Breach detections (schema v29) — counterparty broadcast a revoked
+    # commit; watchtower responded (or is about to).  Feeds Events.
+    rows, err = query_db(path,
+        "SELECT id, timestamp, channel_id, expected_commit_num, "
+        "txid_seen, height_seen, response_txid "
+        "FROM breach_detections ORDER BY id DESC LIMIT 50")
+    out["breach_detections"] = rows if not err else []
+    # Signing progress — per-signer nonce/sig collection status
+    rows, err = query_db(path,
+        "SELECT factory_id, node_index, signer_slot, has_nonce, "
+        "has_partial_sig, updated_at "
+        "FROM signing_progress ORDER BY factory_id, node_index, signer_slot")
+    out["signing_progress"] = rows if not err else []
+    # Watchtower pending — penalty TXs in-flight
+    rows, err = query_db(path,
+        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
+        "FROM watchtower_pending ORDER BY bump_count DESC")
+    out["watchtower_pending"] = rows if not err else []
+    # Old commitment HTLCs — HTLCs attached to old (revoked) commitments.
+    # Schema uses htlc_vout/htlc_amount and integer direction (0=offered,
+    # 1=received per htlc_direction_t).  Alias to match the live htlcs
+    # row shape (htlc_index, amount, string direction) so rPayments and
+    # the per-channel rollup can consume both lists uniformly without
+    # special-casing the historical table.
+    rows, err = query_db(path,
+        "SELECT channel_id, commit_num, htlc_vout AS htlc_index, "
+        "CASE direction WHEN 0 THEN 'offered' ELSE 'received' END AS direction, "
+        "htlc_amount AS amount, payment_hash, cltv_expiry "
+        "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
+    out["old_commitment_htlcs"] = rows if not err else []
+    # PR #181 Phase A consumer: count old_commitments rows with persisted
+    # penalty TX bytes vs total rows.  Column was added in schema v25
+    # (old_commitments.signed_penalty_tx_hex).  If column is missing
+    # (pre-#181 LSP), the first query errors and we fall back to
+    # total-only — persisted reads 0 which surfaces as "not yet
+    # persisted" in the UI.
+    rows, err = query_db(path,
+        "SELECT COUNT(*) AS total, "
+        "COUNT(CASE WHEN signed_penalty_tx_hex IS NOT NULL "
+        "  AND length(signed_penalty_tx_hex) > 0 THEN 1 END) AS persisted "
+        "FROM old_commitments")
+    if err:
         rows, err = query_db(path,
-            "SELECT channel_id, commit_num, txid, to_local_amount, to_local_vout "
-            "FROM old_commitments ORDER BY channel_id, commit_num DESC LIMIT 30")
-        data[label]["old_commitments"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT channel_id, COUNT(*) as cnt FROM revocation_secrets GROUP BY channel_id")
-        data[label]["revocations_by_channel"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT channel_id, side, next_index FROM nonce_pools ORDER BY channel_id, side")
-        data[label]["nonce_pools"] = rows if not err else []
-        # Phase 22: new tables
-        rows, err = query_db(path,
-            "SELECT * FROM tree_nodes ORDER BY factory_id, node_index")
-        data[label]["tree_nodes"] = rows if not err else []
-        # Wire-messages query: filter out PING/PONG heartbeats and raise the
-        # limit.  Without this, an LSP that's been alive a few minutes fills
-        # the entire "latest 100" window with PING/PONG (the LSP emits one
-        # of each per ~5s heartbeat).  Result: the Ceremonies reconstructed
-        # view goes blank because FACTORY_PROPOSE / NONCE_BUNDLE / etc.
-        # have fallen off the window, and the Protocol Log shows nothing
-        # but heartbeat noise.  Filtering at query time keeps the operationally
-        # interesting messages visible.  200-row limit gives headroom for
-        # multi-factory deployments without bloating the API payload.
-        rows, err = query_db(path,
-            "SELECT * FROM wire_messages "
-            "WHERE msg_name NOT IN ('PING','PONG') "
-            "ORDER BY id DESC LIMIT 200")
-        data[label]["wire_messages"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM ladder_factories ORDER BY factory_id")
-        data[label]["ladder_factories"] = rows if not err else []
-        # Phase 23: persistence hardening tables
-        rows, err = query_db(path,
-            "SELECT * FROM dw_counter_state ORDER BY factory_id")
-        data[label]["dw_counter_state"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM departed_clients ORDER BY factory_id, client_idx")
-        data[label]["departed_clients"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM invoice_registry ORDER BY id DESC LIMIT 50")
-        data[label]["invoice_registry"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM htlc_origins ORDER BY id DESC LIMIT 50")
-        data[label]["htlc_origins"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM client_invoices ORDER BY id DESC LIMIT 50")
-        data[label]["client_invoices"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT * FROM id_counters ORDER BY name")
-        data[label]["id_counters"] = rows if not err else []
-        # JIT Channels (Gap #2 hardening)
-        rows, err = query_db(path,
-            "SELECT jit_channel_id, client_idx, state, funding_txid, "
-            "funding_vout, funding_amount, local_amount, remote_amount, "
-            "commitment_number, created_at, target_factory_id "
-            "FROM jit_channels ORDER BY jit_channel_id")
-        data[label]["jit_channels"] = rows if not err else []
-        # Broadcast log — TX broadcast history for operators.
-        # LIMIT 200: a 16-client force-close broadcasts ~62 tree TXes plus
-        # funding + close + sweeps, which the prior LIMIT 50 truncated on
-        # the funding-end (so the Events derivation lost the "Factory funded"
-        # bookend).  200 matches the wire_messages limit used elsewhere.
-        # reorg_stale (schema v29) — broadcast_log rows whose enclosing block
-        # was invalidated by a tip regression.  Surfacing this lets operators
-        # tell apart "TX failed" from "TX confirmed then orphaned" — same
-        # txid, very different recovery actions.
-        rows, err = query_db(path,
-            "SELECT id, txid, source, result, broadcast_time, "
-            "COALESCE(reorg_stale, 0) AS reorg_stale "
-            "FROM broadcast_log ORDER BY id DESC LIMIT 200")
-        data[label]["broadcast_log"] = rows if not err else []
-        # Reorg events (schema v29) — tip regressions detected by the daemon
-        # loop / standalone watchtower.  Feeds the Events narrative.
-        rows, err = query_db(path,
-            "SELECT id, timestamp, old_tip, new_tip, n_entries_reset "
-            "FROM reorg_events ORDER BY id DESC LIMIT 50")
-        data[label]["reorg_events"] = rows if not err else []
-        # Breach detections (schema v29) — counterparty broadcast a revoked
-        # commit; watchtower responded (or is about to).  Feeds Events.
-        rows, err = query_db(path,
-            "SELECT id, timestamp, channel_id, expected_commit_num, "
-            "txid_seen, height_seen, response_txid "
-            "FROM breach_detections ORDER BY id DESC LIMIT 50")
-        data[label]["breach_detections"] = rows if not err else []
-        # Signing progress — per-signer nonce/sig collection status
-        rows, err = query_db(path,
-            "SELECT factory_id, node_index, signer_slot, has_nonce, "
-            "has_partial_sig, updated_at "
-            "FROM signing_progress ORDER BY factory_id, node_index, signer_slot")
-        data[label]["signing_progress"] = rows if not err else []
-        # Watchtower pending — penalty TXs in-flight
-        rows, err = query_db(path,
-            "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
-            "FROM watchtower_pending ORDER BY bump_count DESC")
-        data[label]["watchtower_pending"] = rows if not err else []
-        # Old commitment HTLCs — HTLCs attached to old (revoked) commitments.
-        # Schema uses htlc_vout/htlc_amount and integer direction (0=offered,
-        # 1=received per htlc_direction_t).  Alias to match the live htlcs
-        # row shape (htlc_index, amount, string direction) so rPayments and
-        # the per-channel rollup can consume both lists uniformly without
-        # special-casing the historical table.
-        rows, err = query_db(path,
-            "SELECT channel_id, commit_num, htlc_vout AS htlc_index, "
-            "CASE direction WHEN 0 THEN 'offered' ELSE 'received' END AS direction, "
-            "htlc_amount AS amount, payment_hash, cltv_expiry "
-            "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
-        data[label]["old_commitment_htlcs"] = rows if not err else []
-        # PR #181 Phase A consumer: count old_commitments rows with persisted
-        # penalty TX bytes vs total rows.  Column was added in schema v25
-        # (old_commitments.signed_penalty_tx_hex).  If column is missing
-        # (pre-#181 LSP), the first query errors and we fall back to
-        # total-only — persisted reads 0 which surfaces as "not yet
-        # persisted" in the UI.
-        rows, err = query_db(path,
-            "SELECT COUNT(*) AS total, "
-            "COUNT(CASE WHEN signed_penalty_tx_hex IS NOT NULL "
-            "  AND length(signed_penalty_tx_hex) > 0 THEN 1 END) AS persisted "
-            "FROM old_commitments")
-        if err:
-            rows, err = query_db(path,
-                "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitments")
-        data[label]["old_commitments_coverage"] = (rows[0] if rows else
-            {"total": 0, "persisted": 0})
-        # PR #181 Phase B consumer: signing_rounds journal summary.  Table
-        # was added in schema v26.  Empty (table missing) on pre-#181 LSPs
-        # — graceful: row stays as the defaults, UI shows the
-        # journal-not-yet-available copy.
-        rows, err = query_db(path,
-            "SELECT COUNT(*) AS total, "
-            "COUNT(CASE WHEN result = 'success' THEN 1 END) AS success, "
-            "COUNT(CASE WHEN result = 'timeout' THEN 1 END) AS timeout, "
-            "COUNT(CASE WHEN result = 'aborted_crash' THEN 1 END) AS crashed, "
-            "COUNT(CASE WHEN completed_at IS NULL THEN 1 END) AS in_flight, "
-            "COUNT(DISTINCT ceremony_type) AS types "
-            "FROM signing_rounds")
-        data[label]["signing_rounds_summary"] = (rows[0] if rows and not err
-            else {"total": 0, "success": 0, "timeout": 0, "crashed": 0,
-                  "in_flight": 0, "types": 0})
-        # Recent signing rounds for the Overview ledger.  Same graceful
-        # fallback as the summary.
-        rows, err = query_db(path,
-            "SELECT id, factory_id, node_idx, ceremony_type, epoch, "
-            "started_at, completed_at, n_participants, "
-            "nonces_collected, partial_sigs_collected, "
-            "result, result_txid, error_detail "
-            "FROM signing_rounds ORDER BY started_at DESC LIMIT 20")
-        data[label]["signing_rounds_recent"] = rows if not err else []
-        # Factory revocation secrets — per-epoch flat revocation
-        rows, err = query_db(path,
-            "SELECT factory_id, COUNT(*) as cnt "
-            "FROM factory_revocation_secrets GROUP BY factory_id")
-        data[label]["factory_revocations_by_factory"] = rows if not err else []
-        # PS leaf chains (schema v20+): canonical pseudo-Spilman leaf state
-        # chains.  Each row is chain[N] for a given (factory_id, leaf_node_idx),
-        # with chan_amount_sats decreasing as the LSP sells liquidity into the
-        # leaf and poison_tx_hex (v22+) carrying the per-position wire-signed
-        # poison TX for the trustless watchtower defense.
-        # F2: include epoch column (v24+).  COALESCE handles older DBs where
-        # ALTER TABLE may have failed silently and rows lack the field.
-        rows, err = query_db(path,
-            "SELECT factory_id, leaf_node_idx, chain_pos, txid, "
-            "chan_amount_sats, "
-            "COALESCE(epoch, 0) AS epoch, "
-            "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
-            "  THEN 1 ELSE 0 END AS has_poison "
-            "FROM ps_leaf_chains "
-            "ORDER BY factory_id, leaf_node_idx, chain_pos")
-        data[label]["ps_leaf_chains"] = rows if not err else []
-        # PS sub-factory chains (schema v21+): k² wide-leaves shape.  Each row
-        # carries sales_stock_amount_sats + channel_amounts_csv for the
-        # per-sub-factory chain.  Empty when --ps-subfactory-arity=1.
-        rows, err = query_db(path,
-            "SELECT factory_id, sub_node_idx, chain_pos, txid, "
-            "sales_stock_amount_sats, channel_amounts_csv, "
-            "COALESCE(epoch, 0) AS epoch, "
-            "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
-            "  THEN 1 ELSE 0 END AS has_poison "
-            "FROM ps_subfactory_chains "
-            "ORDER BY factory_id, sub_node_idx, chain_pos")
-        data[label]["ps_subfactory_chains"] = rows if not err else []
-        # PS chain[0] initial signed states (schema v23+): the chain origin TX
-        # for each PS leaf / sub-factory.  Empty rows here when other PS
-        # tables are populated indicates the v0.1.15 force-close-fails-with-25
-        # bug pattern.
-        rows, err = query_db(path,
-            "SELECT factory_id, node_idx, txid, "
-            "COALESCE(epoch, 0) AS epoch "
-            "FROM ps_initial_signed_states "
-            "ORDER BY factory_id, node_idx")
-        data[label]["ps_initial_signed_states"] = rows if not err else []
-        # Client-side PS double-spend defense (schema v20+): one row per
-        # (factory_id, parent_txid, parent_vout) the client has co-signed.
-        # Aggregate per leaf to keep the dashboard payload small.
-        rows, err = query_db(path,
-            "SELECT factory_id, leaf_node_idx, COUNT(*) as cnt "
-            "FROM client_ps_signed_inputs "
-            "GROUP BY factory_id, leaf_node_idx")
-        data[label]["ps_signed_inputs_by_leaf"] = rows if not err else []
-        # TX preparedness audit feeds — one query per signed-bytes-bearing
-        # table so the TX Inventory tab can build a unified "is the defense
-        # set ready" view across factory tree, channel commitments,
-        # distribution TXs and pending sweeps.
-        rows, err = query_db(path,
-            "SELECT channel_id, commitment_number, "
-            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
-            "  THEN 1 ELSE 0 END AS has_bytes "
-            "FROM signed_commitments ORDER BY channel_id")
-        data[label]["signed_commitments"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT factory_id, "
-            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
-            "  THEN 1 ELSE 0 END AS has_bytes "
-            "FROM distribution_txs ORDER BY factory_id")
-        data[label]["distribution_txs"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT id, sweep_type, state, source_txid, source_vout, "
-            "amount_sats, channel_id, factory_id, sweep_txid, csv_delay, "
-            "confirmed_height "
-            "FROM pending_sweeps ORDER BY id DESC LIMIT 30")
-        data[label]["pending_sweeps"] = rows if not err else []
-        # The factories table only carries funding_txid (no bytes); the
-        # bytes live in the bitcoind wallet.  Treat "txid present" as the
-        # readiness signal for the funding category.
-        rows, err = query_db(path,
-            "SELECT id, funding_amount, "
-            "CASE WHEN funding_txid IS NOT NULL AND length(funding_txid)>0 "
-            "  THEN 1 ELSE 0 END AS has_funding_bytes "
-            "FROM factories ORDER BY id")
-        data[label]["factory_funding_bytes"] = rows if not err else []
-        rows, err = query_db(path,
-            "SELECT factory_id, node_index, "
-            "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
-            "  THEN 1 ELSE 0 END AS has_bytes "
-            "FROM tree_nodes ORDER BY factory_id, node_index")
-        data[label]["tree_nodes_bytes"] = rows if not err else []
-        # P1: count PS leaf + sub-factory nodes so we can derive correct
-        # chain[0] "expected" denominators.  Persisted schema doesn't carry
-        # is_ps_leaf as a direct column; identify via nsequence (PS leaves
-        # have nsequence = 0xFFFFFFFE = BIP-68 disabled) and via type
-        # column ("ps_subfactory" persisted from NODE_PS_SUBFACTORY).
-        rows, err = query_db(path,
-            "SELECT factory_id, "
-            "SUM(CASE WHEN nsequence = 4294967294 AND type='state' "
-            "         THEN 1 ELSE 0 END) AS ps_leaf_count, "
-            "SUM(CASE WHEN type LIKE '%subfactory%' "
-            "         THEN 1 ELSE 0 END) AS subfactory_count "
-            "FROM tree_nodes GROUP BY factory_id")
-        data[label]["ps_node_counts"] = rows if not err else []
-        # P1: how many channels have had at least one commit exchange?
-        # signed_commitments only stores rows once commitment_number > 0;
-        # at commit 0 (just opened, no payments) there's nothing to sign.
-        rows, err = query_db(path,
-            "SELECT factory_id, "
-            "SUM(CASE WHEN commitment_number > 0 THEN 1 ELSE 0 END) "
-            "  AS channels_with_commits "
-            "FROM channels GROUP BY factory_id")
-        data[label]["channels_committed"] = rows if not err else []
+            "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitments")
+    out["old_commitments_coverage"] = (rows[0] if rows else
+        {"total": 0, "persisted": 0})
+    # PR #181 Phase B consumer: signing_rounds journal summary.  Table
+    # was added in schema v26.  Empty (table missing) on pre-#181 LSPs
+    # — graceful: row stays as the defaults, UI shows the
+    # journal-not-yet-available copy.
+    rows, err = query_db(path,
+        "SELECT COUNT(*) AS total, "
+        "COUNT(CASE WHEN result = 'success' THEN 1 END) AS success, "
+        "COUNT(CASE WHEN result = 'timeout' THEN 1 END) AS timeout, "
+        "COUNT(CASE WHEN result = 'aborted_crash' THEN 1 END) AS crashed, "
+        "COUNT(CASE WHEN completed_at IS NULL THEN 1 END) AS in_flight, "
+        "COUNT(DISTINCT ceremony_type) AS types "
+        "FROM signing_rounds")
+    out["signing_rounds_summary"] = (rows[0] if rows and not err
+        else {"total": 0, "success": 0, "timeout": 0, "crashed": 0,
+              "in_flight": 0, "types": 0})
+    # Recent signing rounds for the Overview ledger.  Same graceful
+    # fallback as the summary.
+    rows, err = query_db(path,
+        "SELECT id, factory_id, node_idx, ceremony_type, epoch, "
+        "started_at, completed_at, n_participants, "
+        "nonces_collected, partial_sigs_collected, "
+        "result, result_txid, error_detail "
+        "FROM signing_rounds ORDER BY started_at DESC LIMIT 20")
+    out["signing_rounds_recent"] = rows if not err else []
+    # Factory revocation secrets — per-epoch flat revocation
+    rows, err = query_db(path,
+        "SELECT factory_id, COUNT(*) as cnt "
+        "FROM factory_revocation_secrets GROUP BY factory_id")
+    out["factory_revocations_by_factory"] = rows if not err else []
+    # PS leaf chains (schema v20+): canonical pseudo-Spilman leaf state
+    # chains.  Each row is chain[N] for a given (factory_id, leaf_node_idx),
+    # with chan_amount_sats decreasing as the LSP sells liquidity into the
+    # leaf and poison_tx_hex (v22+) carrying the per-position wire-signed
+    # poison TX for the trustless watchtower defense.
+    # F2: include epoch column (v24+).  COALESCE handles older DBs where
+    # ALTER TABLE may have failed silently and rows lack the field.
+    rows, err = query_db(path,
+        "SELECT factory_id, leaf_node_idx, chain_pos, txid, "
+        "chan_amount_sats, "
+        "COALESCE(epoch, 0) AS epoch, "
+        "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
+        "  THEN 1 ELSE 0 END AS has_poison "
+        "FROM ps_leaf_chains "
+        "ORDER BY factory_id, leaf_node_idx, chain_pos")
+    out["ps_leaf_chains"] = rows if not err else []
+    # PS sub-factory chains (schema v21+): k² wide-leaves shape.  Each row
+    # carries sales_stock_amount_sats + channel_amounts_csv for the
+    # per-sub-factory chain.  Empty when --ps-subfactory-arity=1.
+    rows, err = query_db(path,
+        "SELECT factory_id, sub_node_idx, chain_pos, txid, "
+        "sales_stock_amount_sats, channel_amounts_csv, "
+        "COALESCE(epoch, 0) AS epoch, "
+        "CASE WHEN poison_tx_hex IS NOT NULL AND length(poison_tx_hex)>0 "
+        "  THEN 1 ELSE 0 END AS has_poison "
+        "FROM ps_subfactory_chains "
+        "ORDER BY factory_id, sub_node_idx, chain_pos")
+    out["ps_subfactory_chains"] = rows if not err else []
+    # PS chain[0] initial signed states (schema v23+): the chain origin TX
+    # for each PS leaf / sub-factory.  Empty rows here when other PS
+    # tables are populated indicates the v0.1.15 force-close-fails-with-25
+    # bug pattern.
+    rows, err = query_db(path,
+        "SELECT factory_id, node_idx, txid, "
+        "COALESCE(epoch, 0) AS epoch "
+        "FROM ps_initial_signed_states "
+        "ORDER BY factory_id, node_idx")
+    out["ps_initial_signed_states"] = rows if not err else []
+    # Client-side PS double-spend defense (schema v20+): one row per
+    # (factory_id, parent_txid, parent_vout) the client has co-signed.
+    # Aggregate per leaf to keep the dashboard payload small.
+    rows, err = query_db(path,
+        "SELECT factory_id, leaf_node_idx, COUNT(*) as cnt "
+        "FROM client_ps_signed_inputs "
+        "GROUP BY factory_id, leaf_node_idx")
+    out["ps_signed_inputs_by_leaf"] = rows if not err else []
+    # TX preparedness audit feeds — one query per signed-bytes-bearing
+    # table so the TX Inventory tab can build a unified "is the defense
+    # set ready" view across factory tree, channel commitments,
+    # distribution TXs and pending sweeps.
+    rows, err = query_db(path,
+        "SELECT channel_id, commitment_number, "
+        "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+        "  THEN 1 ELSE 0 END AS has_bytes "
+        "FROM signed_commitments ORDER BY channel_id")
+    out["signed_commitments"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT factory_id, "
+        "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+        "  THEN 1 ELSE 0 END AS has_bytes "
+        "FROM distribution_txs ORDER BY factory_id")
+    out["distribution_txs"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT id, sweep_type, state, source_txid, source_vout, "
+        "amount_sats, channel_id, factory_id, sweep_txid, csv_delay, "
+        "confirmed_height "
+        "FROM pending_sweeps ORDER BY id DESC LIMIT 30")
+    out["pending_sweeps"] = rows if not err else []
+    # The factories table only carries funding_txid (no bytes); the
+    # bytes live in the bitcoind wallet.  Treat "txid present" as the
+    # readiness signal for the funding category.
+    rows, err = query_db(path,
+        "SELECT id, funding_amount, "
+        "CASE WHEN funding_txid IS NOT NULL AND length(funding_txid)>0 "
+        "  THEN 1 ELSE 0 END AS has_funding_bytes "
+        "FROM factories ORDER BY id")
+    out["factory_funding_bytes"] = rows if not err else []
+    rows, err = query_db(path,
+        "SELECT factory_id, node_index, "
+        "CASE WHEN signed_tx_hex IS NOT NULL AND length(signed_tx_hex)>0 "
+        "  THEN 1 ELSE 0 END AS has_bytes "
+        "FROM tree_nodes ORDER BY factory_id, node_index")
+    out["tree_nodes_bytes"] = rows if not err else []
+    # P1: count PS leaf + sub-factory nodes so we can derive correct
+    # chain[0] "expected" denominators.  Persisted schema doesn't carry
+    # is_ps_leaf as a direct column; identify via nsequence (PS leaves
+    # have nsequence = 0xFFFFFFFE = BIP-68 disabled) and via type
+    # column ("ps_subfactory" persisted from NODE_PS_SUBFACTORY).
+    rows, err = query_db(path,
+        "SELECT factory_id, "
+        "SUM(CASE WHEN nsequence = 4294967294 AND type='state' "
+        "         THEN 1 ELSE 0 END) AS ps_leaf_count, "
+        "SUM(CASE WHEN type LIKE '%subfactory%' "
+        "         THEN 1 ELSE 0 END) AS subfactory_count "
+        "FROM tree_nodes GROUP BY factory_id")
+    out["ps_node_counts"] = rows if not err else []
+    # P1: how many channels have had at least one commit exchange?
+    # signed_commitments only stores rows once commitment_number > 0;
+    # at commit 0 (just opened, no payments) there's nothing to sign.
+    rows, err = query_db(path,
+        "SELECT factory_id, "
+        "SUM(CASE WHEN commitment_number > 0 THEN 1 ELSE 0 END) "
+        "  AS channels_with_commits "
+        "FROM channels GROUP BY factory_id")
+    out["channels_committed"] = rows if not err else []
+    return out
+
+
+def collect_databases(cfg, selected_pov=None):
+    """Read lsp.db (singular) + the SELECTED client.db and return a
+    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id}
+    dict.
+
+    Multi-client invocations (operator/audit) populate `povs` with one
+    entry per --client-db, plus an "lsp" entry for the LSP-only view.
+    `client` holds ONLY the selected POV's data — never an aggregate
+    across users.  This was an intentional pivot from the earlier merge
+    design: aggregating client.dbs leaks who-saw-what across user
+    boundaries even for operators, and the goal here is "switch between
+    POVs," not "fuse them."
+
+    Single --client-db invocations: `povs` has just that one entry, the
+    UI doesn't render a switcher, behavior is unchanged from
+    pre-multi-client-db days.
+
+    `selected_pov` is "lsp" (LSP-only) or "client_N" (Nth --client-db
+    in argv order).  Defaults to the first client when --client-db was
+    given, else "lsp"."""
+    data = {"lsp": _collect_one_db(cfg.lsp_db), "client": {}}
+
+    # Build POV menu.  Each entry: {"id", "label", "source"}.
+    povs = []
+    if cfg.client_dbs:
+        # Show "LSP-only" as an explicit option when multiple clients exist
+        # (operator's first instinct is often "look at the LSP's truth
+        # before drilling into a specific client's POV").  Single-client
+        # case skips this — that's the only entry anyway.
+        if len(cfg.client_dbs) > 1:
+            povs.append({"id": "lsp", "label": "LSP-only view (no client data)",
+                         "source": None})
+        for i, cdb in enumerate(cfg.client_dbs):
+            base = os.path.basename(str(cdb))
+            label = base if len(cfg.client_dbs) > 1 else "Client"
+            povs.append({"id": f"client_{i}", "label": label, "source": cdb})
+    data["povs"] = povs
+
+    if not povs:
+        data["client"]["error"] = "not configured"
+        data["selected_pov"] = None
+        return data
+
+    # Resolve selected POV.  Falls back to first entry if the caller asked
+    # for an unknown id (browser cached an id that no longer exists, etc.).
+    selected = next((p for p in povs if p["id"] == selected_pov), povs[0])
+    data["selected_pov"] = selected["id"]
+    if selected["source"]:
+        data["client"] = _collect_one_db(selected["source"])
+    # else: LSP-only — data["client"] stays empty.
     return data
 
 def collect_cln(cfg):
@@ -788,9 +859,9 @@ def derive_events(db):
     return events[-50:]
 
 def _db_freshness(cfg):
-    """Sample mtime + ISO timestamp of lsp.db and client.db so the UI can
-    detect a stale browser fetch (operator looks at the page after a wipe
-    + restart, sees old data, doesn't realize the tab cached an earlier
+    """Sample mtime + ISO timestamp of lsp.db and every client.db so the UI
+    can detect a stale browser fetch (operator looks at the page after a
+    wipe + restart, sees old data, doesn't realize the tab cached an earlier
     /api/status response).  Times are unix seconds; renderer can compute
     'now - api_ts' to flag staleness.
 
@@ -800,25 +871,35 @@ def _db_freshness(cfg):
     dashboard report "quiet DB" during heavy ceremony bursts — exactly when
     the operator most wants the real signal.  Take max(.db, .db-wal); skip
     .db-shm because reader connections (including the dashboard's own
-    read-only open) touch -shm, which would make every fetch look fresh."""
+    read-only open) touch -shm, which would make every fetch look fresh.
+
+    Multi-client deployments: report max mtime across every --client-db so
+    one quiet client doesn't mask another's recent activity."""
+    def _wal_aware_mtime(path):
+        if not path or not os.path.exists(str(path)):
+            return 0
+        paths = [str(path), str(path) + "-wal"]
+        mtimes = [os.path.getmtime(p) for p in paths if os.path.exists(p)]
+        return int(max(mtimes)) if mtimes else 0
     out = {"api_ts": int(time.time()),
            "api_time": time.strftime("%H:%M:%S")}
-    for label, path in (("lsp_db_mtime", cfg.lsp_db),
-                         ("client_db_mtime", cfg.client_db)):
-        try:
-            if path and os.path.exists(str(path)):
-                paths = [str(path), str(path) + "-wal"]
-                mtimes = [os.path.getmtime(p) for p in paths if os.path.exists(p)]
-                out[label] = int(max(mtimes)) if mtimes else 0
-            else:
-                out[label] = 0
-        except OSError:
-            out[label] = 0
+    try:
+        out["lsp_db_mtime"] = _wal_aware_mtime(cfg.lsp_db)
+    except OSError:
+        out["lsp_db_mtime"] = 0
+    try:
+        if cfg.client_dbs:
+            out["client_db_mtime"] = max(
+                (_wal_aware_mtime(p) for p in cfg.client_dbs), default=0)
+        else:
+            out["client_db_mtime"] = 0
+    except OSError:
+        out["client_db_mtime"] = 0
     return out
 
-def collect_all(cfg):
+def collect_all(cfg, selected_pov=None):
     if cfg.demo: return collect_demo()
-    db = collect_databases(cfg)
+    db = collect_databases(cfg, selected_pov)
     return {"timestamp": time.strftime("%H:%M:%S"),
         "freshness": _db_freshness(cfg),
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
@@ -1160,7 +1241,7 @@ tr:hover td{background:#1c2128}
 <div class="wrap">
 <div class="hdr">
  <h1>SuperScalar Dashboard<span class="sub">DW Factories + Timeout-Sig-Trees + Laddering</span></h1>
- <div class="tm"><span id="stale" title="data staleness: server payload age" style="display:none;background:#bb800922;color:#d29922;border:1px solid #bb800966;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:6px">—</span><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
+ <div class="tm"><select id="povsel" onchange="setPov(this.value)" title="Switch viewing POV (operator mode — one client at a time, never merged)" style="display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 6px;border-radius:3px;font-size:11px;margin-right:6px"></select><span id="stale" title="data staleness: server payload age" style="display:none;background:#bb800922;color:#d29922;border:1px solid #bb800966;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:6px">—</span><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
 </div>
 <div id="dm" class="demo" style="display:none">DEMO MODE — simulated data for UI preview</div>
 <div class="tabs" id="tabs">
@@ -2202,7 +2283,13 @@ function rTxInventory(D){
  const chansCommitted=lsp.channels_committed||[];
  const comExpected=chansCommitted.reduce((a,r)=>a+(r.channels_with_commits||0),0);
  const distSigned=distTx.filter(r=>r.has_bytes).length;
- const distExpected=facs.length;
+ // Distribution TX (recovery) is per-client: every client holds their own
+ // CLTV-timeout-d recovery TX so they can sweep funds back at factory CLTV
+ // even if the LSP disappears.  Expected = sum across factories of (clients
+ // in that factory).  Previously this was `facs.length` (1 per factory),
+ // which silently rendered "1/1 (100%)" for any deployment — wrong, since
+ // we never actually verified that every CLIENT held its own copy.
+ const distExpected=facs.reduce((s,f)=>s+Math.max(0,((f.n_participants||1)-1)),0);
  const jitSigned=jits.length;
  const totalSigned=fundingSigned+treeSigned+psChainSigned+psInitSigned+psSubSigned+psPoisonHave+comSigned+distSigned+jitSigned;
  const totalExpected=fundingExpected+treeExpected+psChainSigned+psInitExpected+psSubSigned+psPoisonExpected+comExpected+distExpected+jitSigned;
@@ -2238,7 +2325,7 @@ function rTxInventory(D){
  // --client-db, so it can only see one client's row out of N — not a
  // signing failure, just a single-client view.  Multi-client.db aggregation
  // would close the gap (separate PR).
- cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder', `Per-client schema (PRIMARY KEY channel_id) — dashboard reads one --client-db, so this shows 1-of-N until multi-POV PR lands. Not a signing failure.`);
+ cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder', `Per-client schema (PRIMARY KEY channel_id) — each client.db holds one row.  Dashboard renders one POV at a time (multi --client-db invocations expose a switcher in the header to step through each user's POV).  End-users only see their own row, which is correct for their POV.`);
  cat('Distribution TX (recovery)','distribution_txs (client-side)', distSigned,   distExpected,    'ANY client at CLTV timeout');
  cat('JIT channel funding',  'jit_channels.funding_tx_hex',       jitSigned,     jitSigned,       'LSP');
  h+=`</table></div>`;
@@ -3060,7 +3147,31 @@ function render(D){
  // auto-refresh without them having to retype.
  if(curTab==='protocol')applyProtoFilter();
 }
-async function refresh(){try{const r=await fetch('/api/status');if(r.ok)render(await r.json());}catch(e){}}
+// POV switcher state (operator-mode only).  Lives at module scope so it
+// survives between refreshes.  Empty string = let the server pick the
+// default (first --client-db, or "lsp" when none).  Updated by setPov()
+// from the dropdown change handler.
+let curPov='';
+function setPov(p){curPov=p;refresh();}
+function renderPovSelector(D){
+ const sel=document.getElementById('povsel');
+ const povs=(D.databases&&D.databases.povs)||[];
+ // Only show the switcher when there's a real choice (>1 POV).  Single-POV
+ // invocations (the production end-user case) keep the header clean.
+ if(povs.length<=1){sel.style.display='none';return;}
+ const active=D.databases.selected_pov||povs[0].id;
+ // Rebuild only when the options change; keeps the dropdown DOM stable.
+ const sig=povs.map(p=>p.id).join('|')+'#'+active;
+ if(sel.dataset.sig!==sig){
+  sel.innerHTML=povs.map(p=>`<option value="${p.id}"${p.id===active?' selected':''}>${p.label}</option>`).join('');
+  sel.dataset.sig=sig;
+ }
+ sel.style.display='inline-block';
+ // Mirror server-resolved selection back into curPov so the next refresh
+ // sends the right ?pov= even if the user landed on a fallback.
+ curPov=active;
+}
+async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();renderPovSelector(D);render(D);}}catch(e){}}
 refresh();setInterval(refresh,R);
 </script></body></html>"""
 
@@ -3075,8 +3186,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
-        elif self.path == "/api/status":
-            d = collect_all(self.cfg)
+        elif self.path == "/api/status" or self.path.startswith("/api/status?"):
+            # ?pov=lsp or ?pov=client_N selects which POV the dashboard
+            # renders.  Defaults to the first --client-db (or LSP-only when
+            # no --client-db was passed).  The selector is rendered by the
+            # JS only when multiple --client-db inputs are configured.
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            pov = params.get("pov", [None])[0]
+            d = collect_all(self.cfg, selected_pov=pov)
             self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-cache"); self.end_headers()
             self.wfile.write(json.dumps(d, default=str).encode("utf-8"))
         else: self.send_error(404)
@@ -3084,7 +3202,17 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser(description="SuperScalar Web Dashboard")
     p.add_argument("--port",type=int,default=8080); p.add_argument("--demo",action="store_true")
-    p.add_argument("--lsp-db",default=None); p.add_argument("--client-db",default=None)
+    p.add_argument("--lsp-db",default=None)
+    # action='append' allows the operator/test rig to pass --client-db
+    # repeatedly so the dashboard can SWITCH between POVs (one client.db
+    # at a time, never merged).  In production each user runs their own
+    # dashboard with their own single --client-db.  Single-flag
+    # invocations are unchanged; multi-flag invocations get a UI
+    # dropdown to pick which POV to render.  A startup warning fires
+    # when N>1 to make operator-mode usage visible.
+    p.add_argument("--client-db",default=None,action="append",
+                   help="Path to a client.db.  Repeat for multiple clients "
+                        "(operator/audit only; renders a POV switcher)")
     p.add_argument("--btc-cli",default="bitcoin-cli"); p.add_argument("--btc-network",default="signet")
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
     p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
@@ -3095,6 +3223,13 @@ def main():
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
     s = HTTPServer(("0.0.0.0",cfg.port), Handler)
     print(f"SuperScalar Dashboard: http://localhost:{cfg.port}")
+    # Operator-mode warning: passing multiple --client-db only makes sense
+    # on a box that legitimately holds all the client.db files (test rigs,
+    # LSP-operator audits, the test matrix runner).  Surface it explicitly
+    # so this isn't accidentally how someone ships an end-user dashboard.
+    if len(cfg.client_dbs) > 1:
+        print(f"  ⚠ Operator mode: {len(cfg.client_dbs)} client.dbs configured. "
+              f"POV switcher will be rendered; views never merge across users.", file=sys.stderr)
     print("Press Ctrl+C to stop")
     try: s.serve_forever()
     except KeyboardInterrupt: print("\nDone"); s.server_close()
