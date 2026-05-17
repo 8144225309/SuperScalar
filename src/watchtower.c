@@ -986,6 +986,13 @@ int watchtower_check(watchtower_t *wt) {
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, poison_txid,
                                                   "subfactory_poison", poison_hex, "ok");
+                        /* v29 (PR-C-6 / #176): observability — record sub-factory
+                           breach detection.  Mirrors WATCH_FACTORY_NODE call at L932. */
+                        if (wt->db && wt->db->db) {
+                            int sub_h = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                            persist_log_breach_detection(wt->db, e->channel_id,
+                                e->commit_num, e->txid, sub_h, poison_txid);
+                        }
                     } else {
                         fprintf(stderr, "  Sub-factory poison tx broadcast failed\n");
                         if (wt->db && wt->db->db)
@@ -1062,6 +1069,13 @@ int watchtower_check(watchtower_t *wt) {
                 if (wt->db && wt->db->db)
                     persist_log_broadcast(wt->db, penalty_txid, "penalty",
                                           penalty_hex, "ok");
+                /* v29 (PR-C-6 / #175): observability — record HTLC-commitment
+                   breach detection.  Mirrors WATCH_FACTORY_NODE call at L932. */
+                if (wt->db && wt->db->db) {
+                    int com_h = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                    persist_log_breach_detection(wt->db, e->channel_id,
+                        e->commit_num, e->txid, com_h, penalty_txid);
+                }
             } else {
                 fprintf(stderr, "  Penalty tx broadcast failed — queued for retry\n");
                 if (wt->db && wt->db->db)
