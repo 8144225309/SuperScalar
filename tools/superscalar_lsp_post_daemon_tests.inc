@@ -1600,6 +1600,20 @@
         }
         printf("  Factory 1 created and stored in ladder slot 1\n");
 
+        /* SF-ROT #158: save Factory 0 channel balances so rotation preserves them.
+           Without this, mgr2 channels init to default split; client
+           client_do_factory_rotation balance-carry check (src/client.c:1276)
+           REFUSES with "balance not carried" and disconnects, then
+           send_ready reads EOF (0x00) on the next recv.  Mirrors production
+           rotation save/restore at src/lsp_rotation.c:848-911. */
+        size_t rot_saved_n_channels = mgr->n_channels;
+        uint64_t rot_saved_ch_local[FACTORY_MAX_SIGNERS];
+        uint64_t rot_saved_ch_remote[FACTORY_MAX_SIGNERS];
+        for (size_t c = 0; c < rot_saved_n_channels && c < FACTORY_MAX_SIGNERS; c++) {
+            rot_saved_ch_local[c]  = mgr->entries[c].channel.local_amount;
+            rot_saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
+        }
+
         /* Initialize new channel manager + send CHANNEL_READY */
         lsp_channel_mgr_t *mgr2 = calloc(1, sizeof(lsp_channel_mgr_t));
         if (!mgr2) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
@@ -1611,6 +1625,18 @@
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
             free(mgr2); lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
+        }
+        /* Restore Factory 0 balances if they fit in new channel capacity (same
+           rule as src/lsp_rotation.c:902-911). */
+        for (size_t c = 0; c < mgr2->n_channels && c < rot_saved_n_channels; c++) {
+            channel_t *ch = &mgr2->entries[c].channel;
+            uint64_t old_total = rot_saved_ch_local[c] + rot_saved_ch_remote[c];
+            uint64_t new_usable = ch->local_amount + ch->remote_amount;
+            if (old_total > 0 && old_total <= new_usable) {
+                ch->local_amount   = rot_saved_ch_local[c];
+                ch->remote_amount  = rot_saved_ch_remote[c];
+                ch->funding_amount = old_total;
+            }
         }
         if (!lsp_channels_exchange_basepoints(mgr2, lsp_p)) {
             fprintf(stderr, "ROTATION: basepoint exchange for Factory 1 failed\n");
