@@ -3464,6 +3464,56 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
         const char *raw_hex = (const char *)sqlite3_column_text(stmt, 1);
         if (!raw_hex) continue;
 
+        /* SF-RR #150: if backend supports outpoint queries, check the first
+           input's outpoint before re-broadcasting. If it has been spent
+           (state moved on while we were down), mark stale and skip — prevents
+           infinite retry on dead pending entries. */
+        if (chain->is_outpoint_unspent) {
+            size_t hex_len = strlen(raw_hex);
+            if (hex_len >= 84) {
+                /* Detect segwit marker at offset 8-11 to compute vin offset. */
+                int is_segwit = (hex_len >= 12 &&
+                                 raw_hex[8] == '0' && raw_hex[9] == '0' &&
+                                 raw_hex[10] == '0' && raw_hex[11] == '1');
+                size_t vin_ofs = is_segwit ? (4 + 2 + 1) * 2 : (4 + 1) * 2;
+                if (hex_len >= vin_ofs + 64 + 8) {
+                    char prev_txid_disp[65];
+                    /* prev_txid is stored LE in raw; display order reverses bytes. */
+                    for (int j = 0; j < 32; j++) {
+                        prev_txid_disp[j*2]   = raw_hex[vin_ofs + (31 - j)*2];
+                        prev_txid_disp[j*2+1] = raw_hex[vin_ofs + (31 - j)*2 + 1];
+                    }
+                    prev_txid_disp[64] = 0;
+                    uint32_t prev_vout = 0;
+                    for (int j = 0; j < 4; j++) {
+                        char hb[3] = { raw_hex[vin_ofs + 64 + j*2],
+                                       raw_hex[vin_ofs + 64 + j*2 + 1], 0 };
+                        prev_vout |= (uint32_t)strtoul(hb, NULL, 16) << (j * 8);
+                    }
+                    int unspent = chain->is_outpoint_unspent(chain,
+                                    prev_txid_disp, prev_vout);
+                    if (unspent == 0) {
+                        fprintf(stderr,
+                            "SF-RR #150: outpoint %s:%u already spent, "
+                            "marking broadcast_log row %d stale_input_spent\n",
+                            prev_txid_disp, prev_vout, row_id);
+                        const char *upd_stale =
+                            "UPDATE broadcast_log "
+                            "SET result='stale_input_spent' WHERE id=?;";
+                        sqlite3_stmt *us;
+                        if (sqlite3_prepare_v2(p->db, upd_stale, -1, &us, NULL)
+                                == SQLITE_OK) {
+                            sqlite3_bind_int(us, 1, row_id);
+                            sqlite3_step(us);
+                            sqlite3_finalize(us);
+                        }
+                        continue;  /* skip this row */
+                    }
+                    /* unspent==1 (good) or unspent==-1 (RPC error) → fall through */
+                }
+            }
+        }
+
         char txid_out[65] = {0};
         if (chain->send_raw_tx(chain, raw_hex, txid_out)) {
             fprintf(stderr, "Watchtower: retry broadcast succeeded: %s\n", txid_out);
