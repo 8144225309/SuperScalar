@@ -2190,6 +2190,52 @@ function rPayments(D){
   h+=`<div class="ki"><span class="k">Paid</span><span class="b ok">${paid}</span></div>`;
   h+=`</div></div>`;
  }
+ // PTLC payments rollup — parallel to the HTLC grouping above but keyed on
+ // payment_point instead of payment_hash.  PTLCs reveal via discrete-log
+ // extraction from an adapted Schnorr signature rather than preimage
+ // release, so there's no preimage column.  Renders only when PTLC data
+ // is present (silent on HTLC-only deployments); auto-lights-up once
+ // real PTLC payments start flowing.
+ const ptlcs=lsp.ptlcs||[];
+ const oldPtlcs=lsp.old_commitment_ptlcs||[];
+ if(ptlcs.length||oldPtlcs.length){
+  const byPoint={};
+  const notePoint=(pp)=>{if(!byPoint[pp])byPoint[pp]={point:pp,ptlcs:[],historical:[]};return byPoint[pp];};
+  for(const x of ptlcs){if(x.payment_point)notePoint(x.payment_point).ptlcs.push(x);}
+  for(const x of oldPtlcs){if(x.payment_point)notePoint(x.payment_point).historical.push(x);}
+  const ptlcPayments=Object.values(byPoint);
+  const allPtlcs=ptlcs.concat(oldPtlcs);
+  const ptlcStateCounts={};
+  for(const x of allPtlcs)ptlcStateCounts[x.state||'unknown']=(ptlcStateCounts[x.state||'unknown']||0)+1;
+  const ptlcTotalAmt=allPtlcs.reduce((a,x)=>a+(x.amount||0),0);
+  const ptlcSuccN=(ptlcStateCounts.settled||0)+(ptlcStateCounts.fulfilled||0);
+  const ptlcFailN=(ptlcStateCounts.failed||0);
+  const ptlcActiveN=(ptlcStateCounts.active||0)+(ptlcStateCounts.offered||0)+(ptlcStateCounts.received||0)+(ptlcStateCounts.pending||0);
+  h+=`<div class="s"><div class="st"><span>PTLC Payment Activity</span><span class="c h-ptlc">point-locked</span><span class="c">${ptlcPayments.length} unique, ${allPtlcs.length} PTLC(s)</span></div>`;
+  h+=`<div class="kv">`;
+  h+=`<div class="ki"><span class="k">Total PTLCs</span><span class="v">${allPtlcs.length}</span></div>`;
+  h+=`<div class="ki"><span class="k">Unique payments</span><span class="v">${ptlcPayments.length}</span></div>`;
+  h+=`<div class="ki"><span class="k">Volume routed</span><span class="v">${fs(ptlcTotalAmt)}</span></div>`;
+  if(ptlcActiveN)h+=`<div class="ki"><span class="k">In-flight</span><span class="b w">${ptlcActiveN}</span></div>`;
+  if(ptlcSuccN)h+=`<div class="ki"><span class="k">Settled</span><span class="b ok">${ptlcSuccN}</span></div>`;
+  if(ptlcFailN)h+=`<div class="ki"><span class="k">Failed</span><span class="b dn">${ptlcFailN}</span></div>`;
+  h+=`</div></div>`;
+  if(ptlcPayments.length){
+   h+=`<div class="s"><div class="st"><span>PTLC Payments</span><span class="c h-ptlc">point-locked</span><span class="c">${ptlcPayments.length}</span></div>`;
+   h+=`<table><tr><th>Payment Point</th><th class="r">Total Amt</th><th class="r"># PTLCs</th><th>States</th><th>CH(s)</th></tr>`;
+   ptlcPayments.sort((a,b)=>(b.ptlcs.length+b.historical.length)-(a.ptlcs.length+a.historical.length));
+   for(const p of ptlcPayments.slice(0,50)){
+    const all=p.ptlcs.concat(p.historical);
+    const amt=all.reduce((a,x)=>a+(x.amount||0),0);
+    const states={};for(const x of all)states[x.state||'?']=(states[x.state||'?']||0)+1;
+    const stateStr=Object.entries(states).map(([s,n])=>`${s}×${n}`).join(', ');
+    const chans=[...new Set(all.map(x=>x.channel_id))].join(', ');
+    h+=`<tr><td class="h">${th(p.point)}</td><td class="r">${fs(amt)}</td><td class="r">${all.length}</td><td style="font-size:11px">${stateStr}</td><td>${chans}</td></tr>`;
+   }
+   if(ptlcPayments.length>50)h+=`<tr><td colspan="5" class="mu">… and ${ptlcPayments.length-50} more</td></tr>`;
+   h+=`</table></div>`;
+  }
+ }
  return h;
 }
 
@@ -3026,6 +3072,33 @@ function rDefenseStatus(D){
    risk:'Cheater wins disputed balance if LSP restarts before broadcast'});
  }
 
+ // #6 — HTLC/PTLC times out → watchtower in-flight coverage.
+ // The defense is the watchtower tracking every in-flight contract so it
+ // can broadcast the appropriate timeout/success TX before CLTV.  PTLCs
+ // are wired by SF-W-PTLC (LSP-side PR #242).  This tile fires off the
+ // live htlcs + ptlcs tables; coverage is "all in-flight contracts are
+ // visible to the LSP" (which by definition they always are — but the
+ // tile surfaces volume/state so operators see at a glance whether a
+ // backlog is forming).
+ {
+  const liveHtlcs=lsp.htlcs||[];
+  const livePtlcs=lsp.ptlcs||[];
+  const totalInFlight=liveHtlcs.length+livePtlcs.length;
+  const stuck=[...liveHtlcs,...livePtlcs].filter(x=>{
+   const s=(x.state||'').toLowerCase();
+   return s==='offered'||s==='received'||s==='active'||s==='pending';
+  }).length;
+  let color, status;
+  if(totalInFlight===0){color='grey'; status='no in-flight contracts (HTLC or PTLC)';}
+  else if(stuck===0){color='green'; status=`${totalInFlight} contracts tracked, none stuck`;}
+  else{color='yellow'; status=`${totalInFlight} contracts tracked, ${stuck} pending/in-flight`;}
+  const htlcN=liveHtlcs.length, ptlcN=livePtlcs.length;
+  tiles.push({n:'#6',icon:'⏳',name:'HTLC/PTLC times out',
+   defense:`Watchtower tracks every in-flight contract (HTLCs ${htlcN}, PTLCs ${ptlcN}) to broadcast timeout/success TX before CLTV`,
+   status,color,source:'htlcs + ptlcs (live in-flight)',scope:'lsp',
+   risk:'Stuck contract expires unredeemed; sender or receiver loses funds'});
+ }
+
  // Filter tiles by POV.  Client POV sees only 'client'-scoped + 'shared'
  // tiles (failure modes a single user can verify from their own
  // client.db: factory tree path, their poison TX, their distribution TX,
@@ -3085,7 +3158,7 @@ function rDefenseStatus(D){
   {n:'#3', name:'Old DW state published (legacy)',             status:'skipped — n/a on canonical PS (arity=3) deployments; tile would always show grey'},
   {n:'#4', name:'Old PS chain state published',                status:'tile above'},
   {n:'#5', name:'CLTV timeout, LSP gone',                      status:'tile above'},
-  {n:'#6', name:'HTLC times out / preimage not received',      status:'skipped — built on-demand, no preparedness check available'},
+  {n:'#6', name:'HTLC/PTLC times out / secret not received',   status:'tile above (in-flight watchtower coverage)'},
   {n:'#7', name:'LSP crash mid-ceremony',                      status:'tile above'},
   {n:'#8', name:'Mempool fee spike during force-close',        status:'tile above'},
   {n:'#9', name:'Reorg invalidates penalty confirmation',      status:'skipped — needs deeper bitcoind enrichment; informational only'},
