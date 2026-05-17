@@ -28,10 +28,16 @@
 #include <unistd.h>
 
 #include "superscalar/sha256.h"
+#include "superscalar/tapscript.h"
 #include "superscalar/wallet_source.h"
 #include "superscalar/wallet_source_hd.h"
 
 /* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
+
+/* SF-CH #154: 2-party funding keyagg discovery is now centralized in
+   channel.c as channel_discover_funding_keyagg (shared with client.c).
+   The LSP caller passes its own pubkey as "my", the client's as "peer";
+   the returned my_signer_idx indicates LSP's position in the keyagg. */
 
 /* Verify that a revocation secret matches the per-commitment point stored for
    the given commitment number.  Returns 1 if valid (or if no stored PCP to
@@ -279,19 +285,42 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
 
-        /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering.
-           channel_init's SPK-match heuristic fails for CLTV-taptree outputs
-           (cltv_timeout > 0), falling back to [local, remote] = [lsp, client].
-           Override to match the factory's actual ordering. */
+        /* SF-CH #154: factory leaf outputs use DIFFERENT keyagg orderings
+           depending on leaf type (setup_leaf_outputs / setup_single_leaf_outputs
+           / setup_nway_leaf_outputs use [client, LSP]; setup_ps_leaf_outputs
+           uses [LSP, client] via build_subtree's signer set).  Hardcoding one
+           order breaks the other family — PS-leaf channels (arity != 2) failed
+           on-chain Schnorr verify because the LSP-side 2-party keyagg didn't
+           match the factory's actual aggregate.  Auto-discover by reproducing
+           the factory's P2TR construction and comparing to funding_spk. */
         {
-            secp256k1_pubkey ch_pks[2] = { *client_pubkey, lsp_pubkey };
-            if (!musig_aggregate_keys(ctx, &entry->channel.funding_keyagg, ch_pks, 2))
+            musig_keyagg_t ka;
+            uint32_t signer_idx;
+            unsigned char merkle[32];
+            int has_merkle = 0;
+            if (!channel_discover_funding_keyagg(
+                    ctx, &lsp_pubkey, client_pubkey, &lsp_pubkey,
+                    factory->cltv_timeout, state_node->cltv_timeout,
+                    funding_spk, funding_spk_len,
+                    &ka, &signer_idx, merkle, &has_merkle)) {
+                fprintf(stderr,
+                        "LSP: channel %zu funding_keyagg discovery failed — "
+                        "no combination of ordering [client,LSP]/[LSP,client] "
+                        "and cltv (factory=%u, node=%u) produces the on-chain "
+                        "funding_spk. Cannot proceed: on-chain spends would "
+                        "fail Schnorr verify.\n",
+                        c, factory->cltv_timeout, state_node->cltv_timeout);
                 return 0;
-            entry->channel.local_funding_signer_idx = 1;  /* LSP at index 1 */
+            }
+            entry->channel.funding_keyagg = ka;
+            entry->channel.local_funding_signer_idx = signer_idx;
+            if (has_merkle) {
+                memcpy(entry->channel.chan_merkle_root, merkle, 32);
+                entry->channel.has_chan_merkle_root = 1;
+            } else {
+                entry->channel.has_chan_merkle_root = 0;
+            }
         }
-        /* Set CLTV taptree merkle root so MuSig2 session uses correct tweak */
-        if (factory->cltv_timeout > 0)
-            channel_set_cltv_merkle_root(&entry->channel, factory->cltv_timeout, &lsp_pubkey);
 
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {
@@ -440,15 +469,34 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         /* Do NOT override fee_rate from estimatesmartfee: client always uses the
            default 1000 sat/kvB from channel_init, so both sides must agree. */
 
-        /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering */
+        /* SF-CH #154: auto-discover funding keyagg ordering (see comment in
+           lsp_channels_init for full rationale). */
         {
-            secp256k1_pubkey ch_pks2[2] = { *client_pubkey, lsp_pubkey };
-            if (!musig_aggregate_keys(ctx, &entry->channel.funding_keyagg, ch_pks2, 2))
+            musig_keyagg_t ka;
+            uint32_t signer_idx;
+            unsigned char merkle[32];
+            int has_merkle = 0;
+            if (!channel_discover_funding_keyagg(
+                    ctx, &lsp_pubkey, client_pubkey, &lsp_pubkey,
+                    factory->cltv_timeout, state_node->cltv_timeout,
+                    funding_spk, funding_spk_len,
+                    &ka, &signer_idx, merkle, &has_merkle)) {
+                fprintf(stderr,
+                        "LSP recovery: channel %zu funding_keyagg discovery "
+                        "failed (factory_cltv=%u, node_cltv=%u). Refusing "
+                        "to load — on-chain spends would fail Schnorr verify.\n",
+                        c, factory->cltv_timeout, state_node->cltv_timeout);
                 return 0;
-            entry->channel.local_funding_signer_idx = 1;  /* LSP at index 1 */
+            }
+            entry->channel.funding_keyagg = ka;
+            entry->channel.local_funding_signer_idx = signer_idx;
+            if (has_merkle) {
+                memcpy(entry->channel.chan_merkle_root, merkle, 32);
+                entry->channel.has_chan_merkle_root = 1;
+            } else {
+                entry->channel.has_chan_merkle_root = 0;
+            }
         }
-        if (factory->cltv_timeout > 0)
-            channel_set_cltv_merkle_root(&entry->channel, factory->cltv_timeout, &lsp_pubkey);
 
         /* Load basepoints from DB instead of generating random ones */
         unsigned char local_secrets[4][32];

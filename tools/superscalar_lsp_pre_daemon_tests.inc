@@ -1996,12 +1996,34 @@
                 return 1;
             }
 
-            /* Step 1: Add a pending HTLC on channel 0 (low CLTV for quick timeout) */
+            /* Step 1: Add a pending HTLC on channel 0 (low CLTV for quick timeout).
+               #119: size the HTLC adaptively — channel_add_htlc requires
+               local_amount - amount >= CHANNEL_RESERVE_SATS.  Fail fast with
+               a clear message if even the dust-limit minimum can't clear. */
             uint32_t current_height = (uint32_t)regtest_get_block_height(&rt);
             uint32_t htlc_cltv = current_height + 10;  /* expires in ~10 blocks */
             unsigned char dummy_hash[32];
             memset(dummy_hash, 0xAA, 32);  /* dummy payment hash */
+            uint64_t ch0_local = mgr->entries[0].channel.local_amount;
             uint64_t htlc_amount = 1000;
+            if (ch0_local < htlc_amount + CHANNEL_RESERVE_SATS + 100 /* fee buffer */) {
+                if (ch0_local <= CHANNEL_DUST_LIMIT_SATS + CHANNEL_RESERVE_SATS + 100) {
+                    fprintf(stderr,
+                            "HTLC FORCE-CLOSE TEST: channel 0 local %llu sats < "
+                            "minimum %d (dust + reserve + fee); increase --amount\n",
+                            (unsigned long long)ch0_local,
+                            CHANNEL_DUST_LIMIT_SATS + CHANNEL_RESERVE_SATS + 100);
+                    lsp_cleanup(lsp_p);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                htlc_amount = ch0_local - CHANNEL_RESERVE_SATS - 100;
+                printf("HTLC FORCE-CLOSE TEST: sized HTLC down to %llu sats "
+                       "(channel 0 local=%llu, reserve=%d)\n",
+                       (unsigned long long)htlc_amount,
+                       (unsigned long long)ch0_local, CHANNEL_RESERVE_SATS);
+            }
 
             printf("Adding pending HTLC on channel 0 (amount=%llu sats, cltv=%u, "
                    "current_height=%u)\n",
@@ -2046,9 +2068,22 @@
                 return 1;
             }
 
-            /* Sign with both LSP + client keys (test key 0x22..22) */
+            /* Sign with both LSP + client keys.
+               #154: previously hardcoded cli_sec = 0x22*32 which assumed
+               client 1's seckey matched runt4.sh's CKEYS scheme.  When a
+               different launcher uses a different scheme, the keypair
+               mismatch produces an Invalid Schnorr signature on broadcast.
+               Now reads from SUPERSCALAR_TEST_CLIENT0_SECKEY (64 hex chars)
+               with fallback to the historic 0x22*32 default. */
             unsigned char cli_sec[32];
-            memset(cli_sec, 0x22, 32);
+            const char *cli_sec_hex = getenv("SUPERSCALAR_TEST_CLIENT0_SECKEY");
+            if (cli_sec_hex && strlen(cli_sec_hex) == 64
+                && hex_decode(cli_sec_hex, cli_sec, 32)) {
+                fprintf(stderr, "HTLC FORCE-CLOSE TEST: using client[0] seckey "
+                        "from SUPERSCALAR_TEST_CLIENT0_SECKEY env\n");
+            } else {
+                memset(cli_sec, 0x22, 32);
+            }
             secp256k1_keypair cli_kp;
             if (!secp256k1_keypair_create(ctx, &cli_kp, cli_sec)) {
                 fprintf(stderr, "HTLC FORCE-CLOSE TEST: client keypair failed\n");
@@ -2077,6 +2112,128 @@
             char *commit_hex = malloc(commit_signed.len * 2 + 1);
             hex_encode(commit_signed.data, commit_signed.len, commit_hex);
             char commit_txid_str[65];
+
+            /* #154 SF-CH: dump everything needed to diagnose Invalid Schnorr
+               on bitcoind broadcast.  Compare these against
+               `bitcoin-cli -regtest gettxout <funding_txid_display> <vout>`. */
+            if (getenv("SUPERSCALAR_DUMP_SIGHASH")) {
+                char funding_txid_disp_hex[65];
+                /* Display order: bitcoind reverses the internal byte order. */
+                for (int i = 0; i < 32; i++)
+                    sprintf(funding_txid_disp_hex + i * 2,
+                            "%02x", ch0->funding_txid[31 - i]);
+                funding_txid_disp_hex[64] = 0;
+                char funding_spk_hex[69];
+                for (size_t i = 0; i < ch0->funding_spk_len && i < 34; i++)
+                    sprintf(funding_spk_hex + i * 2,
+                            "%02x", ch0->funding_spk[i]);
+                funding_spk_hex[ch0->funding_spk_len * 2] = 0;
+                char commit_txid_disp_hex[65];
+                for (int i = 0; i < 32; i++)
+                    sprintf(commit_txid_disp_hex + i * 2,
+                            "%02x", commit_txid[31 - i]);
+                commit_txid_disp_hex[64] = 0;
+                /* Dump keyagg state so we can verify the keyagg.agg_pubkey
+                   matches the funding_spk after TapTweak(merkle_root). */
+                unsigned char agg_xonly_ser[32] = {0};
+                secp256k1_xonly_pubkey_serialize(ctx, agg_xonly_ser,
+                                                  &ch0->funding_keyagg.agg_pubkey);
+                char agg_xonly_hex[65];
+                for (int i = 0; i < 32; i++)
+                    sprintf(agg_xonly_hex + i * 2, "%02x", agg_xonly_ser[i]);
+                agg_xonly_hex[64] = 0;
+                char chan_merkle_hex[65];
+                if (ch0->has_chan_merkle_root) {
+                    for (int i = 0; i < 32; i++)
+                        sprintf(chan_merkle_hex + i * 2,
+                                "%02x", ch0->chan_merkle_root[i]);
+                } else {
+                    strcpy(chan_merkle_hex, "none");
+                }
+                chan_merkle_hex[64] = 0;
+                /* LSP funding pubkey (compressed 33 bytes) */
+                secp256k1_pubkey lsp_pub_dbg;
+                unsigned char lsp_pub_ser[33];
+                size_t lsp_pub_len = 33;
+                char lsp_pub_hex[67] = {0};
+                if (secp256k1_keypair_pub(ctx, &lsp_pub_dbg,
+                                          &ch0->local_funding_keypair) &&
+                    secp256k1_ec_pubkey_serialize(ctx, lsp_pub_ser,
+                                                  &lsp_pub_len, &lsp_pub_dbg,
+                                                  SECP256K1_EC_COMPRESSED)) {
+                    for (size_t i = 0; i < lsp_pub_len; i++)
+                        sprintf(lsp_pub_hex + i * 2, "%02x", lsp_pub_ser[i]);
+                }
+                /* Client funding pubkey from the cli_kp we just built */
+                secp256k1_pubkey cli_pub_dbg;
+                unsigned char cli_pub_ser[33];
+                size_t cli_pub_len = 33;
+                char cli_pub_hex[67] = {0};
+                if (secp256k1_keypair_pub(ctx, &cli_pub_dbg, &cli_kp) &&
+                    secp256k1_ec_pubkey_serialize(ctx, cli_pub_ser,
+                                                  &cli_pub_len, &cli_pub_dbg,
+                                                  SECP256K1_EC_COMPRESSED)) {
+                    for (size_t i = 0; i < cli_pub_len; i++)
+                        sprintf(cli_pub_hex + i * 2, "%02x", cli_pub_ser[i]);
+                }
+                /* Self-verify: compute TapTweak(agg_xonly, chan_merkle_root)
+                   and check it matches funding_spk's xonly key. */
+                char expected_xonly_hex[65] = "<failed>";
+                int spk_match = 0;
+                {
+                    unsigned char twk[32];
+                    extern void sha256_tagged(const char *tag, const unsigned char *data, size_t len, unsigned char *out);
+                    if (ch0->has_chan_merkle_root) {
+                        unsigned char buf[64];
+                        memcpy(buf, agg_xonly_ser, 32);
+                        memcpy(buf + 32, ch0->chan_merkle_root, 32);
+                        sha256_tagged("TapTweak", buf, 64, twk);
+                    } else {
+                        sha256_tagged("TapTweak", agg_xonly_ser, 32, twk);
+                    }
+                    secp256k1_pubkey tweaked_full;
+                    if (secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full,
+                                                          &ch0->funding_keyagg.agg_pubkey,
+                                                          twk)) {
+                        secp256k1_xonly_pubkey tweaked_xonly;
+                        if (secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly,
+                                                                NULL, &tweaked_full)) {
+                            unsigned char tx_ser[32];
+                            if (secp256k1_xonly_pubkey_serialize(ctx, tx_ser, &tweaked_xonly)) {
+                                for (int i = 0; i < 32; i++)
+                                    sprintf(expected_xonly_hex + i * 2,
+                                            "%02x", tx_ser[i]);
+                                expected_xonly_hex[64] = 0;
+                                /* funding_spk[2..34] = xonly portion */
+                                if (ch0->funding_spk_len == 34 &&
+                                    memcmp(tx_ser, ch0->funding_spk + 2, 32) == 0)
+                                    spk_match = 1;
+                            }
+                        }
+                    }
+                }
+                fprintf(stderr,
+                        "[DUMP_SIGHASH_BROADCAST] phase=htlc_force_close "
+                        "ch_idx=0 funding_txid=%s funding_vout=%u "
+                        "funding_amount=%" PRIu64 " funding_spk_len=%zu "
+                        "funding_spk=%s commit_txid=%s commit_n_htlcs=%zu "
+                        "commit_local=%" PRIu64 " commit_remote=%" PRIu64 " "
+                        "agg_xonly_pre_tweak=%s chan_merkle_root=%s "
+                        "signer_idx=%u lsp_pub=%s cli_pub=%s "
+                        "expected_tweaked_xonly=%s spk_match=%d "
+                        "signed_tx_len=%zu signed_tx=%s\n",
+                        funding_txid_disp_hex, ch0->funding_vout,
+                        ch0->funding_amount, ch0->funding_spk_len,
+                        funding_spk_hex, commit_txid_disp_hex,
+                        ch0->n_htlcs, ch0->local_amount, ch0->remote_amount,
+                        agg_xonly_hex, chan_merkle_hex,
+                        (unsigned int)ch0->local_funding_signer_idx,
+                        lsp_pub_hex, cli_pub_hex,
+                        expected_xonly_hex, spk_match,
+                        commit_signed.len, commit_hex);
+                fflush(stderr);
+            }
+
             int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, sent ? commit_txid_str : "?",
