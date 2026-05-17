@@ -240,6 +240,19 @@ def _collect_one_db(path):
         ("participants", "SELECT * FROM factory_participants ORDER BY factory_id, slot"),
         ("channels", "SELECT * FROM channels ORDER BY id"),
         ("htlcs", "SELECT * FROM htlcs ORDER BY id DESC LIMIT 50"),
+        # PTLCs (point-time-locked contracts) — Taproot-era replacement
+        # for HTLCs.  Same role (in-flight payment commitments on a
+        # channel commitment), different lock primitive: payment_point
+        # (33-byte compressed pubkey for adaptor sigs) instead of a
+        # 32-byte payment_hash.  Schema has no AUTOINCREMENT id; PK is
+        # composite (channel_id, ptlc_id) so ORDER BY uses both.  The
+        # dashboard renders HTLCs and PTLCs in parallel sections so
+        # operators can see them differentiated at a glance.
+        ("ptlcs",
+         "SELECT channel_id, ptlc_id, direction, amount, "
+         "lower(hex(payment_point)) AS payment_point, "
+         "cltv_expiry, state "
+         "FROM ptlcs ORDER BY channel_id, ptlc_id DESC LIMIT 50"),
     ]:
         rows, err = query_db(path, sql)
         # Always assign a list on error (matches the pattern used by
@@ -362,6 +375,16 @@ def _collect_one_db(path):
         "htlc_amount AS amount, payment_hash, cltv_expiry "
         "FROM old_commitment_htlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
     out["old_commitment_htlcs"] = rows if not err else []
+    # Same shape for PTLCs attached to revoked commits — payment_point
+    # instead of payment_hash but otherwise parallel.  Aliased columns
+    # match old_commitment_htlcs so downstream code can render in
+    # parallel without per-table special-casing.
+    rows, err = query_db(path,
+        "SELECT channel_id, commit_num, ptlc_vout AS ptlc_index, "
+        "CASE direction WHEN 0 THEN 'offered' ELSE 'received' END AS direction, "
+        "ptlc_amount AS amount, payment_point, cltv_expiry "
+        "FROM old_commitment_ptlcs ORDER BY channel_id, commit_num DESC LIMIT 50")
+    out["old_commitment_ptlcs"] = rows if not err else []
     # PR #181 Phase A consumer: count old_commitments rows with persisted
     # penalty TX bytes vs total rows.  Column was added in schema v25
     # (old_commitments.signed_penalty_tx_hex).  If column is missing
@@ -1201,6 +1224,12 @@ a{color:#58a6ff;text-decoration:none}
 .s{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 16px;margin-bottom:10px}
 .st{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;display:flex;justify-content:space-between}
 .st .c{color:#58a6ff}
+/* Lock-type badges next to HTLC / PTLC section titles so the lock primitive
+ * (hash vs point) is identifiable at a glance.  Hash = orangey amber,
+ * point = magenta — visually distinct, matches the common convention of
+ * coloring HTLCs warm and PTLCs cool. */
+.st .h-htlc{color:#d29922;font-size:10px;background:#d2992211;padding:1px 6px;border-radius:3px;margin-left:6px;text-transform:none;letter-spacing:0}
+.st .h-ptlc{color:#bc8cff;font-size:10px;background:#bc8cff11;padding:1px 6px;border-radius:3px;margin-left:6px;text-transform:none;letter-spacing:0}
 .kv{display:flex;flex-wrap:wrap;gap:6px 18px}
 .ki{display:flex;align-items:center;gap:5px}
 .ki .k{color:#484f58;font-size:11px}.ki .v{color:#c9d1d9;font-weight:600}
@@ -1867,12 +1896,30 @@ function rChannels(D){
    h+=`<tr><td>0x${(j.jit_channel_id||0).toString(16)}</td><td>${j.client_idx}</td><td>${sb(j.state)}</td><td class="h">${th(j.funding_txid)}</td><td class="r">${fs(j.funding_amount)}</td><td class="r">${fs(jl)}</td><td class="r">${fs(jr)}</td><td>${bar(jl,jr)}</td><td class="r">${j.commitment_number??'?'}</td><td>${j.target_factory_id||'\u2014'}</td><td>${ta(j.created_at)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
- // HTLCs
- h+=`<div class="s"><div class="st"><span>HTLCs</span><span class="c">${htlcs.length}</span></div>`;
+ // HTLCs \u2014 hash-locked, payment_hash + preimage reveal.  A 'Lock' header
+ // badge labels the column to make this visually distinct from the PTLCs
+ // section that follows.
+ h+=`<div class="s"><div class="st"><span>HTLCs</span><span class="c h-htlc">hash-locked</span><span class="c">${htlcs.length}</span></div>`;
  if(!htlcs.length)h+=`<p class="mu">No HTLCs</p>`;
  else{h+=`<table><tr><th>ID</th><th>CH</th><th>#</th><th>Dir</th><th class="r">Amount</th><th>State</th><th class="r">CLTV</th><th>Payment Hash</th><th>Preimage</th></tr>`;
   for(const x of htlcs){const dc=x.direction==='offered'?'color:#f0883e':'color:#3fb950';
    h+=`<tr><td>${x.id??'\u2014'}</td><td>${x.channel_id}</td><td>${x.htlc_id??'\u2014'}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td>${sb(x.state)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td><td class="h">${th(x.payment_hash)}</td><td class="h">${x.payment_preimage?ts(x.payment_preimage):'\u2014'}</td></tr>`;}
+  h+=`</table>`;}
+ h+=`</div>`;
+ // PTLCs \u2014 point-locked (Taproot adaptor-sig).  Same role as HTLCs but
+ // the in-flight unlock is a payment_point (33-byte compressed pubkey)
+ // rather than a payment_hash, and reveal happens through a Schnorr
+ // adaptor-signature unlock rather than preimage release.  Schema has
+ // no preimage column (the secret is the discrete log of the point,
+ // extracted from the adapted signature) \u2014 column count is smaller as
+ // a result.  Section is parallel to HTLCs above so operators can
+ // compare HTLC vs PTLC activity at a glance.
+ const ptlcs=lsp.ptlcs||[];
+ h+=`<div class="s"><div class="st"><span>PTLCs</span><span class="c h-ptlc">point-locked (Taproot)</span><span class="c">${ptlcs.length}</span></div>`;
+ if(!ptlcs.length)h+=`<p class="mu">No PTLCs</p>`;
+ else{h+=`<table><tr><th>CH</th><th>#</th><th>Dir</th><th class="r">Amount</th><th>State</th><th class="r">CLTV</th><th>Payment Point</th></tr>`;
+  for(const x of ptlcs){const dc=x.direction==='offered'?'color:#f0883e':'color:#3fb950';
+   h+=`<tr><td>${x.channel_id}</td><td>${x.ptlc_id??'\u2014'}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td>${sb(x.state)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td><td class="h">${th(x.payment_point)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
  // Invoice Registry (Phase 23)
@@ -2155,12 +2202,21 @@ function rWatchtower(D){
    h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${txBadge(D,o.txid,'reserve')}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
   if(oc.length>15)h+=`<tr><td colspan="6" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
   h+=`</table>`;}
- // Old commitment HTLCs (breach penalty HTLCs)
+ // Old commitment HTLCs (breach penalty HTLCs) \u2014 payment_hash secret.
  const och=lsp.old_commitment_htlcs||[];
- if(och.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitment HTLCs (breach penalty)</span><span class="c">${och.length}</span></div>`;
+ if(och.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitment HTLCs (breach penalty)</span><span class="c h-htlc">hash-locked</span><span class="c">${och.length}</span></div>`;
   h+=`<table><tr><th>CH</th><th>Commit#</th><th>HTLC#</th><th>Dir</th><th class="r">Amount</th><th>Hash</th><th class="r">CLTV</th></tr>`;
   for(const x of och){const dc=x.direction==='offered'?'color:#f0883e':'color:#3fb950';
    h+=`<tr><td>${x.channel_id}</td><td>${x.commit_num}</td><td>${x.htlc_index}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td class="h">${th(x.payment_hash)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td></tr>`;}
+  h+=`</table>`;}
+ // Old commitment PTLCs (breach penalty PTLCs) \u2014 payment_point secret.
+ // Parallel to old_commitment_htlcs above; rendered separately so the
+ // lock primitive (hash vs point) is visually distinct.
+ const ocp=lsp.old_commitment_ptlcs||[];
+ if(ocp.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitment PTLCs (breach penalty)</span><span class="c h-ptlc">point-locked</span><span class="c">${ocp.length}</span></div>`;
+  h+=`<table><tr><th>CH</th><th>Commit#</th><th>PTLC#</th><th>Dir</th><th class="r">Amount</th><th>Payment Point</th><th class="r">CLTV</th></tr>`;
+  for(const x of ocp){const dc=x.direction==='offered'?'color:#f0883e':'color:#3fb950';
+   h+=`<tr><td>${x.channel_id}</td><td>${x.commit_num}</td><td>${x.ptlc_index}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td class="h">${th(x.payment_point)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td></tr>`;}
   h+=`</table>`;}
  // Factory revocation secrets count
  const frs=lsp.factory_revocations_by_factory||[];
