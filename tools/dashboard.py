@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse, json, os, random, sqlite3, subprocess, sys, time
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------------------------------------------------------------------------
@@ -514,66 +515,56 @@ def _collect_one_db(path):
     return out
 
 
-def collect_databases(cfg):
-    """Read lsp.db (singular) + every --client-db (one or many) and return a
-    {"lsp": {...}, "client": {...}} dict shaped for the rest of the
-    dashboard.  When multiple client DBs are configured, list-typed
-    feeds (signed_commitments, distribution_txs, …) are concatenated so
-    the API caller sees a unified "all clients of this LSP" view —
-    the rest of the dashboard (TX Inventory coverage, channel rendering,
-    etc.) works unchanged.  Scalar counters (watchtower_count, …) are
-    summed.  Dict-typed feeds (old_commitments_coverage, …) sum their
-    numeric inner fields.
+def collect_databases(cfg, selected_pov=None):
+    """Read lsp.db (singular) + the SELECTED client.db and return a
+    {"lsp": {...}, "client": {...}, "povs": [...], "selected_pov": id}
+    dict.
 
-    Single --client-db invocations stay byte-for-byte identical to the
-    pre-refactor shape; the merge code is a no-op for one input."""
+    Multi-client invocations (operator/audit) populate `povs` with one
+    entry per --client-db, plus an "lsp" entry for the LSP-only view.
+    `client` holds ONLY the selected POV's data — never an aggregate
+    across users.  This was an intentional pivot from the earlier merge
+    design: aggregating client.dbs leaks who-saw-what across user
+    boundaries even for operators, and the goal here is "switch between
+    POVs," not "fuse them."
+
+    Single --client-db invocations: `povs` has just that one entry, the
+    UI doesn't render a switcher, behavior is unchanged from
+    pre-multi-client-db days.
+
+    `selected_pov` is "lsp" (LSP-only) or "client_N" (Nth --client-db
+    in argv order).  Defaults to the first client when --client-db was
+    given, else "lsp"."""
     data = {"lsp": _collect_one_db(cfg.lsp_db), "client": {}}
-    if not cfg.client_dbs:
+
+    # Build POV menu.  Each entry: {"id", "label", "source"}.
+    povs = []
+    if cfg.client_dbs:
+        # Show "LSP-only" as an explicit option when multiple clients exist
+        # (operator's first instinct is often "look at the LSP's truth
+        # before drilling into a specific client's POV").  Single-client
+        # case skips this — that's the only entry anyway.
+        if len(cfg.client_dbs) > 1:
+            povs.append({"id": "lsp", "label": "LSP-only view (no client data)",
+                         "source": None})
+        for i, cdb in enumerate(cfg.client_dbs):
+            base = os.path.basename(str(cdb))
+            label = base if len(cfg.client_dbs) > 1 else "Client"
+            povs.append({"id": f"client_{i}", "label": label, "source": cdb})
+    data["povs"] = povs
+
+    if not povs:
         data["client"]["error"] = "not configured"
+        data["selected_pov"] = None
         return data
-    sources = []
-    for cdb in cfg.client_dbs:
-        per = _collect_one_db(cdb)
-        if per.get("error"):
-            continue
-        sources.append(cdb)
-        for k, v in per.items():
-            existing = data["client"].get(k)
-            if isinstance(v, list):
-                if existing is None:
-                    data["client"][k] = list(v)
-                else:
-                    existing.extend(v)
-            elif isinstance(v, bool):
-                # Booleans must be checked before int (bool subclasses int);
-                # OR them together rather than summing.
-                data["client"][k] = bool(existing) or v
-            elif isinstance(v, (int, float)):
-                data["client"][k] = (existing or 0) + v
-            elif isinstance(v, dict):
-                # Dict-typed counter rows like old_commitments_coverage
-                # ({"total": N, "persisted": M}): sum numeric inner fields,
-                # keep first non-numeric value.
-                merged = existing if isinstance(existing, dict) else {}
-                for ik, iv in v.items():
-                    if isinstance(iv, bool):
-                        merged[ik] = bool(merged.get(ik)) or iv
-                    elif isinstance(iv, (int, float)):
-                        merged[ik] = merged.get(ik, 0) + iv
-                    else:
-                        merged.setdefault(ik, iv)
-                data["client"][k] = merged
-            else:
-                # First non-empty wins for strings (e.g., "error").
-                if existing in (None, ""):
-                    data["client"][k] = v
-    if sources:
-        # _sources field lets the UI show which DBs were merged (and the
-        # count, for the "1/N coverage" tile copy).  Underscore prefix so
-        # the JS render side recognizes it as metadata, not a table feed.
-        data["client"]["_sources"] = sources
-    elif cfg.client_dbs:
-        data["client"]["error"] = "not configured"
+
+    # Resolve selected POV.  Falls back to first entry if the caller asked
+    # for an unknown id (browser cached an id that no longer exists, etc.).
+    selected = next((p for p in povs if p["id"] == selected_pov), povs[0])
+    data["selected_pov"] = selected["id"]
+    if selected["source"]:
+        data["client"] = _collect_one_db(selected["source"])
+    # else: LSP-only — data["client"] stays empty.
     return data
 
 def collect_cln(cfg):
@@ -902,9 +893,9 @@ def _db_freshness(cfg):
         out["client_db_mtime"] = 0
     return out
 
-def collect_all(cfg):
+def collect_all(cfg, selected_pov=None):
     if cfg.demo: return collect_demo()
-    db = collect_databases(cfg)
+    db = collect_databases(cfg, selected_pov)
     return {"timestamp": time.strftime("%H:%M:%S"),
         "freshness": _db_freshness(cfg),
         "processes": collect_processes(cfg), "bitcoin": collect_bitcoin(cfg),
@@ -1246,7 +1237,7 @@ tr:hover td{background:#1c2128}
 <div class="wrap">
 <div class="hdr">
  <h1>SuperScalar Dashboard<span class="sub">DW Factories + Timeout-Sig-Trees + Laddering</span></h1>
- <div class="tm"><span id="stale" title="data staleness: server payload age" style="display:none;background:#bb800922;color:#d29922;border:1px solid #bb800966;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:6px">—</span><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
+ <div class="tm"><select id="povsel" onchange="setPov(this.value)" title="Switch viewing POV (operator mode — one client at a time, never merged)" style="display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 6px;border-radius:3px;font-size:11px;margin-right:6px"></select><span id="stale" title="data staleness: server payload age" style="display:none;background:#bb800922;color:#d29922;border:1px solid #bb800966;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:6px">—</span><span id="poison" title="trustless poison-TX coverage across PS chain entries" style="display:none">—</span><button id="exp" onclick="exportSnapshot()" title="download current dashboard state as JSON for incident sharing" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-right:4px">⇩ snapshot</button><span id="ts">--:--:--</span><span id="dot" class="dot r"></span></div>
 </div>
 <div id="dm" class="demo" style="display:none">DEMO MODE — simulated data for UI preview</div>
 <div class="tabs" id="tabs">
@@ -2291,7 +2282,8 @@ function rTxInventory(D){
  // CLTV-timeout-d recovery TX so they can sweep funds back at factory CLTV
  // even if the LSP disappears.  Expected = sum across factories of (clients
  // in that factory).  Previously this was `facs.length` (1 per factory),
- // which made multi-client merging show absurd numbers like 4/1 (400%).
+ // which silently rendered "1/1 (100%)" for any deployment — wrong, since
+ // we never actually verified that every CLIENT held its own copy.
  const distExpected=facs.reduce((s,f)=>s+Math.max(0,((f.n_participants||1)-1)),0);
  const jitSigned=jits.length;
  const totalSigned=fundingSigned+treeSigned+psChainSigned+psInitSigned+psSubSigned+psPoisonHave+comSigned+distSigned+jitSigned;
@@ -2328,7 +2320,7 @@ function rTxInventory(D){
  // --client-db, so it can only see one client's row out of N — not a
  // signing failure, just a single-client view.  Multi-client.db aggregation
  // would close the gap (separate PR).
- cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder', `Per-client schema (PRIMARY KEY channel_id) — each client.db holds one row.  Pass --client-db once per client to merge all clients' rows into the count (operator/debug only; real end-users only see their own row, which is correct for their POV).`);
+ cat('Channel commitments',  'signed_commitments (client-side)',  comSigned,     comExpected,     'Side holder', `Per-client schema (PRIMARY KEY channel_id) — each client.db holds one row.  Dashboard renders one POV at a time (multi --client-db invocations expose a switcher in the header to step through each user's POV).  End-users only see their own row, which is correct for their POV.`);
  cat('Distribution TX (recovery)','distribution_txs (client-side)', distSigned,   distExpected,    'ANY client at CLTV timeout');
  cat('JIT channel funding',  'jit_channels.funding_tx_hex',       jitSigned,     jitSigned,       'LSP');
  h+=`</table></div>`;
@@ -3131,7 +3123,31 @@ function render(D){
  // auto-refresh without them having to retype.
  if(curTab==='protocol')applyProtoFilter();
 }
-async function refresh(){try{const r=await fetch('/api/status');if(r.ok)render(await r.json());}catch(e){}}
+// POV switcher state (operator-mode only).  Lives at module scope so it
+// survives between refreshes.  Empty string = let the server pick the
+// default (first --client-db, or "lsp" when none).  Updated by setPov()
+// from the dropdown change handler.
+let curPov='';
+function setPov(p){curPov=p;refresh();}
+function renderPovSelector(D){
+ const sel=document.getElementById('povsel');
+ const povs=(D.databases&&D.databases.povs)||[];
+ // Only show the switcher when there's a real choice (>1 POV).  Single-POV
+ // invocations (the production end-user case) keep the header clean.
+ if(povs.length<=1){sel.style.display='none';return;}
+ const active=D.databases.selected_pov||povs[0].id;
+ // Rebuild only when the options change; keeps the dropdown DOM stable.
+ const sig=povs.map(p=>p.id).join('|')+'#'+active;
+ if(sel.dataset.sig!==sig){
+  sel.innerHTML=povs.map(p=>`<option value="${p.id}"${p.id===active?' selected':''}>${p.label}</option>`).join('');
+  sel.dataset.sig=sig;
+ }
+ sel.style.display='inline-block';
+ // Mirror server-resolved selection back into curPov so the next refresh
+ // sends the right ?pov= even if the user landed on a fallback.
+ curPov=active;
+}
+async function refresh(){try{const url=curPov?'/api/status?pov='+encodeURIComponent(curPov):'/api/status';const r=await fetch(url);if(r.ok){const D=await r.json();renderPovSelector(D);render(D);}}catch(e){}}
 refresh();setInterval(refresh,R);
 </script></body></html>"""
 
@@ -3146,8 +3162,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
-        elif self.path == "/api/status":
-            d = collect_all(self.cfg)
+        elif self.path == "/api/status" or self.path.startswith("/api/status?"):
+            # ?pov=lsp or ?pov=client_N selects which POV the dashboard
+            # renders.  Defaults to the first --client-db (or LSP-only when
+            # no --client-db was passed).  The selector is rendered by the
+            # JS only when multiple --client-db inputs are configured.
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            pov = params.get("pov", [None])[0]
+            d = collect_all(self.cfg, selected_pov=pov)
             self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-cache"); self.end_headers()
             self.wfile.write(json.dumps(d, default=str).encode("utf-8"))
         else: self.send_error(404)
@@ -3157,11 +3180,15 @@ def main():
     p.add_argument("--port",type=int,default=8080); p.add_argument("--demo",action="store_true")
     p.add_argument("--lsp-db",default=None)
     # action='append' allows the operator/test rig to pass --client-db
-    # repeatedly to merge multiple clients' views into one dashboard.  In
-    # production each user runs their own dashboard with their own
-    # --client-db.  Single-flag invocations stay backward-compatible.
+    # repeatedly so the dashboard can SWITCH between POVs (one client.db
+    # at a time, never merged).  In production each user runs their own
+    # dashboard with their own single --client-db.  Single-flag
+    # invocations are unchanged; multi-flag invocations get a UI
+    # dropdown to pick which POV to render.  A startup warning fires
+    # when N>1 to make operator-mode usage visible.
     p.add_argument("--client-db",default=None,action="append",
-                   help="Path to a client.db (repeat for multiple clients)")
+                   help="Path to a client.db.  Repeat for multiple clients "
+                        "(operator/audit only; renders a POV switcher)")
     p.add_argument("--btc-cli",default="bitcoin-cli"); p.add_argument("--btc-network",default="signet")
     p.add_argument("--btc-rpcuser",default=None); p.add_argument("--btc-rpcpassword",default=None)
     p.add_argument("--btc-datadir",default=None,help="bitcoind datadir (for non-default deployments)")
@@ -3172,6 +3199,13 @@ def main():
     a = p.parse_args(); cfg = Config(a); Handler.cfg = cfg
     s = HTTPServer(("0.0.0.0",cfg.port), Handler)
     print(f"SuperScalar Dashboard: http://localhost:{cfg.port}")
+    # Operator-mode warning: passing multiple --client-db only makes sense
+    # on a box that legitimately holds all the client.db files (test rigs,
+    # LSP-operator audits, the test matrix runner).  Surface it explicitly
+    # so this isn't accidentally how someone ships an end-user dashboard.
+    if len(cfg.client_dbs) > 1:
+        print(f"  ⚠ Operator mode: {len(cfg.client_dbs)} client.dbs configured. "
+              f"POV switcher will be rendered; views never merge across users.", file=sys.stderr)
     print("Press Ctrl+C to stop")
     try: s.serve_forever()
     except KeyboardInterrupt: print("\nDone"); s.server_close()
