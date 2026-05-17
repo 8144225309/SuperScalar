@@ -14,7 +14,44 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 33
+#define PERSIST_SCHEMA_VERSION 34
+
+/* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
+   Ceremony state enum (column `ceremonies.state`).
+   Order matters — used in INTEGER comparisons. */
+enum {
+    PERSIST_CEREMONY_STATE_PENDING_NONCES    = 0,
+    PERSIST_CEREMONY_STATE_NONCES_AGGREGATED = 1,
+    PERSIST_CEREMONY_STATE_PENDING_SIGS      = 2,
+    PERSIST_CEREMONY_STATE_FINALIZED         = 3,
+    PERSIST_CEREMONY_STATE_ABORTED           = 4,
+    PERSIST_CEREMONY_STATE_PARTIAL_FAILED    = 5,
+};
+
+/* Participant phase enum (column `ceremony_participants.phase`). */
+enum {
+    PERSIST_CEREMONY_PHASE_NOT_SENT   = 0,
+    PERSIST_CEREMONY_PHASE_SENT       = 1,
+    PERSIST_CEREMONY_PHASE_NONCED     = 2,
+    PERSIST_CEREMONY_PHASE_SIGNED     = 3,
+    PERSIST_CEREMONY_PHASE_TIMED_OUT  = 4,
+    PERSIST_CEREMONY_PHASE_REFUSED    = 5,
+};
+
+/* Ceremony type discriminator (column `ceremonies.ceremony_type`).
+   See CEREMONY_DESIGN.md §3. */
+enum {
+    PERSIST_CEREMONY_TYPE_INITIAL      = 1,
+    PERSIST_CEREMONY_TYPE_ROTATE       = 2,
+    PERSIST_CEREMONY_TYPE_JOIN         = 3,  /* v2 */
+    PERSIST_CEREMONY_TYPE_LEAVE        = 4,  /* v2 */
+    PERSIST_CEREMONY_TYPE_FORCE_OUT    = 5,
+    PERSIST_CEREMONY_TYPE_CLOSE        = 6,  /* v2 */
+    PERSIST_CEREMONY_TYPE_DISTRIBUTION_UPDATE = 7, /* v2 */
+    PERSIST_CEREMONY_TYPE_STATE_UPDATE = 8,  /* v2 */
+    PERSIST_CEREMONY_TYPE_PENALTY_BURN = 9,
+    PERSIST_CEREMONY_TYPE_ABORT        = 10,
+};
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
