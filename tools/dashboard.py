@@ -550,7 +550,11 @@ def collect_factory_config(cfg):
     try:
         r = subprocess.run(["pgrep", "-f", "superscalar_lsp"],
                            capture_output=True, text=True, timeout=2)
-        if r.returncode != 0: return out
+        # pgrep rc=1 (no match) is the common case for saved-DB sessions —
+        # fall through to the DB fallback instead of returning early, which
+        # made factory_config unreachable post-LSP-exit.  The for loop below
+        # is naturally a no-op on empty stdout.
+        if r.returncode not in (0, 1): return out
         for pid in r.stdout.strip().split("\n"):
             if not pid.strip(): continue
             try:
@@ -2384,15 +2388,21 @@ function rOutcomes(D){
    applicable:isDWLegacy,
    notApplicableNote:isPSCanon?'PS canonical (arity 3) — leaves use PS chain advance, not DW state':'',
    blurb:'3-of-3 partial advance of one leaf without rolling the root state.'},
-  {name:'L-stock burn', icon:'🔥', sources:['burn','l_stock_burn'],
+  {name:'L-stock burn', icon:'🔥', sources:['burn','l_stock_burn','factory_burn'],
    readySignal:'',
    applicable:isDWLegacy,
    notApplicableNote:isPSCanon?'PS canonical — uses poison TX (tile below) instead of shachain burn':'',
    blurb:'Burn TX broadcast: OP_RETURN destroys L-stock when LSP publishes old state (deterrence).'},
-  {name:'Trustless poison redistribute', icon:'🛡', sources:['poison'],
+  {name:'Trustless poison redistribute', icon:'🛡', sources:['poison','subfactory_poison'],
    readySignal:(psChain.filter(r=>r.has_poison).length+psSub.filter(r=>r.has_poison).length)+' poison TXs signed',
    blurb:'Pre-signed poison TX redistributes L-stock / sales-stock to clients on cheat.'},
-  {name:'Breach + penalty', icon:'⚔', sources:['penalty','response'],
+  // Breach + penalty: the canonical detection signal is breach_detections
+  // (LSP-side: "we saw a revoked TXID on chain at height H").  factory_response,
+  // cheat_leaf_*, cheat_subfactory_* are the broadcast-side artifacts of the
+  // same event chain (the penalty/poison TX that goes out in response).  Match
+  // any of them so the tile fires under any of the cheat-* test scenarios.
+  {name:'Breach + penalty', icon:'⚔', sources:['penalty','response','factory_response','cheat_leaf','cheat_subfactory','cheat_daemon'],
+   breachSignal:(lsp.breach_detections||[]).length>0,
    readySignal:wtPending.length?wtPending.length+' penalties in flight':'',
    blurb:'Watchtower detects revoked commitment broadcast, broadcasts penalty sweep.'},
   {name:'HTLC force-close', icon:'🪝', sources:['htlc','ptlc'],
@@ -2431,14 +2441,26 @@ function rOutcomes(D){
   // deployment-shape reason in the body.
   const isNA = sc.applicable !== undefined && !sc.applicable;
   const fired=matchAny(sc.sources, sc.ceremonies);
+  // breachSignal: tile fires off table-presence (e.g. breach_detections row)
+  // even when no source/ceremony matched.  Used by 'Breach + penalty' to
+  // light up off the LSP's authoritative detection even before / without
+  // the penalty TX hitting broadcast_log.
+  const breachFired=sc.breachSignal===true;
   let state, badge, lastTx='';
   if(isNA){
    state='na'; badge=`<span class="b" style="background:#0d1117;color:#484f58;border:1px solid #21262d">n/a for this deployment</span>`;
    if(sc.notApplicableNote)lastTx=`<div class="mu" style="font-size:10px;margin-top:4px;font-style:italic">${sc.notApplicableNote}</div>`;
-  } else if(fired.length>0){
-   state='fired'; badge=`<span class="b ok">fired ${fired.length}×</span>`;
-   const latest=fired.reduce((a,b)=>(a.broadcast_time||0)>(b.broadcast_time||0)?a:b);
-   lastTx=`<div class="kv" style="margin-top:4px;gap:2px 8px"><div class="ki"><span class="k">last</span><span class="v h" style="font-size:10px">${th(latest.txid)}</span></div><div class="ki"><span class="k">at</span><span class="v" style="font-size:10px">${ta(latest.broadcast_time)} ago</span></div></div>`;
+  } else if(fired.length>0||breachFired){
+   const count=fired.length||1;
+   const label=fired.length>0?`fired ${count}×`:`detected`;
+   state='fired'; badge=`<span class="b ok">${label}</span>`;
+   if(fired.length>0){
+    const latest=fired.reduce((a,b)=>(a.broadcast_time||0)>(b.broadcast_time||0)?a:b);
+    lastTx=`<div class="kv" style="margin-top:4px;gap:2px 8px"><div class="ki"><span class="k">last</span><span class="v h" style="font-size:10px">${th(latest.txid)}</span></div><div class="ki"><span class="k">at</span><span class="v" style="font-size:10px">${ta(latest.broadcast_time)} ago</span></div></div>`;
+   } else if(breachFired){
+    const bdc=(lsp.breach_detections||[]).length;
+    lastTx=`<div class="mu" style="font-size:10px;margin-top:4px">${bdc} breach detection${bdc===1?'':'s'} logged (see Watchtower tab)</div>`;
+   }
   } else if(sc.readySignal){
    state='ready'; badge=`<span class="b i">ready</span>`;
    lastTx=`<div class="mu" style="font-size:10px;margin-top:4px">${sc.readySignal}</div>`;
