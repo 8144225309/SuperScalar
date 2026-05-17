@@ -191,7 +191,8 @@ int test_client_watch_revoked_commitment(void) {
     size_t entries_before = wt.n_entries;
     watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
-                                          NULL, 0);
+                                          NULL, 0,
+                                          /* SF-W-PTLC */ NULL, 0);
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -454,7 +455,8 @@ int test_htlc_penalty_watch(void) {
     size_t entries_before = wt.n_entries;
     watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
-                                          old_htlcs, old_n_htlcs);
+                                          old_htlcs, old_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");

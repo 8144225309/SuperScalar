@@ -297,7 +297,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                     (uint32_t)dest_idx, old_cn,
                     old_dest_local, old_dest_remote,
-                    old_dest_htlcs, old_dest_n_htlcs);
+                    old_dest_htlcs, old_dest_n_htlcs,
+                    /* SF-W-PTLC: bridge flow doesn't track PTLC snapshots
+                       yet — pass NULL/0; production PTLC payments go through
+                       the peer_mgr / ptlc_commit_dispatch path which carries
+                       full PTLC state and will need a separate registration
+                       call from that codepath. */
+                    NULL, 0);
                 secp256k1_pubkey next_pcp;
                 if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                     channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -426,7 +432,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             watchtower_watch_revoked_commitment(mgr->watchtower, ch,
                                 (uint32_t)client_idx, old_cn,
                                 old_local, old_remote,
-                                old_htlcs, old_n_htlcs);
+                                old_htlcs, old_n_htlcs,
+                                /* SF-W-PTLC: no PTLC snapshot here either */
+                                NULL, 0);
                             secp256k1_pubkey next_pcp;
                             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp,
                                                             next_point, 33))

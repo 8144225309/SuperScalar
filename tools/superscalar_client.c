@@ -639,7 +639,8 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
                 old_local, old_remote,
-                old_htlcs, old_n_htlcs);
+                old_htlcs, old_n_htlcs,
+                /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
         }
 
         /* Store LSP's next per-commitment point */
@@ -1205,7 +1206,8 @@ handle_message:
                     size_t wt_n_htlcs = cbd->pending_wt_valid
                                         ? cbd->pending_wt_n_htlcs : 0;
                     watchtower_watch_revoked_commitment(cbd->wt, ch,
-                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs);
+                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs,
+                        /* SF-W-PTLC */ NULL, 0);
                     cbd->pending_wt_valid = 0;
                 }
                 /* Persist new remote PCP */

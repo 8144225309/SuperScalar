@@ -258,7 +258,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)from_client, old_cn,
                 old_sender_local, old_sender_remote,
-                old_sender_htlcs, old_sender_n_htlcs);
+                old_sender_htlcs, old_sender_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -381,7 +382,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)to_client, old_cn,
                 old_dest_local, old_dest_remote,
-                old_dest_htlcs, old_dest_n_htlcs);
+                old_dest_htlcs, old_dest_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -499,7 +501,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)to_client, old_cn,
                         old_dest_ful_local, old_dest_ful_remote,
-                        old_dest_ful_htlcs, old_dest_ful_n_htlcs);
+                        old_dest_ful_htlcs, old_dest_ful_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -594,7 +597,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)from_client, old_cn,
                         old_sender_ful_local, old_sender_ful_remote,
-                        old_sender_ful_htlcs, old_sender_ful_n_htlcs);
+                        old_sender_ful_htlcs, old_sender_ful_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -942,7 +946,8 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)from_client, old_cn,
                 old_local, old_remote,
-                old_htlcs, old_n_htlcs);
+                old_htlcs, old_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);

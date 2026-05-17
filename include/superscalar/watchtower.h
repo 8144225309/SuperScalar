@@ -189,12 +189,17 @@ int watchtower_check(watchtower_t *wt);
 /* After receiving a revocation, register the old commitment with the watchtower.
    Rebuilds the old commitment tx to get its txid and to_local output info.
    old_htlcs/old_n_htlcs: snapshot of HTLC state at the time of the old commitment.
-   Pass NULL/0 if HTLC state is not available (HTLC outputs won't be watched). */
+   Pass NULL/0 if HTLC state is not available (HTLC outputs won't be watched).
+   old_ptlcs/old_n_ptlcs: snapshot of PTLC state at the time of the old commitment.
+   Pass NULL/0 if no PTLCs.  When provided, the watchtower will populate
+   entry->ptlc_outputs so the sweep loop in watchtower_check can broadcast a
+   PTLC penalty TX on breach. */
 void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                            uint32_t channel_id,
                                            uint64_t old_commit_num,
                                            uint64_t old_local, uint64_t old_remote,
-                                           const htlc_t *old_htlcs, size_t old_n_htlcs);
+                                           const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                           const ptlc_t *old_ptlcs, size_t old_n_ptlcs);
 
 /* === Oracular API (#208 A3.1 — daemon-friendly) ===
 
@@ -236,6 +241,8 @@ void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *c
                                                     uint64_t old_remote,
                                                     const htlc_t *old_htlcs,
                                                     size_t old_n_htlcs,
+                                                    const ptlc_t *old_ptlcs,
+                                                    size_t old_n_ptlcs,
                                                     const unsigned char *signed_penalty_tx,
                                                     size_t signed_penalty_tx_len);
 

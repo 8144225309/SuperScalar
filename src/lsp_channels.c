@@ -1182,7 +1182,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
                 old_sender_local, old_sender_remote,
-                old_sender_htlcs, old_sender_n_htlcs);
+                old_sender_htlcs, old_sender_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             /* Store next per-commitment point from peer */
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
@@ -1460,7 +1461,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 wt_chan_id, old_cn,
                 old_dest_local, old_dest_remote,
-                old_dest_htlcs, old_dest_n_htlcs);
+                old_dest_htlcs, old_dest_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33)) {
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -4169,7 +4171,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             watchtower_watch_revoked_commitment(mgr->watchtower, ch,
                 (uint32_t)client_idx, old_cn,
                 old_ch_local, old_ch_remote,
-                old_ch_htlcs, old_ch_n_htlcs);
+                old_ch_htlcs, old_ch_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
@@ -4294,7 +4297,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)s, old_cn,
                         old_sender_local, old_sender_remote,
-                        old_sender_htlcs, old_sender_n_htlcs);
+                        old_sender_htlcs, old_sender_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -4725,7 +4729,8 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                     watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)reconnected_idx, old_cn,
                         old_dest_local, old_dest_remote,
-                        old_dest_htlcs, old_dest_n_htlcs);
+                        old_dest_htlcs, old_dest_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
