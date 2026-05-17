@@ -299,8 +299,13 @@ def collect_databases(cfg):
         # funding + close + sweeps, which the prior LIMIT 50 truncated on
         # the funding-end (so the Events derivation lost the "Factory funded"
         # bookend).  200 matches the wire_messages limit used elsewhere.
+        # reorg_stale (schema v29) — broadcast_log rows whose enclosing block
+        # was invalidated by a tip regression.  Surfacing this lets operators
+        # tell apart "TX failed" from "TX confirmed then orphaned" — same
+        # txid, very different recovery actions.
         rows, err = query_db(path,
-            "SELECT id, txid, source, result, broadcast_time "
+            "SELECT id, txid, source, result, broadcast_time, "
+            "COALESCE(reorg_stale, 0) AS reorg_stale "
             "FROM broadcast_log ORDER BY id DESC LIMIT 200")
         data[label]["broadcast_log"] = rows if not err else []
         # Reorg events (schema v29) — tip regressions detected by the daemon
@@ -2104,7 +2109,8 @@ function rWatchtower(D){
  if(bl.length){h+=`<div class="s"><div class="st"><span>Broadcast Log</span><span class="c">${bl.length}</span></div>`;
   h+=`<table><tr><th>ID</th><th>TXID</th><th>On-chain</th><th>Source</th><th>Result</th><th>Time</th></tr>`;
   for(const b of bl){const rc=b.result==='success'||b.result==='ok'?'b ok':'b dn';
-   h+=`<tr><td>${b.id}</td><td class="h">${th(b.txid)}</td><td>${txBadge(D,b.txid)}</td><td>${b.source||'\u2014'}</td><td><span class="${rc}">${b.result||'?'}</span></td><td>${ta(b.broadcast_time)}</td></tr>`;}
+   const staleBadge=b.reorg_stale?` <span class="b w" style="font-size:9px" title="Block containing this TX was orphaned by a reorg \u2014 broadcast may need to be re-attempted">stale</span>`:'';
+   h+=`<tr><td>${b.id}</td><td class="h">${th(b.txid)}${staleBadge}</td><td>${txBadge(D,b.txid)}</td><td>${b.source||'\u2014'}</td><td><span class="${rc}">${b.result||'?'}</span></td><td>${ta(b.broadcast_time)}</td></tr>`;}
   h+=`</table></div>`;}
  return h;
 }
@@ -2447,7 +2453,8 @@ function rOutcomes(D){
   h+=`<table><tr><th>ID</th><th>Source</th><th>Result</th><th>TXID</th><th>On-chain status</th><th>When</th></tr>`;
   for(const r of log){
    const rc=r.result==='ok'?'b ok':r.result==='failed'?'b dn':'b i';
-   h+=`<tr><td>${r.id}</td><td><code>${r.source||'?'}</code></td><td><span class="${rc}">${r.result||'?'}</span></td><td class="h">${th(r.txid)}</td><td>${txBadge(D,r.txid)}</td><td>${ta(r.broadcast_time)} ago</td></tr>`;
+   const staleBadge=r.reorg_stale?` <span class="b w" style="font-size:9px" title="Block containing this TX was orphaned by a reorg — broadcast may need to be re-attempted">stale</span>`:'';
+   h+=`<tr><td>${r.id}</td><td><code>${r.source||'?'}</code></td><td><span class="${rc}">${r.result||'?'}</span></td><td class="h">${th(r.txid)}${staleBadge}</td><td>${txBadge(D,r.txid)}</td><td>${ta(r.broadcast_time)} ago</td></tr>`;
   }
   h+=`</table></div>`;
  }
