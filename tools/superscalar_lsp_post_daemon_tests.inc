@@ -1010,10 +1010,10 @@
 
         if (leaf_arity != 2) {
             printf("  SKIP: --test-realloc requires --leaf-arity 2\n");
-            printf("LEAF REALLOC TEST: SKIP\n");
+            printf("LEAF REALLOC TEST: SKIP (gate=arity)\n");
         } else if (n_clients < 2) {
             printf("  SKIP: --test-realloc requires --clients >= 2\n");
-            printf("LEAF REALLOC TEST: SKIP\n");
+            printf("LEAF REALLOC TEST: SKIP (gate=clients)\n");
         } else {
             /* Record current leaf node output amounts (authoritative source) */
             size_t leaf_node_idx = lsp_p->factory.leaf_node_indices[0];
@@ -1254,7 +1254,7 @@
 
         if (leaf_arity != 2) {
             printf("  SKIP: --test-buy-liquidity requires --leaf-arity 2\n");
-            printf("BUY LIQUIDITY TEST: SKIP\n");
+            printf("BUY LIQUIDITY TEST: SKIP (gate=arity)\n");
         } else {
             /* Buy 1000 sats of inbound liquidity for client 0 from L-stock */
             uint64_t buy_amount = 1000;
@@ -1307,7 +1307,7 @@
         /* Verify we have more than 4 clients */
         if (n_clients <= 4) {
             printf("  SKIP: --test-large-factory requires --clients > 4\n");
-            printf("LARGE FACTORY TEST: SKIP\n");
+            printf("LARGE FACTORY TEST: SKIP (gate=clients)\n");
         } else {
             /* Verify all channels are active */
             int active = 0;

@@ -1351,10 +1351,10 @@
                 lsp_p->factory.ps_subfactory_arity <= 1) {
                 printf("  SKIP: --test-subfactory-advance requires --arity 3 "
                        "and --ps-subfactory-arity K (K>1)\n");
-                printf("PS K² SUB-FACTORY TEST: SKIP\n");
+                printf("PS K² SUB-FACTORY TEST: SKIP (gate=arity)\n");
             } else if (lsp_p->factory.n_leaf_nodes < 1) {
                 printf("  SKIP: no leaves built\n");
-                printf("PS K² SUB-FACTORY TEST: SKIP\n");
+                printf("PS K² SUB-FACTORY TEST: SKIP (gate=no-leaves)\n");
             } else {
                 /* Pick leaf 0, sub-factory 0, channel 0; transfer 50000 sats
                    from sales-stock to channel 0. */
@@ -1362,7 +1362,7 @@
                 factory_node_t *leaf = &lsp_p->factory.nodes[leaf0_idx];
                 if (leaf->n_subfactories < 1) {
                     printf("  SKIP: leaf 0 has no sub-factories\n");
-                    printf("PS K² SUB-FACTORY TEST: SKIP\n");
+                    printf("PS K² SUB-FACTORY TEST: SKIP (gate=no-subfactories)\n");
                 } else {
                     int sub0_node_i = leaf->subfactory_node_indices[0];
                     factory_node_t *sub0 =
@@ -1611,7 +1611,7 @@
             if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
                 lsp_p->factory.leaf_arity != FACTORY_ARITY_PS) {
                 printf("  SKIP: --test-tier-b-rollover requires --arity 1 (DW) or --arity 3 (PS)\n");
-                printf("TIER B ROLLOVER TEST: SKIP\n");
+                printf("TIER B ROLLOVER TEST: SKIP (gate=arity)\n");
             } else {
                 /* Populate factory.keypairs[] for the LSP's local
                    factory_build_burn_tx call inside lsp_advance_leaf.

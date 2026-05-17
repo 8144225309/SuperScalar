@@ -3344,22 +3344,51 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    int leaf_side, int sub_idx_in_leaf,
                                    int channel_idx_in_sub,
                                    uint64_t delta_sats) {
-    if (!mgr || !lsp) return 0;
+    /* SF-ERR #159: each silent return path now logs to stderr so operators
+       can distinguish "dust" from "invalid leaf_side" from "signing fail"
+       without log-diving the entire LSP loop. */
+    if (!mgr || !lsp) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — null mgr or lsp\n");
+        return 0;
+    }
     factory_t *f = &lsp->factory;
 
-    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — leaf_side %d "
+                "out of range [0, %d)\n", leaf_side, f->n_leaf_nodes);
+        return 0;
+    }
     size_t leaf_node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *leaf = &f->nodes[leaf_node_idx];
-    if (sub_idx_in_leaf < 0 || sub_idx_in_leaf >= leaf->n_subfactories)
+    if (sub_idx_in_leaf < 0 || sub_idx_in_leaf >= leaf->n_subfactories) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — "
+                "sub_idx_in_leaf %d out of range [0, %d) on leaf %d\n",
+                sub_idx_in_leaf, leaf->n_subfactories, leaf_side);
         return 0;
+    }
     int sub_node_i = leaf->subfactory_node_indices[sub_idx_in_leaf];
-    if (sub_node_i < 0) return 0;
+    if (sub_node_i < 0) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — leaf %d "
+                "sub %d has invalid sub_node_i=%d\n",
+                leaf_side, sub_idx_in_leaf, sub_node_i);
+        return 0;
+    }
 
     factory_node_t *sub = &f->nodes[sub_node_i];
-    if (sub->type != NODE_PS_SUBFACTORY) return 0;
+    if (sub->type != NODE_PS_SUBFACTORY) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — sub %d "
+                "node type %d != NODE_PS_SUBFACTORY\n",
+                sub_idx_in_leaf, (int)sub->type);
+        return 0;
+    }
     /* k clients on this sub-factory (LSP is signer 0). */
     size_t n_clients_in_sub = sub->n_signers - 1;
-    if (n_clients_in_sub == 0) return 0;
+    if (n_clients_in_sub == 0) {
+        fprintf(stderr, "lsp_subfactory_chain_advance: refused — sub %d "
+                "has n_signers=%zu (need at least 2 for LSP + 1 client)\n",
+                sub_idx_in_leaf, sub->n_signers);
+        return 0;
+    }
 
     /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
        flight for the startup sweep to mark aborted_crash. */
@@ -6475,6 +6504,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            hb_height, fstate_str, online, mgr->n_channels,
                            uptime_s / 3600, (uptime_s / 60) % 60, uptime_s % 60);
                     fflush(stdout);
+                    /* SF-WAL #157: passive checkpoint so the dashboard reader
+                       sees committed writes within heartbeat granularity. */
+                    if (mgr->persist)
+                        persist_wal_checkpoint((persist_t *)mgr->persist);
                 }
             }
 

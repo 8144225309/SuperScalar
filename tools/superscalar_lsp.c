@@ -706,6 +706,10 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
         printf("  node[%zu] broadcast: %s (mined %d blocks)\n",
                i, display_hex, blocks_to_mine);
     }
+    /* SF-FS #156: factory tree has been broadcast in full → mark closed in DB.
+       Dashboards filter on state='closed' to suppress operational alerts. */
+    if (g_db)
+        persist_mark_factory_closed(g_db, /*factory_id=*/0);
     return 1;
 }
 
@@ -956,6 +960,10 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
             return 0;
         }
     }
+    /* SF-FS #156: factory tree has been broadcast in full → mark closed in DB.
+       Dashboards filter on state='closed' to suppress operational alerts. */
+    if (g_db)
+        persist_mark_factory_closed(g_db, /*factory_id=*/0);
     return 1;
 }
 
