@@ -76,7 +76,7 @@ echo "--- LSP (--demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $AD
 "$LSP_BIN" \
     --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
     --amount $FUNDING_SATS --fee-rate 1000 --confirm-timeout 600 \
-    --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
+    --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 50 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" \
@@ -133,7 +133,7 @@ echo "  LSP peak RSS       : $(grep -m1 'LSP peak RSS' "$LSP_LOG" 2>/dev/null ||
 
 echo
 echo "=== Final result ==="
-if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null && [ "${CHAIN_ROWS:-0}" -ge "$ADVANCE_COUNT" ]; then
+if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null && [ "${ADV:-0}" -ge "$ADVANCE_COUNT" ]; then
     echo "  PASS: $ADVANCE_COUNT advances persisted, defense fired"
     exit 0
 else

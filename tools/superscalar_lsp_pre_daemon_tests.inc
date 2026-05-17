@@ -829,7 +829,21 @@
                 tx_buf_free(&cl1_cheat_stale_leaf_tx);
             }
 
-            int pass = left_changed && right_unchanged && leaf_pass;
+            /* #170: cheat-side-aware PASS criterion. The advance and unchanged checks
+   must follow cl1_cheat_side (0=left, 1=right) — the SIDE=1 path was
+   previously hardcoded to expect left advance + right unchanged, so any
+   right-side cheat always failed despite the WT defense firing. */
+            int cheated_changed = (cl1_cheat_side == 0)
+                ? left_changed
+                : (is_ps_factory
+                    ? (right_chain_pos_after > right_chain_pos_before)
+                    : !right_nseq_unchanged);
+            int other_unchanged = (cl1_cheat_side == 0)
+                ? right_unchanged
+                : (is_ps_factory
+                    ? (left_chain_pos_peak == left_chain_pos_before)
+                    : !left_nseq_changed);
+            int pass = cheated_changed && other_unchanged && leaf_pass;
             printf("\n=== LEAF ADVANCE TEST %s ===\n", pass ? "PASSED" : "FAILED");
             if (tier_b_fired_in_loop)
                 printf("(Tier B fired during the advance loop; chain_pos reset; "
