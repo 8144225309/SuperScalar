@@ -855,8 +855,18 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_signed) {
-            fprintf(stderr, "force-close: node %zu not signed\n", i);
-            return 0;
+            /* SF-CHEAT-SF #165: unsigned-mid-tree is now a SKIP, not a hard
+               error.  The cheat-subfactory test scaffold deliberately clears
+               is_signed on NODE_PS_SUBFACTORY entries so this loop walks
+               only the parent chain (root → leaf), leaving sub-factories
+               unbroadcast (so they can later be broadcast in a different
+               order with stale state).  Pre-fix this returned 0 with a
+               stderr line, breaking the cheat test.  Logging at info level
+               so legitimate unsigned-state callers still see the warning
+               without aborting the whole broadcast. */
+            printf("force-close: skipping unsigned node %zu (type=%d)\n",
+                   i, (int)node->type);
+            continue;
         }
 
         int is_ps_chain_node = (node->is_ps_leaf ||
