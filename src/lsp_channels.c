@@ -3968,6 +3968,37 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    n_refreshed, leaf_side, sub_idx_in_leaf);
     }
 
+    /* SF-DST #155 (quick-cut, interim): the factory's distribution TX
+       (built at ceremony time for CLTV-after-factory-expires recovery,
+       N-party MuSig-signed) was sized against pre-advance per-client
+       amounts.  Post-advance, the buyer's purchase is reflected on chain
+       in the sub-factory chain[N] state but the distribution TX still
+       refunds the OLD allocation if it ever needs to be broadcast.
+
+       A real fix requires re-signing the distribution TX with the new
+       per-client amounts via an N-party MuSig ceremony — same wire
+       surface as #142 (multi-input MuSig wire ceremony) and naturally
+       lands as part of that work.  For now, mark the cached distribution
+       TX as stale so any code that reads dist_tx_ready knows the
+       signature no longer reflects post-advance state, and log a clear
+       operator notice so a rotation is the obvious next step.
+
+       This is a HONEST-INTERIM, not a full fix.  Operators relying on
+       the CLTV recovery TX after a sub-factory advance MUST run a
+       rotation to rebuild the distribution TX before the CLTV expires.
+       Tracked separately under #155 + #142. */
+    if (f->dist_tx_ready) {
+        f->dist_tx_ready = 0;
+        fprintf(stderr,
+                "LSP: WARNING — distribution TX signature is now stale after "
+                "sub-factory %d.%d advance.  Per-client distribution amounts "
+                "have shifted; the cached signed TX would refund the "
+                "pre-advance allocation if broadcast.  Trigger a rotation to "
+                "regenerate the distribution TX before CLTV timeout "
+                "(block %u).  See SF-DST #155.\n",
+                leaf_side, sub_idx_in_leaf, f->cltv_timeout);
+    }
+
     /* C3 (Tier 1): journal success. */
     if (mgr->persist && c3_round_id > 0) {
         persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
