@@ -2506,9 +2506,52 @@ int factory_reset_all_subfactory_chains(factory_t *f) {
         node->ps_chain_len = 0;
         node->ps_n_prev_outputs = 0;
         memset(node->ps_prev_txid, 0, 32);
+        node->ps_chain_confirmed_height = 0;
         n_reset++;
     }
     return n_reset;
+}
+
+/* #146: height-aware reset.  Walks PS sub-factories and resets only those
+   whose latest confirmation is now above the safe height (i.e., possibly
+   reorged out).  Legacy entries with confirmed_height == 0 are reset
+   conservatively — better-safe-than-sorry until they're stamped. */
+int factory_reset_subfactory_chains_above_height(factory_t *f,
+                                                  uint32_t reorg_max_safe_height)
+{
+    if (!f) return 0;
+    int n_reset = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->type != NODE_PS_SUBFACTORY) continue;
+        if (node->ps_chain_len == 0) continue;
+
+        /* Keep state when confirmation is at-or-below the safe height
+           AND we have a real confirmation record.  Reset otherwise:
+             - confirmed_height == 0 → no record → conservative reset
+             - confirmed_height > reorg_max_safe_height → reorged out */
+        if (node->ps_chain_confirmed_height > 0 &&
+            node->ps_chain_confirmed_height <= reorg_max_safe_height) {
+            continue;
+        }
+        node->ps_chain_len = 0;
+        node->ps_n_prev_outputs = 0;
+        memset(node->ps_prev_txid, 0, 32);
+        node->ps_chain_confirmed_height = 0;
+        n_reset++;
+    }
+    return n_reset;
+}
+
+void factory_set_subfactory_chain_confirmed_height(factory_t *f,
+                                                    size_t node_idx,
+                                                    uint32_t confirmed_height)
+{
+    if (!f || node_idx >= f->n_nodes) return;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (node->type != NODE_PS_SUBFACTORY) return;
+    if (node->ps_chain_len == 0) return;
+    node->ps_chain_confirmed_height = confirmed_height;
 }
 
 /* --- Per-node split-round signing helpers --- */

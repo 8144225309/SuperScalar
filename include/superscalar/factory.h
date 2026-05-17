@@ -177,6 +177,12 @@ typedef struct {
     uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX
                                           (legacy 1-input shape; for multi-input PS sub-factory
                                           chain advances see ps_prev_amounts[] below) */
+    /* #146: height-aware reset.  Block height at which the latest chain
+       entry was observed confirmed (0 = unset / legacy).  Used by
+       factory_reset_subfactory_chains_above_height to leave chain state
+       intact through reorgs that don't go deep enough to bury this
+       entry. */
+    uint32_t ps_chain_confirmed_height;
 
     /* Multi-input PS sub-factory chain advance state (#207).
        When a NODE_PS_SUBFACTORY chain extends, the new TX consumes ALL
@@ -550,6 +556,30 @@ int factory_subfactory_chain_advance_unsigned(
 
    Returns the count of sub-factories reset (for observability). */
 int factory_reset_all_subfactory_chains(factory_t *f);
+
+/* #146: height-aware variant.  Only resets sub-factory chain state for
+   nodes whose ps_chain_confirmed_height > reorg_max_safe_height (i.e.,
+   their latest confirmation is no longer on the active chain).  Nodes
+   with ps_chain_confirmed_height == 0 (legacy / unset) are reset
+   conservatively (matches pre-#146 behavior) so a missing confirmation
+   record never silently leaves stale state.  Returns the count reset.
+
+   reorg_max_safe_height is the highest block height that's still
+   confirmed on the new tip — typically the new tip height itself minus
+   a safety buffer.  Anything strictly above that may have been reorged
+   out and needs invalidation. */
+int factory_reset_subfactory_chains_above_height(factory_t *f,
+                                                  uint32_t reorg_max_safe_height);
+
+/* #146: record the height at which a sub-factory chain entry was
+   observed confirmed.  Stamped by the reorg detector / heartbeat when
+   it sees the latest chain TX in a block, so subsequent reorgs can use
+   factory_reset_subfactory_chains_above_height to avoid wiping
+   still-confirmed state.  No-op when the node isn't a PS sub-factory or
+   has ps_chain_len == 0. */
+void factory_set_subfactory_chain_confirmed_height(factory_t *f,
+                                                    size_t node_idx,
+                                                    uint32_t confirmed_height);
 
 /* Compute the factory_early_warning_time (blocks) per BLIP-56.
    This is the worst-case blocks needed for full unilateral close from

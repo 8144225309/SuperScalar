@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 32
+#define PERSIST_SCHEMA_VERSION 33
 
 /* Open or create database at path. Creates schema if needed.
    Runs migrations if DB version < code version.
