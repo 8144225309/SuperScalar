@@ -1928,6 +1928,121 @@ void channel_update_funding(channel_t *ch,
     ch->funding_spk_len = new_funding_spk_len;
 }
 
+#include "superscalar/tapscript.h"
+
+/* SF-CH #154 helper: try one (ordering, cltv) combination and return 1+set
+   outputs on match. */
+static int channel_funding_keyagg_try_combo(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *pks_ordered,  /* 2 elements */
+    uint32_t my_idx_for_this_order,
+    uint32_t cltv_timeout,
+    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
+    const unsigned char *target_xonly,
+    musig_keyagg_t *keyagg_out,
+    uint32_t *my_signer_idx_out,
+    unsigned char *merkle_root_out32,
+    int *has_merkle_root_out)
+{
+    unsigned char chan_cltv_merkle[32];
+    const unsigned char *merkle_root = NULL;
+    if (cltv_timeout > 0) {
+        secp256k1_xonly_pubkey lsp_xonly;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL,
+                                                 cltv_leaf_lsp_pubkey))
+            return 0;
+        tapscript_leaf_t leaf;
+        if (!tapscript_build_cltv_timeout(&leaf, cltv_timeout, &lsp_xonly, ctx))
+            return 0;
+        if (!tapscript_merkle_root(chan_cltv_merkle, &leaf, 1))
+            return 0;
+        merkle_root = chan_cltv_merkle;
+    }
+
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks_ordered, 2))
+        return 0;
+
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
+        return 0;
+
+    unsigned char tweak[32];
+    if (merkle_root) {
+        unsigned char buf[64];
+        memcpy(buf, internal_ser, 32);
+        memcpy(buf + 32, merkle_root, 32);
+        sha256_tagged("TapTweak", buf, 64, tweak);
+    } else {
+        sha256_tagged("TapTweak", internal_ser, 32, tweak);
+    }
+
+    secp256k1_pubkey tweaked_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full,
+                                          &ka.agg_pubkey, tweak))
+        return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL,
+                                            &tweaked_full))
+        return 0;
+    unsigned char tx_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tx_ser, &tweaked_xonly))
+        return 0;
+
+    if (memcmp(tx_ser, target_xonly, 32) != 0)
+        return 0;
+
+    *keyagg_out = ka;
+    *my_signer_idx_out = my_idx_for_this_order;
+    if (merkle_root) {
+        memcpy(merkle_root_out32, merkle_root, 32);
+        *has_merkle_root_out = 1;
+    } else {
+        *has_merkle_root_out = 0;
+    }
+    return 1;
+}
+
+int channel_discover_funding_keyagg(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *my_pubkey,
+    const secp256k1_pubkey *peer_pubkey,
+    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
+    uint32_t factory_cltv,
+    uint32_t node_cltv,
+    const unsigned char *funding_spk,
+    size_t funding_spk_len,
+    musig_keyagg_t *keyagg_out,
+    uint32_t *my_signer_idx_out,
+    unsigned char *merkle_root_out32,
+    int *has_merkle_root_out)
+{
+    if (funding_spk_len != 34 || funding_spk[0] != 0x51 || funding_spk[1] != 0x20)
+        return 0;
+    const unsigned char *target_xonly = funding_spk + 2;
+
+    /* Two orderings × up to two cltv sources. */
+    secp256k1_pubkey orderings[2][2] = {
+        { *my_pubkey, *peer_pubkey },   /* order_idx=0 → "my" at signer_idx=0 */
+        { *peer_pubkey, *my_pubkey }    /* order_idx=1 → "my" at signer_idx=1 */
+    };
+    const uint32_t my_idx_for_order[2] = { 0, 1 };
+    uint32_t cltvs[2] = { factory_cltv, node_cltv };
+
+    for (int oi = 0; oi < 2; oi++) {
+        for (int ci = 0; ci < 2; ci++) {
+            if (ci == 1 && cltvs[0] == cltvs[1]) continue;
+            if (channel_funding_keyagg_try_combo(
+                    ctx, orderings[oi], my_idx_for_order[oi],
+                    cltvs[ci], cltv_leaf_lsp_pubkey, target_xonly,
+                    keyagg_out, my_signer_idx_out,
+                    merkle_root_out32, has_merkle_root_out))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- HTLC resolution transactions ---- */
 
 /* Helper: rebuild HTLC taptree leaves for a given HTLC at htlc_index.

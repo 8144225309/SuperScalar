@@ -287,22 +287,40 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     channel_set_remote_basepoints(ch, remote_payment_bp, remote_delayed_bp, remote_revocation_bp);
     channel_set_remote_htlc_basepoint(ch, remote_htlc_bp);
 
-    /* Fix keyagg: factory leaf outputs always use [client, lsp] key ordering.
-       channel_init's SPK-match heuristic fails for CLTV-taptree outputs
-       (cltv_timeout > 0), falling back to [local, remote] = [client, lsp] which
-       is coincidentally correct here, but with wrong signer_idx vs LSP's fallback.
-       Override explicitly to guarantee consistent ordering on both sides. */
+    /* SF-CH #154: factory leaf SPKs use different keyagg orderings + cltv
+       sources depending on leaf type (PS leaves use [LSP, client] +
+       node_cltv via setup_ps_leaf_outputs; non-PS leaves use [client, LSP] +
+       factory_cltv via setup_*_leaf_outputs).  Auto-discover by reproducing
+       the factory's P2TR construction (see channel_discover_funding_keyagg).
+       Hard-fail if neither combination matches funding_spk — proceeding
+       would leave on-chain spends unable to verify. */
     {
-        secp256k1_pubkey ch_pks[2] = { my_pubkey, *lsp_pubkey };
-        if (!musig_aggregate_keys(ctx, &ch->funding_keyagg, ch_pks, 2)) {
+        musig_keyagg_t ka;
+        uint32_t signer_idx;
+        unsigned char merkle[32];
+        int has_merkle = 0;
+        if (!channel_discover_funding_keyagg(
+                ctx, &my_pubkey, lsp_pubkey, lsp_pubkey,
+                factory->cltv_timeout, state_node->cltv_timeout,
+                funding_spk, funding_spk_len,
+                &ka, &signer_idx, merkle, &has_merkle)) {
+            fprintf(stderr,
+                    "Client %u: funding_keyagg discovery failed for channel "
+                    "(factory_cltv=%u, node_cltv=%u). Refusing to set up "
+                    "channel — on-chain spends would fail Schnorr verify.\n",
+                    my_index, factory->cltv_timeout, state_node->cltv_timeout);
             memset(my_seckey, 0, 32);
             return 0;
         }
-        ch->local_funding_signer_idx = 0;  /* client at index 0 */
+        ch->funding_keyagg = ka;
+        ch->local_funding_signer_idx = signer_idx;
+        if (has_merkle) {
+            memcpy(ch->chan_merkle_root, merkle, 32);
+            ch->has_chan_merkle_root = 1;
+        } else {
+            ch->has_chan_merkle_root = 0;
+        }
     }
-    /* Set CLTV taptree merkle root so MuSig2 session uses correct tweak */
-    if (factory->cltv_timeout > 0)
-        channel_set_cltv_merkle_root(ch, factory->cltv_timeout, lsp_pubkey);
 
     memset(my_seckey, 0, 32);
     return 1;

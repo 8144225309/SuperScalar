@@ -401,6 +401,30 @@ void channel_update_funding(channel_t *ch,
                               const unsigned char *new_funding_spk,
                               size_t new_funding_spk_len);
 
+/* SF-CH #154: discover the correct 2-party funding keyagg ordering by
+   reproducing the factory's P2TR construction.  Tries both [my, peer] and
+   [peer, my] orderings, each against both factory_cltv and node_cltv (since
+   non-PS leaves use the factory base while PS leaves use the depth-adjusted
+   node value).  On match, sets *keyagg, *my_signer_idx (0 if "my" is at
+   index 0, 1 if "my" is at index 1), and *merkle_root if cltv > 0.  Returns
+   1 on match, 0 if no combination matches funding_spk.
+
+   Caller perspective: pass YOUR pubkey as my_pubkey; the returned
+   my_signer_idx tells you where your key sits in the keyagg ordering. */
+int channel_discover_funding_keyagg(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *my_pubkey,
+    const secp256k1_pubkey *peer_pubkey,
+    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
+    uint32_t factory_cltv,
+    uint32_t node_cltv,
+    const unsigned char *funding_spk,
+    size_t funding_spk_len,
+    musig_keyagg_t *keyagg_out,
+    uint32_t *my_signer_idx_out,
+    unsigned char *merkle_root_out32,
+    int *has_merkle_root_out);
+
 /* --- Random bytes utility --- */
 
 int channel_read_random_bytes(unsigned char *buf, size_t len);
