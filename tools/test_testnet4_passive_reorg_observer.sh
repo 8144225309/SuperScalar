@@ -26,7 +26,7 @@ fi
 
 set -uo pipefail
 
-BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build}"
+BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 WT_BIN="$BUILD_DIR/superscalar_watchtower"
 WT_LOG="${WT_LOG:-/tmp/passive_reorg_observer.log}"
 WT_DB="${1:-}"
