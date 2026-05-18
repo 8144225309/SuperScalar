@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #ifndef BASEPOINT_DIAG
 #define BASEPOINT_DIAG 0
@@ -1349,6 +1350,65 @@ void persist_close(persist_t *p) {
         sqlite3_close(p->db);
         p->db = NULL;
     }
+}
+
+int persist_take_snapshot(persist_t *p, const char *snapshot_path,
+                           const char *reason) {
+    if (!p || !p->db || !snapshot_path) return 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    sqlite3 *dst = NULL;
+    int rc = sqlite3_open_v2(snapshot_path, &dst,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                             NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "BACKUP: snapshot FAIL reason=%s err=open:%s\n",
+                reason ? reason : "?", sqlite3_errstr(rc));
+        if (dst) sqlite3_close(dst);
+        return 0;
+    }
+
+    sqlite3_backup *bk = sqlite3_backup_init(dst, "main", p->db, "main");
+    if (!bk) {
+        fprintf(stderr, "BACKUP: snapshot FAIL reason=%s err=backup_init:%s\n",
+                reason ? reason : "?", sqlite3_errmsg(dst));
+        sqlite3_close(dst);
+        return 0;
+    }
+
+    rc = sqlite3_backup_step(bk, -1);
+    int finish_rc = sqlite3_backup_finish(bk);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "BACKUP: snapshot FAIL reason=%s err=step:%s\n",
+                reason ? reason : "?", sqlite3_errstr(rc));
+        sqlite3_close(dst);
+        return 0;
+    }
+    if (finish_rc != SQLITE_OK) {
+        fprintf(stderr, "BACKUP: snapshot FAIL reason=%s err=finish:%s\n",
+                reason ? reason : "?", sqlite3_errstr(finish_rc));
+        sqlite3_close(dst);
+        return 0;
+    }
+
+    /* Size + timing for the success log line. */
+    int64_t bytes = 0;
+    {
+        struct stat st;
+        if (stat(snapshot_path, &st) == 0) bytes = (int64_t)st.st_size;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L
+                    + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+
+    fprintf(stderr,
+            "BACKUP: snapshot OK reason=%s path=%s bytes=%lld elapsed_ms=%ld\n",
+            reason ? reason : "?", snapshot_path,
+            (long long)bytes, elapsed_ms);
+
+    sqlite3_close(dst);
+    return 1;
 }
 
 int persist_schema_version(persist_t *p) {

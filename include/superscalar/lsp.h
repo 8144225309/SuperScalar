@@ -71,6 +71,9 @@ typedef struct {
        not gating — helper failures are logged but never abort the
        ceremony. */
     persist_t *db;
+    /* SF-BACKUP-PRE-ROTATION (#213): if non-NULL, dir to write
+     * pre-rotation SQLite snapshots into.  NULL = disabled. */
+    char *backup_dir;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

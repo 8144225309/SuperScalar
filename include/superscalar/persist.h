@@ -1285,6 +1285,21 @@ typedef int (*persist_participant_cb_t)(const persist_participant_t *p, void *us
 /* Insert a new ceremony row.  parent_ceremony_id8_or_null == NULL means
  * this is the first ceremony on the factory (no parent linkage).  Returns
  * 1 on success, 0 on error. */
+/* SF-BACKUP-PRE-ROTATION (#213): take a SQLite snapshot of the live DB
+ * to `snapshot_path` using sqlite3 backup API.  Used by
+ * lsp_run_state_advance to capture pre-rotation state before any
+ * in-memory mutation.  Returns 1 on success, 0 on failure (caller may
+ * warn but must not abort the rotation).  Logs the snapshot path +
+ * timestamp to stderr in a structured form operators can grep:
+ *
+ *   "BACKUP: snapshot OK reason=<reason> path=<path> bytes=<N> elapsed_ms=<M>"
+ *   "BACKUP: snapshot FAIL reason=<reason> err=<sqlite err>"
+ *
+ * Does NOT introduce a new table or schema bump — the file on disk and
+ * the stderr line are the record. */
+int persist_take_snapshot(persist_t *p, const char *snapshot_path,
+                           const char *reason);
+
 int persist_save_ceremony(persist_t *p,
                            const unsigned char *ceremony_id8,
                            const unsigned char *factory_instance_id32,

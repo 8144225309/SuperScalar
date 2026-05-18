@@ -1221,6 +1221,7 @@ int main(int argc, char *argv[]) {
     const char *seckey_hex = NULL;
     const char *report_path = NULL;
     const char *db_path = NULL;
+    const char *backup_dir = NULL;
     const char *network = NULL;
     const char *keyfile_path = NULL;
     const char *passphrase = "";
@@ -1431,6 +1432,8 @@ int main(int argc, char *argv[]) {
             demo_mode = 1;
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc)
+            backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
@@ -2935,6 +2938,9 @@ accept_new_factory:
        can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
        supplied — leaving lsp_p->db NULL is the legacy/no-persistence path. */
     lsp_p->db = g_db;
+    /* SF-BACKUP-PRE-ROTATION (#213): operator-configurable backup dir;
+     * NULL means feature disabled (no snapshots taken). */
+    lsp_p->backup_dir = backup_dir ? strdup(backup_dir) : NULL;
     lsp_p->accept_timeout_sec = accept_timeout_arg;
     if (max_connections_arg > 0)
         lsp_p->max_connections = max_connections_arg;
