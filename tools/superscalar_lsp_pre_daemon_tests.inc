@@ -1446,6 +1446,65 @@
                                sub0->is_signed);
                     }
 
+                    /* === SF-A #142: SECOND advance — multi-input ceremony ===
+                       The first advance produced chain[1] which spends a single
+                       sales-stock UTXO (single-input).  Now drive a SECOND
+                       advance so chain[2] spends ALL k+1 outputs of chain[1]
+                       (k channels + sales-stock).  This is the multi-input
+                       MuSig case (#142 SF-A). */
+                    if (sub_pass && test_subfactory_advance_multi) {
+                        printf("\n--- SF-A: SECOND advance (multi-input ceremony) ---\n");
+                        fflush(stdout);
+                        int chain1 = sub0->ps_chain_len;
+                        uint64_t ch0_b4 = sub0->outputs[0].amount_sats;
+                        uint64_t sstock_b4 =
+                            sub0->outputs[sub0->n_outputs - 1].amount_sats;
+                        /* Auto-scale second-advance delta to remaining sales-stock. */
+                        uint64_t delta2 = sstock_b4 / 4;
+                        if (delta2 < 1000) delta2 = 1000;
+                        if (delta2 + 1000 + 546 > sstock_b4) delta2 = 0;
+
+                        if (delta2 == 0) {
+                            printf("  SKIP: sales-stock too small for 2nd advance "
+                                   "(%llu sats)\n", (unsigned long long)sstock_b4);
+                        } else {
+                            printf("  pre-2nd-advance: chain_len=%d, ch[0]=%llu, "
+                                   "sales-stock=%llu, delta2=%llu, "
+                                   "ps_n_prev_outputs=%zu\n",
+                                   chain1, (unsigned long long)ch0_b4,
+                                   (unsigned long long)sstock_b4,
+                                   (unsigned long long)delta2,
+                                   sub0->ps_n_prev_outputs);
+                            fflush(stdout);
+                            int rc2 = lsp_subfactory_chain_advance(mgr, lsp_p,
+                                                                    /*leaf_side=*/0,
+                                                                    /*sub_idx=*/0,
+                                                                    /*channel_idx=*/0,
+                                                                    delta2);
+                            if (rc2 != 1) {
+                                printf("  FAIL: 2nd lsp_subfactory_chain_advance "
+                                       "returned %d\n", rc2);
+                                sub_pass = 0;
+                            } else if (sub0->ps_chain_len != chain1 + 1) {
+                                printf("  FAIL: chain_len did not increment "
+                                       "(was %d, now %d)\n",
+                                       chain1, sub0->ps_chain_len);
+                                sub_pass = 0;
+                            } else if (!sub0->is_signed) {
+                                printf("  FAIL: chain[N+2] is not signed\n");
+                                sub_pass = 0;
+                            } else {
+                                printf("  post-2nd-advance: chain_len=%d, "
+                                       "ch[0]=%llu, sales-stock=%llu (signed=%d)\n",
+                                       sub0->ps_chain_len,
+                                       (unsigned long long)sub0->outputs[0].amount_sats,
+                                       (unsigned long long)sub0->outputs[sub0->n_outputs - 1].amount_sats,
+                                       sub0->is_signed);
+                                printf("  SF-A MULTI-INPUT CEREMONY: PASS\n");
+                            }
+                        }
+                    }
+
                     /* === Sub-factory CHEATING + WATCHTOWER POISON ===
 
                        The LSP "cheats" by broadcasting the now-stale

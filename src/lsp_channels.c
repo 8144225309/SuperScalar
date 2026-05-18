@@ -3584,6 +3584,447 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
+    /* Build the client list once (used by both single- and multi-input branches
+       AND by the post-ceremony epilogue for the DONE broadcast). */
+    uint32_t sub_clients[FACTORY_MAX_SIGNERS];
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++)
+        sub_clients[ci] = sub->signer_indices[ci + 1];
+
+    /* === MULTI-INPUT FORK (SF-A / #142) ===
+
+       When the chain has been advanced before (ps_chain_len > 0 after the
+       call above means chain_len now >= 1 AND prev_n_outputs > 1), the
+       NEW chain[N] TX spends k+1 outputs of the prior chain[N-1] TX (k
+       channel UTXOs + sales-stock) instead of a single sales-stock UTXO.
+       This requires k+1 independent MuSig2 sessions (one per input, since
+       BIP-341 sighashes differ per input).
+
+       Detection: factory_node_uses_multi_input returns 1 when
+       (is_ps_leaf && ps_chain_len > 0 && type == PS_SUBFACTORY &&
+        ps_n_prev_outputs > 1).  Note that this is set by
+       factory_subfactory_chain_advance_unsigned, so we detect AFTER the
+       call.
+
+       Poison-TX side-channel is still single-input (spends ONE old
+       sales-stock UTXO), so we run it in parallel using the existing
+       poison_pubnonce/poison_partial_sig wire fields. */
+    if (factory_node_uses_multi_input(f, (size_t)sub_node_i)) {
+        size_t n_inputs = sub->ps_n_prev_outputs;
+        printf("LSP: sub-factory %d.%d chain advance is MULTI-INPUT "
+               "(n_inputs=%zu, ps_chain_len=%d)\n",
+               leaf_side, sub_idx_in_leaf, n_inputs, sub->ps_chain_len);
+
+        /* --- Multi-input Step 2: Init n_inputs state sessions + poison session. --- */
+        for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_init_node_input(f, (size_t)sub_node_i, i)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "init input session %zu failed\n", i);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+        }
+        if (poison_prepared &&
+            !factory_session_init_node_poison(f, (size_t)sub_node_i)) {
+            fprintf(stderr, "LSP subfactory advance (multi): "
+                    "poison session init failed — degrading\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
+
+        /* --- Multi-input Step 3: Generate n_inputs LSP nonces (one per input) + 1 poison nonce. --- */
+        int lsp_slot = factory_find_signer_slot(f, (size_t)sub_node_i, 0);
+        if (lsp_slot < 0) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        unsigned char lsp_seckey[32];
+        if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        secp256k1_musig_secnonce *lsp_secnonces =
+            calloc(n_inputs, sizeof(secp256k1_musig_secnonce));
+        secp256k1_musig_pubnonce *lsp_pubnonces =
+            calloc(n_inputs, sizeof(secp256k1_musig_pubnonce));
+        unsigned char (*lsp_pn_ser)[66] =
+            calloc(n_inputs, sizeof(unsigned char[66]));
+        if (!lsp_secnonces || !lsp_pubnonces || !lsp_pn_ser) {
+            free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+            memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        for (size_t i = 0; i < n_inputs; i++) {
+            if (!musig_generate_nonce(lsp->ctx, &lsp_secnonces[i], &lsp_pubnonces[i],
+                                       lsp_seckey, &lsp->lsp_pubkey,
+                                       &sub->keyagg.cache)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "nonce gen input %zu failed\n", i);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            musig_pubnonce_serialize(lsp->ctx, lsp_pn_ser[i], &lsp_pubnonces[i]);
+        }
+        secp256k1_musig_secnonce lsp_poison_secnonce;
+        secp256k1_musig_pubnonce lsp_poison_pubnonce;
+        unsigned char lsp_poison_pn_ser[66] = {0};
+        if (poison_prepared) {
+            if (!musig_generate_nonce(lsp->ctx, &lsp_poison_secnonce,
+                                       &lsp_poison_pubnonce,
+                                       lsp_seckey, &lsp->lsp_pubkey,
+                                       &sub->keyagg.cache)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "poison nonce gen failed — degrading\n");
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            } else {
+                musig_pubnonce_serialize(lsp->ctx, lsp_poison_pn_ser,
+                                          &lsp_poison_pubnonce);
+            }
+        }
+
+        /* --- Multi-input Step 4: Send PROPOSE with n_inputs + lsp_pubnonces[] array. --- */
+        /* The PROPOSE carries lsp_pn_ser[0] in the single-input field for
+           compatibility with old parsers; multi-aware receivers will use
+           the array attached below. */
+        cJSON *propose = wire_build_subfactory_propose(leaf_side, sub_idx_in_leaf,
+                                                         channel_idx_in_sub,
+                                                         delta_sats,
+                                                         lsp_pn_ser[0]);
+        wire_subfactory_propose_set_inputs(propose, n_inputs,
+                                            (const unsigned char (*)[66])lsp_pn_ser);
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+            if (!wire_send(lsp->client_fds[fd_idx],
+                           MSG_SUBFACTORY_PROPOSE, propose)) {
+                cJSON_Delete(propose);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+        }
+        cJSON_Delete(propose);
+
+        /* --- Multi-input Step 5: Collect NONCE from each client (k+1 nonces each + poison). --- */
+        /* all_pn_per_input[signer_slot * n_inputs + input_idx] = 66-byte nonce. */
+        unsigned char *all_pn_per_input = calloc(sub->n_signers * n_inputs, 66);
+        unsigned char all_poison_pn[FACTORY_MAX_SIGNERS][66];
+        if (!all_pn_per_input) {
+            free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+            memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        /* Seed LSP's own nonces into the matrix. */
+        for (size_t i = 0; i < n_inputs; i++)
+            memcpy(all_pn_per_input + ((size_t)lsp_slot * n_inputs + i) * 66,
+                    lsp_pn_ser[i], 66);
+        if (poison_prepared)
+            memcpy(all_poison_pn[lsp_slot], lsp_poison_pn_ser, 66);
+
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+            wire_msg_t nmsg;
+            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                                &nmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+                nmsg.msg_type != MSG_SUBFACTORY_NONCE) {
+                fprintf(stderr, "LSP subfactory advance (multi): expected "
+                        "SUBFACTORY_NONCE from client %u, got 0x%02x\n",
+                        sub_clients[ci], nmsg.msg_type);
+                if (nmsg.json) cJSON_Delete(nmsg.json);
+                free(all_pn_per_input);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            /* Parse single-field + poison via the legacy helper (just for
+               poison side-channel; single-field state nonce is ignored). */
+            unsigned char client_state_pn[66], client_poison_pn[66];
+            int parse_rc = wire_parse_subfactory_nonce(
+                nmsg.json, client_state_pn,
+                poison_prepared ? client_poison_pn : NULL);
+            if (parse_rc == 0) {
+                cJSON_Delete(nmsg.json);
+                free(all_pn_per_input);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            if (poison_prepared && parse_rc < 2) {
+                fprintf(stderr,
+                        "LSP subfactory advance (multi): client %u omitted "
+                        "poison nonce — degrading\n", sub_clients[ci]);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            }
+            /* Parse the array of k+1 client nonces (REQUIRED in multi-input mode). */
+            unsigned char client_pns[FACTORY_MAX_OUTPUTS][66];
+            size_t n_client_pns = wire_subfactory_nonce_get_pubnonces(
+                nmsg.json, client_pns, FACTORY_MAX_OUTPUTS);
+            cJSON_Delete(nmsg.json);
+            if (n_client_pns != n_inputs) {
+                fprintf(stderr, "LSP subfactory advance (multi): client %u "
+                        "sent %zu nonces, expected %zu\n",
+                        sub_clients[ci], n_client_pns, n_inputs);
+                free(all_pn_per_input);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
+                                                        sub_clients[ci]);
+            if (client_slot < 0) {
+                free(all_pn_per_input);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            for (size_t i = 0; i < n_inputs; i++)
+                memcpy(all_pn_per_input +
+                            ((size_t)client_slot * n_inputs + i) * 66,
+                        client_pns[i], 66);
+            if (poison_prepared)
+                memcpy(all_poison_pn[client_slot], client_poison_pn, 66);
+        }
+
+        /* --- Multi-input Step 6: Set nonces on every input session, broadcast ALL_NONCES. --- */
+        for (size_t s = 0; s < sub->n_signers; s++) {
+            for (size_t i = 0; i < n_inputs; i++) {
+                secp256k1_musig_pubnonce pn;
+                if (!musig_pubnonce_parse(lsp->ctx, &pn,
+                        all_pn_per_input + (s * n_inputs + i) * 66) ||
+                    !factory_session_set_nonce_input(f, (size_t)sub_node_i,
+                                                     i, s, &pn)) {
+                    fprintf(stderr, "LSP subfactory advance (multi): "
+                            "set_nonce_input(signer=%zu, input=%zu) failed\n",
+                            s, i);
+                    free(all_pn_per_input);
+                    free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                    memset(lsp_seckey, 0, 32);
+                    factory_session_reset_poison(f, (size_t)sub_node_i);
+                    return 0;
+                }
+            }
+            if (poison_prepared) {
+                secp256k1_musig_pubnonce ppn;
+                if (!musig_pubnonce_parse(lsp->ctx, &ppn, all_poison_pn[s]) ||
+                    !factory_session_set_nonce_poison(f, (size_t)sub_node_i,
+                                                        s, &ppn)) {
+                    fprintf(stderr, "LSP subfactory advance (multi): "
+                            "poison set_nonce(signer=%zu) failed — degrading\n", s);
+                    factory_session_reset_poison(f, (size_t)sub_node_i);
+                    poison_prepared = 0;
+                }
+            }
+        }
+        /* Build ALL_NONCES with the per-input matrix attached.  Single-field
+           "pubnonces" still carries input-0 nonces for legacy parsers. */
+        unsigned char all_pn_in0[FACTORY_MAX_SIGNERS][66];
+        for (size_t s = 0; s < sub->n_signers; s++)
+            memcpy(all_pn_in0[s], all_pn_per_input + (s * n_inputs) * 66, 66);
+        cJSON *all_nonces = wire_build_subfactory_all_nonces(
+            (const unsigned char (*)[66])all_pn_in0,
+            poison_prepared ? (const unsigned char (*)[66])all_poison_pn : NULL,
+            sub->n_signers);
+        wire_subfactory_all_nonces_set_per_input(all_nonces, sub->n_signers,
+                                                  n_inputs, (const unsigned char (*)[66])all_pn_per_input);
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+            wire_send(lsp->client_fds[fd_idx],
+                       MSG_SUBFACTORY_ALL_NONCES, all_nonces);
+        }
+        cJSON_Delete(all_nonces);
+        free(all_pn_per_input);
+
+        /* --- Multi-input Step 7: Finalize every input session + poison. --- */
+        for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_finalize_node_input(f, (size_t)sub_node_i, i)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "finalize input %zu failed\n", i);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                memset(lsp_seckey, 0, 32);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+        }
+        if (poison_prepared &&
+            !factory_session_finalize_node_poison(f, (size_t)sub_node_i)) {
+            fprintf(stderr, "LSP subfactory advance (multi): "
+                    "poison finalize failed — degrading\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
+
+        /* --- Multi-input Step 8: LSP signs each input + poison. --- */
+        secp256k1_keypair lsp_kp;
+        if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+            free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+            memset(lsp_seckey, 0, 32);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        memset(lsp_seckey, 0, 32);
+        unsigned char (*lsp_psig_ser)[32] =
+            calloc(n_inputs, sizeof(unsigned char[32]));
+        if (!lsp_psig_ser) {
+            free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        for (size_t i = 0; i < n_inputs; i++) {
+            secp256k1_musig_partial_sig lsp_psig_i;
+            if (!musig_create_partial_sig(lsp->ctx, &lsp_psig_i,
+                    &lsp_secnonces[i], &lsp_kp,
+                    &sub->input_signing_sessions[i])) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "create_partial_sig input %zu failed\n", i);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            if (!factory_session_set_partial_sig_input(f, (size_t)sub_node_i,
+                                                        i, (size_t)lsp_slot,
+                                                        &lsp_psig_i)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "set_partial_sig_input(input=%zu) failed\n", i);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            musig_partial_sig_serialize(lsp->ctx, lsp_psig_ser[i], &lsp_psig_i);
+        }
+        free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+        secp256k1_musig_partial_sig lsp_poison_psig;
+        if (poison_prepared) {
+            if (!musig_create_partial_sig(lsp->ctx, &lsp_poison_psig,
+                                          &lsp_poison_secnonce, &lsp_kp,
+                                          &sub->poison_signing_session)) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "LSP poison psig failed — degrading\n");
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            } else if (!factory_session_set_partial_sig_poison(
+                            f, (size_t)sub_node_i,
+                            (size_t)lsp_slot, &lsp_poison_psig)) {
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            }
+        }
+
+        /* --- Multi-input Step 9: Collect PSIG from each client (k+1 sigs + poison). --- */
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+            wire_msg_t pmsg;
+            if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                                &pmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+                pmsg.msg_type != MSG_SUBFACTORY_PSIG) {
+                fprintf(stderr, "LSP subfactory advance (multi): expected "
+                        "SUBFACTORY_PSIG from client %u, got 0x%02x\n",
+                        sub_clients[ci], pmsg.msg_type);
+                if (pmsg.json) cJSON_Delete(pmsg.json);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            /* Legacy single-field (ignored for state) + poison. */
+            unsigned char client_psig_legacy[32], client_poison_psig_ser[32];
+            int parse_rc = wire_parse_subfactory_psig(
+                pmsg.json, client_psig_legacy,
+                poison_prepared ? client_poison_psig_ser : NULL);
+            if (parse_rc == 0) {
+                cJSON_Delete(pmsg.json);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            if (poison_prepared && parse_rc < 2) {
+                fprintf(stderr, "LSP subfactory advance (multi): client %u "
+                        "omitted poison psig — degrading\n", sub_clients[ci]);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                poison_prepared = 0;
+            }
+            unsigned char client_psigs[FACTORY_MAX_OUTPUTS][32];
+            size_t n_client_psigs = wire_subfactory_psig_get_partial_sigs(
+                pmsg.json, client_psigs, FACTORY_MAX_OUTPUTS);
+            cJSON_Delete(pmsg.json);
+            if (n_client_psigs != n_inputs) {
+                fprintf(stderr, "LSP subfactory advance (multi): client %u "
+                        "sent %zu psigs, expected %zu\n",
+                        sub_clients[ci], n_client_psigs, n_inputs);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
+                                                       sub_clients[ci]);
+            if (client_slot < 0) {
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
+            for (size_t i = 0; i < n_inputs; i++) {
+                secp256k1_musig_partial_sig client_psig_i;
+                if (!musig_partial_sig_parse(lsp->ctx, &client_psig_i,
+                                              client_psigs[i]) ||
+                    !factory_session_set_partial_sig_input(f, (size_t)sub_node_i,
+                                                            i, (size_t)client_slot,
+                                                            &client_psig_i)) {
+                    fprintf(stderr, "LSP subfactory advance (multi): client %u "
+                            "psig parse/set input=%zu failed\n",
+                            sub_clients[ci], i);
+                    free(lsp_psig_ser);
+                    factory_session_reset_poison(f, (size_t)sub_node_i);
+                    return 0;
+                }
+            }
+            if (poison_prepared) {
+                secp256k1_musig_partial_sig client_poison_psig;
+                if (!musig_partial_sig_parse(lsp->ctx, &client_poison_psig,
+                                              client_poison_psig_ser) ||
+                    !factory_session_set_partial_sig_poison(f, (size_t)sub_node_i,
+                                                              (size_t)client_slot,
+                                                              &client_poison_psig)) {
+                    fprintf(stderr, "LSP subfactory advance (multi): client %u "
+                            "poison psig parse/set failed — degrading\n",
+                            sub_clients[ci]);
+                    factory_session_reset_poison(f, (size_t)sub_node_i);
+                    poison_prepared = 0;
+                }
+            }
+        }
+        free(lsp_psig_ser);
+
+        /* --- Multi-input Step 10: Aggregate + assemble the k+1-witness signed TX. --- */
+        if (!factory_session_assemble_signed_tx_multi(f, (size_t)sub_node_i)) {
+            fprintf(stderr, "LSP subfactory advance (multi): "
+                    "assemble_signed_tx_multi failed\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            return 0;
+        }
+        if (poison_prepared &&
+            !factory_session_complete_node_poison(f, (size_t)sub_node_i)) {
+            fprintf(stderr, "LSP subfactory advance (multi): "
+                    "poison complete failed — degrading\n");
+            factory_session_reset_poison(f, (size_t)sub_node_i);
+            poison_prepared = 0;
+        }
+
+        /* Fall through to the common post-ceremony steps (10/10b/11) which
+           handle persist, watchtower, DONE, channel-funding refresh,
+           distribution-TX invalidation. We use a goto to share the
+           epilogue with the single-input path. */
+        goto multi_ceremony_complete;
+    }
+
     /* Step 2: Init BOTH signing sessions (state + poison).  Poison
        session uses the SAME keyagg as state but a separate session so
        nonces are independent (MuSig2 demands fresh nonces per message). */
@@ -3635,10 +4076,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     unsigned char lsp_pubnonce_ser[66];
     musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
 
-    /* Build the client list (signer_indices[1..n] are clients; signer 0 is LSP). */
-    uint32_t sub_clients[FACTORY_MAX_SIGNERS];
-    for (size_t ci = 0; ci < n_clients_in_sub; ci++)
-        sub_clients[ci] = sub->signer_indices[ci + 1];
+    /* sub_clients already populated at function entry (used by both branches). */
 
     cJSON *propose = wire_build_subfactory_propose(leaf_side, sub_idx_in_leaf,
                                                      channel_idx_in_sub,
@@ -3866,6 +4304,7 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+multi_ceremony_complete:
     /* Step 10: Persist sub-factory chain entry (Phase 4a save +
        Phase 4c per-channel amounts) into the dedicated v21
        `ps_subfactory_chains` table.
