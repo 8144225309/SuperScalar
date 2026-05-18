@@ -310,9 +310,13 @@ echo "=== Verifying clients participated in sub-factory ceremony ==="
 PARTICIPATED=0
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     LOG="$TMPDIR/client_${i}.log"
-    if grep -q "sub-factory.*advanced to chain_len" "$LOG" 2>/dev/null; then
+    # Match both legacy single-input ("advanced to chain_len") and the
+    # multi-input ceremony (#142 SF-A) which logs "advanced (MULTI) to
+    # chain_len".  Sub-factories with ps_chain_len>0 + n_prev_outputs>1
+    # use the multi-input MuSig fork added in PR #270.
+    if grep -qE "sub-factory.*advanced( \(MULTI\))? to chain_len" "$LOG" 2>/dev/null; then
         PARTICIPATED=$((PARTICIPATED + 1))
-        SA=$(grep "sub-factory.*advanced to chain_len" "$LOG" | head -1)
+        SA=$(grep -E "sub-factory.*advanced( \(MULTI\))? to chain_len" "$LOG" | head -1)
         echo "  client[$i]: participated — $SA"
     else
         echo "  client[$i]: no sub-factory advance marker (may be in different sub-factory)"
