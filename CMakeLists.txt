@@ -373,6 +373,16 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(bip158_integration_test PRIVATE project_sanitizers)
 endif()
 
+# BIP-158 end-to-end / adversarial helper (#216, GH #264) — driven by
+# tools/test_regtest_bip158_*.sh.
+add_executable(test_bip158_e2e_helper tools/test_bip158_e2e_helper.c)
+target_include_directories(test_bip158_e2e_helper PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(test_bip158_e2e_helper PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(test_bip158_e2e_helper PRIVATE superscalar project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_bip158_e2e_helper PRIVATE project_sanitizers)
+endif()
+
 add_executable(superscalar_bridge tools/superscalar_bridge.c)
 target_include_directories(superscalar_bridge PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar_bridge PRIVATE ${cjson_SOURCE_DIR})
