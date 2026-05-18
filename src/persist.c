@@ -1204,6 +1204,64 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v34 (#185 / wallet-team CEREMONY_DESIGN.md §6.1): three new tables for
+       multi-party ceremony persistence. Enforce the load-bearing sequencing
+       invariants from §5:
+         (1) one in-flight ceremony per factory  — via ceremonies.state index
+         (2) parent linking                       — via parent_ceremony_id
+         (3) revocation gating                    — via revocation_releases
+       Without durable state for these, a crash recovery gap allows binding a
+       second signature for the same epoch transition (the "dual-signature
+       trap"). Enums for state/phase/type are in persist.h alongside
+       PERSIST_SCHEMA_VERSION. */
+    if (db_version < 34) {
+        const char *sql_v34 =
+            "CREATE TABLE IF NOT EXISTS ceremonies ("
+            "  ceremony_id           BLOB PRIMARY KEY,"   /* 8 bytes random */
+            "  factory_instance_id   BLOB NOT NULL,"       /* 32 bytes */
+            "  ceremony_type         INTEGER NOT NULL,"    /* see PERSIST_CEREMONY_TYPE_* */
+            "  parent_ceremony_id    BLOB,"                /* nullable for first ceremony */
+            "  started_at_block      INTEGER NOT NULL,"
+            "  deadline_block        INTEGER NOT NULL,"
+            "  state                 INTEGER NOT NULL,"    /* see PERSIST_CEREMONY_STATE_* */
+            "  aggregated_nonce      BLOB,"                /* populated when state >= NONCES_AGGREGATED */
+            "  final_signature       BLOB,"                /* populated when state == FINALIZED */
+            "  broadcast_txid        BLOB,"                /* populated when state == FINALIZED + broadcast OK */
+            "  abort_reason          INTEGER"              /* populated when state == ABORTED */
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_ceremonies_factory "
+            "  ON ceremonies(factory_instance_id, state);"
+
+            "CREATE TABLE IF NOT EXISTS ceremony_participants ("
+            "  ceremony_id           BLOB NOT NULL,"
+            "  participant_pubkey    BLOB NOT NULL,"       /* 33 bytes */
+            "  phase                 INTEGER NOT NULL,"    /* see PERSIST_CEREMONY_PHASE_* */
+            "  public_nonce          BLOB,"                /* populated when phase >= NONCED */
+            "  partial_signature     BLOB,"                /* populated when phase >= SIGNED */
+            "  refuse_code           INTEGER,"             /* populated when phase == REFUSED */
+            "  last_sent_at          INTEGER,"             /* unix ts; retry timing */
+            "  PRIMARY KEY (ceremony_id, participant_pubkey)"
+            ");"
+
+            "CREATE TABLE IF NOT EXISTS revocation_releases ("
+            "  factory_instance_id   BLOB NOT NULL,"       /* 32 bytes */
+            "  state_id              BLOB NOT NULL,"       /* which state's revocation */
+            "  participant_pubkey    BLOB NOT NULL,"       /* 33 bytes */
+            "  revocation_secret     BLOB NOT NULL,"       /* 32 bytes */
+            "  received_at_block     INTEGER NOT NULL,"
+            "  PRIMARY KEY (factory_instance_id, state_id, participant_pubkey)"
+            ");";
+        char *merr34 = NULL;
+        if (sqlite3_exec(p->db, sql_v34, NULL, NULL, &merr34) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v34 (ceremony tables) failed: %s\n",
+                    merr34 ? merr34 : "unknown");
+            sqlite3_free(merr34);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
