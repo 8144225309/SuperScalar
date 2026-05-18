@@ -2485,6 +2485,12 @@
                 return 1;
             }
 
+            /* SF-PTLC-PERSIST #192: surface PTLC in DB so the
+               dashboard ptlcs table populates during PTLC BASIC TEST. */
+            if (g_db && ch0_p->n_ptlcs > 0)
+                persist_save_ptlc(g_db, 0,
+                    &ch0_p->ptlcs[ch0_p->n_ptlcs - 1]);
+
             /* Step 4: Verify PTLC was added and state is ACTIVE. */
             if (ch0_p->n_ptlcs != initial_n_ptlcs + 1) {
                 fprintf(stderr, "PTLC BASIC TEST: n_ptlcs %zu != expected %zu\n",
@@ -2678,6 +2684,11 @@
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+
+            /* SF-PTLC-PERSIST #192: surface PTLC in DB for dashboard. */
+            if (g_db && ch0_p->n_ptlcs > 0)
+                persist_save_ptlc(g_db, 0,
+                    &ch0_p->ptlcs[ch0_p->n_ptlcs - 1]);
             printf("PTLC added: id=%llu amount=%llu cltv=%u\n",
                    (unsigned long long)br_ptlc_id,
                    (unsigned long long)br_ptlc_amount, br_ptlc_cltv);
@@ -2922,6 +2933,12 @@
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+
+            /* SF-PTLC-PERSIST #192: surface PTLC in DB so the
+               dashboard ptlcs table populates during PTLC RESTART TEST. */
+            if (g_db && ch0_r->n_ptlcs > 0)
+                persist_save_ptlc(g_db, 0,
+                    &ch0_r->ptlcs[ch0_r->n_ptlcs - 1]);
             printf("PTLC added: id=%llu amount=%llu cltv=%u\n",
                    (unsigned long long)re_ptlc_id,
                    (unsigned long long)re_ptlc_amount, re_ptlc_cltv);
@@ -3146,6 +3163,12 @@
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+
+            /* SF-PTLC-PERSIST #192: surface PTLC in DB so the
+               dashboard ptlcs table populates during PTLC CHAIN TEST. */
+            if (g_db && ch0_c->n_ptlcs > 0)
+                persist_save_ptlc(g_db, 0,
+                    &ch0_c->ptlcs[ch0_c->n_ptlcs - 1]);
             printf("PTLC added: id=%llu amount=%llu cltv=%u\n",
                    (unsigned long long)pc_ptlc_id,
                    (unsigned long long)pc_ptlc_amount, pc_ptlc_cltv);
@@ -3335,6 +3358,12 @@
                 lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
+
+            /* SF-PTLC-PERSIST #192: surface PTLC in DB so the
+               dashboard ptlcs table populates during PTLC BREACH CHAIN. */
+            if (g_db && ch0_bc->n_ptlcs > 0)
+                persist_save_ptlc(g_db, 0,
+                    &ch0_bc->ptlcs[ch0_bc->n_ptlcs - 1]);
             printf("[1] PTLC added: id=%llu amount=%llu cltv=%u\n",
                    (unsigned long long)bc_ptlc_id,
                    (unsigned long long)bc_amt, bc_cltv);
