@@ -148,8 +148,32 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     musig_keyagg_t rot_ka;
     musig_aggregate_keys(mgr->ctx, &rot_ka, rot_pks, n_total);
 
+    /* SF-PTLC-TURNOVER-AUTH #196: build context-bound turnover_msg.
+       Old constant turnover_msg let a malicious LSP send unrelated
+       presigs at any moment.  Now bound to (dying_factory_txid,
+       new_factory_nonce, rotation_epoch) hashed via wire_compute_turnover_msg.
+       The client receives the same context in a precursor ROTATION_BEGIN
+       and refuses any presig whose turnover_msg doesn't match. */
+    unsigned char dying_factory_txid[32];
+    memcpy(dying_factory_txid, dying->factory.funding_txid, 32);
+    unsigned char new_factory_nonce[32];
+    {
+        FILE *urn = fopen("/dev/urandom", "rb");
+        if (!urn) {
+            fprintf(stderr, "LSP rotate: cannot open /dev/urandom for nonce\n");
+            return 0;
+        }
+        size_t got = fread(new_factory_nonce, 1, 32, urn);
+        fclose(urn);
+        if (got != 32) {
+            fprintf(stderr, "LSP rotate: /dev/urandom short read\n");
+            return 0;
+        }
+    }
+    uint64_t rotation_epoch = (uint64_t)time(NULL);
     unsigned char turnover_msg[32];
-    sha256_tagged("turnover", (const unsigned char *)"turnover", 8, turnover_msg);
+    wire_compute_turnover_msg(dying_factory_txid, new_factory_nonce,
+                                rotation_epoch, turnover_msg);
 
     /* --- Phase A: PTLC key turnover over wire --- */
     printf("LSP rotate: Phase A — PTLC key turnover\n");
@@ -173,6 +197,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             fprintf(stderr, "LSP rotate: presig failed client %zu, skipping\n", ci);
             turnover_fail++;
             continue;
+        }
+
+        /* SF-PTLC-TURNOVER-AUTH #196: send rotation context to client
+           BEFORE the presig so the client can validate the upcoming presig
+           against the context. */
+        {
+            cJSON *rb = wire_build_rotation_begin(dying_factory_txid,
+                                                    new_factory_nonce,
+                                                    rotation_epoch);
+            if (!wire_send(lsp->client_fds[ci], MSG_ROTATION_BEGIN, rb)) {
+                cJSON_Delete(rb);
+                fprintf(stderr, "LSP rotate: send ROTATION_BEGIN failed client %zu, skipping\n", ci);
+                wire_close(lsp->client_fds[ci]);
+                lsp->client_fds[ci] = -1;
+                turnover_fail++;
+                continue;
+            }
+            cJSON_Delete(rb);
         }
 
         /* Send PTLC_PRESIG to client */

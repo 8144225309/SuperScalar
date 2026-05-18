@@ -507,6 +507,49 @@ typedef struct {
     uint16_t profit_share_bps;      /* client's share from factory terms */
 } daemon_cb_data_t;
 
+/* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
+   handler. The MSG_PTLC_PRESIG handler used to adapt the client identity
+   seckey onto any LSP-supplied presig blindly, letting a malicious LSP
+   extract the seckey via secp256k1_musig_extract_adaptor (scalar
+   subtraction). We now require a precursor MSG_ROTATION_BEGIN carrying
+   (dying_factory_txid, new_factory_nonce, rotation_epoch); the client
+   recomputes the expected turnover_msg via wire_compute_turnover_msg()
+   and refuses any presig whose turnover_msg does not match. The context
+   is one-shot: cleared after a presig is consumed (success OR refusal)
+   so a stale ROTATION_BEGIN cannot authorize a later presig. */
+typedef struct {
+    int           expecting;
+    unsigned char dying_factory_txid[32];
+    unsigned char new_factory_nonce[32];
+    uint64_t      rotation_epoch;
+    unsigned char expected_turnover_msg[32];
+} client_rotation_ctx_t;
+
+static client_rotation_ctx_t g_rotation_ctx;
+
+static void rotation_ctx_set(const unsigned char *dying_txid,
+                              const unsigned char *new_nonce,
+                              uint64_t epoch) {
+    memcpy(g_rotation_ctx.dying_factory_txid, dying_txid, 32);
+    memcpy(g_rotation_ctx.new_factory_nonce,  new_nonce,  32);
+    g_rotation_ctx.rotation_epoch = epoch;
+    wire_compute_turnover_msg(dying_txid, new_nonce, epoch,
+                                g_rotation_ctx.expected_turnover_msg);
+    g_rotation_ctx.expecting = 1;
+}
+
+static void rotation_ctx_clear(void) {
+    memset(&g_rotation_ctx, 0, sizeof(g_rotation_ctx));
+}
+
+/* Returns 1 iff presig turnover_msg matches expected; 0 otherwise. */
+static int rotation_ctx_check_presig(const unsigned char *received_turnover_msg) {
+    if (!g_rotation_ctx.expecting) return 0;
+    if (memcmp(received_turnover_msg,
+               g_rotation_ctx.expected_turnover_msg, 32) != 0) return 0;
+    return 1;
+}
+
 /* Handle a PTLC_PRESIG message inline (when received during a blocking wait
    for another message type like COMMITMENT_SIGNED).  This prevents the rotation
    PTLC from being silently discarded when it arrives mid-HTLC-flow. */
@@ -520,6 +563,13 @@ static void handle_ptlc_presig_inline(int fd, wire_msg_t *msg,
         fprintf(stderr, "Client %u: bad inline PTLC_PRESIG\n", my_index);
         return;
     }
+    /* SF-PTLC-TURNOVER-AUTH #196: refuse if no matching ROTATION_BEGIN. */
+    if (!rotation_ctx_check_presig(turnover_msg)) {
+        fprintf(stderr, "Client %u: REJECTED inline PTLC_PRESIG (no matching ROTATION_BEGIN; adversarial LSP suspected, #196)\n", my_index);
+        rotation_ctx_clear();
+        return;
+    }
+    rotation_ctx_clear();
     unsigned char my_seckey[32];
     if (!secp256k1_keypair_sec(ctx, my_seckey, keypair))
         return;
@@ -555,6 +605,22 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
             return 0;
         if (msg->msg_type == expected_type)
             return 1;
+        if (msg->msg_type == MSG_ROTATION_BEGIN) {
+            /* SF-PTLC-TURNOVER-AUTH #196: record rotation context inline
+               so an inline PTLC_PRESIG (mid-HTLC-flow) can validate. */
+            unsigned char dt[32], nn[32];
+            uint64_t ep = 0;
+            if (wire_parse_rotation_begin(msg->json, dt, nn, &ep)) {
+                rotation_ctx_set(dt, nn, ep);
+                printf("Client %u: ROTATION_BEGIN accepted inline (epoch=%llu)\n",
+                       my_index, (unsigned long long)ep);
+            } else {
+                fprintf(stderr, "Client %u: bad inline ROTATION_BEGIN\n", my_index);
+            }
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;
+        }
         if (msg->msg_type == MSG_PTLC_PRESIG) {
             handle_ptlc_presig_inline(fd, msg, ctx, keypair, my_index);
             cJSON_Delete(msg->json);
@@ -1309,6 +1375,25 @@ handle_message:
             break;
         }
 
+        case MSG_ROTATION_BEGIN: {
+            /* SF-PTLC-TURNOVER-AUTH #196: rotation context precursor.
+               Records (dying_factory_txid, new_factory_nonce, rotation_epoch)
+               so the next MSG_PTLC_PRESIG can be validated against it. */
+            unsigned char dying_txid[32], new_nonce[32];
+            uint64_t epoch = 0;
+            if (!wire_parse_rotation_begin(msg.json, dying_txid, new_nonce, &epoch)) {
+                fprintf(stderr, "Client %u: bad ROTATION_BEGIN\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+            rotation_ctx_set(dying_txid, new_nonce, epoch);
+            printf("Client %u: ROTATION_BEGIN accepted (epoch=%llu, dying_txid=%02x%02x%02x..)\n",
+                   my_index, (unsigned long long)epoch,
+                   dying_txid[0], dying_txid[1], dying_txid[2]);
+            break;
+        }
+
         case MSG_PTLC_PRESIG: {
             /* LSP sends adaptor pre-signature for PTLC key turnover */
             unsigned char presig[64], turnover_msg[32];
@@ -1319,6 +1404,14 @@ handle_message:
                 break;
             }
             cJSON_Delete(msg.json);
+
+            /* SF-PTLC-TURNOVER-AUTH #196: refuse if no matching ROTATION_BEGIN. */
+            if (!rotation_ctx_check_presig(turnover_msg)) {
+                fprintf(stderr, "Client %u: REJECTED PTLC_PRESIG (no matching ROTATION_BEGIN; adversarial LSP suspected, #196)\n", my_index);
+                rotation_ctx_clear();
+                break;
+            }
+            rotation_ctx_clear();
 
             /* Adapt with our secret key */
             unsigned char my_seckey[32];
