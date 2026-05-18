@@ -6362,3 +6362,439 @@ int persist_load_fee_settlement(persist_t *p, uint32_t factory_id,
     sqlite3_finalize(stmt);
     return found;
 }
+
+/* === SF-CEREMONY-HELPERS #185 follow-up =====================================
+ * Implementation of v34 ceremony API helpers (wallet team API, 2026-05-18).
+ * ============================================================================ */
+
+int persist_save_ceremony(persist_t *p,
+                           const unsigned char *ceremony_id8,
+                           const unsigned char *factory_instance_id32,
+                           uint8_t ceremony_type,
+                           const unsigned char *parent_ceremony_id8_or_null,
+                           uint32_t started_at_block,
+                           uint32_t deadline_block) {
+    if (!p || !p->db || !ceremony_id8 || !factory_instance_id32) return 0;
+    const char *sql =
+        "INSERT INTO ceremonies "
+        "(ceremony_id, factory_instance_id, ceremony_type, parent_ceremony_id, "
+        " started_at_block, deadline_block, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, ceremony_id8, 8, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 2, factory_instance_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_int(st, 3, (int)ceremony_type);
+    if (parent_ceremony_id8_or_null)
+        sqlite3_bind_blob(st, 4, parent_ceremony_id8_or_null, 8, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(st, 4);
+    sqlite3_bind_int(st, 5, (int)started_at_block);
+    sqlite3_bind_int(st, 6, (int)deadline_block);
+    sqlite3_bind_int(st, 7, PERSIST_CEREMONY_STATE_PENDING_NONCES);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_load_ceremony(persist_t *p,
+                           const unsigned char *ceremony_id8,
+                           persist_ceremony_t *out) {
+    if (!p || !p->db || !ceremony_id8 || !out) return 0;
+    const char *sql =
+        "SELECT ceremony_id, factory_instance_id, ceremony_type, "
+        "       parent_ceremony_id, started_at_block, deadline_block, state, "
+        "       aggregated_nonce, final_signature, broadcast_txid, abort_reason "
+        "FROM ceremonies WHERE ceremony_id = ?;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, ceremony_id8, 8, SQLITE_STATIC);
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        memset(out, 0, sizeof(*out));
+        const void *cid = sqlite3_column_blob(st, 0);
+        if (cid) memcpy(out->ceremony_id, cid, 8);
+        const void *fid = sqlite3_column_blob(st, 1);
+        if (fid) memcpy(out->factory_instance_id, fid, 32);
+        out->ceremony_type     = (uint8_t)sqlite3_column_int(st, 2);
+        const void *pid = sqlite3_column_blob(st, 3);
+        if (pid && sqlite3_column_bytes(st, 3) == 8) {
+            memcpy(out->parent_ceremony_id, pid, 8);
+            out->has_parent = 1;
+        }
+        out->started_at_block  = (uint32_t)sqlite3_column_int(st, 4);
+        out->deadline_block    = (uint32_t)sqlite3_column_int(st, 5);
+        out->state             = (uint8_t)sqlite3_column_int(st, 6);
+        const void *an = sqlite3_column_blob(st, 7);
+        if (an && sqlite3_column_bytes(st, 7) == 66) {
+            memcpy(out->aggregated_nonce, an, 66);
+            out->has_aggregated_nonce = 1;
+        }
+        const void *fs = sqlite3_column_blob(st, 8);
+        if (fs && sqlite3_column_bytes(st, 8) == 64) {
+            memcpy(out->final_signature, fs, 64);
+            out->has_final_signature = 1;
+        }
+        const void *bt = sqlite3_column_blob(st, 9);
+        if (bt && sqlite3_column_bytes(st, 9) == 32) {
+            memcpy(out->broadcast_txid, bt, 32);
+            out->has_broadcast_txid = 1;
+        }
+        if (sqlite3_column_type(st, 10) != SQLITE_NULL) {
+            out->abort_reason = (uint8_t)sqlite3_column_int(st, 10);
+            out->has_abort_reason = 1;
+        }
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+int persist_update_ceremony_state(persist_t *p,
+                                   const unsigned char *ceremony_id8,
+                                   uint8_t new_state) {
+    if (!p || !p->db || !ceremony_id8) return 0;
+
+    /* SF-CEREMONY-HELPERS §2 hard guard: FINALIZED transition requires
+       every ceremony_participants row at phase=SIGNED.  Prevents the
+       dual-signature trap (plugin re-asking a participant to sign a
+       different TX for the same epoch boundary after a crash). */
+    if (new_state == PERSIST_CEREMONY_STATE_FINALIZED) {
+        const char *gsql =
+            "SELECT COUNT(*) FROM ceremony_participants "
+            "WHERE ceremony_id = ? AND phase != ?;";
+        sqlite3_stmt *gst;
+        if (sqlite3_prepare_v2(p->db, gsql, -1, &gst, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_blob(gst, 1, ceremony_id8, 8, SQLITE_STATIC);
+        sqlite3_bind_int(gst, 2, PERSIST_CEREMONY_PHASE_SIGNED);
+        int unsigned_count = -1;
+        if (sqlite3_step(gst) == SQLITE_ROW)
+            unsigned_count = sqlite3_column_int(gst, 0);
+        sqlite3_finalize(gst);
+        if (unsigned_count < 0) return 0;
+        if (unsigned_count > 0) {
+            fprintf(stderr,
+                "persist_update_ceremony_state: REFUSING FINALIZED transition "
+                "for ceremony %02x%02x%02x..%02x — %d participant(s) not yet "
+                "phase=SIGNED (dual-signature trap guard, #185).\n",
+                ceremony_id8[0], ceremony_id8[1], ceremony_id8[2],
+                ceremony_id8[7], unsigned_count);
+            return 0;
+        }
+    }
+
+    const char *sql = "UPDATE ceremonies SET state = ? WHERE ceremony_id = ?;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, (int)new_state);
+    sqlite3_bind_blob(st, 2, ceremony_id8, 8, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    int changes = sqlite3_changes(p->db);
+    sqlite3_finalize(st);
+    return (rc == SQLITE_DONE && changes == 1) ? 1 : 0;
+}
+
+int persist_update_ceremony_artifacts(persist_t *p,
+                                       const unsigned char *ceremony_id8,
+                                       const unsigned char *aggregated_nonce66_or_null,
+                                       const unsigned char *final_signature64_or_null,
+                                       const unsigned char *broadcast_txid32_or_null,
+                                       int has_abort_reason, uint8_t abort_reason) {
+    if (!p || !p->db || !ceremony_id8) return 0;
+    /* Build dynamic UPDATE — only set the columns whose args were provided. */
+    char sql[256] = "UPDATE ceremonies SET ";
+    int sep = 0;
+    if (aggregated_nonce66_or_null) {
+        strcat(sql, "aggregated_nonce=?"); sep++;
+    }
+    if (final_signature64_or_null) {
+        if (sep) strcat(sql, ",");
+        strcat(sql, "final_signature=?"); sep++;
+    }
+    if (broadcast_txid32_or_null) {
+        if (sep) strcat(sql, ",");
+        strcat(sql, "broadcast_txid=?"); sep++;
+    }
+    if (has_abort_reason) {
+        if (sep) strcat(sql, ",");
+        strcat(sql, "abort_reason=?"); sep++;
+    }
+    if (sep == 0) return 1;  /* nothing to update — vacuous success */
+    strcat(sql, " WHERE ceremony_id=?;");
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int idx = 1;
+    if (aggregated_nonce66_or_null) sqlite3_bind_blob(st, idx++, aggregated_nonce66_or_null, 66, SQLITE_STATIC);
+    if (final_signature64_or_null)  sqlite3_bind_blob(st, idx++, final_signature64_or_null,  64, SQLITE_STATIC);
+    if (broadcast_txid32_or_null)   sqlite3_bind_blob(st, idx++, broadcast_txid32_or_null,   32, SQLITE_STATIC);
+    if (has_abort_reason)            sqlite3_bind_int(st, idx++, (int)abort_reason);
+    sqlite3_bind_blob(st, idx, ceremony_id8, 8, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_save_participant_phase(persist_t *p,
+                                    const unsigned char *ceremony_id8,
+                                    const unsigned char *participant_pubkey33,
+                                    uint8_t phase,
+                                    const unsigned char *public_nonce66_or_null,
+                                    const unsigned char *partial_signature32_or_null,
+                                    int has_refuse_code, uint8_t refuse_code) {
+    if (!p || !p->db || !ceremony_id8 || !participant_pubkey33) return 0;
+    /* UPSERT — ON CONFLICT updates phase + optionally nonce/sig/refuse. */
+    const char *sql =
+        "INSERT INTO ceremony_participants "
+        "(ceremony_id, participant_pubkey, phase, public_nonce, "
+        " partial_signature, refuse_code, last_sent_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now')) "
+        "ON CONFLICT(ceremony_id, participant_pubkey) DO UPDATE SET "
+        "  phase = excluded.phase, "
+        "  public_nonce = COALESCE(excluded.public_nonce, public_nonce), "
+        "  partial_signature = COALESCE(excluded.partial_signature, partial_signature), "
+        "  refuse_code = COALESCE(excluded.refuse_code, refuse_code), "
+        "  last_sent_at = excluded.last_sent_at;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, ceremony_id8, 8, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 2, participant_pubkey33, 33, SQLITE_STATIC);
+    sqlite3_bind_int(st, 3, (int)phase);
+    if (public_nonce66_or_null)
+        sqlite3_bind_blob(st, 4, public_nonce66_or_null, 66, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(st, 4);
+    if (partial_signature32_or_null)
+        sqlite3_bind_blob(st, 5, partial_signature32_or_null, 32, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(st, 5);
+    if (has_refuse_code)
+        sqlite3_bind_int(st, 6, (int)refuse_code);
+    else
+        sqlite3_bind_null(st, 6);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_save_revocation_release(persist_t *p,
+                                      const unsigned char *factory_instance_id32,
+                                      const unsigned char *state_id32,
+                                      const unsigned char *participant_pubkey33,
+                                      const unsigned char *revocation_secret32,
+                                      uint32_t received_at_block) {
+    if (!p || !p->db || !factory_instance_id32 || !state_id32 ||
+        !participant_pubkey33 || !revocation_secret32) return 0;
+    /* INSERT OR IGNORE — idempotent on retry; duplicate (factory, state,
+       participant) is silently skipped. */
+    const char *sql =
+        "INSERT OR IGNORE INTO revocation_releases "
+        "(factory_instance_id, state_id, participant_pubkey, "
+        " revocation_secret, received_at_block) "
+        "VALUES (?, ?, ?, ?, ?);";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 2, state_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 3, participant_pubkey33, 33, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 4, revocation_secret32, 32, SQLITE_STATIC);
+    sqlite3_bind_int(st, 5, (int)received_at_block);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_count_revocations_for_state(persist_t *p,
+                                          const unsigned char *factory_instance_id32,
+                                          const unsigned char *state_id32) {
+    if (!p || !p->db || !factory_instance_id32 || !state_id32) return -1;
+    const char *sql =
+        "SELECT COUNT(*) FROM revocation_releases "
+        "WHERE factory_instance_id = ? AND state_id = ?;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 2, state_id32, 32, SQLITE_STATIC);
+    int count = -1;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* Shared SELECT for ceremony scans — populates a persist_ceremony_t row
+ * from a sqlite3_stmt positioned at SQLITE_ROW. */
+static void persist_ceremony_row_from_stmt(sqlite3_stmt *st,
+                                              persist_ceremony_t *out) {
+    memset(out, 0, sizeof(*out));
+    const void *cid = sqlite3_column_blob(st, 0);
+    if (cid) memcpy(out->ceremony_id, cid, 8);
+    const void *fid = sqlite3_column_blob(st, 1);
+    if (fid) memcpy(out->factory_instance_id, fid, 32);
+    out->ceremony_type    = (uint8_t)sqlite3_column_int(st, 2);
+    const void *pid = sqlite3_column_blob(st, 3);
+    if (pid && sqlite3_column_bytes(st, 3) == 8) {
+        memcpy(out->parent_ceremony_id, pid, 8);
+        out->has_parent = 1;
+    }
+    out->started_at_block = (uint32_t)sqlite3_column_int(st, 4);
+    out->deadline_block   = (uint32_t)sqlite3_column_int(st, 5);
+    out->state            = (uint8_t)sqlite3_column_int(st, 6);
+    const void *an = sqlite3_column_blob(st, 7);
+    if (an && sqlite3_column_bytes(st, 7) == 66) {
+        memcpy(out->aggregated_nonce, an, 66);
+        out->has_aggregated_nonce = 1;
+    }
+    const void *fs = sqlite3_column_blob(st, 8);
+    if (fs && sqlite3_column_bytes(st, 8) == 64) {
+        memcpy(out->final_signature, fs, 64);
+        out->has_final_signature = 1;
+    }
+    const void *bt = sqlite3_column_blob(st, 9);
+    if (bt && sqlite3_column_bytes(st, 9) == 32) {
+        memcpy(out->broadcast_txid, bt, 32);
+        out->has_broadcast_txid = 1;
+    }
+    if (sqlite3_column_type(st, 10) != SQLITE_NULL) {
+        out->abort_reason = (uint8_t)sqlite3_column_int(st, 10);
+        out->has_abort_reason = 1;
+    }
+}
+
+int persist_scan_in_flight_ceremonies(persist_t *p,
+                                        const unsigned char *factory_instance_id32,
+                                        persist_ceremony_cb_t cb,
+                                        void *user_data) {
+    if (!p || !p->db || !factory_instance_id32 || !cb) return 0;
+    const char *sql =
+        "SELECT ceremony_id, factory_instance_id, ceremony_type, "
+        "       parent_ceremony_id, started_at_block, deadline_block, state, "
+        "       aggregated_nonce, final_signature, broadcast_txid, abort_reason "
+        "FROM ceremonies "
+        "WHERE factory_instance_id = ? AND state < ? "
+        "ORDER BY started_at_block ASC;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, PERSIST_CEREMONY_STATE_FINALIZED);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        persist_ceremony_t row;
+        persist_ceremony_row_from_stmt(st, &row);
+        if (!cb(&row, user_data)) break;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+int persist_scan_participants(persist_t *p,
+                                const unsigned char *ceremony_id8,
+                                uint8_t phase_filter,
+                                persist_participant_cb_t cb,
+                                void *user_data) {
+    if (!p || !p->db || !ceremony_id8 || !cb) return 0;
+    const char *sql_any =
+        "SELECT ceremony_id, participant_pubkey, phase, public_nonce, "
+        "       partial_signature, refuse_code, last_sent_at "
+        "FROM ceremony_participants WHERE ceremony_id = ? "
+        "ORDER BY participant_pubkey;";
+    const char *sql_filtered =
+        "SELECT ceremony_id, participant_pubkey, phase, public_nonce, "
+        "       partial_signature, refuse_code, last_sent_at "
+        "FROM ceremony_participants WHERE ceremony_id = ? AND phase = ? "
+        "ORDER BY participant_pubkey;";
+    sqlite3_stmt *st;
+    const char *sql = (phase_filter == 0xFF) ? sql_any : sql_filtered;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, ceremony_id8, 8, SQLITE_STATIC);
+    if (phase_filter != 0xFF)
+        sqlite3_bind_int(st, 2, (int)phase_filter);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        persist_participant_t row;
+        memset(&row, 0, sizeof(row));
+        const void *cid = sqlite3_column_blob(st, 0);
+        if (cid) memcpy(row.ceremony_id, cid, 8);
+        const void *pk = sqlite3_column_blob(st, 1);
+        if (pk) memcpy(row.participant_pubkey, pk, 33);
+        row.phase = (uint8_t)sqlite3_column_int(st, 2);
+        const void *pn = sqlite3_column_blob(st, 3);
+        if (pn && sqlite3_column_bytes(st, 3) == 66) {
+            memcpy(row.public_nonce, pn, 66);
+            row.has_public_nonce = 1;
+        }
+        const void *ps = sqlite3_column_blob(st, 4);
+        if (ps && sqlite3_column_bytes(st, 4) == 32) {
+            memcpy(row.partial_signature, ps, 32);
+            row.has_partial_signature = 1;
+        }
+        if (sqlite3_column_type(st, 5) != SQLITE_NULL) {
+            row.refuse_code = (uint8_t)sqlite3_column_int(st, 5);
+            row.has_refuse_code = 1;
+        }
+        row.last_sent_at = sqlite3_column_int64(st, 6);
+        if (!cb(&row, user_data)) break;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+int persist_get_last_finalized_ceremony(persist_t *p,
+                                          const unsigned char *factory_instance_id32,
+                                          unsigned char *out_ceremony_id8) {
+    if (!p || !p->db || !factory_instance_id32 || !out_ceremony_id8) return 0;
+    /* idx_ceremonies_factory(factory_instance_id, state) supports this; the
+       ORDER BY started_at_block DESC is a sequential scan within the matched
+       index slice. */
+    const char *sql =
+        "SELECT ceremony_id FROM ceremonies "
+        "WHERE factory_instance_id = ? AND state = ? "
+        "ORDER BY started_at_block DESC LIMIT 1;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, PERSIST_CEREMONY_STATE_FINALIZED);
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const void *cid = sqlite3_column_blob(st, 0);
+        if (cid && sqlite3_column_bytes(st, 0) == 8) {
+            memcpy(out_ceremony_id8, cid, 8);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+int persist_scan_ceremonies_by_factory(persist_t *p,
+                                         const unsigned char *factory_instance_id32,
+                                         int state_filter,
+                                         persist_ceremony_cb_t cb,
+                                         void *user_data) {
+    if (!p || !p->db || !factory_instance_id32 || !cb) return 0;
+    const char *sql_any =
+        "SELECT ceremony_id, factory_instance_id, ceremony_type, "
+        "       parent_ceremony_id, started_at_block, deadline_block, state, "
+        "       aggregated_nonce, final_signature, broadcast_txid, abort_reason "
+        "FROM ceremonies WHERE factory_instance_id = ? "
+        "ORDER BY started_at_block DESC;";
+    const char *sql_filtered =
+        "SELECT ceremony_id, factory_instance_id, ceremony_type, "
+        "       parent_ceremony_id, started_at_block, deadline_block, state, "
+        "       aggregated_nonce, final_signature, broadcast_txid, abort_reason "
+        "FROM ceremonies WHERE factory_instance_id = ? AND state = ? "
+        "ORDER BY started_at_block DESC;";
+    sqlite3_stmt *st;
+    const char *sql = (state_filter < 0) ? sql_any : sql_filtered;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
+    if (state_filter >= 0)
+        sqlite3_bind_int(st, 2, state_filter);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        persist_ceremony_t row;
+        persist_ceremony_row_from_stmt(st, &row);
+        if (!cb(&row, user_data)) break;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+/* === End SF-CEREMONY-HELPERS ============================================== */
