@@ -106,6 +106,17 @@ struct chain_backend {
     bool (*is_in_mempool)(chain_backend_t *self, const char *txid_hex);
 
     /*
+     * SF-RR #150: check whether a specific outpoint (txid:vout) is unspent.
+     * Returns 1 if unspent, 0 if spent (or txid not found), -1 on error or
+     * if not implemented. Used by persist_retry_pending_broadcasts to skip
+     * stale pending broadcasts (input UTXO already spent by a later state).
+     * Optional — may be NULL; callers must handle.
+     */
+    int  (*is_outpoint_unspent)(chain_backend_t *self,
+                                  const char *txid_hex_display,
+                                  uint32_t vout);
+
+    /*
      * Broadcast a raw transaction. Writes the resulting txid (64 hex chars
      * + NUL) to txid_out if non-NULL. Returns 1 on success, 0 on failure.
      */

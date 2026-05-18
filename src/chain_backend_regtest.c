@@ -23,6 +23,13 @@ static bool cb_is_in_mempool(chain_backend_t *self, const char *txid_hex)
     return regtest_is_in_mempool((regtest_t *)self->ctx, txid_hex);
 }
 
+static int cb_is_outpoint_unspent(chain_backend_t *self,
+                                   const char *txid_hex_display,
+                                   uint32_t vout)
+{
+    return regtest_outpoint_unspent((regtest_t *)self->ctx, txid_hex_display, vout);
+}
+
 static int cb_send_raw_tx(chain_backend_t *self, const char *tx_hex,
                           char *txid_out)
 {
@@ -57,6 +64,7 @@ void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt)
     backend->get_confirmations       = cb_get_confirmations;
     backend->get_confirmations_batch = cb_get_confirmations_batch;
     backend->is_in_mempool           = cb_is_in_mempool;
+    backend->is_outpoint_unspent     = cb_is_outpoint_unspent;
     backend->send_raw_tx       = cb_send_raw_tx;
     backend->register_script   = cb_register_script;
     backend->unregister_script = cb_unregister_script;

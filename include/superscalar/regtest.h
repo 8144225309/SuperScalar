@@ -74,6 +74,12 @@ int   regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
                                           char *txid_out);
 int   regtest_fund_address(regtest_t *rt, const char *address, double btc_amount, char *txid_out);
 int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
+
+/* SF-RR #150: query whether an outpoint is unspent via gettxout.
+   Returns 1 if unspent, 0 if spent/missing, -1 on RPC error. */
+int   regtest_outpoint_unspent(regtest_t *rt,
+                                 const char *txid_hex_display,
+                                 uint32_t vout);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
 /*
  * Batch confirmations for n_txids display-order hex txids.
