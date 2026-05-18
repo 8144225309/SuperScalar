@@ -2086,6 +2086,26 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                            &c3_round_id);
     }
 
+    /* SF-BACKUP-PRE-ROTATION (#213): before any state mutation, snapshot
+     * the LSP DB if backup_dir is configured.  Failure to snapshot warns
+     * but does NOT abort the rotation — operator decides.  Naming:
+     *   <backup_dir>/lsp_pre_rotation_<epoch>_<unix_ts>.db
+     */
+    if (lsp->backup_dir && mgr->persist) {
+        char snap_path[512];
+        time_t now = time(NULL);
+        snprintf(snap_path, sizeof(snap_path),
+                 "%s/lsp_pre_rotation_%u_%ld.db",
+                 lsp->backup_dir,
+                 (unsigned)f->counter.current_epoch,
+                 (long)now);
+        if (!persist_take_snapshot((persist_t *)mgr->persist, snap_path,
+                                    "pre_rotation")) {
+            fprintf(stderr, "WARN: pre-rotation snapshot failed; "
+                            "continuing rotation anyway\n");
+        }
+    }
+
     /* Capture pre-advance leaf-node state for watchtower overlap window:
        the OLD signed_tx + OLD txid + OLD L-stock vout/amount become the
        parameters used to register a NEW poison/burn TX after the
