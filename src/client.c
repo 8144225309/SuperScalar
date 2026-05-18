@@ -1616,9 +1616,18 @@ int client_run_with_channels(secp256k1_context *ctx,
             return 0;
         }
     } else {
-        fprintf(stderr, "Client: WARNING — funding TX not verified on-chain "
-                "(no --rpcuser or --light-client). Trusting LSP claim of "
-                "%llu sats.\n", (unsigned long long)funding_amount);
+        /* SF-FUND-VERIFY-REFUSE #197: library-layer warning.  Hard refusal
+           moved to the binary launch path in tools/superscalar_client.c
+           (refuses startup on non-regtest networks without --rpcuser /
+           --light-client).  Library callers that legitimately want to
+           proceed without verification (in-process tests, regtest
+           scaffolds) get this loud warning instead of an unconditional
+           refusal. */
+        fprintf(stderr, "Client: WARNING — funding TX NOT VERIFIED on-chain "
+                "(no chain backend wired). Trusting LSP-supplied "
+                "funding_amount of %llu sats. THIS IS UNSAFE ON ANY "
+                "PRODUCTION NETWORK; see audit 2026-05-17.\n",
+                (unsigned long long)funding_amount);
     }
 
     /* Build factory locally (heap — factory_t is ~3MB).

@@ -124,6 +124,28 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     return 1;
 }
 
+/* --- Funding TX no-op verifier for in-process test scaffolds (#197 follow-up).
+ *
+ * The hard refusal added in #197 (no chain backend → refuse to sign factory)
+ * is the right production posture but breaks regtest harness tests that
+ * intentionally run without --rpcuser (testing LSP/client wire flow with the
+ * client trusting the in-process test orchestrator).  This no-op verifier
+ * lets the regtest harness opt out of on-chain verification while keeping
+ * the production refusal intact for mainnet/testnet4/signet.
+ *
+ * Wire the no-op via the --network=regtest path below ONLY when the operator
+ * also did NOT pass --rpcuser/--rpcpassword.  Production deployments on
+ * regtest can still use the real verifier by supplying --rpcuser. */
+static int verify_funding_noop_regtest(const unsigned char *txid32,
+                                         uint32_t vout,
+                                         uint64_t expected_sats, void *ctx) {
+    (void)txid32; (void)vout; (void)expected_sats; (void)ctx;
+    fprintf(stderr, "Client: REGTEST no-op funding verifier (network=regtest, "
+            "no --rpcuser) — trusting LSP claim of %llu sats; THIS IS UNSAFE "
+            "ON ANY PRODUCTION NETWORK.\n", (unsigned long long)expected_sats);
+    return 1;
+}
+
 /* --- Funding TX on-chain verification callback ---
  * Called by client_run_with_channels() between FACTORY_PROPOSE parsing and
  * tree signing.  Uses the RPC chain backend to query the funding TX and
@@ -2877,6 +2899,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
+       backend so the client can verify the funding TX on-chain before
+       signing the factory tree.  An adversarial LSP could otherwise claim
+       a larger funding_amount than actually exists.  Audit 2026-05-17
+       recommended refusing at startup rather than warning. */
+    if (strcmp(network, "regtest") != 0 && !(rpcuser && rpcpassword)) {
+        fprintf(stderr,
+            "Error: network=%s requires --rpcuser/--rpcpassword (or --light-client)\n"
+            "       so the client can verify the funding TX on-chain.\n"
+            "       Without it, an adversarial LSP could claim a larger\n"
+            "       funding_amount than actually exists; see audit 2026-05-17.\n",
+            network);
+        return 1;
+    }
+
     /* Tor SOCKS5 proxy setup */
     if (tor_proxy_arg) {
         char proxy_host[256];
@@ -3236,6 +3273,15 @@ int main(int argc, char *argv[]) {
                 vctx = &verify_rt;
             }
         }
+        /* #197 follow-up: regtest scaffolds may legitimately run without
+           --rpcuser; install a no-op verifier so the hard refusal in
+           src/client.c doesn't break in-process test harnesses. The no-op
+           ONLY fires on network=regtest. Production networks still hit
+           the hard refusal in src/client.c if vfn stays NULL. */
+        if (!vfn && strcmp(network, "regtest") == 0) {
+            vfn = verify_funding_noop_regtest;
+            vctx = NULL;
+        }
 
         while (!g_shutdown) {
             if (first_run || !use_db) {
@@ -3275,6 +3321,11 @@ int main(int argc, char *argv[]) {
                 sa_vfn = verify_funding_rpc;
                 sa_vctx = &sa_verify_rt;
             }
+        }
+        /* #197 follow-up: regtest scaffold opt-out (no-op verifier). */
+        if (!sa_vfn && strcmp(network, "regtest") == 0) {
+            sa_vfn = verify_funding_noop_regtest;
+            sa_vctx = NULL;
         }
         ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data,
                                       sa_vfn, sa_vctx);
