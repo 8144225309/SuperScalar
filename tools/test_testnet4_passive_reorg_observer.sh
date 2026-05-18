@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+
+# Self-respawn in own session so systemd-logind cleanup on SSH session end
+# doesn't kill us mid-run (lesson from 2026-05-18 dual #112/#189 deaths).
+# Skip if already respawned or if running interactively (stdin is a tty).
+if [ -z "${_SS_TESTNET4_DETACHED:-}" ] && [ ! -t 0 ]; then
+    export _SS_TESTNET4_DETACHED=1
+    exec setsid "$0" "$@"
+fi
+
 # test_testnet4_passive_reorg_observer.sh — long-running passive observer
 # that records any natural testnet4 reorg the standalone watchtower
 # detects.
