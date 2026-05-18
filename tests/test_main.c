@@ -1265,6 +1265,12 @@ extern int test_cli_shape_uniform_arity2_n64_rejected(void);
 extern int test_cli_shape_mixed_248_n64_passes(void);
 extern int test_cli_shape_mixed_248_static2_n128_passes(void);
 extern int test_cli_shape_regtest_step10_always_passes(void);
+/* SF-PROMETHEUS-EXPORTER: native /metrics endpoint */
+extern int test_prometheus_build_body_contains_all_metrics(void);
+extern int test_prometheus_handle_connection_metrics(void);
+extern int test_prometheus_handle_connection_404(void);
+extern int test_prometheus_handle_connection_405(void);
+extern int test_prometheus_client_counter(void);
 
 /* Phase 16: Reconnection */
 extern int test_reconnect_wire(void);
@@ -3103,6 +3109,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cli_shape_mixed_248_n64_passes);
     RUN_TEST(test_cli_shape_mixed_248_static2_n128_passes);
     RUN_TEST(test_cli_shape_regtest_step10_always_passes);
+
+    printf("\n=== Prometheus Exporter ===\n");
+    RUN_TEST(test_prometheus_build_body_contains_all_metrics);
+    RUN_TEST(test_prometheus_handle_connection_metrics);
+    RUN_TEST(test_prometheus_handle_connection_404);
+    RUN_TEST(test_prometheus_handle_connection_405);
+    RUN_TEST(test_prometheus_client_counter);
 
     printf("\n=== Reconnection (Phase 16) ===\n");
     RUN_TEST(test_reconnect_wire);

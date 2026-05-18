@@ -175,7 +175,9 @@ add_library(superscalar
     src/bech32m.c
     src/bolt8.c
     src/bolt8_server.c
+    src/http_util.c
     src/lsp_wellknown.c
+    src/prometheus_exporter.c
     src/gossip.c
     src/gossip_store.c
     src/mpp.c
@@ -333,6 +335,7 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_prometheus.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

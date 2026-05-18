@@ -33,6 +33,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/musig.h"
 #include "superscalar/lsp_wellknown.h"
+#include "superscalar/prometheus.h"
 #include "superscalar/admin_rpc.h"
 #include "superscalar/cli_arity.h"
 #include <stdio.h>
@@ -1193,6 +1194,11 @@ int main(int argc, char *argv[]) {
     /* Line-buffered stdout/stderr so logs are visible in real time */
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    /* Process start time, captured before any other work — used for the
+       Prometheus uptime metric so it reflects true LSP-process lifetime
+       rather than the (later) time when --prometheus-port forks the
+       metrics server. */
+    time_t lsp_process_start_time = time(NULL);
 
     /* Ignore SIGPIPE — write() to dead client sockets returns EPIPE instead of killing us */
     signal(SIGPIPE, SIG_IGN);
@@ -1339,6 +1345,7 @@ int main(int argc, char *argv[]) {
     const char *create_offer_desc = NULL;  /* --create-offer DESCRIPTION */
     uint64_t create_offer_amount = 0;      /* optional amount_msat (0 = any) */
     uint16_t well_known_port = 0;          /* 0 = disabled; set with --well-known-port */
+    uint16_t prometheus_port = 0;         /* 0 = disabled; set with --prometheus-port */
     int use_clnbridge = 0;                 /* --clnbridge: use CLN bridge for inbound payments */
     char gossip_peers[1024] = "";          /* --gossip-peers HOST:PORT[,HOST:PORT,...] */
     uint16_t bolt8_listen_port = 0;        /* --bolt8-port N: BOLT #8 TCP accept port */
@@ -1835,6 +1842,8 @@ int main(int argc, char *argv[]) {
             create_offer_amount = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--well-known-port") == 0 && i + 1 < argc)
             well_known_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--prometheus-port") == 0 && i + 1 < argc)
+            prometheus_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--clnbridge") == 0)
             use_clnbridge = 1;
         else if (strcmp(argv[i], "--gossip-peers") == 0 && i + 1 < argc) {
@@ -3126,6 +3135,21 @@ accept_new_factory:
                 fprintf(stderr,
                         "LSP: warning: well-known server on port %u failed\n",
                         (unsigned)well_known_port);
+        }
+
+        if (prometheus_port > 0) {
+            static prometheus_cfg_t prom_cfg;
+            prom_cfg.db_path = use_db ? db_path : NULL;
+            prom_cfg.start_time = lsp_process_start_time;
+            prom_cfg.n_clients_connected =
+                (g_lsp ? (const volatile size_t *)&g_lsp->n_clients : NULL);
+            if (prometheus_serve_fork(&prom_cfg, prometheus_port))
+                printf("LSP: Prometheus /metrics on port %u\n",
+                       (unsigned)prometheus_port);
+            else
+                fprintf(stderr,
+                        "LSP: warning: Prometheus server on port %u failed\n",
+                        (unsigned)prometheus_port);
         }
     }
 
