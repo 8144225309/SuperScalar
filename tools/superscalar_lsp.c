@@ -310,6 +310,7 @@ static void usage(const char *prog) {
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
+        "  --test-subfactory-advance-multi  Drive TWO advances back-to-back; the second exercises the multi-input MuSig ceremony (#142 SF-A)\n"
         "  --cheat-subfactory   After --test-subfactory-advance: broadcast stale chain[N-1] sub-factory TX, verify watchtower detects + responds with poison TX (works on regtest + testnet4/signet via confirmation polling; CL1)\n"
         "  --cheat-leaf [SIDE]  After --test-leaf-advance: broadcast stale pre-advance PS leaf state on SIDE (0=left default, 1=right); verify watchtower broadcasts L-stock poison TX. Tests partial-tree integrity. Works on any network (CL1).\n"
         "  --cheat-daemon-leaf [SIDE]  Same as --cheat-leaf but does NOT run LSP-internal watchtower_check; sleeps after broadcast so standalone WT can detect + respond. CL4.B.\n"
@@ -1300,6 +1301,7 @@ int main(int argc, char *argv[]) {
     int test_realloc = 0;
     int test_tier_b_rollover = 0;  /* Tier B (Gap B+F) — drive root rollover */
     int test_subfactory_advance = 0;  /* Phase 2c — drive sub-factory chain extension */
+    int test_subfactory_advance_multi = 0;  /* SF-A #142 — drive a SECOND advance to exercise the multi-input ceremony */
     int cheat_subfactory_after_advance = 0;  /* Gap A test: broadcast stale chain[N-1] post-advance */
     int ps_subfactory_arity_arg = 0;  /* k for PS k² sub-factories (0 = default k=1) */
     int test_jit = 0;
@@ -1526,6 +1528,12 @@ int main(int argc, char *argv[]) {
             test_tier_b_rollover = 1;
         else if (strcmp(argv[i], "--test-subfactory-advance") == 0)
             test_subfactory_advance = 1;
+        else if (strcmp(argv[i], "--test-subfactory-advance-multi") == 0) {
+            /* SF-A #142: drive a SECOND chain advance after the first
+               so the multi-input ceremony fires (n_inputs = k+1). */
+            test_subfactory_advance = 1;
+            test_subfactory_advance_multi = 1;
+        }
         else if (strcmp(argv[i], "--cheat-subfactory") == 0) {
             /* Sub-factory cheating mode: after --test-subfactory-advance
                extends the chain, broadcast the now-stale chain[N-1] TX
