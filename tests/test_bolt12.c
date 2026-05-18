@@ -261,7 +261,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 34, "schema version is 34 (v34 adds ceremonies/ceremony_participants/revocation_releases — #185)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 35, "schema version is 35 (v35 adds old_commitment_htlcs.signed_sweep_tx_hex — #207)");
     persist_close(&p);
     return 1;
 }

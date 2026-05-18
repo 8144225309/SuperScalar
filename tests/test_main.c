@@ -1194,6 +1194,7 @@ extern int test_ceremony_helpers_participant_upsert(void);
 extern int test_persist_ps_subfactory_chain_v22_poison_round_trip(void);
 extern int test_persist_ps_initial_signed_state_round_trip(void);
 extern int test_persist_old_commitment_witness_round_trip(void);
+extern int test_persist_old_commitment_htlc_sweep_round_trip(void);
 extern int test_persist_signing_rounds_round_trip(void);
 extern int test_persist_pending_fee_bump_round_trip(void);
 extern int test_persist_force_close_round_trip(void);
@@ -3031,6 +3032,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_ps_subfactory_chain_v22_poison_round_trip);
     RUN_TEST(test_persist_ps_initial_signed_state_round_trip);
     RUN_TEST(test_persist_old_commitment_witness_round_trip);
+    RUN_TEST(test_persist_old_commitment_htlc_sweep_round_trip);
     RUN_TEST(test_persist_signing_rounds_round_trip);
     RUN_TEST(test_persist_pending_fee_bump_round_trip);
     RUN_TEST(test_persist_force_close_round_trip);
