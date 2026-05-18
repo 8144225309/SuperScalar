@@ -390,17 +390,14 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
             n_active_ptlcs++;
     }
 
-    /* Ensure old remote PCP is available: derive from stored revocation secret */
-    {
-        unsigned char old_rev_secret[32];
-        if (channel_get_received_revocation(ch, old_commit_num, old_rev_secret)) {
-            secp256k1_pubkey old_pcp;
-            if (secp256k1_ec_pubkey_create(ch->ctx, &old_pcp, old_rev_secret)) {
-                channel_set_remote_pcp(ch, old_commit_num, &old_pcp);
-            }
-            secure_zero(old_rev_secret, 32);
-        }
-    }
+    /* #206 fix: NO eager remote-PCP install.  channel_get_remote_pcp's
+     * fallback handles derive-from-rev-secret when the slot is missing.
+     * Eagerly overwriting a still-present slot was a regression — the slot
+     * holds the REAL remote PCP from state exchange, and "rev_secret * G"
+     * produces the LOCAL party's pubkey in unit-test scenarios (where the
+     * test self-revokes), not the remote's.  In production, rev_secret and
+     * slot pcp are guaranteed equal by protocol invariant, so removing this
+     * block is safe. */
 
     tx_buf_t old_tx;
     tx_buf_init(&old_tx, 512);
