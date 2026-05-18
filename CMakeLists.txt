@@ -420,3 +420,9 @@ if(ENABLE_FUZZING)
             -fsanitize=fuzzer,address,undefined)
     endforeach()
 endif()
+
+# --- CLN plugin (opt-in, bLIP-56 integration #172) ---
+option(BUILD_CLN_PLUGIN "Build the CLN plugin shared library (libsuperscalar_cln.so)" OFF)
+if(BUILD_CLN_PLUGIN)
+    add_subdirectory(cln-plugin)
+endif()
