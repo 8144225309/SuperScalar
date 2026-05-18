@@ -78,6 +78,14 @@ static const char *SCHEMA_SQL =
     "  payment_preimage TEXT,"
     "  cltv_expiry INTEGER,"
     "  state TEXT NOT NULL,"
+    /* v36 (#208 / dashboard team SCHEMA_GAPS section 2): pre-built signed HTLC
+       resolution TX bytes (hex) - timeout for OFFERED, success for
+       RECEIVED.  Persisted at commitment-sign time so the LSP can
+       broadcast resolution TXs after a force-close + restart without
+       reconstructing from secrets.  NULL preserves legacy lazy-build
+       fallback.  BLOB column per dashboard team spec; we write hex
+       strings via the stamper helper (SQLite is type-flexible). */
+    "  signed_resolution_tx_hex BLOB,"
     "  UNIQUE(channel_id, htlc_id)"
     ");"
     "CREATE TABLE IF NOT EXISTS nonce_pools ("
@@ -102,6 +110,13 @@ static const char *SCHEMA_SQL =
        Lets the oracular CPFP path drive fee escalation without needing
        live channel state.  0 = unset (legacy entries) → caller falls back. */
     "  csv_delay INTEGER NOT NULL DEFAULT 0,"
+    /* v36 (#209 / dashboard team SCHEMA_GAPS section 3): pre-built signed L-stock
+       burn TX bytes (hex).  OP_RETURN destruction of LSP L-stock when a
+       revoked state is broadcast - an additional penalty layer beyond
+       the to_local + HTLC sweeps.  Persisted at the same registration
+       moment as signed_penalty_tx_hex; burn and penalty share source
+       data.  NULL preserves legacy lazy-build fallback. */
+    "  signed_burn_tx_hex BLOB,"
     "  PRIMARY KEY (channel_id, commit_num)"
     ");"
     "CREATE TABLE IF NOT EXISTS old_commitment_htlcs ("
@@ -1277,6 +1292,27 @@ int persist_open(persist_t *p, const char *path) {
     if (db_version < 35) {
         sqlite3_exec(p->db,
             "ALTER TABLE old_commitment_htlcs ADD COLUMN signed_sweep_tx_hex TEXT NOT NULL DEFAULT '';",
+            NULL, NULL, NULL);
+    }
+
+    /* v36 (#208 / #209, dashboard team SCHEMA_GAPS sections 2 & 3): two
+       parallel TX-bytes columns to close the same restart-loses-defense
+       gap that v25 (penalty TX) and v35 (HTLC sweep TX) already closed,
+       extended to the remaining two TX classes in the dashboard's
+       TX Inventory tab:
+         - #208 htlcs.signed_resolution_tx_hex: timeout/success TXs for
+           in-flight HTLCs on a force-closed (NOT breached) commitment.
+         - #209 old_commitments.signed_burn_tx_hex: OP_RETURN L-stock
+           burn TX on a breached commitment (additional penalty layer).
+       Both columns default NULL (BLOB) so the dashboard's coverage
+       query (COUNT(col) vs COUNT(*)) auto-detects population without
+       schema-fork awareness, and the lazy-build fallback survives. */
+    if (db_version < 36) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE htlcs ADD COLUMN signed_resolution_tx_hex BLOB;",
+            NULL, NULL, NULL);
+        sqlite3_exec(p->db,
+            "ALTER TABLE old_commitments ADD COLUMN signed_burn_tx_hex BLOB;",
             NULL, NULL, NULL);
     }
 
@@ -3336,6 +3372,181 @@ int persist_load_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
                 } else {
                     free(bytes);
                     result = -1;
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* --- v36 (#208): pre-built signed HTLC resolution TX bytes ---
+   Path A force-close path - timeout TX for OFFERED HTLCs, success TX
+   for RECEIVED HTLCs (broadcast with preimage if available).  Persisted
+   at commitment-sign time so the LSP can broadcast after force-close +
+   process restart without reconstructing from secrets.  Identified by
+   the per-channel (channel_id, htlc_id) UNIQUE pair, same key the rest
+   of the htlcs table uses.  Mirrors the v35 sweep stamper. */
+
+int persist_save_htlc_resolution_tx(persist_t *p, uint32_t channel_id,
+                                     uint64_t htlc_id,
+                                     const unsigned char *signed_resolution_tx,
+                                     size_t signed_resolution_tx_len) {
+    if (!p || !p->db) return 0;
+    if (!signed_resolution_tx || signed_resolution_tx_len == 0) return 1;
+
+    char *hex = malloc(signed_resolution_tx_len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(signed_resolution_tx, signed_resolution_tx_len, hex);
+
+    const char *sql =
+        "UPDATE htlcs SET signed_resolution_tx_hex = ? "
+        "WHERE channel_id = ? AND htlc_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(hex);
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_load_htlc_resolution_tx(persist_t *p, uint32_t channel_id,
+                                     uint64_t htlc_id,
+                                     unsigned char **out_bytes,
+                                     size_t *out_len) {
+    if (!p || !p->db || !out_bytes || !out_len) return -1;
+    *out_bytes = NULL;
+    *out_len = 0;
+
+    const char *sql =
+        "SELECT signed_resolution_tx_hex FROM htlcs "
+        "WHERE channel_id = ? AND htlc_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)htlc_id);
+
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
+            result = 0;
+        } else {
+            const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+            if (!hex || hex[0] == 0) {
+                result = 0;
+            } else {
+                size_t hex_len = strlen(hex);
+                size_t byte_len = hex_len / 2;
+                unsigned char *bytes = malloc(byte_len);
+                if (!bytes) {
+                    result = -1;
+                } else {
+                    int decoded = hex_decode(hex, bytes, byte_len);
+                    if (decoded > 0) {
+                        *out_bytes = bytes;
+                        *out_len = (size_t)decoded;
+                        result = 1;
+                    } else {
+                        free(bytes);
+                        result = -1;
+                    }
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* --- v36 (#209): pre-built signed L-stock burn TX bytes ---
+   SuperScalar-specific defense - OP_RETURN destruction of LSP L-stock
+   when a revoked state is broadcast, as an additional penalty layer
+   beyond the to_local + HTLC sweeps.  Burn and penalty share the
+   source data and registration moment; this stamper mirrors the
+   v25 penalty TX persistence on the same row. */
+
+int persist_save_old_commitment_burn_tx(persist_t *p, uint32_t channel_id,
+                                         uint64_t commit_num,
+                                         const unsigned char *signed_burn_tx,
+                                         size_t signed_burn_tx_len) {
+    if (!p || !p->db) return 0;
+    if (!signed_burn_tx || signed_burn_tx_len == 0) return 1;
+
+    char *hex = malloc(signed_burn_tx_len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(signed_burn_tx, signed_burn_tx_len, hex);
+
+    const char *sql =
+        "UPDATE old_commitments SET signed_burn_tx_hex = ? "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(hex);
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)commit_num);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_load_old_commitment_burn_tx(persist_t *p, uint32_t channel_id,
+                                         uint64_t commit_num,
+                                         unsigned char **out_bytes,
+                                         size_t *out_len) {
+    if (!p || !p->db || !out_bytes || !out_len) return -1;
+    *out_bytes = NULL;
+    *out_len = 0;
+
+    const char *sql =
+        "SELECT signed_burn_tx_hex FROM old_commitments "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
+            result = 0;
+        } else {
+            const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+            if (!hex || hex[0] == 0) {
+                result = 0;
+            } else {
+                size_t hex_len = strlen(hex);
+                size_t byte_len = hex_len / 2;
+                unsigned char *bytes = malloc(byte_len);
+                if (!bytes) {
+                    result = -1;
+                } else {
+                    int decoded = hex_decode(hex, bytes, byte_len);
+                    if (decoded > 0) {
+                        *out_bytes = bytes;
+                        *out_len = (size_t)decoded;
+                        result = 1;
+                    } else {
+                        free(bytes);
+                        result = -1;
+                    }
                 }
             }
         }
@@ -6605,6 +6816,42 @@ int persist_update_ceremony_artifacts(persist_t *p,
                                        const unsigned char *broadcast_txid32_or_null,
                                        int has_abort_reason, uint8_t abort_reason) {
     if (!p || !p->db || !ceremony_id8) return 0;
+
+    /* #219 (SF-AGG-HARD-GUARD, wallet team CEREMONY_COORD_REPLY_2 §2):
+       hard-check that every participant is at phase=SIGNED before we
+       persist the aggregated final_signature.  Mirrors the FINALIZED
+       state-transition guard in persist_update_ceremony_state (#185).
+       Catches the dual-signature trap window where a crash between the
+       last partial-sig collection and the participant-phase persist
+       could otherwise let the plugin re-ask a participant to sign a
+       different TX for the same epoch boundary.  Refuses + logs.
+       Other artifact updates (aggregated_nonce, broadcast_txid,
+       abort_reason) are unaffected by the guard. */
+    if (final_signature64_or_null) {
+        const char *gsql =
+            "SELECT COUNT(*) FROM ceremony_participants "
+            "WHERE ceremony_id = ? AND phase != ?;";
+        sqlite3_stmt *gst;
+        if (sqlite3_prepare_v2(p->db, gsql, -1, &gst, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_blob(gst, 1, ceremony_id8, 8, SQLITE_STATIC);
+        sqlite3_bind_int(gst, 2, PERSIST_CEREMONY_PHASE_SIGNED);
+        int unsigned_count = -1;
+        if (sqlite3_step(gst) == SQLITE_ROW)
+            unsigned_count = sqlite3_column_int(gst, 0);
+        sqlite3_finalize(gst);
+        if (unsigned_count < 0) return 0;
+        if (unsigned_count > 0) {
+            fprintf(stderr,
+                "persist_update_ceremony_artifacts: REFUSING final_signature "
+                "write for ceremony %02x%02x%02x..%02x — %d participant(s) "
+                "not yet phase=SIGNED (dual-signature trap guard, #219).\n",
+                ceremony_id8[0], ceremony_id8[1], ceremony_id8[2],
+                ceremony_id8[7], unsigned_count);
+            return 0;
+        }
+    }
+
     /* Build dynamic UPDATE — only set the columns whose args were provided. */
     char sql[256] = "UPDATE ceremonies SET ";
     int sep = 0;

@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 35
+#define PERSIST_SCHEMA_VERSION 36
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -533,6 +533,45 @@ int persist_load_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
                                             uint32_t htlc_vout,
                                             unsigned char **out_bytes,
                                             size_t *out_len);
+
+/* v36 (#208 / dashboard team SCHEMA_GAPS §2): persist pre-built signed HTLC
+   resolution TX bytes (timeout for OFFERED, success for RECEIVED).  Used
+   on the Path A force-close path after the LSP broadcasts its own commit.
+   Idempotent UPDATE on (channel_id, htlc_id).  Returns 1 on success, 0 on
+   DB error.  Safe to call with NULL/zero bytes — no-op. */
+int persist_save_htlc_resolution_tx(persist_t *p, uint32_t channel_id,
+                                     uint64_t htlc_id,
+                                     const unsigned char *signed_resolution_tx,
+                                     size_t signed_resolution_tx_len);
+
+/* Load pre-built signed HTLC resolution TX bytes for (channel, htlc_id).
+   *out_bytes is malloc()'d on success — caller must free().  Returns 1
+   if bytes loaded, 0 if row exists but column NULL/empty (legacy lazy
+   fallback), -1 on DB error or missing row. */
+int persist_load_htlc_resolution_tx(persist_t *p, uint32_t channel_id,
+                                     uint64_t htlc_id,
+                                     unsigned char **out_bytes,
+                                     size_t *out_len);
+
+/* v36 (#209 / dashboard team SCHEMA_GAPS §3): persist pre-built signed
+   L-stock burn TX bytes for a revoked commitment.  OP_RETURN destruction
+   of LSP L-stock — additional penalty layer beyond to_local + HTLC
+   sweeps.  Idempotent UPDATE on (channel_id, commit_num) — same row as
+   signed_penalty_tx_hex.  Returns 1 on success, 0 on DB error.  Safe to
+   call with NULL/zero bytes — no-op. */
+int persist_save_old_commitment_burn_tx(persist_t *p, uint32_t channel_id,
+                                         uint64_t commit_num,
+                                         const unsigned char *signed_burn_tx,
+                                         size_t signed_burn_tx_len);
+
+/* Load pre-built signed L-stock burn TX bytes for (channel, commit_num).
+   *out_bytes is malloc()'d on success — caller must free().  Returns 1
+   if bytes loaded, 0 if row exists but column NULL/empty (legacy lazy
+   fallback), -1 on DB error or missing row. */
+int persist_load_old_commitment_burn_tx(persist_t *p, uint32_t channel_id,
+                                         uint64_t commit_num,
+                                         unsigned char **out_bytes,
+                                         size_t *out_len);
 
 /* --- v30 (PR-PTLC-1): PTLC output metadata persistence ---
    Parallel to old_commitment_htlcs.  Stores PTLC outputs on revoked
@@ -1273,7 +1312,16 @@ int persist_update_ceremony_state(persist_t *p,
 
 /* Optional: attach aggregated_nonce when state transitions to
  * NONCES_AGGREGATED, or final_signature when transitioning to FINALIZED.
- * Either field can be NULL to leave unchanged.  Returns 1 on success. */
+ * Either field can be NULL to leave unchanged.  Returns 1 on success.
+ *
+ * #219 SF-AGG-HARD-GUARD (wallet team CEREMONY_COORD_REPLY_2 §2):
+ * when final_signature64_or_null is non-NULL, this function hard-
+ * checks that EVERY ceremony_participants row is at phase=SIGNED
+ * before persisting the aggregated signature.  Mirrors the FINALIZED
+ * state-transition guard.  Returns 0 (refusal) if any participant
+ * is in any other phase, with a fprintf(stderr) explaining why.
+ * Aggregated-nonce / broadcast-txid / abort-reason updates are not
+ * affected by the guard. */
 int persist_update_ceremony_artifacts(persist_t *p,
                                        const unsigned char *ceremony_id8,
                                        const unsigned char *aggregated_nonce66_or_null,
