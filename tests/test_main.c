@@ -1073,6 +1073,13 @@ extern int test_ptlc_commit_dispatch_null_ch(void);
 extern int test_ln_dispatch_routes_ptlc_presig(void);
 extern int test_ln_dispatch_routes_ptlc_adapted(void);
 extern int test_channel_ptlc_grow(void);
+extern int test_ptlc_ta1_turnover_msg_deterministic(void);
+extern int test_ptlc_ta2_turnover_msg_binds_dying(void);
+extern int test_ptlc_ta3_turnover_msg_binds_nonce(void);
+extern int test_ptlc_ta4_turnover_msg_binds_epoch(void);
+extern int test_ptlc_ta5_turnover_msg_not_legacy(void);
+extern int test_ptlc_ta6_rotation_begin_codec_roundtrip(void);
+extern int test_ptlc_ta7_rotation_begin_parse_rejects_malformed(void);
 extern int test_channel_fail_ptlc_not_found(void);
 extern int test_channel_settle_ptlc_not_found(void);
 extern int test_ln_dispatch_routes_ptlc_complete(void);
@@ -2946,6 +2953,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ln_dispatch_routes_ptlc_presig);
     RUN_TEST(test_ln_dispatch_routes_ptlc_adapted);
     RUN_TEST(test_channel_ptlc_grow);
+    /* #196 SF-PTLC-TURNOVER-AUTH: wire context-binding tests. */
+    RUN_TEST(test_ptlc_ta1_turnover_msg_deterministic);
+    RUN_TEST(test_ptlc_ta2_turnover_msg_binds_dying);
+    RUN_TEST(test_ptlc_ta3_turnover_msg_binds_nonce);
+    RUN_TEST(test_ptlc_ta4_turnover_msg_binds_epoch);
+    RUN_TEST(test_ptlc_ta5_turnover_msg_not_legacy);
+    RUN_TEST(test_ptlc_ta6_rotation_begin_codec_roundtrip);
+    RUN_TEST(test_ptlc_ta7_rotation_begin_parse_rejects_malformed);
     RUN_TEST(test_channel_fail_ptlc_not_found);
     RUN_TEST(test_channel_settle_ptlc_not_found);
     RUN_TEST(test_ln_dispatch_routes_ptlc_complete);

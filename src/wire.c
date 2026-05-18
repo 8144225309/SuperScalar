@@ -1372,7 +1372,11 @@ cJSON *wire_build_rotation_begin(const unsigned char *dying_factory_txid32,
     cJSON *j = cJSON_CreateObject();
     wire_json_add_hex(j, "dying_factory_txid", dying_factory_txid32, 32);
     wire_json_add_hex(j, "new_factory_nonce",   new_factory_nonce32,  32);
-    cJSON_AddNumberToObject(j, "rotation_epoch", (double)rotation_epoch);
+    /* #196: encode rotation_epoch as hex string for uint64 precision. */
+    char rotation_epoch_hex[17];
+    snprintf(rotation_epoch_hex, sizeof(rotation_epoch_hex),
+             "%016llx", (unsigned long long)rotation_epoch);
+    cJSON_AddStringToObject(j, "rotation_epoch", rotation_epoch_hex);
     return j;
 }
 
@@ -1386,8 +1390,9 @@ int wire_parse_rotation_begin(const cJSON *json,
     if (wire_json_get_hex(json, "new_factory_nonce", new_factory_nonce32, 32) != 32)
         return 0;
     cJSON *e = cJSON_GetObjectItem(json, "rotation_epoch");
-    if (!e || !cJSON_IsNumber(e)) return 0;
-    *rotation_epoch = (uint64_t)e->valuedouble;
+    if (!e || !cJSON_IsString(e) || !e->valuestring) return 0;
+    /* #196: decode hex string for uint64 precision. */
+    *rotation_epoch = (uint64_t)strtoull(e->valuestring, NULL, 16);
     return 1;
 }
 
