@@ -1,6 +1,8 @@
 #include "superscalar/lsp.h"
 #include "superscalar/ceremony.h"
 #include "superscalar/lsps.h"
+#include "superscalar/persist.h"
+#include "superscalar/sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -13,6 +15,48 @@
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
+
+/* === Task #205: ceremony persistence helpers =============================== *
+ *
+ * Wire the SF-CEREMONY-HELPERS API (PR #259) into the factory_init propose
+ * path so crashes leave a forensic trail (one ceremony row + N participant
+ * rows per attempt). Persist is observability, not gating — every helper
+ * failure is logged but never aborts the ceremony.  The crash-recovery
+ * scaffold (tools/test_regtest_crash_at_every_phase.sh, PR #262) drives the
+ * test that asserts these rows exist post-SIGKILL.
+ *
+ * Ceremony-id derivation: sha256(factory_instance_id || ceremony_type ||
+ * be64(epoch))[:8].  Deterministic so retries of the same epoch boundary
+ * map to the same row (idempotent re-PROPOSE after partial failure does not
+ * produce duplicate ceremony rows). The factory_instance_id is the 32-byte
+ * funding TXID (internal byte order) — the only stable 32-byte identifier
+ * available at initial creation, agreed with wallet team §3 (the
+ * autoincrement factory_id is not stable across LSP restarts before
+ * persist_save_factory completes).
+ * =========================================================================== */
+
+static void lsp_ceremony_derive_id(const unsigned char *fid32,
+                                    uint8_t ceremony_type,
+                                    uint64_t epoch,
+                                    unsigned char out_cid8[8]) {
+    unsigned char buf[32 + 1 + 8];
+    memcpy(buf, fid32, 32);
+    buf[32] = ceremony_type;
+    /* big-endian epoch so the hash domain matches wire/RPC representations */
+    for (int i = 0; i < 8; i++)
+        buf[33 + i] = (unsigned char)((epoch >> (56 - 8 * i)) & 0xff);
+    unsigned char digest[32];
+    sha256(buf, sizeof(buf), digest);
+    memcpy(out_cid8, digest, 8);
+}
+
+static void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
+                                              unsigned char out33[33]) {
+    size_t len = 33;
+    secp256k1_ec_pubkey_serialize(lsp->ctx, out33, &len,
+                                   &lsp->client_pubkeys[client_idx],
+                                   SECP256K1_EC_COMPRESSED);
+}
 
 /* Log MSG_ERROR from a client during ceremony. Returns 1 if msg was error. */
 static int check_client_error(const wire_msg_t *msg, size_t client_idx) {
@@ -359,6 +403,32 @@ int lsp_run_factory_creation(lsp_t *lsp,
         return 0;
     }
 
+    /* Task #205: ceremony persistence — derive ID + insert ceremony row.
+       cer_id is 0 when lsp->db == NULL (legacy / no --db); all helper calls
+       below early-return harmlessly in that case. */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (lsp->db) {
+        lsp_ceremony_derive_id(funding_txid,
+                                PERSIST_CEREMONY_TYPE_INITIAL,
+                                (uint64_t)f->counter.current_epoch,
+                                cer_id);
+        /* started_at_block = 0 (unknown — caller doesn't pass current height
+           to this function; the bookkeeping row records the wallclock+epoch
+           context via the ceremony_id derivation above).  deadline_block =
+           cltv_timeout: the absolute block beyond which the factory cannot
+           be safely used. */
+        if (!persist_save_ceremony(lsp->db, cer_id, funding_txid,
+                                    PERSIST_CEREMONY_TYPE_INITIAL,
+                                    /*parent_ceremony_id8_or_null*/ NULL,
+                                    /*started_at_block*/ 0,
+                                    /*deadline_block*/ cltv_timeout)) {
+            fprintf(stderr, "LSP: persist_save_ceremony failed (continuing)\n");
+        } else {
+            cer_persisted = 1;
+        }
+    }
+
     /* Send FACTORY_PROPOSE to all clients */
     cJSON *propose = wire_build_factory_propose(f);
     /* Include per-client distribution amounts if available (rotation) */
@@ -372,10 +442,32 @@ int lsp_run_factory_creation(lsp_t *lsp,
         if (!wire_send(lsp->client_fds[i], MSG_FACTORY_PROPOSE, propose)) {
             fprintf(stderr, "LSP: failed to send FACTORY_PROPOSE to client %zu\n", i);
             cJSON_Delete(propose);
+            if (cer_persisted) {
+                /* Step 8 partial: abort the ceremony row — a wire-send failure
+                   here means we never told all clients to start. */
+                persist_update_ceremony_state(lsp->db, cer_id,
+                                               PERSIST_CEREMONY_STATE_ABORTED);
+                persist_update_ceremony_artifacts(lsp->db, cer_id, NULL, NULL, NULL,
+                                                   /*has_abort_reason*/ 1,
+                                                   PERSIST_CEREMONY_PHASE_TIMED_OUT);
+            }
             return 0;
         }
     }
     cJSON_Delete(propose);
+
+    /* Task #205 Step 1: record SENT phase for every recipient client. */
+    if (cer_persisted) {
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, i, pk33);
+            if (!persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                 PERSIST_CEREMONY_PHASE_SENT,
+                                                 NULL, NULL, 0, 0)) {
+                fprintf(stderr, "LSP: persist_save_participant_phase(SENT) client %zu failed\n", i);
+            }
+        }
+    }
 
     /* Initialize signing sessions */
     if (!factory_sessions_init(f)) {
@@ -513,6 +605,14 @@ int lsp_run_factory_creation(lsp_t *lsp,
                     if (ceremony.clients[i] == CLIENT_WAITING) {
                         ceremony.clients[i] = CLIENT_TIMED_OUT;
                         fprintf(stderr, "LSP: timeout waiting for NONCE_BUNDLE from client %zu\n", i);
+                        /* Task #205 Step 8: record TIMED_OUT participant phase. */
+                        if (cer_persisted) {
+                            unsigned char pk33[33];
+                            lsp_ceremony_get_client_pubkey33(lsp, i, pk33);
+                            persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                            PERSIST_CEREMONY_PHASE_TIMED_OUT,
+                                                            NULL, NULL, 0, 0);
+                        }
                     }
                 }
                 break;
@@ -549,6 +649,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
                                                      ce_cap, 66);
 
                 int client_ok = 1;
+                /* Task #205 Step 2: capture the lowest-node pubnonce from this
+                   client for the participant row (informational; the full set
+                   of per-node nonces lives in the factory in-memory state). */
+                unsigned char first_pubnonce_ser[66];
+                int have_first_pubnonce = 0;
+                uint32_t first_pubnonce_node = UINT32_MAX;
                 for (size_t e = 0; e < n_entries; e++) {
                     secp256k1_musig_pubnonce pubnonce;
                     if (!musig_pubnonce_parse(lsp->ctx, &pubnonce, client_entries[e].data)) {
@@ -567,6 +673,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
                         client_ok = 0;
                         break;
                     }
+                    if (client_entries[e].node_idx < first_pubnonce_node &&
+                        client_entries[e].data_len == 66) {
+                        memcpy(first_pubnonce_ser, client_entries[e].data, 66);
+                        first_pubnonce_node = client_entries[e].node_idx;
+                        have_first_pubnonce = 1;
+                    }
                     all_nonce_entries[all_nonce_count] = client_entries[e];
                     all_nonce_count++;
                 }
@@ -576,8 +688,25 @@ int lsp_run_factory_creation(lsp_t *lsp,
                 if (client_ok) {
                     ceremony.clients[c] = CLIENT_NONCE_RECEIVED;
                     nonces_received++;
+                    if (cer_persisted) {
+                        unsigned char pk33[33];
+                        lsp_ceremony_get_client_pubkey33(lsp, c, pk33);
+                        if (!persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                             PERSIST_CEREMONY_PHASE_NONCED,
+                                                             have_first_pubnonce ? first_pubnonce_ser : NULL,
+                                                             NULL, 0, 0)) {
+                            fprintf(stderr, "LSP: persist_save_participant_phase(NONCED) client %zu failed\n", c);
+                        }
+                    }
                 } else {
                     ceremony.clients[c] = CLIENT_ERROR;
+                    if (cer_persisted) {
+                        unsigned char pk33[33];
+                        lsp_ceremony_get_client_pubkey33(lsp, c, pk33);
+                        persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                        PERSIST_CEREMONY_PHASE_REFUSED,
+                                                        NULL, NULL, 1, /*refuse_code*/ 1);
+                    }
                 }
             }
         }
@@ -650,6 +779,14 @@ int lsp_run_factory_creation(lsp_t *lsp,
                             ceremony.clients[ci] = CLIENT_NONCE_RECEIVED;
                             nonces_received++;
                             fprintf(stderr, "LSP: client %zu reconnected and sent nonces\n", ci);
+                            /* Task #205 Step 2 (recovery path): record NONCED. */
+                            if (cer_persisted) {
+                                unsigned char pk33[33];
+                                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                                persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                                PERSIST_CEREMONY_PHASE_NONCED,
+                                                                NULL, NULL, 0, 0);
+                            }
                         }
                     }
                     if (retry_msg.json) cJSON_Delete(retry_msg.json);
@@ -687,6 +824,22 @@ int lsp_run_factory_creation(lsp_t *lsp,
     if (!factory_sessions_finalize(f)) {
         fprintf(stderr, "LSP: factory_sessions_finalize failed\n");
         goto fail;
+    }
+
+    /* Task #205 Step 3: state -> NONCES_AGGREGATED + attach aggregated nonce
+       from the root node (representative of the multi-node tree). */
+    if (cer_persisted) {
+        if (!persist_update_ceremony_state(lsp->db, cer_id,
+                                            PERSIST_CEREMONY_STATE_NONCES_AGGREGATED)) {
+            fprintf(stderr, "LSP: persist_update_ceremony_state(NONCES_AGGREGATED) failed\n");
+        }
+        unsigned char agg_nonce_ser[66];
+        if (f->n_nodes > 0 &&
+            secp256k1_musig_aggnonce_serialize(lsp->ctx, agg_nonce_ser,
+                                                &f->nodes[0].signing_session.aggnonce)) {
+            persist_update_ceremony_artifacts(lsp->db, cer_id,
+                                                agg_nonce_ser, NULL, NULL, 0, 0);
+        }
     }
 
     /* Finalize distribution TX signing session (separate from tree nodes) */
@@ -734,6 +887,17 @@ int lsp_run_factory_creation(lsp_t *lsp,
         }
     }
 
+    /* Task #205 Step 4: state -> PENDING_SIGS just before we start collecting
+       MSG_PSIG_BUNDLE responses (LSP psig is computed above; the wire path is
+       client -> LSP, so "before sending PSIG_BUNDLE" here means the
+       client-side will be sending in response to ALL_NONCES). */
+    if (cer_persisted) {
+        if (!persist_update_ceremony_state(lsp->db, cer_id,
+                                            PERSIST_CEREMONY_STATE_PENDING_SIGS)) {
+            fprintf(stderr, "LSP: persist_update_ceremony_state(PENDING_SIGS) failed\n");
+        }
+    }
+
     /* Collect PSIG_BUNDLEs from all clients (parallel select) */
     {
         ceremony_t psig_ceremony;
@@ -756,6 +920,13 @@ int lsp_run_factory_creation(lsp_t *lsp,
                     if (psig_ceremony.clients[i] == CLIENT_WAITING) {
                         psig_ceremony.clients[i] = CLIENT_TIMED_OUT;
                         fprintf(stderr, "LSP: timeout waiting for PSIG_BUNDLE from client %zu\n", i);
+                        if (cer_persisted) {
+                            unsigned char pk33[33];
+                            lsp_ceremony_get_client_pubkey33(lsp, i, pk33);
+                            persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                            PERSIST_CEREMONY_PHASE_TIMED_OUT,
+                                                            NULL, NULL, 0, 0);
+                        }
                     }
                 }
                 break;
@@ -791,6 +962,10 @@ int lsp_run_factory_creation(lsp_t *lsp,
                                                      pce_cap, 32);
 
                 int client_ok = 1;
+                /* Task #205 Step 5: capture root-node psig for participant row. */
+                unsigned char first_psig_ser[32];
+                int have_first_psig = 0;
+                uint32_t first_psig_node = UINT32_MAX;
                 for (size_t e = 0; e < n_entries; e++) {
                     secp256k1_musig_partial_sig psig;
                     if (!musig_partial_sig_parse(lsp->ctx, &psig, client_entries[e].data)) {
@@ -811,6 +986,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
                         client_ok = 0;
                         break;
                     }
+                    if (client_entries[e].node_idx < first_psig_node &&
+                        client_entries[e].data_len == 32) {
+                        memcpy(first_psig_ser, client_entries[e].data, 32);
+                        first_psig_node = client_entries[e].node_idx;
+                        have_first_psig = 1;
+                    }
                 }
                 free(client_entries);
                 cJSON_Delete(msg.json);
@@ -818,8 +999,24 @@ int lsp_run_factory_creation(lsp_t *lsp,
                 if (client_ok) {
                     psig_ceremony.clients[c] = CLIENT_PSIG_RECEIVED;
                     psigs_received++;
+                    if (cer_persisted) {
+                        unsigned char pk33[33];
+                        lsp_ceremony_get_client_pubkey33(lsp, c, pk33);
+                        persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                        PERSIST_CEREMONY_PHASE_SIGNED,
+                                                        NULL,
+                                                        have_first_psig ? first_psig_ser : NULL,
+                                                        0, 0);
+                    }
                 } else {
                     psig_ceremony.clients[c] = CLIENT_ERROR;
+                    if (cer_persisted) {
+                        unsigned char pk33[33];
+                        lsp_ceremony_get_client_pubkey33(lsp, c, pk33);
+                        persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                        PERSIST_CEREMONY_PHASE_REFUSED,
+                                                        NULL, NULL, 1, /*refuse_code*/ 2);
+                    }
                 }
             }
         }
@@ -840,6 +1037,40 @@ int lsp_run_factory_creation(lsp_t *lsp,
     if (!factory_sessions_complete(f)) {
         fprintf(stderr, "LSP: factory_sessions_complete failed\n");
         goto fail;
+    }
+
+    /* Task #205 Steps 6+7: state -> FINALIZED (runs the §2 hard guard which
+       refuses the transition if any participant phase != SIGNED), then attach
+       the final signature (root node) and the broadcast txid (the funding
+       TXID — already broadcast by the caller before this ceremony started;
+       the wallet team treats it as the authoritative on-chain anchor). */
+    if (cer_persisted) {
+        if (!persist_update_ceremony_state(lsp->db, cer_id,
+                                            PERSIST_CEREMONY_STATE_FINALIZED)) {
+            /* Guard refused or DB error. Demote to PARTIAL_FAILED so
+               operator/recovery sees a clear classification. */
+            fprintf(stderr, "LSP: persist_update_ceremony_state(FINALIZED) refused; "
+                            "demoting to PARTIAL_FAILED\n");
+            persist_update_ceremony_state(lsp->db, cer_id,
+                                            PERSIST_CEREMONY_STATE_PARTIAL_FAILED);
+        } else {
+            /* Schnorr sig: best-effort extraction from the root node's signed
+               TX witness (final 64 bytes of the witness item).  Schema field
+               is observability-only; skip if extraction fails. */
+            unsigned char final_sig[64];
+            int have_final_sig = 0;
+            if (f->n_nodes > 0 && f->nodes[0].signed_tx.len >= 64) {
+                memcpy(final_sig,
+                        f->nodes[0].signed_tx.data + f->nodes[0].signed_tx.len - 64,
+                        64);
+                have_final_sig = 1;
+            }
+            persist_update_ceremony_artifacts(lsp->db, cer_id,
+                                                NULL,
+                                                have_final_sig ? final_sig : NULL,
+                                                funding_txid,
+                                                0, 0);
+        }
     }
 
     /* Aggregate distribution TX signature */
@@ -900,6 +1131,17 @@ int lsp_run_factory_creation(lsp_t *lsp,
 
 fail:
     lsp_abort_ceremony(lsp, "factory creation failed");
+    /* Task #205 Step 8: persist ceremony aborted.  Reason is the §4 wallet-team
+       code for participant-loss (we group all generic ceremony failures under
+       PHASE_TIMED_OUT for now; the observability layer can refine using the
+       participant rows we already recorded). */
+    if (cer_persisted) {
+        persist_update_ceremony_state(lsp->db, cer_id,
+                                        PERSIST_CEREMONY_STATE_ABORTED);
+        persist_update_ceremony_artifacts(lsp->db, cer_id, NULL, NULL, NULL,
+                                            /*has_abort_reason*/ 1,
+                                            PERSIST_CEREMONY_PHASE_TIMED_OUT);
+    }
     free(all_nonce_entries);
     /* Clean up partially-built factory: factory_build_tree may have allocated
        tx_bufs in f->nodes that would otherwise leak (or worse, get double-freed

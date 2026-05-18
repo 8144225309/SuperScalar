@@ -4,6 +4,7 @@
 #include "factory.h"
 #include "wire.h"
 #include "rate_limit.h"
+#include "persist.h"
 #include <secp256k1.h>
 
 #define LSP_MAX_CLIENTS 128
@@ -60,6 +61,16 @@ typedef struct {
        (Campaign #3 stranded 6.5M signet sats this way). Enable on all
        non-regtest deployments. Default: 0 (off, regtest-friendly). */
     int require_slot_hints;
+
+    /* Optional ceremony persistence handle (task #205).  When non-NULL,
+       lsp_run_factory_creation calls the SF-CEREMONY-HELPERS API to
+       record each phase transition: PROPOSE sent, NONCEs received,
+       SIGs received, FINALIZED.  NULL = no persistence (legacy / tests
+       without --db).  The caller (tools/superscalar_lsp.c) sets this
+       from g_db after persist_open succeeds.  Persist is observability,
+       not gating — helper failures are logged but never abort the
+       ceremony. */
+    persist_t *db;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

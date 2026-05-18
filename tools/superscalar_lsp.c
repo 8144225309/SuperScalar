@@ -2914,6 +2914,10 @@ accept_new_factory:
         return 1;
     }
     g_lsp = lsp_p;
+    /* Task #205: plumb the optional persist handle so lsp_run_factory_creation
+       can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
+       supplied — leaving lsp_p->db NULL is the legacy/no-persistence path. */
+    lsp_p->db = g_db;
     lsp_p->accept_timeout_sec = accept_timeout_arg;
     if (max_connections_arg > 0)
         lsp_p->max_connections = max_connections_arg;
