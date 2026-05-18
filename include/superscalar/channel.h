@@ -48,6 +48,7 @@ typedef struct {
     int              has_pre_sig;
     unsigned char    adapted_sig[64]; /* final adapted signature from client */
     int              has_adapted_sig;
+    uint64_t         fee_at_add;      /* #182: per-PTLC commit fee deducted from funder at add time */
 } ptlc_t;
 
 typedef struct {

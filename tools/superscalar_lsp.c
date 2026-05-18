@@ -379,10 +379,11 @@ static void usage(const char *prog) {
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
-        "  --enable-ptlc-unsafe Enable PTLC channel ops (opt-in for testnet4/regtest;\n"
-        "                      watchtower PTLC sweep is wired via SF-W-PTLC, but the\n"
-        "                      feed only fires when PTLCs actually flow through\n"
-        "                      these channels)\n"
+        "  --disable-ptlc      Disable PTLC channel ops (operator opt-out). PTLCs are\n"
+        "                      default-on after #103 audit + #242 feed landed; this\n"
+        "                      flag restores pre-#174 default-off behavior.\n"
+        "  --enable-ptlc-unsafe  [DEPRECATED] No-op alias kept for back-compat with\n"
+        "                      existing test runners. PTLCs already default-on.\n"
         "  --test-ptlc-basic   After demo: add a PTLC to channel 0, verify commitment\n"
         "                      TX includes PTLC output, fail PTLC, cooperative close.\n"
         "                      Validates LSP-side PTLC machinery end-to-end on real\n"
@@ -395,6 +396,14 @@ static void usage(const char *prog) {
         "                      (persists to DB), close + reopen persist, load PTLCs\n"
         "                      from DB, verify fields. Validates schema v30\n"
         "                      persistence. Implies --enable-ptlc-unsafe. (regtest)\n"
+        "  --test-ptlc-chain   After demo: add a PTLC, broadcast factory tree, sign\n"
+        "                      + broadcast channel-0 commit TX with PTLC output, mine\n"
+        "                      block, verify confirmation. Validates PTLC outputs are\n"
+        "                      Bitcoin-valid on real chain. (regtest)\n"
+        "  --test-ptlc-breach-chain  Full chain-level PTLC breach test: add PTLC,\n"
+        "                      sign commit-N, advance state, broadcast revoked commit\n"
+        "                      (the breach), watchtower detects + broadcasts PTLC\n"
+        "                      penalty sweep. Proves trustless model on chain. (regtest)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -1239,6 +1248,8 @@ int main(int argc, char *argv[]) {
     int test_ptlc_basic = 0;
     int test_ptlc_breach = 0;
     int test_ptlc_restart = 0;
+    int test_ptlc_chain = 0;
+    int test_ptlc_breach_chain = 0;
     int test_htlc_force_close = 0;
     int test_multi_htlc_force_close = 0;
     int test_full_settlement = 0;
@@ -1334,6 +1345,15 @@ int main(int argc, char *argv[]) {
     int use_json_log = 0;                  /* --json-log */
 
     /* Load config file if --config provided (first pass) */
+    /* SF-W-PTLC #174: PTLC ops are default-ON now that Phase 0 audit (#103)
+       + breach-defense feed (PR #242) have both landed. Operator opts OUT
+       with --disable-ptlc. The legacy --enable-ptlc-unsafe is kept as a
+       no-op alias for back-compat with existing test scripts/runners. */
+    {
+        extern void ptlc_safety_set_enabled(int);
+        ptlc_safety_set_enabled(1);
+    }
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             FILE *cf = fopen(argv[i + 1], "r");
@@ -1370,6 +1390,15 @@ int main(int argc, char *argv[]) {
     }
 
     /* Parse CLI arguments (override config file) */
+    /* SF-W-PTLC #174: PTLC ops are default-ON now that Phase 0 audit (#103)
+       + breach-defense feed (PR #242) have both landed. Operator opts OUT
+       with --disable-ptlc. The legacy --enable-ptlc-unsafe is kept as a
+       no-op alias for back-compat with existing test scripts/runners. */
+    {
+        extern void ptlc_safety_set_enabled(int);
+        ptlc_safety_set_enabled(1);
+    }
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = atoi(argv[++i]);
@@ -1428,11 +1457,19 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--test-rotation") == 0)
             test_rotation = 1;
         else if (strcmp(argv[i], "--enable-ptlc-unsafe") == 0) {
-            /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops.
-               Default-off in production (mainnet should still gate). */
+            /* SF-W-PTLC #174: kept as a no-op alias for back-compat.
+               PTLCs are default-on after #103 audit + #242 feed landed.
+               Operator opts OUT with --disable-ptlc. */
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
-            printf("LSP: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+            printf("LSP: --enable-ptlc-unsafe is now a no-op alias (PTLCs default-on)\n");
+        }
+        else if (strcmp(argv[i], "--disable-ptlc") == 0) {
+            /* SF-W-PTLC #174: operator opt-out. Disables channel_add_ptlc
+               at the safety gate; restores pre-#174 default-off behavior. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(0);
+            printf("LSP: PTLC channel ops disabled (--disable-ptlc)\n");
         }
         else if (strcmp(argv[i], "--test-ptlc-basic") == 0) {
             /* SF-W-PTLC Phase 3a (#107): validate LSP-side PTLC happy path
@@ -1457,6 +1494,23 @@ int main(int argc, char *argv[]) {
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
             test_ptlc_restart = 1;
+        }
+        else if (strcmp(argv[i], "--test-ptlc-chain") == 0) {
+            /* SF-W-PTLC #173: chain-level PTLC validation. Add PTLC,
+               broadcast factory tree, sign + broadcast commit TX with
+               PTLC output, verify confirmation. Proves PTLC outputs
+               are real-chain Bitcoin-valid. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_chain = 1;
+        }
+        else if (strcmp(argv[i], "--test-ptlc-breach-chain") == 0) {
+            /* SF-W-PTLC #184 Stage A: chain-level PTLC breach with sweep.
+               Full trustless test: cheat broadcasts revoked commit with
+               PTLC, watchtower detects + sweeps via PTLC penalty TX. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_breach_chain = 1;
         }
         else if (strcmp(argv[i], "--test-partial-rotation") == 0)
             test_partial_rotation = 1;
@@ -3650,7 +3704,7 @@ accept_new_factory:
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
-        test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
+        test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_ptlc_chain || test_ptlc_breach_chain || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
         test_tier_b_rollover || test_subfactory_advance ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||

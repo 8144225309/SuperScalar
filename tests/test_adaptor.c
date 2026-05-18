@@ -675,6 +675,13 @@ int test_channel_add_ptlc(void)
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182 balance accounting: channel_add_ptlc deducts amount +
+       per_ptlc_fee from funder. Seed balances large enough for the
+       sum of PTLC amounts the test adds, plus 5000 reserve, plus
+       buffer for per_ptlc_fee (fee_rate_sat_per_kvb=0 → fee=0). */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     secp256k1_pubkey payment_pt;
     unsigned char sec[32]; memset(sec, 0x22, 32);
@@ -701,6 +708,13 @@ int test_channel_settle_ptlc(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182 balance accounting: channel_add_ptlc deducts amount +
+       per_ptlc_fee from funder. Seed balances large enough for the
+       sum of PTLC amounts the test adds, plus 5000 reserve, plus
+       buffer for per_ptlc_fee (fee_rate_sat_per_kvb=0 → fee=0). */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     uint64_t id = 0;
     int r = channel_add_ptlc(&ch, PTLC_RECEIVED, 10000, NULL, 700200, &id);
@@ -723,6 +737,13 @@ int test_channel_fail_ptlc(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182 balance accounting: channel_add_ptlc deducts amount +
+       per_ptlc_fee from funder. Seed balances large enough for the
+       sum of PTLC amounts the test adds, plus 5000 reserve, plus
+       buffer for per_ptlc_fee (fee_rate_sat_per_kvb=0 → fee=0). */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     uint64_t id = 0;
     channel_add_ptlc(&ch, PTLC_OFFERED, 20000, NULL, 700300, &id);
@@ -742,6 +763,13 @@ int test_channel_ptlc_multiple(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182 balance accounting: channel_add_ptlc deducts amount +
+       per_ptlc_fee from funder. Seed balances large enough for the
+       sum of PTLC amounts the test adds, plus 5000 reserve, plus
+       buffer for per_ptlc_fee (fee_rate_sat_per_kvb=0 → fee=0). */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     uint64_t id0, id1, id2;
     channel_add_ptlc(&ch, PTLC_OFFERED, 1000, NULL, 700000, &id0);
@@ -765,6 +793,10 @@ int test_ptlc_commit_dispatch_presig(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
     peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
 
     /* Add a PTLC to receive presig for */
@@ -793,6 +825,10 @@ int test_ptlc_commit_dispatch_adapted(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
     peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
 
     uint64_t id = 0;
@@ -817,6 +853,10 @@ int test_ptlc_commit_dispatch_complete(void)
 {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
     peer_mgr_t pmgr; memset(&pmgr, 0, sizeof(pmgr));
 
     uint64_t id = 0;
@@ -852,6 +892,8 @@ int test_ptlc_commit_dispatch_null_ch(void)
 int test_channel_ptlc_grow(void)
 {
     channel_t ch; memset(&ch, 0, sizeof(ch));
+    /* #182: seed balances + funder for channel_add_ptlc. */
+    ch.local_amount = 100000; ch.remote_amount = 100000; ch.funder_is_local = 1;
     /* Add 10 PTLCs to force realloc */
     for (int i = 0; i < 10; i++) {
         uint64_t id = 0;
