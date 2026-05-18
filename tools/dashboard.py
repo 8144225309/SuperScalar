@@ -1342,6 +1342,30 @@ tr:hover td{background:#1c2128}
 .et{color:#484f58;flex-shrink:0}.em{color:#8b949e}
 .conn{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
 .conn.on{background:#3fb950}.conn.off{background:#f85149}
+/* Live Monitor: chronological event feed.  Each event row has a left
+ * border color band keyed to type; new rows fade-in a brief background
+ * highlight via the lm-flash keyframe so an operator can spot what just
+ * arrived without diffing manually. */
+.lm-evt{display:flex;align-items:center;gap:10px;padding:6px 10px;border-left:3px solid #30363d;border-bottom:1px solid #21262d;cursor:pointer;font-size:12px;transition:background .15s}
+.lm-evt:hover{background:#1c2128}
+.lm-evt-breach{border-left-color:#f85149}
+.lm-evt-broadcast-ok{border-left-color:#3fb950}
+.lm-evt-broadcast-err{border-left-color:#f0883e}
+.lm-evt-broadcast-stale{border-left-color:#8b949e}
+.lm-evt-reorg{border-left-color:#d29922}
+.lm-time{color:#484f58;font-size:10px;font-variant-numeric:tabular-nums;flex-shrink:0;min-width:60px}
+.lm-summary{color:#c9d1d9;flex:1;word-break:break-all}
+.lm-tag{display:inline-block;padding:1px 7px;border-radius:3px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;flex-shrink:0}
+.lm-tag-breach{background:#490202;color:#f85149}
+.lm-tag-ok{background:#238636;color:#3fb950}
+.lm-tag-err{background:#5a2d00;color:#f0883e}
+.lm-tag-stale{background:#21262d;color:#8b949e}
+.lm-tag-reorg{background:#3d2e00;color:#d29922}
+.lm-detail{background:#0d1117;border-left:3px solid #30363d;padding:8px 14px;font-size:11px}
+.lm-detail table{margin:0}
+.lm-detail td{padding:2px 6px;border:none}
+@keyframes lm-flash{0%{background:rgba(88,166,255,.22)}100%{background:transparent}}
+.lm-evt.lm-new{animation:lm-flash 2.5s ease-out}
 </style></head><body>
 <div class="wrap">
 <div class="hdr">
@@ -1358,6 +1382,7 @@ tr:hover td{background:#1c2128}
  <div class="tab" data-t="ceremonies">Ceremonies</div>
  <div class="tab" data-t="lightning">Lightning Network</div>
  <div class="tab" data-t="watchtower">Watchtower</div>
+ <div class="tab" data-t="livemon">Live Monitor</div>
  <div class="tab" data-t="defense">Defense Status</div>
  <div class="tab" data-t="txinv">TX Inventory</div>
  <div class="tab" data-t="outcomes">Outcomes</div>
@@ -1377,6 +1402,11 @@ let facSel='all';
 let _D=null;
 let _hist={sigStates:[],wtEntries:[],htlcCount:[],fwdActive:[]};
 const _HIST_MAX=60; // ~5 minutes at the 5s refresh tick
+// Live Monitor: track event IDs seen across polls so newly-arrived rows get
+// briefly highlighted on each refresh.  null = first-render sentinel (we
+// populate but don't flag anything new on the first tick to avoid flashing
+// the entire backlog).
+let _lmSeen=null;
 document.getElementById('tabs').addEventListener('click',e=>{
     const t=e.target.closest('.tab'); if(!t)return;
     document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
@@ -2484,6 +2514,150 @@ function rWatchtower(D){
  return h;
 }
 
+// === TAB: Live Monitor (chronological watchtower event feed) ===
+// Companion view to the existing Watchtower tab.  Watchtower shows STATE
+// (current counts, breakdowns); Live Monitor shows EVENTS (what happened
+// when).  Merges breach_detections + broadcast_log + reorg_events into one
+// reverse-chronological feed, color-coded by event type.  Rows that appear
+// for the first time across a poll briefly highlight to draw operator
+// attention.  Status tiles at top give at-a-glance counts.  POV scope:
+// LSP-only \u2014 same reasoning as rWatchtower (these are LSP-internal feeds
+// a trustless client shouldn't depend on).
+function rLiveMonitor(D){
+ if(!isLSPVisible())return naPanel("Live Monitor is the chronological view of LSP-internal watchtower activity \u2014 breach detections, TX broadcasts, reorgs.  Real clients have no visibility into these LSP-aggregate feeds (same reasoning as the Watchtower tab).  Future work: when client-side watchtower mode lands, this tab can grow a client-POV variant sourced from cl.broadcast_log alone.");
+ const db=D.databases||{},lsp=db.lsp||{};
+ const bd=lsp.breach_detections||[];
+ const bl=lsp.broadcast_log||[];
+ const re=lsp.reorg_events||[];
+ const wp=lsp.watchtower_pending||[];
+
+ // Build unified event list \u2014 each gets a stable id, type, timestamp
+ // (epoch seconds), tag pill, summary line, and the raw row for the
+ // expandable detail panel.
+ const evs=[];
+ for(const x of bd){
+  evs.push({
+   id:'br:'+x.id,
+   type:'breach',
+   ts:x.timestamp,
+   tag:'BREACH',
+   tagCls:'lm-tag lm-tag-breach',
+   summary:`CH${x.channel_id} broadcast revoked commit #${x.expected_commit_num} (h=${x.height_seen})`+(x.response_txid?` \u2192 penalty ${String(x.response_txid).slice(0,12)}\u2026`:' (no penalty yet)'),
+   row:x,
+  });
+ }
+ for(const x of bl){
+  const ok=x.result==='success'||x.result==='ok';
+  evs.push({
+   id:'bl:'+x.id,
+   type:x.reorg_stale?'broadcast-stale':(ok?'broadcast-ok':'broadcast-err'),
+   ts:x.broadcast_time,
+   tag:'TX BCAST',
+   tagCls:x.reorg_stale?'lm-tag lm-tag-stale':(ok?'lm-tag lm-tag-ok':'lm-tag lm-tag-err'),
+   summary:`${x.source||'?'}: ${x.txid?String(x.txid).slice(0,16)+'\u2026':''} \u2014 ${x.result||'?'}`+(x.reorg_stale?' (orphaned by reorg)':''),
+   row:x,
+  });
+ }
+ for(const x of re){
+  evs.push({
+   id:'rg:'+x.id,
+   type:'reorg',
+   ts:x.timestamp,
+   tag:'REORG',
+   tagCls:'lm-tag lm-tag-reorg',
+   summary:`tip ${x.old_tip||'?'} \u2192 ${x.new_tip||'?'} (${x.n_entries_reset} entries reset)`,
+   row:x,
+  });
+ }
+ evs.sort((a,b)=>(b.ts||0)-(a.ts||0));
+
+ // Status-tile aggregates
+ const now=Math.floor(Date.now()/1000);
+ const lastHr=now-3600;
+ const last24h=now-86400;
+ const bcastLastHr=bl.filter(b=>(b.broadcast_time||0)>=lastHr).length;
+ const breachLast24h=bd.filter(b=>(b.timestamp||0)>=last24h).length;
+ const lastTs=evs.length?evs[0].ts:0;
+ const formatAge=(s)=>{
+  if(s===null||s===undefined)return 'never';
+  if(s<0)return 'future?';
+  if(s<60)return `${s}s ago`;
+  if(s<3600)return `${Math.floor(s/60)}m ago`;
+  if(s<86400)return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+ };
+ const lastAgeSec=lastTs?Math.max(0,now-lastTs):null;
+
+ // Track newly-arrived rows.  First render: seed _lmSeen with current ids
+ // but don't flag anything new (avoids flashing the entire backlog).
+ const newIds=new Set();
+ if(_lmSeen===null){
+  _lmSeen=new Set();
+  for(const e of evs)_lmSeen.add(e.id);
+ }else{
+  for(const e of evs){
+   if(!_lmSeen.has(e.id)){newIds.add(e.id);_lmSeen.add(e.id);}
+  }
+ }
+
+ let h='';
+ // Zone 1: status tiles
+ h+=`<div class="s"><div class="st"><span>Watchtower Live Status</span><span class="c">${evs.length} event(s) total${newIds.size?`, ${newIds.size} new this poll`:''}</span></div>`;
+ h+=`<div class="kv">`;
+ h+=`<div class="ki"><span class="k">Pending sweeps</span><span class="${wp.length?'b w':'b'}">${wp.length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Breaches (24h)</span><span class="${breachLast24h?'b dn':'b'}">${breachLast24h}</span></div>`;
+ h+=`<div class="ki"><span class="k">Breaches (total)</span><span class="${bd.length?'b dn':'b'}">${bd.length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Broadcasts (1h)</span><span class="${bcastLastHr?'b ok':'b'}">${bcastLastHr}</span></div>`;
+ h+=`<div class="ki"><span class="k">Reorgs (total)</span><span class="${re.length?'b w':'b'}">${re.length}</span></div>`;
+ h+=`<div class="ki"><span class="k">Last event</span><span class="v">${formatAge(lastAgeSec)}</span></div>`;
+ h+=`</div></div>`;
+
+ // Zone 2: timeline
+ h+=`<div class="s"><div class="st"><span>Event Timeline</span><span class="c">newest first \u2014 click a row to expand</span></div>`;
+ if(!evs.length){
+  h+=`<p class="mu">No watchtower events yet.  Once a TX is broadcast, a revoked commitment is detected, or a tip reorg fires, events will stream in here.  The watchtower's <code>breach_detections</code>, <code>broadcast_log</code>, and <code>reorg_events</code> feed this view.</p>`;
+ }else{
+  const MAX=100;
+  for(const e of evs.slice(0,MAX)){
+   const isNew=newIds.has(e.id)?' lm-new':'';
+   h+=`<div class="lm-evt lm-evt-${e.type}${isNew}" onclick="lmToggle('${e.id}')">`;
+   h+=`<span class="lm-time">${ta(e.ts)}</span>`;
+   h+=`<span class="${e.tagCls}">${e.tag}</span>`;
+   h+=`<span class="lm-summary">${e.summary}</span>`;
+   h+=`</div>`;
+   h+=`<div class="lm-detail" id="lm-d-${e.id}" style="display:none">`;
+   h+=`<table>`;
+   for(const k of Object.keys(e.row)){
+    let v=e.row[k];
+    if(v===null||v===undefined)v='\u2014';
+    else if(typeof v==='string'&&v.length>40)v=`<span class="h">${v}</span>`;
+    h+=`<tr><td class="mu" style="padding-right:14px">${k}</td><td>${v}</td></tr>`;
+   }
+   h+=`</table></div>`;
+  }
+  if(evs.length>MAX)h+=`<p class="mu">\u2026 and ${evs.length-MAX} older events not shown</p>`;
+ }
+ h+=`</div>`;
+
+ // Zone 3: pending sweeps (state, not events \u2014 but operationally critical)
+ if(wp.length){
+  h+=`<div class="s"><div class="st"><span>Pending Sweeps</span><span class="c">${wp.length} penalty TX(s) in mempool</span></div>`;
+  h+=`<table><tr><th>TXID</th><th>On-chain</th><th class="r">Anchor Vout</th><th class="r">Anchor Amount</th><th class="r">Cycles</th><th class="r">Bumps</th></tr>`;
+  for(const w of wp)h+=`<tr><td class="h">${th(w.txid)}</td><td>${txBadge(D,w.txid)}</td><td class="r">${w.anchor_vout}</td><td class="r">${fs(w.anchor_amount)}</td><td class="r">${w.cycles_in_mempool}</td><td class="r">${w.bump_count}</td></tr>`;
+  h+=`</table></div>`;
+ }
+
+ return h;
+}
+
+// Toggle handler for Live Monitor detail panels.  Module-scope so the
+// inline onclick="lmToggle(...)" attribute finds it.
+function lmToggle(id){
+ const el=document.getElementById('lm-d-'+id);
+ if(!el)return;
+ el.style.display=el.style.display==='none'?'block':'none';
+}
+
 // === TAB: TX Inventory (preparedness ledger) ===
 // Renders every signed-bytes-bearing pre-signed TX the LSP holds, grouped
 // by category, plus a top-level "defense readiness" headline.  Surfaces
@@ -3474,6 +3648,7 @@ function render(D){
  h+=`<div class="tp ${curTab==='ceremonies'?'show':''}" id="t-ceremonies">${rCeremonies(D)}</div>`;
  h+=`<div class="tp ${curTab==='lightning'?'show':''}" id="t-lightning">${rLightning(D)}</div>`;
  h+=`<div class="tp ${curTab==='watchtower'?'show':''}" id="t-watchtower">${rWatchtower(D)}</div>`;
+ h+=`<div class="tp ${curTab==='livemon'?'show':''}" id="t-livemon">${rLiveMonitor(D)}</div>`;
  h+=`<div class="tp ${curTab==='defense'?'show':''}" id="t-defense">${rDefenseStatus(D)}</div>`;
  h+=`<div class="tp ${curTab==='txinv'?'show':''}" id="t-txinv">${rTxInventory(D)}</div>`;
  h+=`<div class="tp ${curTab==='outcomes'?'show':''}" id="t-outcomes">${rOutcomes(D)}</div>`;
