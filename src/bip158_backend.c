@@ -973,6 +973,65 @@ static void scan_tx_callback(const char *txid_hex,
 }
 
 /*
+ * Return the genesis-block hash (internal byte order, 32 bytes) for the
+ * configured network. Used by bip158_sync_headers to seed the locator on
+ * initial sync (Bitcoin Core 30.x silently drops empty-locator getheaders).
+ * Returns 1 on success + writes to out32, 0 on unknown network.
+ */
+static int bip158_genesis_hash(const char *network, uint8_t out32[32])
+{
+    /* Hashes are stored in INTERNAL byte order (reverse of the displayed
+     * hex you'd see in a block explorer).  Computed by reversing the
+     * canonical display strings:
+     *   mainnet:  000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+     *   testnet3: 000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943
+     *   testnet4: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043
+     *   signet:   00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6
+     *   regtest:  0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
+     */
+    static const struct { const char *name; uint8_t h[32]; } table[] = {
+        { "mainnet",
+          { 0x6f,0xe2,0x8c,0x0a,0xb6,0xf1,0xb3,0x72,
+            0xc1,0xa6,0xa2,0x46,0xae,0x63,0xf7,0x4f,
+            0x93,0x1e,0x83,0x65,0xe1,0x5a,0x08,0x9c,
+            0x68,0xd6,0x19,0x00,0x00,0x00,0x00,0x00 } },
+        { "testnet3",
+          { 0x43,0x49,0x7f,0xd7,0xf8,0x26,0x95,0x71,
+            0x08,0xf4,0xa3,0x0f,0xd9,0xce,0xc3,0xae,
+            0xba,0x79,0x97,0x20,0x84,0xe9,0x0e,0xad,
+            0x01,0xea,0x33,0x09,0x00,0x00,0x00,0x00 } },
+        { "testnet",
+          { 0x43,0x49,0x7f,0xd7,0xf8,0x26,0x95,0x71,
+            0x08,0xf4,0xa3,0x0f,0xd9,0xce,0xc3,0xae,
+            0xba,0x79,0x97,0x20,0x84,0xe9,0x0e,0xad,
+            0x01,0xea,0x33,0x09,0x00,0x00,0x00,0x00 } },
+        { "testnet4",
+          { 0x43,0xf0,0x8b,0xda,0xb0,0x50,0xe3,0x5b,
+            0x56,0xc8,0x67,0xb9,0x14,0x49,0xff,0x07,
+            0xae,0x72,0x5a,0xe2,0xde,0x53,0xbc,0xfb,
+            0xba,0xf2,0x84,0xda,0x00,0x00,0x00,0x00 } },
+        { "signet",
+          { 0xf6,0x1e,0xee,0x3b,0x63,0xa3,0x80,0xa4,
+            0x77,0xa0,0x63,0xaf,0x32,0xb2,0xbb,0xc9,
+            0x7c,0x9f,0xf9,0xf0,0x1f,0x2c,0x42,0x25,
+            0xe9,0x73,0x98,0x81,0x08,0x00,0x00,0x00 } },
+        { "regtest",
+          { 0x06,0x22,0x6e,0x46,0x11,0x1a,0x0b,0x59,
+            0xca,0xaf,0x12,0x60,0x43,0xeb,0x5b,0xbf,
+            0x28,0xc3,0x4f,0x3a,0x5e,0x33,0x2a,0x1f,
+            0xc7,0xb2,0xb7,0x3c,0xf1,0x88,0x91,0x0f } },
+    };
+    if (!network || !out32) return 0;
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(table[i].name, network) == 0) {
+            memcpy(out32, table[i].h, 32);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
  * Sync block header hashes into the ring buffer via P2P getheaders/headers.
  * Issues up to-2000-header round trips until the peer stops sending more.
  * Returns the highest synced height on success, or -1 on P2P error.
@@ -987,15 +1046,23 @@ static int bip158_sync_headers(bip158_backend_t *b)
     for (;;) {
         int start_height = (b->headers_synced >= 0) ? b->headers_synced + 1 : 0;
 
-        /* Single-entry locator from our current best known block, or empty */
+        /* Single-entry locator from our current best known block, or
+         * the genesis hash on initial sync. (#221 fix: Bitcoin Core 30.x
+         * silently drops empty-locator getheaders requests, so we must
+         * always send at least one hash.) */
         uint8_t        locator_buf[1][32];
-        const uint8_t (*locator)[32] = NULL;
-        size_t         n_locator     = 0;
+        const uint8_t (*locator)[32] = locator_buf;
+        size_t         n_locator     = 1;
         if (b->headers_synced >= 0) {
             memcpy(locator_buf[0],
                    b->header_hashes[b->headers_synced % BIP158_HEADER_WINDOW], 32);
-            locator   = locator_buf;
-            n_locator = 1;
+        } else if (!bip158_genesis_hash(b->network, locator_buf[0])) {
+            fprintf(stderr,
+                    "BIP158: unknown network %s — cannot seed genesis "
+                    "locator for initial sync\n",
+                    b->network);
+            result = -1;
+            break;
         }
 
         if (!p2p_send_getheaders(&b->peers[b->current_peer], locator, n_locator, NULL)) {
