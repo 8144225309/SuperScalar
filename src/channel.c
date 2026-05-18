@@ -892,6 +892,17 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
         rv.htlcs = htlc_copy;
     }
 
+    /* SF-W-PTLC #211: ptlcs is also a pointer (dynamic allocation); copy
+     * the array separately so the upcoming direction swap does not mutate
+     * the caller-owned ch->ptlcs storage. */
+    ptlc_t *ptlc_copy = NULL;
+    if (rv.n_ptlcs > 0) {
+        ptlc_copy = (ptlc_t *)malloc(rv.n_ptlcs * sizeof(ptlc_t));
+        if (!ptlc_copy) { free(htlc_copy); return 0; }
+        memcpy(ptlc_copy, ch->ptlcs, rv.n_ptlcs * sizeof(ptlc_t));
+        rv.ptlcs = ptlc_copy;
+    }
+
     /* Swap amounts */
     rv.local_amount = ch->remote_amount;
     rv.remote_amount = ch->local_amount;
@@ -911,8 +922,19 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
             rv.htlcs[i].direction = HTLC_OFFERED;
     }
 
+    /* SF-W-PTLC #211: flip PTLC directions for remote view, analogous to
+     * the HTLC swap above.  Without this the remote-view commit and the
+     * WT's lazy-built penalty TX disagree on the script for OFFERED PTLCs. */
+    for (size_t i = 0; i < rv.n_ptlcs; i++) {
+        if (rv.ptlcs[i].direction == PTLC_OFFERED)
+            rv.ptlcs[i].direction = PTLC_RECEIVED;
+        else
+            rv.ptlcs[i].direction = PTLC_OFFERED;
+    }
+
     int result = channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, &remote_pcp);
     free(htlc_copy);
+    free(ptlc_copy);
     return result;
 }
 
