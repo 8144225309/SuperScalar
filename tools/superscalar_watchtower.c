@@ -50,6 +50,7 @@ int main(int argc, char *argv[]) {
     const char *rpcuser = NULL;
     const char *rpcpassword = NULL;
     const char *datadir = NULL;
+    int inspect_db_mode = 0;
     int rpcport = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -78,6 +79,9 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--inspect-db") == 0) {
+            inspect_db_mode = 1;
+        }
         else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_watchtower %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -102,6 +106,60 @@ int main(int argc, char *argv[]) {
     if (!persist_open(&db, db_path)) {
         fprintf(stderr, "Error: cannot open database '%s'\n", db_path);
         return 1;
+    }
+
+    if (inspect_db_mode) {
+        /* CL6: forensic dump mode.  Read-only inspection of key tables.
+         * Operators run this against a snapshot DB to triage incidents
+         * without spinning up the chain backend.  Output is human-readable;
+         * for machine-readable use sqlite3 directly. */
+        printf("=== superscalar_watchtower --inspect-db ===\n");
+        printf("DB: %s\n", db_path);
+        printf("Schema version: %d\n", persist_schema_version(&db));
+        printf("\n");
+        /* Counts on key tables. */
+        struct { const char *name; const char *sql; } counts[] = {
+            { "factories",          "SELECT COUNT(*) FROM factories;" },
+            { "channels",           "SELECT COUNT(*) FROM channels;" },
+            { "old_commitments",    "SELECT COUNT(*) FROM old_commitments;" },
+            { "broadcast_log",      "SELECT COUNT(*) FROM broadcast_log;" },
+            { "breach_detections",  "SELECT COUNT(*) FROM breach_detections;" },
+            { "reorg_events",       "SELECT COUNT(*) FROM reorg_events;" },
+            { "signing_rounds",     "SELECT COUNT(*) FROM signing_rounds;" },
+            { "ceremonies",         "SELECT COUNT(*) FROM ceremonies;" },
+            { "ceremony_participants", "SELECT COUNT(*) FROM ceremony_participants;" },
+            { "revocation_releases","SELECT COUNT(*) FROM revocation_releases;" },
+        };
+        printf("Row counts:\n");
+        for (size_t k = 0; k < sizeof(counts)/sizeof(counts[0]); k++) {
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(db.db, counts[k].sql, -1, &stmt, NULL) == SQLITE_OK
+                && sqlite3_step(stmt) == SQLITE_ROW) {
+                printf("  %-24s %d\n", counts[k].name, sqlite3_column_int(stmt, 0));
+            } else {
+                printf("  %-24s (table missing)\n", counts[k].name);
+            }
+            if (stmt) sqlite3_finalize(stmt);
+        }
+        /* Last 10 broadcast_log entries. */
+        printf("\nLast 10 broadcast_log entries:\n");
+        const char *q = "SELECT broadcast_at, source, result, "
+                        "substr(txid,1,16) FROM broadcast_log "
+                        "ORDER BY broadcast_at DESC LIMIT 10;";
+        sqlite3_stmt *bl = NULL;
+        if (sqlite3_prepare_v2(db.db, q, -1, &bl, NULL) == SQLITE_OK) {
+            while (sqlite3_step(bl) == SQLITE_ROW) {
+                printf("  ts=%lld src=%-16s result=%-8s txid=%s...\n",
+                       (long long)sqlite3_column_int64(bl, 0),
+                       (const char *)sqlite3_column_text(bl, 1),
+                       (const char *)sqlite3_column_text(bl, 2),
+                       (const char *)sqlite3_column_text(bl, 3));
+            }
+            sqlite3_finalize(bl);
+        }
+        printf("\n=== done ===\n");
+        persist_close(&db);
+        return 0;
     }
 
     /* Initialize bitcoin RPC connection */
