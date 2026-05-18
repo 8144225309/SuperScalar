@@ -55,6 +55,7 @@
 #define MSG_INVOICE_CREATED     0x4B  /* Client → LSP: here's the payment_hash */
 
 /* PTLC key turnover messages (Tier 3) */
+#define MSG_ROTATION_BEGIN      0x56  /* LSP → Client: rotation context precursor (gates blind-signing — #196) */
 #define MSG_PTLC_PRESIG         0x4C  /* LSP → Client: adaptor pre-signature */
 #define MSG_PTLC_ADAPTED_SIG    0x4D  /* Client → LSP: adapted signature */
 #define MSG_PTLC_COMPLETE       0x4E  /* LSP → Client: turnover acknowledged */
@@ -515,6 +516,29 @@ int wire_parse_invoice_created(const cJSON *json,
                                  uint64_t *amount_msat);
 
 /* --- PTLC key turnover messages (Tier 3) --- */
+
+/* LSP → Client: ROTATION_BEGIN {dying_factory_funding_txid, new_factory_nonce,
+   rotation_epoch} — REQUIRED precursor to MSG_PTLC_PRESIG.  Gates the client
+   blind-signing path (#196 audit).  Client records the context and uses it
+   to compute the expected turnover_msg for the next PTLC_PRESIG; refuses
+   any PTLC_PRESIG whose turnover_msg doesn't match this context. */
+cJSON *wire_build_rotation_begin(const unsigned char *dying_factory_txid32,
+                                  const unsigned char *new_factory_nonce32,
+                                  uint64_t rotation_epoch);
+
+int wire_parse_rotation_begin(const cJSON *json,
+                               unsigned char *dying_factory_txid32,
+                               unsigned char *new_factory_nonce32,
+                               uint64_t *rotation_epoch);
+
+/* Compute the context-bound turnover_msg32 from the rotation context.
+   sha256_tagged("ss/turnover/v1", dying_factory_txid || new_factory_nonce ||
+   be64(rotation_epoch), 72) → 32-byte output.  Both LSP and client compute
+   this independently; client refuses PTLC_PRESIG if computed != received. */
+void wire_compute_turnover_msg(const unsigned char *dying_factory_txid32,
+                                const unsigned char *new_factory_nonce32,
+                                uint64_t rotation_epoch,
+                                unsigned char *turnover_msg_out32);
 
 /* LSP → Client: PTLC_PRESIG {presig, nonce_parity, turnover_msg} */
 cJSON *wire_build_ptlc_presig(const unsigned char *presig64,

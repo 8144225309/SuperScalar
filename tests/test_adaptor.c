@@ -1,6 +1,7 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/ptlc_commit.h"
+#include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
@@ -940,5 +941,143 @@ int test_ptlc_complete_via_dispatch(void)
     ln_dispatch_t d; memset(&d, 0, sizeof(d));
     int r = ln_dispatch_process_msg(&d, 0, msg, sizeof(msg));
     TEST_ASSERT(r == 78, "PTLC12: type 0x4E dispatched as 78");
+    return 1;
+}
+
+/* ================================================================== */
+/* #196 — context-bound turnover_msg + ROTATION_BEGIN wire codec.    */
+/* ================================================================== */
+
+/* Test PTLC_TA1 — wire_compute_turnover_msg deterministic for same input. */
+int test_ptlc_ta1_turnover_msg_deterministic(void)
+{
+    unsigned char dying[32], nonce[32];
+    memset(dying, 0xAA, 32);
+    memset(nonce, 0xBB, 32);
+    uint64_t epoch = 0xDEADBEEFCAFEBABEULL;
+
+    unsigned char out1[32], out2[32];
+    wire_compute_turnover_msg(dying, nonce, epoch, out1);
+    wire_compute_turnover_msg(dying, nonce, epoch, out2);
+    TEST_ASSERT(memcmp(out1, out2, 32) == 0,
+                "PTLC_TA1: same input must produce same output");
+    return 1;
+}
+
+/* Test PTLC_TA2 — wire_compute_turnover_msg changes on dying_factory_txid. */
+int test_ptlc_ta2_turnover_msg_binds_dying(void)
+{
+    unsigned char dying_a[32], dying_b[32], nonce[32];
+    memset(dying_a, 0x01, 32);
+    memset(dying_b, 0x02, 32);
+    memset(nonce,   0xBB, 32);
+    uint64_t epoch = 100;
+
+    unsigned char a[32], b[32];
+    wire_compute_turnover_msg(dying_a, nonce, epoch, a);
+    wire_compute_turnover_msg(dying_b, nonce, epoch, b);
+    TEST_ASSERT(memcmp(a, b, 32) != 0,
+                "PTLC_TA2: changing dying_factory_txid must change output");
+    return 1;
+}
+
+/* Test PTLC_TA3 — wire_compute_turnover_msg changes on new_factory_nonce. */
+int test_ptlc_ta3_turnover_msg_binds_nonce(void)
+{
+    unsigned char dying[32], nonce_a[32], nonce_b[32];
+    memset(dying,    0xAA, 32);
+    memset(nonce_a,  0x01, 32);
+    memset(nonce_b,  0x02, 32);
+    uint64_t epoch = 100;
+
+    unsigned char a[32], b[32];
+    wire_compute_turnover_msg(dying, nonce_a, epoch, a);
+    wire_compute_turnover_msg(dying, nonce_b, epoch, b);
+    TEST_ASSERT(memcmp(a, b, 32) != 0,
+                "PTLC_TA3: changing new_factory_nonce must change output");
+    return 1;
+}
+
+/* Test PTLC_TA4 — wire_compute_turnover_msg changes on rotation_epoch. */
+int test_ptlc_ta4_turnover_msg_binds_epoch(void)
+{
+    unsigned char dying[32], nonce[32];
+    memset(dying, 0xAA, 32);
+    memset(nonce, 0xBB, 32);
+
+    unsigned char a[32], b[32];
+    wire_compute_turnover_msg(dying, nonce, 100, a);
+    wire_compute_turnover_msg(dying, nonce, 101, b);
+    TEST_ASSERT(memcmp(a, b, 32) != 0,
+                "PTLC_TA4: changing rotation_epoch must change output");
+    return 1;
+}
+
+/* Test PTLC_TA5 — wire_compute_turnover_msg differs from legacy constant. */
+int test_ptlc_ta5_turnover_msg_not_legacy(void)
+{
+    unsigned char legacy[32];
+    sha256_tagged("turnover", (const unsigned char *)"turnover", 8, legacy);
+
+    unsigned char dying[32], nonce[32];
+    memset(dying, 0xAA, 32);
+    memset(nonce, 0xBB, 32);
+    unsigned char bound[32];
+    wire_compute_turnover_msg(dying, nonce, 42, bound);
+
+    TEST_ASSERT(memcmp(legacy, bound, 32) != 0,
+                "PTLC_TA5: bound output must differ from legacy constant");
+    return 1;
+}
+
+/* Test PTLC_TA6 — wire_build_rotation_begin / wire_parse_rotation_begin roundtrip. */
+int test_ptlc_ta6_rotation_begin_codec_roundtrip(void)
+{
+    unsigned char dying_in[32], nonce_in[32];
+    for (int i = 0; i < 32; i++) { dying_in[i] = (unsigned char)(i + 1); }
+    for (int i = 0; i < 32; i++) { nonce_in[i] = (unsigned char)(0xF0 ^ i); }
+    uint64_t epoch_in = 0x1122334455667788ULL;
+
+    cJSON *j = wire_build_rotation_begin(dying_in, nonce_in, epoch_in);
+    TEST_ASSERT(j != NULL, "PTLC_TA6: build_rotation_begin");
+
+    unsigned char dying_out[32], nonce_out[32];
+    uint64_t epoch_out = 0;
+    int r = wire_parse_rotation_begin(j, dying_out, nonce_out, &epoch_out);
+    cJSON_Delete(j);
+    TEST_ASSERT(r == 1, "PTLC_TA6: parse_rotation_begin");
+    TEST_ASSERT(memcmp(dying_in, dying_out, 32) == 0, "PTLC_TA6: dying roundtrip");
+    TEST_ASSERT(memcmp(nonce_in, nonce_out, 32) == 0, "PTLC_TA6: nonce roundtrip");
+    TEST_ASSERT(epoch_in == epoch_out, "PTLC_TA6: epoch roundtrip");
+    return 1;
+}
+
+/* Test PTLC_TA7 — wire_parse_rotation_begin rejects malformed input. */
+int test_ptlc_ta7_rotation_begin_parse_rejects_malformed(void)
+{
+    unsigned char dying_out[32], nonce_out[32];
+    uint64_t epoch_out = 0;
+
+    /* NULL json */
+    TEST_ASSERT(wire_parse_rotation_begin(NULL, dying_out, nonce_out, &epoch_out) == 0,
+                "PTLC_TA7a: NULL json refused");
+
+    /* empty object */
+    cJSON *empty = cJSON_CreateObject();
+    TEST_ASSERT(wire_parse_rotation_begin(empty, dying_out, nonce_out, &epoch_out) == 0,
+                "PTLC_TA7b: empty object refused");
+    cJSON_Delete(empty);
+
+    /* missing rotation_epoch */
+    cJSON *partial = cJSON_CreateObject();
+    unsigned char d[32], n[32];
+    memset(d, 0xAA, 32); memset(n, 0xBB, 32);
+    extern void wire_json_add_hex(cJSON *j, const char *k, const unsigned char *v, size_t l);
+    wire_json_add_hex(partial, "dying_factory_txid", d, 32);
+    wire_json_add_hex(partial, "new_factory_nonce",  n, 32);
+    TEST_ASSERT(wire_parse_rotation_begin(partial, dying_out, nonce_out, &epoch_out) == 0,
+                "PTLC_TA7c: missing epoch refused");
+    cJSON_Delete(partial);
+
     return 1;
 }

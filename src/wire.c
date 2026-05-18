@@ -1,4 +1,5 @@
 #include "superscalar/wire.h"
+#include "superscalar/sha256.h"
 #include "superscalar/lsp_queue.h"
 #include "superscalar/factory.h"
 #include "superscalar/noise.h"
@@ -1361,6 +1362,56 @@ int wire_parse_invoice_created(const cJSON *json,
 }
 
 /* --- PTLC key turnover messages (Tier 3) --- */
+
+/* SF-PTLC-TURNOVER-AUTH #196: rotation-context precursor message.
+   Sent by LSP before MSG_PTLC_PRESIG so the client can bind the upcoming
+   adaptor pre-signature to a specific rotation, refusing replay/abuse. */
+cJSON *wire_build_rotation_begin(const unsigned char *dying_factory_txid32,
+                                  const unsigned char *new_factory_nonce32,
+                                  uint64_t rotation_epoch) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "dying_factory_txid", dying_factory_txid32, 32);
+    wire_json_add_hex(j, "new_factory_nonce",   new_factory_nonce32,  32);
+    /* #196: encode rotation_epoch as hex string for uint64 precision. */
+    char rotation_epoch_hex[17];
+    snprintf(rotation_epoch_hex, sizeof(rotation_epoch_hex),
+             "%016llx", (unsigned long long)rotation_epoch);
+    cJSON_AddStringToObject(j, "rotation_epoch", rotation_epoch_hex);
+    return j;
+}
+
+int wire_parse_rotation_begin(const cJSON *json,
+                               unsigned char *dying_factory_txid32,
+                               unsigned char *new_factory_nonce32,
+                               uint64_t *rotation_epoch) {
+    if (!json) return 0;
+    if (wire_json_get_hex(json, "dying_factory_txid", dying_factory_txid32, 32) != 32)
+        return 0;
+    if (wire_json_get_hex(json, "new_factory_nonce", new_factory_nonce32, 32) != 32)
+        return 0;
+    cJSON *e = cJSON_GetObjectItem(json, "rotation_epoch");
+    if (!e || !cJSON_IsString(e) || !e->valuestring) return 0;
+    /* #196: decode hex string for uint64 precision. */
+    *rotation_epoch = (uint64_t)strtoull(e->valuestring, NULL, 16);
+    return 1;
+}
+
+/* Compute context-bound turnover_msg32 from rotation context.  Both LSP
+   and client compute this independently; mismatch on the client side
+   triggers refusal of MSG_PTLC_PRESIG.  Tag is "ss/turnover/v1" — bump
+   the version suffix if the binding format ever changes. */
+void wire_compute_turnover_msg(const unsigned char *dying_factory_txid32,
+                                const unsigned char *new_factory_nonce32,
+                                uint64_t rotation_epoch,
+                                unsigned char *turnover_msg_out32) {
+    unsigned char buf[32 + 32 + 8];
+    memcpy(buf,      dying_factory_txid32, 32);
+    memcpy(buf + 32, new_factory_nonce32,  32);
+    /* Encode rotation_epoch as big-endian 8 bytes (matches BIP-340 style). */
+    for (int i = 0; i < 8; i++)
+        buf[64 + i] = (unsigned char)((rotation_epoch >> (56 - 8 * i)) & 0xFF);
+    sha256_tagged("ss/turnover/v1", buf, sizeof(buf), turnover_msg_out32);
+}
 
 cJSON *wire_build_ptlc_presig(const unsigned char *presig64,
                                int nonce_parity,
