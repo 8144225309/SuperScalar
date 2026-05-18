@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# test_testnet4_splice.sh — BOLT-2 splice on real testnet4.
+# test_testnet4_splice.sh — BOLT-2 splice WIRE-CODEC SMOKE on real testnet4.
 #
-# Validates the splice protocol (STFU → SPLICE_INIT → SPLICE_ACK →
-# SPLICE_CREATED → SPLICE_LOCKED) end-to-end on testnet4.  Regtest
-# coverage exists via --test-splice in manual_tests.py; this is the
-# real-chain counterpart.
+# CAVEAT: this is NOT a full BOLT-2 splice end-to-end.  SuperScalar's
+# current splice implementation is a wire-codec stub (#198 SF-SPLICE-FULL
+# tracks the real version).  In particular:
+#   - LSP never contributes to the splice TX (acceptor_contribution = 0).
+#   - LSP doesn't participate in building the splice TX (no interactive-tx).
+#   - LSP doesn't sign the splice TX (no MuSig ceremony for splice).
+#   - SPLICE_LOCKED records the new outpoint but keeps the old funding_amount.
 #
-# Pass criteria:
-#   1. Factory funded + tree broadcast on testnet4
-#   2. Splice-out 10k sats from channel[0] succeeds
-#   3. Splice TX confirms on testnet4 chain
-#   4. Both sides log "SPLICE_LOCKED"
+# This runner exercises ONLY:
+#   1. STFU/STFU_ACK quiescence flow.
+#   2. SPLICE_INIT → SPLICE_ACK wire round-trip.
+#   3. Client builds + broadcasts a splice TX externally (NOT collaborative).
+#   4. SPLICE_LOCKED wire round-trip + channel outpoint update on the LSP side.
+#
+# PASS here means the wire codec works on testnet4.  It does NOT prove
+# splice would work against an external Lightning peer (CLN/LND).  That
+# requires the full implementation in #198.
 #
 # Wall time: ~30-60 min (depends on testnet4 block timing).
 
