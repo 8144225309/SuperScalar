@@ -49,7 +49,10 @@ enum {
     PERSIST_CEREMONY_TYPE_CLOSE        = 6,  /* v2 */
     PERSIST_CEREMONY_TYPE_DISTRIBUTION_UPDATE = 7, /* v2 */
     PERSIST_CEREMONY_TYPE_STATE_UPDATE = 8,  /* v2 */
-    PERSIST_CEREMONY_TYPE_PENALTY_BURN = 9,
+    PERSIST_CEREMONY_TYPE_RESERVED_DEPRECATED_PENALTY_BURN = 9,
+    /* SF-CEREMONY-HELPERS §4 (wallet team 2026-05-18): PENALTY_BURN
+       was dropped from v1 ceremony types after correction. Type byte
+       0x09 reserved unused; never write rows with this type. */
     PERSIST_CEREMONY_TYPE_ABORT        = 10,
 };
 
@@ -1162,5 +1165,167 @@ int persist_save_fee_settlement(persist_t *p, uint32_t factory_id,
 int persist_load_fee_settlement(persist_t *p, uint32_t factory_id,
                                  uint64_t *accumulated_fees_sats_out,
                                  uint32_t *last_settlement_block_out);
+
+/* === SF-CEREMONY-HELPERS #185 follow-up =====================================
+ *
+ * Plugin-side accessors over the v34 ceremony schema (#185 / PR #252).
+ * Wallet team API per coord doc 2026-05-18.  Lib owns crypto + ceremony
+ * bookkeeping; plugin owns orchestration + state transitions.
+ *
+ * All API takes the 32-byte factory_instance_id BLOB (not the autoincrement
+ * factory_id) per wallet team §3 agreement.  Lib translates internally if
+ * needed.
+ *
+ * Hard finalization guard (§2 agreement): persist_update_ceremony_state
+ * REFUSES the FINALIZED transition if any ceremony_participants row for
+ * this ceremony has phase != PERSIST_CEREMONY_PHASE_SIGNED.  This prevents
+ * the dual-signature trap (plugin re-asking a participant to sign a
+ * different TX for the same epoch boundary after a crash).
+ * ============================================================================ */
+
+/* Loaded ceremony row.  Out-only struct used by load + scan helpers. */
+typedef struct {
+    unsigned char ceremony_id[8];
+    unsigned char factory_instance_id[32];
+    uint8_t       ceremony_type;        /* PERSIST_CEREMONY_TYPE_* */
+    int           has_parent;
+    unsigned char parent_ceremony_id[8];
+    uint32_t      started_at_block;
+    uint32_t      deadline_block;
+    uint8_t       state;                /* PERSIST_CEREMONY_STATE_* */
+    int           has_aggregated_nonce;
+    unsigned char aggregated_nonce[66]; /* musig2 pubnonce, 66 bytes */
+    int           has_final_signature;
+    unsigned char final_signature[64];
+    int           has_broadcast_txid;
+    unsigned char broadcast_txid[32];   /* internal order */
+    int           has_abort_reason;
+    uint8_t       abort_reason;
+} persist_ceremony_t;
+
+/* Loaded participant row.  Out-only struct used by scan helper. */
+typedef struct {
+    unsigned char ceremony_id[8];
+    unsigned char participant_pubkey[33];
+    uint8_t       phase;                /* PERSIST_CEREMONY_PHASE_* */
+    int           has_public_nonce;
+    unsigned char public_nonce[66];
+    int           has_partial_signature;
+    unsigned char partial_signature[32]; /* schnorr s-scalar half */
+    int           has_refuse_code;
+    uint8_t       refuse_code;
+    int64_t       last_sent_at;         /* unix ts, 0 if unset */
+} persist_participant_t;
+
+/* Scan callbacks.  Return 0 to stop iteration, 1 to continue. */
+typedef int (*persist_ceremony_cb_t)(const persist_ceremony_t *c, void *user_data);
+typedef int (*persist_participant_cb_t)(const persist_participant_t *p, void *user_data);
+
+/* --- Core CRUD --- */
+
+/* Insert a new ceremony row.  parent_ceremony_id8_or_null == NULL means
+ * this is the first ceremony on the factory (no parent linkage).  Returns
+ * 1 on success, 0 on error. */
+int persist_save_ceremony(persist_t *p,
+                           const unsigned char *ceremony_id8,
+                           const unsigned char *factory_instance_id32,
+                           uint8_t ceremony_type,
+                           const unsigned char *parent_ceremony_id8_or_null,
+                           uint32_t started_at_block,
+                           uint32_t deadline_block);
+
+/* Load a ceremony by id.  Returns 1 if found + populates out; 0 if not
+ * found or error. */
+int persist_load_ceremony(persist_t *p,
+                           const unsigned char *ceremony_id8,
+                           persist_ceremony_t *out);
+
+/* Update a ceremony's state column.  When new_state == FINALIZED, runs the
+ * hard guard: counts ceremony_participants where phase != SIGNED; if any,
+ * refuses the transition and returns 0 (caller MUST then transition to
+ * PARTIAL_FAILED or ABORTED via a separate call).
+ *
+ * Returns 1 on success, 0 on failure (including guard failure).  Idempotent
+ * on identical state transitions. */
+int persist_update_ceremony_state(persist_t *p,
+                                   const unsigned char *ceremony_id8,
+                                   uint8_t new_state);
+
+/* Optional: attach aggregated_nonce when state transitions to
+ * NONCES_AGGREGATED, or final_signature when transitioning to FINALIZED.
+ * Either field can be NULL to leave unchanged.  Returns 1 on success. */
+int persist_update_ceremony_artifacts(persist_t *p,
+                                       const unsigned char *ceremony_id8,
+                                       const unsigned char *aggregated_nonce66_or_null,
+                                       const unsigned char *final_signature64_or_null,
+                                       const unsigned char *broadcast_txid32_or_null,
+                                       int has_abort_reason, uint8_t abort_reason);
+
+/* Insert-or-update a participant phase row.  *_or_null params can be NULL
+ * to leave that column unchanged on update (or NULL on insert).
+ * has_refuse_code == 0 leaves refuse_code unchanged on update / NULL on
+ * insert.  Returns 1 on success. */
+int persist_save_participant_phase(persist_t *p,
+                                    const unsigned char *ceremony_id8,
+                                    const unsigned char *participant_pubkey33,
+                                    uint8_t phase,
+                                    const unsigned char *public_nonce66_or_null,
+                                    const unsigned char *partial_signature32_or_null,
+                                    int has_refuse_code, uint8_t refuse_code);
+
+/* Insert a revocation_releases row.  Returns 1 on success, 0 on error
+ * (including UNIQUE conflict if (factory_id, state_id, participant) already
+ * exists — safe to ignore in idempotent retry scenarios). */
+int persist_save_revocation_release(persist_t *p,
+                                      const unsigned char *factory_instance_id32,
+                                      const unsigned char *state_id32,
+                                      const unsigned char *participant_pubkey33,
+                                      const unsigned char *revocation_secret32,
+                                      uint32_t received_at_block);
+
+/* Count revocations for a specific (factory, state) pair.  Returns the
+ * count (>=0) on success, or -1 on error.  Used as the "all required
+ * revocations received → next ceremony allowed" gate (§5.3 invariant 3). */
+int persist_count_revocations_for_state(persist_t *p,
+                                          const unsigned char *factory_instance_id32,
+                                          const unsigned char *state_id32);
+
+/* --- Scans --- */
+
+/* Walk every in-flight ceremony (state < FINALIZED) for this factory.
+ * Returns 1 if iteration completed (or cb returned 0 to stop), 0 on error. */
+int persist_scan_in_flight_ceremonies(persist_t *p,
+                                        const unsigned char *factory_instance_id32,
+                                        persist_ceremony_cb_t cb,
+                                        void *user_data);
+
+/* SF-CEREMONY-HELPERS §1a: walk every participant for this ceremony.
+ * phase_filter is one of PERSIST_CEREMONY_PHASE_* values, OR 0xFF to match
+ * any phase. Returns 1 on completion, 0 on error. */
+int persist_scan_participants(persist_t *p,
+                                const unsigned char *ceremony_id8,
+                                uint8_t phase_filter,
+                                persist_participant_cb_t cb,
+                                void *user_data);
+
+/* SF-CEREMONY-HELPERS §1b: get the most recent FINALIZED ceremony id for
+ * this factory.  Writes the 8-byte id to out_ceremony_id8 and returns 1 on
+ * found; returns 0 if no finalized ceremony exists yet (out unchanged).
+ * Used to verify CEREMONY_START.parent_ceremony_id on every wire msg —
+ * indexed via idx_ceremonies_factory(factory_instance_id, state). */
+int persist_get_last_finalized_ceremony(persist_t *p,
+                                          const unsigned char *factory_instance_id32,
+                                          unsigned char *out_ceremony_id8);
+
+/* SF-CEREMONY-HELPERS §1c: walk every ceremony on this factory, regardless
+ * of state.  state_filter is one of PERSIST_CEREMONY_STATE_* values, OR -1
+ * for any state.  Used by operator/dashboard RPCs. */
+int persist_scan_ceremonies_by_factory(persist_t *p,
+                                         const unsigned char *factory_instance_id32,
+                                         int state_filter,
+                                         persist_ceremony_cb_t cb,
+                                         void *user_data);
+
+/* === End SF-CEREMONY-HELPERS ============================================== */
 
 #endif /* SUPERSCALAR_PERSIST_H */

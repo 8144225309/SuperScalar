@@ -4305,3 +4305,306 @@ int test_persist_observability_tables(void)
     persist_close(&db);
     return 1;
 }
+
+/* === SF-CEREMONY-HELPERS test suite (#199 / wallet team API) ============== */
+
+static int ch_test_count_cb(const persist_ceremony_t *c, void *ud) {
+    (void)c;
+    int *n = (int *)ud;
+    (*n)++;
+    return 1;
+}
+
+static int ch_test_count_p_cb(const persist_participant_t *p, void *ud) {
+    (void)p;
+    int *n = (int *)ud;
+    (*n)++;
+    return 1;
+}
+
+/* CH_T1 — save + load roundtrip */
+int test_ceremony_helpers_save_load(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory");
+    unsigned char cid[8]   = {1,2,3,4,5,6,7,8};
+    unsigned char fid[32];  memset(fid, 0xAA, 32);
+    unsigned char pid[8]   = {9,8,7,6,5,4,3,2};
+    TEST_ASSERT(persist_save_ceremony(&db, cid, fid,
+                                       PERSIST_CEREMONY_TYPE_ROTATE, pid,
+                                       100, 200),
+                "save");
+    persist_ceremony_t out;
+    TEST_ASSERT(persist_load_ceremony(&db, cid, &out), "load");
+    TEST_ASSERT(memcmp(out.ceremony_id, cid, 8) == 0,           "cid roundtrip");
+    TEST_ASSERT(memcmp(out.factory_instance_id, fid, 32) == 0,  "fid roundtrip");
+    TEST_ASSERT(out.ceremony_type == PERSIST_CEREMONY_TYPE_ROTATE, "type roundtrip");
+    TEST_ASSERT(out.has_parent == 1,                            "parent flag");
+    TEST_ASSERT(memcmp(out.parent_ceremony_id, pid, 8) == 0,    "parent roundtrip");
+    TEST_ASSERT(out.started_at_block == 100,                    "started block");
+    TEST_ASSERT(out.deadline_block == 200,                      "deadline block");
+    TEST_ASSERT(out.state == PERSIST_CEREMONY_STATE_PENDING_NONCES, "initial state");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T2 — load nonexistent returns 0 */
+int test_ceremony_helpers_load_missing(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    persist_ceremony_t out;
+    TEST_ASSERT(persist_load_ceremony(&db, cid, &out) == 0, "miss returns 0");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T3 — state transition guard: FINALIZED refuses if any participant
+            not at phase=SIGNED. */
+int test_ceremony_helpers_finalize_guard(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8] = {1};   /* simplistic ids */
+    unsigned char fid[32]; memset(fid, 0xBB, 32);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 1, 100);
+    /* Add 2 participants — one SIGNED, one only NONCED. */
+    unsigned char p1[33]; memset(p1, 0x01, 33);
+    unsigned char p2[33]; memset(p2, 0x02, 33);
+    persist_save_participant_phase(&db, cid, p1,
+                                    PERSIST_CEREMONY_PHASE_SIGNED, NULL, NULL,
+                                    0, 0);
+    persist_save_participant_phase(&db, cid, p2,
+                                    PERSIST_CEREMONY_PHASE_NONCED, NULL, NULL,
+                                    0, 0);
+    /* FINALIZED transition should refuse. */
+    int rc = persist_update_ceremony_state(&db, cid,
+                                            PERSIST_CEREMONY_STATE_FINALIZED);
+    TEST_ASSERT(rc == 0, "finalize refused when participant not signed");
+    /* But transition to PARTIAL_FAILED should succeed (no guard). */
+    rc = persist_update_ceremony_state(&db, cid,
+                                       PERSIST_CEREMONY_STATE_PARTIAL_FAILED);
+    TEST_ASSERT(rc == 1, "partial_failed succeeds");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T4 — state transition guard: FINALIZED succeeds when all signed. */
+int test_ceremony_helpers_finalize_all_signed(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8] = {2};
+    unsigned char fid[32]; memset(fid, 0xCC, 32);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 1, 100);
+    for (int i = 0; i < 3; i++) {
+        unsigned char pk[33]; memset(pk, (unsigned char)(0x10 + i), 33);
+        persist_save_participant_phase(&db, cid, pk,
+                                        PERSIST_CEREMONY_PHASE_SIGNED,
+                                        NULL, NULL, 0, 0);
+    }
+    int rc = persist_update_ceremony_state(&db, cid,
+                                            PERSIST_CEREMONY_STATE_FINALIZED);
+    TEST_ASSERT(rc == 1, "finalize succeeds when all signed");
+    persist_ceremony_t out;
+    persist_load_ceremony(&db, cid, &out);
+    TEST_ASSERT(out.state == PERSIST_CEREMONY_STATE_FINALIZED, "state finalized");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T5 — get_last_finalized_ceremony returns most recent. */
+int test_ceremony_helpers_last_finalized(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char fid[32]; memset(fid, 0xDD, 32);
+    /* Create 3 ceremonies in temporal order. */
+    for (int i = 1; i <= 3; i++) {
+        unsigned char cid[8]; memset(cid, (unsigned char)i, 8);
+        persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_ROTATE,
+                               NULL, /* started_at_block */ (uint32_t)(100 + i),
+                               200);
+        if (i < 3) {  /* finalize first two */
+            unsigned char pk[33]; memset(pk, 0x01, 33);
+            persist_save_participant_phase(&db, cid, pk,
+                                            PERSIST_CEREMONY_PHASE_SIGNED,
+                                            NULL, NULL, 0, 0);
+            persist_update_ceremony_state(&db, cid,
+                                           PERSIST_CEREMONY_STATE_FINALIZED);
+        }
+    }
+    unsigned char latest[8];
+    int rc = persist_get_last_finalized_ceremony(&db, fid, latest);
+    TEST_ASSERT(rc == 1, "found a finalized");
+    /* Should be ceremony id {2,2,...} since it had the latest started_at_block
+       among finalized. */
+    TEST_ASSERT(latest[0] == 2, "latest is c2");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T6 — get_last_finalized_ceremony returns 0 if none finalized. */
+int test_ceremony_helpers_last_finalized_none(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char fid[32]; memset(fid, 0xEE, 32);
+    unsigned char cid[8]; memset(cid, 0x01, 8);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 100, 200);
+    /* Still in PENDING_NONCES, not finalized. */
+    unsigned char latest[8] = {0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA};
+    int rc = persist_get_last_finalized_ceremony(&db, fid, latest);
+    TEST_ASSERT(rc == 0, "no finalized → returns 0");
+    TEST_ASSERT(latest[0] == 0xAA, "out unchanged on miss");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T7 — scan_participants filtered + any. */
+int test_ceremony_helpers_scan_participants(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8] = {0x03};
+    unsigned char fid[32]; memset(fid, 0xFF, 32);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 1, 100);
+    /* 4 participants, 2 signed + 1 nonced + 1 refused. */
+    for (int i = 0; i < 4; i++) {
+        unsigned char pk[33]; memset(pk, (unsigned char)(0x20 + i), 33);
+        uint8_t phase = (i < 2) ? PERSIST_CEREMONY_PHASE_SIGNED
+                      : (i == 2 ? PERSIST_CEREMONY_PHASE_NONCED
+                                : PERSIST_CEREMONY_PHASE_REFUSED);
+        persist_save_participant_phase(&db, cid, pk, phase, NULL, NULL, 0, 0);
+    }
+    int any_count = 0;
+    persist_scan_participants(&db, cid, 0xFF, ch_test_count_p_cb, &any_count);
+    TEST_ASSERT(any_count == 4, "scan any → 4");
+    int signed_count = 0;
+    persist_scan_participants(&db, cid, PERSIST_CEREMONY_PHASE_SIGNED,
+                               ch_test_count_p_cb, &signed_count);
+    TEST_ASSERT(signed_count == 2, "scan signed → 2");
+    int refused_count = 0;
+    persist_scan_participants(&db, cid, PERSIST_CEREMONY_PHASE_REFUSED,
+                               ch_test_count_p_cb, &refused_count);
+    TEST_ASSERT(refused_count == 1, "scan refused → 1");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T8 — scan_ceremonies_by_factory all + state-filtered. */
+int test_ceremony_helpers_scan_by_factory(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char fid_a[32]; memset(fid_a, 0xA1, 32);
+    unsigned char fid_b[32]; memset(fid_b, 0xB1, 32);
+    /* 3 ceremonies on fid_a, 1 on fid_b. */
+    for (int i = 0; i < 3; i++) {
+        unsigned char cid[8]; memset(cid, (unsigned char)(0x40 + i), 8);
+        persist_save_ceremony(&db, cid, fid_a, PERSIST_CEREMONY_TYPE_ROTATE,
+                               NULL, (uint32_t)(100 + i), 200);
+    }
+    {
+        unsigned char cid[8]; memset(cid, 0x50, 8);
+        persist_save_ceremony(&db, cid, fid_b, PERSIST_CEREMONY_TYPE_ROTATE,
+                               NULL, 100, 200);
+    }
+    int n_a = 0;
+    persist_scan_ceremonies_by_factory(&db, fid_a, -1, ch_test_count_cb, &n_a);
+    TEST_ASSERT(n_a == 3, "scan all on fid_a → 3");
+    int n_b = 0;
+    persist_scan_ceremonies_by_factory(&db, fid_b, -1, ch_test_count_cb, &n_b);
+    TEST_ASSERT(n_b == 1, "scan all on fid_b → 1");
+    /* Mark one ceremony on fid_a as ABORTED. */
+    unsigned char cid_abort[8]; memset(cid_abort, 0x40, 8);
+    persist_update_ceremony_state(&db, cid_abort,
+                                   PERSIST_CEREMONY_STATE_ABORTED);
+    int n_aborted = 0;
+    persist_scan_ceremonies_by_factory(&db, fid_a,
+                                         PERSIST_CEREMONY_STATE_ABORTED,
+                                         ch_test_count_cb, &n_aborted);
+    TEST_ASSERT(n_aborted == 1, "filtered scan → 1 aborted");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T9 — revocation_releases save + count idempotent on duplicate. */
+int test_ceremony_helpers_revocations(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char fid[32]; memset(fid, 0xAB, 32);
+    unsigned char sid[32]; memset(sid, 0xCD, 32);
+    unsigned char pk[33];  memset(pk, 0x11, 33);
+    unsigned char sec[32]; memset(sec, 0xEF, 32);
+    TEST_ASSERT(persist_save_revocation_release(&db, fid, sid, pk, sec, 1000),
+                "first save");
+    TEST_ASSERT(persist_save_revocation_release(&db, fid, sid, pk, sec, 1001),
+                "second save (idempotent — INSERT OR IGNORE returns DONE)");
+    TEST_ASSERT(persist_count_revocations_for_state(&db, fid, sid) == 1,
+                "count = 1 after duplicate insert");
+    /* Add a different participant. */
+    unsigned char pk2[33]; memset(pk2, 0x22, 33);
+    persist_save_revocation_release(&db, fid, sid, pk2, sec, 1002);
+    TEST_ASSERT(persist_count_revocations_for_state(&db, fid, sid) == 2,
+                "count = 2 after second participant");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T10 — scan_in_flight_ceremonies excludes FINALIZED + ABORTED. */
+int test_ceremony_helpers_scan_in_flight(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char fid[32]; memset(fid, 0x33, 32);
+    /* 5 ceremonies: 2 in-flight, 1 finalized, 1 aborted, 1 partial_failed. */
+    for (int i = 0; i < 5; i++) {
+        unsigned char cid[8]; memset(cid, (unsigned char)(0x60 + i), 8);
+        persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_ROTATE,
+                               NULL, (uint32_t)(100 + i), 200);
+        if (i == 2) {
+            unsigned char pk[33]; memset(pk, 0x99, 33);
+            persist_save_participant_phase(&db, cid, pk,
+                                            PERSIST_CEREMONY_PHASE_SIGNED,
+                                            NULL, NULL, 0, 0);
+            persist_update_ceremony_state(&db, cid,
+                                           PERSIST_CEREMONY_STATE_FINALIZED);
+        } else if (i == 3) {
+            persist_update_ceremony_state(&db, cid,
+                                           PERSIST_CEREMONY_STATE_ABORTED);
+        } else if (i == 4) {
+            persist_update_ceremony_state(&db, cid,
+                                           PERSIST_CEREMONY_STATE_PARTIAL_FAILED);
+        }
+    }
+    int n = 0;
+    persist_scan_in_flight_ceremonies(&db, fid, ch_test_count_cb, &n);
+    TEST_ASSERT(n == 2, "in-flight count = 2 (state < FINALIZED only)");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T11 — participant phase UPSERT updates without re-inserting. */
+int test_ceremony_helpers_participant_upsert(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8]; memset(cid, 0x71, 8);
+    unsigned char fid[32]; memset(fid, 0x71, 32);
+    unsigned char pk[33];  memset(pk, 0x71, 33);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 1, 100);
+    persist_save_participant_phase(&db, cid, pk,
+                                    PERSIST_CEREMONY_PHASE_NOT_SENT,
+                                    NULL, NULL, 0, 0);
+    persist_save_participant_phase(&db, cid, pk,
+                                    PERSIST_CEREMONY_PHASE_SENT,
+                                    NULL, NULL, 0, 0);
+    persist_save_participant_phase(&db, cid, pk,
+                                    PERSIST_CEREMONY_PHASE_SIGNED,
+                                    NULL, NULL, 0, 0);
+    /* Only 1 row should exist (UPSERT). */
+    int n = 0;
+    persist_scan_participants(&db, cid, 0xFF, ch_test_count_p_cb, &n);
+    TEST_ASSERT(n == 1, "single row after 3 upserts");
+    persist_close(&db);
+    return 1;
+}
+
+/* === End SF-CEREMONY-HELPERS tests ======================================== */
