@@ -2882,6 +2882,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
+       backend so the client can verify the funding TX on-chain before
+       signing the factory tree.  An adversarial LSP could otherwise claim
+       a larger funding_amount than actually exists.  Audit 2026-05-17
+       recommended refusing at startup rather than warning. */
+    if (strcmp(network, "regtest") != 0 && !(rpcuser && rpcpassword)) {
+        fprintf(stderr,
+            "Error: network=%s requires --rpcuser/--rpcpassword (or --light-client)\n"
+            "       so the client can verify the funding TX on-chain.\n"
+            "       Without it, an adversarial LSP could claim a larger\n"
+            "       funding_amount than actually exists; see audit 2026-05-17.\n",
+            network);
+        return 1;
+    }
+
     /* Tor SOCKS5 proxy setup */
     if (tor_proxy_arg) {
         char proxy_host[256];
