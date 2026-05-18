@@ -27,7 +27,7 @@ RPCPORT="${RPCPORT:-48332}"
 WALLET="${WALLET:-superscalar_test}"
 
 PORT="${PORT:-9935}"
-N_CLIENTS=2  # splice tests need just 1 client + LSP
+N_CLIENTS=1  # splice test = 1 client + LSP (was N=2 with only 1 launched — #193)
 AMOUNT="${AMOUNT:-200000}"
 
 TAG="ts_splice"
