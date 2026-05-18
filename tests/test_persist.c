@@ -4096,6 +4096,210 @@ int test_persist_old_commitment_htlc_sweep_round_trip(void)
     return 1;
 }
 
+/* CH_T12 (#208 / SF-SCHEMA-HTLC-RESOLUTION): persist_save_htlc_resolution_tx
+   + persist_load_htlc_resolution_tx round-trip.  Verifies schema v36 column
+   present, idempotent UPDATE, NULL/empty fallback semantics, and the
+   dashboard's coverage query auto-detects population. */
+int test_persist_htlc_resolution_tx_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    TEST_ASSERT(persist_schema_version(&db) >= 36,
+                "schema version >= 36 (signed_resolution_tx_hex column present)");
+
+    uint32_t channel_id = 12;
+    htlc_t h0 = {0};
+    h0.id = 1001;
+    h0.direction = HTLC_OFFERED;
+    h0.amount_sats = 50000;
+    memset(h0.payment_hash, 0x55, 32);
+    memset(h0.payment_preimage, 0x66, 32);
+    h0.cltv_expiry = 700000;
+    h0.state = HTLC_STATE_ACTIVE;
+    h0.fee_at_add = 100;
+
+    htlc_t h1 = {0};
+    h1.id = 1002;
+    h1.direction = HTLC_RECEIVED;
+    h1.amount_sats = 75000;
+    memset(h1.payment_hash, 0x77, 32);
+    h1.cltv_expiry = 700100;
+    h1.state = HTLC_STATE_ACTIVE;
+    h1.fee_at_add = 100;
+
+    TEST_ASSERT(persist_save_htlc(&db, channel_id, &h0), "save HTLC 0");
+    TEST_ASSERT(persist_save_htlc(&db, channel_id, &h1), "save HTLC 1");
+
+    unsigned char *got = NULL;
+    size_t got_len = 0;
+    int rc = persist_load_htlc_resolution_tx(&db, channel_id, h0.id, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 0, "NULL resolution column returns 0");
+    TEST_ASSERT(got == NULL, "empty load returns NULL bytes");
+
+    unsigned char resolve0[150];
+    for (size_t i = 0; i < sizeof(resolve0); i++) resolve0[i] = (unsigned char)(i * 7 + 13);
+    unsigned char resolve1[210];
+    for (size_t i = 0; i < sizeof(resolve1); i++) resolve1[i] = (unsigned char)(i * 11 + 5);
+
+    TEST_ASSERT(persist_save_htlc_resolution_tx(&db, channel_id, h0.id,
+                                                  resolve0, sizeof(resolve0)),
+                "save resolution TX bytes for HTLC 0");
+    TEST_ASSERT(persist_save_htlc_resolution_tx(&db, channel_id, h1.id,
+                                                  resolve1, sizeof(resolve1)),
+                "save resolution TX bytes for HTLC 1");
+
+    got = NULL; got_len = 0;
+    rc = persist_load_htlc_resolution_tx(&db, channel_id, h0.id, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load resolution TX bytes (HTLC 0)");
+    TEST_ASSERT_EQ(got_len, sizeof(resolve0), "loaded len matches saved (HTLC 0)");
+    TEST_ASSERT(memcmp(got, resolve0, sizeof(resolve0)) == 0,
+                "loaded bytes match saved (HTLC 0)");
+    free(got);
+
+    got = NULL; got_len = 0;
+    rc = persist_load_htlc_resolution_tx(&db, channel_id, h1.id, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load resolution TX bytes (HTLC 1)");
+    TEST_ASSERT_EQ(got_len, sizeof(resolve1), "loaded len matches saved (HTLC 1)");
+    TEST_ASSERT(memcmp(got, resolve1, sizeof(resolve1)) == 0,
+                "loaded bytes match saved (HTLC 1)");
+    free(got);
+
+    unsigned char resolve0b[80];
+    memset(resolve0b, 0x88, sizeof(resolve0b));
+    TEST_ASSERT(persist_save_htlc_resolution_tx(&db, channel_id, h0.id,
+                                                  resolve0b, sizeof(resolve0b)),
+                "re-save resolution TX bytes (HTLC 0)");
+    got = NULL; got_len = 0;
+    rc = persist_load_htlc_resolution_tx(&db, channel_id, h0.id, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "reload after re-save");
+    TEST_ASSERT_EQ(got_len, sizeof(resolve0b), "re-saved len");
+    TEST_ASSERT(memcmp(got, resolve0b, sizeof(resolve0b)) == 0,
+                "re-saved bytes match");
+    free(got);
+
+    TEST_ASSERT(persist_save_htlc_resolution_tx(&db, channel_id, h0.id, NULL, 0),
+                "save NULL is safe no-op (returns 1)");
+
+    rc = persist_load_htlc_resolution_tx(&db, 999, 99999, &got, &got_len);
+    TEST_ASSERT_EQ(rc, -1, "missing row returns -1");
+
+    sqlite3_stmt *stmt = NULL;
+    int prepared = sqlite3_prepare_v2(db.db,
+        "SELECT COUNT(*), COUNT(signed_resolution_tx_hex) FROM htlcs;",
+        -1, &stmt, NULL);
+    TEST_ASSERT_EQ(prepared, SQLITE_OK, "prepare dashboard coverage query");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step coverage row");
+    int total_rows = sqlite3_column_int(stmt, 0);
+    int rows_with_resolution = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    TEST_ASSERT_EQ(total_rows, 2, "two HTLC rows total");
+    TEST_ASSERT_EQ(rows_with_resolution, 2, "both rows have resolution_tx_hex populated");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T13 (#209 / SF-SCHEMA-LSTOCK-BURN): persist_save_old_commitment_burn_tx
+   + persist_load_old_commitment_burn_tx round-trip.  Verifies schema v36
+   column present, idempotent UPDATE, NULL/empty fallback semantics, and
+   dashboard coverage auto-detection. */
+int test_persist_old_commitment_burn_tx_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    TEST_ASSERT(persist_schema_version(&db) >= 36,
+                "schema version >= 36 (signed_burn_tx_hex column present)");
+
+    uint32_t channel_id = 13;
+    uint64_t commit_num_a = 5;
+    uint64_t commit_num_b = 6;
+    unsigned char txid_a[32]; memset(txid_a, 0xAA, 32);
+    unsigned char txid_b[32]; memset(txid_b, 0xBB, 32);
+    unsigned char to_local_spk[34]; memset(to_local_spk, 0xCC, 34);
+
+    TEST_ASSERT(persist_save_old_commitment(&db, channel_id, commit_num_a,
+                                              txid_a, 0, 300000, to_local_spk, 34),
+                "save old_commitments row A");
+    TEST_ASSERT(persist_save_old_commitment(&db, channel_id, commit_num_b,
+                                              txid_b, 0, 400000, to_local_spk, 34),
+                "save old_commitments row B");
+
+    unsigned char *got = NULL;
+    size_t got_len = 0;
+    int rc = persist_load_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                                   &got, &got_len);
+    TEST_ASSERT_EQ(rc, 0, "NULL burn column returns 0 (legacy fallback)");
+    TEST_ASSERT(got == NULL, "empty load returns NULL bytes");
+
+    unsigned char burn_a[120];
+    for (size_t i = 0; i < sizeof(burn_a); i++) burn_a[i] = (unsigned char)(i * 2 + 3);
+    unsigned char burn_b[160];
+    for (size_t i = 0; i < sizeof(burn_b); i++) burn_b[i] = (unsigned char)(i * 4 + 7);
+
+    TEST_ASSERT(persist_save_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                                      burn_a, sizeof(burn_a)),
+                "save burn TX bytes for commit A");
+    TEST_ASSERT(persist_save_old_commitment_burn_tx(&db, channel_id, commit_num_b,
+                                                      burn_b, sizeof(burn_b)),
+                "save burn TX bytes for commit B");
+
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                               &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load burn TX bytes (commit A)");
+    TEST_ASSERT_EQ(got_len, sizeof(burn_a), "loaded len matches saved (commit A)");
+    TEST_ASSERT(memcmp(got, burn_a, sizeof(burn_a)) == 0,
+                "loaded bytes match saved (commit A)");
+    free(got);
+
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_burn_tx(&db, channel_id, commit_num_b,
+                                               &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load burn TX bytes (commit B)");
+    TEST_ASSERT_EQ(got_len, sizeof(burn_b), "loaded len matches saved (commit B)");
+    TEST_ASSERT(memcmp(got, burn_b, sizeof(burn_b)) == 0,
+                "loaded bytes match saved (commit B)");
+    free(got);
+
+    unsigned char burn_a2[60];
+    memset(burn_a2, 0x99, sizeof(burn_a2));
+    TEST_ASSERT(persist_save_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                                      burn_a2, sizeof(burn_a2)),
+                "re-save burn TX bytes (commit A)");
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                               &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "reload after re-save");
+    TEST_ASSERT_EQ(got_len, sizeof(burn_a2), "re-saved len");
+    TEST_ASSERT(memcmp(got, burn_a2, sizeof(burn_a2)) == 0,
+                "re-saved bytes match");
+    free(got);
+
+    TEST_ASSERT(persist_save_old_commitment_burn_tx(&db, channel_id, commit_num_a,
+                                                      NULL, 0),
+                "save NULL is safe no-op (returns 1)");
+
+    rc = persist_load_old_commitment_burn_tx(&db, 999, 999, &got, &got_len);
+    TEST_ASSERT_EQ(rc, -1, "missing row returns -1");
+
+    sqlite3_stmt *stmt = NULL;
+    int prepared = sqlite3_prepare_v2(db.db,
+        "SELECT COUNT(*), COUNT(signed_burn_tx_hex) FROM old_commitments;",
+        -1, &stmt, NULL);
+    TEST_ASSERT_EQ(prepared, SQLITE_OK, "prepare dashboard coverage query");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step coverage row");
+    int total_rows = sqlite3_column_int(stmt, 0);
+    int rows_with_burn = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    TEST_ASSERT_EQ(total_rows, 2, "two old_commitment rows total");
+    TEST_ASSERT_EQ(rows_with_burn, 2, "both rows have burn_tx_hex populated");
+
+    persist_close(&db);
+    return 1;
+}
+
 /* v26 (C3) signing_rounds journal round-trip: start → done → sweep. */
 int test_persist_signing_rounds_round_trip(void)
 {
@@ -4734,6 +4938,84 @@ int test_ceremony_helpers_participant_upsert(void) {
     int n = 0;
     persist_scan_participants(&db, cid, 0xFF, ch_test_count_p_cb, &n);
     TEST_ASSERT(n == 1, "single row after 3 upserts");
+    persist_close(&db);
+    return 1;
+}
+
+/* CH_T14 (#219 / SF-AGG-HARD-GUARD, wallet team CEREMONY_COORD_REPLY_2 §2):
+   persist_update_ceremony_artifacts(final_signature=X) REFUSES when any
+   ceremony_participants row has phase != SIGNED.  Mirrors CH_T3 (the
+   FINALIZED state-transition guard).  Other artifact updates (aggregated
+   nonce, broadcast_txid, abort_reason) are unaffected by the guard. */
+int test_ceremony_helpers_aggregate_hard_guard(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    unsigned char cid[8]; memset(cid, 0xD1, 8);
+    unsigned char fid[32]; memset(fid, 0xD2, 32);
+    persist_save_ceremony(&db, cid, fid, PERSIST_CEREMONY_TYPE_INITIAL,
+                           NULL, 1, 100);
+
+    /* Two participants - one SIGNED, one only NONCED. */
+    unsigned char p1[33]; memset(p1, 0x01, 33);
+    unsigned char p2[33]; memset(p2, 0x02, 33);
+    persist_save_participant_phase(&db, cid, p1,
+                                    PERSIST_CEREMONY_PHASE_SIGNED,
+                                    NULL, NULL, 0, 0);
+    persist_save_participant_phase(&db, cid, p2,
+                                    PERSIST_CEREMONY_PHASE_NONCED,
+                                    NULL, NULL, 0, 0);
+
+    /* Attempt to persist a final_signature -> MUST refuse. */
+    unsigned char final_sig[64]; memset(final_sig, 0xAB, 64);
+    int rc = persist_update_ceremony_artifacts(&db, cid,
+                                                NULL,       /* nonce */
+                                                final_sig,  /* GUARDED */
+                                                NULL,       /* broadcast_txid */
+                                                0, 0);      /* abort_reason */
+    TEST_ASSERT(rc == 0, "final_signature persist refused when one participant !=SIGNED");
+
+    /* Verify final_signature was NOT written. */
+    sqlite3_stmt *stmt = NULL;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT final_signature FROM ceremonies WHERE ceremony_id = ?;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare check");
+    sqlite3_bind_blob(stmt, 1, cid, 8, SQLITE_STATIC);
+    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "row exists");
+    TEST_ASSERT(sqlite3_column_type(stmt, 0) == SQLITE_NULL,
+                "final_signature still NULL (guard rejected write)");
+    sqlite3_finalize(stmt);
+
+    /* Aggregated_nonce update without final_signature should succeed. */
+    unsigned char agg_nonce[66]; memset(agg_nonce, 0x7F, 66);
+    rc = persist_update_ceremony_artifacts(&db, cid,
+                                            agg_nonce,
+                                            NULL,
+                                            NULL,
+                                            0, 0);
+    TEST_ASSERT(rc == 1, "nonce-only artifact update bypasses guard");
+
+    /* Promote p2 to SIGNED -> final_signature write should succeed. */
+    persist_save_participant_phase(&db, cid, p2,
+                                    PERSIST_CEREMONY_PHASE_SIGNED,
+                                    NULL, NULL, 0, 0);
+    rc = persist_update_ceremony_artifacts(&db, cid,
+                                            NULL,
+                                            final_sig,
+                                            NULL,
+                                            0, 0);
+    TEST_ASSERT(rc == 1, "final_signature persists when all participants SIGNED");
+
+    /* Verify it was actually written. */
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT final_signature FROM ceremonies WHERE ceremony_id = ?;",
+        -1, &stmt, NULL) == SQLITE_OK, "prepare verify");
+    sqlite3_bind_blob(stmt, 1, cid, 8, SQLITE_STATIC);
+    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "row exists post-write");
+    TEST_ASSERT(sqlite3_column_bytes(stmt, 0) == 64, "final_signature 64 bytes");
+    TEST_ASSERT(memcmp(sqlite3_column_blob(stmt, 0), final_sig, 64) == 0,
+                "final_signature bytes match");
+    sqlite3_finalize(stmt);
+
     persist_close(&db);
     return 1;
 }

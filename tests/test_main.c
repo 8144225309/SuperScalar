@@ -1191,10 +1191,13 @@ extern int test_ceremony_helpers_scan_by_factory(void);
 extern int test_ceremony_helpers_revocations(void);
 extern int test_ceremony_helpers_scan_in_flight(void);
 extern int test_ceremony_helpers_participant_upsert(void);
+extern int test_ceremony_helpers_aggregate_hard_guard(void);  /* #219 */
 extern int test_persist_ps_subfactory_chain_v22_poison_round_trip(void);
 extern int test_persist_ps_initial_signed_state_round_trip(void);
 extern int test_persist_old_commitment_witness_round_trip(void);
 extern int test_persist_old_commitment_htlc_sweep_round_trip(void);
+extern int test_persist_htlc_resolution_tx_round_trip(void);          /* #208 */
+extern int test_persist_old_commitment_burn_tx_round_trip(void);      /* #209 */
 extern int test_persist_signing_rounds_round_trip(void);
 extern int test_persist_pending_fee_bump_round_trip(void);
 extern int test_persist_force_close_round_trip(void);
@@ -3029,10 +3032,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ceremony_helpers_revocations);
     RUN_TEST(test_ceremony_helpers_scan_in_flight);
     RUN_TEST(test_ceremony_helpers_participant_upsert);
+    RUN_TEST(test_ceremony_helpers_aggregate_hard_guard);   /* #219 SF-AGG-HARD-GUARD */
     RUN_TEST(test_persist_ps_subfactory_chain_v22_poison_round_trip);
     RUN_TEST(test_persist_ps_initial_signed_state_round_trip);
     RUN_TEST(test_persist_old_commitment_witness_round_trip);
     RUN_TEST(test_persist_old_commitment_htlc_sweep_round_trip);
+    RUN_TEST(test_persist_htlc_resolution_tx_round_trip);      /* #208 SF-SCHEMA-HTLC-RESOLUTION */
+    RUN_TEST(test_persist_old_commitment_burn_tx_round_trip);  /* #209 SF-SCHEMA-LSTOCK-BURN */
     RUN_TEST(test_persist_signing_rounds_round_trip);
     RUN_TEST(test_persist_pending_fee_bump_round_trip);
     RUN_TEST(test_persist_force_close_round_trip);
