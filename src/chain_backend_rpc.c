@@ -53,9 +53,15 @@ static int rpc_base64(const char *in, size_t in_len, char *out, size_t out_cap)
 /* ------------------------------------------------------------------ */
 
 /* Send a JSON-RPC call to bitcoind and return the parsed "result" field.
-   Caller must cJSON_Delete the returned object. Returns NULL on error. */
-static cJSON *rpc_call(const chain_backend_rpc_ctx_t *rpc,
-                        const char *method, cJSON *params)
+   Caller must cJSON_Delete the returned object. Returns NULL on error.
+
+   If expected_err_code is non-zero and the RPC returns that error code,
+   the call returns NULL silently (no stderr spam). Used by poll loops
+   where -5 "not in mempool/chain" is the expected negative answer,
+   not an operator-visible problem. See task #200. */
+static cJSON *rpc_call_ex(const chain_backend_rpc_ctx_t *rpc,
+                           const char *method, cJSON *params,
+                           int expected_err_code)
 {
     /* Basic Auth header */
     char credentials[512];
@@ -156,10 +162,13 @@ static cJSON *rpc_call(const chain_backend_rpc_ctx_t *rpc,
     if (err && !cJSON_IsNull(err)) {
         cJSON *ecode = cJSON_GetObjectItem(err, "code");
         cJSON *emsg  = cJSON_GetObjectItem(err, "message");
-        fprintf(stderr, "HTTP RPC %s error: {\"code\":%d,\"message\":\"%s\"}\n",
-                method,
-                ecode ? ecode->valueint : 0,
-                emsg && cJSON_IsString(emsg) ? emsg->valuestring : "unknown");
+        int code = ecode ? ecode->valueint : 0;
+        /* Silently swallow the expected "not found" code for poll loops. */
+        if (expected_err_code == 0 || code != expected_err_code) {
+            fprintf(stderr, "HTTP RPC %s error: {\"code\":%d,\"message\":\"%s\"}\n",
+                    method, code,
+                    emsg && cJSON_IsString(emsg) ? emsg->valuestring : "unknown");
+        }
         cJSON_Delete(jresp);
         return NULL;
     }
@@ -168,6 +177,13 @@ static cJSON *rpc_call(const chain_backend_rpc_ctx_t *rpc,
     cJSON *result = cJSON_DetachItemFromObject(jresp, "result");
     cJSON_Delete(jresp);
     return result;
+}
+
+/* Back-compat wrapper: errors always printed. */
+static cJSON *rpc_call(const chain_backend_rpc_ctx_t *rpc,
+                        const char *method, cJSON *params)
+{
+    return rpc_call_ex(rpc, method, params, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,23 +206,17 @@ static int cb_rpc_get_confirmations(chain_backend_t *self, const char *txid_hex)
 {
     chain_backend_rpc_ctx_t *rpc = (chain_backend_rpc_ctx_t *)self->ctx;
 
-    /* Try gettransaction first (wallet TX) */
+    /* Use getrawtransaction (node-level RPC). Requires -txindex on the
+       bitcoind node OR the tx still in mempool. We do NOT fall back to
+       gettransaction (a wallet RPC) because callers (watchtower, rotation,
+       channel-confirm polling) want chain state, not wallet state — and
+       gettransaction noisily errors with -5/-19 when the tx is not in the
+       wallet or when multiple wallets are loaded. See task #200. */
     cJSON *params = cJSON_CreateArray();
     cJSON_AddItemToArray(params, cJSON_CreateString(txid_hex));
-    cJSON *result = rpc_call(rpc, "gettransaction", params);
-
-    if (result) {
-        cJSON *confs = cJSON_GetObjectItem(result, "confirmations");
-        int c = confs && cJSON_IsNumber(confs) ? (int)confs->valuedouble : 0;
-        cJSON_Delete(result);
-        return c > 0 ? c : 0;
-    }
-
-    /* Fallback: getrawtransaction (requires -txindex or mempool) */
-    params = cJSON_CreateArray();
-    cJSON_AddItemToArray(params, cJSON_CreateString(txid_hex));
     cJSON_AddItemToArray(params, cJSON_CreateBool(1)); /* verbose */
-    result = rpc_call(rpc, "getrawtransaction", params);
+    /* -5 = "No such mempool or blockchain transaction" — normal poll miss. */
+    cJSON *result = rpc_call_ex(rpc, "getrawtransaction", params, -5);
 
     if (result) {
         cJSON *confs = cJSON_GetObjectItem(result, "confirmations");
@@ -233,7 +243,8 @@ static bool cb_rpc_is_in_mempool(chain_backend_t *self, const char *txid_hex)
     chain_backend_rpc_ctx_t *rpc = (chain_backend_rpc_ctx_t *)self->ctx;
     cJSON *params = cJSON_CreateArray();
     cJSON_AddItemToArray(params, cJSON_CreateString(txid_hex));
-    cJSON *result = rpc_call(rpc, "getmempoolentry", params);
+    /* -5 = "Transaction not in mempool" — expected negative answer. */
+    cJSON *result = rpc_call_ex(rpc, "getmempoolentry", params, -5);
     if (result) {
         cJSON_Delete(result);
         return true;

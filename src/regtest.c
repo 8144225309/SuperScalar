@@ -16,6 +16,20 @@
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
+/* Thread-local "quiet poll" flag for the next regtest_exec calls.
+   When set, RPC error codes commonly seen during normal polling are silently
+   swallowed (no stderr spam): -5 "no such mempool/blockchain transaction" or
+   "transaction not in mempool", and -19 "multiple wallets loaded". Used by
+   poll loops where these are the normal negative answers, not operator-visible
+   problems. See task #200. The flag must be cleared by the caller after the
+   logical operation completes (we do NOT auto-clear, since a single logical
+   poll often spans multiple RPCs — e.g. gettransaction then fallback
+   getrawtransaction). */
+static __thread int g_regtest_poll_quiet = 0;
+static inline bool regtest_err_is_expected_poll_miss(int code) {
+    return code == -5 || code == -19;
+}
+
 #ifdef _POSIX_VERSION
 
 /* Default timeout for bitcoin-cli commands (seconds). */
@@ -592,10 +606,18 @@ static char *regtest_http_rpc(const regtest_t *rt,
     /* Check for error */
     cJSON *err = cJSON_GetObjectItem(jresp, "error");
     if (err && !cJSON_IsNull(err)) {
-        char *errstr = cJSON_PrintUnformatted(err);
-        if (errstr) {
-            fprintf(stderr, "HTTP RPC %s error: %s\n", method, errstr);
-            free(errstr);
+        cJSON *ecode = cJSON_GetObjectItem(err, "code");
+        int code = (ecode && cJSON_IsNumber(ecode)) ? ecode->valueint : 0;
+        /* In poll-quiet scope, swallow the codes that are the normal negative
+           answer (tx not in mempool/chain; wallet path wrong because tx not
+           in this wallet). Real errors (-32700 parse, -32601 method missing,
+           etc.) still surface. See task #200. */
+        if (!(g_regtest_poll_quiet && regtest_err_is_expected_poll_miss(code))) {
+            char *errstr = cJSON_PrintUnformatted(err);
+            if (errstr) {
+                fprintf(stderr, "HTTP RPC %s error: %s\n", method, errstr);
+                free(errstr);
+            }
         }
         cJSON_Delete(jresp);
         return NULL;
@@ -932,7 +954,9 @@ int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
     return 1;
 }
 
-int regtest_get_confirmations(regtest_t *rt, const char *txid) {
+/* Inner worker — flag-clearing wrapper below ensures g_regtest_poll_quiet
+   is reset on every return path (poll-loop quiet scope, task #200). */
+static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
     char params[256];
 
     /* Try gettransaction (wallet txs) */
@@ -1018,6 +1042,15 @@ int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     return -1;
 }
 
+int regtest_get_confirmations(regtest_t *rt, const char *txid) {
+    /* Poll-loop quiet scope: suppress -5/-19 noise. Task #200. */
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
+    int r = regtest_get_confirmations_inner(rt, txid);
+    g_regtest_poll_quiet = prev;
+    return r;
+}
+
 int regtest_get_confirmations_batch(regtest_t *rt,
                                     const char **txids_hex, size_t n_txids,
                                     int *confs_out)
@@ -1028,6 +1061,12 @@ int regtest_get_confirmations_batch(regtest_t *rt,
         confs_out[i] = -1;
 
     size_t n_remaining = n_txids;
+
+    /* Poll-loop quiet scope: suppress -5/-19 noise. Task #200.
+       Restored at every return point below. */
+    int _ss_prev_quiet = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
+    #define SS_RET_BATCH(v) do { g_regtest_poll_quiet = _ss_prev_quiet; return (v); } while (0)
 
     /* Step 1: gettransaction for each txid (cheap for wallet txs) */
     for (size_t i = 0; i < n_txids; i++) {
@@ -1046,7 +1085,7 @@ int regtest_get_confirmations_batch(regtest_t *rt,
         cJSON_Delete(json);
     }
 
-    if (n_remaining == 0) return 1;
+    if (n_remaining == 0) SS_RET_BATCH(1);
 
     /* Step 1b: getrawtransaction for remaining txids (works with -txindex=1
        or for mempool TXs).  Same approach as CLN/LND/LDK. */
@@ -1069,13 +1108,13 @@ int regtest_get_confirmations_batch(regtest_t *rt,
         n_remaining--;
     }
 
-    if (n_remaining == 0) return 1;
+    if (n_remaining == 0) SS_RET_BATCH(1);
 
     /* Step 2: scan recent blocks — one getblockhash + one getblock per block,
        then check all remaining txids against the block's tx array in memory.
        O(scan_depth) RPCs regardless of n_txids. */
     char *hcnt = regtest_exec(rt, "getblockcount", "");
-    if (!hcnt) return 1;
+    if (!hcnt) SS_RET_BATCH(1);
     int height = atoi(hcnt);
     free(hcnt);
 
@@ -1130,13 +1169,22 @@ int regtest_get_confirmations_batch(regtest_t *rt,
         cJSON_Delete(block);
     }
 
-    return 1;
+    SS_RET_BATCH(1);
+    #undef SS_RET_BATCH
 }
 
 bool regtest_is_in_mempool(regtest_t *rt, const char *txid) {
     char params[256];
     snprintf(params, sizeof(params), "\"%s\"", txid);
+
+    /* Poll-loop quiet scope: getmempoolentry returns -5 "Transaction not in
+       mempool" as the normal negative answer — not an operator-visible
+       problem. Task #200. */
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
     char *result = regtest_exec(rt, "getmempoolentry", params);
+    g_regtest_poll_quiet = prev;
+
     if (!result || result[0] == '\0') {
         free(result);
         return false;
@@ -1534,7 +1582,12 @@ int regtest_get_mempool_entry_seconds_ago(regtest_t *rt, const char *txid) {
     if (!rt || !txid) return -1;
     char params[80];
     snprintf(params, sizeof(params), "\"%s\"", txid);
+    /* Poll-loop quiet scope: -5 "Transaction not in mempool" is the normal
+       answer when the tx hasn't entered (or has left) the mempool. Task #200. */
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
     char *result = regtest_exec(rt, "getmempoolentry", params);
+    g_regtest_poll_quiet = prev;
     if (!result) return -1;
     cJSON *j = cJSON_Parse(result);
     free(result);
