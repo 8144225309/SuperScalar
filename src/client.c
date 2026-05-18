@@ -1616,9 +1616,20 @@ int client_run_with_channels(secp256k1_context *ctx,
             return 0;
         }
     } else {
-        fprintf(stderr, "Client: WARNING — funding TX not verified on-chain "
-                "(no --rpcuser or --light-client). Trusting LSP claim of "
-                "%llu sats.\n", (unsigned long long)funding_amount);
+        /* SF-FUND-VERIFY-REFUSE #197: hard refusal when no chain backend.
+           Audit (2026-05-17) flagged this fallback as an adversarial-LSP
+           fund-theft path — a stderr warning is unlikely to be noticed by
+           a daemonized client.  Refuse outright rather than sign against
+           an unverifiable LSP claim. */
+        fprintf(stderr, "Client: REFUSING to sign factory tree — funding TX "
+                "cannot be verified on-chain (no chain backend configured: "
+                "use --rpcuser or --light-client). Trusting an LSP-supplied "
+                "funding_amount of %llu sats is an adversarial-LSP fund-theft "
+                "path; see audit 2026-05-17.\n",
+                (unsigned long long)funding_amount);
+        client_send_error(fd, "funding_tx_unverifiable_no_chain_backend");
+        wire_close(fd);
+        return 0;
     }
 
     /* Build factory locally (heap — factory_t is ~3MB).
