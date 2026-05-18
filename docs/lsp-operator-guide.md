@@ -1,5 +1,7 @@
 # LSP Operator Guide
 
+For mainnet operations see [mainnet-runbook.md](mainnet-runbook.md).
+
 How to deploy and run a SuperScalar LSP node. Covers regtest, signet, and testnet.
 
 ## Prerequisites
