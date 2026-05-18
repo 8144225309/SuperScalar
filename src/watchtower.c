@@ -571,6 +571,63 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                         persist_rollback(wt->db);
                 }
             }
+
+            /* v35 (#207): pre-build the signed HTLC sweep TX bytes at
+               registration time and persist them, mirroring the v25 pattern
+               for the to_local penalty TX above.  Closes the restart-loses-
+               HTLC-defense gap: after an LSP crash, watchtower_check no
+               longer needs live channel_t state to broadcast HTLC sweeps —
+               the bytes are durably on disk.  Also enables standalone-WT
+               operation (run superscalar_watchtower against the same DB).
+
+               channel_build_htlc_penalty_tx requires ch->htlcs[0] to carry
+               the HTLC metadata (direction, payment_hash, cltv_expiry) —
+               same shim watchtower_check uses on the lazy-build path. */
+            if (wt->db && wt->db->db && entry->n_htlc_outputs > 0 && ch) {
+                int use_anchor_h = fee_should_use_anchor(wt->fee);
+
+                /* Save + restore ch->htlcs[0] across the per-output build loop. */
+                size_t wt_saved_n = ch->n_htlcs;
+                htlc_t wt_saved_h0 = {0};
+                if (wt_saved_n > 0)
+                    wt_saved_h0 = ch->htlcs[0];
+
+                for (size_t h = 0; h < entry->n_htlc_outputs; h++) {
+                    watchtower_htlc_t *wh_h = &entry->htlc_outputs[h];
+
+                    /* Shim ch->htlcs[0] like the watchtower_check sweep loop. */
+                    ch->n_htlcs = 1;
+                    memset(&ch->htlcs[0], 0, sizeof(htlc_t));
+                    ch->htlcs[0].direction = wh_h->direction;
+                    memcpy(ch->htlcs[0].payment_hash, wh_h->payment_hash, 32);
+                    ch->htlcs[0].cltv_expiry = wh_h->cltv_expiry;
+                    ch->htlcs[0].state = HTLC_STATE_ACTIVE;
+
+                    tx_buf_t sweep;
+                    tx_buf_init(&sweep, 512);
+                    if (channel_build_htlc_penalty_tx(ch, &sweep,
+                            old_txid, wh_h->htlc_vout, wh_h->htlc_amount,
+                            wh_h->htlc_spk, 34, old_commit_num, 0,
+                            use_anchor_h ? wt->anchor_spk : NULL,
+                            use_anchor_h ? wt->anchor_spk_len : 0)) {
+                        persist_save_old_commitment_htlc_sweep(
+                            wt->db, channel_id, old_commit_num,
+                            wh_h->htlc_vout, sweep.data, sweep.len);
+                    } else {
+                        fprintf(stderr,
+                                "watchtower: failed to build HTLC sweep TX "
+                                "(vout %u) at registration time — restart "
+                                "defense will fall back to lazy build\n",
+                                wh_h->htlc_vout);
+                    }
+                    tx_buf_free(&sweep);
+                }
+
+                /* Restore ch->htlcs[0] / ch->n_htlcs. */
+                ch->n_htlcs = wt_saved_n;
+                if (wt_saved_n > 0)
+                    ch->htlcs[0] = wt_saved_h0;
+            }
         }
 
         /* SF-W-PTLC: parse PTLC outputs (vouts after HTLC outputs).  Without

@@ -3965,6 +3965,137 @@ int test_persist_old_commitment_witness_round_trip(void)
     return 1;
 }
 
+/* v35 (#207): per-output HTLC sweep TX persistence round-trip.
+   Verifies the new save/load pair, idempotency, and the load fallback
+   semantics that watchtower_check relies on (column-empty → 0; missing
+   row → -1; bytes present → 1). */
+int test_persist_old_commitment_htlc_sweep_round_trip(void)
+{
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Schema must be at least v35 to have the new column. */
+    TEST_ASSERT(persist_schema_version(&db) >= 35,
+                "schema version >= 35 (signed_sweep_tx_hex column present)");
+
+    uint32_t channel_id = 11;
+    uint64_t commit_num = 7;
+    unsigned char txid[32]; memset(txid, 0xAB, 32);
+    unsigned char to_local_spk[34]; memset(to_local_spk, 0xCD, 34);
+
+    /* Parent old_commitments row */
+    TEST_ASSERT(persist_save_old_commitment(&db, channel_id, commit_num,
+                                              txid, 0, 200000, to_local_spk, 34),
+                "save old_commitments parent row");
+
+    /* Two HTLC rows on the breached commitment. */
+    watchtower_htlc_t h0 = {0};
+    h0.htlc_vout = 2;
+    h0.htlc_amount = 12345;
+    memset(h0.htlc_spk, 0x11, 34);
+    h0.direction = HTLC_OFFERED;
+    memset(h0.payment_hash, 0x22, 32);
+    h0.cltv_expiry = 600000;
+
+    watchtower_htlc_t h1 = {0};
+    h1.htlc_vout = 3;
+    h1.htlc_amount = 67890;
+    memset(h1.htlc_spk, 0x33, 34);
+    h1.direction = HTLC_RECEIVED;
+    memset(h1.payment_hash, 0x44, 32);
+    h1.cltv_expiry = 600100;
+
+    TEST_ASSERT(persist_save_old_commitment_htlc(&db, channel_id, commit_num, &h0),
+                "save HTLC row 0");
+    TEST_ASSERT(persist_save_old_commitment_htlc(&db, channel_id, commit_num, &h1),
+                "save HTLC row 1");
+
+    /* Before any sweep persist: load returns 0 (column empty → legacy lazy). */
+    unsigned char *got = NULL;
+    size_t got_len = 0;
+    int rc = persist_load_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                     h0.htlc_vout, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 0, "empty sweep column returns 0 (legacy fallback)");
+    TEST_ASSERT(got == NULL, "empty load returns NULL bytes");
+
+    /* Save sweep bytes for vout 2 and vout 3. */
+    unsigned char sweep0[180];
+    for (size_t i = 0; i < sizeof(sweep0); i++) sweep0[i] = (unsigned char)(i * 3 + 1);
+    unsigned char sweep1[220];
+    for (size_t i = 0; i < sizeof(sweep1); i++) sweep1[i] = (unsigned char)(i * 5 + 9);
+
+    TEST_ASSERT(persist_save_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                        h0.htlc_vout,
+                                                        sweep0, sizeof(sweep0)),
+                "save sweep TX bytes for vout 2");
+    TEST_ASSERT(persist_save_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                        h1.htlc_vout,
+                                                        sweep1, sizeof(sweep1)),
+                "save sweep TX bytes for vout 3");
+
+    /* Round-trip vout 2. */
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                  h0.htlc_vout, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load sweep TX bytes (vout 2)");
+    TEST_ASSERT_EQ(got_len, sizeof(sweep0), "loaded len matches saved (vout 2)");
+    TEST_ASSERT(memcmp(got, sweep0, sizeof(sweep0)) == 0,
+                "loaded bytes match saved (vout 2)");
+    free(got);
+
+    /* Round-trip vout 3 — separate per-output row */
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                  h1.htlc_vout, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "load sweep TX bytes (vout 3)");
+    TEST_ASSERT_EQ(got_len, sizeof(sweep1), "loaded len matches saved (vout 3)");
+    TEST_ASSERT(memcmp(got, sweep1, sizeof(sweep1)) == 0,
+                "loaded bytes match saved (vout 3)");
+    free(got);
+
+    /* Idempotent re-save replaces. */
+    unsigned char sweep0b[64];
+    memset(sweep0b, 0x77, sizeof(sweep0b));
+    TEST_ASSERT(persist_save_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                        h0.htlc_vout,
+                                                        sweep0b, sizeof(sweep0b)),
+                "re-save sweep TX bytes (vout 2)");
+    got = NULL; got_len = 0;
+    rc = persist_load_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                  h0.htlc_vout, &got, &got_len);
+    TEST_ASSERT_EQ(rc, 1, "reload after re-save");
+    TEST_ASSERT_EQ(got_len, sizeof(sweep0b), "re-saved len");
+    TEST_ASSERT(memcmp(got, sweep0b, sizeof(sweep0b)) == 0,
+                "re-saved bytes match");
+    free(got);
+
+    /* NULL/zero is a safe no-op. */
+    TEST_ASSERT(persist_save_old_commitment_htlc_sweep(&db, channel_id, commit_num,
+                                                        h0.htlc_vout, NULL, 0),
+                "save NULL is safe no-op (returns 1)");
+
+    /* Missing (channel, commit, vout) → -1. */
+    rc = persist_load_old_commitment_htlc_sweep(&db, 999, 999, 99, &got, &got_len);
+    TEST_ASSERT_EQ(rc, -1, "missing row returns -1");
+
+    /* Coverage query the dashboard team uses: COUNT(*), COUNT(col).
+       After save: count rows with non-empty sweep column. */
+    sqlite3_stmt *stmt = NULL;
+    int prepared = sqlite3_prepare_v2(db.db,
+        "SELECT COUNT(*), SUM(CASE WHEN signed_sweep_tx_hex != '' THEN 1 ELSE 0 END) "
+        "FROM old_commitment_htlcs;", -1, &stmt, NULL);
+    TEST_ASSERT_EQ(prepared, SQLITE_OK, "prepare dashboard coverage query");
+    TEST_ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW, "step coverage row");
+    int total_rows = sqlite3_column_int(stmt, 0);
+    int rows_with_sweep = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    TEST_ASSERT_EQ(total_rows, 2, "two HTLC rows total");
+    TEST_ASSERT_EQ(rows_with_sweep, 2, "both rows have sweep_tx_hex populated");
+
+    persist_close(&db);
+    return 1;
+}
+
 /* v26 (C3) signing_rounds journal round-trip: start → done → sweep. */
 int test_persist_signing_rounds_round_trip(void)
 {

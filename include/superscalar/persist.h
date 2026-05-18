@@ -14,7 +14,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 34
+#define PERSIST_SCHEMA_VERSION 35
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -513,6 +513,26 @@ int persist_save_old_commitment_htlc(persist_t *p, uint32_t channel_id,
 /* Load HTLC output metadata for an old commitment. Returns count loaded. */
 size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
     uint64_t commit_num, watchtower_htlc_t *htlcs_out, size_t max_htlcs);
+
+/* v35 (#207 / dashboard team SCHEMA_GAPS): persist pre-built signed HTLC
+   sweep TX bytes per HTLC output on a revoked commitment.  Mirrors the
+   v25 penalty TX persistence pair.  Idempotent UPDATE.  Returns 1 on
+   success, 0 on DB error.  Safe to call with NULL/zero bytes — no-op. */
+int persist_save_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t htlc_vout,
+                                            const unsigned char *signed_sweep_tx,
+                                            size_t signed_sweep_tx_len);
+
+/* Load pre-built signed HTLC sweep TX bytes for a given (channel, commit,
+   htlc_vout).  *out_bytes is malloc()'d on success — caller must free().
+   Returns 1 if bytes loaded, 0 if row exists but column empty (degrade
+   to legacy lazy-build path), -1 on DB error or missing row. */
+int persist_load_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t htlc_vout,
+                                            unsigned char **out_bytes,
+                                            size_t *out_len);
 
 /* --- v30 (PR-PTLC-1): PTLC output metadata persistence ---
    Parallel to old_commitment_htlcs.  Stores PTLC outputs on revoked

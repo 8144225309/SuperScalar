@@ -113,6 +113,11 @@ static const char *SCHEMA_SQL =
     "  direction INTEGER NOT NULL,"
     "  payment_hash TEXT NOT NULL,"
     "  cltv_expiry INTEGER NOT NULL,"
+    /* v35 (#207): pre-built signed HTLC sweep TX bytes (hex).  Persisted
+       at watch-registration time so the watchtower can broadcast HTLC
+       sweeps after a process restart or from a standalone WT reading the
+       same DB.  Default '' preserves legacy lazy-build fallback. */
+    "  signed_sweep_tx_hex TEXT NOT NULL DEFAULT '',"
     "  PRIMARY KEY (channel_id, commit_num, htlc_vout)"
     ");"
     /* v30 (PR-PTLC-1): parallel to old_commitment_htlcs for PTLC outputs.
@@ -1260,6 +1265,19 @@ int persist_open(persist_t *p, const char *path) {
             p->db = NULL;
             return 0;
         }
+    }
+
+    /* v35 (#207 / dashboard team SCHEMA_GAPS): pre-built signed HTLC sweep TX
+       bytes per HTLC output on a revoked commitment.  Mirrors the v25 pattern
+       for old_commitments.signed_penalty_tx_hex.  Persisted at registration
+       time in watchtower_watch_revoked_commitment so the watchtower can
+       broadcast HTLC sweeps after a process restart, and so a standalone
+       watchtower (reading the same DB) can defend without LSP state.
+       Default empty preserves legacy lazy-build fallback in watchtower_check. */
+    if (db_version < 35) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE old_commitment_htlcs ADD COLUMN signed_sweep_tx_hex TEXT NOT NULL DEFAULT '';",
+            NULL, NULL, NULL);
     }
 
     /* Record the current version if not already present */
@@ -3239,6 +3257,91 @@ size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- v35 (#207): pre-built signed HTLC sweep TX bytes ---
+   Closes the same restart-loses-defense gap that v25 closed for the
+   to_local penalty TX, but per-HTLC.  Mirrors persist_save/load_
+   old_commitment_witness. */
+
+int persist_save_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t htlc_vout,
+                                            const unsigned char *signed_sweep_tx,
+                                            size_t signed_sweep_tx_len) {
+    if (!p || !p->db) return 0;
+    if (!signed_sweep_tx || signed_sweep_tx_len == 0) return 1;  /* no-op */
+
+    char *hex = malloc(signed_sweep_tx_len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(signed_sweep_tx, signed_sweep_tx_len, hex);
+
+    const char *sql =
+        "UPDATE old_commitment_htlcs SET signed_sweep_tx_hex = ? "
+        "WHERE channel_id = ? AND commit_num = ? AND htlc_vout = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(hex);
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)commit_num);
+    sqlite3_bind_int(stmt, 4, (int)htlc_vout);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_load_old_commitment_htlc_sweep(persist_t *p, uint32_t channel_id,
+                                            uint64_t commit_num,
+                                            uint32_t htlc_vout,
+                                            unsigned char **out_bytes,
+                                            size_t *out_len) {
+    if (!p || !p->db || !out_bytes || !out_len) return -1;
+    *out_bytes = NULL;
+    *out_len = 0;
+
+    const char *sql =
+        "SELECT signed_sweep_tx_hex FROM old_commitment_htlcs "
+        "WHERE channel_id = ? AND commit_num = ? AND htlc_vout = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_int(stmt, 3, (int)htlc_vout);
+
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (!hex || hex[0] == '\0') {
+            result = 0;  /* row exists, column empty — legacy/lazy fallback */
+        } else {
+            size_t hex_len = strlen(hex);
+            size_t byte_len = hex_len / 2;
+            unsigned char *bytes = malloc(byte_len);
+            if (!bytes) {
+                result = -1;
+            } else {
+                int decoded = hex_decode(hex, bytes, byte_len);
+                if (decoded > 0) {
+                    *out_bytes = bytes;
+                    *out_len = (size_t)decoded;
+                    result = 1;
+                } else {
+                    free(bytes);
+                    result = -1;
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
 }
 
 /* --- v30 (PR-PTLC-1): PTLC output persistence (mirrors HTLC pair above) --- */
