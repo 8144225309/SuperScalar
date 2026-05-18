@@ -177,6 +177,23 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* --- Phase A: PTLC key turnover over wire --- */
     printf("LSP rotate: Phase A — PTLC key turnover\n");
+
+    /* SF-PTLC-HARDEN (#217): journal the turnover ceremony to signing_rounds
+     * so the dashboard / operator-mode can see "X/Y clients turned over key"
+     * after the fact (slow signers, refuses, timeouts).  Same pattern as
+     * Tier B rollover at lsp_channels.c:2080.  Failure to journal is
+     * non-fatal — the ceremony continues. */
+    int64_t ptlc_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id = */ dying_id,
+                                           /* node_idx = */ 0,
+                                           "ptlc_turnover",
+                                           (uint32_t)rotation_epoch,
+                                           (uint32_t)lsp->n_clients,
+                                           &ptlc_round_id);
+    }
+
     size_t turnover_ok = 0, turnover_fail = 0;
     for (size_t ci = 0; ci < lsp->n_clients; ci++) {
         if (lsp->client_fds[ci] < 0) {
@@ -299,10 +316,34 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         cJSON_Delete(cm);
 
         turnover_ok++;
+        if (ptlc_round_id > 0 && mgr->persist) {
+            persist_save_signing_round_participant_psig(
+                (persist_t *)mgr->persist, ptlc_round_id,
+                (uint32_t)(ci + 1), "verified");
+        }
         printf("LSP rotate: client %zu key extracted via wire PTLC\n", ci + 1);
     }
     printf("LSP rotate: Phase A complete — %zu/%zu clients cooperated (%zu failed)\n",
            turnover_ok, lsp->n_clients, turnover_fail);
+
+    /* SF-PTLC-HARDEN (#217): finalize the journal row.  partial = some
+     * clients failed; success = all OK.  result_txid is NULL because
+     * turnover doesn't produce a single on-chain TX (it's a per-client
+     * key extraction). */
+    if (ptlc_round_id > 0 && mgr->persist) {
+        const char *result = (turnover_fail == 0) ? "success" : "partial";
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "ok=%zu fail=%zu n_clients=%zu",
+                 turnover_ok, turnover_fail, lsp->n_clients);
+        persist_save_signing_round_done((persist_t *)mgr->persist,
+                                          ptlc_round_id,
+                                          /* nonces_collected = */ (uint32_t)turnover_ok,
+                                          /* partial_sigs_collected = */ (uint32_t)turnover_ok,
+                                          result,
+                                          /* result_txid = */ NULL,
+                                          (turnover_fail == 0) ? NULL : detail);
+    }
 
     /* Probe client sockets: detect fds that are still positive but the
        remote end has closed (e.g., client disconnected after MSG_ERROR from
