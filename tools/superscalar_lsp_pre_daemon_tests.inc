@@ -3368,6 +3368,28 @@
                    (unsigned long long)bc_ptlc_id,
                    (unsigned long long)bc_amt, bc_cltv);
 
+            /* #206 fix: override remote_pcp slot with rev_secret*G so that
+             * commit-N, WT entry, and penalty TX all derive from the same PCP.
+             * In production the LSP receives a real remote PCP during state
+             * exchange + a real rev_secret from the remote; protocol invariant
+             * guarantees rev_secret*G == slot_pcp.  In this single-process
+             * test scaffold we self-revoke (LOCAL secret stored as if it were
+             * the remote's revelation), so we must sync the slot to match. */
+            {
+                uint64_t bc_preview_cn = ch0_bc->commitment_number;
+                unsigned char bc_preview_secret[32];
+                if (channel_get_per_commitment_secret(ch0_bc, bc_preview_cn,
+                                                       bc_preview_secret)) {
+                    secp256k1_pubkey bc_synth_pcp;
+                    if (secp256k1_ec_pubkey_create(ctx, &bc_synth_pcp,
+                                                    bc_preview_secret)) {
+                        channel_set_remote_pcp(ch0_bc, bc_preview_cn,
+                                                &bc_synth_pcp);
+                    }
+                    secure_zero(bc_preview_secret, 32);
+                }
+            }
+
             /* Step 2: Build + sign commit-N TX (PRESERVE signed bytes) */
             tx_buf_t bc_commit_uns;
             tx_buf_init(&bc_commit_uns, 512);
