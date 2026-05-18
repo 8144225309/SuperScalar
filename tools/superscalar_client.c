@@ -2050,6 +2050,12 @@ int main(int argc, char *argv[]) {
     size_t n_actions = 0;
 
     /* Load config file if --config provided (first pass) */
+    /* SF-W-PTLC #174: PTLCs default-on; operator opts out with --disable-ptlc. */
+    {
+        extern void ptlc_safety_set_enabled(int);
+        ptlc_safety_set_enabled(1);
+    }
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             FILE *cf = fopen(argv[i + 1], "r");
@@ -2087,6 +2093,12 @@ int main(int argc, char *argv[]) {
     }
 
     /* Parse CLI arguments (override config file) */
+    /* SF-W-PTLC #174: PTLCs default-on; operator opts out with --disable-ptlc. */
+    {
+        extern void ptlc_safety_set_enabled(int);
+        ptlc_safety_set_enabled(1);
+    }
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seckey") == 0 && i + 1 < argc)
             seckey_hex = argv[++i];
@@ -2099,10 +2111,15 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--daemon") == 0)
             daemon_mode = 1;
         else if (strcmp(argv[i], "--enable-ptlc-unsafe") == 0) {
-            /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops */
+            /* SF-W-PTLC #174: kept as a no-op alias for back-compat. */
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(1);
-            printf("Client: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+            printf("Client: --enable-ptlc-unsafe is now a no-op alias (PTLCs default-on)\n");
+        }
+        else if (strcmp(argv[i], "--disable-ptlc") == 0) {
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(0);
+            printf("Client: PTLC channel ops disabled (--disable-ptlc)\n");
         }
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];

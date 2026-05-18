@@ -3319,6 +3319,10 @@ int test_ptlc_rt1_add_and_sign(void) {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
     ch.ctx = ctx;
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     unsigned char pp_priv[32];
     memset(pp_priv, 0x55, 32); pp_priv[0] = 0x01;
@@ -3349,6 +3353,10 @@ int test_ptlc_rt2_settle(void) {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
     ch.ctx = ctx;
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     unsigned char pp_priv[32];
     memset(pp_priv, 0x66, 32); pp_priv[0] = 0x01;
@@ -3379,6 +3387,10 @@ int test_ptlc_rt3_fail(void) {
     channel_t ch;
     memset(&ch, 0, sizeof(ch));
     ch.ctx = ctx;
+    /* #182: seed balances for channel_add_ptlc. */
+    ch.local_amount = 1000000;
+    ch.remote_amount = 1000000;
+    ch.funder_is_local = 1;
 
     unsigned char pp_priv[32];
     memset(pp_priv, 0x77, 32); pp_priv[0] = 0x01;
