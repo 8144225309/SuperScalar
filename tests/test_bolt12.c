@@ -261,7 +261,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 33, "schema version is 33 (v33 adds ps_subfactory_chains.confirmed_height + reorg_stale — SF-followup #146)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 34, "schema version is 34 (v34 adds ceremonies/ceremony_participants/revocation_releases — #185)");
     persist_close(&p);
     return 1;
 }
