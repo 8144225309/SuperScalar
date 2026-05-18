@@ -319,12 +319,13 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                            uint32_t channel_id,
                                            uint64_t old_commit_num,
                                            uint64_t old_local, uint64_t old_remote,
-                                           const htlc_t *old_htlcs, size_t old_n_htlcs) {
+                                           const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                           const ptlc_t *old_ptlcs, size_t old_n_ptlcs) {
     if (!wt)
         return;
 
-    /* Save current state (including HTLC state — the old commitment may have
-     * had different active HTLCs than the current channel state) */
+    /* Save current state (HTLC + PTLC — the old commitment may have had
+     * different active HTLCs/PTLCs than the current channel state) */
     uint64_t saved_num = ch->commitment_number;
     uint64_t saved_local = ch->local_amount;
     uint64_t saved_remote = ch->remote_amount;
@@ -334,10 +335,20 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     if (saved_n_htlcs > 0 && !saved_htlcs) return;
     if (saved_n_htlcs > 0)
         memcpy(saved_htlcs, ch->htlcs, saved_n_htlcs * sizeof(htlc_t));
+    /* SF-W-PTLC: also save PTLC state */
+    size_t saved_n_ptlcs = ch->n_ptlcs;
+    ptlc_t *saved_ptlcs = saved_n_ptlcs > 0
+        ? malloc(saved_n_ptlcs * sizeof(ptlc_t)) : NULL;
+    if (saved_n_ptlcs > 0 && !saved_ptlcs) {
+        free(saved_htlcs);
+        return;
+    }
+    if (saved_n_ptlcs > 0)
+        memcpy(saved_ptlcs, ch->ptlcs, saved_n_ptlcs * sizeof(ptlc_t));
 
-    /* Temporarily set to old state, restoring the HTLC state that was active
-     * at the time of the old commitment. This ensures the rebuilt commitment tx
-     * includes HTLC outputs and produces the correct txid. */
+    /* Temporarily set to old state, restoring the HTLC + PTLC state that was
+     * active at the time of the old commitment. This ensures the rebuilt
+     * commitment tx includes HTLC + PTLC outputs and produces the correct txid. */
     ch->commitment_number = old_commit_num;
     ch->local_amount = old_local;
     ch->remote_amount = old_remote;
@@ -347,12 +358,36 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     } else {
         ch->n_htlcs = 0;
     }
+    /* SF-W-PTLC: install old PTLCs so commitment-TX rebuild includes them */
+    if (old_ptlcs && old_n_ptlcs > 0) {
+        if (ch->ptlcs_cap < old_n_ptlcs) {
+            ptlc_t *new_arr = realloc(ch->ptlcs, old_n_ptlcs * sizeof(ptlc_t));
+            if (new_arr) {
+                ch->ptlcs = new_arr;
+                ch->ptlcs_cap = old_n_ptlcs;
+            }
+        }
+        if (ch->ptlcs && ch->ptlcs_cap >= old_n_ptlcs) {
+            ch->n_ptlcs = old_n_ptlcs;
+            memcpy(ch->ptlcs, old_ptlcs, old_n_ptlcs * sizeof(ptlc_t));
+        } else {
+            ch->n_ptlcs = 0;  /* alloc failed — degrade gracefully */
+        }
+    } else {
+        ch->n_ptlcs = 0;
+    }
 
-    /* Count active HTLCs for output parsing */
+    /* Count active HTLCs + PTLCs for output parsing */
     size_t n_active_htlcs = 0;
     for (size_t i = 0; i < ch->n_htlcs; i++) {
         if (ch->htlcs[i].state == HTLC_STATE_ACTIVE)
             n_active_htlcs++;
+    }
+    size_t n_active_ptlcs = 0;
+    for (size_t i = 0; i < ch->n_ptlcs; i++) {
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE &&
+            ch->ptlcs[i].amount_sats >= 546 /* dust */)
+            n_active_ptlcs++;
     }
 
     /* Ensure old remote PCP is available: derive from stored revocation secret */
@@ -375,17 +410,25 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
        revocation secrets needed to punish via the penalty TX. */
     int ok = channel_build_commitment_tx_for_remote(ch, &old_tx, old_txid);
 
-    /* Restore state */
+    /* Restore state (HTLCs + PTLCs) */
     ch->commitment_number = saved_num;
     ch->local_amount = saved_local;
     ch->remote_amount = saved_remote;
     ch->n_htlcs = saved_n_htlcs;
     if (saved_n_htlcs > 0)
         memcpy(ch->htlcs, saved_htlcs, saved_n_htlcs * sizeof(htlc_t));
+    /* SF-W-PTLC: restore PTLC state */
+    if (saved_n_ptlcs > 0 && saved_ptlcs && ch->ptlcs && ch->ptlcs_cap >= saved_n_ptlcs) {
+        ch->n_ptlcs = saved_n_ptlcs;
+        memcpy(ch->ptlcs, saved_ptlcs, saved_n_ptlcs * sizeof(ptlc_t));
+    } else {
+        ch->n_ptlcs = 0;
+    }
 
     if (!ok) {
         tx_buf_free(&old_tx);
         free(saved_htlcs);
+        free(saved_ptlcs);
         return;
     }
 
@@ -458,6 +501,11 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
             }
         }
 
+        /* SF-W-PTLC: out_ofs lives at outer scope so the PTLC parsing block
+           below can pick up where HTLC parsing left off (PTLC outputs follow
+           HTLC outputs in the commitment TX layout). */
+        size_t out_ofs = ofs;
+
         /* If we have active HTLCs, parse their outputs (vout 2+) and store
          * in the watchtower entry we just created */
         if (n_active_htlcs > 0 && wt->n_entries > 0) {
@@ -467,7 +515,6 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
             entry->n_htlc_outputs = 0;
 
             /* Skip output 0 and output 1 to reach HTLC outputs */
-            size_t out_ofs = ofs;
             for (uint32_t v = 0; v < 2; v++) {
                 if (out_ofs + 9 > old_tx.len) break;
                 uint8_t slen = old_tx.data[out_ofs + 8];
@@ -528,10 +575,100 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 }
             }
         }
+
+        /* SF-W-PTLC: parse PTLC outputs (vouts after HTLC outputs).  Without
+           this feed, watchtower_check's PTLC sweep loop is unreachable and a
+           breach with PTLCs in flight leaks PTLC value.  Mirror of the HTLC
+           block above; uses old_ptlcs (passed in) and walks outputs starting
+           where the HTLC parse left off (out_ofs). */
+        if (n_active_ptlcs > 0 && wt->n_entries > 0 && old_ptlcs) {
+            watchtower_entry_t *entry = &wt->entries[wt->n_entries - 1];
+            entry->ptlc_outputs = calloc(n_active_ptlcs, sizeof(watchtower_htlc_t));
+            entry->n_ptlc_outputs = 0;
+
+            /* If there were no HTLC outputs, out_ofs is still at the first
+               output; advance past to_local + to_remote.  If HTLCs existed,
+               the HTLC parse already advanced out_ofs to the post-HTLC
+               position. */
+            if (n_active_htlcs == 0) {
+                for (uint32_t v = 0; v < 2; v++) {
+                    if (out_ofs + 9 > old_tx.len) break;
+                    uint8_t slen = old_tx.data[out_ofs + 8];
+                    out_ofs += 8 + 1 + slen;
+                }
+            }
+
+            size_t ptlc_active_idx = 0;
+            if (entry->ptlc_outputs)
+            for (size_t i = 0; i < old_n_ptlcs && ptlc_active_idx < n_active_ptlcs; i++) {
+                if (old_ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
+                if (old_ptlcs[i].amount_sats < 546 /* dust */) continue;
+
+                if (out_ofs + 8 + 1 > old_tx.len) break;
+                uint64_t amount = 0;
+                for (int b = 0; b < 8; b++)
+                    amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
+                uint8_t slen = old_tx.data[out_ofs + 8];
+                if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
+                    out_ofs += 8 + 1 + slen;
+                    ptlc_active_idx++;
+                    continue;
+                }
+
+                watchtower_htlc_t *wp = &entry->ptlc_outputs[entry->n_ptlc_outputs];
+                wp->htlc_vout = (uint32_t)(2 + n_active_htlcs + ptlc_active_idx);
+                wp->htlc_amount = amount;
+                memcpy(wp->htlc_spk, &old_tx.data[out_ofs + 9], 34);
+                wp->direction = (htlc_direction_t)old_ptlcs[i].direction;
+                /* Store xonly form of payment_point in payment_hash[32].
+                   The persist + sweep code already treats this field as
+                   the xonly serialization for PTLC entries. */
+                {
+                    secp256k1_xonly_pubkey pp_xonly;
+                    if (secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly,
+                            NULL, &old_ptlcs[i].payment_point)) {
+                        secp256k1_xonly_pubkey_serialize(ch->ctx,
+                            wp->payment_hash, &pp_xonly);
+                    } else {
+                        memset(wp->payment_hash, 0, 32);
+                    }
+                }
+                wp->cltv_expiry = old_ptlcs[i].cltv_expiry;
+                entry->n_ptlc_outputs++;
+
+                /* Register PTLC script with chain backend */
+                if (wt->chain && wt->chain->register_script)
+                    wt->chain->register_script(wt->chain, wp->htlc_spk, 34);
+
+                out_ofs += 8 + 1 + slen;
+                ptlc_active_idx++;
+            }
+
+            /* Persist PTLC outputs (transactional) */
+            if (wt->db && wt->db->db && entry->n_ptlc_outputs > 0) {
+                if (!persist_begin(wt->db)) {
+                    fprintf(stderr, "watchtower: persist_begin failed, skipping PTLC persist\n");
+                } else {
+                    int ptlc_ok = 1;
+                    for (size_t p = 0; p < entry->n_ptlc_outputs; p++) {
+                        if (!persist_save_old_commitment_ptlc(wt->db, channel_id,
+                                old_commit_num, &entry->ptlc_outputs[p])) {
+                            ptlc_ok = 0;
+                            break;
+                        }
+                    }
+                    if (ptlc_ok)
+                        persist_commit(wt->db);
+                    else
+                        persist_rollback(wt->db);
+                }
+            }
+        }
     }
 
     tx_buf_free(&old_tx);
     free(saved_htlcs);
+    free(saved_ptlcs);
 }
 
 void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
@@ -541,12 +678,14 @@ void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *c
                                                     uint64_t old_remote,
                                                     const htlc_t *old_htlcs,
                                                     size_t old_n_htlcs,
+                                                    const ptlc_t *old_ptlcs,
+                                                    size_t old_n_ptlcs,
                                                     const unsigned char *signed_penalty_tx,
                                                     size_t signed_penalty_tx_len) {
     /* Run the existing registration so persist + script registration +
-       HTLC parsing all stay identical.  Then attach pre-signed penalty
-       TX bytes to the new entry (the LAST one, since the legacy call
-       always pushes to wt->n_entries - 1 if successful).
+       HTLC + PTLC parsing all stay identical.  Then attach pre-signed
+       penalty TX bytes to the new entry (the LAST one, since the legacy
+       call always pushes to wt->n_entries - 1 if successful).
 
        If signed_penalty_tx is NULL we degrade to legacy lazy-build
        behaviour transparently — same call shape as the non-oracular
@@ -554,7 +693,8 @@ void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *c
     size_t n_before = wt->n_entries;
     watchtower_watch_revoked_commitment(wt, ch, channel_id, old_commit_num,
                                           old_local, old_remote,
-                                          old_htlcs, old_n_htlcs);
+                                          old_htlcs, old_n_htlcs,
+                                          old_ptlcs, old_n_ptlcs);
     if (!signed_penalty_tx || signed_penalty_tx_len == 0) return;
     if (wt->n_entries == n_before) return;  /* legacy registration failed */
 
@@ -1051,9 +1191,20 @@ int watchtower_check(watchtower_t *wt) {
             ch->ptlcs[0].direction = (ptlc_direction_t)e->ptlc_outputs[p].direction;
             ch->ptlcs[0].cltv_expiry = e->ptlc_outputs[p].cltv_expiry;
             ch->ptlcs[0].state = PTLC_STATE_ACTIVE;
-            /* Use payment_hash as serialized payment_point for tapscript */
-            secp256k1_ec_pubkey_parse(ch->ctx, &ch->ptlcs[0].payment_point,
-                                       e->ptlc_outputs[p].payment_hash, 33);
+            /* SF-W-PTLC fix: payment_hash[32] holds the xonly form of the
+               PTLC payment_point.  Prepend the even-parity byte (0x02) to
+               build a 33-byte compressed pubkey for secp256k1_ec_pubkey_parse;
+               consumer (channel_build_ptlc_penalty_tx) only uses the xonly
+               form via secp256k1_xonly_pubkey_from_pubkey, so parity is
+               immaterial for the script-merkle reconstruction.  Pre-fix
+               this read 33 bytes from a 32-byte field (heap OOB). */
+            {
+                unsigned char pp33[33];
+                pp33[0] = 0x02;
+                memcpy(pp33 + 1, e->ptlc_outputs[p].payment_hash, 32);
+                secp256k1_ec_pubkey_parse(ch->ctx, &ch->ptlcs[0].payment_point,
+                                           pp33, 33);
+            }
 
             tx_buf_t ptlc_penalty;
             tx_buf_init(&ptlc_penalty, 512);
@@ -1197,6 +1348,9 @@ int watchtower_check(watchtower_t *wt) {
             if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;
+                /* #248 leak fix: matching ptlc_outputs free. */
+                free(e->ptlc_outputs);
+                e->ptlc_outputs = NULL;
                 /* Oracular bytes (#208 A3.1) — free before swap-with-last */
                 free(e->signed_penalty_tx);
                 e->signed_penalty_tx = NULL;
@@ -1557,6 +1711,10 @@ void watchtower_cleanup(watchtower_t *wt) {
         free(wt->entries[i].leaf_channel_ids);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
+        /* #248 leak fix: ptlc_outputs allocated by
+           watchtower_watch_revoked_commitment SF-W-PTLC block. */
+        free(wt->entries[i].ptlc_outputs);
+        wt->entries[i].ptlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE ||
             wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
@@ -1760,6 +1918,9 @@ void watchtower_clear_entries(watchtower_t *wt) {
         entry_unregister_scripts(wt, &wt->entries[i]);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
+        /* #248 leak fix: ptlc_outputs counterpart. */
+        free(wt->entries[i].ptlc_outputs);
+        wt->entries[i].ptlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE ||
             wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
@@ -1827,6 +1988,9 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
         if (wt->entries[i].channel_id == channel_id) {
             entry_unregister_scripts(wt, &wt->entries[i]);
             free(wt->entries[i].htlc_outputs);
+            /* #248 leak fix: ptlc_outputs counterpart. */
+            free(wt->entries[i].ptlc_outputs);
+            wt->entries[i].ptlc_outputs = NULL;
             if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);
                 free(wt->entries[i].burn_tx);

@@ -22,6 +22,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/lsp_fund.h"
@@ -378,6 +379,22 @@ static void usage(const char *prog) {
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
+        "  --enable-ptlc-unsafe Enable PTLC channel ops (opt-in for testnet4/regtest;\n"
+        "                      watchtower PTLC sweep is wired via SF-W-PTLC, but the\n"
+        "                      feed only fires when PTLCs actually flow through\n"
+        "                      these channels)\n"
+        "  --test-ptlc-basic   After demo: add a PTLC to channel 0, verify commitment\n"
+        "                      TX includes PTLC output, fail PTLC, cooperative close.\n"
+        "                      Validates LSP-side PTLC machinery end-to-end on real\n"
+        "                      chain. Implies --enable-ptlc-unsafe. (regtest/testnet4)\n"
+        "  --test-ptlc-breach  After demo: add a PTLC, snapshot, register revoked\n"
+        "                      commit with PTLC snapshot, verify watchtower entry has\n"
+        "                      ptlc_outputs[], build PTLC penalty TX. Implies\n"
+        "                      --enable-ptlc-unsafe. (regtest/testnet4)\n"
+        "  --test-ptlc-restart After demo: add a PTLC, register with watchtower\n"
+        "                      (persists to DB), close + reopen persist, load PTLCs\n"
+        "                      from DB, verify fields. Validates schema v30\n"
+        "                      persistence. Implies --enable-ptlc-unsafe. (regtest)\n"
         "  --i-accept-the-risk Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
@@ -1219,6 +1236,9 @@ int main(int argc, char *argv[]) {
                                         0 = disabled (default for backward compat) */
     int force_close = 0;
     int test_burn = 0;
+    int test_ptlc_basic = 0;
+    int test_ptlc_breach = 0;
+    int test_ptlc_restart = 0;
     int test_htlc_force_close = 0;
     int test_multi_htlc_force_close = 0;
     int test_full_settlement = 0;
@@ -1407,6 +1427,37 @@ int main(int argc, char *argv[]) {
             test_turnover = 1;
         else if (strcmp(argv[i], "--test-rotation") == 0)
             test_rotation = 1;
+        else if (strcmp(argv[i], "--enable-ptlc-unsafe") == 0) {
+            /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops.
+               Default-off in production (mainnet should still gate). */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            printf("LSP: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+        }
+        else if (strcmp(argv[i], "--test-ptlc-basic") == 0) {
+            /* SF-W-PTLC Phase 3a (#107): validate LSP-side PTLC happy path
+               on real chain. Implies --enable-ptlc-unsafe. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_basic = 1;
+        }
+        else if (strcmp(argv[i], "--test-ptlc-breach") == 0) {
+            /* SF-W-PTLC Phase 3b (#108): validate PTLC watchtower feed
+               end-to-end: add PTLC, snapshot, register revoked-commit
+               with PTLC snapshot, verify entry->ptlc_outputs populated,
+               build PTLC penalty TX. Implies --enable-ptlc-unsafe. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_breach = 1;
+        }
+        else if (strcmp(argv[i], "--test-ptlc-restart") == 0) {
+            /* SF-W-PTLC Phase 3c (#109): validate schema v30 PTLC
+               persistence: save + reload across a fresh persist_t.
+               Implies --enable-ptlc-unsafe. */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            test_ptlc_restart = 1;
+        }
         else if (strcmp(argv[i], "--test-partial-rotation") == 0)
             test_partial_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
@@ -3599,7 +3650,7 @@ accept_new_factory:
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
-        test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
+        test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
         test_rebalance || test_batch_rebalance || test_realloc ||
         test_tier_b_rollover || test_subfactory_advance ||
         test_dual_factory || test_dw_exhibition || test_splice || test_bridge || test_jit || test_bolt12 ||

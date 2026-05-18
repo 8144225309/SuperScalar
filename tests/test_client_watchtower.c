@@ -11,6 +11,7 @@
 #include "superscalar/wire.h"
 #include "superscalar/fee.h"
 #include "superscalar/regtest.h"
+#include "superscalar/ptlc_commit.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -191,7 +192,8 @@ int test_client_watch_revoked_commitment(void) {
     size_t entries_before = wt.n_entries;
     watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
-                                          NULL, 0);
+                                          NULL, 0,
+                                          /* SF-W-PTLC */ NULL, 0);
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -454,7 +456,8 @@ int test_htlc_penalty_watch(void) {
     size_t entries_before = wt.n_entries;
     watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
-                                          old_htlcs, old_n_htlcs);
+                                          old_htlcs, old_n_htlcs,
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -476,6 +479,117 @@ int test_htlc_penalty_watch(void) {
                 "HTLC payment_hash should match");
     TEST_ASSERT(entry->htlc_outputs[0].cltv_expiry == 500,
                 "HTLC cltv_expiry should be 500");
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    watchtower_cleanup(&wt);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* SF-W-PTLC: PTLC analog of test_htlc_penalty_watch — verifies the new
+   watchtower_watch_revoked_commitment PTLC feed populates entry->ptlc_outputs
+   so the existing sweep loop at watchtower.c:1039+ can broadcast a PTLC
+   penalty TX on breach. */
+int test_ptlc_penalty_watch(void) {
+    extern void ptlc_safety_set_enabled(int);
+    ptlc_safety_set_enabled(1);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char lsp_sec[32], client_sec[32];
+    memset(lsp_sec, 0x11, 32);
+    memset(client_sec, 0x22, 32);
+
+    channel_t lsp_ch, client_ch;
+    if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
+
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
+
+    /* Build a payment_point from a known secret */
+    secp256k1_pubkey payment_pt;
+    unsigned char pp_sec[32];
+    memset(pp_sec, 0x77, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &payment_pt, pp_sec),
+                "create payment_point pubkey");
+
+    /* Add 1 PTLC (5000 sats, offered from LSP to client) */
+    uint64_t lsp_ptlc_id, client_ptlc_id;
+    TEST_ASSERT(channel_add_ptlc(&lsp_ch, PTLC_OFFERED, 5000, &payment_pt, 500,
+                                  &lsp_ptlc_id),
+                "add_ptlc on LSP should succeed");
+    TEST_ASSERT(channel_add_ptlc(&client_ch, PTLC_RECEIVED, 5000, &payment_pt, 500,
+                                  &client_ptlc_id),
+                "add_ptlc on client should succeed");
+
+    /* Snapshot old state INCLUDING the PTLC */
+    uint64_t old_cn = client_ch.commitment_number;
+    uint64_t old_local = client_ch.local_amount;
+    uint64_t old_remote = client_ch.remote_amount;
+    size_t old_n_ptlcs = client_ch.n_ptlcs;
+    ptlc_t old_ptlcs[8];
+    memcpy(old_ptlcs, client_ch.ptlcs, old_n_ptlcs * sizeof(ptlc_t));
+
+    /* Advance commitment */
+    lsp_ch.commitment_number++;
+    channel_generate_local_pcs(&lsp_ch, lsp_ch.commitment_number);
+    client_ch.commitment_number++;
+    channel_generate_local_pcs(&client_ch, client_ch.commitment_number);
+
+    /* LSP reveals old secret to client */
+    unsigned char lsp_old_secret[32];
+    channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
+    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+
+    secp256k1_pubkey lsp_new_pcp;
+    channel_get_per_commitment_point(&lsp_ch, lsp_ch.commitment_number + 1, &lsp_new_pcp);
+    channel_set_remote_pcp(&client_ch, client_ch.commitment_number + 1, &lsp_new_pcp);
+
+    /* Register old commitment WITH PTLC state — the new feed should fire */
+    size_t entries_before = wt.n_entries;
+    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+                                          old_local, old_remote,
+                                          /* no HTLCs */ NULL, 0,
+                                          old_ptlcs, old_n_ptlcs);
+
+    TEST_ASSERT(wt.n_entries == entries_before + 1,
+                "watchtower should have one more entry");
+
+    watchtower_entry_t *entry = &wt.entries[entries_before];
+    TEST_ASSERT(entry->channel_id == 0, "entry channel_id should be 0");
+    TEST_ASSERT(entry->commit_num == old_cn, "entry commit_num should match");
+
+    /* Verify PTLC output was stored (the new feed activated) */
+    TEST_ASSERT(entry->n_ptlc_outputs == 1,
+                "entry should have 1 PTLC output");
+    TEST_ASSERT(entry->ptlc_outputs[0].htlc_vout == 2,
+                "PTLC output vout should be 2 (no HTLCs preceding)");
+    TEST_ASSERT(entry->ptlc_outputs[0].htlc_amount == 5000,
+                "PTLC output amount should be 5000");
+    TEST_ASSERT(entry->ptlc_outputs[0].direction == (htlc_direction_t)PTLC_RECEIVED,
+                "PTLC direction should be RECEIVED (client's perspective)");
+    TEST_ASSERT(entry->ptlc_outputs[0].cltv_expiry == 500,
+                "PTLC cltv_expiry should be 500");
+
+    /* payment_hash[32] holds the xonly form of payment_point.  Reconstruct and
+       verify it matches. */
+    {
+        secp256k1_xonly_pubkey expected_xonly;
+        unsigned char expected_ser[32];
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &expected_xonly,
+                        NULL, &payment_pt),
+                    "compute xonly of payment_point");
+        secp256k1_xonly_pubkey_serialize(ctx, expected_ser, &expected_xonly);
+        TEST_ASSERT(memcmp(entry->ptlc_outputs[0].payment_hash, expected_ser, 32) == 0,
+                    "payment_hash should be xonly form of payment_point");
+    }
 
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);

@@ -639,7 +639,8 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
                 old_local, old_remote,
-                old_htlcs, old_n_htlcs);
+                old_htlcs, old_n_htlcs,
+                /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
         }
 
         /* Store LSP's next per-commitment point */
@@ -1205,7 +1206,8 @@ handle_message:
                     size_t wt_n_htlcs = cbd->pending_wt_valid
                                         ? cbd->pending_wt_n_htlcs : 0;
                     watchtower_watch_revoked_commitment(cbd->wt, ch,
-                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs);
+                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs,
+                        /* SF-W-PTLC */ NULL, 0);
                     cbd->pending_wt_valid = 0;
                 }
                 /* Persist new remote PCP */
@@ -2096,6 +2098,12 @@ int main(int argc, char *argv[]) {
             expect_channels = 1;
         else if (strcmp(argv[i], "--daemon") == 0)
             daemon_mode = 1;
+        else if (strcmp(argv[i], "--enable-ptlc-unsafe") == 0) {
+            /* SF-W-PTLC: operator opt-in for testnet4/regtest PTLC ops */
+            extern void ptlc_safety_set_enabled(int);
+            ptlc_safety_set_enabled(1);
+            printf("Client: PTLC channel ops enabled (operator opt-in, --enable-ptlc-unsafe)\n");
+        }
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
