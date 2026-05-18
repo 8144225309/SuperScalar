@@ -1348,6 +1348,9 @@ int watchtower_check(watchtower_t *wt) {
             if (unswept == 0) {
                 free(e->htlc_outputs);
                 e->htlc_outputs = NULL;
+                /* #248 leak fix: matching ptlc_outputs free. */
+                free(e->ptlc_outputs);
+                e->ptlc_outputs = NULL;
                 /* Oracular bytes (#208 A3.1) — free before swap-with-last */
                 free(e->signed_penalty_tx);
                 e->signed_penalty_tx = NULL;
@@ -1708,6 +1711,10 @@ void watchtower_cleanup(watchtower_t *wt) {
         free(wt->entries[i].leaf_channel_ids);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
+        /* #248 leak fix: ptlc_outputs allocated by
+           watchtower_watch_revoked_commitment SF-W-PTLC block. */
+        free(wt->entries[i].ptlc_outputs);
+        wt->entries[i].ptlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE ||
             wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
@@ -1911,6 +1918,9 @@ void watchtower_clear_entries(watchtower_t *wt) {
         entry_unregister_scripts(wt, &wt->entries[i]);
         free(wt->entries[i].htlc_outputs);
         wt->entries[i].htlc_outputs = NULL;
+        /* #248 leak fix: ptlc_outputs counterpart. */
+        free(wt->entries[i].ptlc_outputs);
+        wt->entries[i].ptlc_outputs = NULL;
         if (wt->entries[i].type == WATCH_FACTORY_NODE ||
             wt->entries[i].type == WATCH_SUBFACTORY_NODE) {
             free(wt->entries[i].response_tx);
@@ -1978,6 +1988,9 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {
         if (wt->entries[i].channel_id == channel_id) {
             entry_unregister_scripts(wt, &wt->entries[i]);
             free(wt->entries[i].htlc_outputs);
+            /* #248 leak fix: ptlc_outputs counterpart. */
+            free(wt->entries[i].ptlc_outputs);
+            wt->entries[i].ptlc_outputs = NULL;
             if (wt->entries[i].type == WATCH_FACTORY_NODE) {
                 free(wt->entries[i].response_tx);
                 free(wt->entries[i].burn_tx);
