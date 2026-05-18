@@ -6,6 +6,7 @@
  */
 
 #include "superscalar/lsp_wellknown.h"
+#include "superscalar/http_util_internal.h"
 #include <cJSON.h>
 
 #include <stdio.h>
@@ -119,30 +120,6 @@ cleanup:
 
 /* --- HTTP connection handler --- */
 
-/* Read one line from fd (strips \r\n). Returns 0 on EOF/error. */
-static int read_line(int fd, char *buf, size_t cap) {
-    size_t i = 0;
-    while (i < cap - 1) {
-        char c;
-        ssize_t n = read(fd, &c, 1);
-        if (n <= 0) return 0;
-        if (c == '\n') break;
-        if (c != '\r') buf[i++] = c;
-    }
-    buf[i] = '\0';
-    return 1;
-}
-
-/* Write all bytes to fd */
-static int write_all(int fd, const char *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, buf + sent, len - sent);
-        if (n <= 0) return 0;
-        sent += (size_t)n;
-    }
-    return 1;
-}
 
 void lsp_wellknown_handle_connection(int fd,
                                       const lsp_wellknown_cfg_t *cfg) {
@@ -153,14 +130,14 @@ void lsp_wellknown_handle_connection(int fd,
 
     /* Read request line: "GET /path HTTP/1.x" */
     char req_line[512];
-    if (!read_line(fd, req_line, sizeof(req_line))) {
+    if (!http_util_read_line(fd, req_line, sizeof(req_line))) {
         close(fd);
         return;
     }
 
     /* Drain headers */
     char header_line[512];
-    while (read_line(fd, header_line, sizeof(header_line))) {
+    while (http_util_read_line(fd, header_line, sizeof(header_line))) {
         if (header_line[0] == '\0') break;  /* blank line = end of headers */
     }
 
@@ -172,7 +149,7 @@ void lsp_wellknown_handle_connection(int fd,
         const char *resp405 =
             "HTTP/1.0 405 Method Not Allowed\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp405, strlen(resp405));
+        http_util_write_all(fd, resp405, strlen(resp405));
         close(fd);
         return;
     }
@@ -181,7 +158,7 @@ void lsp_wellknown_handle_connection(int fd,
         const char *resp404 =
             "HTTP/1.0 404 Not Found\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp404, strlen(resp404));
+        http_util_write_all(fd, resp404, strlen(resp404));
         close(fd);
         return;
     }
@@ -193,7 +170,7 @@ void lsp_wellknown_handle_connection(int fd,
         const char *resp500 =
             "HTTP/1.0 500 Internal Server Error\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp500, strlen(resp500));
+        http_util_write_all(fd, resp500, strlen(resp500));
         close(fd);
         return;
     }
@@ -209,8 +186,8 @@ void lsp_wellknown_handle_connection(int fd,
         close(fd);
         return;
     }
-    write_all(fd, header, (size_t)header_len);
-    write_all(fd, body, body_len);
+    http_util_write_all(fd, header, (size_t)header_len);
+    http_util_write_all(fd, body, body_len);
     close(fd);
 }
 
@@ -253,7 +230,7 @@ int lsp_wellknown_fetch_http_port(const char *domain, uint16_t tcp_port,
         "Host: %s\r\n"
         "Connection: close\r\n\r\n",
         domain);
-    if (req_len <= 0 || !write_all(fd, req, (size_t)req_len)) {
+    if (req_len <= 0 || !http_util_write_all(fd, req, (size_t)req_len)) {
         close(fd);
         return 0;
     }

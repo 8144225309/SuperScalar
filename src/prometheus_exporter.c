@@ -13,6 +13,7 @@
  */
 
 #include "superscalar/prometheus.h"
+#include "superscalar/http_util_internal.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -28,33 +29,6 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sqlite3.h>
-
-/* ------------------------------------------------------------------ */
-/* IO helpers (copied from lsp_wellknown.c to avoid coupling)         */
-/* ------------------------------------------------------------------ */
-
-static int read_line(int fd, char *buf, size_t cap) {
-    size_t i = 0;
-    while (i < cap - 1) {
-        char c;
-        ssize_t n = read(fd, &c, 1);
-        if (n <= 0) return 0;
-        if (c == '\n') break;
-        if (c != '\r') buf[i++] = c;
-    }
-    buf[i] = '\0';
-    return 1;
-}
-
-static int write_all(int fd, const char *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, buf + sent, len - sent);
-        if (n <= 0) return 0;
-        sent += (size_t)n;
-    }
-    return 1;
-}
 
 /* Bounded append helper. Returns new offset (or buf_cap on overflow). */
 static size_t append_str(char *buf, size_t buf_cap, size_t off,
@@ -348,13 +322,13 @@ void prometheus_handle_connection(int fd, const prometheus_cfg_t *cfg) {
     }
 
     char req_line[512];
-    if (!read_line(fd, req_line, sizeof(req_line))) {
+    if (!http_util_read_line(fd, req_line, sizeof(req_line))) {
         close(fd);
         return;
     }
 
     char header_line[512];
-    while (read_line(fd, header_line, sizeof(header_line))) {
+    while (http_util_read_line(fd, header_line, sizeof(header_line))) {
         if (header_line[0] == '\0') break;
     }
 
@@ -365,7 +339,7 @@ void prometheus_handle_connection(int fd, const prometheus_cfg_t *cfg) {
         const char *resp =
             "HTTP/1.0 405 Method Not Allowed\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp, strlen(resp));
+        http_util_write_all(fd, resp, strlen(resp));
         close(fd);
         return;
     }
@@ -374,7 +348,7 @@ void prometheus_handle_connection(int fd, const prometheus_cfg_t *cfg) {
         const char *resp =
             "HTTP/1.0 404 Not Found\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp, strlen(resp));
+        http_util_write_all(fd, resp, strlen(resp));
         close(fd);
         return;
     }
@@ -385,7 +359,7 @@ void prometheus_handle_connection(int fd, const prometheus_cfg_t *cfg) {
         const char *resp =
             "HTTP/1.0 500 Internal Server Error\r\n"
             "Content-Length: 0\r\n\r\n";
-        write_all(fd, resp, strlen(resp));
+        http_util_write_all(fd, resp, strlen(resp));
         close(fd);
         return;
     }
@@ -400,8 +374,8 @@ void prometheus_handle_connection(int fd, const prometheus_cfg_t *cfg) {
         close(fd);
         return;
     }
-    write_all(fd, header, (size_t)header_len);
-    write_all(fd, body, body_len);
+    http_util_write_all(fd, header, (size_t)header_len);
+    http_util_write_all(fd, body, body_len);
     close(fd);
 }
 

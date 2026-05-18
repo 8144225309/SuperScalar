@@ -1194,6 +1194,11 @@ int main(int argc, char *argv[]) {
     /* Line-buffered stdout/stderr so logs are visible in real time */
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    /* Process start time, captured before any other work — used for the
+       Prometheus uptime metric so it reflects true LSP-process lifetime
+       rather than the (later) time when --prometheus-port forks the
+       metrics server. */
+    time_t lsp_process_start_time = time(NULL);
 
     /* Ignore SIGPIPE — write() to dead client sockets returns EPIPE instead of killing us */
     signal(SIGPIPE, SIG_IGN);
@@ -3135,7 +3140,7 @@ accept_new_factory:
         if (prometheus_port > 0) {
             static prometheus_cfg_t prom_cfg;
             prom_cfg.db_path = use_db ? db_path : NULL;
-            prom_cfg.start_time = time(NULL);
+            prom_cfg.start_time = lsp_process_start_time;
             prom_cfg.n_clients_connected =
                 (g_lsp ? (const volatile size_t *)&g_lsp->n_clients : NULL);
             if (prometheus_serve_fork(&prom_cfg, prometheus_port))

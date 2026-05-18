@@ -175,6 +175,7 @@ add_library(superscalar
     src/bech32m.c
     src/bolt8.c
     src/bolt8_server.c
+    src/http_util.c
     src/lsp_wellknown.c
     src/prometheus_exporter.c
     src/gossip.c
