@@ -4523,6 +4523,20 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    /* === BOLT-2 SPLICE — STUB IMPLEMENTATION (#198 SF-SPLICE-FULL) ===
+       The MSG_SPLICE_* handlers here are a wire-codec stub only:
+         - LSP always responds with acceptor_contribution = 0 (never contributes).
+         - LSP does NOT participate in building the splice TX (no interactive-tx
+           messages: MSG_TX_ADD_INPUT/OUTPUT/COMPLETE/SIGNATURES are absent).
+         - LSP does NOT sign the splice TX (no MuSig ceremony for splice).
+         - SPLICE_LOCKED updates funding_txid/vout but keeps the OLD
+           funding_amount.
+       SuperScalar's own lifecycle doesn't need splice — internal rebalancing
+       uses leaf realloc, sub-factory chain advance, DW rotation, JIT channels,
+       and cooperative close.  These handlers exist for future BOLT-2 wire
+       compatibility with external Lightning peers (e.g. CLN via #172
+       CLN-bLIP56).  A real production splice between SuperScalar and an
+       external LN peer requires the full implementation tracked in #198. */
     case MSG_SPLICE_INIT: {
         /* Initiator sent splice proposal: parse and send SPLICE_ACK */
         uint32_t channel_id = 0;
