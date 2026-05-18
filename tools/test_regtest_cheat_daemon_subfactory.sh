@@ -73,6 +73,12 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
     sleep 1
     for pid in "${PIDS[@]:-}"; do kill -9 "$pid" 2>/dev/null || true; done
+    # #178: checkpoint WAL before cp so the saved snapshot has the actual data
+    # (kill -9 above bypasses SQLite's clean shutdown, leaving recent writes
+    # in the WAL file. Without this checkpoint, the cp captures an empty stub
+    # DB and downstream sqlite3 queries on /tmp/cheat_daemon_sub_last_lsp.db
+    # see zero tables.)
+    sqlite3 "$LSP_DB" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
     cp "$LSP_LOG" /tmp/cheat_daemon_sub_last_lsp.log 2>/dev/null || true
     cp "$WT_LOG"  /tmp/cheat_daemon_sub_last_wt.log  2>/dev/null || true
     cp "$LSP_DB"  /tmp/cheat_daemon_sub_last_lsp.db  2>/dev/null || true
