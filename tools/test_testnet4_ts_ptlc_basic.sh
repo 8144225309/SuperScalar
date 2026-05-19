@@ -53,17 +53,17 @@ echo "  wallet  : $WALLET"
 echo "  N       : $N_CLIENTS"
 echo "  amount  : $AMOUNT sats"
 echo "  binary  : build-release (per #138 ASan-stability rule)"
-echo "  fee-rate: 110 sat/vB (signet-budget memory rule)"
+echo "  fee-rate: 1 sat/vB (testnet4 wallet mintxfee floor)"
 
 pkill -9 -f "superscalar_(lsp|client).*--port $PORT" 2>/dev/null || true
 
 # --test-ptlc-basic implies --enable-ptlc-unsafe (parser flips the gate).
-# --fee-rate 110 per signet-sat budget memory.
+# --fee-rate 1000 per signet-sat budget memory.
 nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
     --demo --test-ptlc-basic \
     --clients "$N_CLIENTS" --arity "$ARITY" \
-    --amount "$AMOUNT" --fee-rate 110 \
+    --amount "$AMOUNT" --fee-rate 1000 \
     --confirm-timeout 259200 \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -91,7 +91,7 @@ for N in 1 2 3 4; do
     for _ in $(seq 1 32); do SK="${SK}${HEX}"; done
     nohup "$CLIENT_BIN" \
         --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-        --seckey "$SK" --fee-rate 110 --lsp-balance-pct 50 \
+        --seckey "$SK" --fee-rate 1000 --lsp-balance-pct 50 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$N" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${HEX}.db" \

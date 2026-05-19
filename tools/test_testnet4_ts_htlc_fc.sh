@@ -56,7 +56,7 @@ nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
     --demo --test-htlc-force-close \
     --clients "$N_CLIENTS" --arity "$ARITY" \
-    --amount "$AMOUNT" --fee-rate 1100 \
+    --amount "$AMOUNT" --fee-rate 1000 \
     --confirm-timeout 259200 \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -85,7 +85,7 @@ for N in 1 2 3 4; do
     for _ in $(seq 1 32); do SK_FULL="${SK_FULL}${SK}"; done
     nohup "$CLIENT_BIN" \
         --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-        --seckey "$SK_FULL" --fee-rate 1100 --lsp-balance-pct 50 \
+        --seckey "$SK_FULL" --fee-rate 1000 --lsp-balance-pct 50 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$N" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${SK}${SK}.db" \

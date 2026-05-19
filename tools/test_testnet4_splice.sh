@@ -67,7 +67,7 @@ nohup "$LSP_BIN" \
     --clients "$N_CLIENTS" --arity 1 --amount "$AMOUNT" \
     --active-blocks 50 --dying-blocks 20 \
     --step-blocks 5 --states-per-layer 2 \
-    --fee-rate 1100 --lsp-balance-pct 100 \
+    --fee-rate 1000 --lsp-balance-pct 100 \
     --confirm-timeout 86400 \
     --seckey 0000000000000000000000000000000000000000000000000000000000000001 \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -84,7 +84,7 @@ done
 
 nohup "$CLIENT_BIN" \
     --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-    --seckey "$CLIENT_SECKEY" --fee-rate 1100 --lsp-balance-pct 100 \
+    --seckey "$CLIENT_SECKEY" --fee-rate 1000 --lsp-balance-pct 100 \
     --lsp-pubkey "$LSP_PUBKEY" --participant-id 1 \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c0.db" \
