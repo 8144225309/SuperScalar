@@ -2,12 +2,14 @@
 # Phase 5 runner — Shape 3f (N=64 ARITY=2,4 PS_SUBFACTORY_ARITY=2 STATIC_NEAR_ROOT=1)
 # ALL FEATURES INTEGRATION TEST
 
-if [ -z "${_SS_TESTNET4_DETACHED:-}" ] && [ ! -t 0 ]; then
-    export _SS_TESTNET4_DETACHED=1
-    exec setsid "$0" "$@"
-fi
+# No setsid self-respawn — launch via `systemd-run --unit=...` for session isolation.
 
 set -euo pipefail
+
+if pgrep -f "superscalar_lsp.*--port ${PORT:-9954}" >/dev/null 2>&1; then
+    echo "REFUSE: another superscalar_lsp is on port ${PORT:-9954}." >&2
+    exit 3
+fi
 # shellcheck source=../../../tools/test_diag_lib.sh
 source "$(dirname "$0")/../../../tools/test_diag_lib.sh"
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Phase 5 runner — Shape 3a (N=8 ARITY=3 uniform PS)
 
-if [ -z "${_SS_TESTNET4_DETACHED:-}" ] && [ ! -t 0 ]; then
-    export _SS_TESTNET4_DETACHED=1
-    exec setsid "$0" "$@"
-fi
+# No setsid self-respawn — launch via `systemd-run --unit=...` for session isolation.
 
 set -euo pipefail
+
+if pgrep -f "superscalar_lsp.*--port ${PORT:-9951}" >/dev/null 2>&1; then
+    echo "REFUSE: another superscalar_lsp is on port ${PORT:-9951}." >&2
+    exit 3
+fi
 # shellcheck source=../../../tools/test_diag_lib.sh
 source "$(dirname "$0")/../../../tools/test_diag_lib.sh"
 

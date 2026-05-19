@@ -12,13 +12,20 @@
 #   FEE_RATE  sat/kvB (default 1000)
 #   BUILD_DIR (default /root/SuperScalar/build-release)
 
-# Self-respawn in own session per feedback_testnet4_setsid_required.
-if [ -z "${_SS_TESTNET4_DETACHED:-}" ] && [ ! -t 0 ]; then
-    export _SS_TESTNET4_DETACHED=1
-    exec setsid "$0" "$@"
-fi
+# NOTE: no setsid self-respawn. Phase 5 runners launch via `systemd-run --unit=...`
+# which already provides session/scope isolation (immune to systemd-logind kills
+# on SSH session end). setsid here detaches from systemd-run and makes the unit
+# deactivate immediately, losing journal capture.
 
 set -euo pipefail
+
+# Refuse to run if another LSP is already on our port (avoid the foot-gun where
+# a second invocation pkills the first one's LSP).
+if pgrep -f "superscalar_lsp.*--port ${PORT:-9950}" >/dev/null 2>&1; then
+    echo "REFUSE: another superscalar_lsp is on port ${PORT:-9950}." >&2
+    echo "        pkill it manually if it is stale, or set PORT=<other> for this run." >&2
+    exit 3
+fi
 
 # shellcheck source=../../../tools/test_diag_lib.sh
 source "$(dirname "$0")/../../../tools/test_diag_lib.sh"
