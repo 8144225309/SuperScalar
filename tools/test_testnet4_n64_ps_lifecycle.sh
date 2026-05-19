@@ -27,7 +27,7 @@ fi
 
 set -euo pipefail
 
-BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build}"
+BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
