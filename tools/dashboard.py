@@ -401,6 +401,47 @@ def _collect_one_db(path):
             "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitments")
     out["old_commitments_coverage"] = (rows[0] if rows else
         {"total": 0, "persisted": 0})
+    # Schema v35 (#271) consumer: per-output HTLC sweep TX bytes on
+    # old_commitment_htlcs.signed_sweep_tx_hex.  Same graceful-degrade
+    # pattern as the penalty coverage above — if the column is missing
+    # (pre-v35 LSP), the first query errors and we fall back to
+    # total-only, surfacing as "in memory only" in the Schema Gaps row.
+    rows, err = query_db(path,
+        "SELECT COUNT(*) AS total, "
+        "COUNT(CASE WHEN signed_sweep_tx_hex IS NOT NULL "
+        "  AND length(signed_sweep_tx_hex) > 0 THEN 1 END) AS persisted "
+        "FROM old_commitment_htlcs")
+    if err:
+        rows, err = query_db(path,
+            "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitment_htlcs")
+    out["old_commitment_htlcs_coverage"] = (rows[0] if rows else
+        {"total": 0, "persisted": 0})
+    # Schema v36 #208 consumer: HTLC resolution TX bytes on
+    # htlcs.signed_resolution_tx_hex (BLOB).  For Path A force-close
+    # in-flight HTLCs (timeout for OFFERED, success for RECEIVED).
+    rows, err = query_db(path,
+        "SELECT COUNT(*) AS total, "
+        "COUNT(CASE WHEN signed_resolution_tx_hex IS NOT NULL "
+        "  AND length(signed_resolution_tx_hex) > 0 THEN 1 END) AS persisted "
+        "FROM htlcs")
+    if err:
+        rows, err = query_db(path,
+            "SELECT COUNT(*) AS total, 0 AS persisted FROM htlcs")
+    out["htlcs_resolution_coverage"] = (rows[0] if rows else
+        {"total": 0, "persisted": 0})
+    # Schema v36 #209 consumer: L-stock burn TX bytes on
+    # old_commitments.signed_burn_tx_hex (BLOB).  OP_RETURN destruction
+    # TX, parallel to signed_penalty_tx_hex.  Same registration moment.
+    rows, err = query_db(path,
+        "SELECT COUNT(*) AS total, "
+        "COUNT(CASE WHEN signed_burn_tx_hex IS NOT NULL "
+        "  AND length(signed_burn_tx_hex) > 0 THEN 1 END) AS persisted "
+        "FROM old_commitments")
+    if err:
+        rows, err = query_db(path,
+            "SELECT COUNT(*) AS total, 0 AS persisted FROM old_commitments")
+    out["old_commitments_burn_coverage"] = (rows[0] if rows else
+        {"total": 0, "persisted": 0})
     # PR #181 Phase B consumer: signing_rounds journal summary.  Table
     # was added in schema v26.  Empty (table missing) on pre-#181 LSPs
     # — graceful: row stays as the defaults, UI shows the
@@ -2796,12 +2837,42 @@ function rTxInventory(D){
   const pct=Math.round(100*ocPersist/ocTot);
   penRow=`<tr><td>Penalty TXs (revocation breach response)</td><td><span class="b w">partial: ${ocPersist}/${ocTot} (${pct}%)</span></td><td>Some entries persisted, ${ocTot-ocPersist} still in memory only — likely a mix of pre-upgrade entries and new ones.  Will normalize as old entries age out / get re-registered.</td></tr>`;
  }
+ // Coverage rows for the three schema-gap items the LSP team added columns
+ // for in PRs #271 (schema v35: old_commitment_htlcs.signed_sweep_tx_hex) and
+ // #274 (schema v36: htlcs.signed_resolution_tx_hex + old_commitments
+ // .signed_burn_tx_hex).  Same 4-branch pattern as the penalty row above —
+ // dashboard reads the new coverage queries and degrades gracefully when
+ // the columns are missing (pre-v35/v36 LSPs).  Each row's "in memory only"
+ // branch covers two cases: (a) pre-upgrade build with column missing, and
+ // (b) post-upgrade build where the write site is the LSP team's planned
+ // follow-up (the schema add PR explicitly notes "write site left for a
+ // follow-up; column NULL by default").
+ const sweepCov=lsp.old_commitment_htlcs_coverage||{total:0,persisted:0};
+ const sweepTot=sweepCov.total||0, sweepPersist=sweepCov.persisted||0;
+ const resCov=lsp.htlcs_resolution_coverage||{total:0,persisted:0};
+ const resTot=resCov.total||0, resPersist=resCov.persisted||0;
+ const burnCov=lsp.old_commitments_burn_coverage||{total:0,persisted:0};
+ const burnTot=burnCov.total||0, burnPersist=burnCov.persisted||0;
+
+ const coverageRow=(label, column, schemaTag, tot, persist, lazyBuildDesc)=>{
+  if(tot===0){
+   return `<tr><td>${label}</td><td><span class="b i">n/a yet</span></td><td>No rows yet.  Once present, ${schemaTag} active means signed bytes go in <code>${column}</code>.</td></tr>`;
+  } else if(persist===0){
+   return `<tr><td>${label}</td><td><span class="b w">in memory only (${tot} entries)</span></td><td>Column <code>${column}</code> may be missing (pre-${schemaTag} LSP) or present but unwritten (write site is an LSP-side follow-up to the schema add).  Today: ${lazyBuildDesc}</td></tr>`;
+  } else if(persist===tot){
+   return `<tr><td>${label}</td><td><span class="b ok">persisted ✓ (${persist}/${tot})</span></td><td>${schemaTag} active and write site wired — every entry has signed TX bytes on disk.  Survives LSP restart without rebuild from secrets.</td></tr>`;
+  } else {
+   const pct=Math.round(100*persist/tot);
+   return `<tr><td>${label}</td><td><span class="b w">partial: ${persist}/${tot} (${pct}%)</span></td><td>Some entries persisted, ${tot-persist} still in memory only — likely a mix of pre-upgrade entries and new ones.  Normalizes as old entries age out / get re-registered.</td></tr>`;
+  }
+ };
+
  h+=`<div class="s"><div class="st"><span>Schema gaps — pre-signed TXs that are not persisted anywhere</span><span class="c">operational risk</span></div>`;
  h+=`<table><tr><th>TX type</th><th>Status</th><th>Risk</th></tr>`;
  h+=penRow;
- h+=`<tr><td>HTLC sweep TXs (per-output penalty)</td><td><span class="b i">lazy-built per-cycle</span></td><td>Different lifecycle from the commitment penalty above — built per watchtower cycle inside <code>watchtower_check()</code>, not pre-built at registration.  Persistence would require moving the build to registration time first (LSP-side refactor, intentionally deferred per PR #181).</td></tr>`;
- h+=`<tr><td>L-stock burn TXs (OP_RETURN destruction)</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>factory_revocation_secrets</code> + <code>old_commitments</code> on need — works but no preparedness check available</td></tr>`;
- h+=`<tr><td>HTLC success/timeout resolution TXs</td><td><span class="b i">constructed on-demand</span></td><td>Rebuilt from <code>htlcs</code> + commitment data — same as burn</td></tr>`;
+ h+=coverageRow('HTLC sweep TXs (per-output penalty)', 'old_commitment_htlcs.signed_sweep_tx_hex', 'schema v35 (#271)', sweepTot, sweepPersist, 'built per watchtower cycle inside <code>watchtower_check()</code>');
+ h+=coverageRow('HTLC success/timeout resolution TXs', 'htlcs.signed_resolution_tx_hex', 'schema v36 (#274 #208)', resTot, resPersist, 'rebuilt from <code>htlcs</code> + commitment data on need');
+ h+=coverageRow('L-stock burn TXs (OP_RETURN destruction)', 'old_commitments.signed_burn_tx_hex', 'schema v36 (#274 #209)', burnTot, burnPersist, 'rebuilt from <code>factory_revocation_secrets</code> + <code>old_commitments</code> on need');
  h+=`<tr><td>Cooperative close TX</td><td><span class="b i">negotiated at close time</span></td><td>Expected — single TX, both sides online</td></tr>`;
  h+=`<tr><td>CPFP children</td><td><span class="b i">dynamic</span></td><td>Generated by watchtower budget sweeper at broadcast time</td></tr>`;
  h+=`</table></div>`;
