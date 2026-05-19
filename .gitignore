@@ -31,5 +31,6 @@ bitcoin-cli-wrapper.sh
 docs/internal/
 testnet4-onchain-firsts.md
 lost-coordination-branch/
+.claude/
 
 PS_MAINNET_PUNCH_LIST.md
