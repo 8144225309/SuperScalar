@@ -16,6 +16,51 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
+/* Authoritative check: does this serialised penalty TX contain a P2A anchor
+ * at vout 1?  The build-time `use_anchor` decision (fee_should_use_anchor at
+ * registration) can differ from the broadcast-time re-evaluation if the fee
+ * estimator's URGENT rate crossed the 1 sat/vB threshold in between.  When
+ * that happens we'd otherwise track CPFP against an output that doesn't
+ * exist, and bitcoind rejects the child with bad-txns-inputs-missingorspent.
+ * This helper inspects the bytes directly so the two decisions can't drift.
+ *
+ * Penalty TX format assumed (channel_build_penalty_tx, V3/TRUC, segwit):
+ *   [4 version][1 marker=0x00][1 flag=0x01]
+ *   [varint n_in (always 1 for penalty)]
+ *   [32 prev_txid][4 prev_vout][1 script_len=0][4 sequence]
+ *   [varint n_out]
+ *   for each out: [8 value][1 spk_len][spk_len spk]
+ *   [witness ...]
+ *   [4 locktime]
+ * Returns true iff n_out>=2 AND output 1's scriptPubKey equals P2A_SPK. */
+static bool penalty_tx_has_p2a_anchor(const unsigned char *tx, size_t len)
+{
+    if (!tx || len < 10) return false;
+    size_t off = 6;  /* skip version + marker + flag */
+    /* n_inputs: penalty always emits 1 input, so this single byte is enough */
+    if (tx[off++] != 1) return false;
+    off += 32 + 4;                  /* prev_txid + prev_vout */
+    if (off >= len) return false;
+    unsigned int in_script_len = tx[off++];
+    if (in_script_len != 0) return false;  /* segwit empty scriptSig */
+    off += 4;                       /* sequence */
+    if (off >= len) return false;
+    unsigned int n_out = tx[off++];
+    if (n_out < 2) return false;
+    /* Skip output 0: 8 value + spk_len + spk */
+    if (off + 8 + 1 > len) return false;
+    off += 8;
+    unsigned int spk0_len = tx[off++];
+    if (off + spk0_len > len) return false;
+    off += spk0_len;
+    /* Output 1: must be the P2A anchor */
+    if (off + 8 + 1 + P2A_SPK_LEN > len) return false;
+    off += 8;
+    unsigned int spk1_len = tx[off++];
+    if (spk1_len != P2A_SPK_LEN) return false;
+    return memcmp(&tx[off], P2A_SPK, P2A_SPK_LEN) == 0;
+}
+
 int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db) {
     if (!wt) return 0;
@@ -1151,14 +1196,21 @@ int watchtower_check(watchtower_t *wt) {
             ch = wt->channels[e->channel_id];
 
         /* Track in pending for CPFP bump if anchor is active.
-           NOTE: anchor_vout=1 must match channel_build_penalty_tx output order.
-           Skip CPFP tracking at sub-1-sat/vB — no anchor output was created.
+           Use authoritative byte-inspection of the pre-built penalty TX
+           (penalty_tx_has_p2a_anchor) rather than re-deriving use_anchor —
+           the build-time and broadcast-time fee_should_use_anchor() can
+           disagree when the URGENT fee rate crosses 1 sat/vB in between,
+           which produces ghost-anchor pending entries whose CPFP child
+           bitcoind rejects with bad-txns-inputs-missingorspent.
            SF-WTC #149: dropped `ch &&` gate.  csv_delay now sourced from
            e->csv_delay (persisted at watch-registration), falling back to
            live ch->to_self_delay for legacy entries pre v32, and to the
            hard default if neither is available. */
         uint32_t cur_height = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
-        if (penalty_sent && use_anchor &&
+        bool penalty_actually_has_anchor =
+            penalty_tx_has_p2a_anchor(e->signed_penalty_tx,
+                                        e->signed_penalty_tx_len);
+        if (penalty_sent && penalty_actually_has_anchor &&
             wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < wt->pending_cap) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
@@ -1470,44 +1522,59 @@ int watchtower_check(watchtower_t *wt) {
         }
         uint32_t cur_block = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
         if (htlc_fee_bump_should_bump(&p->fee_bump, cur_block)) {
-            uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
-            tx_buf_t cpfp;
-            tx_buf_init(&cpfp, 512);
-            if (watchtower_build_cpfp_tx(wt, &cpfp, p->txid,
-                                           p->anchor_vout, p->anchor_amount, fr)) {
-                char *cpfp_hex = (char *)malloc(cpfp.len * 2 + 1);
-                if (cpfp_hex) {
-                    hex_encode(cpfp.data, cpfp.len, cpfp_hex);
-                    char cpfp_txid[65];
-                    if (wt->chain->send_raw_tx(wt->chain, cpfp_hex, cpfp_txid)) {
-                        htlc_fee_bump_record_broadcast(&p->fee_bump, cur_block, fr);
-                        printf("  CPFP child broadcast (feerate %llu): %s\n",
-                               (unsigned long long)fr, cpfp_txid);
-                        if (wt->db && wt->db->db) {
-                            /* v27: persist the escalation schedule so a
-                               mid-bump restart resumes instead of rebasing. */
-                            persist_save_pending(wt->db, p->txid,
-                                p->anchor_vout, p->anchor_amount,
-                                p->cycles_in_mempool,
-                                (int)p->fee_bump.last_bump_block,
-                                p->penalty_value, p->csv_delay, p->start_height,
-                                p->fee_bump.start_block,
-                                p->fee_bump.deadline_block,
-                                p->fee_bump.budget_sat,
-                                p->fee_bump.start_feerate);
-                            persist_log_broadcast(wt->db, cpfp_txid,
-                                                  "cpfp", cpfp_hex, "ok");
+            /* Pre-flight: bitcoind rejects CPFP with
+             * bad-txns-inputs-missingorspent when the parent is no longer
+             * in mempool — RBF replacement, mempool eviction, or never
+             * propagated. Skip the build+broadcast effort in that case
+             * and emit a meaningful skip line rather than a confusing
+             * "broadcast failed". If parent confirmed in the gap since
+             * the conf check at loop top, the next cycle removes the entry. */
+            bool parent_in_mempool = !wt->chain->is_in_mempool ||
+                wt->chain->is_in_mempool(wt->chain, p->txid);
+            if (!parent_in_mempool) {
+                fprintf(stderr,
+                    "  CPFP skipped: parent %s not in mempool (cycles=%u)\n",
+                    p->txid, p->cycles_in_mempool);
+            } else {
+                uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
+                tx_buf_t cpfp;
+                tx_buf_init(&cpfp, 512);
+                if (watchtower_build_cpfp_tx(wt, &cpfp, p->txid,
+                                               p->anchor_vout, p->anchor_amount, fr)) {
+                    char *cpfp_hex = (char *)malloc(cpfp.len * 2 + 1);
+                    if (cpfp_hex) {
+                        hex_encode(cpfp.data, cpfp.len, cpfp_hex);
+                        char cpfp_txid[65];
+                        if (wt->chain->send_raw_tx(wt->chain, cpfp_hex, cpfp_txid)) {
+                            htlc_fee_bump_record_broadcast(&p->fee_bump, cur_block, fr);
+                            printf("  CPFP child broadcast (feerate %llu): %s\n",
+                                   (unsigned long long)fr, cpfp_txid);
+                            if (wt->db && wt->db->db) {
+                                /* v27: persist the escalation schedule so a
+                                   mid-bump restart resumes instead of rebasing. */
+                                persist_save_pending(wt->db, p->txid,
+                                    p->anchor_vout, p->anchor_amount,
+                                    p->cycles_in_mempool,
+                                    (int)p->fee_bump.last_bump_block,
+                                    p->penalty_value, p->csv_delay, p->start_height,
+                                    p->fee_bump.start_block,
+                                    p->fee_bump.deadline_block,
+                                    p->fee_bump.budget_sat,
+                                    p->fee_bump.start_feerate);
+                                persist_log_broadcast(wt->db, cpfp_txid,
+                                                      "cpfp", cpfp_hex, "ok");
+                            }
+                        } else {
+                            fprintf(stderr, "  CPFP child broadcast failed\n");
+                            if (wt->db && wt->db->db)
+                                persist_log_broadcast(wt->db, "?",
+                                                      "cpfp", cpfp_hex, "failed");
                         }
-                    } else {
-                        fprintf(stderr, "  CPFP child broadcast failed\n");
-                        if (wt->db && wt->db->db)
-                            persist_log_broadcast(wt->db, "?",
-                                                  "cpfp", cpfp_hex, "failed");
+                        free(cpfp_hex);
                     }
-                    free(cpfp_hex);
                 }
+                tx_buf_free(&cpfp);
             }
-            tx_buf_free(&cpfp);
         }
         i++;
     }
