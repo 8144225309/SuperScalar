@@ -16,6 +16,10 @@ fi
 
 set -euo pipefail
 
+# Diagnostic helpers: forensics bundle on LSP death, periodic /proc snapshots.
+# shellcheck source=test_diag_lib.sh
+source "$(dirname "$0")/test_diag_lib.sh"
+
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
@@ -42,6 +46,7 @@ rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG" "$DONE"
 for HEX in 2222 3333 4444 5555; do
     rm -f "/tmp/ss_t4_${TAG}_c${HEX}.db"* "/tmp/ss_t4_${TAG}_c${HEX}.log"
 done
+diag_setup "ss_t4_${TAG}"
 
 echo "=== testnet4 TS-HTLC-FC (#112) ==="
 echo "  port    : $PORT"
@@ -64,6 +69,7 @@ nohup "$LSP_BIN" \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 echo "  LSP pid=$LSP_PID"
+diag_periodic "$LSP_PID" 60
 
 # Wait for listen
 for i in $(seq 1 60); do
@@ -95,9 +101,10 @@ done
 
 echo "  4 clients launched; waiting for LSP to exit..."
 
-# Wait for LSP to finish (test completes when --test-htlc-force-close ceremony done)
-wait $LSP_PID
-EXIT=$?
+# Wait for LSP to finish (captures EXIT without set -e short-circuit;
+# runs diag bundle if LSP dies non-zero).
+diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
+EXIT=$DIAG_EXIT
 
 pkill -f "superscalar_client.*--port $PORT" 2>/dev/null || true
 echo "EXIT=$EXIT" > "$DONE"

@@ -529,23 +529,23 @@ gate for flipping the kill switch from `mainnet refused` to
 
 - [ ] All schema migrations v1..v34 covered by upgrade tests on a
       populated DB
-- [ ] Watchtower restart audit (#135, #161) signed off — done per
+- [x] Watchtower restart audit (#135, #161) signed off — done per
       `.claude/WT_RESTART_AUDIT_135_161.md`
 - [ ] Reorg correctness audit (#125-#129) signed off
 - [ ] Force-close cost calculator validated against on-chain replay
       (#72)
 - [ ] Confirmation depth policy (#136) enforced for every code path
       that depends on funding finality
-- [ ] PTLC production threading merged (#253) — gates non-trivial
+- [x] PTLC production threading merged (#253) — gates non-trivial
       routed payments
 - [ ] CLN bridge security review (#175 / #176 follow-ups for
       watchtower breach recording) signed off
-- [ ] PTLC presig gating (#196, #256) and factory tree sign refusal
+- [x] PTLC presig gating (#196, #256) and factory tree sign refusal
       without chain backend (#197, #257) both verified to refuse
       under hostile inputs
 - [ ] Ceremony finalization guard (#199, #259) tested under crash
       injection at every state boundary
-- [ ] Splice path either fully implemented or explicitly disabled
+- [x] Splice path either fully implemented or explicitly disabled
       (currently a wire-codec stub per #198, #260)
 
 ### Operational prereqs

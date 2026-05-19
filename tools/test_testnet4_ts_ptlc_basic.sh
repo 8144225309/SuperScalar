@@ -20,6 +20,9 @@ fi
 
 set -euo pipefail
 
+# shellcheck source=test_diag_lib.sh
+source "$(dirname "$0")/test_diag_lib.sh"
+
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
@@ -46,6 +49,7 @@ rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG" "$DONE"
 for HEX in 2222 3333 4444 5555; do
     rm -f "/tmp/ss_t4_${TAG}_c${HEX}.db"* "/tmp/ss_t4_${TAG}_c${HEX}.log"
 done
+diag_setup "ss_t4_${TAG}"
 
 echo "=== testnet4 TS-PTLC-BASIC (#107, SF-W-PTLC Phase 3a) ==="
 echo "  port    : $PORT"
@@ -58,12 +62,12 @@ echo "  fee-rate: 110 sat/vB (signet-budget memory rule)"
 pkill -9 -f "superscalar_(lsp|client).*--port $PORT" 2>/dev/null || true
 
 # --test-ptlc-basic implies --enable-ptlc-unsafe (parser flips the gate).
-# --fee-rate 110 per signet-sat budget memory.
+# --fee-rate 1100 per signet-sat budget memory.
 nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
     --demo --test-ptlc-basic \
     --clients "$N_CLIENTS" --arity "$ARITY" \
-    --amount "$AMOUNT" --fee-rate 110 \
+    --amount "$AMOUNT" --fee-rate 1100 \
     --confirm-timeout 259200 \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -71,6 +75,7 @@ nohup "$LSP_BIN" \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 echo "  LSP pid=$LSP_PID"
+diag_periodic "$LSP_PID" 60
 
 # Wait for listen
 for i in $(seq 1 60); do
@@ -91,7 +96,7 @@ for N in 1 2 3 4; do
     for _ in $(seq 1 32); do SK="${SK}${HEX}"; done
     nohup "$CLIENT_BIN" \
         --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-        --seckey "$SK" --fee-rate 110 --lsp-balance-pct 50 \
+        --seckey "$SK" --fee-rate 1100 --lsp-balance-pct 50 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$N" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${HEX}.db" \
@@ -101,8 +106,8 @@ done
 
 echo "  $N_CLIENTS clients launched; waiting for LSP to exit..."
 
-wait $LSP_PID
-EXIT=$?
+diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
+EXIT=$DIAG_EXIT
 
 pkill -f "superscalar_client.*--port $PORT" 2>/dev/null || true
 echo "EXIT=$EXIT" > "$DONE"
