@@ -186,6 +186,19 @@ def collect_bitcoin(cfg):
         if ok:
             try: handler(json.loads(out))
             except: pass
+    # Force-close cost projection (Item 1 mainnet-gate finding): fetch the
+    # current network fee estimate so the dashboard can compare it against
+    # each factory's at-creation-budgeted fee_per_tx.  CONSERVATIVE / 6
+    # blocks matches what most ops dashboards quote.  Returned in BTC/kvB;
+    # convert to sat/vbyte for downstream math.
+    out, ok = btc_cmd(cfg, "estimatesmartfee", "6", "CONSERVATIVE")
+    if ok:
+        try:
+            o = json.loads(out)
+            if "feerate" in o:
+                d["fee_estimate_sat_per_vb"] = round(float(o["feerate"]) * 1e5, 3)
+                d["fee_estimate_blocks"] = o.get("blocks", 6)
+        except: pass
     out, ok = btc_cmd(cfg, "-rpcwallet=superscalar_lsp", "getbalance")
     if ok:
         try: d["balance"] = float(out)
@@ -1789,12 +1802,40 @@ function rPsChains(D){
   h+=`</div>`;return h;
  }
  // Per-leaf summary table
- // Build a factory_id -> fee_per_tx lookup so force-close cost
+ // Build a factory_id -> fee_per_tx lookup so chain-broadcast cost
  // projection can be expressed in absolute sats.  chain_len + 1 because
  // chain[0] (initial) must also be broadcast for chain[N] to be valid.
  const facMap={};for(const fr of (lsp.factories||[]))facMap[fr.id]=fr;
+ // FC validation audit (Item 1, finding 1): the budgeted fee_per_tx is set
+ // at factory creation and never refreshed.  On regtest with stable fees
+ // it's a safe over-estimate, but a mainnet fee spike (10-100x) can leave
+ // the LSP under-budgeted while the dashboard still shows green.  We
+ // surface current-network projection alongside the budget — cheapest
+ // honest answer.  TYPICAL_TX_VBYTES is the median observed in the
+ // validation sample (decoded broadcast_log raw_hex across 8 scenarios:
+ // ~111-150 vbytes per tree TX).
+ const feeRate=(D.bitcoin&&D.bitcoin.fee_estimate_sat_per_vb)||0;
+ const TYPICAL_TX_VBYTES=145;
+ // chainCostCell(fcTxCount, fac) → table cell HTML showing budget + current.
+ // Returns one row stacked (budget on top, current beneath) with a stale
+ // badge when current > 1.3× budget.  Pure function so both leaf + sub
+ // tables can share.
+ const chainCostCell=(fcTxCount,fac)=>{
+  const budget=fcTxCount*(fac.fee_per_tx||0);
+  const cur=feeRate?Math.round(fcTxCount*TYPICAL_TX_VBYTES*feeRate):0;
+  const stale=budget>0&&cur>budget*1.3;
+  let line1=`<span title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX">${fs(budget)} <span class="mu" style="font-size:10px">budget</span></span>`;
+  let line2='';
+  if(feeRate){
+   const badge=stale?` <span class="b w" title="current rate exceeds budgeted fee by >30%; broadcast may be under-funded">stale budget</span>`:'';
+   line2=`<div style="font-size:10px" title="${fcTxCount} TXs × ${TYPICAL_TX_VBYTES} vB × ${feeRate} sat/vB (current network rate from estimatesmartfee 6)">${fs(cur)} <span class="mu">@ ${feeRate} sat/vB</span>${badge}</div>`;
+  }else{
+   line2=`<div class="mu" style="font-size:10px" title="bitcoin-cli estimatesmartfee unavailable; current-rate projection skipped">current rate n/a</div>`;
+  }
+  return `<td class="r">${line1}${line2}</td>`;
+ };
  if(leafKeys.length){
-  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Epoch</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Leaf</th><th class="r">Epoch</th><th class="r">Chain len</th><th>chain[0] persisted</th><th class="r">Latest amt</th><th class="r">Poison coverage</th><th class="r">Defense rows</th><th class="r" title="Cost to broadcast chain[0]+chain[1..N] for this leaf only; excludes channel commitments, HTLC/PTLC sweeps, penalty TXs, CPFP children, and factory-burn">Chain-broadcast cost</th><th>Latest TXID</th></tr>`;
   for(const k of leafKeys){
    const e=byLeaf[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
@@ -1812,15 +1853,14 @@ function rPsChains(D){
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
    const sig=sigMap[`${e.factory_id}_${e.leaf_node_idx}`]||0;
    const fac=facMap[e.factory_id]||{};
-   // Force-close cost projection: each chain entry needs its own on-chain
+   // Chain-broadcast cost projection: each chain entry needs its own on-chain
    // broadcast.  chain[0] + chain[1..N] = curEntries.length+1 total TXs;
    // fee_per_tx is the LSP's budgeted endogenous fee at factory creation.
-   // Real cost can be higher under CPFP fee-bumps; this is the baseline
-   // operator commitment for the CURRENT epoch.
+   // Real cost can be higher under CPFP fee-bumps or current-network-rate
+   // movement; chainCostCell surfaces both.
    const fcTxCount=curEntries.length+(init?1:0);
-   const fcCost=fcTxCount*(fac.fee_per_tx||0);
    const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r">${sig}</td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.leaf_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td>${init?'<span class="b ok">yes</span>':'<span class="b dn">missing</span>'}</td><td class="r">${fs(latest.chan_amount_sats)}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r">${sig}</td>${chainCostCell(fcTxCount,fac)}<td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
   h+=`</table>`;
  }
  // Per-leaf chain detail (one mini-table per leaf showing chain[0..N])
@@ -1848,7 +1888,7 @@ function rPsChains(D){
   const subKeys=Object.keys(bySub).sort();
   h+=`<div style="margin-top:14px;border-top:1px solid #30363d;padding-top:10px">`;
   h+=`<div class="st"><span>PS Sub-Factory Chains (k² wide leaves)</span><span class="c">${subKeys.length} sub-factories</span></div>`;
-  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Epoch</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th class="r">Force-close cost</th><th>Latest TXID</th></tr>`;
+  h+=`<table><tr><th>Factory</th><th>Sub</th><th class="r">Epoch</th><th class="r">Chain len</th><th class="r">Sales-stock (latest)</th><th>Channel amounts (latest)</th><th class="r">Poison coverage</th><th class="r" title="Cost to broadcast chain[0]+chain[1..N] for this sub-factory only; excludes channel commitments, HTLC/PTLC sweeps, penalty TXs, CPFP children, and factory-burn">Chain-broadcast cost</th><th>Latest TXID</th></tr>`;
   for(const k of subKeys){
    const e=bySub[k];
    e.entries.sort((a,b)=>a.chain_pos-b.chain_pos);
@@ -1861,10 +1901,35 @@ function rPsChains(D){
    const cls=pct===100?'b ok':pct>=80?'b i':'b w';
    const fac=facMap[e.factory_id]||{};
    const fcTxCount=curEntries.length+1;  // chain[0] + chain[1..N]
-   const fcCost=fcTxCount*(fac.fee_per_tx||0);
    const epochBadge=curEpoch>0?` <span class="mu">(${e.entries.length-curEntries.length} historical)</span>`:'';
-   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td><td class="r" title="${fcTxCount} TXs × ${fac.fee_per_tx||0} sat budgeted fee/TX, current epoch only">${fs(fcCost)}</td><td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
+   h+=`<tr><td>#${e.factory_id}</td><td>node ${e.sub_node_idx}</td><td class="r">${curEpoch}${epochBadge}</td><td class="r">${curEntries.length}</td><td class="r">${fs(latest.sales_stock_amount_sats)}</td><td style="font-size:11px">${latest.channel_amounts_csv||'—'}</td><td class="r"><span class="${cls}">${cov}/${curEntries.length} (${pct}%)</span></td>${chainCostCell(fcTxCount,fac)}<td class="h">${th(latest.txid)} ${txBadge(D,latest.txid,'reserve')}</td></tr>`;  }
   h+=`</table></div>`;
+ }
+ // FC validation audit (Item 1) footnote: surface scope honestly + failed-
+ // broadcast caveat.  Operators looking at "Chain-broadcast cost" should
+ // understand that the figure is for ONE leaf's PS chain, not the full
+ // force-close bill (commits + HTLC sweeps + penalty + CPFP + burn extra),
+ // and that broadcast_log rows with result='failed' are not in this number.
+ {
+  const bl=lsp.broadcast_log||[];
+  const failed=bl.filter(r=>r.result&&r.result!=='ok').length;
+  const treeBcastOk=bl.filter(r=>r.result==='ok'&&r.source&&String(r.source).startsWith('tree_node')).length;
+  const totalTreeNodes=(lsp.tree_nodes||[]).length;
+  let rotNote='';
+  if(treeBcastOk>0&&totalTreeNodes>0&&treeBcastOk>totalTreeNodes){
+   // Finding 3: rotation produced extra tree_node_* broadcasts beyond the
+   // current factory's tree_nodes count.  Surface the gap so operators
+   // know their budget multiplier should be widened.
+   rotNote=` Tree-broadcast log shows <b>${treeBcastOk}</b> successful tree_node TXs across history vs <b>${totalTreeNodes}</b> nodes in the current tree — rotation produced ${treeBcastOk-totalTreeNodes} extra broadcasts that are not in the per-leaf projection.`;
+  }
+  const failNote=failed?` ${failed} broadcast_log row${failed===1?'':'s'} with result≠ok ${failed===1?'is':'are'} excluded from cost (no fee paid; see Live Monitor / Outcomes for retry context).`:'';
+  if(rotNote||failNote||feeRate===0){
+   h+=`<p class="mu" style="font-size:11px;margin-top:10px;line-height:1.5">`;
+   h+=`<b>Scope:</b> Chain-broadcast cost covers chain[0]+chain[1..N] PS broadcasts only.  Full force-close bill also pays for channel commitments, HTLC/PTLC sweeps, penalty TXs, CPFP children, and factory-burn — those are budgeted separately in <code>src/fee.c</code> and are not summed here.`;
+   if(feeRate===0)h+=` Current network rate (<code>bitcoin-cli estimatesmartfee 6 CONSERVATIVE</code>) unavailable — only at-creation budget shown.`;
+   h+=rotNote+failNote;
+   h+=`</p>`;
+  }
  }
  h+=`</div>`;
  return h;
