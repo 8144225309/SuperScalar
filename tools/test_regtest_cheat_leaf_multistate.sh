@@ -77,6 +77,7 @@ echo "=== PS LEAF CHEAT MULTI-STATE (regtest) ==="
 echo "  N clients     : $N_CLIENTS"
 echo "  side cheated  : $SIDE (0=left, 1=right)"
 echo "  advance count : $ADVANCE_COUNT"
+echo "  cheat state K : ${CHEAT_STATE:-0} (CL3-K: 0=oldest stale chain[0]; >0 = middle state chain[K])"
 echo "  funding       : $FUNDING_SATS sats"
 
 # --- bitcoind ---
@@ -100,7 +101,11 @@ echo "  miner ready, 101 fresh blocks"
 
 # --- LSP ---
 echo
-echo "--- LSP daemon (--demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $ADVANCE_COUNT) ---"
+CHEAT_STATE_ARG=()
+if [ "${CHEAT_STATE:-0}" -gt 0 ]; then
+    CHEAT_STATE_ARG=(--cheat-state "$CHEAT_STATE")
+fi
+echo "--- LSP daemon (--demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $ADVANCE_COUNT ${CHEAT_STATE_ARG[*]:-}) ---"
 ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$LSP_BIN" \
     --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
@@ -110,6 +115,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" \
     --demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $ADVANCE_COUNT \
+    "${CHEAT_STATE_ARG[@]}" \
     --lsp-balance-pct 100 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)

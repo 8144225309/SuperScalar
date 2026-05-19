@@ -617,22 +617,40 @@
                        n_total * sizeof(secp256k1_keypair));
             }
 
-            /* CL1: snapshot pre-advance leaf signed_tx if --cheat-leaf is set */
+            /* CL1: snapshot pre-advance leaf signed_tx if --cheat-leaf is set.
+               This is chain[0] (state BEFORE any advance fires).  CL3-K
+               extends this: if --cheat-state K is set with K>0, the
+               advance loop below re-snapshots after the Kth advance so we
+               broadcast chain[K] instead.  K must be in [0, advance_count_arg-1];
+               we validate after parsing and silently clamp to range. */
             tx_buf_t cl1_cheat_stale_leaf_tx;
             tx_buf_init(&cl1_cheat_stale_leaf_tx, 0);
             int cl1_cheat_side = (cheat_leaf_side >= 0) ? cheat_leaf_side : 0;
             unsigned char cl1_cheat_stale_leaf_txid[32] = {0};
+            int cl3k_cheat_state = cheat_state_idx;
+            if (cl3k_cheat_state >= advance_count_arg) {
+                /* K out of range — clamp to the last valid index and warn. */
+                fprintf(stderr,
+                    "CL3-K: --cheat-state %d out of range for --advance-count %d; "
+                    "clamping to %d (== advance_count-1)\n",
+                    cl3k_cheat_state, advance_count_arg, advance_count_arg - 1);
+                cl3k_cheat_state = advance_count_arg - 1;
+            }
             {
                 size_t cleaf_ni = (cl1_cheat_side == 0) ? left_ni : right_ni;
                 if (cheat_leaf_side >= 0) memcpy(cl1_cheat_stale_leaf_txid, lsp_p->factory.nodes[cleaf_ni].txid, 32);
-                if (cheat_leaf_side >= 0 &&
+                if (cheat_leaf_side >= 0 && cl3k_cheat_state == 0 &&
                     lsp_p->factory.nodes[cleaf_ni].is_signed &&
                     lsp_p->factory.nodes[cleaf_ni].signed_tx.len > 0) {
+                    /* K=0 path: snapshot chain[0] now.  Matches the original
+                       single-advance behavior — broadcasting the pre-advance
+                       state after N advances is the oldest-stale cheat. */
                     tx_buf_t *src = &lsp_p->factory.nodes[cleaf_ni].signed_tx;
                     tx_buf_init(&cl1_cheat_stale_leaf_tx, (int)src->len);
                     memcpy(cl1_cheat_stale_leaf_tx.data, src->data, src->len);
                     cl1_cheat_stale_leaf_tx.len = src->len;
                 }
+                /* K>0 path: snapshot deferred to inside the advance loop. */
             }
 
             /* CL1.F: use lsp_channels_advance_ps_leaf which drives the REAL wire ceremony
@@ -653,6 +671,45 @@
                     memset(lsp_seckey, 0, 32);
                     secp256k1_context_destroy(ctx);
                     return 1;
+                }
+                /* CL3-K: middle-state snapshot.  After this iteration, the
+                   cheated leaf is at chain[ac+1].  If --cheat-state K == ac+1,
+                   capture its CURRENT signed_tx for later broadcast.
+                   Remaining iterations will continue advancing past it, so by
+                   the time we broadcast cl1_cheat_stale_leaf_tx the leaf is
+                   at chain[N] but we're rebroadcasting chain[K] — the
+                   middle-state revocation case.
+
+                   We only do this when --cheat-state K with K>0 was set
+                   (cl3k_cheat_state > 0); K=0 case was snapshotted before
+                   the loop above and we never overwrite it here. */
+                if (cheat_leaf_side >= 0 && cl3k_cheat_state > 0 &&
+                    cl3k_cheat_state == ac + 1) {
+                    size_t cleaf_ni_cl3k = (cl1_cheat_side == 0) ? left_ni : right_ni;
+                    factory_node_t *cleaf_node_cl3k = &lsp_p->factory.nodes[cleaf_ni_cl3k];
+                    if (cleaf_node_cl3k->is_signed &&
+                        cleaf_node_cl3k->signed_tx.len > 0) {
+                        /* If a prior K=0 snapshot exists (shouldn't, since
+                           the K>0 branch above skips it), free it first. */
+                        if (cl1_cheat_stale_leaf_tx.data)
+                            tx_buf_free(&cl1_cheat_stale_leaf_tx);
+                        tx_buf_t *src = &cleaf_node_cl3k->signed_tx;
+                        tx_buf_init(&cl1_cheat_stale_leaf_tx, (int)src->len);
+                        memcpy(cl1_cheat_stale_leaf_tx.data, src->data, src->len);
+                        cl1_cheat_stale_leaf_tx.len = src->len;
+                        memcpy(cl1_cheat_stale_leaf_txid,
+                               cleaf_node_cl3k->txid, 32);
+                        printf("  CL3-K: snapshotted chain[%d] (after advance %d) "
+                               "for stale broadcast (side=%d, len=%zu)\n",
+                               cl3k_cheat_state, ac + 1, cl1_cheat_side,
+                               cl1_cheat_stale_leaf_tx.len);
+                    } else {
+                        fprintf(stderr,
+                            "CL3-K: cannot snapshot chain[%d] — leaf node "
+                            "is_signed=%d, signed_tx.len=%zu\n",
+                            cl3k_cheat_state, cleaf_node_cl3k->is_signed,
+                            cleaf_node_cl3k->signed_tx.len);
+                    }
                 }
                 /* Track peak chain_pos: F1+F7 Tier B resets chain_pos to 0 on
                    rollover; without peak tracking the test sees before=0/after=0
@@ -799,8 +856,9 @@
                         leaf_pass = 0;
                     }
                 } else {
-                    printf("  Stale pre-advance leaf broadcast: %s (side=%d)\n",
-                           cheat_txid_str, cl1_cheat_side);
+                    printf("  Stale pre-advance leaf broadcast: %s "
+                           "(side=%d, cheat_state=chain[%d])\n",
+                           cheat_txid_str, cl1_cheat_side, cl3k_cheat_state);
                     /* Wait for 5 confs of stale */
                     if (is_regtest) {
                         regtest_mine_blocks(&rt, 5, mine_addr);

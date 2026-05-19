@@ -318,7 +318,8 @@ static void usage(const char *prog) {
         "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
         "  --cheat-daemon-leaf [SIDE]  Same as --cheat-leaf but skips internal watchtower_check; sleeps so standalone WT can detect + respond. CL4.B.\n"
         "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
-        "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[0] when at chain[N] — validates oldest-stale poison TX still works. CL3.\n"
+        "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[K] (per --cheat-state K, default 0 = oldest stale) when at chain[N]. CL3.\n"
+        "  --cheat-state K      With --cheat-leaf and --advance-count N: snapshot+broadcast chain[K] (default 0 = oldest stale).  K in [0,N-1].  K>0 exercises the watchtower's middle-state revocation walk — boundary-only K=0/K=N-1 tests miss this path. CL3-K.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1270,6 +1271,13 @@ int main(int argc, char *argv[]) {
                                   -Werror to keep the build green until then. */
     (void)cheat_leaf_side;
     int advance_count_arg = 1;  /* CL3: number of leaf advances to drive */
+    int cheat_state_idx = 0;    /* CL3-K: which chain entry to broadcast as
+                                   stale.  0 = chain[0] (pre-advance, oldest
+                                   stale; today's default + only-supported
+                                   behavior).  1..advance_count_arg-1 = a
+                                   MIDDLE chain entry — exercises the
+                                   watchtower's middle-state revocation walk
+                                   that boundary-only tests never hit. */
     int test_dual_factory = 0;
     int test_dw_exhibition = 0;
     int test_bridge = 0;
@@ -1683,6 +1691,14 @@ int main(int argc, char *argv[]) {
             /* CL3: how many leaf advances to drive in test_leaf_advance. */
             advance_count_arg = atoi(argv[++i]);
             if (advance_count_arg < 1) advance_count_arg = 1;
+        }
+        else if (strcmp(argv[i], "--cheat-state") == 0 && i + 1 < argc) {
+            /* CL3-K: which chain index to snapshot + broadcast as stale.
+               Combined with --cheat-leaf + --advance-count N.  Valid range:
+               [0, N-1].  K=0 matches today's behavior (chain[0] / oldest
+               stale).  K>0 exercises middle-state revocation. */
+            cheat_state_idx = atoi(argv[++i]);
+            if (cheat_state_idx < 0) cheat_state_idx = 0;
         }
         else if (strcmp(argv[i], "--kill-after-state-advance") == 0) {
             /* CL5: clean exit after first state-advance ceremony completes
