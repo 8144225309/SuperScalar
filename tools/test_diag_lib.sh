@@ -30,10 +30,38 @@ diag_setup() {
     local tag="$1"
     DIAG_DIR="/tmp/${tag}_diag"
     mkdir -p "$DIAG_DIR"
-    rm -f "$DIAG_DIR"/*.txt "$DIAG_DIR"/*.ndjson "$DIAG_DIR"/lsp.log.* 2>/dev/null || true
+    rm -f "$DIAG_DIR"/*.txt "$DIAG_DIR"/*.ndjson "$DIAG_DIR"/lsp.log.* \
+          "$DIAG_DIR"/*.stderr "$DIAG_DIR"/predeath_* "$DIAG_DIR"/core.* 2>/dev/null || true
     echo "diag: forensics dir = $DIAG_DIR"
     # Record service start time so we can slice journal precisely.
     date -u +%Y-%m-%dT%H:%M:%SZ > "$DIAG_DIR/start.txt"
+}
+
+# diag_enable_core_dumps
+# Lifts the RLIMIT_CORE soft limit and points the kernel core-pattern (best
+# effort — needs root for sysctl) at DIAG_DIR so a SIGSEGV/SIGABRT leaves
+# a usable core file in the forensics bundle.
+diag_enable_core_dumps() {
+    ulimit -c unlimited 2>/dev/null || true
+    if [ -w /proc/sys/kernel/core_pattern ] 2>/dev/null; then
+        echo "${DIAG_DIR}/core.%e.%p.%t" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    fi
+    # core_uses_pid keeps the %p in the name if pattern wasn't writable
+    [ -w /proc/sys/kernel/core_uses_pid ] && \
+        echo 1 > /proc/sys/kernel/core_uses_pid 2>/dev/null || true
+    {
+        echo "ulimit_c: $(ulimit -c 2>/dev/null)"
+        echo "core_pattern: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+        echo "core_uses_pid: $(cat /proc/sys/kernel/core_uses_pid 2>/dev/null)"
+    } > "$DIAG_DIR/core_config.txt"
+    echo "diag: core dumps -> $DIAG_DIR/core.* (ulimit_c=$(ulimit -c 2>/dev/null))"
+}
+
+# diag_stderr_path <name>
+# Returns a per-name stderr path under DIAG_DIR.  Use like:
+#   "$BIN" args > "$LOG" 2> "$(diag_stderr_path lsp)" &
+diag_stderr_path() {
+    echo "${DIAG_DIR:-/tmp}/$1.stderr"
 }
 
 # diag_periodic <PID> [interval_sec]
@@ -44,6 +72,7 @@ diag_periodic() {
     local pid="$1"
     local interval="${2:-60}"
     local out="$DIAG_DIR/timeseries.${pid}.ndjson"
+    local snap="$DIAG_DIR/predeath_${pid}"  # rotating snapshot prefix
     (
         while kill -0 "$pid" 2>/dev/null; do
             if [ -r "/proc/$pid/status" ]; then
@@ -59,12 +88,26 @@ diag_periodic() {
                 printf '{"ts":%s,"pid":%s,"vmrss_kb":%s,"vmsize_kb":%s,"threads":%s,"state":"%s","oom_score":%s,"io_read":%s,"io_write":%s}\n' \
                     "$ts" "$pid" "${vmrss:-0}" "${vmsize:-0}" "${threads:-0}" "${state:-?}" \
                     "$oom_score" "$io_read" "$io_write" >> "$out"
+
+                # Rotating predeath snapshot: overwrites each interval so the
+                # post-death handler always has a recent /proc capture even if
+                # the kernel reaped the process between death and handler run.
+                cat /proc/$pid/status > "${snap}_status.txt" 2>/dev/null || true
+                cat /proc/$pid/stat   > "${snap}_stat.txt"   2>/dev/null || true
+                readlink /proc/$pid/exe > "${snap}_exe.txt"  2>/dev/null || true
+                # The last few lines of any file referenced via /proc/$pid/fd
+                # would be too much; track just the open-fd count as a smoke
+                # signal for fd leaks.
+                if [ -d "/proc/$pid/fd" ]; then
+                    ls /proc/$pid/fd 2>/dev/null | wc -l > "${snap}_nfd.txt" || true
+                fi
+                date -u +%Y-%m-%dT%H:%M:%SZ > "${snap}_ts.txt"
             fi
             sleep "$interval"
         done
     ) &
     DIAG_PERIODIC_PID=$!
-    echo "diag: periodic recorder pid=$DIAG_PERIODIC_PID -> $out"
+    echo "diag: periodic recorder pid=$DIAG_PERIODIC_PID -> $out (predeath snapshots: ${snap}_*)"
 }
 
 # Internal: decode exit code into human-readable form
@@ -141,6 +184,33 @@ diag_on_lsp_death() {
         cat "/proc/$pid/status" > "$diag_dir/proc-status.txt" 2>/dev/null || true
         readlink "/proc/$pid/exe" >> "$diag_dir/proc-status.txt" 2>/dev/null || true
     fi
+
+    # 5b. Predeath snapshot — last /proc capture written by diag_periodic.
+    # Lives independently of post-death /proc reaping; safe to rely on.
+    {
+        for f in "${diag_dir}/predeath_${pid}_"*; do
+            [ -r "$f" ] || continue
+            echo "=== ${f##*/} ==="
+            cat "$f" 2>/dev/null
+            echo
+        done
+    } > "$diag_dir/predeath.txt" 2>&1
+
+    # 5c. Separated stderr tail — useful when the LSP log captures stdout-only
+    # diagnostics but the death cause is a stderr-only assertion / glibc abort.
+    local stderr_path="${diag_dir}/lsp.stderr"
+    if [ -r "$stderr_path" ]; then
+        tail -200 "$stderr_path" > "$diag_dir/lsp.stderr.tail" 2>/dev/null || true
+    fi
+
+    # 5d. Core file — if ulimit + core_pattern were set up at boot, a SIGSEGV/
+    # SIGABRT/SIGBUS leaves a core in DIAG_DIR.  Match by pid OR by name pattern.
+    {
+        ls -la "$diag_dir/core."* 2>/dev/null
+        # Default kernel pattern may dump in CWD; check there too.
+        find /tmp -maxdepth 2 -name "core.*${pid}*" -newer "$diag_dir/start.txt" 2>/dev/null
+        find . -maxdepth 1 -name "core.*${pid}*" 2>/dev/null
+    } > "$diag_dir/core_files.txt" 2>&1
 
     # 6. Audit kill records for this pid (signal attribution)
     if command -v ausearch >/dev/null 2>&1; then

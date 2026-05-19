@@ -50,6 +50,7 @@ for HEX in 2222 3333 4444 5555; do
     rm -f "/tmp/ss_t4_${TAG}_c${HEX}.db"* "/tmp/ss_t4_${TAG}_c${HEX}.log"
 done
 diag_setup "ss_t4_${TAG}"
+diag_enable_core_dumps
 
 echo "=== testnet4 TS-PTLC-BASIC (#107, SF-W-PTLC Phase 3a) ==="
 echo "  port    : $PORT"
@@ -72,7 +73,7 @@ nohup "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "$LSP_DB" \
-    > "$LSP_LOG" 2>&1 &
+    > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
 LSP_PID=$!
 echo "  LSP pid=$LSP_PID"
 diag_periodic "$LSP_PID" 60
@@ -100,7 +101,7 @@ for N in 1 2 3 4; do
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$N" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${HEX}.db" \
-        > "/tmp/ss_t4_${TAG}_c${HEX}.log" 2>&1 &
+        > "/tmp/ss_t4_${TAG}_c${HEX}.log" 2> "$(diag_stderr_path client${N})" &
     sleep 0.5
 done
 

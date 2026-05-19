@@ -64,6 +64,7 @@ rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG" "$DONE"
 rm -f "/tmp/ss_t4_${TAG}_c0.db" "/tmp/ss_t4_${TAG}_c0.db-shm" \
       "/tmp/ss_t4_${TAG}_c0.db-wal" "/tmp/ss_t4_${TAG}_c0.log"
 diag_setup "ss_t4_${TAG}"
+diag_enable_core_dumps
 
 echo "=== testnet4 splice test ==="
 echo "  port      : $PORT"
@@ -83,7 +84,7 @@ nohup "$LSP_BIN" \
     --wallet "$WALLET" --db "$LSP_DB" \
     --demo --test-splice \
     --test-splice-client-seckey "$CLIENT_SECKEY" \
-    > "$LSP_LOG" 2>&1 &
+    > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
 LSP_PID=$!
 diag_periodic "$LSP_PID" 60
 
@@ -98,7 +99,7 @@ nohup "$CLIENT_BIN" \
     --lsp-pubkey "$LSP_PUBKEY" --participant-id 1 \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c0.db" \
-    > "/tmp/ss_t4_${TAG}_c0.log" 2>&1 &
+    > "/tmp/ss_t4_${TAG}_c0.log" 2> "$(diag_stderr_path client0)" &
 CLIENT_PID=$!
 
 diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"

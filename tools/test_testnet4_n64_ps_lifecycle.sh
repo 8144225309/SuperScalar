@@ -59,6 +59,7 @@ for n in $(seq 2 65); do
     rm -f "/tmp/ss_t4_${TAG}_c${HEX:60:4}.db"* "/tmp/ss_t4_${TAG}_c${HEX:60:4}.log"
 done
 diag_setup "ss_t4_${TAG}"
+diag_enable_core_dumps
 
 echo "=== testnet4 N=64 PS lifecycle ==="
 echo "  port            : $PORT"
@@ -87,7 +88,7 @@ nohup "$LSP_BIN" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "$LSP_DB" \
     --demo --force-close \
-    > "$LSP_LOG" 2>&1 &
+    > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
 LSP_PID=$!
 echo "  LSP pid=$LSP_PID"
 diag_periodic "$LSP_PID" 60
@@ -108,7 +109,7 @@ for i in $(seq 1 $N_CLIENTS); do
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $i \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${SK:60:4}.db" \
-        > "/tmp/ss_t4_${TAG}_c${SK:60:4}.log" 2>&1 &
+        > "/tmp/ss_t4_${TAG}_c${SK:60:4}.log" 2> "$(diag_stderr_path client${i})" &
     sleep 0.2  # stagger to avoid HELLO_ACK pile-up
 done
 
