@@ -21,6 +21,10 @@ set -euo pipefail
 source "$(dirname "$0")/test_diag_lib.sh"
 
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
+# Fee rate in sat/kvB. Default 1000 = 1 sat/vB = testnet4 wallet mintxfee floor.
+# Lower (e.g. FEE_RATE=100 = 0.1 sat/vB) when running sat-recovery sweeps
+# against a bitcoind that has -mintxfee lowered in bitcoin.conf.
+FEE_RATE="${FEE_RATE:-1000}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
@@ -61,7 +65,7 @@ nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
     --demo --test-htlc-force-close \
     --clients "$N_CLIENTS" --arity "$ARITY" \
-    --amount "$AMOUNT" --fee-rate 1100 \
+    --amount "$AMOUNT" --fee-rate "$FEE_RATE" \
     --confirm-timeout 259200 \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -91,7 +95,7 @@ for N in 1 2 3 4; do
     for _ in $(seq 1 32); do SK_FULL="${SK_FULL}${SK}"; done
     nohup "$CLIENT_BIN" \
         --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-        --seckey "$SK_FULL" --fee-rate 1100 --lsp-balance-pct 50 \
+        --seckey "$SK_FULL" --fee-rate "$FEE_RATE" --lsp-balance-pct 50 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$N" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${SK}${SK}.db" \
