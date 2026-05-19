@@ -1533,7 +1533,7 @@ int watchtower_check(watchtower_t *wt) {
                 wt->chain->is_in_mempool(wt->chain, p->txid);
             if (!parent_in_mempool) {
                 fprintf(stderr,
-                    "  CPFP skipped: parent %s not in mempool (cycles=%u)\n",
+                    "  CPFP skipped: parent %s not in mempool (cycles=%d)\n",
                     p->txid, p->cycles_in_mempool);
             } else {
                 uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
