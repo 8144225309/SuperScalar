@@ -32,6 +32,9 @@ fi
 
 set -euo pipefail
 
+# shellcheck source=test_diag_lib.sh
+source "$(dirname "$0")/test_diag_lib.sh"
+
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
@@ -55,6 +58,7 @@ LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 CLIENT_SECKEY="0000000000000000000000000000000000000000000000000000000000000002"
 
 rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG" "$DONE"
+diag_setup "ss_t4_${TAG}"
 
 echo "=== testnet4 splice test ==="
 echo "  port      : $PORT"
@@ -76,6 +80,7 @@ nohup "$LSP_BIN" \
     --test-splice-client-seckey "$CLIENT_SECKEY" \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
+diag_periodic "$LSP_PID" 60
 
 for i in $(seq 1 30); do
     sleep 1
@@ -91,8 +96,8 @@ nohup "$CLIENT_BIN" \
     > "/tmp/ss_t4_${TAG}_c0.log" 2>&1 &
 CLIENT_PID=$!
 
-wait $LSP_PID
-EXIT=$?
+diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
+EXIT=$DIAG_EXIT
 pkill -9 -f "superscalar_client.*$PORT" 2>/dev/null || true
 
 echo "EXIT=$EXIT" > "$DONE"
