@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Phase 5 runner — Shape 3a (N=8 ARITY=3 uniform PS)
+
+if [ -z "${_SS_TESTNET4_DETACHED:-}" ] && [ ! -t 0 ]; then
+    export _SS_TESTNET4_DETACHED=1
+    exec setsid "$0" "$@"
+fi
+
+set -euo pipefail
+# shellcheck source=../../../tools/test_diag_lib.sh
+source "$(dirname "$0")/../../../tools/test_diag_lib.sh"
+
+VARIANT="${VARIANT:-V1}"
+TAG="${TAG:-phase5_3a_${VARIANT}}"
+WALLET="${WALLET:-superscalar_test}"
+RESUME="${RESUME:-0}"
+PORT="${PORT:-9951}"
+AMOUNT="${AMOUNT:-1000000}"
+FEE_RATE="${FEE_RATE:-1000}"
+BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
+
+LSP_BIN="$BUILD_DIR/superscalar_lsp"
+CLIENT_BIN="$BUILD_DIR/superscalar_client"
+WT_BIN="$BUILD_DIR/superscalar_watchtower"
+
+NETWORK="testnet4"
+RPCUSER="${RPCUSER:-testnet4rpc}"
+RPCPASS="${RPCPASS:-testnet4rpcpass123}"
+RPCPORT="${RPCPORT:-48332}"
+
+LSP_DB="/tmp/ss_t4_${TAG}.db"
+LSP_LOG="/tmp/ss_t4_${TAG}_lsp.log"
+DONE="/tmp/ss_t4_${TAG}.done"
+EVIDENCE="/tmp/ss_t4_${TAG}.evidence.md"
+LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
+
+case "$VARIANT" in
+    V1) DEMO_FLAGS="--demo" ;;
+    V2) DEMO_FLAGS="--demo --force-close" ;;
+    *)  echo "FAIL: unknown VARIANT=$VARIANT (V1|V2)" >&2; exit 2 ;;
+esac
+
+if [ "$RESUME" -ne 1 ]; then
+    rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG" "$DONE" "$EVIDENCE"
+    for n in 2 3 4 5 6 7 8 9; do
+        SK=$(printf '%064x' "$n")
+        rm -f "/tmp/ss_t4_${TAG}_c${SK:60:4}.db"* "/tmp/ss_t4_${TAG}_c${SK:60:4}.log"
+    done
+fi
+
+diag_setup "ss_t4_${TAG}"
+diag_enable_core_dumps
+
+emit() { printf '%s\n' "$*" >> "$EVIDENCE"; }
+emit "# Shape 3a $VARIANT — incremental evidence"
+emit "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)  Wallet: $WALLET  Tag: $TAG  Variant: $VARIANT"
+emit "Commit:  $(cd /root/SuperScalar && git rev-parse HEAD 2>/dev/null)"
+emit ""
+
+echo "=== Phase 5 Shape 3a $VARIANT (N=8 ARITY=3 uniform PS) ==="
+
+pkill -9 -f "superscalar_(lsp|client|watchtower).*--port $PORT" 2>/dev/null || true
+
+nohup "$LSP_BIN" \
+    --network "$NETWORK" --port "$PORT" \
+    --clients 8 --arity 3 \
+    --amount "$AMOUNT" --fee-rate "$FEE_RATE" \
+    --active-blocks 50 --dying-blocks 20 \
+    --step-blocks 5 --states-per-layer 2 \
+    --confirm-timeout 86400 \
+    --seckey "$LSP_SECKEY" \
+    --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
+    --wallet "$WALLET" --db "$LSP_DB" \
+    $DEMO_FLAGS \
+    > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
+LSP_PID=$!
+emit "LSP pid: $LSP_PID"
+diag_periodic "$LSP_PID" 60
+
+for _ in $(seq 1 60); do
+    sleep 1
+    grep -q "listening on port $PORT" "$LSP_LOG" 2>/dev/null && break
+    if ! kill -0 "$LSP_PID" 2>/dev/null; then
+        emit "FAIL: LSP died before listen"
+        tail -30 "$LSP_LOG" >> "$EVIDENCE"
+        echo "EXIT=1" > "$DONE"
+        exit 1
+    fi
+done
+emit "LSP listening: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+nohup "$WT_BIN" --network "$NETWORK" --db "$LSP_DB" --poll-interval 30 \
+    --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
+    > "/tmp/ss_t4_${TAG}_wt.log" 2> "$(diag_stderr_path wt)" &
+emit "WT  pid: $!"
+sleep 2
+
+for n in 1 2 3 4 5 6 7 8; do
+    SK=$(printf '%064x' $((n + 1)))   # 0x02..0x09
+    nohup "$CLIENT_BIN" \
+        --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
+        --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 50 \
+        --lsp-pubkey "$LSP_PUBKEY" --participant-id "$n" \
+        --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
+        --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${SK:60:4}.db" \
+        > "/tmp/ss_t4_${TAG}_c${SK:60:4}.log" 2> "$(diag_stderr_path client${n})" &
+    sleep 0.3
+done
+
+diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
+EXIT=$DIAG_EXIT
+
+emit ""
+emit "## On-chain events"
+grep -oE "(funding|tree_node_[0-9]+|FORCE CLOSE|cooperative close).*txid=[a-f0-9]+" "$LSP_LOG" | sort -u >> "$EVIDENCE" || true
+emit ""
+emit "## Log assertions"
+for m in "shape ewt =" "PS leaf" "TEST PASSED" "TEST FAILED"; do
+    H=$(grep -E "$m" "$LSP_LOG" | head -1 || true)
+    [ -n "$H" ] && emit "- $m: $H"
+done
+emit ""
+emit "Ended: $(date -u +%Y-%m-%dT%H:%M:%SZ)  Outcome: $([ "$EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+
+pkill -f "superscalar_client.*--port $PORT" 2>/dev/null || true
+pkill -f "superscalar_watchtower.*$LSP_DB" 2>/dev/null || true
+echo "EXIT=$EXIT" > "$DONE"
+cat "$EVIDENCE"
+exit $EXIT
