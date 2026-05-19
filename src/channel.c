@@ -2,6 +2,7 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/fee_estimator.h"
 #include "superscalar/persist.h"
+#include "superscalar/noise.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 
 #include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *, size_t);
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
 /* ---- Key derivation (BOLT #3) ---- */
 
@@ -399,16 +401,74 @@ void channel_set_remote_basepoints(channel_t *ch,
 #define BASEPOINT_DIAG 0
 #endif
 
+/* When SUPERSCALAR_TEST_SEED is set in the environment, derive the four
+   basepoint secrets deterministically via HMAC-SHA256 instead of /dev/urandom.
+   This lets test scaffolds recover access to factory outputs after a DB wipe
+   by re-seeding from a stored hex.  Production leaves the env var unset and
+   falls through to the random path.
+
+   Domain separation:
+     key   = test_seed
+     data  = local_funding_secret(32) || channel_counter_be32(4) || role
+     role  ∈ {"payment", "delayed", "revocation", "htlc"}
+   The local_funding_secret discriminates LSP vs client (their static seckeys
+   already differ).  The per-process counter discriminates channels created
+   with the same funding secret in sequence. */
 int channel_generate_random_basepoints(channel_t *ch) {
     unsigned char ps[32], ds[32], rs[32], hs[32];
-    if (!channel_read_random_bytes(ps, 32) || !channel_read_random_bytes(ds, 32) ||
-        !channel_read_random_bytes(rs, 32) || !channel_read_random_bytes(hs, 32)) {
-        return 0;
+    int seeded = 0;
+
+    const char *test_seed_hex = getenv("SUPERSCALAR_TEST_SEED");
+    if (test_seed_hex && *test_seed_hex) {
+        size_t hex_len = strlen(test_seed_hex);
+        if (hex_len == 0 || hex_len > 128 || (hex_len & 1)) {
+            fprintf(stderr,
+                    "WARN SUPERSCALAR_TEST_SEED invalid length %zu — using /dev/urandom\n",
+                    hex_len);
+        } else {
+            unsigned char seed[64];
+            int n = hex_decode(test_seed_hex, seed, sizeof(seed));
+            if (n <= 0) {
+                fprintf(stderr,
+                        "WARN SUPERSCALAR_TEST_SEED invalid hex — using /dev/urandom\n");
+            } else {
+                static uint32_t s_test_chan_counter = 0;
+                uint32_t idx = s_test_chan_counter++;
+                unsigned char info[32 + 4 + 16];
+                memcpy(info, ch->local_funding_secret, 32);
+                info[32] = (unsigned char)((idx >> 24) & 0xff);
+                info[33] = (unsigned char)((idx >> 16) & 0xff);
+                info[34] = (unsigned char)((idx >> 8) & 0xff);
+                info[35] = (unsigned char)(idx & 0xff);
+                static const char *const roles[4] = {
+                    "payment", "delayed", "revocation", "htlc" };
+                unsigned char *outs[4] = { ps, ds, rs, hs };
+                for (int r = 0; r < 4; r++) {
+                    size_t rl = strlen(roles[r]);
+                    memcpy(info + 36, roles[r], rl);
+                    hmac_sha256(outs[r], seed, (size_t)n, info, 36 + rl);
+                }
+                memset(seed, 0, sizeof(seed));
+                memset(info, 0, sizeof(info));
+                fprintf(stderr,
+                        "DIAG basepoint: derived from SUPERSCALAR_TEST_SEED channel_idx=%u\n",
+                        (unsigned)idx);
+                seeded = 1;
+            }
+        }
+    }
+
+    if (!seeded) {
+        if (!channel_read_random_bytes(ps, 32) || !channel_read_random_bytes(ds, 32) ||
+            !channel_read_random_bytes(rs, 32) || !channel_read_random_bytes(hs, 32)) {
+            return 0;
+        }
     }
 
 #if BASEPOINT_DIAG
-    fprintf(stderr, "DIAG basepoint: generated random (pay=%02x%02x..., delay=%02x%02x..., "
+    fprintf(stderr, "DIAG basepoint: generated %s (pay=%02x%02x..., delay=%02x%02x..., "
             "revoc=%02x%02x..., htlc=%02x%02x...)\n",
+            seeded ? "deterministic" : "random",
             ps[0], ps[1], ds[0], ds[1], rs[0], rs[1], hs[0], hs[1]);
 #endif
 
