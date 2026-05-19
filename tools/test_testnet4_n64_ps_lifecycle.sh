@@ -27,6 +27,9 @@ fi
 
 set -euo pipefail
 
+# shellcheck source=test_diag_lib.sh
+source "$(dirname "$0")/test_diag_lib.sh"
+
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
@@ -55,6 +58,7 @@ for n in $(seq 2 65); do
     HEX=$(printf '%064x' $n)
     rm -f "/tmp/ss_t4_${TAG}_c${HEX:60:4}.db"* "/tmp/ss_t4_${TAG}_c${HEX:60:4}.log"
 done
+diag_setup "ss_t4_${TAG}"
 
 echo "=== testnet4 N=64 PS lifecycle ==="
 echo "  port            : $PORT"
@@ -86,6 +90,7 @@ nohup "$LSP_BIN" \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 echo "  LSP pid=$LSP_PID"
+diag_periodic "$LSP_PID" 60
 
 # Wait for listen
 for i in $(seq 1 60); do
@@ -107,8 +112,8 @@ for i in $(seq 1 $N_CLIENTS); do
     sleep 0.2  # stagger to avoid HELLO_ACK pile-up
 done
 
-wait $LSP_PID
-EXIT=$?
+diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
+EXIT=$DIAG_EXIT
 pkill -9 -f "superscalar_client.*$PORT" 2>/dev/null || true
 
 echo "EXIT=$EXIT" > "$DONE"
