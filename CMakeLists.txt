@@ -138,6 +138,7 @@ add_library(superscalar
     src/lsp.c
     src/client.c
     src/lsp_channels.c
+    src/crash_inject.c
     src/lsp_bridge.c
     src/lsp_rotation.c
     src/lsp_demo.c
