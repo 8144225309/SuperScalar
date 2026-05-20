@@ -110,6 +110,21 @@ int lsp_accept_bridge(lsp_t *lsp);
 /* Send MSG_ERROR to all connected clients, then close their fds. */
 void lsp_abort_ceremony(lsp_t *lsp, const char *reason);
 
+/* Derive an 8-byte ceremony_id from (factory_instance_id, type, epoch).
+   Shared with src/lsp_rotation.c (ROTATE ceremony) and any other ceremony
+   driver that needs to compute or recompute a deterministic ceremony_id
+   (e.g., when linking parent_ceremony_id back to the dying factory's
+   INITIAL ceremony). */
+void lsp_ceremony_derive_id(const unsigned char *fid32,
+                              uint8_t ceremony_type,
+                              uint64_t epoch,
+                              unsigned char out_cid8[8]);
+
+/* Serialize a client's pubkey as 33 compressed bytes. Shared helper used
+   by ceremony drivers that persist participant phases. */
+void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
+                                       unsigned char out33[33]);
+
 /* Cleanup */
 void lsp_cleanup(lsp_t *lsp);
 
