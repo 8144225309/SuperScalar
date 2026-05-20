@@ -212,3 +212,37 @@ diag_wait_lsp() {
         diag_on_lsp_death "$pid" "$lsp_log" "$tag" "$DIAG_EXIT" || true
     fi
 }
+
+# diag_emit_onchain_events <LSP_DB> <LSP_LOG> <EVIDENCE_FILE>
+#
+# Phase 5 runners' shared "## On-chain events" section emitter. Replaces the
+# previous per-runner grep that missed half the LSP's log formats (txid=
+# vs. txid: vs. bare confirmed: <hex>). Prefers a sqlite3 dump of the
+# broadcast_log table (the LSP's authoritative record); falls back to a
+# log grep that matches both txid=<hex> and txid: <hex> patterns so older
+# ceremonies that pre-date the broadcast_log journal still get captured.
+#
+# Writes a markdown table to the evidence file. Safe to call when LSP_DB
+# is absent (legacy runners), in which case only the grep fallback runs.
+diag_emit_onchain_events() {
+    local lsp_db="$1"
+    local lsp_log="$2"
+    local evidence="$3"
+    {
+        printf '\n## On-chain events\n\n'
+        printf '| source | txid | result |\n'
+        printf '|---|---|---|\n'
+    } >> "$evidence"
+    if [ -f "$lsp_db" ]; then
+        sqlite3 -separator '|' "$lsp_db" \
+            "SELECT source, txid, result FROM broadcast_log ORDER BY id;" \
+            2>/dev/null \
+            | awk -F'|' 'NF>=2 { printf "| %s | %s | %s |\n", $1, $2, $3 }' \
+            >> "$evidence" || true
+    fi
+    # Fallback grep catches anything broadcast_log missed. Matches both
+    # `txid=<hex>` (tree_node broadcasts) and `txid: <hex>` (cooperative
+    # close success line).
+    grep -oE "(funding|tree_node_[0-9]+|FORCE CLOSE|cooperative close|subfactory|breach|response)[^[:space:]]*[[:space:]]+txid[:=][[:space:]]*[a-f0-9]+" \
+        "$lsp_log" 2>/dev/null | sort -u >> "$evidence" || true
+}
