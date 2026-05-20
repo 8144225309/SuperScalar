@@ -33,7 +33,8 @@ echo "sweep-back: $POOL -> $DEST  (balance=$BAL)" >&2
 OUT=$($RPC -rpcwallet="$POOL" -named send \
     outputs="[{\"$DEST\":\"$BAL\"}]" \
     options="{\"include_unsafe\":true,\"subtract_fee_from_outputs\":[0]}" \
-    fee_rate=1.1 2>&1)
+    fee_rate=1 2>&1)
+# fee_rate=1 honors the Phase 5 1 sat/vB ceiling (METHODOLOGY.md).
 TXID=$(echo "$OUT" | python3 -c "import sys,json
 try:
   d=json.load(sys.stdin); print(d.get('txid','ERR'))

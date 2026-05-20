@@ -37,6 +37,21 @@
    ```
    Record sweep-back txid in the V<n>.md doc's Sweep-back section.
 
+## Fee ceiling — 1 sat/vB MAX
+
+**Hard rule.** Every transaction in the campaign — funding, tree broadcast, sub-factory chain[N], force-close commits, per-leaf sweeps, sweep-back — uses **fee_rate ≤ 1 sat/vB** (equivalently `--fee-rate ≤ 1000` sat/kvB on LSP CLI, or `fee_rate=1` on bitcoind RPC).
+
+Testnet4 wallet's `mintxfee` is also 1 sat/vB, so this is the tightest value the wallet will accept. NEVER use a higher fee rate (the earlier 1.1 sat/vB multiwithdraw + 8 sat/vB CPFP were the only exceptions, both pre-rule). If a TX gets stuck in mempool, prefer waiting over fee-bumping — testnet4 reorg/mempool turnover surfaces the test, not a fee discipline failure.
+
+## Per-test file structure
+
+Every shape × variant gets **two files** (the test plan + the evidence):
+
+- `<shape>/V<n>-commands.md` — the exact env vars, systemd-run launch line, expected log markers, and sweep-back command. Frozen at write time so the test is reproducible later.
+- `<shape>/V<n>-results.md` — txids, block heights, conservation math, sweep-back txid. Filled in as the run progresses.
+
+The two-file split keeps inputs (commands) and outputs (results) auditable separately for later examination.
+
 ## Conservation math
 For every PASS run, verify:
 ```

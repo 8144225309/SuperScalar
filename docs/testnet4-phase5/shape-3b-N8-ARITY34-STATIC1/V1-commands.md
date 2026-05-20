@@ -1,0 +1,41 @@
+# shape-3b-N8-ARITY34-STATIC1 V1 - Commands
+
+Proves: TRUE N-way mixed-arity (PR #104) + static-near-root depth 1 (PR #105) on real chain. Static layer contributes zero CSV.
+
+Fee ceiling: **1 sat/vB** (FEE_RATE=1000 sat/kvB). Every TX in this run obeys.
+
+
+## Pre-flight
+```
+ssh root@68.168.216.243 'free -h | head -2; bitcoin-cli -datadir=/var/lib/bitcoind-testnet4 -rpcuser=testnet4rpc -rpcpassword=testnet4rpcpass123 -rpcport=48332 -rpcwallet=ss_pool_4 getbalance'
+```
+
+## Sync repo on VPS
+```
+ssh root@68.168.216.243 'cd /root/SuperScalar-phase5 && git fetch origin feat-testnet4-phase5-scaffold && git reset --hard origin/feat-testnet4-phase5-scaffold'
+```
+
+## Launch
+```
+ssh root@68.168.216.243 'systemd-run --unit=ss-t4-phase5-3b-V1.service \
+  --setenv WALLET=ss_pool_4 --setenv TAG=phase5_3b_V1 --setenv VARIANT=V1 \
+  bash /root/SuperScalar-phase5/docs/testnet4-phase5/shape-3b-N8-ARITY34-STATIC1/runner.sh'
+```
+Variant V1 -> `--demo`. Port 9952.
+
+## Monitor
+```
+ssh root@68.168.216.243 'tail -f /tmp/ss_t4_phase5_3b_V1_lsp.log'
+ssh root@68.168.216.243 'journalctl -u ss-t4-phase5-3b-V1.service -f'
+```
+
+## Sweep-back (run after PASS or FAIL)
+```
+ssh root@68.168.216.243 'bash /root/SuperScalar-phase5/docs/testnet4-phase5/sweep-back.sh ss_pool_4'
+```
+fee_rate=1 sat/vB. Echoes sweep-back txid; capture into V1-results.md.
+
+## Stop (if needed)
+```
+ssh root@68.168.216.243 'systemctl stop ss-t4-phase5-3b-V1.service'
+```

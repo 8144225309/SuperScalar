@@ -19,7 +19,7 @@ Status legend: `[ ]` pending, `[~]` in flight, `[x]` PASS, `[!]` FAIL.
 | [3a](shape-3a-N8-ARITY3/) | 8 | 3 | 0 | 1 | `[ ]` | `[ ]` | — | — | — | — |
 | [3b](shape-3b-N8-ARITY34-STATIC1/) | 8 | 3,4 | 1 | 1 | `[ ]` | `[ ]` | — | — | — | — |
 | [3c](shape-3c-N64-ARITY248-STATIC1/) | 64 | 2,4,8 | 1 | 1 | — | `[~]` | — | — | — | — |
-| [3e](shape-3e-N4-ARITY3-K2/) | 4 | 3 | 0 | 2 | `[ ]` | `[ ]` | `[ ]` | `[ ]` | — | — |
+| [3e](shape-3e-N4-ARITY3-K2/) | 4 | 3 | 0 | 2 | `[x]` | `[ ]` | `[ ]` | `[ ]` | — | — |
 | [3e+](shape-3epp-N16-ARITY3-K2/) | 16 | 3 | 0 | 2 | — | `[ ]` | `[ ]` | `[ ]` | — | — |
 | [3f](shape-3f-N64-ARITY24-K2-STATIC1/) | 64 | 2,4 | 1 | 2 | `[ ]` | `[ ]` | `[ ]` | `[ ]` | `[ ]` | `[ ]` |
 | 3d (N=128) | 128 | 2,4,8 | 2 | 1 | DEFERRED to v0.3 — gated on #212 SF-SCALE-128 regtest pass |
