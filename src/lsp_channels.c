@@ -3358,6 +3358,42 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
+    /* Step 11b: register the OLD (pre-realloc) leaf state with the
+       watchtower as a stale-broadcast target.  Without this, a malicious
+       LSP can force-close + broadcast the pre-realloc leaf TX and the WT
+       has no entry to match the on-chain spend against.  Mirror the
+       leaf-advance pattern at line ~2785 — registers (OLD txid → NEW
+       signed_tx as response + poison TX).  Surfaced by SF-WT-REALLOC-DETECT-GAP
+       (#258), reproduced end-to-end by tools/test_regtest_cheat_realloc.sh. */
+    if (mgr->watchtower && realloc_had_signed && node->is_signed &&
+        node->signed_tx.len > 0) {
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        size_t n_leaf_ch = 0;
+        for (size_t cc = 0; cc < mgr->n_channels; cc++) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, cc, &c_node, &c_vout)) continue;
+            if (c_node == node_idx)
+                leaf_ch_ids[n_leaf_ch++] = (uint32_t)cc;
+        }
+        const unsigned char *poison_data = NULL;
+        size_t poison_len = 0;
+        if (realloc_poison_prepared &&
+            node->poison_is_signed && node->poison_signed_tx.len > 0) {
+            poison_data = node->poison_signed_tx.data;
+            poison_len = node->poison_signed_tx.len;
+        }
+        watchtower_watch_factory_node_with_channels(mgr->watchtower,
+            (uint32_t)node_idx, realloc_old_leaf_txid,
+            node->signed_tx.data, node->signed_tx.len,
+            poison_data, poison_len,
+            leaf_ch_ids, n_leaf_ch);
+        printf("LSP realloc: watchtower registered OLD leaf %zu txid as stale "
+               "(response_tx=%zub, poison=%s, %zu channels)\n",
+               node_idx, (size_t)node->signed_tx.len,
+               poison_data ? "yes" : "no", n_leaf_ch);
+    }
+
     /* Step 12: Update channel amounts in lsp_channel_entry_t.
 
        Generic mapping: each client owns the leaf output at the vout
