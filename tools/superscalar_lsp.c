@@ -795,21 +795,34 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         }
     }
 
-    /* Try to broadcast — may need retries if BIP68 not yet satisfied */
+    /* Try to broadcast — may need retries if BIP68 not yet satisfied.
+       #247 (SF-CSV-WAIT): the height-wait loop above has already advanced
+       the chain by `required_depth` blocks; the parent should be BIP68-final
+       within one more block on average. Retrying every 15s on testnet4
+       (block tempo ~30min) wasted ~120 RPC calls per block. Poll every 60s
+       on non-regtest and emit a progress line every 5 attempts so an
+       operator tail-ing the log can see we're not stuck. */
     int ok = 0;
     int bcast_waited = 0;
     int bcast_limit = is_regtest ? 60 : confirm_timeout;
+    const int CSV_RETRY_INTERVAL_SECS = 60;
     for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
         ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
         if (ok) break;
-        if (attempt == 0)
+        if (attempt == 0) {
             printf("  %s broadcast pending (waiting for BIP68)...\n", log_source);
+        } else if (!is_regtest && (attempt % 5 == 0)) {
+            int cur_h = regtest_get_block_height(rt);
+            printf("    %s still pending — %ds elapsed, chain at height %d\n",
+                   log_source, bcast_waited, cur_h);
+            fflush(stdout);
+        }
         if (is_regtest) {
             regtest_mine_blocks(rt, 1, mine_addr);
             bcast_waited++;
         } else {
-            sleep(15);
-            bcast_waited += 15;
+            sleep(CSV_RETRY_INTERVAL_SECS);
+            bcast_waited += CSV_RETRY_INTERVAL_SECS;
         }
     }
 
