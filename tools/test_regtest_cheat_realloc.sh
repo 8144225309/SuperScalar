@@ -195,12 +195,25 @@ echo "=== breach_detections rows ==="
 sqlite3 "$LSP_DB" "SELECT * FROM breach_detections ORDER BY id DESC LIMIT 5;" 2>/dev/null
 echo
 echo "=== Final result ==="
-if grep -q "LEAF REALLOC TEST: PASS" "$LSP_LOG" 2>/dev/null && \
-   grep -q "CL2 CHEAT-REALLOC: BREACH DETECTED" "$LSP_LOG" 2>/dev/null; then
-    echo "  PASS: realloc cheat detected + penalty broadcast"
+# PASS criterion: the WT must have DETECTED the cheat broadcast (FACTORY
+# BREACH log line) AND broadcast at least one defense TX (poison/penalty
+# /response).  Detection can fire either via the watchtower_check() call
+# from the test scaffold OR the WT's main-loop block scan — both count.
+# Earlier criterion only checked watchtower_check() which misses the case
+# where detection fires in the main loop before the scaffold's explicit
+# check.
+BREACH_DETECTED=$(grep -cE "FACTORY BREACH on node|CL2 CHEAT-REALLOC: BREACH DETECTED" "$LSP_LOG" 2>/dev/null || echo 0)
+BREACH_DETECTED="${BREACH_DETECTED:-0}"
+POISON_BROADCAST=$(grep -cE "L-stock burn tx broadcast|poison TX broadcast|penalty.*broadcast" "$LSP_LOG" 2>/dev/null || echo 0)
+POISON_BROADCAST="${POISON_BROADCAST:-0}"
+
+if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
+    echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + broadcast poison (x$POISON_BROADCAST)"
+    grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
 fi
-echo "  FAIL: cheat-realloc defense did not fire as expected"
+
+echo "  FAIL: BREACH_DETECTED=$BREACH_DETECTED POISON_BROADCAST=$POISON_BROADCAST"
 echo "  LSP log tail:"
 tail -40 "$LSP_LOG"
 exit 1
