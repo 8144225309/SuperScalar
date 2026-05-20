@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 
 #ifdef _POSIX_VERSION
@@ -1511,10 +1512,68 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
 
     return -1;  /* timeout */
 }
+/* #259 SF-RECOVERY-REBROADCAST: detect mempool eviction and re-broadcast.
+   Called from the confirmation-wait loop on every iteration. Returns 1
+   if the TX was re-broadcast, 0 if no action was needed (already
+   confirmed, still in mempool, or wallet doesn't have the hex).
+
+   Trigger condition is the AND of:
+     - getrawtransaction.confirmations <= 0  (not on canonical chain)
+     - getmempoolentry returns no entry      (evicted from mempool)
+
+   If both hold, bitcoind has lost the broadcast — likely a small reorg
+   bumped it and the wallet didn't re-relay. We look up the raw hex via
+   `getrawtransaction $TXID 0` (which still resolves for TXs the wallet
+   created or received outputs from) and call sendrawtransaction. If the
+   wallet doesn't have the hex (force-close commit TXs broadcast outside
+   the wallet, etc.) we no-op and let the caller's higher-level
+   broadcast_log scan recover that case. */
+static int regtest_resend_if_evicted(regtest_t *rt, const char *txid) {
+    if (!rt || !txid) return 0;
+    int conf = regtest_get_confirmations(rt, txid);
+    if (conf >= 1) return 0;   /* already on chain */
+    if (regtest_get_mempool_entry_seconds_ago(rt, txid) >= 0)
+        return 0;              /* still in mempool */
+
+    /* Neither confirmed nor in mempool → likely evicted. Try the wallet. */
+    char params[96];
+    snprintf(params, sizeof(params), "\"%s\" 0", txid);
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
+    char *hex_raw = regtest_exec(rt, "getrawtransaction", params);
+    g_regtest_poll_quiet = prev;
+    if (!hex_raw) return 0;
+
+    /* bitcoin-cli prints `"<hex>"\n` — strip the outer quotes + whitespace. */
+    char *p = hex_raw;
+    while (*p == '"' || *p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+    size_t hl = strlen(p);
+    while (hl > 0 && (p[hl-1] == '"' || p[hl-1] == ' ' || p[hl-1] == '\n' ||
+                       p[hl-1] == '\r' || p[hl-1] == '\t')) p[--hl] = 0;
+    if (hl < 20) { free(hex_raw); return 0; }
+
+    fprintf(stderr,
+            "regtest_resend_if_evicted: txid=%.16s... evicted from mempool, "
+            "re-broadcasting from wallet hex (%zu chars)\n", txid, hl);
+
+    char *send_params = malloc(hl + 8);
+    if (!send_params) { free(hex_raw); return 0; }
+    snprintf(send_params, hl + 8, "\"%s\"", p);
+    char *send_result = regtest_exec(rt, "sendrawtransaction", send_params);
+    free(send_params);
+    free(hex_raw);
+    if (send_result) free(send_result);
+    return 1;
+}
+
 /* CL8: reorg-aware confirmation wait.
    Returns 1 when txid stably has >= target_depth confirmations (verified
    by a second poll after a delay; if conf drops more than
-   max_tolerated_reorg_depth, restart the wait). Returns 0 on timeout. */
+   max_tolerated_reorg_depth, restart the wait). Returns 0 on timeout.
+
+   #259: also detects mempool eviction during the wait and re-broadcasts
+   from bitcoind's wallet history. Throttled to one resend per 5 minutes
+   to avoid hammering a permanently-stuck TX. */
 int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
                                           int target_depth,
                                           int max_tolerated_reorg_depth,
@@ -1523,6 +1582,8 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
     int is_regtest = (strcmp(rt->network, "regtest") == 0);
     int waited = 0;
     int prev_conf = 0;
+    int last_resend_at = INT_MIN;  /* allow first resend immediately on eviction */
+    const int RESEND_THROTTLE_SECS = 300;
     while (waited < timeout_secs) {
         int cur = regtest_get_confirmations(rt, txid);
         if (cur >= target_depth) {
@@ -1539,6 +1600,13 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
             }
             prev_conf = recheck;
             continue;
+        }
+        /* #259 eviction recovery — only checked on the non-confirmed branch
+           (when conf >= target_depth we know the TX is on chain). Throttled
+           so a permanently-stuck TX doesn't trigger a resend storm. */
+        if (cur < 1 && (waited - last_resend_at) >= RESEND_THROTTLE_SECS) {
+            if (regtest_resend_if_evicted(rt, txid))
+                last_resend_at = waited;
         }
         prev_conf = cur;
         sleep(is_regtest ? 2 : 15);
