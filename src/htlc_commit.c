@@ -349,7 +349,47 @@ int htlc_commit_recv_update_fee(channel_t *ch,
     uint32_t feerate = get_u32(msg + 34); /* after type(2) + channel_id(32) */
     if (feerate < feerate_floor || feerate > feerate_ceiling) return 0;
 
-    ch->fee_rate_sat_per_kvb = (uint64_t)feerate * 4; /* sat/kw -> sat/kvb */
+    /* Dust-race defense (SF-CHEAT-DUST-RACE): a peer-proposed feerate that's
+       in-bounds can still strand funds. The accepted feerate is later used to
+       compute per-HTLC sweep fees (channel.c:1730, 2177, 2326). If the sweep
+       fee at the new rate would push any active HTLC's sweep output below
+       dust, refuse the update — otherwise the counterparty can force-close
+       leaving us unable to claim. */
+    uint64_t new_kvb = (uint64_t)feerate * 4;
+    uint64_t htlc_sweep_fee = (new_kvb * 180 + 999) / 1000;
+    uint64_t htlc_safe_floor = htlc_sweep_fee + CHANNEL_DUST_LIMIT_SATS;
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        if (ch->htlcs[i].state != HTLC_STATE_ACTIVE) continue;
+        if (ch->htlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue; /* already trimmed */
+        if (ch->htlcs[i].amount_sats < htlc_safe_floor) {
+            fprintf(stderr,
+                    "htlc_commit_recv_update_fee: REJECT feerate %u sat/kw — "
+                    "HTLC[%zu] amount=%llu sats would yield sweep amount below dust "
+                    "(sweep_fee=%llu, dust=%u)\n",
+                    feerate, i,
+                    (unsigned long long)ch->htlcs[i].amount_sats,
+                    (unsigned long long)htlc_sweep_fee,
+                    CHANNEL_DUST_LIMIT_SATS);
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < ch->n_ptlcs; i++) {
+        if (ch->ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
+        if (ch->ptlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
+        if (ch->ptlcs[i].amount_sats < htlc_safe_floor) {
+            fprintf(stderr,
+                    "htlc_commit_recv_update_fee: REJECT feerate %u sat/kw — "
+                    "PTLC[%zu] amount=%llu sats would yield sweep amount below dust "
+                    "(sweep_fee=%llu, dust=%u)\n",
+                    feerate, i,
+                    (unsigned long long)ch->ptlcs[i].amount_sats,
+                    (unsigned long long)htlc_sweep_fee,
+                    CHANNEL_DUST_LIMIT_SATS);
+            return 0;
+        }
+    }
+
+    ch->fee_rate_sat_per_kvb = new_kvb;
     return 1;
 }
 
