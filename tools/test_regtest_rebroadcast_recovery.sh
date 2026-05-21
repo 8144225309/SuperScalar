@@ -89,12 +89,11 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
 fi
 echo "  bitcoind reachable, chain at height $($BCLI getblockcount)"
 
-# --- need Bitcoin Core 28+ for clearmempool RPC ---
-if ! $BCLI help clearmempool >/dev/null 2>&1; then
-    echo "FAIL: this bitcoind does not support the 'clearmempool' RPC"
-    echo "      (requires Bitcoin Core 28+); skipping this test"
-    exit 0
-fi
+# --- check bitcoind reachable (no clearmempool RPC exists in stock
+#     Bitcoin Core — we evict by killing bitcoind + restarting with
+#     -persistmempool=0, which is the only reliable way to wipe a regtest
+#     mempool without writing the eviction RPC ourselves). ---
+$BCLI getblockchaininfo >/dev/null 2>&1 || { echo "FAIL: bitcoind unreachable"; exit 1; }
 
 # --- miner wallet + initial blocks ---
 MINER_WALLET="ss_rebroadcast_miner"
@@ -192,28 +191,24 @@ echo "  close TX: $CLOSE_TXID"
 
 # --- create the eviction window ---
 echo ""
-echo "--- injecting mempool eviction ---"
+echo "--- injecting mempool eviction (bitcoind restart w/ -persistmempool=0) ---"
 stop_miner
 
-# Make sure close TX is currently in mempool before evicting
-sleep 2
-IN_MP_BEFORE=$($BCLI getmempoolentry "$CLOSE_TXID" 2>&1 | grep -c "size" || true)
-if [ "$IN_MP_BEFORE" -lt 1 ]; then
-    # TX may already be in a block — re-broadcast it to mempool first
-    HEX=$($BCLI getrawtransaction "$CLOSE_TXID" 0 2>/dev/null || true)
-    if [ -n "$HEX" ]; then
-        $BCLI sendrawtransaction "$HEX" 2>&1 | head -3 || true
-        sleep 1
-    fi
-fi
+# Stop bitcoind cleanly (this would normally PERSIST the mempool to a file
+# bitcoind reads on restart — we need to suppress that)
+$BCLI stop >/dev/null 2>&1
+for i in $(seq 1 15); do sleep 1; $BCLI getblockchaininfo >/dev/null 2>&1 || break; done
 
-# Now wipe the mempool
-$BCLI clearmempool >/dev/null 2>&1 || { echo "FAIL: clearmempool RPC failed"; exit 1; }
-sleep 1
+# Restart bitcoind with -persistmempool=0 so it comes up with an empty mempool
+bitcoind -regtest -conf="$REGTEST_CONF" -daemon -persistmempool=0
+for i in $(seq 1 30); do sleep 1; $BCLI getblockchaininfo >/dev/null 2>&1 && break; done
+$BCLI loadwallet $MINER_WALLET 2>/dev/null || true
+echo "  bitcoind back up with empty mempool"
 
-IN_MP_AFTER_CLEAR=$($BCLI getmempoolentry "$CLOSE_TXID" 2>&1 | grep -c "size" || true)
-if [ "$IN_MP_AFTER_CLEAR" -gt 0 ]; then
-    echo "FAIL: clearmempool did not remove our TX (still in mempool)"
+# Verify our TX is gone from mempool (it should be; -persistmempool=0 wiped)
+IN_MP_AFTER=$($BCLI getmempoolentry "$CLOSE_TXID" 2>&1 | grep -c "size" || true)
+if [ "$IN_MP_AFTER" -gt 0 ]; then
+    echo "FAIL: TX still in mempool after restart with -persistmempool=0"
     exit 1
 fi
 echo "  ✓ TX evicted from mempool"
