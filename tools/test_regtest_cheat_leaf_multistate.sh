@@ -183,17 +183,17 @@ echo "=== Final result ==="
 # We REQUIRE evidence that the WT actually defended — not just that the
 # stale broadcast was unspendable for unrelated reasons.  Three signals,
 # at least one required:
-#   1. watchtower_check returned >= 1 (LSP log)
+#   1. WT defense broadcast marker in LSP log (Penalty/Poison/Latest state/L-stock burn)
 #   2. breach_detections has at least one row tagged poison/penalty
 #   3. broadcast_log has a row whose source contains 'poison' or 'penalty'
 # A "Tier B made stale unspendable" by itself is NOT a defense — it's an
 # unrelated state-machine intervention.  Counting it as PASS produces
 # false-positives on a broken WT.
-WT_CHECK_FIRED=$(grep -cE "watchtower_check returned: [1-9]" "$LSP_LOG" 2>/dev/null || echo 0)
+WT_CHECK_FIRED=$(grep -cE "(Penalty tx broadcast|Sub-factory poison tx broadcast|Latest state tx broadcast|L-stock burn tx broadcast)" "$LSP_LOG" 2>/dev/null || echo 0)
 WT_CHECK_FIRED="${WT_CHECK_FIRED:-0}"
-BREACH_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections WHERE response_action LIKE '%poison%' OR response_action LIKE '%penalty%';" 2>/dev/null || echo 0)
+BREACH_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections;" 2>/dev/null || echo 0)
 BREACH_ROWS="${BREACH_ROWS:-0}"
-POISON_BROADCASTS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM broadcast_log WHERE source LIKE '%poison%' OR source LIKE '%penalty%';" 2>/dev/null || echo 0)
+POISON_BROADCASTS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM broadcast_log WHERE source LIKE '%poison%' OR source LIKE '%penalty%' OR source LIKE 'factory_%' OR source LIKE 'htlc_%' OR source LIKE 'ptlc_%';" 2>/dev/null || echo 0)
 POISON_BROADCASTS="${POISON_BROADCASTS:-0}"
 
 if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null && \

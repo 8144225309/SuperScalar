@@ -254,10 +254,18 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
             entry->close_spk_len = 34;
         }
 
-        /* Commitment tx fee: use manager's fee estimator if available */
+        /* Commitment tx fee: pinned at the channel's stored fee_rate (1000
+           sat/kvB; channel_init at src/channel.c:282). Using the live fee
+           estimator here would diverge from the client's symmetric
+           client_check_conservation (which reads ch->fee_rate_sat_per_kvb=1000
+           and computes base_commit_fee=154) -- concretely, a 2562 sat/kvB live
+           rate produced a constant -241 sat conservation gap on testnet4 that
+           crashed PS_ADVANCE quorums (3e V3 / V3b, task #262). Real fee
+           bumping at broadcast time happens via CPFP on the factory tree, not
+           via this initial accounting deduction. */
         fee_estimator_static_t _fe_default;
-        fee_estimator_t *_fe = (fee_estimator_t *)mgr->fee;
-        if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
+        fee_estimator_static_init(&_fe_default, 1000);
+        fee_estimator_t *_fe = &_fe_default.base;
         uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
@@ -282,8 +290,8 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Attach persistence so revocation secrets land in revocation_secrets
            and a standalone watchtower can hydrate this channel. */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
-        /* Do NOT override fee_rate from estimatesmartfee: client always uses the
-           default 1000 sat/kvB from channel_init, so both sides must agree. */
+        /* fee_rate stays at channel_init default (1000); commit_fee above is
+           pinned to the same rate to maintain the conservation invariant. */
 
         /* SF-CH #154: factory leaf outputs use DIFFERENT keyagg orderings
            depending on leaf type (setup_leaf_outputs / setup_single_leaf_outputs
@@ -440,10 +448,12 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
             entry->close_spk_len = 34;
         }
 
-        /* Commitment tx fee: use manager's fee estimator if available */
+        /* Commitment tx fee: pinned at 1000 sat/kvB to match channel_init
+           (src/channel.c:282) and client_check_conservation (src/client.c).
+           See sister site in lsp_channels_init for full rationale. */
         fee_estimator_static_t _fe_default2;
-        fee_estimator_t *_fe2 = (fee_estimator_t *)mgr->fee;
-        if (!_fe2) { fee_estimator_static_init(&_fe_default2, 1000); _fe2 = &_fe_default2.base; }
+        fee_estimator_static_init(&_fe_default2, 1000);
+        fee_estimator_t *_fe2 = &_fe_default2.base;
         uint64_t commit_fee = fee_for_commitment_tx(_fe2, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         uint16_t pct2 = mgr->lsp_balance_pct;
@@ -466,8 +476,8 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.funder_is_local = 1;
         /* Attach persistence (see lsp_channels_init for rationale). */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
-        /* Do NOT override fee_rate from estimatesmartfee: client always uses the
-           default 1000 sat/kvB from channel_init, so both sides must agree. */
+        /* fee_rate stays at channel_init default (1000); commit_fee above is
+           pinned to the same rate to maintain the conservation invariant. */
 
         /* SF-CH #154: auto-discover funding keyagg ordering (see comment in
            lsp_channels_init for full rationale). */

@@ -369,7 +369,7 @@ int htlc_commit_recv_update_fee(channel_t *ch,
                     feerate, i,
                     (unsigned long long)ch->htlcs[i].amount_sats,
                     (unsigned long long)htlc_sweep_fee,
-                    CHANNEL_DUST_LIMIT_SATS);
+                    (unsigned int)CHANNEL_DUST_LIMIT_SATS);
             return 0;
         }
     }
@@ -384,7 +384,7 @@ int htlc_commit_recv_update_fee(channel_t *ch,
                     feerate, i,
                     (unsigned long long)ch->ptlcs[i].amount_sats,
                     (unsigned long long)htlc_sweep_fee,
-                    CHANNEL_DUST_LIMIT_SATS);
+                    (unsigned int)CHANNEL_DUST_LIMIT_SATS);
             return 0;
         }
     }
