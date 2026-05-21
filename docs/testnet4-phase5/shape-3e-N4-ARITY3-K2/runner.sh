@@ -157,15 +157,8 @@ done
 diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
 EXIT=$DIAG_EXIT
 
-# --- harvest on-chain evidence from log ---
-emit ""
-emit "## On-chain events"
-emit "| Event | TXID | grep marker |"
-emit "|---|---|---|"
-grep -oE "factory funding.* txid=[a-f0-9]+" "$LSP_LOG" | head -1 | sed 's/.*txid=/| funding | /; s/$/ | /' >> "$EVIDENCE" || true
-grep -oE "tree_node_[0-9]+ broadcast OK.*txid=[a-f0-9]+" "$LSP_LOG" | sed 's/.*tree_node_/| tree_node_/; s/.broadcast OK.*txid=/ | /; s/$/ | /' >> "$EVIDENCE" || true
-grep -oE "subfactory.* chain_len=[0-9]+.*txid=[a-f0-9]+" "$LSP_LOG" | sed 's/^/| subfactory | /; s/$/ | /' >> "$EVIDENCE" || true
-grep -oE "FORCE CLOSE.*txid=[a-f0-9]+" "$LSP_LOG" | sed 's/^/| force-close | /; s/$/ | /' >> "$EVIDENCE" || true
+# --- harvest on-chain evidence (broadcast_log + log-grep fallback) ---
+diag_emit_onchain_events "$LSP_DB" "$LSP_LOG" "$EVIDENCE"
 
 # --- harvest log assertions ---
 emit ""

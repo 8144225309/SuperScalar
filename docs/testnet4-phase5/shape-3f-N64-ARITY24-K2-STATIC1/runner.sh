@@ -119,10 +119,7 @@ done
 diag_wait_lsp "$LSP_PID" "$LSP_LOG" "ss_t4_${TAG}"
 EXIT=$DIAG_EXIT
 
-emit ""
-emit "## On-chain events"
-grep -oE "(funding|tree_node_[0-9]+|subfactory.*chain_len|FORCE CLOSE|cooperative close|breach|response).*txid=[a-f0-9]+" "$LSP_LOG" | sort -u >> "$EVIDENCE" || true
-emit ""
+diag_emit_onchain_events "$LSP_DB" "$LSP_LOG" "$EVIDENCE"
 emit "## Log assertions"
 for m in "shape ewt =" "static-near-root" "k²=" "sub-factory" "MSG_SUBFACTORY_DONE" "persist: ps_subfactory_chain" "watchtower: registered subfactory" "TEST PASSED" "TEST FAILED"; do
     H=$(grep -E "$m" "$LSP_LOG" | head -1 || true)
