@@ -1679,6 +1679,28 @@ int test_fee_estimator_wiring(void) {
                        "channel uses default 1000 sat/kvB (not wired from estimator)");
     }
 
+    /* Conservation invariant under high live-fee-rate: the LSP-side init must
+     * deduct commit_fee using the channel's stored 1000 sat/kvB rate, NOT the
+     * live 2000 sat/kvB estimator above, or client_check_conservation will
+     * trip with a delta equal to (live_rate - 1000) * 154 / 1000 sats per
+     * channel.  Regression guard for task #262 (3e V3b on testnet4 produced a
+     * constant -241 sat gap because the LSP init read estimatesmartfee's
+     * ~2562 sat/kvB while channel_init pinned ch->fee_rate at 1000). */
+    {
+        uint64_t expected_commit_fee = fee_at_1000;  /* 154 sats at 1000 rate */
+        for (size_t c = 0; c < 4; c++) {
+            channel_t *ch = &mgr.entries[c].channel;
+            uint64_t expected_usable = ch->funding_amount - expected_commit_fee;
+            uint64_t actual_sum = ch->local_amount + ch->remote_amount;
+            TEST_ASSERT_EQ(actual_sum, expected_usable,
+                           "conservation: local+remote == funding - 154 (not - "
+                           "fee_at_live_rate); see task #262");
+        }
+        /* Also exercise the LSP-side check directly. */
+        TEST_ASSERT(lsp_channels_check_conservation(&mgr),
+                    "lsp_channels_check_conservation passes after init under live high rate");
+    }
+
     lsp_channels_cleanup(&mgr);
     factory_free(f);
     free(f);
