@@ -3,14 +3,14 @@
 [![CI](https://github.com/8144225309/SuperScalar/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/8144225309/SuperScalar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/8144225309/SuperScalar)](https://github.com/8144225309/SuperScalar/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
+[![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > v0.1.13 — post-Chart-B verification release. 30/30 signet exhibition tests passed (S1–S30), 13/13 testnet4 structures validated. Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, rotation conservation fix, CPFP child-broadcast / anchor mismatch fix (#287), PTLC turnover ceremony journaled to signing_rounds (#280), schema v36 (HTLC resolution + L-stock burn + agg hard guard). 95 test files across `tests/` (1300+ unit cases) and 42 regtest integration tests.
 
 > ✅ **Production readiness — multi-process LSPs**: the wire-ceremony poison TX defense is now implemented for **all 4 ceremony paths** (PRs #136 sub-factory advance, #137 leaf advance, #138 leaf realloc, #151 + #152 Tier B root rollover).  Multi-process LSPs produce a fully-signed L-stock / sales-stock poison TX via a second MuSig2 round bundled with every state advance — the watchtower receives a real signed poison TX and can redistribute the stake to clients on cheating across all advance paths.  See [`docs/poison-tx.md`](docs/poison-tx.md) for the full security model.
 
-Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
+Implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
 A Bitcoin channel factory protocol combining:
 
