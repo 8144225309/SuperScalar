@@ -6,7 +6,7 @@
 [![Bitcoin](https://img.shields.io/badge/Bitcoin-Lightning-orange.svg)](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-> v0.1.12 — 30/30 signet exhibition tests passed (S1–S30). Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, rotation conservation fix. 1363 unit tests, 42 regtest integration tests.
+> v0.1.13 — post-Chart-B verification release. 30/30 signet exhibition tests passed (S1–S30), 13/13 testnet4 structures validated. Standalone watchtower penalty signing, secp256k1-zkp pin sync with CLN/wally, rotation conservation fix, CPFP child-broadcast / anchor mismatch fix (#287), PTLC turnover ceremony journaled to signing_rounds (#280), schema v36 (HTLC resolution + L-stock burn + agg hard guard). 95 test files across `tests/` (1300+ unit cases) and 42 regtest integration tests.
 
 > ✅ **Production readiness — multi-process LSPs**: the wire-ceremony poison TX defense is now implemented for **all 4 ceremony paths** (PRs #136 sub-factory advance, #137 leaf advance, #138 leaf realloc, #151 + #152 Tier B root rollover).  Multi-process LSPs produce a fully-signed L-stock / sales-stock poison TX via a second MuSig2 round bundled with every state advance — the watchtower receives a real signed poison TX and can redistribute the stake to clients on cheating across all advance paths.  See [`docs/poison-tx.md`](docs/poison-tx.md) for the full security model.
 
@@ -25,12 +25,12 @@ A Bitcoin channel factory protocol combining:
 |------|--------------------|
 | **Cryptography** | MuSig2 (key agg, 2-round signing, nonce pools), Schnorr adaptor signatures, PTLC key turnover, shachain revocation, 2-leaf taptree with script-path revocation penalty |
 | **Transport** | BOLT #8 Noise_XK encrypted transport (ChaCha20-Poly1305, key rotation, phase timeouts), BOLT #7 gossip (node_announcement, channel_announcement, channel_update, gossip queries), Tor hidden services + SOCKS5 |
-| **Persistence** | SQLite3 with 27 tables — factory state, channels, HTLCs, watchtower data; full crash recovery |
+| **Persistence** | SQLite3 with 60+ tables (schema v36) — factory state, channels, HTLCs, PTLCs, ceremonies, signing_rounds, watchtower data; full crash recovery + idempotent additive migrations |
 | **Wire Protocol** | Full BOLT #2 commitment (update_add/fulfill/fail HTLC, commitment_signed, revoke_and_ack, update_fee), BOLT #4 multi-hop onion (Sphinx, keysend TLV), BOLT #11 invoice, BOLT #12 offers + blinded paths, LSPS0/1/2, MPP (10-part / 32-payment), AMP, Dijkstra pathfinding over gossip graph, PTLC state machine, dual-fund v2, cooperative close, factory lifecycle, reconnection |
 | **Signing** | Distributed MuSig2 signing for factory creation (2-round N-of-N ceremony) and per-leaf advance (single-round 2-of-2) |
 | **Security** | Client + LSP + standalone watchtowers, breach detection + penalty broadcast (key-path and script-path) + L-stock burn, per-client close addresses, encrypted keyfiles (PBKDF2 600K iterations), encrypted backup/restore (PBKDF2 + ChaCha20-Poly1305), BIP39 mnemonic seed recovery, per-IP connection rate limiting, shell-free subprocess execution |
 | **Operations** | Web dashboard, JSON diagnostic reports, interactive CLI, configurable economics (fee splits, placement modes), UTXO coin selection, RBF fee bumping |
-| **Testing** | 1363 unit + 42 regtest integration + 30 signet exhibition tests (S1–S30), CI on every push (Linux, macOS, ARM64, sanitizers, cppcheck, coverage, fuzz) |
+| **Testing** | 95 test source files covering 1300+ unit cases + 42 regtest integration tests + 30 signet exhibition tests (S1–S30) + 13 testnet4 structures, CI on every push (Linux, macOS, ARM64, AddressSanitizer, TSan, cppcheck, coverage, libFuzzer, Regtest Integration, Regtest Multi-Process sanitizers) |
 
 ## Quick Start
 
@@ -77,7 +77,7 @@ CC=clang cmake .. -DENABLE_FUZZING=ON  # libFuzzer targets (requires clang)
 
 ## Tests
 
-1363 automated tests (unit + regtest integration) plus 30 signet exhibition tests (S1–S30). CI runs automated suites on every push — Linux, macOS, ARM64, AddressSanitizer, cppcheck static analysis, coverage, and libFuzzer.
+95 test source files across `tests/` (covering 1300+ unit cases, full BOLT 1/4/8/9/11/12 + factory + channel + ceremony + persist + watchtower + reorg coverage) plus 42 regtest integration tests, 30 signet exhibition tests (S1–S30), and 13 testnet4 on-chain structures. CI runs every push — Linux, macOS, ARM64, AddressSanitizer + TSan + UBSan, cppcheck, coverage, libFuzzer, Regtest Integration, Regtest Multi-Process sanitizers.
 
 See [docs/testing-guide.md](docs/testing-guide.md) for the full testing guide.
 
@@ -259,15 +259,20 @@ Then open **http://localhost:8080** in your browser.
 
 | Tab | What it shows |
 |-----|---------------|
-| **Overview** | Process status (bitcoind, CLN, bridge, LSP, client), blockchain height, wallet balance, system health |
-| **Factory** | Factory state (ACTIVE/DYING/EXPIRED), creation block, participant keys, DW epoch, funding txid |
-| **Channels** | Per-channel balances (local/remote), commitment number, HTLC count, state |
-| **Protocol** | Factory tree node visualization (kickoff + state nodes), signatures, wire message log |
-| **Lightning** | CLN node info, peers, channels, forwarding stats (requires `--cln-a-dir` / `--cln-b-dir`) |
-| **Watchtower** | Old commitment tracking, breach detection status, penalty tx history |
-| **Events** | Recent 100 wire messages with timestamp, direction, type, peer label, payload summary |
+| **Overview** | Process status (bitcoind, CLN, bridge, LSP, client), blockchain height, wallet balance, system health, freshness banner |
+| **Factory** | Factory state (ACTIVE/DYING/EXPIRED), creation block, participant keys, DW epoch + counter, funding txid, factory tree topology, per-factory isolation selector for multi-factory deployments |
+| **Channels & HTLCs** | Per-channel balances (local/remote), commitment number, HTLC count, state; HTLC table with `payment_hash`, CLTV, preimage |
+| **Payments** | HTLC + PTLC payment groups (MPP rollups), per-POV scoping (LSP / client / view-all), in-flight + completed payments |
+| **Protocol Log** | Wire message stream (last 200 messages) with timestamp, direction, type, peer label, payload summary |
+| **Ceremonies** | Factory creation + rotation + leaf-advance + sub-factory-advance ceremonies reconstructed from `signing_rounds` / `wire_messages`; participant phases + dual-sig-trap guard status |
+| **Lightning Network** | CLN node info, peers, channels, forwarding stats (requires `--cln-a-dir` / `--cln-b-dir`) |
+| **Watchtower** | Old commitment tracking, breach detections, penalty TX history, PTLC sweep status, defense-row coverage |
+| **Live Monitor** | Chronological feed merging `broadcast_log` + `breach_detections` + `reorg_events` — every watchtower-relevant event in one stream |
+| **Defense Status** | 8+ trustless-model failure-mode tiles (poison TX coverage, penalty bytes ready, CPFP child, wallet UTXO health, breach detection, factory burn, PTLC in-flight) |
+| **TX Inventory** | Preparedness scoring per TX category (commit, HTLC sweep, penalty, CPFP, factory burn, ps_chain) with "ready / signed / broadcast" badges |
+| **Outcomes** | 13-scenario tile grid mapping each SuperScalar protocol path to whether it fired in this deployment |
 
-The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy, yellow = warning, red = error.
+The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy / fired, blue = ready / signed, yellow = warning, red = error, grey = not applicable for this deployment.
 
 ### Dashboard Flags
 
@@ -284,6 +289,9 @@ The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy
 | `--cln-cli` | lightning-cli | Path to lightning-cli |
 | `--cln-a-dir` | — | CLN Node A data directory |
 | `--cln-b-dir` | — | CLN Node B data directory |
+| `--lsp-wallet` | — | Bitcoin wallet name for `listunspent` (Defense Status wallet-UTXO tile) |
+| `--btc-datadir` | — | Bitcoin data directory (for non-default `bitcoin-cli` paths) |
+| `--btc-rpcport` | — | Bitcoin RPC port (for non-standard daemons) |
 
 ---
 
@@ -511,6 +519,29 @@ superscalar_lsp [OPTIONS]
 | `--test-dual-factory` | — | off | Run two concurrent independent factories |
 | `--test-bridge` | — | off | BOLT11 Lightning ↔ factory bridge via CLN plugin |
 | `--test-htlc-force-close` | — | off | Force-close with live HTLC outputs, preimage reveal |
+| `--test-multi-htlc-fc` | — | off | Multi-HTLC force-close: 4+ live HTLCs at force-close time, all swept correctly |
+| `--test-full-settlement` | — | off | Full lifecycle: factory + payments + settle + close, all stages covered |
+| `--test-ps-advance` | — | off | Pseudo-Spilman leaf chain advance (3-of-3 single-round signing) |
+| `--test-leaf-advance` | — | off | Per-leaf state advance via 3-of-3 signing (alias path through PS) |
+| `--test-tier-b-rollover` | — | off | Drive Tier B PS rollover ceremony: every leaf re-signed with fresh chain[0] |
+| `--test-subfactory-advance` | — | off | Sub-factory chain extension (requires `--arity 3 --ps-subfactory-arity K, K>1`) |
+| `--test-subfactory-advance-multi` | — | off | Two back-to-back sub-factory advances; second exercises multi-input MuSig |
+| `--test-ptlc-basic` | — | off | LSP-internal PTLC scaffold: add PTLC to channel, build commitment with PTLC output |
+| `--test-ptlc-chain` | — | off | Broadcast real Bitcoin TX with PTLC output and confirm on chain |
+| `--test-ptlc-breach` | — | off | Register PTLC with watchtower, build penalty sweep TX (no broadcast) |
+| `--test-ptlc-restart` | — | off | PTLC state survives LSP restart |
+| `--test-ptlc-breach-chain` | — | off | Full chain-level PTLC breach: add → broadcast tree → cheat → WT detect → penalty broadcast |
+| `--test-bad-terms` / `--test-bad-settlement` | — | off | Adversarial test: malformed terms / bad settlement attempted by LSP |
+| `--cheat-leaf [SIDE]` | — | off | Snapshot pre-advance leaf state, broadcast stale, verify WT poison TX. CL1. |
+| `--cheat-state K` | N | 0 | With `--cheat-leaf` + `--advance-count N`: broadcast `chain[K]` for arbitrary K (CL3-K middle-state revocation) |
+| `--cheat-daemon-leaf [SIDE]` | — | off | `--cheat-leaf` but skips LSP-internal WT; standalone WT does detection + response |
+| `--cheat-daemon-sub` | — | off | Sub-factory cheat with standalone WT |
+| `--cheat-subfactory` | — | off | Broadcast stale `chain[N-1]` sub-factory TX, verify WT response |
+| `--advance-count N` | N | 1 | Number of leaf advances to drive (CL3) |
+| `--kill-after-state-advance` | — | off | Clean exit after first state-advance ceremony (restart-harness test) |
+| `--enable-ptlc-unsafe` | — | off | Operator opt-in to enable PTLC code paths (gated; SF-W-PTLC #174) |
+| `--ps-subfactory-arity K` | N | 1 | PS sub-factory arity k (k=1 single-client; k>1 = k² clients per leaf) |
+| `--prometheus-port PORT` | PORT | — | Enable native Prometheus metrics endpoint |
 | `--routing-fee-ppm` | N | 0 | Routing fee in parts-per-million (0 = free) |
 | `--lsp-balance-pct` | N | 100 | LSP's share of channel capacity, 0-100 (--demo overrides to 50) |
 | `--placement-mode` | MODE | sequential | Client placement: sequential / inward / outward |
@@ -617,9 +648,12 @@ superscalar_watchtower [OPTIONS]
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
 | `--datadir` | PATH | — | Bitcoin datadir |
 | `--rpcport` | PORT | — | Bitcoin RPC port |
+| `--max-bump-fee` | SATS | — | Cap on cumulative RBF fee bumps for penalty broadcast |
+| `--bump-budget-pct` | N | — | Percentage of channel value to budget for fee bumps |
+| `--inspect-db` | — | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. CL6. |
 | `--version` | — | — | Show version and exit |
 
-The watchtower opens the database read-only (no write contention with the LSP) and broadcasts penalty transactions if it detects a breach. Run it on a separate machine for defense-in-depth.
+The watchtower opens the database read-only (no write contention with the LSP) and broadcasts penalty transactions if it detects a breach. Run it on a separate machine for defense-in-depth. `--inspect-db` is the forensics entrypoint for examining a captured DB without running the polling loop.
 
 ---
 
@@ -706,7 +740,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-54 message types over TCP with length-prefixed JSON framing. TLV binary codec available for BOLT-compatible encoding (version negotiated via HELLO/HELLO_ACK):
+79 message types over TCP with length-prefixed JSON framing. TLV binary codec available for BOLT-compatible encoding (version negotiated via HELLO/HELLO_ACK):
 
 | Category | Messages |
 |----------|----------|
@@ -777,6 +811,51 @@ CLN (lightningd)
 | `wire_tlv` | wire_tlv.c | TLV (Type-Length-Value) binary codec for BOLT-compatible wire protocol |
 | `rate_limit` | rate_limit.c | Per-IP sliding-window connection rate limiting with concurrent handshake cap |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness (fork/execvp on POSIX, popen fallback), UTXO coin selection, RBF fee bumping |
+| `chain_backend_rpc` / `chain_backend_regtest` | chain_backend_*.c | Pluggable chain backends — full RPC bitcoind for production, regtest for tests |
+| `bip158_backend` | bip158_backend.c | BIP-158 compact block filter SPV lite-client mode for clients without their own bitcoind |
+| `p2p_bitcoin` | p2p_bitcoin.c | Bitcoin P2P client for BIP-158 light-client peers |
+| `bolt8` / `bolt8_server` | bolt8*.c | BOLT #8 Noise_XK encrypted transport (client + server sides) |
+| `bolt11` | bolt11.c | BOLT #11 invoice encoding/decoding |
+| `bolt12` | bolt12.c | BOLT #12 offers + blinded paths |
+| `bolt4_failure` | bolt4_failure.c | BOLT #4 onion routing failure taxonomy |
+| `blinded_path` | blinded_path.c | Blinded path construction for BOLT 12 + privacy routing |
+| `onion` / `onion_last_hop` / `onion_message` / `onion_msg_relay` | onion*.c | Sphinx onion routing, BOLT 12 onion messages, relay handling |
+| `pathfind` / `pathfind_exclude` / `mission_control` | pathfind*.c, mission_control.c | Dijkstra pathfinding over gossip graph, exclusion lists, mission control state |
+| `mpp` | mpp.c | Multi-part payment splitting (BOLT 4 AMP-style routing) |
+| `trampoline` | trampoline.c | Trampoline routing for delegated path selection |
+| `gossip` / `gossip_ingest` / `gossip_peer` / `gossip_store` | gossip*.c | BOLT #7 gossip protocol — announce/update messages, peer routing, on-disk store |
+| `rgs` | rgs.c | Rapid Gossip Sync — compressed gossip snapshot ingest |
+| `htlc_accept` / `htlc_commit` / `htlc_forward` / `htlc_inbound` / `htlc_fee_bump` | htlc_*.c | Inbound HTLC accept path, commitment update, forwarding, fee bumping under congestion |
+| `chan_open` / `chan_close` | chan_*.c | Channel open + close orchestration |
+| `splice` | splice.c | Splicing wire codec stub (per #198 / #260; not yet a full implementation) |
+| `payment` / `payment_uri` / `stateless_invoice` | payment*.c | End-user payment driver, lightning: URI parsing, BOLT 12 stateless invoices |
+| `hold_invoice` | hold_invoice.c | Hold-invoice support (BOLT 04 onion-hold pattern) |
+| `lnurl` | lnurl.c | LNURL-pay / withdraw / auth client |
+| `liquidity_ad` | liquidity_ad.c | LSPS1 / LSPS2 liquidity advertisements |
+| `lsps` | lsps.c | LSPS0/1/2 client + server logic |
+| `probe` | probe.c | Channel-liquidity probing for routing decisions |
+| `route_policy` | route_policy.c | Route fee + cltv constraints, restrictions |
+| `scid_registry` | scid_registry.c | Short-channel-id registry mapping |
+| `scb` / `scb_recovery` | scb*.c | Static channel backup encoding + recovery |
+| `peer_db` / `peer_mgr` / `peer_storage` | peer*.c | Peer database, manager loop, BOLT 04 peer-storage protocol |
+| `fwd_history` | fwd_history.c | Forwarding history tracking + accounting |
+| `circuit_breaker` | circuit_breaker.c | Peer-level circuit breaking on repeated failure |
+| `cltv_watchdog` | cltv_watchdog.c | CLTV expiry monitor — closes channels before HTLC timeout |
+| `sweeper` | sweeper.c | Bitcoin output sweeper for matured / unlocked outputs |
+| `factory_recovery` | factory_recovery.c | Recovery driver — broadcast factory tree from DB state without LSP |
+| `ptlc_commit` | ptlc_commit.c | PTLC commitment-output build + state machine (LSP-internal only — no peer-driven wire) |
+| `crash_inject` | crash_inject.c | `SUPERSCALAR_CRASH_AT` env-var test hook for deterministic crash-injection testing |
+| `admin_rpc` | admin_rpc.c | Unix-socket admin RPC for `sweepfactory`, status queries |
+| `prometheus_exporter` | prometheus_exporter.c | Native Prometheus metrics endpoint |
+| `fee_estimator_*` | fee_estimator_{api,blocks,rpc,static}.c | Pluggable fee estimators — block-window, RPC, static; configured per-deployment |
+| `wallet_source_hd` / `wallet_source_rpc` | wallet_source_*.c | Pluggable wallet sources — HD derivation or external RPC wallet |
+| `hd_key` | hd_key.c | BIP32 HD key derivation |
+| `bech32m` | bech32m.c | BIP-350 bech32m encoder for taproot addresses |
+| `lsp_fund` / `lsp_queue` / `lsp_wellknown` | lsp_*.c | LSP-side funding flow, ceremony queue, well-known endpoint advertisement |
+| `ln_dispatch` | ln_dispatch.c | LN payment dispatch over the gossip graph |
+| `notify` | notify.c | Notification fan-out (CLN plugin events, dashboard events) |
+| `readiness` | readiness.c | Operator readiness probes (mainnet-gate-style checks) |
+| `superscalar_sdk` | superscalar_sdk.c | C SDK surface for third-party plugins |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
 ## Known Limitations
