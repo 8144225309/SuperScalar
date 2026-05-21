@@ -173,6 +173,26 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 1;
         }
 
+        /* CLTV bound: reject HTLCs that expire at/past the factory timeout
+           or below the DW safety delta.  A misconfigured bridge could request
+           expiry past the channel's CSV horizon, trapping funds.  Mirror the
+           client-side forwarding policy at src/lsp_channels.c:1389.
+           Closes Finding C of LSP_TEAM_BRIDGE_AUDIT_2026-05-19.md. */
+        uint32_t factory_delta = lsp_compute_factory_cltv_delta(&lsp->factory);
+        uint32_t fwd_cltv_expiry;
+        if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
+                                            lsp->factory.cltv_timeout,
+                                            factory_delta)) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "cltv_expiry_out_of_bounds", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            fprintf(stderr, "LSP: bridge HTLC cltv_expiry=%u rejected "
+                    "(delta=%u, factory_timeout=%u)\n",
+                    cltv_expiry, factory_delta, lsp->factory.cltv_timeout);
+            return 1;
+        }
+
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
         /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
@@ -185,10 +205,12 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (old_dest_n_htlcs > 0)
             memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
-        /* Add HTLC to destination's channel (offered from LSP) */
+        /* Add HTLC to destination's channel (offered from LSP).
+           Uses fwd_cltv_expiry (bound-checked + safety-delta-subtracted)
+           so the destination commitment carries the correct expiry. */
         uint64_t dest_htlc_id;
         if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
-                               payment_hash, cltv_expiry, &dest_htlc_id)) {
+                               payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
             cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
                 "insufficient_funds", htlc_id);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
