@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
 #include <unistd.h>
 
 #ifdef _POSIX_VERSION
@@ -1582,8 +1581,12 @@ int regtest_wait_for_stable_confirmation(regtest_t *rt, const char *txid,
     int is_regtest = (strcmp(rt->network, "regtest") == 0);
     int waited = 0;
     int prev_conf = 0;
-    int last_resend_at = INT_MIN;  /* allow first resend immediately on eviction */
     const int RESEND_THROTTLE_SECS = 300;
+    /* Sentinel chosen so (waited - last_resend_at) on iteration 0 equals
+       RESEND_THROTTLE_SECS exactly — first eviction triggers an immediate
+       resend, subsequent are throttled. Using INT_MIN here would have
+       caused signed-integer overflow UB on the subtraction. */
+    int last_resend_at = -RESEND_THROTTLE_SECS;
     while (waited < timeout_secs) {
         int cur = regtest_get_confirmations(rt, txid);
         if (cur >= target_depth) {
