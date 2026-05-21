@@ -183,7 +183,7 @@ if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
 # Without this, the test PASSes by side-effect of the WT broadcasting,
 # but doesn't verify the trustless guarantee.
 echo "=== CL7: verifying net-delta(cheater) <= 0 ==="
-PENALTY_COUNT=$(sqlite3 "$LSP_DB" "SELECT COUNT(*) FROM broadcast_log WHERE source='penalty' AND result='ok';" 2>/dev/null || echo 0)
+PENALTY_COUNT=$(sqlite3 "$LSP_DB" "SELECT COUNT(*) FROM broadcast_log WHERE source IN ('penalty','factory_response','factory_burn','subfactory_poison','htlc_penalty','ptlc_penalty') AND result='ok';" 2>/dev/null || echo 0)
 if [ "$PENALTY_COUNT" -lt 1 ]; then
     echo "FAIL: no penalty broadcast — cheater would have netted positive"
     exit 1
