@@ -1040,6 +1040,21 @@
                    (unsigned long long)new_amounts[1],
                    (unsigned long long)new_amounts[2]);
 
+            /* CL2 --cheat-realloc: snapshot the pre-realloc leaf signed_tx BEFORE
+               lsp_realloc_leaf mutates the node. After realloc completes, this
+               snapshotted tx is the revoked state we'll attempt to broadcast. */
+            tx_buf_t cl2_pre_realloc_tx;
+            tx_buf_init(&cl2_pre_realloc_tx, 0);
+            if (cheat_realloc &&
+                leaf_node->is_signed && leaf_node->signed_tx.len > 0) {
+                tx_buf_init(&cl2_pre_realloc_tx, (int)leaf_node->signed_tx.len);
+                memcpy(cl2_pre_realloc_tx.data, leaf_node->signed_tx.data,
+                       leaf_node->signed_tx.len);
+                cl2_pre_realloc_tx.len = leaf_node->signed_tx.len;
+                printf("CL2 cheat-realloc: snapshotted pre-realloc leaf tx (%zu bytes)\n",
+                       (size_t)cl2_pre_realloc_tx.len);
+            }
+
             int rc = lsp_realloc_leaf(mgr, lsp_p, 0, new_amounts, 3);
             if (rc != 1) {
                 printf("  FAIL: lsp_realloc_leaf returned %d (expected 1)\n", rc);
@@ -1059,6 +1074,76 @@
                     realloc_pass = 0;
                 }
             }
+
+            /* CL2 cheat-realloc broadcast + watchtower assertion. */
+            if (realloc_pass && cheat_realloc && cl2_pre_realloc_tx.len > 0) {
+                /* The realloc cheat is only meaningful if the parent factory
+                   tree is on-chain (else the stale leaf has no parent UTXO to
+                   spend, sendrawtransaction returns -25 missingorspent).
+                   Mirror the --cheat-leaf trick: temporarily set is_signed=0
+                   on the realloc'd leaf so broadcast_factory_tree_any_network
+                   skips it, broadcast the parent path, then restore and broadcast
+                   the snapshotted pre-realloc leaf. WT now sees the stale on
+                   chain alongside the registered post-realloc state. */
+                printf("\n--- CL2 cheat-realloc: broadcasting parent factory tree (skipping realloc'd leaf) ---\n");
+                fflush(stdout);
+                int saved_leaf_is_signed = leaf_node->is_signed;
+                leaf_node->is_signed = 0;
+                int parent_tree_ok = broadcast_factory_tree_any_network(
+                    &lsp_p->factory, &rt, mine_addr, is_regtest,
+                    confirm_timeout_secs);
+                leaf_node->is_signed = saved_leaf_is_signed;
+                if (!parent_tree_ok) {
+                    fprintf(stderr,
+                            "CL2 CHEAT-REALLOC: parent tree broadcast failed — cannot test stale broadcast\n");
+                    realloc_pass = 0;
+                    goto cl2_cleanup;
+                }
+                printf("CL2 CHEAT-REALLOC: parent tree on-chain; broadcasting revoked pre-realloc leaf\n");
+
+                char *cheat_hex = malloc((size_t)cl2_pre_realloc_tx.len * 2 + 1);
+                char cheat_txid_str[65] = {0};
+                int sent = 0;
+                if (cheat_hex) {
+                    hex_encode(cl2_pre_realloc_tx.data,
+                               (size_t)cl2_pre_realloc_tx.len, cheat_hex);
+                    sent = regtest_send_raw_tx(&rt, cheat_hex, cheat_txid_str);
+                    if (g_db)
+                        persist_log_broadcast(g_db,
+                            sent ? cheat_txid_str : "?",
+                            "cheat_realloc_stale",
+                            cheat_hex,
+                            sent ? "ok" : "failed");
+                    free(cheat_hex);
+                }
+                if (!sent) {
+                    fprintf(stderr, "CL2 CHEAT-REALLOC: stale broadcast failed\n");
+                    realloc_pass = 0;
+                } else {
+                    printf("CL2 CHEAT-REALLOC: revoked tx broadcast txid=%s\n",
+                           cheat_txid_str);
+                    if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
+                    watchtower_t *wt_cl2 = mgr->watchtower;
+                    if (!wt_cl2) {
+                        fprintf(stderr,
+                                "CL2 CHEAT-REALLOC: no watchtower configured — cannot assert defense\n");
+                        realloc_pass = 0;
+                    } else {
+                        int detected = watchtower_check(wt_cl2);
+                        if (detected > 0) {
+                            printf("CL2 CHEAT-REALLOC: BREACH DETECTED! Watchtower broadcast %d penalty tx(s)\n",
+                                   detected);
+                            if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
+                        } else {
+                            fprintf(stderr,
+                                    "CL2 CHEAT-REALLOC: watchtower did NOT detect revoked broadcast (defense MISS)\n");
+                            realloc_pass = 0;
+                        }
+                    }
+                }
+            }
+        cl2_cleanup:
+            tx_buf_free(&cl2_pre_realloc_tx);
 
             printf("LEAF REALLOC TEST: %s\n", realloc_pass ? "PASS" : "FAIL");
         }

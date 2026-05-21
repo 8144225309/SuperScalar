@@ -320,6 +320,7 @@ static void usage(const char *prog) {
         "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
         "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[K] (per --cheat-state K, default 0 = oldest stale) when at chain[N]. CL3.\n"
         "  --cheat-state K      With --cheat-leaf and --advance-count N: snapshot+broadcast chain[K] (default 0 = oldest stale).  K in [0,N-1].  K>0 exercises the watchtower's middle-state revocation walk — boundary-only K=0/K=N-1 tests miss this path. CL3-K.\n"
+        "  --cheat-realloc      With --test-realloc: after realloc completes, broadcast the now-revoked pre-realloc leaf TX and verify watchtower defense fires (penalty TX broadcast, breach_detections row). Tests adversarial path against realloc revocation. CL2.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1283,6 +1284,9 @@ int main(int argc, char *argv[]) {
                                   landed on main, so suppress unused-but-set
                                   -Werror to keep the build green until then. */
     (void)cheat_leaf_side;
+    int cheat_realloc = 0;     /* CL2: when set, after --test-realloc completes,
+                                  broadcast the pre-realloc leaf signed_tx (now revoked)
+                                  and verify the watchtower fires its defense path. */
     int advance_count_arg = 1;  /* CL3: number of leaf advances to drive */
     int cheat_state_idx = 0;    /* CL3-K: which chain entry to broadcast as
                                    stale.  0 = chain[0] (pre-advance, oldest
@@ -1718,6 +1722,10 @@ int main(int argc, char *argv[]) {
                (post MSG_PATH_SIGN_DONE). Drives restart-harness tests:
                persistence + revocation_secrets must survive. */
             setenv("SS_KILL_AFTER_STATE_ADVANCE", "1", 1);
+        }
+        else if (strcmp(argv[i], "--cheat-realloc") == 0) {
+            /* CL2: enable post-finalize cheat broadcast against --test-realloc. */
+            cheat_realloc = 1;
         }
         else if (strcmp(argv[i], "--test-dual-factory") == 0)
             test_dual_factory = 1;
