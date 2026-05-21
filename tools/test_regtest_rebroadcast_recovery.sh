@@ -194,14 +194,27 @@ echo ""
 echo "--- injecting mempool eviction (bitcoind restart w/ -persistmempool=0) ---"
 stop_miner
 
-# Stop bitcoind cleanly (this would normally PERSIST the mempool to a file
-# bitcoind reads on restart — we need to suppress that)
-$BCLI stop >/dev/null 2>&1
-for i in $(seq 1 15); do sleep 1; $BCLI getblockchaininfo >/dev/null 2>&1 || break; done
+# Stop bitcoind. The graceful stop can take a while (flushes mempool/chainstate);
+# wait up to 40s, then force-kill as fallback.
+$BCLI stop >/dev/null 2>&1 || true
+for i in $(seq 1 40); do
+    sleep 1
+    pgrep -x bitcoind >/dev/null 2>&1 || break
+done
+if pgrep -x bitcoind >/dev/null 2>&1; then
+    echo "  bitcoind didn't stop in 40s, force-killing"
+    pkill -9 -x bitcoind
+    sleep 3
+fi
+echo "  bitcoind stopped"
 
-# Restart bitcoind with -persistmempool=0 so it comes up with an empty mempool
-bitcoind -regtest -conf="$REGTEST_CONF" -daemon -persistmempool=0
-for i in $(seq 1 30); do sleep 1; $BCLI getblockchaininfo >/dev/null 2>&1 && break; done
+# Restart with -persistmempool=0 so it comes up with an empty mempool
+bitcoind -regtest -conf="$REGTEST_CONF" -daemon -persistmempool=0 2>&1 | head -3 || true
+for i in $(seq 1 60); do
+    sleep 1
+    $BCLI getblockchaininfo >/dev/null 2>&1 && break
+done
+$BCLI getblockchaininfo >/dev/null 2>&1 || { echo "FAIL: bitcoind didn't come back up"; exit 1; }
 $BCLI loadwallet $MINER_WALLET 2>/dev/null || true
 echo "  bitcoind back up with empty mempool"
 
