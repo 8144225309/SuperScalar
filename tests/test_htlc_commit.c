@@ -16,6 +16,12 @@
  * HC13: test_htlc_commit_recv_update_fee_accepts   — valid feerate accepted
  * HC14: test_htlc_commit_recv_update_fee_rejects_low  — below floor rejected
  * HC15: test_htlc_commit_recv_update_fee_rejects_high — above ceiling rejected
+ * HC16: test_htlc_commit_recv_update_fee_dust_race_rejects — abusive feerate
+ *                                                       rejected when active HTLC
+ *                                                       would become unsweepable
+ * HC17: test_htlc_commit_recv_update_fee_dust_race_accepts_large — safe-but-high
+ *                                                       feerate accepted when
+ *                                                       HTLC value is sufficient
  */
 
 #include "superscalar/htlc_commit.h"
@@ -701,6 +707,100 @@ int test_htlc_commit_recv_update_fee_rejects_high(void) {
                                       BOLT2_UPDATE_FEE_FLOOR,
                                       BOLT2_UPDATE_FEE_CEILING);
     ASSERT(ok == 1, "feerate exactly at ceiling accepted");
+
+    return 1;
+}
+
+/* ================================================================== */
+/* HC16 — dust-race rejection: abusive feerate would strand small HTLC */
+/* ================================================================== */
+
+int test_htlc_commit_recv_update_fee_dust_race_rejects(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.fee_rate_sat_per_kvb = 1000;
+
+    /* Small active HTLC (5000 sats). At ceiling 100000 sat/kw,
+       sweep fee = (400000*180+999)/1000 = 72000 sats. The HTLC sweep
+       output would be 5000 - 72000 < 0 → unsweepable. Must reject. */
+    htlc_t htlcs[1];
+    memset(htlcs, 0, sizeof(htlcs));
+    htlcs[0].state = HTLC_STATE_ACTIVE;
+    htlcs[0].direction = HTLC_OFFERED;
+    htlcs[0].amount_sats = 5000;
+    ch.htlcs = htlcs;
+    ch.n_htlcs = 1;
+
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    wr16(msg, BOLT2_UPDATE_FEE);
+    wr32(msg + 34, BOLT2_UPDATE_FEE_CEILING);
+
+    int ok = htlc_commit_recv_update_fee(&ch, msg, sizeof(msg),
+                                          BOLT2_UPDATE_FEE_FLOOR,
+                                          BOLT2_UPDATE_FEE_CEILING);
+    ASSERT(ok == 0, "abusive feerate rejected (HTLC would become unsweepable)");
+    ASSERT(ch.fee_rate_sat_per_kvb == 1000,
+           "fee_rate unchanged on dust-race rejection");
+
+    /* Sub-dust HTLCs are already trimmed — they shouldn't block fee updates */
+    htlcs[0].amount_sats = 200;  /* below CHANNEL_DUST_LIMIT_SATS = 546 */
+    ok = htlc_commit_recv_update_fee(&ch, msg, sizeof(msg),
+                                      BOLT2_UPDATE_FEE_FLOOR,
+                                      BOLT2_UPDATE_FEE_CEILING);
+    ASSERT(ok == 1, "already-trimmed sub-dust HTLC does not block fee update");
+
+    return 1;
+}
+
+/* ================================================================== */
+/* HC17 — dust-race acceptance: safe-but-high feerate ok when HTLC big */
+/* ================================================================== */
+
+int test_htlc_commit_recv_update_fee_dust_race_accepts_large(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.fee_rate_sat_per_kvb = 1000;
+
+    /* Active HTLC of 200k sats. At ceiling, sweep fee = 72000 sats,
+       sweep amount = 200000 - 72000 = 128000 > dust → accept. */
+    htlc_t htlcs[1];
+    memset(htlcs, 0, sizeof(htlcs));
+    htlcs[0].state = HTLC_STATE_ACTIVE;
+    htlcs[0].direction = HTLC_OFFERED;
+    htlcs[0].amount_sats = 200000;
+    ch.htlcs = htlcs;
+    ch.n_htlcs = 1;
+
+    unsigned char msg[38];
+    memset(msg, 0, sizeof(msg));
+    wr16(msg, BOLT2_UPDATE_FEE);
+    wr32(msg + 34, BOLT2_UPDATE_FEE_CEILING);
+
+    int ok = htlc_commit_recv_update_fee(&ch, msg, sizeof(msg),
+                                          BOLT2_UPDATE_FEE_FLOOR,
+                                          BOLT2_UPDATE_FEE_CEILING);
+    ASSERT(ok == 1, "safe-but-high feerate accepted with sufficient HTLC value");
+    ASSERT(ch.fee_rate_sat_per_kvb == (uint64_t)BOLT2_UPDATE_FEE_CEILING * 4,
+           "fee_rate updated on dust-race acceptance");
+
+    /* PTLC counterpart: also blocks if small */
+    ch.fee_rate_sat_per_kvb = 1000;
+    ch.n_htlcs = 0;
+    ptlc_t ptlcs[1];
+    memset(ptlcs, 0, sizeof(ptlcs));
+    ptlcs[0].state = PTLC_STATE_ACTIVE;
+    ptlcs[0].direction = PTLC_OFFERED;
+    ptlcs[0].amount_sats = 5000;
+    ch.ptlcs = ptlcs;
+    ch.n_ptlcs = 1;
+
+    ok = htlc_commit_recv_update_fee(&ch, msg, sizeof(msg),
+                                      BOLT2_UPDATE_FEE_FLOOR,
+                                      BOLT2_UPDATE_FEE_CEILING);
+    ASSERT(ok == 0, "abusive feerate rejected (PTLC would become unsweepable)");
+    ASSERT(ch.fee_rate_sat_per_kvb == 1000,
+           "fee_rate unchanged on PTLC dust-race rejection");
 
     return 1;
 }

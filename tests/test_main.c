@@ -913,6 +913,8 @@ extern int test_htlc_commit_update_fee_layout(void);
 extern int test_htlc_commit_recv_update_fee_accepts(void);
 extern int test_htlc_commit_recv_update_fee_rejects_low(void);
 extern int test_htlc_commit_recv_update_fee_rejects_high(void);
+extern int test_htlc_commit_recv_update_fee_dust_race_rejects(void);
+extern int test_htlc_commit_recv_update_fee_dust_race_accepts_large(void);
 /* PR #21 Phase 3: CLTV watchdog */
 extern int test_cltv_watchdog_default_delta(void);
 extern int test_cltv_watchdog_no_htlcs(void);
@@ -2775,6 +2777,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
     RUN_TEST(test_htlc_commit_recv_update_fee_rejects_low);
     RUN_TEST(test_htlc_commit_recv_update_fee_rejects_high);
+    RUN_TEST(test_htlc_commit_recv_update_fee_dust_race_rejects);
+    RUN_TEST(test_htlc_commit_recv_update_fee_dust_race_accepts_large);
     printf("\n=== PR #21 Phase 3: CLTV Watchdog ===\n");
     RUN_TEST(test_cltv_watchdog_default_delta);
     RUN_TEST(test_cltv_watchdog_no_htlcs);
