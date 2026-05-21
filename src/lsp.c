@@ -3,6 +3,7 @@
 #include "superscalar/lsps.h"
 #include "superscalar/persist.h"
 #include "superscalar/sha256.h"
+#include "superscalar/crash_inject.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -427,6 +428,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
         } else {
             cer_persisted = 1;
         }
+        lsp_crash_checkpoint("pending_nonces");
     }
 
     /* Send FACTORY_PROPOSE to all clients */
@@ -841,6 +843,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
                                                 agg_nonce_ser, NULL, NULL, 0, 0);
         }
     }
+    lsp_crash_checkpoint("nonces_aggregated");
 
     /* Finalize distribution TX signing session (separate from tree nodes) */
     if (has_dist_tx && f->dist_tx_ready) {
@@ -897,6 +900,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
             fprintf(stderr, "LSP: persist_update_ceremony_state(PENDING_SIGS) failed\n");
         }
     }
+    lsp_crash_checkpoint("pending_sigs");
 
     /* Collect PSIG_BUNDLEs from all clients (parallel select) */
     {
@@ -1044,6 +1048,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
        the final signature (root node) and the broadcast txid (the funding
        TXID — already broadcast by the caller before this ceremony started;
        the wallet team treats it as the authoritative on-chain anchor). */
+    lsp_crash_checkpoint("finalize_partial");
     if (cer_persisted) {
         if (!persist_update_ceremony_state(lsp->db, cer_id,
                                             PERSIST_CEREMONY_STATE_FINALIZED)) {
