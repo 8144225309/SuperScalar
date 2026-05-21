@@ -810,13 +810,11 @@
                     &lsp_p->factory, &rt, mine_addr, is_regtest,
                     confirm_timeout_secs);
                 cleaf_node_cl1c->is_signed = saved_is_signed;
-                /* Record one broadcast_log entry summarizing the parent path */
-                if (g_db) {
-                    persist_log_broadcast(g_db,
-                        parent_tree_ok ? "tree_ok" : "tree_fail",
-                        "cheat_leaf_parent_tree", "",
-                        parent_tree_ok ? "ok" : "failed");
-                }
+                /* Don't synthesize a broadcast_log row for the parent-tree
+                   broadcast itself: broadcast_factory_tree_any_network() already
+                   logs each tree node with a real txid + raw_hex. A synthetic
+                   "tree_ok"/"tree_fail" placeholder with empty raw_hex was
+                   dashboard noise (Item 2 of LSP_TEAM_OUTSTANDING_2026-05-21). */
                 if (!parent_tree_ok) {
                     /* CL1.H: parent-tree broadcast intentionally bails on the cheated leaf
                        (is_signed=0 trick). Tree_node_0..4 still broadcast successfully.
