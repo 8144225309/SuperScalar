@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-if pgrep -f "superscalar_lsp.*--port ${PORT:-9953}" >/dev/null 2>&1; then
+if (for pid in $(pgrep -f "/superscalar_lsp.*--port ${PORT:-9953}" 2>/dev/null); do [ "$(cat /proc/$pid/comm 2>/dev/null)" = "superscalar_lsp" ] && echo found && break; done | grep -q found); then
     echo "REFUSE: another superscalar_lsp is on port ${PORT:-9953}." >&2
     exit 3
 fi
@@ -76,6 +76,7 @@ nohup "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "$LSP_DB" \
+    --lsp-balance-pct 50 \
     $DEMO_FLAGS \
     > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
 LSP_PID=$!
