@@ -22,6 +22,8 @@
 #include <errno.h>
 
 #include "superscalar/sha256.h"
+#include "superscalar/lsp.h"
+#include "superscalar/crash_inject.h"
 extern void hex_encode(const unsigned char *, size_t, char *);
 extern int hex_decode(const char *, unsigned char *, size_t);
 extern void reverse_bytes(unsigned char *, size_t);
@@ -175,6 +177,38 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     wire_compute_turnover_msg(dying_factory_txid, new_factory_nonce,
                                 rotation_epoch, turnover_msg);
 
+    /* #245 Gap A: persist a ROTATE ceremony row so a crash anywhere from
+       here onward leaves a recoverable trail. The INITIAL ceremony was
+       derived from (dying_factory_txid, INITIAL, epoch=0) at factory
+       creation time; we link parent_ceremony_id back to it so forensic
+       walks can follow the chain INITIAL → ROTATE → (next INITIAL for
+       the rotated-into factory). rot_cer_persisted gates every later
+       persist_update_ceremony_state call — when lsp->db is NULL (legacy
+       deployments) the rotation runs unchanged. */
+    unsigned char rot_cer_id[8] = {0};
+    unsigned char rot_parent_cer_id[8] = {0};
+    int rot_cer_persisted = 0;
+    persist_t *rot_db = (persist_t *)mgr->persist;
+    if (rot_db) {
+        lsp_ceremony_derive_id(dying_factory_txid,
+                                PERSIST_CEREMONY_TYPE_ROTATE,
+                                rotation_epoch, rot_cer_id);
+        lsp_ceremony_derive_id(dying_factory_txid,
+                                PERSIST_CEREMONY_TYPE_INITIAL,
+                                /* epoch at INITIAL = 0 */ 0,
+                                rot_parent_cer_id);
+        if (!persist_save_ceremony(rot_db, rot_cer_id, dying_factory_txid,
+                                    PERSIST_CEREMONY_TYPE_ROTATE,
+                                    rot_parent_cer_id,
+                                    /*started_at_block*/ 0,
+                                    /*deadline_block*/ 0)) {
+            fprintf(stderr, "LSP rotate: persist_save_ceremony(ROTATE) failed (continuing)\n");
+        } else {
+            rot_cer_persisted = 1;
+        }
+        lsp_crash_checkpoint("rotate_pending_nonces");
+    }
+
     /* --- Phase A: PTLC key turnover over wire --- */
     printf("LSP rotate: Phase A — PTLC key turnover\n");
 
@@ -212,6 +246,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                                               turnover_msg, rot_kps, n_total,
                                               &ka_copy, NULL, &client_pk)) {
             fprintf(stderr, "LSP rotate: presig failed client %zu, skipping\n", ci);
+            if (rot_cer_persisted) {
+                unsigned char pk33[33];
+                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                PERSIST_CEREMONY_PHASE_REFUSED,
+                                                NULL, NULL, 0, 0);
+            }
             turnover_fail++;
             continue;
         }
@@ -241,10 +282,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             fprintf(stderr, "LSP rotate: send presig failed client %zu, skipping\n", ci);
             wire_close(lsp->client_fds[ci]);
             lsp->client_fds[ci] = -1;
+            if (rot_cer_persisted) {
+                unsigned char pk33[33];
+                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                PERSIST_CEREMONY_PHASE_REFUSED,
+                                                NULL, NULL, 0, 0);
+            }
             turnover_fail++;
             continue;
         }
         cJSON_Delete(pm);
+        if (rot_cer_persisted) {
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+            persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                            PERSIST_CEREMONY_PHASE_SENT,
+                                            NULL, NULL, 0, 0);
+        }
 
         /* Wait for PTLC_ADAPTED_SIG (60s wall-clock).
            Discard stray messages (e.g. MSG_REVOKE_AND_ACK or
@@ -277,6 +332,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             if (!got_sig) {
                 if (resp.json) cJSON_Delete(resp.json);
                 fprintf(stderr, "LSP rotate: no adapted_sig from client %zu, skipping\n", ci);
+                if (rot_cer_persisted) {
+                    unsigned char pk33[33];
+                    lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                    persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                    PERSIST_CEREMONY_PHASE_TIMED_OUT,
+                                                    NULL, NULL, 0, 0);
+                }
                 turnover_fail++;
                 continue;
             }
@@ -286,6 +348,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (!wire_parse_ptlc_adapted_sig(resp.json, adapted_sig)) {
             cJSON_Delete(resp.json);
             fprintf(stderr, "LSP rotate: parse adapted_sig failed client %zu, skipping\n", ci);
+            if (rot_cer_persisted) {
+                unsigned char pk33[33];
+                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                PERSIST_CEREMONY_PHASE_REFUSED,
+                                                NULL, NULL, 0, 0);
+            }
             turnover_fail++;
             continue;
         }
@@ -296,11 +365,25 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (!adaptor_extract_secret(mgr->ctx, extracted, adapted_sig, presig,
                                       nonce_parity)) {
             fprintf(stderr, "LSP rotate: extract failed client %zu, skipping\n", ci);
+            if (rot_cer_persisted) {
+                unsigned char pk33[33];
+                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                PERSIST_CEREMONY_PHASE_REFUSED,
+                                                NULL, NULL, 0, 0);
+            }
             turnover_fail++;
             continue;
         }
         if (!adaptor_verify_extracted_key(mgr->ctx, extracted, &client_pk)) {
             fprintf(stderr, "LSP rotate: verify failed client %zu, skipping\n", ci);
+            if (rot_cer_persisted) {
+                unsigned char pk33[33];
+                lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+                persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                                PERSIST_CEREMONY_PHASE_REFUSED,
+                                                NULL, NULL, 0, 0);
+            }
             turnover_fail++;
             continue;
         }
@@ -321,10 +404,29 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                 (persist_t *)mgr->persist, ptlc_round_id,
                 (uint32_t)(ci + 1), "verified");
         }
+        if (rot_cer_persisted) {
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, ci, pk33);
+            persist_save_participant_phase(rot_db, rot_cer_id, pk33,
+                                            PERSIST_CEREMONY_PHASE_SIGNED,
+                                            NULL, NULL, 0, 0);
+        }
         printf("LSP rotate: client %zu key extracted via wire PTLC\n", ci + 1);
     }
     printf("LSP rotate: Phase A complete — %zu/%zu clients cooperated (%zu failed)\n",
            turnover_ok, lsp->n_clients, turnover_fail);
+
+    /* #245 Gap A: Phase A finished — every cooperating client is now at
+       SIGNED, the non-cooperating ones are at REFUSED/TIMED_OUT. Bump
+       the ceremony state to NONCES_AGGREGATED so a restart sees we've
+       cleared the first round. */
+    if (rot_cer_persisted) {
+        if (!persist_update_ceremony_state(rot_db, rot_cer_id,
+                PERSIST_CEREMONY_STATE_NONCES_AGGREGATED)) {
+            fprintf(stderr, "LSP rotate: persist_update_ceremony_state(NONCES_AGGREGATED) failed (continuing)\n");
+        }
+        lsp_crash_checkpoint("rotate_nonces_aggregated");
+    }
 
     /* SF-PTLC-HARDEN (#217): finalize the journal row.  partial = some
      * clients failed; success = all OK.  result_txid is NULL because
@@ -423,7 +525,26 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     wallet_source_t *wallet_src = (wallet_source_t *)mgr->wallet_src;
     if (!rt && !chain_be) {
         fprintf(stderr, "LSP rotate: no chain connection\n");
+        if (rot_cer_persisted) {
+            persist_update_ceremony_state(rot_db, rot_cer_id,
+                                           PERSIST_CEREMONY_STATE_ABORTED);
+            persist_update_ceremony_artifacts(rot_db, rot_cer_id, NULL, NULL, NULL,
+                                               /*has_abort_reason*/ 1,
+                                               PERSIST_CEREMONY_PHASE_REFUSED);
+        }
         return 0;
+    }
+
+    /* #245 Gap A: Phase B is about to commit the close/partial-retire TX.
+       Bump state to PENDING_SIGS so a crash here re-enters with the right
+       context — we no longer need to redo Phase A turnover, but we DO need
+       to re-broadcast the close TX from a persisted source. */
+    if (rot_cer_persisted) {
+        if (!persist_update_ceremony_state(rot_db, rot_cer_id,
+                PERSIST_CEREMONY_STATE_PENDING_SIGS)) {
+            fprintf(stderr, "LSP rotate: persist_update_ceremony_state(PENDING_SIGS) failed (continuing)\n");
+        }
+        lsp_crash_checkpoint("rotate_pending_sigs");
     }
 
     if (full_close) {
@@ -941,6 +1062,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                             saved_seckey, lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
         secure_zero(saved_seckey, 32);
+        if (rot_cer_persisted) {
+            persist_update_ceremony_state(rot_db, rot_cer_id,
+                                           PERSIST_CEREMONY_STATE_ABORTED);
+            persist_update_ceremony_artifacts(rot_db, rot_cer_id, NULL, NULL, NULL,
+                                               1, PERSIST_CEREMONY_PHASE_REFUSED);
+        }
         return 0;
     }
 
@@ -1048,6 +1175,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         } else {
             fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
             persist_rollback(db);
+            if (rot_cer_persisted) {
+                persist_update_ceremony_state(rot_db, rot_cer_id,
+                                               PERSIST_CEREMONY_STATE_ABORTED);
+                persist_update_ceremony_artifacts(rot_db, rot_cer_id, NULL, NULL, NULL,
+                                                   1, PERSIST_CEREMONY_PHASE_REFUSED);
+            }
             return 0;
         }
     }
@@ -1057,6 +1190,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (jit_channel_is_active(mgr, c)) {
             printf("LSP rotate: migrating JIT channel for client %zu\n", c);
             jit_channel_migrate(mgr, lsp, c, 0);
+        }
+    }
+
+    /* #245 Gap A: rotation complete. Try FINALIZED — the dual-signature-trap
+       guard (persist.c:6836) refuses unless every participant row is at
+       phase=SIGNED. That's correct semantics for a full rotation; on a
+       partial rotation some participants are at REFUSED/TIMED_OUT and the
+       guard will (correctly) refuse, so fall back to PARTIAL_FAILED. */
+    if (rot_cer_persisted) {
+        lsp_crash_checkpoint("rotate_finalize_partial");
+        if (!persist_update_ceremony_state(rot_db, rot_cer_id,
+                PERSIST_CEREMONY_STATE_FINALIZED)) {
+            /* Expected on partial rotation — fall back. The guard already
+               logged WHY. */
+            if (!persist_update_ceremony_state(rot_db, rot_cer_id,
+                    PERSIST_CEREMONY_STATE_PARTIAL_FAILED)) {
+                fprintf(stderr, "LSP rotate: persist_update_ceremony_state(PARTIAL_FAILED) failed (continuing)\n");
+            }
         }
     }
 

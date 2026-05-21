@@ -36,10 +36,10 @@ extern void reverse_bytes(unsigned char *data, size_t len);
  * persist_save_factory completes).
  * =========================================================================== */
 
-static void lsp_ceremony_derive_id(const unsigned char *fid32,
-                                    uint8_t ceremony_type,
-                                    uint64_t epoch,
-                                    unsigned char out_cid8[8]) {
+void lsp_ceremony_derive_id(const unsigned char *fid32,
+                              uint8_t ceremony_type,
+                              uint64_t epoch,
+                              unsigned char out_cid8[8]) {
     unsigned char buf[32 + 1 + 8];
     memcpy(buf, fid32, 32);
     buf[32] = ceremony_type;
@@ -51,8 +51,8 @@ static void lsp_ceremony_derive_id(const unsigned char *fid32,
     memcpy(out_cid8, digest, 8);
 }
 
-static void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
-                                              unsigned char out33[33]) {
+void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
+                                       unsigned char out33[33]) {
     size_t len = 33;
     secp256k1_ec_pubkey_serialize(lsp->ctx, out33, &len,
                                    &lsp->client_pubkeys[client_idx],
