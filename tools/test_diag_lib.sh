@@ -30,10 +30,36 @@ diag_setup() {
     local tag="$1"
     DIAG_DIR="/tmp/${tag}_diag"
     mkdir -p "$DIAG_DIR"
-    rm -f "$DIAG_DIR"/*.txt "$DIAG_DIR"/*.ndjson "$DIAG_DIR"/lsp.log.* 2>/dev/null || true
+    rm -f "$DIAG_DIR"/*.txt "$DIAG_DIR"/*.ndjson "$DIAG_DIR"/lsp.log.* \
+          "$DIAG_DIR"/*.stderr 2>/dev/null || true
     echo "diag: forensics dir = $DIAG_DIR"
     # Record service start time so we can slice journal precisely.
     date -u +%Y-%m-%dT%H:%M:%SZ > "$DIAG_DIR/start.txt"
+}
+
+# diag_enable_core_dumps
+# Lifts the RLIMIT_CORE soft limit and points the kernel core_pattern (best
+# effort — needs root for sysctl) at DIAG_DIR so SIGSEGV/SIGABRT leaves a
+# core file in the forensics bundle.
+diag_enable_core_dumps() {
+    ulimit -c unlimited 2>/dev/null || true
+    if [ -w /proc/sys/kernel/core_pattern ] 2>/dev/null; then
+        echo "${DIAG_DIR}/core.%e.%p.%t" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    fi
+    [ -w /proc/sys/kernel/core_uses_pid ] && \
+        echo 1 > /proc/sys/kernel/core_uses_pid 2>/dev/null || true
+    {
+        echo "ulimit_c: $(ulimit -c 2>/dev/null)"
+        echo "core_pattern: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+    } > "$DIAG_DIR/core_config.txt"
+    echo "diag: core dumps -> $DIAG_DIR/core.* (ulimit_c=$(ulimit -c 2>/dev/null))"
+}
+
+# diag_stderr_path <name>
+# Returns a per-name stderr path under DIAG_DIR.  Use like:
+#   "$BIN" args > "$LOG" 2> "$(diag_stderr_path lsp)" &
+diag_stderr_path() {
+    echo "${DIAG_DIR:-/tmp}/$1.stderr"
 }
 
 # diag_periodic <PID> [interval_sec]

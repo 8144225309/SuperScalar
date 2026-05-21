@@ -1,0 +1,43 @@
+# shape-3c-N64-ARITY248-STATIC1 V2 - Results
+
+See `V2-commands.md` for the launch protocol. Filled in as the run progresses.
+
+## Run record
+- Wallet:    superscalar_test
+- Started:   `<UTC>`
+- Completed: `<UTC>`
+- Duration:  `<wall>`
+- Funding rate: 1.0 sat/vB
+- **Outcome: pending**
+
+## On-chain evidence
+| Event | Block | TXID | Notes |
+|---|---|---|---|
+| Funding TX                     | TBD | TBD | from superscalar_test |
+| Factory root / leaf broadcasts | TBD | TBD | |
+| Sub-factory chain[N] TXs       | TBD | TBD | (k2 shapes only) |
+| Force-close commits            | TBD | TBD | (V2/V5/V6 only) |
+| Per-client sweeps              | TBD | TBD | |
+| Sales-stock sweeps             | TBD | TBD | (k2 shapes only) |
+| WT response TX                 | TBD | TBD | (V5 only) |
+
+## Log assertions observed
+- [ ] `shape ewt =`
+- [ ] `all 64 clients connected`
+- [ ] `tree_node_.* broadcast OK`
+- [ ] `tree_node_.* confirmed`
+
+## Conservation
+- Funding in:   TBD sats
+- Sweeps out:   TBD sats
+- Fees total:   TBD sats (all at <=1 sat/vB)
+- Conservation: `X == Y + Z`  [ ]
+
+## Sweep-back
+- superscalar_test -> superscalar_test
+- TXID:    TBD
+- Block:   TBD
+- Sats:    TBD in / TBD fee at 1 sat/vB
+
+## Failure / observation notes
+(empty)
