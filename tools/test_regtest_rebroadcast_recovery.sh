@@ -2,22 +2,30 @@
 # test_regtest_rebroadcast_recovery.sh — verify the #259 mempool-eviction
 # recovery path actually fires.
 #
+# IMPORTANT: PR #302's regtest_resend_if_evicted runs inside
+# regtest_wait_for_stable_confirmation, which is ONLY called by the LSP
+# on non-regtest networks (the pure-regtest path just calls
+# regtest_mine_blocks). To exercise the code path on a regtest chain we
+# tell the LSP "--network signet" while pointing its RPC at the
+# regtest bitcoind on port 18443. The LSP treats itself as signet
+# (target_depth=3, runs the polling loop) but actually talks to our
+# fast-mining regtest bitcoind. Best of both worlds.
+#
 # Pattern:
 #   1. Start regtest bitcoind, mine 101 blocks
-#   2. Launch LSP --demo + N clients
-#   3. Background miner mines one block every few seconds (drives ceremony)
+#   2. Launch LSP --demo + N clients with --network signet --rpcport 18443
+#   3. Background miner mines a block every 2s (drives the ceremony)
 #   4. When LSP logs "waiting for close tx to reach", capture close txid
-#   5. STOP the background miner (we need a window where the close TX is
-#      in mempool but NOT yet confirmed)
-#   6. Mempool should have the close TX. Force a mempool eviction via the
-#      bitcoind `clearmempool` RPC (Bitcoin Core 28+).
-#   7. Wait up to 30s for the LSP's wait loop to detect (regtest polls
-#      every 2s; throttle sentinel allows the first resend to fire
-#      immediately).
+#   5. STOP the background miner (we want a window where the close TX is
+#      in mempool but not at target_depth=3 yet)
+#   6. clearmempool (Bitcoin Core 28+ RPC) to force eviction
+#   7. Wait up to 30s for the LSP's wait loop to detect (polls every 15s
+#      on non-regtest; throttle sentinel allows the first resend to fire
+#      immediately on the first iteration where eviction is observed)
 #   8. Assert the "regtest_resend_if_evicted: ... re-broadcasting" log
-#      line appeared on LSP stderr.
-#   9. Verify the TX is back in mempool after resend.
-#  10. Restart the background miner — close TX confirms — LSP exits PASS.
+#      line appeared on LSP stderr
+#   9. Verify the TX is back in mempool after resend
+#  10. Restart the background miner — close TX confirms — LSP exits PASS
 #
 # This is the regtest counterpart to the manual 3a V1 fix on testnet4
 # (see PR #302 commit message).
@@ -105,7 +113,8 @@ echo ""
 echo "--- LSP daemon (--demo, $N_CLIENTS clients) ---"
 ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$LSP_BIN" \
-    --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
+    --network signet --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
+    --rpcport 18443 \
     --amount $FUNDING_SATS --fee-rate 1000 --confirm-timeout 600 \
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
     --seckey "$LSP_SECKEY" \
@@ -126,7 +135,8 @@ echo "  LSP listening (PID=$LSP_PID)"
 # --- clients ---
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
-    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $LSP_PORT \
+    "$CLIENT_BIN" --network signet --host 127.0.0.1 --port $LSP_PORT \
+        --rpcport 18443 \
         --seckey "${CLIENT_SECKEYS[$i]}" --fee-rate 1000 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i + 1)) --daemon \
         --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
