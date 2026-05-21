@@ -21,7 +21,7 @@ set -euo pipefail
 
 # Refuse to run if another LSP is already on our port (avoid the foot-gun where
 # a second invocation pkills the first one's LSP).
-if pgrep -f "superscalar_lsp.*--port ${PORT:-9950}" >/dev/null 2>&1; then
+if (for pid in $(pgrep -f "/superscalar_lsp.*--port ${PORT:-9950}" 2>/dev/null); do [ "$(cat /proc/$pid/comm 2>/dev/null)" = "superscalar_lsp" ] && echo found && break; done | grep -q found); then
     echo "REFUSE: another superscalar_lsp is on port ${PORT:-9950}." >&2
     echo "        pkill it manually if it is stale, or set PORT=<other> for this run." >&2
     exit 3
@@ -109,6 +109,7 @@ nohup "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
     --wallet "$WALLET" --db "$LSP_DB" \
+    --lsp-balance-pct 50 \
     $DEMO_FLAGS \
     > "$LSP_LOG" 2> "$(diag_stderr_path lsp)" &
 LSP_PID=$!
