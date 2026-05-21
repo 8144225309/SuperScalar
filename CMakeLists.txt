@@ -144,6 +144,7 @@ add_library(superscalar
     src/lsp_demo.c
     src/report.c
     src/persist.c
+    src/persist_wt.c
     src/bridge.c
     src/fee.c
     src/fee_estimator_static.c
@@ -263,6 +264,7 @@ add_executable(test_superscalar
     tests/test_economic_correctness.c
     tests/test_regtest_hybrid_cln.c
     tests/test_persist.c
+    tests/test_persist_wt.c
     tests/test_bridge.c
     tests/test_daemon.c
     tests/test_reconnect.c
