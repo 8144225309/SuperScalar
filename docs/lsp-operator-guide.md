@@ -140,8 +140,8 @@ Press **Ctrl+C**. The LSP will:
 | `--port` | 9735 | Listen port for client connections |
 | `--clients` | 4 | Number of clients to accept before starting ceremony |
 | `--amount` | 100000 | Factory funding amount in satoshis |
-| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). See [docs/factory-arity.md](factory-arity.md) for canonical shape selection by client count. |
-| `--static-near-root` | 0 | Number of near-root tree levels to make kickoff-only (no DW state machine). Reduces total CSV consumption — see [docs/factory-arity.md](factory-arity.md). |
+| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). Canonical shape selection by client count is documented at [superscalar.win](https://superscalar.win). |
+| `--static-near-root` | 0 | Number of near-root tree levels to make kickoff-only (no DW state machine). Reduces total CSV consumption (full design at [superscalar.win](https://superscalar.win)). |
 | `--network` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
 | `--daemon` | off | Long-lived mode (handles reconnections, Ctrl+C for close) |
 | `--demo` | off | Run scripted payment sequence then close |
@@ -309,6 +309,24 @@ For defense-in-depth, run `superscalar_watchtower` on a separate machine. It ope
 
 The watchtower prints heartbeat messages and broadcasts penalty transactions automatically if a breach is detected. It has no write access to the database, so it cannot interfere with the LSP.
 
+### Watchtower flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db PATH` | **required** | Path to LSP SQLite database (opened read-only) |
+| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
+| `--poll-interval N` | 30 | Seconds between block scans |
+| `--cli-path PATH` | bitcoin-cli | Path to bitcoin-cli binary |
+| `--rpcuser USER` | rpcuser | Bitcoin RPC username |
+| `--rpcpassword PASS` | rpcpass | Bitcoin RPC password |
+| `--datadir PATH` | (default) | Bitcoin datadir |
+| `--rpcport PORT` | (auto) | Bitcoin RPC port override |
+| `--max-bump-fee SATS` | — | Cap on cumulative RBF fee bumps for the penalty broadcast |
+| `--bump-budget-pct N` | — | Percentage of channel value to budget for fee bumps |
+| `--inspect-db` | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. Useful for forensics on a captured DB. |
+| `--version` | — | Show version and exit |
+| `--help` | — | Show help and exit |
+
 ## 9. Monitoring
 
 ### Web Dashboard
@@ -329,11 +347,11 @@ Open http://localhost:8080 for real-time factory, channel, and watchtower status
 ```bash
 # Check channel balances from DB
 sqlite3 -header -column lsp.db \
-  "SELECT channel_id, local_amount, remote_amount, commitment_number FROM channels"
+  "SELECT id, factory_id, slot, local_amount, remote_amount, commitment_number, state FROM channels"
 
 # Check factory state
 sqlite3 -header -column lsp.db \
-  "SELECT factory_id, n_participants, funding_amount, lifecycle_state FROM factories"
+  "SELECT id, n_participants, funding_amount, leaf_arity, state FROM factories"
 ```
 
 ### JSON Diagnostic Report
@@ -494,17 +512,11 @@ lightning-cli plugin list | grep cln_plugin
 
 ## 11. JIT operations and rollback
 
-Buy-liquidity, leaf reallocation, and bridge HTLC forwarding can all
-fail mid-flight (e.g. a client times out during the realloc MuSig
-ceremony, or a downstream BOLT-11 payment fails).  SuperScalar relies
-on **cut-through** for reconciliation rather than a per-realloc undo
-hashlock — the on-chain factory is never mutated mid-flight, so failed
-operations leave the factory at its last fully-signed state and the
-next legitimate state advance absorbs the gap.
+Buy-liquidity, leaf reallocation, and bridge HTLC forwarding can all fail mid-flight (e.g. a client times out during the realloc MuSig ceremony, or a downstream BOLT-11 payment fails). SuperScalar relies on **cut-through** for reconciliation rather than a per-realloc undo hashlock — the on-chain factory is never mutated mid-flight, so failed operations leave the factory at its last fully-signed state and the next legitimate state advance absorbs the gap.
 
-See [`docs/jit-and-rollback.md`](jit-and-rollback.md) for the full
-rollback contract per primitive (realloc, buy-liquidity, bridge HTLC,
-coop close).
+**Operational implication.** An operator does not need to take any recovery action when a JIT operation fails mid-flight — the LSP retries or surfaces the failure to the originating client, and the factory's signed state remains unchanged. Database rollback is automatic via the same transaction boundary as the in-memory state.
+
+The full rollback contract per primitive (realloc, buy-liquidity, bridge HTLC, coop close) is documented at [superscalar.win](https://superscalar.win).
 
 ## 12. Factory Rotation
 
