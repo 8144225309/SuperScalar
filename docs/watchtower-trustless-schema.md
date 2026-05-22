@@ -41,9 +41,7 @@ with shell access to the WT process can `sqlite3 lsp.db ".dump"` and
 extract all secrets. The WT having READ access today implicitly trusts
 the WT host with everything the LSP holds.
 
-This violates the design principle stated in `docs/pseudo-spilman.md`:
-the WT exists to broadcast pre-signed response TXs on observation, not
-to hold key material.
+This violates the canonical WT design principle (described in the Pseudo-Spilman explainer at [superscalar.win](https://superscalar.win)): the WT exists to broadcast pre-signed response TXs on observation, not to hold key material.
 
 ## The trustless model
 
@@ -327,7 +325,7 @@ target.
 
 ## References
 
-- `docs/pseudo-spilman.md` §watchtower — original design intent
+- Pseudo-Spilman §watchtower at [superscalar.win](https://superscalar.win) — original design intent
 - `docs/mainnet-runbook.md` §10 #6 — runbook gate item
 - Issue #289 §6 — mainnet-key-architecture umbrella
 - `src/persist.c:179, 317, 321, 1271` — current secret-bearing columns

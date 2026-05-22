@@ -448,7 +448,7 @@ python3 tools/manual_tests.py help
 | `turnover` | --test-turnover: PTLC key turnover for all clients |
 | `breach` | --breach-test: broadcast revoked commitment + watchtower |
 | `arity1` | --arity 1: per-client leaves, legacy DW (200k funding) |
-| `arity3` | --arity 3: Pseudo-Spilman canonical (chained TXs, default per `docs/factory-arity.md`) |
+| `arity3` | --arity 3: Pseudo-Spilman canonical (chained TXs, default; design at [superscalar.win](https://superscalar.win)) |
 | `mixed_2_4_8` | --arity 2,4,8: TRUE N-way mixed-arity (Phase 2 of mixed-arity initiative) |
 | `static_near_root` | --static-near-root N: kickoff-only nodes at N near-root depths (Phase 3) |
 | `1client` | 1-client factory creation (no payment targets) |
