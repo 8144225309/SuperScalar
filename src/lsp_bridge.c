@@ -206,11 +206,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
         /* Add HTLC to destination's channel (offered from LSP).
-           Uses fwd_cltv_expiry (bound-checked + safety-delta-subtracted)
-           so the destination commitment carries the correct expiry. */
+           cltv_expiry is checked above against the factory horizon
+           but passed raw here so LSP and client both sign the commitment with the
+           same cltv (delta-subtracting LSP-side only would diverge sighashes
+           and break partial_sig_verify — caught by #310 CI regtest_bridge tests). */
         uint64_t dest_htlc_id;
         if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
-                               payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
+                               payment_hash, cltv_expiry, &dest_htlc_id)) {
             cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
                 "insufficient_funds", htlc_id);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
