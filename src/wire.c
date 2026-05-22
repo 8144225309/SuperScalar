@@ -1799,19 +1799,28 @@ cJSON *wire_build_leaf_advance_propose(int leaf_side,
                                         const unsigned char *poison_pubnonce66) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
-    wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
+    /* Phase 1c: in --musig-stateless mode the LSP ships PROPOSE with no
+       nonce field (the client goes first). state_pubnonce66 = NULL is the
+       sentinel for that mode; legacy callers always pass a 66-byte pointer. */
+    if (state_pubnonce66)
+        wire_json_add_hex(j, "pubnonce", state_pubnonce66, 66);
     if (poison_pubnonce66)
         wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce66, 66);
     return j;
 }
 
-/* Returns: 0 on failure, 1 = state pubnonce parsed, 2 = state + poison parsed. */
+/* Returns: 0 on failure, 1 = state pubnonce parsed, 2 = state + poison parsed,
+   3 = stateless mode (no pubnonce field present, leaf_side parsed). */
 int wire_parse_leaf_advance_propose(const cJSON *json, int *leaf_side,
                                       unsigned char *state_pubnonce66,
                                       unsigned char *poison_pubnonce66) {
     cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
     if (!ls || !cJSON_IsNumber(ls)) return 0;
     *leaf_side = (int)ls->valuedouble;
+    /* Phase 1c: stateless-mode PROPOSE omits the pubnonce field entirely.
+       Detect that case and signal to the caller via rc=3. */
+    if (!cJSON_GetObjectItem(json, "pubnonce"))
+        return 3;
     if (wire_json_get_hex(json, "pubnonce", state_pubnonce66, 66) != 66) return 0;
     if (poison_pubnonce66 &&
         wire_json_get_hex(json, "poison_pubnonce", poison_pubnonce66, 66) == 66)

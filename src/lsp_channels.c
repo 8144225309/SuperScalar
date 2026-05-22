@@ -1559,6 +1559,322 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
+
+/* --- Phase 1c (#271): MuSig2 stateless-signer per-leaf advance ---
+
+   Reversed-order flow per .claude/MUSIG_NONCE_REDESIGN_MEMO sec 3.1.  The
+   LSP MUST NOT hold a secnonce across any wire recv-wait -- invariant
+   that motivates the whole redesign.
+
+   Wire round-trip (gated by SS_MUSIG_STATELESS):
+     LSP   -> Client : MSG_LEAF_ADVANCE_PROPOSE   {leaf_side}   (no nonce)
+     Client -> LSP   : MSG_LEAF_ADVANCE_CLIENT_PUBNONCE {client_pubnonce}
+     LSP   -> Client : MSG_LEAF_ADVANCE_LSP_RESPONSE {lsp_pubnonce, lsp_psig}
+                       ^-- LSP atomically: gen nonce, set both nonces,
+                           finalize, create_partial_sig (zeroes secnonce),
+                           reply.  No suspension between gen and zero.
+     Client -> LSP   : MSG_LEAF_ADVANCE_FINAL {final_sig64}
+                       ^-- client locally aggregates psigs into the
+                           64-byte Schnorr sig and ships it for the LSP
+                           to attach to the unsigned tx.
+
+   Scope (Phase 1c MVP):
+     - STATE TX only.  Poison TX is NOT signed in the new flow -- the
+       atomic generate+sign here would require a second independent
+       secnonce, doubling the surface.  TODO(Phase 1d/2): re-introduce
+       poison TX via a second MSG_LEAF_ADVANCE_LSP_RESPONSE round or a
+       parallel atomic sub-ceremony.
+     - Watchtower registration is skipped here too (legacy path keeps
+       it).  TODO(Phase 2): re-enable once we decide whether to register
+       with a NULL poison TX or run the legacy poison sub-ceremony.
+     - Other ceremonies (Tier B, sub-factory, factory creation) defer
+       to later phases per the audit's blast-radius ordering.
+
+   When SS_MUSIG_STATELESS is unset the caller takes the legacy path
+   instead and this function is unreachable. */
+static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        int leaf_side) {
+    factory_t *f = &lsp->factory;
+
+    if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    /* PS k>=2: same refusal as legacy path (see lsp_advance_leaf header). */
+    if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity >= 2) {
+        fprintf(stderr,
+                "lsp_advance_leaf_stateless: refused -- k=%u sub-factory PS has "
+                "no leaf-level dynamic operation.\n",
+                f->ps_subfactory_arity);
+        return 0;
+    }
+
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id */ 0,
+                                           (uint32_t)f->leaf_node_indices[leaf_side],
+                                           "leaf_advance_stateless",
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
+    /* Step 1: advance leaf state to rebuild the unsigned TX. */
+    int rc = factory_advance_leaf_unsigned(f, leaf_side);
+    if (rc == 0) {
+        fprintf(stderr, "LSP-stateless: leaf %d advance exhausted\n", leaf_side);
+        return 0;
+    }
+    if (rc == -1) {
+        /* Root rollover triggers Tier B -- defer to legacy until that
+           ceremony is reversed (Phase 2). */
+        printf("LSP-stateless: leaf %d exhausted, root advanced -- "
+               "falling back to legacy Tier B state-advance ceremony\n",
+               leaf_side);
+        return lsp_run_state_advance(mgr, lsp, leaf_side);
+    }
+
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    uint32_t client_participant = (uint32_t)(leaf_side + 1);
+
+    /* Step 2: ship PROPOSE with NO nonce -- client goes first. */
+    cJSON *propose = wire_build_leaf_advance_propose(leaf_side, NULL, NULL);
+    if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_PROPOSE, propose)) {
+        cJSON_Delete(propose);
+        fprintf(stderr, "LSP-stateless: send PROPOSE failed\n");
+        return 0;
+    }
+    cJSON_Delete(propose);
+
+    /* Step 3: wait for client_pubnonce. */
+    wire_msg_t cpn_msg;
+    int rrc = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side],
+                                             &cpn_msg, WIRE_CEREMONY_RECV_TIMEOUT_SEC);
+    if (!rrc || cpn_msg.msg_type != MSG_LEAF_ADVANCE_CLIENT_PUBNONCE) {
+        const char *why = !rrc ? "recv timeout / peer EOF" : "wrong message type";
+        fprintf(stderr,
+                "LSP-stateless: expected CLIENT_PUBNONCE from client %d, got 0x%02x (%s)\n",
+                leaf_side, cpn_msg.msg_type, why);
+        if (cpn_msg.json) cJSON_Delete(cpn_msg.json);
+        return 0;
+    }
+    unsigned char client_pubnonce_ser[66];
+    int prc = wire_parse_leaf_advance_client_pubnonce(cpn_msg.json,
+                                                         client_pubnonce_ser);
+    cJSON_Delete(cpn_msg.json);
+    if (!prc) {
+        fprintf(stderr, "LSP-stateless: parse CLIENT_PUBNONCE failed\n");
+        return 0;
+    }
+
+    /* Step 4: init session (state only, no poison). */
+    if (!factory_session_init_node(f, node_idx)) {
+        fprintf(stderr, "LSP-stateless: state session init failed for node %zu\n", node_idx);
+        return 0;
+    }
+
+    /* Step 5: set client's pubnonce into the session. */
+    int client_slot = factory_find_signer_slot(f, node_idx, client_participant);
+    int lsp_slot = factory_find_signer_slot(f, node_idx, 0);
+    if (client_slot < 0 || lsp_slot < 0) {
+        fprintf(stderr, "LSP-stateless: signer slot lookup failed (client=%d, lsp=%d)\n",
+                client_slot, lsp_slot);
+        return 0;
+    }
+    secp256k1_musig_pubnonce client_pubnonce;
+    if (!musig_pubnonce_parse(lsp->ctx, &client_pubnonce, client_pubnonce_ser)) {
+        fprintf(stderr, "LSP-stateless: parse client pubnonce failed\n");
+        return 0;
+    }
+    if (!factory_session_set_nonce(f, node_idx, (size_t)client_slot, &client_pubnonce)) {
+        fprintf(stderr, "LSP-stateless: set client nonce failed\n");
+        return 0;
+    }
+
+    /* Step 6 (THE CRITICAL ATOMIC BLOCK):
+       Generate LSP secnonce + pubnonce, install it, finalize the session,
+       create the partial sig (which zeroes our secnonce), and serialize
+       the response.  No wire recv between nonce gen and zeroing. */
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
+        fprintf(stderr, "LSP-stateless: keypair_sec failed\n");
+        return 0;
+    }
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
+                                lsp_seckey, &lsp->lsp_pubkey,
+                                &f->nodes[node_idx].keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless: LSP nonce gen failed\n");
+        return 0;
+    }
+    if (!factory_session_set_nonce(f, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless: set LSP nonce failed\n");
+        return 0;
+    }
+    if (!factory_session_finalize_node(f, node_idx)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless: finalize_node failed\n");
+        return 0;
+    }
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless: keypair_create failed\n");
+        return 0;
+    }
+    memset(lsp_seckey, 0, 32);
+
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
+                                    &f->nodes[node_idx].signing_session)) {
+        fprintf(stderr, "LSP-stateless: create_partial_sig failed\n");
+        return 0;
+    }
+    /* lsp_secnonce has been zeroed by musig_create_partial_sig.
+       INVARIANT: from this point on we no longer hold any LSP secnonce.
+       The wire recv that follows is safe. */
+
+    unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
+    musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+    musig_partial_sig_serialize(lsp->ctx, lsp_psig_ser, &lsp_psig);
+
+    /* Also stash our psig into the session so we can verify the final
+       aggregated sig matches (and for future Phase-2 re-aggregation). */
+    if (!factory_session_set_partial_sig(f, node_idx, (size_t)lsp_slot, &lsp_psig)) {
+        fprintf(stderr, "LSP-stateless: set LSP partial_sig failed\n");
+        return 0;
+    }
+
+    /* Step 7: ship LSP_RESPONSE. */
+    cJSON *response = wire_build_leaf_advance_lsp_response(lsp_pubnonce_ser,
+                                                             lsp_psig_ser);
+    if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_LSP_RESPONSE, response)) {
+        cJSON_Delete(response);
+        fprintf(stderr, "LSP-stateless: send LSP_RESPONSE failed\n");
+        return 0;
+    }
+    cJSON_Delete(response);
+
+    /* Step 8: wait for FINAL with the 64-byte aggregated sig. */
+    wire_msg_t fin_msg;
+    int frc = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side],
+                                             &fin_msg, WIRE_CEREMONY_RECV_TIMEOUT_SEC);
+    if (!frc || fin_msg.msg_type != MSG_LEAF_ADVANCE_FINAL) {
+        const char *why = !frc ? "recv timeout / peer EOF" : "wrong message type";
+        fprintf(stderr,
+                "LSP-stateless: expected FINAL from client %d, got 0x%02x (%s)\n",
+                leaf_side, fin_msg.msg_type, why);
+        if (fin_msg.json) cJSON_Delete(fin_msg.json);
+        return 0;
+    }
+    unsigned char final_sig[64];
+    int frc2 = wire_parse_leaf_advance_final(fin_msg.json, final_sig);
+    cJSON_Delete(fin_msg.json);
+    if (!frc2) {
+        fprintf(stderr, "LSP-stateless: parse FINAL failed\n");
+        return 0;
+    }
+
+    /* Step 9: verify the final sig against the session's keyagg+sighash
+       and (on success) attach it as the node's signed_tx.  The session's
+       cache is the tweaked keyagg (factory_session_finalize_node applied
+       the taproot xonly tweak), so musig_pubkey_get returns the output
+       (tweaked) aggregated pubkey.  Convert to xonly for schnorrsig_verify. */
+    factory_node_t *node = &f->nodes[node_idx];
+    secp256k1_pubkey output_pk;
+    if (!secp256k1_musig_pubkey_get(lsp->ctx, &output_pk,
+                                       &node->signing_session.cache)) {
+        fprintf(stderr, "LSP-stateless: pubkey_get from cache failed\n");
+        return 0;
+    }
+    secp256k1_xonly_pubkey output_xpub;
+    if (!secp256k1_xonly_pubkey_from_pubkey(lsp->ctx, &output_xpub, NULL,
+                                              &output_pk)) {
+        fprintf(stderr, "LSP-stateless: xonly_from_pubkey failed\n");
+        return 0;
+    }
+    if (!secp256k1_schnorrsig_verify(lsp->ctx, final_sig,
+                                       node->signing_session.msg32, 32,
+                                       &output_xpub)) {
+        fprintf(stderr, "LSP-stateless: schnorr verify of FINAL sig failed\n");
+        return 0;
+    }
+    if (!finalize_signed_tx(&node->signed_tx,
+                              node->unsigned_tx.data, node->unsigned_tx.len,
+                              final_sig)) {
+        fprintf(stderr, "LSP-stateless: finalize_signed_tx failed\n");
+        return 0;
+    }
+    node->is_signed = 1;
+
+    /* TODO(Phase 1d/2): poison TX ceremony.  In the legacy path we run
+       a parallel MuSig2 ceremony over the OLD state's L-stock distribution
+       so the watchtower can burn-redistribute on breach.  The reversed
+       flow needs an analogous round (or a second LSP_RESPONSE message
+       carrying lsp_poison_pubnonce + lsp_poison_psig). */
+
+    /* TODO(Phase 2): watchtower_watch_factory_node_with_channels.  Skipped
+       in MVP because the new flow has no poison TX yet -- degrading would
+       broadcast SECURITY-GAP warnings on every advance.  Once poison is
+       wired, re-enable the watchtower registration to mirror the legacy
+       path's Step 9 block. */
+
+    /* Step 10: notify everyone leaf advance done. */
+    cJSON *done = wire_build_leaf_advance_done(leaf_side);
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        wire_send(lsp->client_fds[i], MSG_LEAF_ADVANCE_DONE, done);
+    }
+    cJSON_Delete(done);
+
+    /* Step 11: persist leaf state (same shape as legacy path). */
+    if (mgr->persist) {
+        if (node->is_ps_leaf) {
+            extern void reverse_bytes(unsigned char *, size_t);
+            unsigned char txid_display[32];
+            memcpy(txid_display, node->txid, 32);
+            reverse_bytes(txid_display, 32);
+            persist_save_ps_chain_entry(
+                (persist_t *)mgr->persist, 0,
+                (uint32_t)node_idx,
+                node->ps_chain_len - 1,
+                f->counter.current_epoch,
+                txid_display,
+                node->signed_tx.data, node->signed_tx.len,
+                node->outputs[0].amount_sats,
+                /* poison_tx */ NULL, 0);
+        } else {
+            uint32_t leaf_states[8];
+            for (int i = 0; i < f->n_leaf_nodes; i++)
+                leaf_states[i] = f->leaf_layers[i].current_state;
+            uint32_t layer_states[DW_MAX_LAYERS];
+            for (uint32_t i = 0; i < f->counter.n_layers; i++)
+                layer_states[i] = f->counter.layers[i].config.max_states;
+            persist_save_dw_counter_with_leaves(
+                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                f->counter.n_layers, layer_states,
+                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        }
+    }
+
+    if (node->is_ps_leaf)
+        printf("LSP-stateless: PS leaf %d advanced (node %zu), chain_len %d\n",
+               leaf_side, node_idx, node->ps_chain_len);
+    else
+        printf("LSP-stateless: DW leaf %d advanced (node %zu), DW state %u\n",
+               leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
+
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist, c3_round_id,
+                                          (uint32_t)f->n_participants,
+                                          (uint32_t)f->n_participants,
+                                          "success", NULL, NULL);
+    }
+    return 1;
+}
+
 /* --- Per-leaf advance (arity-1 DW and arity-PS chained-TX, split-round signing) --- */
 
 /* Advance one leaf, do split-round 2-of-2 signing with the affected client,
@@ -1588,6 +1904,14 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
                 "Per docs/ps-subfactories.md spec Phase 2.\n",
                 f->ps_subfactory_arity);
         return 0;
+    }
+
+    /* Phase 1c (#271): when --musig-stateless is in effect, dispatch to the
+       reversed-order flow.  Legacy path below is untouched. */
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        if (stateless && stateless[0] == '1')
+            return lsp_advance_leaf_stateless(mgr, lsp, leaf_side);
     }
 
     /* C3 (Tier 1): journal the ceremony at start; success-update at the
