@@ -202,10 +202,11 @@ echo "=== Final result ==="
 # Earlier criterion only checked watchtower_check() which misses the case
 # where detection fires in the main loop before the scaffold's explicit
 # check.
-BREACH_DETECTED=$(grep -cE "FACTORY BREACH on node|CL2 CHEAT-REALLOC: BREACH DETECTED" "$LSP_LOG" 2>/dev/null || echo 0)
-BREACH_DETECTED="${BREACH_DETECTED:-0}"
-POISON_BROADCAST=$(grep -cE "L-stock burn tx broadcast|poison TX broadcast|penalty.*broadcast" "$LSP_LOG" 2>/dev/null || echo 0)
-POISON_BROADCAST="${POISON_BROADCAST:-0}"
+# Use `grep | wc -l` to guarantee a single integer (grep -c with || echo can
+# yield a "0\n0" two-line value that breaks the integer comparison below;
+# the wc-l form is bullet-proof regardless of grep's stderr/exit behavior).
+BREACH_DETECTED=$(grep -E "FACTORY BREACH on node|CL2 CHEAT-REALLOC: BREACH DETECTED" "$LSP_LOG" 2>/dev/null | wc -l)
+POISON_BROADCAST=$(grep -E "L-stock burn tx broadcast|poison TX broadcast|penalty.*broadcast" "$LSP_LOG" 2>/dev/null | wc -l)
 
 if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
     echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + broadcast poison (x$POISON_BROADCAST)"
