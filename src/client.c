@@ -3393,10 +3393,261 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+
+/* --- Phase 1c (#271): MuSig2 stateless-signer client-side handler ---
+
+   Mirrors lsp_advance_leaf_stateless in src/lsp_channels.c.  The client
+   goes FIRST with its pubnonce; the LSP atomically generates its nonce
+   + signs and replies with both lsp_pubnonce + lsp_psig in one message;
+   the client then aggregates locally and ships the 64-byte final sig.
+
+   Scope: state TX only.  Poison TX deferred (TODO).  See the LSP-side
+   header for the full rationale. */
+static int client_handle_leaf_advance_stateless(int fd,
+                                                  secp256k1_context *ctx,
+                                                  const secp256k1_keypair *keypair,
+                                                  factory_t *factory,
+                                                  uint32_t my_index,
+                                                  const wire_msg_t *propose_msg) {
+    persist_t *persist = g_client_persist;
+    int leaf_side;
+    /* Parse PROPOSE.  In stateless mode the parser returns 3 (no pubnonce
+       field).  We accept that one return value; everything else is an
+       error (we shouldn't be in this function if the LSP is sending the
+       legacy shape). */
+    unsigned char throwaway_pn[66], throwaway_poison_pn[66];
+    int propose_rc = wire_parse_leaf_advance_propose(propose_msg->json,
+                                                       &leaf_side,
+                                                       throwaway_pn,
+                                                       throwaway_poison_pn);
+    if (propose_rc != 3) {
+        fprintf(stderr,
+                "Client-stateless %u: PROPOSE not in stateless shape (rc=%d) "
+                "-- refusing.  Set SS_MUSIG_STATELESS on both ends or unset on both.\n",
+                my_index, propose_rc);
+        return 0;
+    }
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) {
+        fprintf(stderr, "Client-stateless %u: bad leaf_side %d\n", my_index, leaf_side);
+        return 0;
+    }
+
+    size_t node_idx = factory->leaf_node_indices[leaf_side];
+    factory_node_t *ps_node = &factory->nodes[node_idx];
+
+    /* Step 1: advance local state to mirror the LSP. */
+    int rc = factory_advance_leaf_unsigned(factory, leaf_side);
+    if (rc <= 0) {
+        fprintf(stderr, "Client-stateless %u: leaf %d advance_unsigned failed (rc=%d)\n",
+                my_index, leaf_side, rc);
+        return 0;
+    }
+
+    /* PS double-spend defense -- same as legacy path. */
+    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
+        unsigned char prev_sighash[32];
+        int already = persist_check_ps_signed_input(
+            persist, /* factory_id = */ 0,
+            ps_node->ps_prev_txid, /* parent_vout = */ 0,
+            prev_sighash);
+        if (already) {
+            char hex[65];
+            for (int i = 0; i < 32; i++)
+                snprintf(hex + 2 * i, 3, "%02x", ps_node->ps_prev_txid[i]);
+            fprintf(stderr,
+                    "Client-stateless %u: REFUSING PS double-spend -- already signed "
+                    "a TX spending (%s:0).\n", my_index, hex);
+            return 0;
+        }
+    }
+
+    if (!factory_session_init_node(factory, node_idx)) {
+        fprintf(stderr, "Client-stateless %u: session_init failed\n", my_index);
+        return 0;
+    }
+
+    int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
+    int lsp_slot = factory_find_signer_slot(factory, node_idx, 0);
+    if (my_slot < 0 || lsp_slot < 0) {
+        fprintf(stderr, "Client-stateless %u: signer slot lookup failed (my=%d lsp=%d)\n",
+                my_index, my_slot, lsp_slot);
+        return 0;
+    }
+
+    /* Step 2: generate own nonce and ship MSG_LEAF_ADVANCE_CLIENT_PUBNONCE.
+       Client secnonce lives on stack across the LSP_RESPONSE recv -- this
+       is OK because Option G targets specifically the LSP's secnonce
+       lifetime (LSP is the high-value, persistent, multi-tenant party).
+       Client-side secnonce already exists on stack in the legacy flow too. */
+    unsigned char my_seckey[32];
+    secp256k1_pubkey my_pubkey;
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        fprintf(stderr, "Client-stateless %u: keypair_sec failed\n", my_index);
+        return 0;
+    }
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    secp256k1_musig_secnonce my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+                                my_seckey, &my_pubkey,
+                                &factory->nodes[node_idx].keyagg.cache)) {
+        memset(my_seckey, 0, 32);
+        fprintf(stderr, "Client-stateless %u: nonce gen failed\n", my_index);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+    if (!factory_session_set_nonce(factory, node_idx, (size_t)my_slot, &my_pubnonce)) {
+        fprintf(stderr, "Client-stateless %u: set own nonce failed\n", my_index);
+        return 0;
+    }
+
+    unsigned char my_pubnonce_ser[66];
+    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
+    cJSON *cpn_json = wire_build_leaf_advance_client_pubnonce(my_pubnonce_ser);
+    if (!wire_send(fd, MSG_LEAF_ADVANCE_CLIENT_PUBNONCE, cpn_json)) {
+        cJSON_Delete(cpn_json);
+        fprintf(stderr, "Client-stateless %u: send CLIENT_PUBNONCE failed\n", my_index);
+        return 0;
+    }
+    cJSON_Delete(cpn_json);
+
+    /* Step 3: wait for LSP_RESPONSE with lsp_pubnonce + lsp_psig. */
+    wire_msg_t lr_msg;
+    if (!wire_recv(fd, &lr_msg) || lr_msg.msg_type != MSG_LEAF_ADVANCE_LSP_RESPONSE) {
+        fprintf(stderr, "Client-stateless %u: expected LSP_RESPONSE, got 0x%02x\n",
+                my_index, lr_msg.json ? lr_msg.msg_type : 0);
+        if (lr_msg.json) cJSON_Delete(lr_msg.json);
+        return 0;
+    }
+    unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
+    int lrrc = wire_parse_leaf_advance_lsp_response(lr_msg.json,
+                                                       lsp_pubnonce_ser,
+                                                       lsp_psig_ser);
+    cJSON_Delete(lr_msg.json);
+    if (!lrrc) {
+        fprintf(stderr, "Client-stateless %u: parse LSP_RESPONSE failed\n", my_index);
+        return 0;
+    }
+
+    /* Step 4: set LSP nonce, finalize session. */
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser)) {
+        fprintf(stderr, "Client-stateless %u: parse LSP pubnonce failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_set_nonce(factory, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
+        fprintf(stderr, "Client-stateless %u: set LSP nonce failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_finalize_node(factory, node_idx)) {
+        fprintf(stderr, "Client-stateless %u: finalize_node failed\n", my_index);
+        return 0;
+    }
+
+    /* Step 5: create own partial_sig (zeroes own secnonce). */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+                                    &factory->nodes[node_idx].signing_session)) {
+        fprintf(stderr, "Client-stateless %u: create_partial_sig failed\n", my_index);
+        return 0;
+    }
+
+    /* Step 6: parse LSP's psig and set both psigs into the session. */
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_partial_sig_parse(ctx, &lsp_psig, lsp_psig_ser)) {
+        fprintf(stderr, "Client-stateless %u: parse LSP psig failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_set_partial_sig(factory, node_idx, (size_t)my_slot, &my_psig)) {
+        fprintf(stderr, "Client-stateless %u: set own partial_sig failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_set_partial_sig(factory, node_idx, (size_t)lsp_slot, &lsp_psig)) {
+        fprintf(stderr, "Client-stateless %u: set LSP partial_sig failed\n", my_index);
+        return 0;
+    }
+
+    /* PS defense: record what we just signed BEFORE shipping FINAL.  A
+       crash after record + before send is safe -- a retry sees the row
+       and refuses.  Same shape as legacy path. */
+    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
+        unsigned char sighash[32];
+        if (compute_taproot_sighash(sighash,
+                ps_node->unsigned_tx.data, ps_node->unsigned_tx.len, 0,
+                ps_node->outputs[0].script_pubkey,
+                ps_node->outputs[0].script_pubkey_len,
+                ps_node->ps_prev_chan_amount, ps_node->nsequence)) {
+            unsigned char psig_buf[36];
+            unsigned char my_psig_ser[32];
+            musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+            memset(psig_buf, 0, 36);
+            memcpy(psig_buf, my_psig_ser, 32);
+            persist_save_ps_signed_input(persist, /* factory_id = */ 0,
+                (int)node_idx, ps_node->ps_prev_txid, 0,
+                sighash, psig_buf);
+        }
+    }
+
+    /* Step 7: complete_node aggregates both psigs + attaches the signed
+       witness, populating node->signed_tx.  This is the same call the
+       legacy path uses for its local copy. */
+    if (!factory_session_complete_node(factory, node_idx)) {
+        fprintf(stderr, "Client-stateless %u: complete_node failed\n", my_index);
+        return 0;
+    }
+
+    /* Extract the 64-byte aggregated sig so we can ship it to the LSP.
+       The LSP needs the bare 64 bytes (not the segwit witness), so we
+       re-aggregate explicitly from the session's slot-indexed
+       partial_sigs buffer.  node->partial_sigs[0..n_signers-1] are set
+       by factory_session_set_partial_sig in slot order. */
+    factory_node_t *node = &factory->nodes[node_idx];
+    unsigned char final_sig[64];
+    if (!musig_aggregate_partial_sigs(ctx, final_sig,
+                                        &node->signing_session,
+                                        node->partial_sigs, node->n_signers)) {
+        fprintf(stderr, "Client-stateless %u: aggregate_partial_sigs failed\n", my_index);
+        return 0;
+    }
+
+    /* Step 8: ship FINAL. */
+    cJSON *fin_json = wire_build_leaf_advance_final(final_sig);
+    if (!wire_send(fd, MSG_LEAF_ADVANCE_FINAL, fin_json)) {
+        cJSON_Delete(fin_json);
+        fprintf(stderr, "Client-stateless %u: send FINAL failed\n", my_index);
+        return 0;
+    }
+    cJSON_Delete(fin_json);
+
+    /* Step 9: wait for LEAF_ADVANCE_DONE (LSP's broadcast). */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_ADVANCE_DONE) {
+        fprintf(stderr, "Client-stateless %u: expected LEAF_ADVANCE_DONE, got 0x%02x\n",
+                my_index, done_msg.json ? done_msg.msg_type : 0);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        return 0;
+    }
+    if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    printf("Client-stateless %u: leaf %d advance complete\n", my_index, leaf_side);
+    return 1;
+}
+
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory, uint32_t my_index,
                                  const wire_msg_t *propose_msg) {
+    /* Phase 1c (#271): when --musig-stateless is in effect, dispatch to the
+       reversed-order flow.  Legacy path below is untouched. */
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        if (stateless && stateless[0] == '1')
+            return client_handle_leaf_advance_stateless(fd, ctx, keypair,
+                                                          factory, my_index,
+                                                          propose_msg);
+    }
+
     persist_t *persist = g_client_persist;
     int leaf_side;
     unsigned char lsp_pubnonce_ser[66], lsp_poison_pn_ser[66];

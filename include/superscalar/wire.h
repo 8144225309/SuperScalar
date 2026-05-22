@@ -693,13 +693,22 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 
-/* LSP -> Client: LEAF_ADVANCE_PROPOSE {leaf_side, pubnonce, [poison_pubnonce]}.
+/* LSP -> Client: LEAF_ADVANCE_PROPOSE {leaf_side, [pubnonce], [poison_pubnonce]}.
    poison_pubnonce is OPTIONAL on the wire — when present it accompanies
    the state pubnonce so the client can run two MuSig2 ceremonies in
    lockstep (closes Wire-Ceremony Gap A for leaf advance: poison TX
    defense in multi-process LSPs).  Pass `poison_pubnonce66 = NULL` to
-   either build or parse to skip the second nonce.  Parse return value:
-   0 = failure, 1 = state only, 2 = state + poison both parsed. */
+   either build or parse to skip the second nonce.
+
+   Phase 1c (--musig-stateless): passing state_pubnonce66 = NULL to the
+   builder omits the pubnonce field entirely; the parser then returns 3
+   to signal stateless mode (client goes first, LSP_RESPONSE later
+   carries lsp_pubnonce + lsp_psig).  Legacy callers always pass a real
+   66-byte pointer.
+
+   Parse return value:
+   0 = failure, 1 = state only, 2 = state + poison both parsed,
+   3 = stateless (no pubnonce field, leaf_side parsed). */
 cJSON *wire_build_leaf_advance_propose(int leaf_side,
                                         const unsigned char *state_pubnonce66,
                                         const unsigned char *poison_pubnonce66);
