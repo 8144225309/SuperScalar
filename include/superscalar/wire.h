@@ -142,6 +142,15 @@
    surface based on reason. */
 #define MSG_CEREMONY_ABORT      0x79
 
+/* MuSig2 stateless redesign Phase 1b (#271 / MUSIG_NONCE_REDESIGN_MEMO §3.1).
+   Reversed per-leaf-advance round 2 flow.  Sent only when both peers have
+   negotiated --musig-stateless support (Phase 1a flag).  The legacy
+   PROPOSE -> PSIG -> DONE path (opcodes 0x58/0x59/0x5A) continues to
+   work for non-stateless peers. */
+#define MSG_LEAF_ADVANCE_CLIENT_PUBNONCE  0x7A  /* Client -> LSP: client_pubnonce only (no psig yet) */
+#define MSG_LEAF_ADVANCE_LSP_RESPONSE     0x7B  /* LSP -> Client: lsp_pubnonce + lsp_psig (atomic generate + sign on LSP) */
+#define MSG_LEAF_ADVANCE_FINAL            0x7C  /* Client -> LSP: final aggregated sig (optional confirmation for LSP records) */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -430,6 +439,21 @@ int wire_parse_ceremony_abort(const cJSON *json,
                                 unsigned char ceremony_id[8],
                                 unsigned char *out_reason,
                                 char **out_reason_text);
+
+/* Phase 1b per MUSIG_NONCE_REDESIGN_MEMO §3.1 stateless-signer flow. */
+cJSON *wire_build_leaf_advance_client_pubnonce(const unsigned char client_pubnonce[66]);
+int    wire_parse_leaf_advance_client_pubnonce(const cJSON *json,
+                                                  unsigned char out_client_pubnonce[66]);
+
+cJSON *wire_build_leaf_advance_lsp_response(const unsigned char lsp_pubnonce[66],
+                                              const unsigned char lsp_psig[32]);
+int    wire_parse_leaf_advance_lsp_response(const cJSON *json,
+                                              unsigned char out_lsp_pubnonce[66],
+                                              unsigned char out_lsp_psig[32]);
+
+cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64]);
+int    wire_parse_leaf_advance_final(const cJSON *json,
+                                       unsigned char out_final_sig[64]);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
