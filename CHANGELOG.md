@@ -4,6 +4,23 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+Major work merged since v0.1.13.  Roughly 220+ PRs (#88–#309).  Covers: PS k² sub-factories, full canonical mixed-arity + static-near-root, scale to N=128, all-four-paths wire-ceremony poison TX, Tier B multi-leaf state-advance ceremony, reorg correctness audit (R1–R6 mainnet pre-flight), schema migrations v22→v36, PTLC infrastructure (turnover ceremony journal, watchtower feed, security gating, production threading), cheat-engine campaign (CL1–CL7), ceremony crash-injection (API helpers + finalization guard + crash-checkpoints), dashboard buildout (12 tabs incl. Live Monitor, Defense Status, Payments, Ceremonies, TX Inventory, Outcomes, per-POV scoping), trustless watchtower schema design + Phase 1a, native Prometheus exporter, mainnet operator runbook, CLN bridge bLIP-56 skeleton (then split to external `superscalar-cln` repo), BIP-158 light-client end-to-end, splice wire-codec marked stub, and ~70 bug fixes.
+
+### v0.1.14 audit phase 2 + 3 tests (PRs #88–#101)
+
+End-to-end test coverage of the previously untested matrix cells:
+
+- HTLC + force-to_local accounting across all 3 arities (PR #89)
+- HTLC + breach penalty across all 3 arities (PR #90)
+- PS chain-advance sweep with accounting at `chain_len=2` and `chain_len=5` (PR #91)
+- JIT recovery close — coop + force-close with full accounting (PR #92)
+- Hybrid CLN — payment across SuperScalar/CLN boundary (PR #93)
+- Mixed-arity 2,4,8 full lifecycle with sweep + accounting (PR #94)
+- PS factory build/sign/verify at N=128 (PR #95)
+- PS at N=8/16/32 on regtest with full per-party accounting (PRs #97, #98)
+- Multi-process MuSig coordination at N=8 on regtest (PR #100)
+- Signet setup parameterized by `N_CLIENTS` + `ARITY` (PR #99)
+
 ### Mixed-Arity Interior + Static-Near-Root (canonical SuperScalar design)
 
 The factory builder now implements zmn's full canonical SuperScalar design:
@@ -110,6 +127,266 @@ Tested at full severity:
   `test_factory_ps_build_n128` exercises the 128-way MuSig aggregation at the
   root + every per-node MuSig ceremony in the resulting 506-node tree (depth 7,
   8 DW layers — exactly `DW_MAX_LAYERS`). Phase 2 #7.
+
+### N=64 scale pack (PRs #109, #112, #114, #115, #116, #117, #118)
+
+Six production bugs from the canonical mixed-arity campaign at N=64:
+
+- LSP requires `slot_hints` on non-regtest to prevent fund-loss (PR #114)
+- Mixed-arity + static-near-root preserved through factory ceremony (PR #115)
+- `lsp_channels` walks leaves for mixed-arity `client_to_leaf` (PR #117)
+- `factory_client_to_leaf` extracted as canonical helper (PR #118)
+- Subtree compaction when `build_subtree` returns empty children (PR #111)
+- Bridge HTLC at N=64 mixed-arity `{2,4,8}` + `static_threshold=1` (PR #116)
+- N=64 mixed-arity force-close + DW-advance regtests (PR #112)
+- PS leaves are 1-client-per-leaf, not 2 (PR #119)
+
+### PS k² sub-factories (zmn t/1242 canonical leaf shape)
+
+Full implementation of Pseudo-Spilman k² sub-factories — k clients per sub-factory, k sub-factories per leaf, k² clients per leaf. Selected via `--ps-subfactory-arity K`:
+
+- Phase 1 foundation (PR #124)
+- Phase 2: chain extension primitive (PR #125)
+- Phase 2b: wire ceremony (PR #126)
+- Phase 2c: multi-process regtest (PR #127)
+- Phase 3: on-chain force-close at k=2 (PR #128)
+- Phase 3b: per-client channel sweep (PR #129)
+- Phase 4a: persist (PR #130)
+- Phase 4b: watchtower coverage (PR #132)
+- Phase 4c: persist load on LSP restart (PR #131)
+- Phase 5: signet campaign infra (PR #133)
+- Gap A followup: poison TX builder + watchtower wiring (PR #134)
+- Multi-input MuSig ceremony for sub-factory chain advance (PR #270, #142 SF-A)
+- Multi-input tx_builder + sighash + witness primitives (PRs #146, #147, #148)
+- Multi-input wire helpers (PR #150)
+- Force-close persist chain[0] + broadcast PS chain history — **CRITICAL** (PR #144)
+- Sub-factory chain reset on reorg (PR #208)
+- Distribution TX marked stale after sub-factory advance (PR #232)
+- Height-aware sub-factory chain reset on reorg (schema v33, PR #230)
+
+### Wire-ceremony poison TX — all 4 paths closed (SECURITY GAP closure)
+
+Multi-process LSPs now produce a fully-signed L-stock / sales-stock poison TX via a second MuSig2 round bundled with every state advance. Closes the security gap where the watchtower received an unsigned-stub poison TX on multi-process deployments:
+
+- Canonical L-stock SPK + per-client poison TX per zmn t/1242 (PR #121)
+- Sub-factory advance path (PR #136)
+- Leaf advance path (DW + PS leaves) (PR #137)
+- `lsp_realloc_leaf` Tier B per-leaf rotation (PR #138)
+- Tier B root-rotation poison wire ceremony — LSP side (PR #151)
+- Tier B root-rotation poison wire ceremony — client side (PR #152)
+- Poison TX persist + rehydrate across LSP restart (schema v22, PR #141)
+- Multi-process crash fix + SECURITY GAP documentation (PR #135)
+- k² sub-factory breach end-to-end on regtest (PR #142)
+- Sanitizer regtest job catches leaks in wire-ceremony paths (PR #140)
+- Tier B no-SECURITY-GAP rotation log assertion (PR #153)
+- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (PR #258 via #298). Surfaced by the CL2 cheat-realloc test scaffold; before this fix, a malicious LSP could broadcast the pre-realloc leaf state to claim higher L-stock allocation and the watchtower had no recourse.
+
+### Tier B / multi-leaf state-advance ceremony (Gap B + F)
+
+The wire-ceremony equivalent of the per-leaf realloc, for the case where the root DW counter rolls over and every leaf needs re-signing:
+
+- Full implementation (PR #122) with reserved wire IDs `MSG_PATH_NONCE_BUNDLE/ALL_NONCES/PSIG_BUNDLE/SIGN_DONE` (0x60–0x63)
+- Trigger wired (PR #166)
+- Block-driven root rollover semantics (PR #168, supersedes #166)
+- Client loops `factory_tick_root` until rollover (PR #171)
+- PS leaves re-signed on root rollover + epoch-aware persistence + ASan leak fixes (PR #175)
+- Tree-broadcast skips unsigned nodes (PR #234)
+- PS sub-factory chain state reset on DW epoch rollover (PR #237)
+- Lifting FACTORY_ARITY_2 restriction on `lsp_realloc_leaf` + `buy_liquidity` (PR #123)
+- Pre-rotation SQLite snapshot hook (`--backup-dir`, PR #278)
+
+### Reorg correctness — R1–R6 mainnet pre-flight
+
+All six reorg-detection classes wired with forensic table coverage:
+
+- R1: detect same-height + forward reorgs (PR #201)
+- R2: wait loops use stable-confirmation helper (PR #202)
+- R3: per-network safe confirmation depth (PR #203)
+- R4: 3-kind reorg regression test against standalone watchtower (PR #207)
+- R5: `funding_pending_reorg` channel state (schema v31, PR #206, #211)
+- R5 wired: `lsp_channels_revalidate_funding` into R1 handler (PR #210)
+- R5 wire: `MSG_FUNDING_REORG` (PR #212), client-side `ps_chain_len` reset (PR #226)
+- R5 follow-up: proactive mempool-expiry freeze (PR #215)
+- R6: standalone WT detects forward reorgs (PR #204)
+- Schema v29 forensic tables: `reorg_events`, `breach_detections` (PR #189)
+- Sub-factory chain reset on reorg (PR #208)
+- WT restart audit signoff (PRs #135, #161, signed off in PR #287)
+- CPFP child-broadcast / anchor mismatch fix — byte-inspection now authoritative (PR #287, closes #184)
+
+### Schema migrations v22–v36
+
+Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS), version-gated, idempotent.
+
+- **v22** (PR #141): poison TX persist + rehydrate
+- **v26**: `signing_rounds` table (PR #181) — ceremony forensics journal
+- **v27** (PR #186): fee-bump escalation persist
+- **v28** (PR #187): force-close watch persist
+- **v29** (PR #189): `reorg_events` + `breach_detections` forensic tables
+- **v30** (PR #194): `old_commitment_ptlcs` schema groundwork
+- **v33** (PR #230): `ps_subfactory_chains.confirmed_height` + `reorg_stale`
+- **v34** (PR #252): ceremony tables for multi-party coordination (`ceremonies`, `ceremony_participants`, `revocation_releases`)
+- **v35** (PR #271): per-output HTLC sweep TX persistence
+- **v36** (PR #274): HTLC resolution TX + L-stock burn TX + agg hard guard
+
+### PTLC infrastructure (turnover, watchtower, gating, production)
+
+- Watchtower PTLC breach-defense feed + sweep parse bug fix (PR #242)
+- PTLC turnover ceremony journaled to `signing_rounds` (#217 via PR #280)
+- PTLC presig handler gated against blind-sign seckey extraction (PR #256, #196)
+- Factory tree sign refusal when no chain backend (PR #257, #197)
+- PTLC production threading + balance + chain validation consolidated (PR #253, resyncs #248+#249+#250)
+- Gate `channel_add_ptlc` until PTLC breach defense lands (PR #193, task #104)
+- PTLC commit-tx direction swap fix in `commit_tx_for_remote` (PR #269, completes #206)
+- Watchtower: remove eager remote-PCP overwrite + sync test scaffold (PR #268, #206)
+
+### Cheat-engine campaign (CL1–CL7)
+
+Adversarial-test infrastructure for the watchtower defense paths:
+
+- Cheat-engine validation: wire-ceremony poison TX + standalone WT (PR #159)
+- 5 non-protocol issues from cheat-engine campaign fixed (PR #161)
+- Cheat-leaf side-aware PASS (PR #239)
+- CL3-K: `--cheat-state K` arbitrary middle-state cheat (PR #293)
+- PR #293 verdict tightened — require actual WT defense evidence (PR #296)
+- CL2 `--cheat-realloc` driver C-side plumbing (PR #295)
+- CL6 `superscalar_watchtower --inspect-db` diagnostic + CL7 `cheat_client` net-delta assertion (PR #281)
+- Auto-gen seckeys + k=5/k=6 + dual-factory runners (PR #238)
+- Soak threshold fix (PR #239)
+- Synthetic empty-hex `cheat_leaf_parent_tree` broadcast_log row dropped (PR #308)
+
+### Ceremony crash-injection (mainnet gate §10 #9)
+
+- Ceremony API helpers + finalization guard / dual-sig-trap (PRs #199, #259)
+- Wired into `lsp_run_factory_creation` (PR #205 via #266) — INITIAL ceremony
+- Crash-recovery drill scaffold (PR #262)
+- Crash scaffold timing softened to persistence-contract assertion (PR #277)
+- Gap C: `SUPERSCALAR_CRASH_AT` env var + 4 checkpoints in `lsp_run_factory_creation` (PR #297)
+- Gap A: persist ROTATE ceremony + 4 checkpoints in `lsp_channels_rotate_factory` (PR #300, in flight)
+
+### Dashboard buildout
+
+- Factory Config card + PS Leaf Chains panel (PR #162)
+- Defense Status panel — Phase 1 (6 trustless-model failure-mode tiles) (PR #174)
+- Payments tab: HTLC payment flow visualization (PR #178)
+- Ceremonies panel: signing_rounds journal reconstructed from `wire_messages` (PR #176)
+- Live Monitor tab — chronological watchtower event feed (PR #255)
+- PTLCs surfaced alongside HTLCs (PR #241)
+- PTLC payments rollup + Defense Status in-flight tile (PR #243)
+- Multi `--client-db` per-POV switcher (PR #236)
+- Per-POV faithfulness + client-only mode (PR #240)
+- Payments tab POV scoping (PR #244)
+- Old commitments rendered with reserve badge (PR #224)
+- `broadcast_log.reorg_stale` "stale" badge (PR #227)
+- Freshness banner samples `.db-wal` mtime (PR #229)
+- Outcomes tiles for cheat-* scenarios + DB-fallback factory_config (PR #233)
+- Outcomes: signing_rounds_recent match + Tier B tile (PR #222)
+- TX Inventory consumes schema v35/v36 coverage columns (PR #283)
+- Force-close cost projection: current-rate awareness + honest column rename to "Chain-broadcast cost" + scope footnote (PR #291)
+- Production-mode Events derivation (PR #216)
+- Tree-node event spam collapsed + state-mismatch + staleness badge (PR #219)
+- Defense Status Phase 2 partial: wallet UTXO + CPFP tiles (PR #185)
+- Defense Status #2 (penalty bytes) + 15-mode taxonomy reference (PR #183)
+- Ceremonies: direct `signing_rounds` view alongside reconstructed fallback (PR #184)
+- `old_commitment_htlcs` collector fix — payments tab showed 0 sat (PR #205)
+- HTLC payment dashboard polish: filter + sparklines + factory isolation + snapshot (PR #180)
+- C3 dashboard hooks for ceremony types (PR #190)
+- F3b: DW state widget against real-mode dw_counter_state (PR #172)
+
+### Trustless watchtower schema (issue #289 §6)
+
+- Design draft + spec (PR #294) — separate `watchtower.db` with no secrets, LSP writes one-way
+- Phase 1a: `persist_wt` module — watchtower.db schema + register helper (PR #301, in flight)
+
+### Operational
+
+- Mainnet operator runbook (PR #263) — deployment topology, backups, HSM, TLS, monitoring, force-close incident response, reorg incident response, capacity planning, §10 mainnet activation gate
+- Native Prometheus metrics endpoint — `--prometheus-port` (PR #276)
+- Pre-rotation SQLite snapshot hook — `--backup-dir` (PR #278)
+- testnet4 quickstart procedure
+- Slow CSV-wait broadcast retry from 15s to 60s on non-regtest (PR #303)
+- Reject `update_fee` that would strand HTLC sweep outputs (PR #299)
+- Suppress wallet-RPC error noise in chain-state poll loops (PR #200 via #267)
+- Watchtower `csv_delay` persist on entry (PR #217 via #217)
+- Honest force-close HTLC sweep wiring (PR #218 via #218)
+- Channel auto-discover funding keyagg ordering for PS-leaf channels (PR #228)
+- Wire `channel_update_funding` into sub-factory advance + leaf realloc (PR #231)
+- Operability batch: factories.state + WAL checkpoint + SKIP markers + sub-factory diag (PR #225)
+- Watchtower entry registration in factory lifecycle paths now oracular (PR #156, refactor PR #157)
+- Watchtower fails closed in `watchtower_check`; drop `set_channel` API (PR #158)
+
+### CLN bridge (bLIP-56 path)
+
+- bLIP-56 plugin skeleton (PR #261) — then reverted (PR #265) and split to the external [`superscalar-cln`](https://github.com/8144225309/superscalar-cln) repo
+- Bridge HTLC at N=64 mixed-arity (PR #116)
+- testnet4 TS-HTLC-FC runner (PR #251)
+
+### BIP-158 lite client (issue #264)
+
+- End-to-end + adversarial regtest scripts (PR #272, #216)
+- Genesis-hash locator seed on initial header sync (PR #279)
+
+### Splice
+
+- Wire-codec stub marked as such per #198 (PR #260)
+- Splice runner launches 1 client (PR #254, #193)
+
+### Documentation
+
+- Mainnet operator runbook (PR #263) — covers §10 activation gate
+- JIT operations and rollback semantics (PR #120)
+- Poison-tx design (PR #155): all 4 wire-ceremony paths closed
+- PS subfactories design (PR #124)
+- testnet4 quickstart
+- Watchtower trustless schema design (PR #294)
+- Tier B / multi-leaf state-advance ceremony spec
+- Section 10 doc updates + diag wrapper for test runners (PR #287)
+- Pre-existing docs audit (PR #108)
+- Splice marked as wire-codec stub (PR #198)
+- Internal dev/planning docs pruned from `docs/` to keep the published doc set operator-facing
+- Operator doc audit pass — fix dangling links, stale SQL columns, missing flag tables, schema column mismatches in monitoring alerts
+
+### Added
+
+- **Factory Config runtime limits**: `max_signers`, `max_nodes`, `dust_limit` (via existing factory_config; mainnet readiness)
+- **Crash-recovery drill scaffold** (`tools/test_regtest_crash_at_every_phase.sh`)
+- **`tools/recover_stranded_coop_output.c`**: offline N-party MuSig2 sweep tool
+- **Multi-process MuSig at N=8/64** — real wire ceremony verification
+- **bridge-econ signet test** (`tools/test_bridge_econ_signet.sh`)
+- **All 5 cheat-* scenarios + 13 testnet4 structures** validated end-to-end
+
+### Changed
+
+- Default `--lsp-balance-pct 100` (was 50); `--demo` overrides to 50
+- `--arity` default 2 → 3 (PS canonical)
+- Factory tree broadcast skips unsigned nodes instead of hard-erroring (enables cheat-engine SF tests)
+- Watchtower entry registration paths refactored to be oracular (all production paths)
+- Watchtower fails closed in check loop
+
+### Fixed
+
+- **CPFP child broadcast vs penalty-without-anchor mismatch** (PR #287, #184): broadcast-time `fee_should_use_anchor()` re-derivation could drift from build-time decision; replaced with authoritative byte-inspection of pre-built penalty TX (`penalty_tx_has_p2a_anchor`). Defensive `is_in_mempool()` pre-flight on broadcast.
+- **`persist_load_factory` leaked tx_bufs** on validation failure + on reuse (PR #74 etc.)
+- **Tree broadcast double-spend rejection** verified by `test_regtest_funding_double_spend_rejected`
+- **PS chain-advance bookkeeping** at sweep time
+- **Funding tx mempool eviction past expiry** properly handled (PR #215)
+- **N=128 scaling bugs** — six production bugs from canonical campaign (PR #109)
+- **Test_persist init memset** preserves `mgr->persist` (PR #200, #196)
+- **Ceremony recv timeouts bumped + clearer error messages** (PR #197)
+- **`%%s` → `%s` in 8 strftime DEFAULTs** — schema escaping bug (PR #198)
+- **Channel commit signing diag** (PR #220 / #154)
+- **Watchtower remote-PCP eager overwrite removed** (PR #268, #206)
+- **`watchtower_pending` retry chain-state guard** (PR #247, #150)
+- **Cheat-daemon subfactory cleanup checkpoints WAL before cp** (PR #246, #178)
+- **Reorg watcher records breach_detections in subfactory + commitment branches** (PR #245, #175, #176)
+- **CHANGELOG**: this Unreleased section catches up ~140+ PRs since v0.1.13
+
+### Test infrastructure
+
+- testnet4 runner scripts: self-respawn under setsid (PR #275), default BUILD_DIR=build-release (PR #282), operator-tunable `--fee-rate` via `FEE_RATE` env (PR #285), `--lsp-balance-pct 50` on LSP + tighter pgrep (PR #309)
+- testnet4 Phase 5 release validation campaign scaffold (PR #292), runner evidence from `broadcast_log` (PR #304)
+- Crash scaffold timing softened to persistence contract (PR #277)
+- Multi-process multi-input advance test format fix (PR #273)
+- Pin LSP commit_fee at 1000 sat/kvB to match channel_init (PR #305)
 
 ## 0.1.13 — 2026-04-24
 
