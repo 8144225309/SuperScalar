@@ -6361,6 +6361,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     fprintf(stderr, "LSP: deferred reconnect failed\n");
                 if (qjson) cJSON_Delete(qjson);
             } else if (qtype == MSG_BRIDGE_HELLO) {
+                /* Finding A: enforce bridge pubkey pin BEFORE freeing the JSON. */
+                if (!lsp_validate_bridge_pin(lsp, qjson)) {
+                    if (qjson) cJSON_Delete(qjson);
+                    wire_close(qfd);
+                    continue;
+                }
                 if (qjson) cJSON_Delete(qjson);
                 cJSON *ack = wire_build_bridge_hello_ack();
                 wire_send(qfd, MSG_BRIDGE_HELLO_ACK, ack);
@@ -7263,6 +7269,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (wire_recv_timeout(new_fd, &peek, 30)) {
                         if (peek.msg_type == MSG_BRIDGE_HELLO) {
                             /* Bridge connection */
+                            /* Finding A: enforce bridge pubkey pin BEFORE freeing the JSON. */
+                            if (!lsp_validate_bridge_pin(lsp, peek.json)) {
+                                cJSON_Delete(peek.json);
+                                wire_close(new_fd);
+                                continue;
+                            }
                             cJSON_Delete(peek.json);
                             cJSON *ack = wire_build_bridge_hello_ack();
                             wire_send(new_fd, MSG_BRIDGE_HELLO_ACK, ack);

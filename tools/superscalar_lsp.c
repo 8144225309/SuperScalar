@@ -1284,7 +1284,9 @@ int main(int argc, char *argv[]) {
                                   landed on main, so suppress unused-but-set
                                   -Werror to keep the build green until then. */
     (void)cheat_leaf_side;
-    int cheat_realloc = 0;     /* CL2: when set, after --test-realloc completes,
+    int cheat_realloc = 0;
+    secp256k1_pubkey _bridge_pubkey_arg;
+    int _has_bridge_pubkey_arg = 0;     /* CL2: when set, after --test-realloc completes,
                                   broadcast the pre-realloc leaf signed_tx (now revoked)
                                   and verify the watchtower fires its defense path. */
     int advance_count_arg = 1;  /* CL3: number of leaf advances to drive */
@@ -1722,6 +1724,25 @@ int main(int argc, char *argv[]) {
                (post MSG_PATH_SIGN_DONE). Drives restart-harness tests:
                persistence + revocation_secrets must survive. */
             setenv("SS_KILL_AFTER_STATE_ADVANCE", "1", 1);
+        }
+        else if (strcmp(argv[i], "--bridge-pubkey") == 0 && i + 1 < argc) {
+            const char *hex = argv[++i];
+            unsigned char ser[33];
+            extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+            if (strlen(hex) != 66 || !hex_decode(hex, ser, 33)) {
+                fprintf(stderr, "LSP: invalid --bridge-pubkey hex\n");
+                return 1;
+            }
+            secp256k1_context *_pk_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+            secp256k1_pubkey _pk;
+            if (!secp256k1_ec_pubkey_parse(_pk_ctx, &_pk, ser, 33)) {
+                fprintf(stderr, "LSP: invalid --bridge-pubkey curve point\n");
+                secp256k1_context_destroy(_pk_ctx);
+                return 1;
+            }
+            secp256k1_context_destroy(_pk_ctx);
+            memcpy(&_bridge_pubkey_arg, &_pk, sizeof(_pk));
+            _has_bridge_pubkey_arg = 1;
         }
         else if (strcmp(argv[i], "--cheat-realloc") == 0) {
             /* CL2: enable post-finalize cheat broadcast against --test-realloc. */
@@ -2975,6 +2996,8 @@ accept_new_factory:
        can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
        supplied — leaving lsp_p->db NULL is the legacy/no-persistence path. */
     lsp_p->db = g_db;
+    if (_has_bridge_pubkey_arg)
+        lsp_set_expected_bridge_pubkey(lsp_p, &_bridge_pubkey_arg);
     /* SF-BACKUP-PRE-ROTATION (#213): operator-configurable backup dir;
      * NULL means feature disabled (no snapshots taken). */
     lsp_p->backup_dir = backup_dir ? strdup(backup_dir) : NULL;

@@ -55,7 +55,7 @@ int test_bridge_msg_round_trip(void) {
 
     /* BRIDGE_HELLO */
     {
-        cJSON *j = wire_build_bridge_hello();
+        cJSON *j = wire_build_bridge_hello(NULL);
         TEST_ASSERT(j != NULL, "build bridge_hello");
         cJSON_Delete(j);
     }
@@ -175,7 +175,7 @@ int test_bridge_hello_handshake(void) {
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
 
     /* Simulate bridge side: send BRIDGE_HELLO */
-    cJSON *hello = wire_build_bridge_hello();
+    cJSON *hello = wire_build_bridge_hello(NULL);
     TEST_ASSERT(wire_send(sv[0], MSG_BRIDGE_HELLO, hello), "send BRIDGE_HELLO");
     cJSON_Delete(hello);
 
@@ -390,7 +390,7 @@ int test_lsp_bridge_accept(void) {
     /* Manually simulate what lsp_accept_bridge does */
 
     /* Bridge side sends HELLO */
-    cJSON *hello = wire_build_bridge_hello();
+    cJSON *hello = wire_build_bridge_hello(NULL);
     TEST_ASSERT(wire_send(sv[0], MSG_BRIDGE_HELLO, hello), "send hello");
     cJSON_Delete(hello);
 
@@ -908,7 +908,7 @@ int test_regtest_bridge_nk_handshake(void) {
             _exit(3);
 
         /* Send BRIDGE_HELLO (encrypted) */
-        cJSON *hello = wire_build_bridge_hello();
+        cJSON *hello = wire_build_bridge_hello(NULL);
         if (!wire_send(fd, MSG_BRIDGE_HELLO, hello)) {
             cJSON_Delete(hello);
             _exit(4);

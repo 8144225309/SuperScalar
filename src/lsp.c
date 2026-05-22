@@ -1510,7 +1510,14 @@ int lsp_accept_bridge(lsp_t *lsp) {
     }
     cJSON_Delete(msg.json);
 
-    /* Send BRIDGE_HELLO_ACK */
+    /* Finding A: enforce bridge pubkey pin before ACK. */
+    if (!lsp_validate_bridge_pin(lsp, msg.json)) {
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+
+        /* Send BRIDGE_HELLO_ACK */
     cJSON *ack = wire_build_bridge_hello_ack();
     if (!wire_send(fd, MSG_BRIDGE_HELLO_ACK, ack)) {
         fprintf(stderr, "LSP: failed to send BRIDGE_HELLO_ACK\n");
@@ -1555,3 +1562,29 @@ void lsp_cleanup(lsp_t *lsp) {
     }
     factory_free(&lsp->factory);
 }
+
+void lsp_set_expected_bridge_pubkey(lsp_t *lsp, const secp256k1_pubkey *pk) {
+    if (!lsp || !pk) return;
+    memcpy(&lsp->expected_bridge_pubkey, pk, sizeof(secp256k1_pubkey));
+    lsp->has_expected_bridge_pubkey = 1;
+}
+
+int lsp_validate_bridge_pin(lsp_t *lsp, cJSON *hello_json) {
+    if (!lsp || !lsp->has_expected_bridge_pubkey) return 1;
+    secp256k1_pubkey got_pk;
+    int has_pk = 0;
+    wire_parse_bridge_hello(hello_json, &got_pk, &has_pk);
+    if (!has_pk) {
+        fprintf(stderr, "LSP: rejecting BRIDGE_HELLO -- bridge_pubkey missing "
+                        "(Finding A pin set, expected advertise required)\n");
+        return 0;
+    }
+    if (memcmp(&got_pk, &lsp->expected_bridge_pubkey,
+                sizeof(secp256k1_pubkey)) != 0) {
+        fprintf(stderr, "LSP: rejecting BRIDGE_HELLO -- bridge_pubkey mismatch "
+                        "(Finding A pin set, advertised pubkey does not match)\n");
+        return 0;
+    }
+    return 1;
+}
+
