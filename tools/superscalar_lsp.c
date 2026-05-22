@@ -307,7 +307,7 @@ static void usage(const char *prog) {
         "  --test-full-settlement  After demo: force-close tree, broadcast ALL commitment TXs, verify cross-leaf balances\n"
         "  --test-bad-terms    Offer 0 bps profit share; PASSES if client rejects (use with --min-profit-bps on client)\n"
         "  --test-dw-advance   After demo: advance DW counter, re-sign tree, force-close (shows nSequence decrease)\n"
-        "  --test-ps-advance   After demo: advance all PS leaves (chain_pos 0->1), verify amounts, force-close\n"
+        "  --test-ps-advance   After demo (LEGACY 1-client-per-leaf only; for k>=2 sub-factory PS use --test-subfactory-advance): advance all PS leaves (chain_pos 0->1), verify amounts, force-close\n"
         "  --test-leaf-advance After demo: advance left leaf only, force-close (proves per-leaf independence)\n"
         "  --test-tier-b-rollover After demo: drive states_per_layer+1 leaf-0 advances to trigger root rollover; verify Tier B ceremony (Gap B+F)\n"
         "  --test-subfactory-advance After demo: drive a sub-factory chain extension via lsp_subfactory_chain_advance (requires --arity 3 --ps-subfactory-arity K, K>1)\n"
