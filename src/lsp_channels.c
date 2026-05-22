@@ -2096,6 +2096,35 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     factory_t *f = &lsp->factory;
     if (!mgr || !lsp) return 0;
 
+    /* CL4-rollover (#250 Tier B path): snapshot the pre-rollover leaf 0
+       signed_tx so we can broadcast it post-ceremony as the stake-theft
+       attack vector.  Static fire-once across the LSP process lifetime —
+       a separate flag from the ladder-rotation injection in
+       lsp_rotation.c so both paths remain independently testable. */
+    static int ss_cheat_rollover_tier_b_snapshotted = 0;
+    static unsigned char ss_cheat_rollover_tier_b_tx[64 * 1024];
+    static size_t ss_cheat_rollover_tier_b_tx_len = 0;
+    {
+        const char *cheat_on = getenv("SS_CHEAT_ROLLOVER");
+        if (!ss_cheat_rollover_tier_b_snapshotted &&
+            cheat_on && atoi(cheat_on) == 1 &&
+            f->n_leaf_nodes > 0) {
+            size_t li = f->leaf_node_indices[0];
+            factory_node_t *leaf = &f->nodes[li];
+            if (leaf->is_signed && leaf->signed_tx.len > 0 &&
+                leaf->signed_tx.len <= sizeof(ss_cheat_rollover_tier_b_tx)) {
+                memcpy(ss_cheat_rollover_tier_b_tx, leaf->signed_tx.data,
+                       leaf->signed_tx.len);
+                ss_cheat_rollover_tier_b_tx_len = leaf->signed_tx.len;
+                ss_cheat_rollover_tier_b_snapshotted = 1;
+                fprintf(stderr,
+                        "CL4-ROLLOVER (Tier B): snapshotted pre-rollover leaf 0 "
+                        "tx (%zu bytes)\n",
+                        ss_cheat_rollover_tier_b_tx_len);
+            }
+        }
+    }
+
     /* C3 (Tier 1): journal the ceremony.  We log a start row now and update
        at the success exit below.  Error returns leave the row in flight;
        persist_sweep_incomplete_signing_rounds at next LSP startup will mark
@@ -2879,6 +2908,45 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                           "success",
                                           NULL,
                                           NULL);
+    }
+
+    /* CL4-rollover (#250 Tier B path): mid-window cheat broadcast.
+       After the Tier B state advance succeeds, the OLD leaf 0 TX (snapshotted
+       at function entry) is now revoked.  Broadcast it so the watchtower's
+       block scan detects the revoked state and responds with the penalty TX.
+       Severity HIGH -- closest thing to stake-theft attack vector during
+       routine intra-factory rollover. */
+    if (ss_cheat_rollover_tier_b_tx_len > 0) {
+        const char *cheat_on = getenv("SS_CHEAT_ROLLOVER");
+        const char *phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
+        if (cheat_on && atoi(cheat_on) == 1 &&
+            phase && strcmp(phase, "mid-window") == 0) {
+            chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+            if (chain_be) {
+                char *cheat_hex = malloc(ss_cheat_rollover_tier_b_tx_len * 2 + 1);
+                char cheat_txid[65] = {0};
+                if (cheat_hex) {
+                    extern void hex_encode(const unsigned char *, size_t, char *);
+                    hex_encode(ss_cheat_rollover_tier_b_tx,
+                                ss_cheat_rollover_tier_b_tx_len, cheat_hex);
+                    int sent = chain_be->send_raw_tx(chain_be, cheat_hex,
+                                                        cheat_txid);
+                    fprintf(stderr,
+                            "CL4-ROLLOVER (Tier B): mid-window broadcast of "
+                            "pre-rollover leaf 0 tx: sent=%d txid=%s "
+                            "(severity=HIGH)\n",
+                            sent, cheat_txid);
+                    if (sent && mgr->persist) {
+                        persist_log_broadcast((persist_t *)mgr->persist,
+                                                cheat_txid,
+                                                "cheat_rollover_stale_tier_b",
+                                                cheat_hex, "ok");
+                    }
+                    free(cheat_hex);
+                    ss_cheat_rollover_tier_b_tx_len = 0;  /* fire once */
+                }
+            }
+        }
     }
 
     return 1;
