@@ -1091,6 +1091,51 @@ int wire_parse_ceremony_abort(const cJSON *json,
     return 1;
 }
 
+cJSON *wire_build_leaf_advance_client_pubnonce(const unsigned char client_pubnonce[66]) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "client_pubnonce", client_pubnonce, 66);
+    return j;
+}
+
+int wire_parse_leaf_advance_client_pubnonce(const cJSON *json,
+                                              unsigned char out_client_pubnonce[66]) {
+    if (!json || !out_client_pubnonce) return 0;
+    return wire_json_get_hex(json, "client_pubnonce", out_client_pubnonce, 66) == 66;
+}
+
+cJSON *wire_build_leaf_advance_lsp_response(const unsigned char lsp_pubnonce[66],
+                                              const unsigned char lsp_psig[32]) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "lsp_pubnonce", lsp_pubnonce, 66);
+    wire_json_add_hex(j, "lsp_psig", lsp_psig, 32);
+    return j;
+}
+
+int wire_parse_leaf_advance_lsp_response(const cJSON *json,
+                                           unsigned char out_lsp_pubnonce[66],
+                                           unsigned char out_lsp_psig[32]) {
+    if (!json || !out_lsp_pubnonce || !out_lsp_psig) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonce", out_lsp_pubnonce, 66) != 66) return 0;
+    if (wire_json_get_hex(json, "lsp_psig", out_lsp_psig, 32) != 32) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64]) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "final_sig", final_sig, 64);
+    return j;
+}
+
+int wire_parse_leaf_advance_final(const cJSON *json,
+                                    unsigned char out_final_sig[64]) {
+    if (!json || !out_final_sig) return 0;
+    return wire_json_get_hex(json, "final_sig", out_final_sig, 64) == 64;
+}
+
+
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();
 }
