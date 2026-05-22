@@ -1332,6 +1332,7 @@ int main(int argc, char *argv[]) {
     const char *notify_webhook = NULL;  /* --notify-webhook URL */
     const char *notify_exec = NULL;     /* --notify-exec SCRIPT */
     int test_rebalance = 0;
+    int test_wire_leaf_advance = 0;  /* Phase 1c validation */
     int test_batch_rebalance = 0;
     int test_realloc = 0;
     int test_tier_b_rollover = 0;  /* Tier B (Gap B+F) — drive root rollover */
@@ -1558,6 +1559,8 @@ int main(int argc, char *argv[]) {
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
         else if (strcmp(argv[i], "--test-rebalance") == 0)
             test_rebalance = 1;
+        else if (strcmp(argv[i], "--test-wire-leaf-advance") == 0)
+            test_wire_leaf_advance = 1;  /* Phase 1c validation */
         else if (strcmp(argv[i], "--test-batch-rebalance") == 0)
             test_batch_rebalance = 1;
         else if (strcmp(argv[i], "--test-realloc") == 0)

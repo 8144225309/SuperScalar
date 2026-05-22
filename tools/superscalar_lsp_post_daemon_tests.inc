@@ -839,6 +839,27 @@
         return 0;
     }
 
+    /* === Phase 1c Validation: Post-Daemon Wire Leaf Advance ===
+       Existing leaf-advance tests run pre-daemon via single-process simulation
+       that bypasses lsp_advance_leaf entirely.  This test runs the REAL wire
+       ceremony against TCP-connected clients to validate both:
+         - Legacy path (default)
+         - Phase 1c new path (when SS_MUSIG_STATELESS=1) */
+    if (test_wire_leaf_advance && channels_active) {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        printf("\n=== POST-DAEMON WIRE LEAF ADVANCE TEST (stateless=%s) ===\n",
+               (stateless && stateless[0] == '1') ? "1" : "0");
+        fflush(stdout);
+        int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+        if (adv_rc == 1) {
+            printf("=== POST-DAEMON WIRE LEAF ADVANCE: PASS ===\n");
+        } else {
+            printf("=== POST-DAEMON WIRE LEAF ADVANCE: FAIL (rc=%d) ===\n", adv_rc);
+        }
+        fflush(stdout);
+        test_wire_leaf_advance = 0;  /* fire once */
+    }
+
     /* === Auto-Rebalance Test === */
     if (test_rebalance && channels_active) {
         printf("\n=== AUTO-REBALANCE TEST ===\n");
