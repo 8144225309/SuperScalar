@@ -415,7 +415,7 @@ void channel_set_remote_basepoints(channel_t *ch,
    already differ).  The per-process counter discriminates channels created
    with the same funding secret in sequence. */
 int channel_generate_random_basepoints(channel_t *ch) {
-    unsigned char ps[32], ds[32], rs[32], hs[32];
+    unsigned char ps[32] = {0}, ds[32] = {0}, rs[32] = {0}, hs[32] = {0};
     int seeded = 0;
 
     const char *test_seed_hex = getenv("SUPERSCALAR_TEST_SEED");
