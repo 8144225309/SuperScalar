@@ -2231,6 +2231,11 @@ int main(int argc, char *argv[]) {
             ptlc_safety_set_enabled(1);
             printf("Client: --enable-ptlc-unsafe is now a no-op alias (PTLCs default-on)\n");
         }
+        else if (strcmp(argv[i], "--musig-stateless") == 0) {
+            /* #271 Phase 1a: opt into BIP-327 stateless-signer wire flow.
+               Client-side counterpart. Currently registers only. */
+            setenv("SS_MUSIG_STATELESS", "1", 1);
+        }
         else if (strcmp(argv[i], "--disable-ptlc") == 0) {
             extern void ptlc_safety_set_enabled(int);
             ptlc_safety_set_enabled(0);
