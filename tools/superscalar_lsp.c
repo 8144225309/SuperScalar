@@ -1706,6 +1706,23 @@ int main(int argc, char *argv[]) {
             cheat_subfactory_after_advance = 1;
             setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
         }
+        else if (strcmp(argv[i], "--cheat-daemon-rollover") == 0) {
+            /* CL4-rollover: cheat-rollover for standalone WT testing.
+               After Tier B rollover succeeds, the LSP broadcasts the
+               dying factory's leaf TX -- standalone WT should detect
+               via block scan + respond with penalty TX.
+               Optional PHASE: mid-window (default; only one implemented),
+               pre-finalize, post-cleanup. */
+            test_tier_b_rollover = 1;
+            setenv("SS_CHEAT_DAEMON_MODE", "1", 1);
+            setenv("SS_CHEAT_ROLLOVER", "1", 1);
+            if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    strchr("pmpost", argv[i+1][0]) != NULL) {
+                setenv("SS_CHEAT_ROLLOVER_PHASE", argv[++i], 1);
+            } else {
+                setenv("SS_CHEAT_ROLLOVER_PHASE", "mid-window", 1);
+            }
+        }
         else if (strcmp(argv[i], "--advance-count") == 0 && i + 1 < argc) {
             /* CL3: how many leaf advances to drive in test_leaf_advance. */
             advance_count_arg = atoi(argv[++i]);
