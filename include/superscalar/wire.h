@@ -135,6 +135,22 @@
    Payload: { "frozen": 0|1, "funding_txid": "<display-hex>" } */
 #define MSG_FUNDING_REORG       0x78
 
+/* MuSig2 stateless redesign (#271 / MUSIG_NONCE_REDESIGN_MEMO §5.2).
+   Signals "this ceremony can no longer be completed; re-initiate from
+   round 1 if needed."  Used after LSP restart, client timeout, retry
+   limit reached, protocol error.  Receiver decides retry / give up /
+   surface based on reason. */
+#define MSG_CEREMONY_ABORT      0x79
+
+/* Ceremony abort reason codes (single byte). Unknown values: treat as
+   OTHER and surface reason_text for diagnostics. */
+#define CEREMONY_ABORT_LSP_RESTART          0x01
+#define CEREMONY_ABORT_RETRY_LIMIT_REACHED  0x02
+#define CEREMONY_ABORT_CLIENT_TIMEOUT       0x03
+#define CEREMONY_ABORT_PROTOCOL_ERROR       0x04
+#define CEREMONY_ABORT_CLIENT_INITIATED     0x05
+#define CEREMONY_ABORT_OTHER                0xFF
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -398,6 +414,22 @@ cJSON *wire_build_bridge_hello(const secp256k1_pubkey *opt_bridge_pubkey);
 int wire_parse_bridge_hello(const cJSON *json,
                               secp256k1_pubkey *out_pubkey,
                               int *out_has_pubkey);
+
+/* MUSIG_NONCE_REDESIGN_MEMO §5.2: MSG_CEREMONY_ABORT.
+   ceremony_id is the 32-byte derivation from lsp_ceremony_derive_id.
+   reason is one of the CEREMONY_ABORT_* constants. reason_text is
+   optional (NULL or empty for omit); receivers SHOULD surface the
+   text on UNKNOWN reasons for diagnostics. */
+cJSON *wire_build_ceremony_abort(const unsigned char ceremony_id[8],
+                                   unsigned char reason,
+                                   const char *reason_text);
+
+/* Parse MSG_CEREMONY_ABORT. *out_reason_text is malloc'd if non-NULL
+   in the JSON; caller must free. Returns 1 on success, 0 on malformed. */
+int wire_parse_ceremony_abort(const cJSON *json,
+                                unsigned char ceremony_id[8],
+                                unsigned char *out_reason,
+                                char **out_reason_text);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);

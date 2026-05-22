@@ -320,6 +320,7 @@ static void usage(const char *prog) {
         "  --cheat-daemon-sub   Same as --cheat-subfactory but no internal WT. CL4.B.\n"
         "  --advance-count N    With --test-leaf-advance: drive N advances (default 1). Combined with --cheat-leaf, broadcasts chain[K] (per --cheat-state K, default 0 = oldest stale) when at chain[N]. CL3.\n"
         "  --cheat-state K      With --cheat-leaf and --advance-count N: snapshot+broadcast chain[K] (default 0 = oldest stale).  K in [0,N-1].  K>0 exercises the watchtower's middle-state revocation walk — boundary-only K=0/K=N-1 tests miss this path. CL3-K.\n"
+        "  --musig-stateless    [PHASE 1a/EXPERIMENTAL] Opt into BIP-327 stateless-signer wire flow per MUSIG_NONCE_REDESIGN_MEMO. Currently registers the flag; full reversed-flow behavior lands in Phase 1b. Default off.\n"
         "  --cheat-realloc      With --test-realloc: after realloc completes, broadcast the now-revoked pre-realloc leaf TX and verify watchtower defense fires (penalty TX broadcast, breach_detections row). Tests adversarial path against realloc revocation. CL2.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
@@ -1760,6 +1761,13 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(_pk_ctx);
             memcpy(&_bridge_pubkey_arg, &_pk, sizeof(_pk));
             _has_bridge_pubkey_arg = 1;
+        }
+        else if (strcmp(argv[i], "--musig-stateless") == 0) {
+            /* #271 Phase 1: opt into BIP-327 stateless-signer wire flow.
+               Phase 1a (this PR): flag registered, no behavior change yet
+               (old pool-based flow still runs). Phase 1b: reversed round-2
+               wire flow for per-leaf advance behind this flag. */
+            setenv("SS_MUSIG_STATELESS", "1", 1);
         }
         else if (strcmp(argv[i], "--cheat-realloc") == 0) {
             /* CL2: enable post-finalize cheat broadcast against --test-realloc. */

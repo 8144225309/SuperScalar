@@ -1039,6 +1039,58 @@ int wire_parse_bridge_hello(const cJSON *json,
     return 1;
 }
 
+cJSON *wire_build_ceremony_abort(const unsigned char ceremony_id[8],
+                                   unsigned char reason,
+                                   const char *reason_text) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "ceremony_id", ceremony_id, 8);
+    cJSON_AddNumberToObject(j, "reason", (double)reason);
+    if (reason_text && reason_text[0] != '\0') {
+        /* Cap at 256 bytes per spec. */
+        size_t len = strlen(reason_text);
+        if (len > 256) len = 256;
+        char *truncated = malloc(len + 1);
+        if (truncated) {
+            memcpy(truncated, reason_text, len);
+            truncated[len] = '\0';
+            cJSON_AddStringToObject(j, "reason_text", truncated);
+            free(truncated);
+        }
+    }
+    return j;
+}
+
+int wire_parse_ceremony_abort(const cJSON *json,
+                                unsigned char ceremony_id[8],
+                                unsigned char *out_reason,
+                                char **out_reason_text) {
+    if (!json || !out_reason) return 0;
+    if (out_reason_text) *out_reason_text = NULL;
+
+    if (wire_json_get_hex(json, "ceremony_id", ceremony_id, 8) != 8) return 0;
+
+    cJSON *r = cJSON_GetObjectItem(json, "reason");
+    if (!cJSON_IsNumber(r)) return 0;
+    double rv = r->valuedouble;
+    if (rv < 0.0 || rv > 255.0) return 0;
+    *out_reason = (unsigned char)rv;
+
+    if (out_reason_text) {
+        cJSON *t = cJSON_GetObjectItem(json, "reason_text");
+        if (cJSON_IsString(t) && t->valuestring) {
+            size_t len = strlen(t->valuestring);
+            if (len > 256) len = 256;
+            *out_reason_text = malloc(len + 1);
+            if (*out_reason_text) {
+                memcpy(*out_reason_text, t->valuestring, len);
+                (*out_reason_text)[len] = '\0';
+            }
+        }
+    }
+    return 1;
+}
+
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();
 }
