@@ -441,19 +441,30 @@ int wire_parse_ceremony_abort(const cJSON *json,
                                 char **out_reason_text);
 
 /* Phase 1b per MUSIG_NONCE_REDESIGN_MEMO §3.1 stateless-signer flow. */
-cJSON *wire_build_leaf_advance_client_pubnonce(const unsigned char client_pubnonce[66]);
+cJSON *wire_build_leaf_advance_client_pubnonce(const unsigned char client_pubnonce[66],
+                                                  const unsigned char *client_poison_pubnonce_opt /* 66 or NULL */);
+/* Returns 1 on success without poison, 2 if poison_pubnonce present, 0 on parse error. */
 int    wire_parse_leaf_advance_client_pubnonce(const cJSON *json,
-                                                  unsigned char out_client_pubnonce[66]);
+                                                  unsigned char out_client_pubnonce[66],
+                                                  unsigned char out_client_poison_pubnonce_opt[66] /* may be NULL */);
 
 cJSON *wire_build_leaf_advance_lsp_response(const unsigned char lsp_pubnonce[66],
-                                              const unsigned char lsp_psig[32]);
+                                              const unsigned char lsp_psig[32],
+                                              const unsigned char *lsp_poison_pubnonce_opt /* 66 or NULL */,
+                                              const unsigned char *lsp_poison_psig_opt /* 32 or NULL */);
+/* Returns 1 on success without poison, 2 if both poison fields present, 0 on parse error. */
 int    wire_parse_leaf_advance_lsp_response(const cJSON *json,
                                               unsigned char out_lsp_pubnonce[66],
-                                              unsigned char out_lsp_psig[32]);
+                                              unsigned char out_lsp_psig[32],
+                                              unsigned char out_lsp_poison_pubnonce_opt[66] /* may be NULL */,
+                                              unsigned char out_lsp_poison_psig_opt[32] /* may be NULL */);
 
-cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64]);
+cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64],
+                                       const unsigned char *final_poison_sig_opt /* 64 or NULL */);
+/* Returns 1 on success without poison, 2 if poison_sig present, 0 on parse error. */
 int    wire_parse_leaf_advance_final(const cJSON *json,
-                                       unsigned char out_final_sig[64]);
+                                       unsigned char out_final_sig[64],
+                                       unsigned char out_final_poison_sig_opt[64] /* may be NULL */);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
