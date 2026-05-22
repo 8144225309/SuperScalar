@@ -34,3 +34,18 @@ lost-coordination-branch/
 .claude/
 
 PS_MAINNET_PUNCH_LIST.md
+
+# Internal dev / planning / campaign artifacts — never ship in docs/
+docs/GAPS_FOLLOWUP.md
+docs/accounting-chart-c.md
+docs/ln-gossip-plan.md
+docs/signet-k2-procedure.md
+docs/signet-ps-n8-procedure.md
+docs/testnet4-phase5/
+
+# Protocol explainers that live on superscalar.win, not in the repo
+docs/factory-arity.md
+docs/jit-and-rollback.md
+docs/poison-tx.md
+docs/ps-subfactories.md
+docs/pseudo-spilman.md
