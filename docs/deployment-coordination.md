@@ -190,8 +190,8 @@ The bridge connects a SuperScalar factory to the Lightning Network. It has three
 
 | Component | What it is | Starts as |
 |-----------|-----------|-----------|
-|  | Relay daemon between LSP and CLN plugin | Standalone binary |
-|  | CLN plugin that intercepts HTLCs | Loaded by lightningd |
+| `superscalar_bridge` | Relay daemon between LSP and CLN plugin | Standalone binary |
+| `cln_plugin.py` | CLN plugin that intercepts HTLCs | Loaded by lightningd |
 | CLN peer node | Any standard LN node with a channel to the bridge node | Separate lightningd |
 
 ### Plugin Installation
@@ -223,8 +223,8 @@ cp tools/deploy/cln-bridge.conf.example /var/lib/cln/config
 ```
 1. bitcoind          (must be synced)
 2. superscalar_lsp   (listening on --port)
-3. superscalar_bridge --lsp-host 127.0.0.1 --lsp-port 9735 --plugin-port 9737
-4. lightningd        (loads cln_plugin.py, connects to bridge on port 9737)
+3. superscalar_bridge --lsp-host 127.0.0.1 --lsp-port 9735 --plugin-port 9736
+4. lightningd        (loads cln_plugin.py, connects to bridge on port 9736)
 ```
 
 If lightningd starts before the bridge daemon, the plugin retries the connection every 5 seconds — no manual intervention needed.
@@ -233,7 +233,7 @@ If lightningd starts before the bridge daemon, the plugin retries the connection
 
 ```
 LSP port (--port 9735)  <----  superscalar_bridge --lsp-port 9735
-                                                   --plugin-port 9737  ---->  CLN plugin (superscalar-bridge-port=9737)
+                                                   --plugin-port 9736  ---->  CLN plugin (superscalar-bridge-port=9736)
 ```
 
 The LSP's `--port` is the same port clients connect to. The bridge connects to it as a regular client. There is no separate bridge port on the LSP.
@@ -311,15 +311,15 @@ python3 tools/dashboard.py \
 ```bash
 # Channel balances
 sqlite3 -header -column lsp.db \
-  "SELECT channel_id, local_amount, remote_amount FROM channels"
+  "SELECT id, slot, local_amount, remote_amount, state FROM channels"
 
 # Factory state
 sqlite3 -header -column lsp.db \
-  "SELECT factory_id, lifecycle_state, funding_amount FROM factories"
+  "SELECT id, n_participants, funding_amount, leaf_arity, state FROM factories"
 
-# Pending HTLCs
+# Recent HTLCs (state column holds the lifecycle: 'active', 'fulfilled', 'failed', etc.)
 sqlite3 -header -column lsp.db \
-  "SELECT channel_id, payment_hash, amount_msat, direction FROM htlcs WHERE resolved=0"
+  "SELECT channel_id, htlc_id, direction, amount, payment_hash, state FROM htlcs ORDER BY id DESC LIMIT 20"
 ```
 
 ## Firewall & Security
