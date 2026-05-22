@@ -1660,7 +1660,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     unsigned char client_pubnonce_ser[66];
     int prc = wire_parse_leaf_advance_client_pubnonce(cpn_msg.json,
-                                                         client_pubnonce_ser);
+                                                         client_pubnonce_ser, NULL);
     cJSON_Delete(cpn_msg.json);
     if (!prc) {
         fprintf(stderr, "LSP-stateless: parse CLIENT_PUBNONCE failed\n");
@@ -1750,7 +1750,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 7: ship LSP_RESPONSE. */
     cJSON *response = wire_build_leaf_advance_lsp_response(lsp_pubnonce_ser,
-                                                             lsp_psig_ser);
+                                                             lsp_psig_ser, NULL, NULL);
     if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_LSP_RESPONSE, response)) {
         cJSON_Delete(response);
         fprintf(stderr, "LSP-stateless: send LSP_RESPONSE failed\n");
@@ -1771,7 +1771,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
     unsigned char final_sig[64];
-    int frc2 = wire_parse_leaf_advance_final(fin_msg.json, final_sig);
+    int frc2 = wire_parse_leaf_advance_final(fin_msg.json, final_sig, NULL);
     cJSON_Delete(fin_msg.json);
     if (!frc2) {
         fprintf(stderr, "LSP-stateless: parse FINAL failed\n");

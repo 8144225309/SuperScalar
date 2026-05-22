@@ -3504,7 +3504,7 @@ static int client_handle_leaf_advance_stateless(int fd,
 
     unsigned char my_pubnonce_ser[66];
     musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
-    cJSON *cpn_json = wire_build_leaf_advance_client_pubnonce(my_pubnonce_ser);
+    cJSON *cpn_json = wire_build_leaf_advance_client_pubnonce(my_pubnonce_ser, NULL);
     if (!wire_send(fd, MSG_LEAF_ADVANCE_CLIENT_PUBNONCE, cpn_json)) {
         cJSON_Delete(cpn_json);
         fprintf(stderr, "Client-stateless %u: send CLIENT_PUBNONCE failed\n", my_index);
@@ -3523,7 +3523,7 @@ static int client_handle_leaf_advance_stateless(int fd,
     unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
     int lrrc = wire_parse_leaf_advance_lsp_response(lr_msg.json,
                                                        lsp_pubnonce_ser,
-                                                       lsp_psig_ser);
+                                                       lsp_psig_ser, NULL, NULL);
     cJSON_Delete(lr_msg.json);
     if (!lrrc) {
         fprintf(stderr, "Client-stateless %u: parse LSP_RESPONSE failed\n", my_index);
@@ -3612,7 +3612,7 @@ static int client_handle_leaf_advance_stateless(int fd,
     }
 
     /* Step 8: ship FINAL. */
-    cJSON *fin_json = wire_build_leaf_advance_final(final_sig);
+    cJSON *fin_json = wire_build_leaf_advance_final(final_sig, NULL);
     if (!wire_send(fd, MSG_LEAF_ADVANCE_FINAL, fin_json)) {
         cJSON_Delete(fin_json);
         fprintf(stderr, "Client-stateless %u: send FINAL failed\n", my_index);
