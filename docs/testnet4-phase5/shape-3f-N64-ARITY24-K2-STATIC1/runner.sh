@@ -41,7 +41,13 @@ LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
 case "$VARIANT" in
     V1) DEMO_FLAGS="--demo" ;;
     V2) DEMO_FLAGS="--demo --force-close" ;;
-    V3) DEMO_FLAGS="--demo --test-ps-advance" ;;
+    V3) # alias to V4 per #269: leaf-advance has no meaning for k>=2 sub-factory PS.
+        # Per docs/ps-subfactories.md spec Phase 2, dynamic state extension on
+        # k>=2 PS shapes goes through lsp_subfactory_chain_advance, not the
+        # legacy leaf-advance path. Redirect V3 -> V4 here so the canonical
+        # "advance the chain" test on these shapes exercises the correct ceremony.
+        echo "  NOTE: V3 (--test-ps-advance) on k>=2 PS shape redirects to V4 (--test-subfactory-advance)" >&2
+        DEMO_FLAGS="--demo --test-subfactory-advance" ;;
     V4) DEMO_FLAGS="--demo --test-subfactory-advance" ;;
     V5) DEMO_FLAGS="--demo --breach-test" ;;
     V6) DEMO_FLAGS="--demo --force-close" ;;  # operator kills LSP mid-flight externally

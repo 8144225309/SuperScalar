@@ -1571,6 +1571,25 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
+    /* Per docs/ps-subfactories.md (canonical t/1242 PS spec): with k>=2 sub-
+       factory PS, the leaf is static after factory creation. Dynamic state
+       lives in the SUB-FACTORY chain TXs and is extended via
+       lsp_subfactory_chain_advance (Phase 2 of the spec). The leaf-level
+       wire ceremony (MSG_LEAF_ADVANCE_PROPOSE/PSIG) was designed for the
+       legacy 1-client-per-leaf PS shape (k=1, n_signers=2) and silently
+       fails on k>=2 (where the leaf has k^2+1 signers but the wire flow
+       only collects 2 nonces). Refuse the misuse with a clear error.
+       (#269 PS_ADVANCE quorum collapse fix.) */
+    if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity >= 2) {
+        fprintf(stderr,
+                "lsp_advance_leaf: refused -- k=%u sub-factory PS has no "
+                "leaf-level dynamic operation. Use lsp_subfactory_chain_advance "
+                "instead (--test-subfactory-advance). "
+                "Per docs/ps-subfactories.md spec Phase 2.\n",
+                f->ps_subfactory_arity);
+        return 0;
+    }
+
     /* C3 (Tier 1): journal the ceremony at start; success-update at the
        final return below.  Error returns leave the row in flight for the
        startup sweep to mark aborted_crash. */
