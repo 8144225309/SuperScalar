@@ -1004,8 +1004,39 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
 
 /* --- Bridge message builders (Phase 14) --- */
 
-cJSON *wire_build_bridge_hello(void) {
-    return cJSON_CreateObject();
+cJSON *wire_build_bridge_hello(const secp256k1_pubkey *opt_bridge_pubkey) {
+    cJSON *j = cJSON_CreateObject();
+    if (opt_bridge_pubkey) {
+        secp256k1_context *_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        unsigned char ser[33];
+        size_t ser_len = 33;
+        secp256k1_ec_pubkey_serialize(_ctx, ser, &ser_len, opt_bridge_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+        wire_json_add_hex(j, "bridge_pubkey", ser, 33);
+        secp256k1_context_destroy(_ctx);
+    }
+    return j;
+}
+
+int wire_parse_bridge_hello(const cJSON *json,
+                              secp256k1_pubkey *out_pubkey,
+                              int *out_has_pubkey) {
+    if (out_has_pubkey) *out_has_pubkey = 0;
+    if (!json) return 1;
+    cJSON *pk_field = cJSON_GetObjectItem(json, "bridge_pubkey");
+    if (!cJSON_IsString(pk_field) || !pk_field->valuestring) return 1;
+    const char *hex = pk_field->valuestring;
+    if (strlen(hex) != 66) return 1;
+    unsigned char ser[33];
+    extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+    if (!hex_decode(hex, ser, 33)) return 1;
+    secp256k1_context *_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    int ok = out_pubkey
+        ? secp256k1_ec_pubkey_parse(_ctx, out_pubkey, ser, 33)
+        : 1;
+    secp256k1_context_destroy(_ctx);
+    if (ok && out_pubkey && out_has_pubkey) *out_has_pubkey = 1;
+    return 1;
 }
 
 cJSON *wire_build_bridge_hello_ack(void) {

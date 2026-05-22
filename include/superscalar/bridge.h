@@ -31,6 +31,12 @@ typedef struct {
     secp256k1_pubkey lsp_pubkey;        /* pinned LSP static pubkey */
     int use_nk;                         /* 1 = use NK handshake, 0 = NN fallback */
 
+    /* Finding A defense-in-depth: optional bridge static pubkey advertised
+       in BRIDGE_HELLO so the LSP can pin which bridge it expects. Empty
+       unless --bridge-pubkey was passed on the CLI. */
+    secp256k1_pubkey bridge_pubkey;
+    int has_bridge_pubkey;
+
     /* Heartbeat (bridge reliability) */
     time_t last_lsp_activity;           /* timestamp of last message from LSP */
     int heartbeat_interval;             /* seconds between pings (default 30) */
@@ -52,6 +58,11 @@ void bridge_init(bridge_t *br);
 /* Pin LSP static pubkey for NK (server-authenticated) handshake.
    If set, bridge_connect_lsp() uses NK mode instead of NN. */
 void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk);
+
+/* Set this bridge's own static pubkey to advertise in BRIDGE_HELLO so the
+   LSP can pin (Finding A). Without this the bridge runs unpinned; LSPs that
+   configured an expected_bridge_pubkey will reject the connection. */
+void bridge_set_pubkey(bridge_t *br, const secp256k1_pubkey *pk);
 
 /* Connect bridge to LSP. Sends BRIDGE_HELLO, waits for BRIDGE_HELLO_ACK.
    Returns 1 on success. */

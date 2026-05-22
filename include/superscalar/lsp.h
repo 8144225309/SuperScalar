@@ -27,6 +27,12 @@ typedef struct {
     /* Bridge daemon connection (Phase 14) */
     int bridge_fd;
 
+    /* Finding A: expected bridge static pubkey for defense-in-depth pinning.
+       Set via lsp_set_expected_bridge_pubkey (CLI --bridge-pubkey). If set,
+       BRIDGE_HELLO whose bridge_pubkey is absent or mismatched is rejected. */
+    secp256k1_pubkey expected_bridge_pubkey;
+    int has_expected_bridge_pubkey;
+
     /* Listen socket */
     int listen_fd;
     int port;
@@ -106,6 +112,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
    Expects MSG_BRIDGE_HELLO, sends MSG_BRIDGE_HELLO_ACK.
    Returns 1 on success. */
 int lsp_accept_bridge(lsp_t *lsp);
+
+/* Set the expected bridge static pubkey for Finding A defense-in-depth pin. */
+void lsp_set_expected_bridge_pubkey(lsp_t *lsp, const secp256k1_pubkey *pk);
+
+/* Return 1 if hello_json's bridge_pubkey matches the configured pin (or if
+   no pin is configured); 0 to reject + log. Used at all BRIDGE_HELLO accept
+   sites. */
+int lsp_validate_bridge_pin(lsp_t *lsp, cJSON *hello_json);
 
 /* Send MSG_ERROR to all connected clients, then close their fds. */
 void lsp_abort_ceremony(lsp_t *lsp, const char *reason);

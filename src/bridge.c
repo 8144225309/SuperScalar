@@ -31,6 +31,12 @@ void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
     }
 }
 
+void bridge_set_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
+    if (!br || !pk) return;
+    memcpy(&br->bridge_pubkey, pk, sizeof(secp256k1_pubkey));
+    br->has_bridge_pubkey = 1;
+}
+
 int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
     /* Save host/port for reconnection */
     if (lsp_host) {
@@ -70,7 +76,8 @@ int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
     }
 
     /* Send BRIDGE_HELLO */
-    cJSON *hello = wire_build_bridge_hello();
+    cJSON *hello = wire_build_bridge_hello(
+        br->has_bridge_pubkey ? &br->bridge_pubkey : NULL);
     if (!wire_send(br->lsp_fd, MSG_BRIDGE_HELLO, hello)) {
         cJSON_Delete(hello);
         fprintf(stderr, "Bridge: failed to send BRIDGE_HELLO\n");
@@ -403,7 +410,8 @@ int bridge_run(bridge_t *br) {
         if (ret == 0) {
             if (bridge_is_stale(br)) {
                 fprintf(stderr, "Bridge: LSP connection stale, sending ping\n");
-                cJSON *ping = wire_build_bridge_hello();
+                cJSON *ping = wire_build_bridge_hello(
+            br->has_bridge_pubkey ? &br->bridge_pubkey : NULL);
                 if (!wire_send(br->lsp_fd, MSG_BRIDGE_HELLO, ping)) {
                     cJSON_Delete(ping);
                     fprintf(stderr, "Bridge: ping failed, attempting reconnect\n");

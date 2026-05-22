@@ -387,7 +387,17 @@ int wire_parse_register_invoice(const cJSON *json,
 /* --- Bridge message builders (Phase 14) --- */
 
 /* Bridge → LSP: BRIDGE_HELLO {} */
-cJSON *wire_build_bridge_hello(void);
+/* BRIDGE_HELLO optionally carries the bridge's static pubkey for defense-in-
+   depth pinning on the LSP side. Pass NULL for the legacy unpinned form
+   (backwards compatible -- LSP without an expected_bridge_pubkey accepts). */
+cJSON *wire_build_bridge_hello(const secp256k1_pubkey *opt_bridge_pubkey);
+
+/* Parse BRIDGE_HELLO; on return *out_has_pubkey is 1 if a "bridge_pubkey"
+   field was present + successfully parsed into *out_pubkey, else 0.
+   Returns 1 always (HELLO has no required fields). */
+int wire_parse_bridge_hello(const cJSON *json,
+                              secp256k1_pubkey *out_pubkey,
+                              int *out_has_pubkey);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
