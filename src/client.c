@@ -2876,8 +2876,12 @@ static int client_handle_subfactory_advance_stateless(int fd,
                                                         uint32_t my_index,
                                                         const wire_msg_t *propose_msg) {
     uint32_t sub_node_id, n_inputs;
+    int leaf_side, sub_idx, channel_idx;
+    uint64_t delta_sats;
     if (!wire_parse_subfactory_propose_intent(propose_msg->json,
-                                                 &sub_node_id, &n_inputs)) {
+                                                 &sub_node_id, &n_inputs,
+                                                 &leaf_side, &sub_idx, &channel_idx,
+                                                 &delta_sats)) {
         fprintf(stderr, "Client-stateless subfactory %u: parse PROPOSE_INTENT failed\n",
                 my_index);
         return 0;
@@ -2908,27 +2912,20 @@ static int client_handle_subfactory_advance_stateless(int fd,
         }
     }
 
-    /* NOTE: in this MVP, the client doesn'''t know which (leaf_side, sub_idx,
-       channel_idx, delta_sats) values to pass to factory_subfactory_chain_advance_unsigned
-       because PROPOSE_INTENT carries only sub_node_id + n_inputs.  The client
-       would derive them from sub_node_id (locate the leaf, find the sub-idx,
-       etc).  For now this MVP-stateless client only supports the case where
-       the unsigned_tx is ALREADY built (e.g. from a prior legacy advance
-       that left state, or from a separate metadata sync).  Real production
-       use would need PROPOSE_INTENT to carry the advance parameters too.
-       Phase 1e.1.d follow-up will extend the PROPOSE_INTENT payload.
-
-       For now: refuse if the sub node'''s unsigned_tx hasn'''t been built. */
-    if (!sub->is_built || sub->unsigned_tx.len == 0) {
+    /* Phase 1e.1.b amendment: PROPOSE_INTENT now carries the advance params
+       (leaf_side, sub_idx, channel_idx, delta_sats).  Apply the advance
+       locally so unsigned_tx matches LSP's deterministically. */
+    if (!factory_subfactory_chain_advance_unsigned(factory, leaf_side, sub_idx,
+                                                     channel_idx, delta_sats)) {
         fprintf(stderr,
-            "Client-stateless subfactory %u: sub_node_id=%u has no unsigned_tx built; "
-            "PROPOSE_INTENT does not yet carry advance params (Phase 1e.1.d). "
-            "Refuse -- LSP should fall back to legacy.\n",
-            my_index, sub_node_id);
+            "Client-stateless subfactory %u: chain_advance_unsigned failed "
+            "(leaf=%d sub=%d ch=%d delta=%llu)\n",
+            my_index, leaf_side, sub_idx, channel_idx,
+            (unsigned long long)delta_sats);
         return 0;
     }
 
-    /* Init session (state only, no poison in MVP). */
+        /* Init session (state only, no poison in MVP). */
     if (!factory_session_init_node(factory, sub_node_i)) {
         fprintf(stderr, "Client-stateless subfactory %u: session_init failed\n", my_index);
         return 0;

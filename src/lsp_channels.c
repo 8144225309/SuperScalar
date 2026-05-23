@@ -4142,7 +4142,7 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     }
 
     /* Step 3: send PROPOSE_INTENT to each sub-client (NO LSP nonce). */
-    cJSON *propose = wire_build_subfactory_propose_intent((uint32_t)sub_node_i, 1);
+    cJSON *propose = wire_build_subfactory_propose_intent((uint32_t)sub_node_i, 1, leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE_INTENT, propose)) {

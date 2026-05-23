@@ -481,10 +481,15 @@ int    wire_parse_leaf_advance_final(const cJSON *json,
    are minimal — the actual sub-factory advance ceremony (Phase 1e.1.b)
    will define richer payloads (per-input arrays for multi-input).  For
    now these are stubs to be filled in. */
-cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs);
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs,
+                                              int leaf_side, int sub_idx, int channel_idx,
+                                              uint64_t delta_sats);
 int    wire_parse_subfactory_propose_intent(const cJSON *json,
                                               uint32_t *out_subfactory_id,
-                                              uint32_t *out_n_inputs);
+                                              uint32_t *out_n_inputs,
+                                              int *out_leaf_side, int *out_sub_idx,
+                                              int *out_channel_idx,
+                                              uint64_t *out_delta_sats);
 
 cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input /* n_inputs * 66 */,
                                                 uint32_t n_inputs);

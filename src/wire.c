@@ -1178,23 +1178,43 @@ int wire_parse_leaf_advance_final(const cJSON *json,
    per-input arrays serialized as concatenated hex strings (n_inputs * size).
    The receiver passes expected_n_inputs to know how to split. */
 
-cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs) {
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs,
+                                              int leaf_side, int sub_idx, int channel_idx,
+                                              uint64_t delta_sats) {
     cJSON *j = cJSON_CreateObject();
     if (!j) return NULL;
     cJSON_AddNumberToObject(j, "subfactory_id", (double)subfactory_id);
     cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    cJSON_AddNumberToObject(j, "leaf_side", (double)leaf_side);
+    cJSON_AddNumberToObject(j, "sub_idx", (double)sub_idx);
+    cJSON_AddNumberToObject(j, "channel_idx", (double)channel_idx);
+    cJSON_AddNumberToObject(j, "delta_sats", (double)delta_sats);
     return j;
 }
 
 int wire_parse_subfactory_propose_intent(const cJSON *json,
                                            uint32_t *out_subfactory_id,
-                                           uint32_t *out_n_inputs) {
-    if (!json || !out_subfactory_id || !out_n_inputs) return 0;
+                                           uint32_t *out_n_inputs,
+                                           int *out_leaf_side, int *out_sub_idx,
+                                           int *out_channel_idx,
+                                           uint64_t *out_delta_sats) {
+    if (!json || !out_subfactory_id || !out_n_inputs ||
+        !out_leaf_side || !out_sub_idx || !out_channel_idx || !out_delta_sats) return 0;
     cJSON *sf = cJSON_GetObjectItem(json, "subfactory_id");
     cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
-    if (!sf || !ni || !cJSON_IsNumber(sf) || !cJSON_IsNumber(ni)) return 0;
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    cJSON *si = cJSON_GetObjectItem(json, "sub_idx");
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_idx");
+    cJSON *ds = cJSON_GetObjectItem(json, "delta_sats");
+    if (!sf || !ni || !ls || !si || !ci || !ds) return 0;
+    if (!cJSON_IsNumber(sf) || !cJSON_IsNumber(ni) || !cJSON_IsNumber(ls) ||
+        !cJSON_IsNumber(si) || !cJSON_IsNumber(ci) || !cJSON_IsNumber(ds)) return 0;
     *out_subfactory_id = (uint32_t)sf->valuedouble;
     *out_n_inputs = (uint32_t)ni->valuedouble;
+    *out_leaf_side = (int)ls->valuedouble;
+    *out_sub_idx = (int)si->valuedouble;
+    *out_channel_idx = (int)ci->valuedouble;
+    *out_delta_sats = (uint64_t)ds->valuedouble;
     return 1;
 }
 
