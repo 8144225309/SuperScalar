@@ -4065,6 +4065,233 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
    Returns 1 on success (chain extended, all participants confirmed
    via DONE), 0 on any failure (validation, ceremony timeout, crypto). */
+/* Phase 1e.1.b: stateless single-input sub-factory chain advance variant.
+   Dispatched from the public function when SS_MUSIG_STATELESS=1 AND the
+   target node is single-input (factory_node_uses_multi_input returns 0).
+   Multi-input + poison + WT registration deferred to Phase 1e.1.c. */
+static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
+                                                    lsp_t *lsp,
+                                                    int leaf_side,
+                                                    int sub_idx_in_leaf,
+                                                    int channel_idx_in_sub,
+                                                    uint64_t delta_sats) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    if (sub_idx_in_leaf < 0) return 0;
+    size_t leaf_node_i = (size_t)f->leaf_node_indices[leaf_side];
+    if (leaf_node_i >= f->n_nodes) return 0;
+    factory_node_t *leaf = &f->nodes[leaf_node_i];
+    if ((size_t)sub_idx_in_leaf >= leaf->n_outputs) return 0;
+    /* Compute sub_node index — same as legacy.  Sub-factory PS leaves have
+       k sub-nodes after the leaf, one per output other than L-stock. */
+    /* We assume the same layout helper used by the public function.  Look up
+       sub_node_i via factory_node_indices for the leaf's child outputs. */
+    size_t sub_node_i = leaf_node_i + 1 + (size_t)sub_idx_in_leaf;
+    if (sub_node_i >= f->n_nodes) return 0;
+    factory_node_t *sub = &f->nodes[sub_node_i];
+
+    /* Reject multi-input in this MVP — fall back to legacy. */
+    if (factory_node_uses_multi_input(f, sub_node_i)) {
+        fprintf(stderr,
+                "LSP-stateless subfactory advance: multi-input not yet supported "
+                "in stateless flow -- falling back to legacy\n");
+        return -1;  /* signal caller to use legacy path */
+    }
+
+    /* Sub-factory clients (one client per output != L-stock + LSP).
+       Build sub_clients[] -- same shape as legacy. */
+    uint32_t sub_clients[FACTORY_MAX_SIGNERS];
+    size_t n_clients_in_sub = 0;
+    for (size_t s = 1; s < sub->n_signers; s++) {
+        sub_clients[n_clients_in_sub++] = sub->signer_indices[s];
+    }
+    if (n_clients_in_sub == 0) {
+        fprintf(stderr, "LSP-stateless subfactory advance: no clients in sub\n");
+        return 0;
+    }
+
+    /* Step 1: factory_subfactory_chain_advance_unsigned — rebuild unsigned_tx. */
+    if (!factory_subfactory_chain_advance_unsigned(f, leaf_side,
+                                                    sub_idx_in_leaf,
+                                                    channel_idx_in_sub,
+                                                    delta_sats)) {
+        fprintf(stderr, "LSP-stateless subfactory advance: advance_unsigned failed\n");
+        return 0;
+    }
+
+    /* Step 2: init session (state only — no poison in MVP). */
+    if (!factory_session_init_node(f, sub_node_i)) {
+        fprintf(stderr, "LSP-stateless subfactory advance: session init failed\n");
+        return 0;
+    }
+
+    /* Step 3: send PROPOSE_INTENT to each sub-client (NO LSP nonce). */
+    cJSON *propose = wire_build_subfactory_propose_intent((uint32_t)sub_node_i, 1);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE_INTENT, propose)) {
+            cJSON_Delete(propose);
+            fprintf(stderr, "LSP-stateless: send PROPOSE_INTENT failed for client %u\n",
+                    sub_clients[ci]);
+            return 0;
+        }
+    }
+    cJSON_Delete(propose);
+
+    /* Step 4: collect CLIENT_PUBNONCES from each client. */
+    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t nmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &nmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+            nmsg.msg_type != MSG_SUBFACTORY_CLIENT_PUBNONCES) {
+            fprintf(stderr,
+                    "LSP-stateless: expected CLIENT_PUBNONCES from client %u, got 0x%02x\n",
+                    sub_clients[ci], nmsg.msg_type);
+            if (nmsg.json) cJSON_Delete(nmsg.json);
+            return 0;
+        }
+        unsigned char client_pn_buf[66];
+        if (!wire_parse_subfactory_client_pubnonces(nmsg.json, client_pn_buf, 1)) {
+            cJSON_Delete(nmsg.json);
+            fprintf(stderr, "LSP-stateless: parse CLIENT_PUBNONCES failed\n");
+            return 0;
+        }
+        cJSON_Delete(nmsg.json);
+        int client_slot = factory_find_signer_slot(f, sub_node_i, sub_clients[ci]);
+        if (client_slot < 0) return 0;
+        memcpy(all_pubnonces[client_slot], client_pn_buf, 66);
+    }
+
+    /* Step 5 (THE CRITICAL ATOMIC BLOCK): gen LSP secnonce, set all nonces,
+       finalize_node, create_partial_sig (zeros secnonce), serialize. */
+    int lsp_slot = factory_find_signer_slot(f, sub_node_i, 0);
+    if (lsp_slot < 0) return 0;
+
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) return 0;
+
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
+                                lsp_seckey, &lsp->lsp_pubkey,
+                                &sub->keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless subfactory: nonce gen failed\n");
+        return 0;
+    }
+
+    unsigned char lsp_pubnonce_ser[66];
+    musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+    memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
+
+    /* Set every nonce on the session. */
+    for (size_t s = 0; s < sub->n_signers; s++) {
+        secp256k1_musig_pubnonce pn;
+        if (!musig_pubnonce_parse(lsp->ctx, &pn, all_pubnonces[s]) ||
+            !factory_session_set_nonce(f, sub_node_i, s, &pn)) {
+            memset(lsp_seckey, 0, 32);
+            fprintf(stderr, "LSP-stateless subfactory: set_nonce[%zu] failed\n", s);
+            return 0;
+        }
+    }
+
+    if (!factory_session_finalize_node(f, sub_node_i)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP-stateless subfactory: finalize_node failed\n");
+        return 0;
+    }
+
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    memset(lsp_seckey, 0, 32);
+
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
+                                    &sub->signing_session)) {
+        fprintf(stderr, "LSP-stateless subfactory: create_partial_sig failed\n");
+        return 0;
+    }
+    /* lsp_secnonce zeroed by musig_create_partial_sig.
+       INVARIANT: no LSP secnonce held across the wire recv that follows. */
+
+    unsigned char lsp_psig_ser[32];
+    musig_partial_sig_serialize(lsp->ctx, lsp_psig_ser, &lsp_psig);
+
+    if (!factory_session_set_partial_sig(f, sub_node_i, (size_t)lsp_slot, &lsp_psig)) {
+        return 0;
+    }
+
+    /* Step 6: send LSP_RESPONSE to each client (per-client copy so each can
+       individually finalize_node + sign).  Single-input -> 1 element each. */
+    cJSON *response = wire_build_subfactory_lsp_response(lsp_pubnonce_ser,
+                                                          lsp_psig_ser, 1);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_LSP_RESPONSE, response)) {
+            cJSON_Delete(response);
+            fprintf(stderr, "LSP-stateless: send LSP_RESPONSE failed for client %u\n",
+                    sub_clients[ci]);
+            return 0;
+        }
+    }
+    cJSON_Delete(response);
+
+    /* Step 7: collect CLIENT_FINAL_PSIGS from each client. */
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t pmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &pmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+            pmsg.msg_type != MSG_SUBFACTORY_CLIENT_FINAL_PSIGS) {
+            fprintf(stderr,
+                    "LSP-stateless: expected CLIENT_FINAL_PSIGS from client %u, got 0x%02x\n",
+                    sub_clients[ci], pmsg.msg_type);
+            if (pmsg.json) cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        unsigned char client_psig_buf[32];
+        if (!wire_parse_subfactory_client_final_psigs(pmsg.json, client_psig_buf, 1)) {
+            cJSON_Delete(pmsg.json);
+            fprintf(stderr, "LSP-stateless: parse CLIENT_FINAL_PSIGS failed\n");
+            return 0;
+        }
+        cJSON_Delete(pmsg.json);
+        int client_slot = factory_find_signer_slot(f, sub_node_i, sub_clients[ci]);
+        if (client_slot < 0) return 0;
+        secp256k1_musig_partial_sig client_psig;
+        if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_buf) ||
+            !factory_session_set_partial_sig(f, sub_node_i, (size_t)client_slot, &client_psig)) {
+            fprintf(stderr, "LSP-stateless: set client psig failed for %u\n", sub_clients[ci]);
+            return 0;
+        }
+    }
+
+    /* Step 8: aggregate + complete_node (attaches witness to signed_tx). */
+    if (!factory_session_complete_node(f, sub_node_i)) {
+        fprintf(stderr, "LSP-stateless subfactory: complete_node failed\n");
+        return 0;
+    }
+
+    /* Step 9: send DONE to each client. */
+    cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
+    }
+    cJSON_Delete(done);
+
+    printf("LSP-stateless subfactory chain advance: leaf %d sub %d chan %d delta %llu sats DONE\n",
+           leaf_side, sub_idx_in_leaf, channel_idx_in_sub,
+           (unsigned long long)delta_sats);
+    return 1;
+}
+
 int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    int leaf_side, int sub_idx_in_leaf,
                                    int channel_idx_in_sub,
@@ -4077,6 +4304,22 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
     factory_t *f = &lsp->factory;
+
+    /* Phase 1e.1.b (#271): when --musig-stateless is in effect, dispatch
+       to the reversed-order flow.  The stateless variant returns -1 if
+       it cannot handle the case (multi-input etc) and falls through to
+       legacy; otherwise it handles the ceremony end-to-end. */
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        if (stateless && stateless[0] == '1') {
+            int rc = lsp_subfactory_chain_advance_stateless(
+                mgr, lsp, leaf_side, sub_idx_in_leaf,
+                channel_idx_in_sub, delta_sats);
+            if (rc >= 0) return rc;
+            /* rc == -1: stateless function declined (e.g. multi-input);
+               fall through to legacy. */
+        }
+    }
 
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) {
         fprintf(stderr, "lsp_subfactory_chain_advance: refused — leaf_side %d "
