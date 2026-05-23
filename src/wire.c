@@ -1299,6 +1299,110 @@ int wire_parse_subfactory_client_final_psigs(const cJSON *json,
            (int)((size_t)expected_n_inputs * 32);
 }
 
+/* Phase 1e.2.a -- Tier B state advance reversed flow wire codec. */
+
+cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
+                                              uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "epoch_after", (double)epoch_after);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_propose_intent(const cJSON *json,
+                                           uint32_t *out_epoch_after,
+                                           uint32_t *out_n_affected_leaves) {
+    if (!json || !out_epoch_after || !out_n_affected_leaves) return 0;
+    cJSON *e = cJSON_GetObjectItem(json, "epoch_after");
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!e || !n || !cJSON_IsNumber(e) || !cJSON_IsNumber(n)) return 0;
+    *out_epoch_after = (uint32_t)e->valuedouble;
+    *out_n_affected_leaves = (uint32_t)n->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf,
+                                                  uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !pubnonces_per_leaf) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "pubnonces_per_leaf", pubnonces_per_leaf,
+                      (size_t)n_affected_leaves * 66);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_client_path_nonces(const cJSON *json,
+                                               unsigned char *out_pubnonces_per_leaf,
+                                               uint32_t expected_n_affected_leaves) {
+    if (!json || !out_pubnonces_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    return wire_json_get_hex(json, "pubnonces_per_leaf",
+                               out_pubnonces_per_leaf,
+                               (size_t)expected_n_affected_leaves * 66) ==
+           (int)((size_t)expected_n_affected_leaves * 66);
+}
+
+cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf,
+                                            const unsigned char *lsp_psigs_per_leaf,
+                                            uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !lsp_pubnonces_per_leaf || !lsp_psigs_per_leaf) {
+        if (j) cJSON_Delete(j);
+        return NULL;
+    }
+    wire_json_add_hex(j, "lsp_pubnonces_per_leaf", lsp_pubnonces_per_leaf,
+                      (size_t)n_affected_leaves * 66);
+    wire_json_add_hex(j, "lsp_psigs_per_leaf", lsp_psigs_per_leaf,
+                      (size_t)n_affected_leaves * 32);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_lsp_response(const cJSON *json,
+                                         unsigned char *out_lsp_pubnonces_per_leaf,
+                                         unsigned char *out_lsp_psigs_per_leaf,
+                                         uint32_t expected_n_affected_leaves) {
+    if (!json || !out_lsp_pubnonces_per_leaf || !out_lsp_psigs_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonces_per_leaf",
+                            out_lsp_pubnonces_per_leaf,
+                            (size_t)expected_n_affected_leaves * 66) !=
+        (int)((size_t)expected_n_affected_leaves * 66)) return 0;
+    if (wire_json_get_hex(json, "lsp_psigs_per_leaf",
+                            out_lsp_psigs_per_leaf,
+                            (size_t)expected_n_affected_leaves * 32) !=
+        (int)((size_t)expected_n_affected_leaves * 32)) return 0;
+    return 1;
+}
+
+cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf,
+                                                  uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !psigs_per_leaf) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "psigs_per_leaf", psigs_per_leaf,
+                      (size_t)n_affected_leaves * 32);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_client_final_psigs(const cJSON *json,
+                                               unsigned char *out_psigs_per_leaf,
+                                               uint32_t expected_n_affected_leaves) {
+    if (!json || !out_psigs_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    return wire_json_get_hex(json, "psigs_per_leaf",
+                               out_psigs_per_leaf,
+                               (size_t)expected_n_affected_leaves * 32) ==
+           (int)((size_t)expected_n_affected_leaves * 32);
+}
+
 
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();
