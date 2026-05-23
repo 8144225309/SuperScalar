@@ -4091,7 +4091,22 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     if (sub_node_i >= f->n_nodes) return 0;
     factory_node_t *sub = &f->nodes[sub_node_i];
 
-    /* Reject multi-input in this MVP — fall back to legacy. */
+    /* Phase 1e.1.b MVP scope: reject k>=2 multi-client.  Wire codec does
+       not yet relay other client pubnonces in LSP_RESPONSE.  Phase 1e.1.d
+       follow-up will extend the codec.  For now, fall back to legacy. */
+    {
+        size_t check_n_clients = 0;
+        for (size_t s = 1; s < sub->n_signers; s++) check_n_clients++;
+        if (check_n_clients > 1) {
+            fprintf(stderr,
+                "LSP-stateless subfactory: k>=2 (n_clients=%zu) not yet "
+                "supported in stateless flow -- falling back to legacy\n",
+                check_n_clients);
+            return -1;
+        }
+    }
+
+    /* Reject multi-input in this MVP -- fall back to legacy. */
     if (factory_node_uses_multi_input(f, sub_node_i)) {
         fprintf(stderr,
                 "LSP-stateless subfactory advance: multi-input not yet supported "
