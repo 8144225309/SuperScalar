@@ -2553,10 +2553,53 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
    the LSP can retry by calling lsp_run_state_advance() again.  The
    on-chain factory is unaffected — old signed TXs remain stored
    (overlap window) and the watchtower still has the old burn TXs. */
+/* Phase 1e.2.b scaffolding: stub for the reversed-flow stateless Tier B
+   state advance ceremony.  Dispatched from the public function when
+   SS_MUSIG_STATELESS=1 is set.  Currently returns -1 for all cases
+   (caller falls through to legacy lsp_run_state_advance) — Phase 1e.2.c
+   will fill in the actual multi-leaf MuSig ceremony using the wire codec
+   added in Phase 1e.2.a (#328).
+
+   Wire flow (per Phase 1e.2.a opcodes):
+     LSP   -> Client:  MSG_STATE_ADV_PROPOSE_INTENT (0x81)
+     Client -> LSP:    MSG_STATE_ADV_CLIENT_PATH_NONCES (0x82)
+     LSP atomic:       gen lsp_secnonces + set nonces + finalize + create_partial_sigs
+                        (lsp_secnonces zeroed before next send)
+     LSP   -> Client:  MSG_STATE_ADV_LSP_RESPONSE (0x83) per-leaf data
+     Client -> LSP:    MSG_STATE_ADV_CLIENT_FINAL_PSIGS (0x84)
+     LSP:              aggregate + factory_session_complete_node per leaf
+     LSP   -> Client:  MSG_PATH_SIGN_DONE (existing terminal opcode)
+
+   Returns: 1 on success, 0 on failure, -1 if the stateless function cannot
+   handle this case (caller falls through to legacy). */
+static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
+                                             lsp_t *lsp,
+                                             int trigger_leaf_side) {
+    (void)mgr; (void)lsp; (void)trigger_leaf_side;
+    /* Phase 1e.2.b is a stub only.  Phase 1e.2.c will implement the
+       multi-leaf reversed flow.  For now, refuse and fall back to legacy. */
+    fprintf(stderr,
+        "LSP-stateless Tier B: not yet implemented (Phase 1e.2.c) -- "
+        "falling back to legacy lsp_run_state_advance\n");
+    return -1;
+}
+
 int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             int trigger_leaf_side) {
     factory_t *f = &lsp->factory;
     if (!mgr || !lsp) return 0;
+
+    /* Phase 1e.2.b (#271): when --musig-stateless is in effect, dispatch
+       to the reversed-order flow.  Returns -1 to signal fall-through to
+       legacy if the stateless variant cannot handle this case. */
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        if (stateless && stateless[0] == '1') {
+            int rc = lsp_run_state_advance_stateless(mgr, lsp, trigger_leaf_side);
+            if (rc >= 0) return rc;
+            /* rc == -1: stateless declined; fall through to legacy below. */
+        }
+    }
 
     /* CL4-rollover (#250 Tier B path): snapshot the pre-rollover leaf 0
        signed_tx so we can broadcast it post-ceremony as the stake-theft
