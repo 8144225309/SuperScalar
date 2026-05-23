@@ -527,10 +527,12 @@ int    wire_parse_subfactory_client_final_psigs(const cJSON *json,
    ceremony: per-leaf arrays of pubnonces + psigs.  n_affected_leaves is
    the size of each array; receiver passes expected count to size buffers. */
 cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
-                                              uint32_t n_affected_leaves);
+                                              uint32_t n_affected_leaves,
+                                              int trigger_leaf_side);
 int    wire_parse_state_adv_propose_intent(const cJSON *json,
                                               uint32_t *out_epoch_after,
-                                              uint32_t *out_n_affected_leaves);
+                                              uint32_t *out_n_affected_leaves,
+                                              int *out_trigger_leaf_side);
 
 cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf /* n * 66 */,
                                                   uint32_t n_affected_leaves);

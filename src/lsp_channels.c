@@ -2626,7 +2626,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
 
     /* Step 3: Send PROPOSE_INTENT to all clients (no nonces). */
     cJSON *propose = wire_build_state_adv_propose_intent(
-        (uint32_t)f->counter.current_epoch, (uint32_t)n_affected);
+        (uint32_t)f->counter.current_epoch, (uint32_t)n_affected,
+        trigger_leaf_side);
     for (size_t c = 0; c < lsp->n_clients; c++) {
         if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_PROPOSE_INTENT, propose)) {
             cJSON_Delete(propose);

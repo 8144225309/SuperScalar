@@ -1302,23 +1302,30 @@ int wire_parse_subfactory_client_final_psigs(const cJSON *json,
 /* Phase 1e.2.a -- Tier B state advance reversed flow wire codec. */
 
 cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
-                                              uint32_t n_affected_leaves) {
+                                              uint32_t n_affected_leaves,
+                                              int trigger_leaf_side) {
     cJSON *j = cJSON_CreateObject();
     if (!j) return NULL;
     cJSON_AddNumberToObject(j, "epoch_after", (double)epoch_after);
     cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    cJSON_AddNumberToObject(j, "trigger_leaf_side", (double)trigger_leaf_side);
     return j;
 }
 
 int wire_parse_state_adv_propose_intent(const cJSON *json,
                                            uint32_t *out_epoch_after,
-                                           uint32_t *out_n_affected_leaves) {
-    if (!json || !out_epoch_after || !out_n_affected_leaves) return 0;
+                                           uint32_t *out_n_affected_leaves,
+                                           int *out_trigger_leaf_side) {
+    if (!json || !out_epoch_after || !out_n_affected_leaves ||
+        !out_trigger_leaf_side) return 0;
     cJSON *e = cJSON_GetObjectItem(json, "epoch_after");
     cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
-    if (!e || !n || !cJSON_IsNumber(e) || !cJSON_IsNumber(n)) return 0;
+    cJSON *t = cJSON_GetObjectItem(json, "trigger_leaf_side");
+    if (!e || !n || !t ||
+        !cJSON_IsNumber(e) || !cJSON_IsNumber(n) || !cJSON_IsNumber(t)) return 0;
     *out_epoch_after = (uint32_t)e->valuedouble;
     *out_n_affected_leaves = (uint32_t)n->valuedouble;
+    *out_trigger_leaf_side = (int)t->valuedouble;
     return 1;
 }
 
