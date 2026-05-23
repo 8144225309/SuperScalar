@@ -1174,6 +1174,111 @@ int wire_parse_leaf_advance_final(const cJSON *json,
     return 1;
 }
 
+/* Phase 1e.1.a -- sub-factory reversed flow wire codec.  Minimal payloads:
+   per-input arrays serialized as concatenated hex strings (n_inputs * size).
+   The receiver passes expected_n_inputs to know how to split. */
+
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "subfactory_id", (double)subfactory_id);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_propose_intent(const cJSON *json,
+                                           uint32_t *out_subfactory_id,
+                                           uint32_t *out_n_inputs) {
+    if (!json || !out_subfactory_id || !out_n_inputs) return 0;
+    cJSON *sf = cJSON_GetObjectItem(json, "subfactory_id");
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!sf || !ni || !cJSON_IsNumber(sf) || !cJSON_IsNumber(ni)) return 0;
+    *out_subfactory_id = (uint32_t)sf->valuedouble;
+    *out_n_inputs = (uint32_t)ni->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input,
+                                                uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !pubnonces_per_input) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "pubnonces_per_input", pubnonces_per_input,
+                      (size_t)n_inputs * 66);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_client_pubnonces(const cJSON *json,
+                                             unsigned char *out_pubnonces_per_input,
+                                             uint32_t expected_n_inputs) {
+    if (!json || !out_pubnonces_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    return wire_json_get_hex(json, "pubnonces_per_input",
+                               out_pubnonces_per_input,
+                               (size_t)expected_n_inputs * 66) ==
+           (int)((size_t)expected_n_inputs * 66);
+}
+
+cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input,
+                                            const unsigned char *lsp_psigs_per_input,
+                                            uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !lsp_pubnonces_per_input || !lsp_psigs_per_input) {
+        if (j) cJSON_Delete(j);
+        return NULL;
+    }
+    wire_json_add_hex(j, "lsp_pubnonces_per_input", lsp_pubnonces_per_input,
+                      (size_t)n_inputs * 66);
+    wire_json_add_hex(j, "lsp_psigs_per_input", lsp_psigs_per_input,
+                      (size_t)n_inputs * 32);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_lsp_response(const cJSON *json,
+                                         unsigned char *out_lsp_pubnonces_per_input,
+                                         unsigned char *out_lsp_psigs_per_input,
+                                         uint32_t expected_n_inputs) {
+    if (!json || !out_lsp_pubnonces_per_input || !out_lsp_psigs_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonces_per_input",
+                            out_lsp_pubnonces_per_input,
+                            (size_t)expected_n_inputs * 66) !=
+        (int)((size_t)expected_n_inputs * 66)) return 0;
+    if (wire_json_get_hex(json, "lsp_psigs_per_input",
+                            out_lsp_psigs_per_input,
+                            (size_t)expected_n_inputs * 32) !=
+        (int)((size_t)expected_n_inputs * 32)) return 0;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input,
+                                                  uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !psigs_per_input) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "psigs_per_input", psigs_per_input,
+                      (size_t)n_inputs * 32);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_client_final_psigs(const cJSON *json,
+                                               unsigned char *out_psigs_per_input,
+                                               uint32_t expected_n_inputs) {
+    if (!json || !out_psigs_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    return wire_json_get_hex(json, "psigs_per_input",
+                               out_psigs_per_input,
+                               (size_t)expected_n_inputs * 32) ==
+           (int)((size_t)expected_n_inputs * 32);
+}
+
 
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();

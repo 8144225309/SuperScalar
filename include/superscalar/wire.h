@@ -151,6 +151,17 @@
 #define MSG_LEAF_ADVANCE_LSP_RESPONSE     0x7B  /* LSP -> Client: lsp_pubnonce + lsp_psig (atomic generate + sign on LSP) */
 #define MSG_LEAF_ADVANCE_FINAL            0x7C  /* Client -> LSP: final aggregated sig (optional confirmation for LSP records) */
 
+/* MuSig2 stateless redesign Phase 1e (#271) -- sub-factory chain advance
+   reversed flow.  Multi-client, multi-input ceremony.  Same atomic-signer
+   property as Phase 1c/1d: LSP secnonces generated only AFTER receiving all
+   client pubnonces, zeroed by musig_create_partial_sig before any subsequent
+   wire recv.  Existing 0x73-0x77 opcodes continue to work for non-stateless
+   peers. */
+#define MSG_SUBFACTORY_PROPOSE_INTENT      0x7D  /* LSP -> Client: intent (no nonce field) */
+#define MSG_SUBFACTORY_CLIENT_PUBNONCES    0x7E  /* Client -> LSP: this client's pubnonces (one per input) */
+#define MSG_SUBFACTORY_LSP_RESPONSE        0x7F  /* LSP -> Client: lsp_pubnonces + lsp_psigs (atomic gen+sign) */
+#define MSG_SUBFACTORY_CLIENT_FINAL_PSIGS  0x80  /* Client -> LSP: client psigs (one per input, after aggregating LSP+all-clients) */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -465,6 +476,35 @@ cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64],
 int    wire_parse_leaf_advance_final(const cJSON *json,
                                        unsigned char out_final_sig[64],
                                        unsigned char out_final_poison_sig_opt[64] /* may be NULL */);
+
+/* Phase 1e sub-factory reversed flow scaffolding.  Wire builders/parsers
+   are minimal — the actual sub-factory advance ceremony (Phase 1e.1.b)
+   will define richer payloads (per-input arrays for multi-input).  For
+   now these are stubs to be filled in. */
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs);
+int    wire_parse_subfactory_propose_intent(const cJSON *json,
+                                              uint32_t *out_subfactory_id,
+                                              uint32_t *out_n_inputs);
+
+cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input /* n_inputs * 66 */,
+                                                uint32_t n_inputs);
+int    wire_parse_subfactory_client_pubnonces(const cJSON *json,
+                                                unsigned char *out_pubnonces_per_input /* n_inputs * 66 */,
+                                                uint32_t expected_n_inputs);
+
+cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input /* n_inputs * 66 */,
+                                            const unsigned char *lsp_psigs_per_input /* n_inputs * 32 */,
+                                            uint32_t n_inputs);
+int    wire_parse_subfactory_lsp_response(const cJSON *json,
+                                            unsigned char *out_lsp_pubnonces_per_input,
+                                            unsigned char *out_lsp_psigs_per_input,
+                                            uint32_t expected_n_inputs);
+
+cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input /* n_inputs * 32 */,
+                                                  uint32_t n_inputs);
+int    wire_parse_subfactory_client_final_psigs(const cJSON *json,
+                                                  unsigned char *out_psigs_per_input,
+                                                  uint32_t expected_n_inputs);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
