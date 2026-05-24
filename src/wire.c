@@ -1410,6 +1410,103 @@ int wire_parse_state_adv_client_final_psigs(const cJSON *json,
            (int)((size_t)expected_n_affected_leaves * 32);
 }
 
+/* Phase 1e.3.a -- factory creation reversed flow wire codec. */
+
+cJSON *wire_build_factory_propose_intent(uint32_t n_nodes) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "n_nodes", (double)n_nodes);
+    return j;
+}
+
+int wire_parse_factory_propose_intent(const cJSON *json, uint32_t *out_n_nodes) {
+    if (!json || !out_n_nodes) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_nodes");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    *out_n_nodes = (uint32_t)n->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_factory_client_pubnonces(const unsigned char *pubnonces_per_node,
+                                              uint32_t n_nodes) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !pubnonces_per_node) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "pubnonces_per_node", pubnonces_per_node,
+                      (size_t)n_nodes * 66);
+    cJSON_AddNumberToObject(j, "n_nodes", (double)n_nodes);
+    return j;
+}
+
+int wire_parse_factory_client_pubnonces(const cJSON *json,
+                                           unsigned char *out_pubnonces_per_node,
+                                           uint32_t expected_n_nodes) {
+    if (!json || !out_pubnonces_per_node) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_nodes");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_nodes) return 0;
+    return wire_json_get_hex(json, "pubnonces_per_node",
+                               out_pubnonces_per_node,
+                               (size_t)expected_n_nodes * 66) ==
+           (int)((size_t)expected_n_nodes * 66);
+}
+
+cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_node,
+                                          const unsigned char *lsp_psigs_per_node,
+                                          uint32_t n_nodes) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !lsp_pubnonces_per_node || !lsp_psigs_per_node) {
+        if (j) cJSON_Delete(j);
+        return NULL;
+    }
+    wire_json_add_hex(j, "lsp_pubnonces_per_node", lsp_pubnonces_per_node,
+                      (size_t)n_nodes * 66);
+    wire_json_add_hex(j, "lsp_psigs_per_node", lsp_psigs_per_node,
+                      (size_t)n_nodes * 32);
+    cJSON_AddNumberToObject(j, "n_nodes", (double)n_nodes);
+    return j;
+}
+
+int wire_parse_factory_lsp_response(const cJSON *json,
+                                       unsigned char *out_lsp_pubnonces_per_node,
+                                       unsigned char *out_lsp_psigs_per_node,
+                                       uint32_t expected_n_nodes) {
+    if (!json || !out_lsp_pubnonces_per_node || !out_lsp_psigs_per_node) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_nodes");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_nodes) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonces_per_node",
+                            out_lsp_pubnonces_per_node,
+                            (size_t)expected_n_nodes * 66) !=
+        (int)((size_t)expected_n_nodes * 66)) return 0;
+    if (wire_json_get_hex(json, "lsp_psigs_per_node",
+                            out_lsp_psigs_per_node,
+                            (size_t)expected_n_nodes * 32) !=
+        (int)((size_t)expected_n_nodes * 32)) return 0;
+    return 1;
+}
+
+cJSON *wire_build_factory_client_final_psigs(const unsigned char *psigs_per_node,
+                                                uint32_t n_nodes) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !psigs_per_node) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "psigs_per_node", psigs_per_node, (size_t)n_nodes * 32);
+    cJSON_AddNumberToObject(j, "n_nodes", (double)n_nodes);
+    return j;
+}
+
+int wire_parse_factory_client_final_psigs(const cJSON *json,
+                                             unsigned char *out_psigs_per_node,
+                                             uint32_t expected_n_nodes) {
+    if (!json || !out_psigs_per_node) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_nodes");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_nodes) return 0;
+    return wire_json_get_hex(json, "psigs_per_node",
+                               out_psigs_per_node,
+                               (size_t)expected_n_nodes * 32) ==
+           (int)((size_t)expected_n_nodes * 32);
+}
+
 
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();

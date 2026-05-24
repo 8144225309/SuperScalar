@@ -174,6 +174,16 @@
 #define MSG_STATE_ADV_LSP_RESPONSE        0x83  /* LSP -> Client: per-leaf lsp pubnonces + lsp psigs */
 #define MSG_STATE_ADV_CLIENT_FINAL_PSIGS  0x84  /* Client -> LSP: per-leaf client psigs */
 
+/* MuSig2 stateless redesign Phase 1e.3 (#271) -- factory creation reversed flow.
+   Initial ceremony where every signer participates over the full TX tree.
+   Same atomic-signer property: LSP secnonces generated only AFTER
+   CLIENT_PUBNONCES received from every client.  Existing 0x10-0x14 opcodes
+   continue to work for non-stateless peers. */
+#define MSG_FACTORY_PROPOSE_INTENT      0x85  /* LSP -> Client: intent (no nonces) */
+#define MSG_FACTORY_CLIENT_PUBNONCES    0x86  /* Client -> LSP: per-node pubnonces */
+#define MSG_FACTORY_LSP_RESPONSE        0x87  /* LSP -> Client: per-node lsp pubnonces + psigs */
+#define MSG_FACTORY_CLIENT_FINAL_PSIGS  0x88
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -553,6 +563,31 @@ cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_le
 int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_leaf,
                                                   uint32_t expected_n_affected_leaves);
+
+/* Phase 1e.3.a factory creation reversed flow wire codec.  Multi-node ceremony:
+   per-node arrays of pubnonces + psigs. */
+cJSON *wire_build_factory_propose_intent(uint32_t n_nodes);
+int    wire_parse_factory_propose_intent(const cJSON *json, uint32_t *out_n_nodes);
+
+cJSON *wire_build_factory_client_pubnonces(const unsigned char *pubnonces_per_node /* n * 66 */,
+                                              uint32_t n_nodes);
+int    wire_parse_factory_client_pubnonces(const cJSON *json,
+                                              unsigned char *out_pubnonces_per_node,
+                                              uint32_t expected_n_nodes);
+
+cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_node /* n * 66 */,
+                                          const unsigned char *lsp_psigs_per_node /* n * 32 */,
+                                          uint32_t n_nodes);
+int    wire_parse_factory_lsp_response(const cJSON *json,
+                                          unsigned char *out_lsp_pubnonces_per_node,
+                                          unsigned char *out_lsp_psigs_per_node,
+                                          uint32_t expected_n_nodes);
+
+cJSON *wire_build_factory_client_final_psigs(const unsigned char *psigs_per_node /* n * 32 */,
+                                                uint32_t n_nodes);
+int    wire_parse_factory_client_final_psigs(const cJSON *json,
+                                                unsigned char *out_psigs_per_node,
+                                                uint32_t expected_n_nodes);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
