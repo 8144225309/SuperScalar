@@ -162,6 +162,18 @@
 #define MSG_SUBFACTORY_LSP_RESPONSE        0x7F  /* LSP -> Client: lsp_pubnonces + lsp_psigs (atomic gen+sign) */
 #define MSG_SUBFACTORY_CLIENT_FINAL_PSIGS  0x80  /* Client -> LSP: client psigs (one per input, after aggregating LSP+all-clients) */
 
+/* MuSig2 stateless redesign Phase 1e.2 (#271) -- Tier B state advance
+   reversed flow.  Multi-leaf ceremony (each affected leaf is its own MuSig
+   session).  Same atomic-signer property: LSP secnonces generated only
+   AFTER receiving all CLIENT_PATH_NONCES.  Existing 0x60-range opcodes
+   (MSG_STATE_ADVANCE_PROPOSE, MSG_PATH_NONCE_BUNDLE, MSG_PATH_ALL_NONCES,
+   MSG_PATH_PSIG_BUNDLE, MSG_PATH_SIGN_DONE) continue to work for
+   non-stateless peers. */
+#define MSG_STATE_ADV_PROPOSE_INTENT      0x81  /* LSP -> Client: intent (no nonce field) */
+#define MSG_STATE_ADV_CLIENT_PATH_NONCES  0x82  /* Client -> LSP: per-leaf pubnonces */
+#define MSG_STATE_ADV_LSP_RESPONSE        0x83  /* LSP -> Client: per-leaf lsp pubnonces + lsp psigs */
+#define MSG_STATE_ADV_CLIENT_FINAL_PSIGS  0x84  /* Client -> LSP: per-leaf client psigs */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -510,6 +522,37 @@ cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_i
 int    wire_parse_subfactory_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_input,
                                                   uint32_t expected_n_inputs);
+
+/* Phase 1e.2.a Tier B state advance reversed flow wire codec.  Multi-leaf
+   ceremony: per-leaf arrays of pubnonces + psigs.  n_affected_leaves is
+   the size of each array; receiver passes expected count to size buffers. */
+cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
+                                              uint32_t n_affected_leaves,
+                                              int trigger_leaf_side);
+int    wire_parse_state_adv_propose_intent(const cJSON *json,
+                                              uint32_t *out_epoch_after,
+                                              uint32_t *out_n_affected_leaves,
+                                              int *out_trigger_leaf_side);
+
+cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf /* n * 66 */,
+                                                  uint32_t n_affected_leaves);
+int    wire_parse_state_adv_client_path_nonces(const cJSON *json,
+                                                  unsigned char *out_pubnonces_per_leaf,
+                                                  uint32_t expected_n_affected_leaves);
+
+cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf /* n * 66 */,
+                                            const unsigned char *lsp_psigs_per_leaf /* n * 32 */,
+                                            uint32_t n_affected_leaves);
+int    wire_parse_state_adv_lsp_response(const cJSON *json,
+                                            unsigned char *out_lsp_pubnonces_per_leaf,
+                                            unsigned char *out_lsp_psigs_per_leaf,
+                                            uint32_t expected_n_affected_leaves);
+
+cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf /* n * 32 */,
+                                                  uint32_t n_affected_leaves);
+int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
+                                                  unsigned char *out_psigs_per_leaf,
+                                                  uint32_t expected_n_affected_leaves);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
