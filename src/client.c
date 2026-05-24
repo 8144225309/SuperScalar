@@ -2866,10 +2866,198 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    the sub-factory must co-sign the new state.
 
    Returns 1 on success, 0 on any failure. */
+/* Phase 1e.1.c: client-side stateless subfactory advance.  Dispatched
+   from the public function when SS_MUSIG_STATELESS=1 and the LSP sent a
+   PROPOSE_INTENT (new opcode 0x7D) instead of legacy PROPOSE (0x73). */
+static int client_handle_subfactory_advance_stateless(int fd,
+                                                        secp256k1_context *ctx,
+                                                        const secp256k1_keypair *keypair,
+                                                        factory_t *factory,
+                                                        uint32_t my_index,
+                                                        const wire_msg_t *propose_msg) {
+    uint32_t sub_node_id, n_inputs;
+    int leaf_side, sub_idx, channel_idx;
+    uint64_t delta_sats;
+    if (!wire_parse_subfactory_propose_intent(propose_msg->json,
+                                                 &sub_node_id, &n_inputs,
+                                                 &leaf_side, &sub_idx, &channel_idx,
+                                                 &delta_sats)) {
+        fprintf(stderr, "Client-stateless subfactory %u: parse PROPOSE_INTENT failed\n",
+                my_index);
+        return 0;
+    }
+    if (n_inputs != 1) {
+        fprintf(stderr, "Client-stateless subfactory %u: n_inputs=%u not supported "
+                "(MVP single-input only)\n", my_index, n_inputs);
+        return 0;
+    }
+    if (sub_node_id >= factory->n_nodes) {
+        fprintf(stderr, "Client-stateless subfactory %u: bad sub_node_id %u\n",
+                my_index, sub_node_id);
+        return 0;
+    }
+    size_t sub_node_i = (size_t)sub_node_id;
+    factory_node_t *sub = &factory->nodes[sub_node_i];
+
+    /* MVP: refuse k>=2 (multi-client) -- matches LSP-side refusal. */
+    {
+        size_t check_n_clients = 0;
+        for (size_t s = 1; s < sub->n_signers; s++) check_n_clients++;
+        if (check_n_clients > 1) {
+            fprintf(stderr,
+                "Client-stateless subfactory %u: k>=2 (n_clients=%zu) not yet "
+                "supported -- LSP should fall back to legacy\n",
+                my_index, check_n_clients);
+            return 0;
+        }
+    }
+
+    /* Phase 1e.1.b amendment: PROPOSE_INTENT now carries the advance params
+       (leaf_side, sub_idx, channel_idx, delta_sats).  Apply the advance
+       locally so unsigned_tx matches LSP's deterministically. */
+    if (!factory_subfactory_chain_advance_unsigned(factory, leaf_side, sub_idx,
+                                                     channel_idx, delta_sats)) {
+        fprintf(stderr,
+            "Client-stateless subfactory %u: chain_advance_unsigned failed "
+            "(leaf=%d sub=%d ch=%d delta=%llu)\n",
+            my_index, leaf_side, sub_idx, channel_idx,
+            (unsigned long long)delta_sats);
+        return 0;
+    }
+
+        /* Init session (state only, no poison in MVP). */
+    if (!factory_session_init_node(factory, sub_node_i)) {
+        fprintf(stderr, "Client-stateless subfactory %u: session_init failed\n", my_index);
+        return 0;
+    }
+
+    int my_slot = factory_find_signer_slot(factory, sub_node_i, my_index);
+    int lsp_slot = factory_find_signer_slot(factory, sub_node_i, 0);
+    if (my_slot < 0 || lsp_slot < 0) {
+        fprintf(stderr, "Client-stateless subfactory %u: slot lookup failed (my=%d lsp=%d)\n",
+                my_index, my_slot, lsp_slot);
+        return 0;
+    }
+
+    /* Gen own secnonce + pubnonce. */
+    unsigned char my_seckey[32];
+    secp256k1_pubkey my_pubkey;
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        fprintf(stderr, "Client-stateless subfactory %u: keypair_sec failed\n", my_index);
+        return 0;
+    }
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    secp256k1_musig_secnonce my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+                                my_seckey, &my_pubkey,
+                                &sub->keyagg.cache)) {
+        memset(my_seckey, 0, 32);
+        fprintf(stderr, "Client-stateless subfactory %u: nonce gen failed\n", my_index);
+        return 0;
+    }
+    memset(my_seckey, 0, 32);
+    if (!factory_session_set_nonce(factory, sub_node_i, (size_t)my_slot, &my_pubnonce)) {
+        fprintf(stderr, "Client-stateless subfactory %u: set own nonce failed\n", my_index);
+        return 0;
+    }
+
+    /* Send CLIENT_PUBNONCES with own pubnonce. */
+    unsigned char my_pubnonce_ser[66];
+    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
+    cJSON *cpn_json = wire_build_subfactory_client_pubnonces(my_pubnonce_ser, 1);
+    if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_PUBNONCES, cpn_json)) {
+        cJSON_Delete(cpn_json);
+        fprintf(stderr, "Client-stateless subfactory %u: send CLIENT_PUBNONCES failed\n",
+                my_index);
+        return 0;
+    }
+    cJSON_Delete(cpn_json);
+
+    /* Wait for LSP_RESPONSE with lsp_pubnonce + lsp_psig. */
+    wire_msg_t lr_msg;
+    if (!wire_recv(fd, &lr_msg) || lr_msg.msg_type != MSG_SUBFACTORY_LSP_RESPONSE) {
+        fprintf(stderr,
+            "Client-stateless subfactory %u: expected LSP_RESPONSE, got 0x%02x\n",
+            my_index, lr_msg.json ? lr_msg.msg_type : 0);
+        if (lr_msg.json) cJSON_Delete(lr_msg.json);
+        return 0;
+    }
+    unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
+    if (!wire_parse_subfactory_lsp_response(lr_msg.json,
+                                              lsp_pubnonce_ser, lsp_psig_ser, 1)) {
+        cJSON_Delete(lr_msg.json);
+        fprintf(stderr, "Client-stateless subfactory %u: parse LSP_RESPONSE failed\n",
+                my_index);
+        return 0;
+    }
+    cJSON_Delete(lr_msg.json);
+
+    /* Set LSP nonce, finalize_node. */
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser) ||
+        !factory_session_set_nonce(factory, sub_node_i, (size_t)lsp_slot, &lsp_pubnonce)) {
+        fprintf(stderr, "Client-stateless subfactory %u: set LSP nonce failed\n", my_index);
+        return 0;
+    }
+    if (!factory_session_finalize_node(factory, sub_node_i)) {
+        fprintf(stderr, "Client-stateless subfactory %u: finalize_node failed\n", my_index);
+        return 0;
+    }
+
+    /* Create own partial_sig (zeros own secnonce). */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+                                    &sub->signing_session)) {
+        fprintf(stderr, "Client-stateless subfactory %u: create_partial_sig failed\n",
+                my_index);
+        return 0;
+    }
+    /* my_secnonce zeroed by musig_create_partial_sig.
+       INVARIANT: we no longer hold any client secnonce for this signing session. */
+
+    /* Send CLIENT_FINAL_PSIGS with own psig.  LSP aggregates with its own psig. */
+    unsigned char my_psig_ser[32];
+    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
+    cJSON *fp_json = wire_build_subfactory_client_final_psigs(my_psig_ser, 1);
+    if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_FINAL_PSIGS, fp_json)) {
+        cJSON_Delete(fp_json);
+        fprintf(stderr, "Client-stateless subfactory %u: send CLIENT_FINAL_PSIGS failed\n",
+                my_index);
+        return 0;
+    }
+    cJSON_Delete(fp_json);
+
+    /* Wait for DONE. */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_SUBFACTORY_DONE) {
+        fprintf(stderr,
+            "Client-stateless subfactory %u: expected DONE, got 0x%02x\n",
+            my_index, done_msg.json ? done_msg.msg_type : 0);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        return 0;
+    }
+    if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    printf("Client-stateless subfactory %u: advance done (sub_node=%u)\n",
+           my_index, sub_node_id);
+    return 1;
+}
+
 int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const secp256k1_keypair *keypair,
                                        factory_t *factory, uint32_t my_index,
                                        const wire_msg_t *propose_msg) {
+    /* Phase 1e.1.c (#271): if the LSP sent PROPOSE_INTENT (new opcode),
+       it'''s the reversed stateless flow -- dispatch.  Legacy PROPOSE
+       (0x73) keeps using the path below. */
+    if (propose_msg && propose_msg->msg_type == MSG_SUBFACTORY_PROPOSE_INTENT) {
+        return client_handle_subfactory_advance_stateless(fd, ctx, keypair,
+                                                            factory, my_index,
+                                                            propose_msg);
+    }
+
     int leaf_side, sub_idx, channel_idx;
     uint64_t delta_sats;
     unsigned char lsp_pubnonce_ser[66];
@@ -4085,11 +4273,266 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* Phase 1e.2.d: client-side stateless Tier B handler.  Dispatched from
+   client_handle_state_advance when the LSP sends PROPOSE_INTENT (0x81)
+   instead of legacy STATE_ADVANCE_PROPOSE.  Mirrors lsp_run_state_advance_stateless
+   from Phase 1e.2.c.  MVP scope:
+     - multi-leaf state TX
+     - single-input per leaf
+     - no poison TX */
+static int client_handle_state_advance_stateless(int fd,
+                                                   secp256k1_context *ctx,
+                                                   const secp256k1_keypair *keypair,
+                                                   factory_t *factory,
+                                                   uint32_t my_index,
+                                                   const wire_msg_t *propose_msg) {
+    /* Step 1: Parse PROPOSE_INTENT { epoch_after, n_affected_leaves, trigger_leaf_side }. */
+    uint32_t epoch_after, n_affected_leaves;
+    int trigger_leaf_side;
+    if (!wire_parse_state_adv_propose_intent(propose_msg->json,
+                                                &epoch_after, &n_affected_leaves,
+                                                &trigger_leaf_side)) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: parse PROPOSE_INTENT failed\n", my_index);
+        return 0;
+    }
+
+    /* Step 2: Run factory_advance_leaf_unsigned locally.  Must return -1
+       (root rolled over, all leaves rebuilt) — mirrors caller contract on LSP. */
+    int adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
+    if (adv_rc != -1) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: advance_leaf_unsigned returned %d (expected -1)\n",
+            my_index, adv_rc);
+        return 0;
+    }
+
+    /* Step 3: Build affected[] — SAME logic as LSP. */
+    size_t affected[FACTORY_MAX_NODES];
+    size_t n_affected = 0;
+    for (size_t i = 0; i < factory->n_nodes; i++) {
+        const factory_node_t *n = &factory->nodes[i];
+        if (n->is_ps_leaf && trigger_leaf_side != -1) continue;
+        if (!n->is_built) continue;
+        if (n->is_signed) continue;
+        affected[n_affected++] = i;
+    }
+    if (n_affected != n_affected_leaves) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: local n_affected=%zu mismatches LSP=%u\n",
+            my_index, n_affected, n_affected_leaves);
+        return 0;
+    }
+
+    /* MVP refusal: multi-input on any affected. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (factory_node_uses_multi_input(factory, affected[k])) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: affected %zu uses multi-input — refusing\n",
+                my_index, affected[k]);
+            return 0;
+        }
+    }
+
+    /* Step 4: init MuSig session per affected. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!factory_session_init_node(factory, affected[k])) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: init_node[%zu] failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+    }
+
+    /* Step 5: gen own pubnonces for each affected node where this client signs.
+       For non-participating leaves: leave the buffer all-zeros (LSP detects). */
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: keypair_sec failed\n", my_index);
+        return 0;
+    }
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    unsigned char my_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    secp256k1_musig_secnonce my_secnonces[FACTORY_MAX_NODES];
+    int my_slot_per_node[FACTORY_MAX_NODES];
+    int my_signs_per_node[FACTORY_MAX_NODES];
+    for (size_t k = 0; k < n_affected; k++) {
+        memset(my_pubnonces_per_node[k], 0, 66);
+        my_slot_per_node[k] = -1;
+        my_signs_per_node[k] = 0;
+    }
+
+    for (size_t k = 0; k < n_affected; k++) {
+        int slot = factory_find_signer_slot(factory, affected[k], my_index);
+        if (slot < 0) continue;  /* this client doesn't sign this node */
+        secp256k1_musig_pubnonce pn;
+        if (!musig_generate_nonce(ctx, &my_secnonces[k], &pn,
+                                    my_seckey, &my_pubkey,
+                                    &factory->nodes[affected[k]].keyagg.cache)) {
+            memset(my_seckey, 0, 32);
+            fprintf(stderr,
+                "Client-stateless Tier B %u: nonce gen for %zu failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+        my_slot_per_node[k] = slot;
+        my_signs_per_node[k] = 1;
+        musig_pubnonce_serialize(ctx, my_pubnonces_per_node[k], &pn);
+        if (!factory_session_set_nonce(factory, affected[k], (size_t)slot, &pn)) {
+            memset(my_seckey, 0, 32);
+            fprintf(stderr,
+                "Client-stateless Tier B %u: set own nonce for %zu failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Step 6: send CLIENT_PATH_NONCES. */
+    cJSON *cpn = wire_build_state_adv_client_path_nonces(
+        (const unsigned char *)my_pubnonces_per_node, (uint32_t)n_affected);
+    if (!wire_send(fd, MSG_STATE_ADV_CLIENT_PATH_NONCES, cpn)) {
+        cJSON_Delete(cpn);
+        fprintf(stderr,
+            "Client-stateless Tier B %u: send CLIENT_PATH_NONCES failed\n", my_index);
+        return 0;
+    }
+    cJSON_Delete(cpn);
+
+    /* Step 7: recv LSP_RESPONSE { lsp_pubnonces_per_leaf, lsp_psigs_per_leaf }. */
+    wire_msg_t lr;
+    if (!wire_recv(fd, &lr) || lr.msg_type != MSG_STATE_ADV_LSP_RESPONSE) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: expected LSP_RESPONSE, got 0x%02x\n",
+            my_index, lr.json ? lr.msg_type : 0);
+        if (lr.json) cJSON_Delete(lr.json);
+        return 0;
+    }
+    unsigned char lsp_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    unsigned char lsp_psigs_per_node[FACTORY_MAX_NODES][32];
+    if (!wire_parse_state_adv_lsp_response(lr.json,
+                                             (unsigned char *)lsp_pubnonces_per_node,
+                                             (unsigned char *)lsp_psigs_per_node,
+                                             (uint32_t)n_affected)) {
+        cJSON_Delete(lr.json);
+        fprintf(stderr,
+            "Client-stateless Tier B %u: parse LSP_RESPONSE failed\n", my_index);
+        return 0;
+    }
+    cJSON_Delete(lr.json);
+
+    /* Step 8: for each affected node, set LSP nonce + finalize + set LSP psig +
+       create own partial_sig (zeros own secnonce) + set own psig + complete. */
+    unsigned char my_psigs_per_node[FACTORY_MAX_NODES][32];
+    for (size_t k = 0; k < n_affected; k++) memset(my_psigs_per_node[k], 0, 32);
+
+    for (size_t k = 0; k < n_affected; k++) {
+        int lsp_slot = factory_find_signer_slot(factory, affected[k], 0);
+        if (lsp_slot < 0) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: LSP not signer on %zu (invariant violation)\n",
+                my_index, affected[k]);
+            return 0;
+        }
+        secp256k1_musig_pubnonce lsp_pn;
+        if (!musig_pubnonce_parse(ctx, &lsp_pn, lsp_pubnonces_per_node[k]) ||
+            !factory_session_set_nonce(factory, affected[k], (size_t)lsp_slot, &lsp_pn)) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: set LSP nonce for %zu failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+        if (!factory_session_finalize_node(factory, affected[k])) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: finalize_node[%zu] failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+        /* Set LSP's psig into the session. */
+        secp256k1_musig_partial_sig lsp_psig;
+        if (!musig_partial_sig_parse(ctx, &lsp_psig, lsp_psigs_per_node[k]) ||
+            !factory_session_set_partial_sig(factory, affected[k], (size_t)lsp_slot, &lsp_psig)) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: set LSP psig for %zu failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+        /* Create own partial_sig (zeros own secnonce). */
+        if (my_signs_per_node[k]) {
+            secp256k1_musig_partial_sig my_psig;
+            if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonces[k], keypair,
+                                            &factory->nodes[affected[k]].signing_session)) {
+                fprintf(stderr,
+                    "Client-stateless Tier B %u: create_partial_sig[%zu] failed\n",
+                    my_index, affected[k]);
+                return 0;
+            }
+            musig_partial_sig_serialize(ctx, my_psigs_per_node[k], &my_psig);
+            if (!factory_session_set_partial_sig(factory, affected[k],
+                                                   (size_t)my_slot_per_node[k], &my_psig)) {
+                fprintf(stderr,
+                    "Client-stateless Tier B %u: set own psig[%zu] failed\n",
+                    my_index, affected[k]);
+                return 0;
+            }
+        }
+    }
+    /* INVARIANT: own secnonces zeroed by musig_create_partial_sig. */
+
+    /* Step 9: send CLIENT_FINAL_PSIGS. */
+    cJSON *fp = wire_build_state_adv_client_final_psigs(
+        (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected);
+    if (!wire_send(fd, MSG_STATE_ADV_CLIENT_FINAL_PSIGS, fp)) {
+        cJSON_Delete(fp);
+        fprintf(stderr,
+            "Client-stateless Tier B %u: send CLIENT_FINAL_PSIGS failed\n", my_index);
+        return 0;
+    }
+    cJSON_Delete(fp);
+
+    /* Step 10: complete_node per affected (LSP will also). */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!factory_session_complete_node(factory, affected[k])) {
+            fprintf(stderr,
+                "Client-stateless Tier B %u: complete_node[%zu] failed\n",
+                my_index, affected[k]);
+            return 0;
+        }
+    }
+
+    /* Step 11: recv DONE (MSG_PATH_SIGN_DONE). */
+    wire_msg_t done;
+    if (!wire_recv(fd, &done) || done.msg_type != MSG_PATH_SIGN_DONE) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: expected PATH_SIGN_DONE, got 0x%02x\n",
+            my_index, done.json ? done.msg_type : 0);
+        if (done.json) cJSON_Delete(done.json);
+        return 0;
+    }
+    if (done.json) cJSON_Delete(done.json);
+
+    printf("Client-stateless Tier B %u: %zu affected nodes signed\n",
+           my_index, n_affected);
+    return 1;
+}
+
 int client_handle_state_advance(int fd, secp256k1_context *ctx,
                                   const secp256k1_keypair *keypair,
                                   factory_t *factory,
                                   uint32_t my_index,
                                   const wire_msg_t *propose_msg) {
+    /* Phase 1e.2.d: if LSP sent the new stateless PROPOSE_INTENT opcode,
+       dispatch to the stateless handler.  Legacy STATE_ADVANCE_PROPOSE
+       continues to use the path below. */
+    if (propose_msg && propose_msg->msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
+        return client_handle_state_advance_stateless(fd, ctx, keypair,
+                                                       factory, my_index,
+                                                       propose_msg);
+    }
+
     /* Parse propose */
     uint32_t epoch_in;
     int trigger_leaf;

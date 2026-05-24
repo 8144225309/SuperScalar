@@ -151,6 +151,29 @@
 #define MSG_LEAF_ADVANCE_LSP_RESPONSE     0x7B  /* LSP -> Client: lsp_pubnonce + lsp_psig (atomic generate + sign on LSP) */
 #define MSG_LEAF_ADVANCE_FINAL            0x7C  /* Client -> LSP: final aggregated sig (optional confirmation for LSP records) */
 
+/* MuSig2 stateless redesign Phase 1e (#271) -- sub-factory chain advance
+   reversed flow.  Multi-client, multi-input ceremony.  Same atomic-signer
+   property as Phase 1c/1d: LSP secnonces generated only AFTER receiving all
+   client pubnonces, zeroed by musig_create_partial_sig before any subsequent
+   wire recv.  Existing 0x73-0x77 opcodes continue to work for non-stateless
+   peers. */
+#define MSG_SUBFACTORY_PROPOSE_INTENT      0x7D  /* LSP -> Client: intent (no nonce field) */
+#define MSG_SUBFACTORY_CLIENT_PUBNONCES    0x7E  /* Client -> LSP: this client's pubnonces (one per input) */
+#define MSG_SUBFACTORY_LSP_RESPONSE        0x7F  /* LSP -> Client: lsp_pubnonces + lsp_psigs (atomic gen+sign) */
+#define MSG_SUBFACTORY_CLIENT_FINAL_PSIGS  0x80  /* Client -> LSP: client psigs (one per input, after aggregating LSP+all-clients) */
+
+/* MuSig2 stateless redesign Phase 1e.2 (#271) -- Tier B state advance
+   reversed flow.  Multi-leaf ceremony (each affected leaf is its own MuSig
+   session).  Same atomic-signer property: LSP secnonces generated only
+   AFTER receiving all CLIENT_PATH_NONCES.  Existing 0x60-range opcodes
+   (MSG_STATE_ADVANCE_PROPOSE, MSG_PATH_NONCE_BUNDLE, MSG_PATH_ALL_NONCES,
+   MSG_PATH_PSIG_BUNDLE, MSG_PATH_SIGN_DONE) continue to work for
+   non-stateless peers. */
+#define MSG_STATE_ADV_PROPOSE_INTENT      0x81  /* LSP -> Client: intent (no nonce field) */
+#define MSG_STATE_ADV_CLIENT_PATH_NONCES  0x82  /* Client -> LSP: per-leaf pubnonces */
+#define MSG_STATE_ADV_LSP_RESPONSE        0x83  /* LSP -> Client: per-leaf lsp pubnonces + lsp psigs */
+#define MSG_STATE_ADV_CLIENT_FINAL_PSIGS  0x84  /* Client -> LSP: per-leaf client psigs */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -465,6 +488,71 @@ cJSON *wire_build_leaf_advance_final(const unsigned char final_sig[64],
 int    wire_parse_leaf_advance_final(const cJSON *json,
                                        unsigned char out_final_sig[64],
                                        unsigned char out_final_poison_sig_opt[64] /* may be NULL */);
+
+/* Phase 1e sub-factory reversed flow scaffolding.  Wire builders/parsers
+   are minimal — the actual sub-factory advance ceremony (Phase 1e.1.b)
+   will define richer payloads (per-input arrays for multi-input).  For
+   now these are stubs to be filled in. */
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs,
+                                              int leaf_side, int sub_idx, int channel_idx,
+                                              uint64_t delta_sats);
+int    wire_parse_subfactory_propose_intent(const cJSON *json,
+                                              uint32_t *out_subfactory_id,
+                                              uint32_t *out_n_inputs,
+                                              int *out_leaf_side, int *out_sub_idx,
+                                              int *out_channel_idx,
+                                              uint64_t *out_delta_sats);
+
+cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input /* n_inputs * 66 */,
+                                                uint32_t n_inputs);
+int    wire_parse_subfactory_client_pubnonces(const cJSON *json,
+                                                unsigned char *out_pubnonces_per_input /* n_inputs * 66 */,
+                                                uint32_t expected_n_inputs);
+
+cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input /* n_inputs * 66 */,
+                                            const unsigned char *lsp_psigs_per_input /* n_inputs * 32 */,
+                                            uint32_t n_inputs);
+int    wire_parse_subfactory_lsp_response(const cJSON *json,
+                                            unsigned char *out_lsp_pubnonces_per_input,
+                                            unsigned char *out_lsp_psigs_per_input,
+                                            uint32_t expected_n_inputs);
+
+cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input /* n_inputs * 32 */,
+                                                  uint32_t n_inputs);
+int    wire_parse_subfactory_client_final_psigs(const cJSON *json,
+                                                  unsigned char *out_psigs_per_input,
+                                                  uint32_t expected_n_inputs);
+
+/* Phase 1e.2.a Tier B state advance reversed flow wire codec.  Multi-leaf
+   ceremony: per-leaf arrays of pubnonces + psigs.  n_affected_leaves is
+   the size of each array; receiver passes expected count to size buffers. */
+cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
+                                              uint32_t n_affected_leaves,
+                                              int trigger_leaf_side);
+int    wire_parse_state_adv_propose_intent(const cJSON *json,
+                                              uint32_t *out_epoch_after,
+                                              uint32_t *out_n_affected_leaves,
+                                              int *out_trigger_leaf_side);
+
+cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf /* n * 66 */,
+                                                  uint32_t n_affected_leaves);
+int    wire_parse_state_adv_client_path_nonces(const cJSON *json,
+                                                  unsigned char *out_pubnonces_per_leaf,
+                                                  uint32_t expected_n_affected_leaves);
+
+cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf /* n * 66 */,
+                                            const unsigned char *lsp_psigs_per_leaf /* n * 32 */,
+                                            uint32_t n_affected_leaves);
+int    wire_parse_state_adv_lsp_response(const cJSON *json,
+                                            unsigned char *out_lsp_pubnonces_per_leaf,
+                                            unsigned char *out_lsp_psigs_per_leaf,
+                                            uint32_t expected_n_affected_leaves);
+
+cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf /* n * 32 */,
+                                                  uint32_t n_affected_leaves);
+int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
+                                                  unsigned char *out_psigs_per_leaf,
+                                                  uint32_t expected_n_affected_leaves);
 
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);

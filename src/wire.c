@@ -1174,6 +1174,242 @@ int wire_parse_leaf_advance_final(const cJSON *json,
     return 1;
 }
 
+/* Phase 1e.1.a -- sub-factory reversed flow wire codec.  Minimal payloads:
+   per-input arrays serialized as concatenated hex strings (n_inputs * size).
+   The receiver passes expected_n_inputs to know how to split. */
+
+cJSON *wire_build_subfactory_propose_intent(uint32_t subfactory_id, uint32_t n_inputs,
+                                              int leaf_side, int sub_idx, int channel_idx,
+                                              uint64_t delta_sats) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "subfactory_id", (double)subfactory_id);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    cJSON_AddNumberToObject(j, "leaf_side", (double)leaf_side);
+    cJSON_AddNumberToObject(j, "sub_idx", (double)sub_idx);
+    cJSON_AddNumberToObject(j, "channel_idx", (double)channel_idx);
+    cJSON_AddNumberToObject(j, "delta_sats", (double)delta_sats);
+    return j;
+}
+
+int wire_parse_subfactory_propose_intent(const cJSON *json,
+                                           uint32_t *out_subfactory_id,
+                                           uint32_t *out_n_inputs,
+                                           int *out_leaf_side, int *out_sub_idx,
+                                           int *out_channel_idx,
+                                           uint64_t *out_delta_sats) {
+    if (!json || !out_subfactory_id || !out_n_inputs ||
+        !out_leaf_side || !out_sub_idx || !out_channel_idx || !out_delta_sats) return 0;
+    cJSON *sf = cJSON_GetObjectItem(json, "subfactory_id");
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    cJSON *si = cJSON_GetObjectItem(json, "sub_idx");
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_idx");
+    cJSON *ds = cJSON_GetObjectItem(json, "delta_sats");
+    if (!sf || !ni || !ls || !si || !ci || !ds) return 0;
+    if (!cJSON_IsNumber(sf) || !cJSON_IsNumber(ni) || !cJSON_IsNumber(ls) ||
+        !cJSON_IsNumber(si) || !cJSON_IsNumber(ci) || !cJSON_IsNumber(ds)) return 0;
+    *out_subfactory_id = (uint32_t)sf->valuedouble;
+    *out_n_inputs = (uint32_t)ni->valuedouble;
+    *out_leaf_side = (int)ls->valuedouble;
+    *out_sub_idx = (int)si->valuedouble;
+    *out_channel_idx = (int)ci->valuedouble;
+    *out_delta_sats = (uint64_t)ds->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input,
+                                                uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !pubnonces_per_input) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "pubnonces_per_input", pubnonces_per_input,
+                      (size_t)n_inputs * 66);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_client_pubnonces(const cJSON *json,
+                                             unsigned char *out_pubnonces_per_input,
+                                             uint32_t expected_n_inputs) {
+    if (!json || !out_pubnonces_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    return wire_json_get_hex(json, "pubnonces_per_input",
+                               out_pubnonces_per_input,
+                               (size_t)expected_n_inputs * 66) ==
+           (int)((size_t)expected_n_inputs * 66);
+}
+
+cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input,
+                                            const unsigned char *lsp_psigs_per_input,
+                                            uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !lsp_pubnonces_per_input || !lsp_psigs_per_input) {
+        if (j) cJSON_Delete(j);
+        return NULL;
+    }
+    wire_json_add_hex(j, "lsp_pubnonces_per_input", lsp_pubnonces_per_input,
+                      (size_t)n_inputs * 66);
+    wire_json_add_hex(j, "lsp_psigs_per_input", lsp_psigs_per_input,
+                      (size_t)n_inputs * 32);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_lsp_response(const cJSON *json,
+                                         unsigned char *out_lsp_pubnonces_per_input,
+                                         unsigned char *out_lsp_psigs_per_input,
+                                         uint32_t expected_n_inputs) {
+    if (!json || !out_lsp_pubnonces_per_input || !out_lsp_psigs_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonces_per_input",
+                            out_lsp_pubnonces_per_input,
+                            (size_t)expected_n_inputs * 66) !=
+        (int)((size_t)expected_n_inputs * 66)) return 0;
+    if (wire_json_get_hex(json, "lsp_psigs_per_input",
+                            out_lsp_psigs_per_input,
+                            (size_t)expected_n_inputs * 32) !=
+        (int)((size_t)expected_n_inputs * 32)) return 0;
+    return 1;
+}
+
+cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input,
+                                                  uint32_t n_inputs) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !psigs_per_input) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "psigs_per_input", psigs_per_input,
+                      (size_t)n_inputs * 32);
+    cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
+    return j;
+}
+
+int wire_parse_subfactory_client_final_psigs(const cJSON *json,
+                                               unsigned char *out_psigs_per_input,
+                                               uint32_t expected_n_inputs) {
+    if (!json || !out_psigs_per_input) return 0;
+    cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
+    if (!ni || !cJSON_IsNumber(ni)) return 0;
+    if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
+    return wire_json_get_hex(json, "psigs_per_input",
+                               out_psigs_per_input,
+                               (size_t)expected_n_inputs * 32) ==
+           (int)((size_t)expected_n_inputs * 32);
+}
+
+/* Phase 1e.2.a -- Tier B state advance reversed flow wire codec. */
+
+cJSON *wire_build_state_adv_propose_intent(uint32_t epoch_after,
+                                              uint32_t n_affected_leaves,
+                                              int trigger_leaf_side) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON_AddNumberToObject(j, "epoch_after", (double)epoch_after);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    cJSON_AddNumberToObject(j, "trigger_leaf_side", (double)trigger_leaf_side);
+    return j;
+}
+
+int wire_parse_state_adv_propose_intent(const cJSON *json,
+                                           uint32_t *out_epoch_after,
+                                           uint32_t *out_n_affected_leaves,
+                                           int *out_trigger_leaf_side) {
+    if (!json || !out_epoch_after || !out_n_affected_leaves ||
+        !out_trigger_leaf_side) return 0;
+    cJSON *e = cJSON_GetObjectItem(json, "epoch_after");
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    cJSON *t = cJSON_GetObjectItem(json, "trigger_leaf_side");
+    if (!e || !n || !t ||
+        !cJSON_IsNumber(e) || !cJSON_IsNumber(n) || !cJSON_IsNumber(t)) return 0;
+    *out_epoch_after = (uint32_t)e->valuedouble;
+    *out_n_affected_leaves = (uint32_t)n->valuedouble;
+    *out_trigger_leaf_side = (int)t->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf,
+                                                  uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !pubnonces_per_leaf) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "pubnonces_per_leaf", pubnonces_per_leaf,
+                      (size_t)n_affected_leaves * 66);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_client_path_nonces(const cJSON *json,
+                                               unsigned char *out_pubnonces_per_leaf,
+                                               uint32_t expected_n_affected_leaves) {
+    if (!json || !out_pubnonces_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    return wire_json_get_hex(json, "pubnonces_per_leaf",
+                               out_pubnonces_per_leaf,
+                               (size_t)expected_n_affected_leaves * 66) ==
+           (int)((size_t)expected_n_affected_leaves * 66);
+}
+
+cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf,
+                                            const unsigned char *lsp_psigs_per_leaf,
+                                            uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !lsp_pubnonces_per_leaf || !lsp_psigs_per_leaf) {
+        if (j) cJSON_Delete(j);
+        return NULL;
+    }
+    wire_json_add_hex(j, "lsp_pubnonces_per_leaf", lsp_pubnonces_per_leaf,
+                      (size_t)n_affected_leaves * 66);
+    wire_json_add_hex(j, "lsp_psigs_per_leaf", lsp_psigs_per_leaf,
+                      (size_t)n_affected_leaves * 32);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_lsp_response(const cJSON *json,
+                                         unsigned char *out_lsp_pubnonces_per_leaf,
+                                         unsigned char *out_lsp_psigs_per_leaf,
+                                         uint32_t expected_n_affected_leaves) {
+    if (!json || !out_lsp_pubnonces_per_leaf || !out_lsp_psigs_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    if (wire_json_get_hex(json, "lsp_pubnonces_per_leaf",
+                            out_lsp_pubnonces_per_leaf,
+                            (size_t)expected_n_affected_leaves * 66) !=
+        (int)((size_t)expected_n_affected_leaves * 66)) return 0;
+    if (wire_json_get_hex(json, "lsp_psigs_per_leaf",
+                            out_lsp_psigs_per_leaf,
+                            (size_t)expected_n_affected_leaves * 32) !=
+        (int)((size_t)expected_n_affected_leaves * 32)) return 0;
+    return 1;
+}
+
+cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf,
+                                                  uint32_t n_affected_leaves) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !psigs_per_leaf) { if(j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "psigs_per_leaf", psigs_per_leaf,
+                      (size_t)n_affected_leaves * 32);
+    cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
+    return j;
+}
+
+int wire_parse_state_adv_client_final_psigs(const cJSON *json,
+                                               unsigned char *out_psigs_per_leaf,
+                                               uint32_t expected_n_affected_leaves) {
+    if (!json || !out_psigs_per_leaf) return 0;
+    cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
+    if (!n || !cJSON_IsNumber(n)) return 0;
+    if ((uint32_t)n->valuedouble != expected_n_affected_leaves) return 0;
+    return wire_json_get_hex(json, "psigs_per_leaf",
+                               out_psigs_per_leaf,
+                               (size_t)expected_n_affected_leaves * 32) ==
+           (int)((size_t)expected_n_affected_leaves * 32);
+}
+
 
 cJSON *wire_build_bridge_hello_ack(void) {
     return cJSON_CreateObject();
