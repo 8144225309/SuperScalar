@@ -273,12 +273,22 @@ grep -E "chain_len=[0-9].*signed=1" "$LSP_LOG" | sed 's/^/    /'
 # --- Verify MULTI-INPUT ceremony marker (LSP side) ---
 echo ""
 echo "=== Verifying MULTI-INPUT ceremony fired ==="
-if ! grep -q "chain advance is MULTI-INPUT" "$LSP_LOG"; then
+# Accept EITHER the legacy multi-input marker ("chain advance is MULTI-INPUT")
+# OR the stateless multi-input marker ("MULTI-INPUT advance (n_inputs=...)").
+# Under SS_MUSIG_STATELESS=1 the stateless path runs and the legacy line is
+# (correctly) absent.  Also assert the stateless flow did NOT fall back to
+# legacy when stateless was requested.
+if grep -q "multi-input not yet supported in stateless flow" "$LSP_LOG"; then
+    echo "FAIL: stateless multi-input fell back to legacy (invariant violated)"
+    grep -E "multi-input not yet supported|MULTI-INPUT" "$LSP_LOG" | head -10
+    exit 1
+fi
+if ! grep -qE "chain advance is MULTI-INPUT|MULTI-INPUT advance \(n_inputs=" "$LSP_LOG"; then
     echo "FAIL: MULTI-INPUT ceremony marker missing from LSP log"
     grep -E "MULTI|SF-A|sub-factory" "$LSP_LOG" | head -20
     exit 1
 fi
-MULTI_LINE=$(grep "chain advance is MULTI-INPUT" "$LSP_LOG" | head -1)
+MULTI_LINE=$(grep -E "chain advance is MULTI-INPUT|MULTI-INPUT advance \(n_inputs=" "$LSP_LOG" | head -1)
 echo "  $MULTI_LINE"
 
 # --- Verify client mirror MULTI-INPUT marker ---
@@ -286,9 +296,9 @@ echo ""
 echo "=== Verifying clients ran the MULTI-INPUT mirror ==="
 N_MULTI_CLIENTS=0
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    if grep -q "advance is MULTI-INPUT\|advanced (MULTI)" "$TMPDIR/client_${i}.log" 2>/dev/null; then
+    if grep -qE "advance is MULTI-INPUT|advanced \(MULTI\)|subfactory MULTI-INPUT [0-9]+: advance done" "$TMPDIR/client_${i}.log" 2>/dev/null; then
         N_MULTI_CLIENTS=$((N_MULTI_CLIENTS + 1))
-        MARK=$(grep -E "advance is MULTI-INPUT|advanced \(MULTI\)" "$TMPDIR/client_${i}.log" | head -1)
+        MARK=$(grep -E "advance is MULTI-INPUT|advanced \(MULTI\)|subfactory MULTI-INPUT [0-9]+: advance done" "$TMPDIR/client_${i}.log" | head -1)
         echo "    client[$i]: $MARK"
     fi
 done
