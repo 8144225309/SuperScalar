@@ -233,7 +233,7 @@ while [ "$WAITED" -lt 600 ]; do
         break
     fi
     if [ $((WAITED % 20)) -eq 0 ]; then
-        BREACH_PROGRESS=$(grep -cE "sub-factory.*chain extended|CHEAT-SUBFACTORY|SUB-FACTORY BREACH" \
+        BREACH_PROGRESS=$(grep -cE "sub-factory.*chain extended|LSP-stateless subfactory chain advance.*DONE|CHEAT-SUBFACTORY|SUB-FACTORY BREACH" \
                             "$LSP_LOG" 2>/dev/null || echo 0)
         echo "  ... ${WAITED}s elapsed, breach markers in LSP log: $BREACH_PROGRESS"
     fi
@@ -257,11 +257,11 @@ fi
 # --- Verify ceremony + breach detection markers ---
 echo ""
 echo "=== Verifying sub-factory advance fired ==="
-if ! grep -q "sub-factory.*chain extended" "$LSP_LOG"; then
+if ! grep -qE "sub-factory.*chain extended|LSP-stateless subfactory chain advance.*DONE" "$LSP_LOG"; then
     echo "FAIL: sub-factory chain extension never fired"
     tail -120 "$LSP_LOG"; exit 1
 fi
-echo "  $(grep 'sub-factory.*chain extended' "$LSP_LOG" | head -1)"
+echo "  $(grep -E 'sub-factory.*chain extended|LSP-stateless subfactory chain advance.*DONE' "$LSP_LOG" | head -1)"
 
 echo ""
 echo "=== Verifying CHEAT-SUBFACTORY broadcast ==="

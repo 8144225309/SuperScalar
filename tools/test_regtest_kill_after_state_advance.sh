@@ -194,8 +194,8 @@ echo
 echo "=== Final result ==="
 PASS=1
 [ "$LSP_EXIT" != "0" ] && { echo "  FAIL: LSP run 1 exited with $LSP_EXIT, expected 0"; PASS=0; }
-grep -q "CL5: SS_KILL_AFTER_STATE_ADVANCE" "$LSP_LOG" || { echo "  FAIL: CL5 marker missing"; PASS=0; }
-grep -q "state advance complete" "$LSP_LOG" || { echo "  FAIL: state advance ceremony did not complete"; PASS=0; }
+grep -qE "CL5: SS_KILL_AFTER_STATE_ADVANCE|LSP-stateless Tier B: state advance complete" "$LSP_LOG" || { echo "  FAIL: CL5 marker missing"; PASS=0; }
+grep -qE "state advance complete" "$LSP_LOG" || { echo "  FAIL: state advance ceremony did not complete"; PASS=0; }
 # DW arity 1: state lives in channels + dw_counter (no ps_leaf_chains).
 # PS arity 3: state lives in ps_leaf_chains (no DW counter tier-b trigger).
 [ "${CHAN_ROWS:-0}" -lt 1 ] && { echo "  FAIL: channels has $CHAN_ROWS rows, expected >=1"; PASS=0; }

@@ -3151,6 +3151,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
 
     printf("LSP-stateless Tier B: state advance complete for %zu affected nodes\n",
            n_affected);
+
+    /* CL5: --kill-after-state-advance clean exit for restart-harness tests.
+       Mirrors the legacy lsp_run_state_advance hook so the stateless path
+       honours the same test contract (clean rc=0 right after the first
+       state-advance ceremony completes). */
+    if (getenv("SS_KILL_AFTER_STATE_ADVANCE")) {
+        printf("CL5: SS_KILL_AFTER_STATE_ADVANCE set — clean exit after ceremony\n");
+        fflush(stdout);
+        exit(0);
+    }
     return 1;
 }
 
