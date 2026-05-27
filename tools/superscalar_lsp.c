@@ -745,6 +745,30 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
     return 1;
 }
 
+/* #247 (SF-CSV-WAIT): extract the first input's prevout txid (the PARENT tx
+   this tx spends) from a raw signed tx, in DISPLAY (big-endian) order for RPC
+   lookups.  Handles the segwit marker+flag.  Returns 1 on success, 0 if the
+   tx is too short or uses a multi-byte input-count varint (factory txs always
+   have a single-byte count). */
+static int tx_first_parent_txid_display(const unsigned char *tx, size_t len,
+                                          char out_hex[65]) {
+    if (!tx || len < 10) return 0;
+    size_t off = 4; /* skip version */
+    if (tx[4] == 0x00) {            /* segwit marker (real txin_count is never 0) */
+        if (len < 7) return 0;
+        off = 6;                    /* skip marker(0x00)+flag(0x01) */
+    }
+    if (off >= len) return 0;
+    unsigned char vin_count = tx[off];
+    if (vin_count == 0x00 || vin_count >= 0xFD) return 0; /* need single-byte >=1 */
+    off += 1;
+    if (off + 32 > len) return 0;
+    unsigned char disp[32];
+    for (int i = 0; i < 32; i++) disp[i] = tx[off + 31 - i]; /* internal -> display */
+    hex_encode(disp, 32, out_hex);
+    return 1;
+}
+
 /* Broadcast a single signed TX with BIP68 wait + retry logic.
    Returns 1 on success, 0 on failure.  Logs to broadcast_log via g_db.
    `display_txid_internal_be` is for the diagnostic print at the end. */
@@ -761,6 +785,11 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
 
     char txid_out[65];
 
+    /* #247: parse the parent (prevout) txid so we can wait on its CSV depth. */
+    char parent_txid_disp[65];
+    int have_parent = tx_first_parent_txid_display(signed_tx, signed_tx_len,
+                                                     parent_txid_disp);
+
     /* For nodes with nSequence > 0, we may need to wait for the parent
        to reach sufficient depth before this tx is valid */
     if (!(nsequence & 0x80000000u) && nsequence > 0) {  /* BIP68 enabled only when bit 31 clear */
@@ -773,7 +802,34 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
 
         if (is_regtest) {
             regtest_mine_blocks(rt, (int)required_depth, mine_addr);
+        } else if (have_parent) {
+            /* #247: BIP68 relative timelock is measured from the PARENT's
+               confirmation depth, not from "now".  Wait until the parent (the
+               tx this one spends) reaches required_depth confirmations, then
+               broadcast once.  This replaces the previous start_height+depth
+               baseline (wrong when the parent confirmed earlier/later) and the
+               indefinite high-frequency retry that stalled #247. */
+            int waited = 0, conf = 0;
+            for (;;) {
+                conf = regtest_get_confirmations(rt, parent_txid_disp);
+                if (conf < 0) break;                    /* unknown -> retry loop */
+                if (conf >= (int)required_depth) break;  /* CSV satisfied */
+                if (waited >= confirm_timeout) {
+                    fprintf(stderr, "force-close: %s CSV wait timed out after "
+                            "%ds (parent %d/%u confs)\n",
+                            log_source, waited, conf, required_depth);
+                    free(tx_hex);
+                    return 0;
+                }
+                int sleep_s = ((int)required_depth - conf) > 1 ? 60 : 20;
+                sleep(sleep_s);
+                waited += sleep_s;
+                printf("    %s CSV wait: parent %d/%u confs (%ds elapsed)\n",
+                       log_source, conf, required_depth, waited);
+                fflush(stdout);
+            }
         } else {
+            /* Parent txid unparseable: legacy fixed height-wait (start+depth). */
             int start_height = regtest_get_block_height(rt);
             int target_height = start_height + (int)required_depth;
             int waited = 0;
@@ -786,13 +842,11 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
                     free(tx_hex);
                     return 0;
                 }
-                sleep(10);
-                waited += 10;
+                sleep(20);
+                waited += 20;
                 int cur_h = regtest_get_block_height(rt);
-                int blocks_left = target_height - cur_h;
-                int em = blocks_left * 10;
-                printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
-                       cur_h, target_height, waited, em / 60, em % 60);
+                printf("    height: %d / %d (%ds elapsed)\n",
+                       cur_h, target_height, waited);
                 fflush(stdout);
             }
         }
