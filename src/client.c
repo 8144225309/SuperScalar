@@ -4335,13 +4335,49 @@ static int client_handle_state_advance_stateless(int fd,
         }
     }
 
-    /* Step 4: init MuSig session per affected. */
+    /* Step 3.5 (Tier B poison): prepare the L-stock poison TX for each affected
+       DW leaf with an old signed state (deterministic; matches the LSP minus
+       the watchtower gate, which is LSP-only).  PS leaves carry no L-stock
+       poison.  poison_prepared[k] is cleared per-leaf if anything degrades or
+       if the LSP doesn't reciprocate poison fields. */
+    const uint64_t TIERB_POISON_FEE_SATS = 1000;
+    int poison_prepared_c[FACTORY_MAX_NODES];
+    secp256k1_musig_secnonce my_poison_secnonces[FACTORY_MAX_NODES];
+    unsigned char my_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    unsigned char my_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    for (size_t k = 0; k < n_affected; k++) {
+        poison_prepared_c[k] = 0;
+        memset(my_poison_pubnonces_per_node[k], 0, 66);
+        memset(my_poison_psigs_per_node[k], 0, 32);
+        factory_node_t *an = &factory->nodes[affected[k]];
+        int had_old = (an->is_signed && an->signed_tx.len > 0);
+        int old_no = an->n_outputs;
+        uint64_t old_l = (old_no >= 2) ? an->outputs[old_no - 1].amount_sats : 0;
+        if (!an->is_ps_leaf && had_old && old_no >= 2 &&
+            old_l > TIERB_POISON_FEE_SATS +
+                (uint64_t)(an->n_signers - 1) * 330u) {
+            unsigned char old_txid[32];
+            memcpy(old_txid, an->txid, 32);
+            if (factory_session_prepare_poison_tx_leaf(
+                    factory, affected[k], old_txid, (uint32_t)(old_no - 1),
+                    old_l, TIERB_POISON_FEE_SATS)) {
+                poison_prepared_c[k] = 1;  /* init_node_poison after state init */
+            }
+        }
+    }
+
+    /* Step 4: init MuSig session per affected (state + poison). */
     for (size_t k = 0; k < n_affected; k++) {
         if (!factory_session_init_node(factory, affected[k])) {
             fprintf(stderr,
                 "Client-stateless Tier B %u: init_node[%zu] failed\n",
                 my_index, affected[k]);
             return 0;
+        }
+        if (poison_prepared_c[k] &&
+            !factory_session_init_node_poison(factory, affected[k])) {
+            factory_session_reset_poison(factory, affected[k]);
+            poison_prepared_c[k] = 0;
         }
     }
 
@@ -4389,12 +4425,27 @@ static int client_handle_state_advance_stateless(int fd,
                 my_index, affected[k]);
             return 0;
         }
+        /* Poison: own nonce for this leaf (my_seckey still live this loop). */
+        if (poison_prepared_c[k]) {
+            secp256k1_musig_pubnonce ppn;
+            if (!musig_generate_nonce(ctx, &my_poison_secnonces[k], &ppn,
+                                        my_seckey, &my_pubkey,
+                                        &factory->nodes[affected[k]].keyagg.cache) ||
+                !factory_session_set_nonce_poison(factory, affected[k],
+                                                    (size_t)slot, &ppn)) {
+                factory_session_reset_poison(factory, affected[k]);
+                poison_prepared_c[k] = 0;
+            } else {
+                musig_pubnonce_serialize(ctx, my_poison_pubnonces_per_node[k], &ppn);
+            }
+        }
     }
     memset(my_seckey, 0, 32);
 
     /* Step 6: send CLIENT_PATH_NONCES. */
     cJSON *cpn = wire_build_state_adv_client_path_nonces(
-        (const unsigned char *)my_pubnonces_per_node, (uint32_t)n_affected, NULL);
+        (const unsigned char *)my_pubnonces_per_node, (uint32_t)n_affected,
+        (const unsigned char *)my_poison_pubnonces_per_node);
     if (!wire_send(fd, MSG_STATE_ADV_CLIENT_PATH_NONCES, cpn)) {
         cJSON_Delete(cpn);
         fprintf(stderr,
@@ -4414,11 +4465,16 @@ static int client_handle_state_advance_stateless(int fd,
     }
     unsigned char lsp_pubnonces_per_node[FACTORY_MAX_NODES][66];
     unsigned char lsp_psigs_per_node[FACTORY_MAX_NODES][32];
+    unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    memset(lsp_poison_pubnonces_per_node, 0, sizeof(lsp_poison_pubnonces_per_node));
+    memset(lsp_poison_psigs_per_node, 0, sizeof(lsp_poison_psigs_per_node));
     if (!wire_parse_state_adv_lsp_response(lr.json,
                                              (unsigned char *)lsp_pubnonces_per_node,
                                              (unsigned char *)lsp_psigs_per_node,
                                              (uint32_t)n_affected,
-                                             NULL, NULL)) {
+                                             (unsigned char *)lsp_poison_pubnonces_per_node,
+                                             (unsigned char *)lsp_poison_psigs_per_node)) {
         cJSON_Delete(lr.json);
         fprintf(stderr,
             "Client-stateless Tier B %u: parse LSP_RESPONSE failed\n", my_index);
@@ -4481,12 +4537,41 @@ static int client_handle_state_advance_stateless(int fd,
                 return 0;
             }
         }
+
+        /* Poison (lockstep): set LSP poison nonce + finalize + set LSP poison
+           psig + create own poison psig + complete.  Degrade this leaf if the
+           LSP sent no poison (poison field all-zero) or any step fails. */
+        if (poison_prepared_c[k]) {
+            int lsp_pz_zero = 1;
+            for (size_t b = 0; b < 66; b++)
+                if (lsp_poison_pubnonces_per_node[k][b]) { lsp_pz_zero = 0; break; }
+            secp256k1_musig_pubnonce lsp_ppn;
+            secp256k1_musig_partial_sig lsp_ppsig, my_ppsig;
+            if (lsp_pz_zero ||
+                !musig_pubnonce_parse(ctx, &lsp_ppn, lsp_poison_pubnonces_per_node[k]) ||
+                !factory_session_set_nonce_poison(factory, affected[k], (size_t)lsp_slot, &lsp_ppn) ||
+                !factory_session_finalize_node_poison(factory, affected[k]) ||
+                !musig_partial_sig_parse(ctx, &lsp_ppsig, lsp_poison_psigs_per_node[k]) ||
+                !factory_session_set_partial_sig_poison(factory, affected[k], (size_t)lsp_slot, &lsp_ppsig) ||
+                !musig_create_partial_sig(ctx, &my_ppsig, &my_poison_secnonces[k], keypair,
+                                            &factory->nodes[affected[k]].poison_signing_session) ||
+                !factory_session_set_partial_sig_poison(factory, affected[k],
+                                                          (size_t)my_slot_per_node[k], &my_ppsig) ||
+                !factory_session_complete_node_poison(factory, affected[k])) {
+                factory_session_reset_poison(factory, affected[k]);
+                poison_prepared_c[k] = 0;
+            } else {
+                musig_partial_sig_serialize(ctx, my_poison_psigs_per_node[k], &my_ppsig);
+            }
+            memset(&my_poison_secnonces[k], 0, sizeof(my_poison_secnonces[k]));
+        }
     }
-    /* INVARIANT: own secnonces zeroed by musig_create_partial_sig. */
+    /* INVARIANT: own state + poison secnonces zeroed by musig_create_partial_sig. */
 
     /* Step 9: send CLIENT_FINAL_PSIGS. */
     cJSON *fp = wire_build_state_adv_client_final_psigs(
-        (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected, NULL);
+        (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected,
+        (const unsigned char *)my_poison_psigs_per_node);
     if (!wire_send(fd, MSG_STATE_ADV_CLIENT_FINAL_PSIGS, fp)) {
         cJSON_Delete(fp);
         fprintf(stderr,
