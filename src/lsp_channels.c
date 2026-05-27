@@ -2629,13 +2629,11 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
 
-    /* MVP refusal: watchtower configured -> poison TX would be required. */
-    if (mgr->watchtower) {
-        fprintf(stderr,
-            "LSP-stateless Tier B: watchtower configured (poison TX needed) -- "
-            "falling back to legacy\n");
-        return -1;
-    }
+    /* Phase 1e.2.e (Tier B poison wiring): the watchtower is configured in
+       production.  Instead of refusing, we run the per-DW-leaf L-stock poison
+       ceremony in lockstep with the state ceremony (mirror of leaf-advance
+       #330, applied per affected leaf).  Each poison step is gated on
+       poison_prepared[k]; a degraded leaf simply registers without poison. */
 
     /* Step 1: Build affected[] (same logic as legacy at line ~2725). */
     size_t affected[FACTORY_MAX_NODES];
@@ -2666,12 +2664,55 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
 
-    /* Step 2: Init MuSig session for each affected node (state only). */
+    /* Step 1.5 (Tier B poison): capture each affected DW leaf's OLD signed
+       state + prepare its L-stock poison TX (mirror of leaf-advance #330).
+       PS leaves carry no L-stock poison (it lives in their sub-factory chain).
+       Per-affected-node arrays indexed by affected[] order (k). */
+    const uint64_t TIERB_POISON_FEE_SATS = 1000;
+    int poison_prepared[FACTORY_MAX_NODES];
+    unsigned char poison_old_txid[FACTORY_MAX_NODES][32];
+    uint64_t poison_old_l_amount[FACTORY_MAX_NODES];
+    int poison_client_slot[FACTORY_MAX_NODES];
+    unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    for (size_t k = 0; k < n_affected; k++) {
+        poison_prepared[k] = 0;
+        poison_client_slot[k] = -1;
+        poison_old_l_amount[k] = 0;
+        memset(poison_old_txid[k], 0, 32);
+        memset(lsp_poison_pubnonces_per_node[k], 0, 66);
+        memset(lsp_poison_psigs_per_node[k], 0, 32);
+        factory_node_t *an = &f->nodes[affected[k]];
+        int had_old = (an->is_signed && an->signed_tx.len > 0);
+        int old_no = an->n_outputs;
+        if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
+        poison_old_l_amount[k] = (old_no >= 2)
+            ? an->outputs[old_no - 1].amount_sats : 0;
+        if (mgr->watchtower && !an->is_ps_leaf && had_old && old_no >= 2 &&
+            poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
+                (uint64_t)(an->n_signers - 1) * 330u) {
+            if (factory_session_prepare_poison_tx_leaf(
+                    f, affected[k], poison_old_txid[k], (uint32_t)(old_no - 1),
+                    poison_old_l_amount[k], TIERB_POISON_FEE_SATS)) {
+                poison_prepared[k] = 1;  /* init_node_poison after state init */
+            }
+        }
+    }
+
+    /* Step 2: Init MuSig session for each affected node (state + poison). */
     for (size_t k = 0; k < n_affected; k++) {
         if (!factory_session_init_node(f, affected[k])) {
             fprintf(stderr,
                 "LSP-stateless Tier B: init_node[%zu] failed\n", affected[k]);
             return 0;
+        }
+        if (poison_prepared[k] &&
+            !factory_session_init_node_poison(f, affected[k])) {
+            fprintf(stderr,
+                "LSP-stateless Tier B: init_node_poison[%zu] -- degrading leaf\n",
+                affected[k]);
+            factory_session_reset_poison(f, affected[k]);
+            poison_prepared[k] = 0;
         }
     }
 
@@ -2711,10 +2752,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         unsigned char this_client_pn[FACTORY_MAX_NODES][66];
+        unsigned char this_client_poison_pn[FACTORY_MAX_NODES][66];
+        memset(this_client_poison_pn, 0, sizeof(this_client_poison_pn));
         if (!wire_parse_state_adv_client_path_nonces(nmsg.json,
                                                        (unsigned char *)this_client_pn,
                                                        (uint32_t)n_affected,
-                                                       NULL)) {
+                                                       (unsigned char *)this_client_poison_pn)) {
             cJSON_Delete(nmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_PATH_NONCES from client %zu failed\n",
@@ -2744,6 +2787,33 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             }
             memcpy(client_pubnonces_per_node[k], this_client_pn[k], 66);
             client_slot_per_node[k] = slot;
+
+            /* Poison: if this leaf has a prepared poison TX and the client
+               sent a (non-zero) poison nonce, set it on the poison session. */
+            if (poison_prepared[k]) {
+                int pz = 1;
+                for (size_t b = 0; b < 66; b++)
+                    if (this_client_poison_pn[k][b]) { pz = 0; break; }
+                if (pz) {
+                    fprintf(stderr,
+                        "LSP-stateless Tier B: client %zu sent no poison nonce "
+                        "for node %zu -- degrading leaf poison\n", c, affected[k]);
+                    factory_session_reset_poison(f, affected[k]);
+                    poison_prepared[k] = 0;
+                } else {
+                    secp256k1_musig_pubnonce ppn;
+                    if (!musig_pubnonce_parse(lsp->ctx, &ppn, this_client_poison_pn[k]) ||
+                        !factory_session_set_nonce_poison(f, affected[k], (size_t)slot, &ppn)) {
+                        fprintf(stderr,
+                            "LSP-stateless Tier B: set client poison nonce node %zu "
+                            "-- degrading\n", affected[k]);
+                        factory_session_reset_poison(f, affected[k]);
+                        poison_prepared[k] = 0;
+                    } else {
+                        poison_client_slot[k] = slot;
+                    }
+                }
+            }
         }
     }
 
@@ -2819,6 +2889,50 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 "LSP-stateless Tier B: set LSP psig[%zu] failed\n", affected[k]);
             return 0;
         }
+
+        /* Poison (lockstep): LSP poison nonce -> set -> finalize -> partial sig.
+           lsp_poison_secnonce is a loop local, zeroed by create_partial_sig in
+           this same iteration -- no poison secnonce held across the wire recv
+           that follows (same stateless invariant as the state nonce). */
+        if (poison_prepared[k]) {
+            secp256k1_musig_secnonce lsp_poison_secnonce;
+            secp256k1_musig_pubnonce lsp_poison_pubnonce;
+            secp256k1_musig_partial_sig lsp_poison_psig;
+            unsigned char lsp_psk[32];
+            /* musig_generate_nonce takes (seckey32, pubkey, keyagg.cache); the
+               state lsp_seckey was already zeroed after the pool gen, so derive
+               a fresh local seckey and zero it right after. */
+            int pz_ok =
+                secp256k1_keypair_sec(lsp->ctx, lsp_psk, &lsp->lsp_keypair) &&
+                musig_generate_nonce(lsp->ctx, &lsp_poison_secnonce, &lsp_poison_pubnonce,
+                                       lsp_psk, &lsp->lsp_pubkey,
+                                       &f->nodes[affected[k]].keyagg.cache) &&
+                factory_session_set_nonce_poison(f, affected[k], (size_t)slot,
+                                                   &lsp_poison_pubnonce) &&
+                factory_session_finalize_node_poison(f, affected[k]) &&
+                musig_create_partial_sig(lsp->ctx, &lsp_poison_psig,
+                                           &lsp_poison_secnonce, &lsp_kp,
+                                           &f->nodes[affected[k]].poison_signing_session) &&
+                factory_session_set_partial_sig_poison(f, affected[k], (size_t)slot,
+                                                         &lsp_poison_psig);
+            memset(lsp_psk, 0, 32);
+            /* Zero the poison secnonce on any path: create_partial_sig already
+               zeroed it on success; on early-chain failure this clears the
+               generated-but-unconsumed secnonce so none lingers across the recv. */
+            memset(&lsp_poison_secnonce, 0, sizeof(lsp_poison_secnonce));
+            if (!pz_ok) {
+                fprintf(stderr,
+                    "LSP-stateless Tier B: LSP poison sign[%zu] -- degrading leaf\n",
+                    affected[k]);
+                factory_session_reset_poison(f, affected[k]);
+                poison_prepared[k] = 0;
+            } else {
+                musig_pubnonce_serialize(lsp->ctx, lsp_poison_pubnonces_per_node[k],
+                                          &lsp_poison_pubnonce);
+                musig_partial_sig_serialize(lsp->ctx, lsp_poison_psigs_per_node[k],
+                                             &lsp_poison_psig);
+            }
+        }
     }
     /* INVARIANT: every LSP secnonce in lsp_pool has been pulled and zeroed
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
@@ -2829,7 +2943,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         (const unsigned char *)lsp_pubnonces_per_node,
         (const unsigned char *)lsp_psigs_per_node,
         (uint32_t)n_affected,
-        NULL, NULL);
+        (const unsigned char *)lsp_poison_pubnonces_per_node,
+        (const unsigned char *)lsp_poison_psigs_per_node);
     for (size_t c = 0; c < lsp->n_clients; c++) {
         if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_LSP_RESPONSE, response)) {
             cJSON_Delete(response);
@@ -2853,10 +2968,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
+        unsigned char this_client_poison_psigs[FACTORY_MAX_NODES][32];
+        memset(this_client_poison_psigs, 0, sizeof(this_client_poison_psigs));
         if (!wire_parse_state_adv_client_final_psigs(pmsg.json,
                                                        (unsigned char *)this_client_psigs,
                                                        (uint32_t)n_affected,
-                                                       NULL)) {
+                                                       (unsigned char *)this_client_poison_psigs)) {
             cJSON_Delete(pmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_FINAL_PSIGS[%zu] failed\n", c);
@@ -2880,6 +2997,33 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                     c, affected[k]);
                 return 0;
             }
+            /* Poison: set this client's poison partial sig if this leaf still
+               has poison active and the client signed for it. */
+            if (poison_prepared[k] && (int)slot == poison_client_slot[k]) {
+                secp256k1_musig_partial_sig ppsig;
+                if (!musig_partial_sig_parse(lsp->ctx, &ppsig, this_client_poison_psigs[k]) ||
+                    !factory_session_set_partial_sig_poison(f, affected[k],
+                                                              (size_t)slot, &ppsig)) {
+                    fprintf(stderr,
+                        "LSP-stateless Tier B: set client poison psig node %zu "
+                        "-- degrading\n", affected[k]);
+                    factory_session_reset_poison(f, affected[k]);
+                    poison_prepared[k] = 0;
+                }
+            }
+        }
+    }
+
+    /* Step 9b (poison): complete the poison session for each leaf that still
+       has poison active -> attaches node->poison_signed_tx. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (poison_prepared[k] &&
+            !factory_session_complete_node_poison(f, affected[k])) {
+            fprintf(stderr,
+                "LSP-stateless Tier B: complete_node_poison[%zu] -- degrading\n",
+                affected[k]);
+            factory_session_reset_poison(f, affected[k]);
+            poison_prepared[k] = 0;
         }
     }
 
@@ -2889,6 +3033,41 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             fprintf(stderr,
                 "LSP-stateless Tier B: complete_node[%zu] failed\n", affected[k]);
             return 0;
+        }
+    }
+
+    /* Step 10 (Tier B poison): register each affected leaf's new state +
+       wire-signed L-stock poison TX with the watchtower (mirror of legacy
+       Step 10 / leaf-advance #330).  poison_signed_tx is NULL for leaves that
+       degraded or were never poison-eligible (PS leaves / no old L-stock). */
+    if (mgr->watchtower) {
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            const unsigned char *poison_data = NULL;
+            size_t poison_len = 0;
+            if (poison_prepared[k] && an->poison_is_signed &&
+                an->poison_signed_tx.len > 0) {
+                poison_data = an->poison_signed_tx.data;
+                poison_len  = an->poison_signed_tx.len;
+                printf("LSP-stateless Tier B: node %zu poison TX signed "
+                       "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
+                       (unsigned long long)poison_old_l_amount[k]);
+            }
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            size_t n_leaf_ch = 0;
+            for (size_t cc = 0; cc < mgr->n_channels; cc++) {
+                size_t c_node; uint32_t c_vout;
+                client_to_leaf(cc, f, &c_node, &c_vout);
+                if (c_node == affected[k])
+                    leaf_ch_ids[n_leaf_ch++] = (uint32_t)cc;
+            }
+            watchtower_watch_factory_node_with_channels(mgr->watchtower,
+                (uint32_t)affected[k], poison_old_txid[k],
+                an->signed_tx.data, an->signed_tx.len,
+                poison_data, poison_len,
+                leaf_ch_ids, n_leaf_ch);
+            if (poison_prepared[k])
+                factory_session_reset_poison(f, affected[k]);
         }
     }
 
