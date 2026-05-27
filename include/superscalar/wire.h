@@ -184,6 +184,12 @@
 #define MSG_FACTORY_LSP_RESPONSE        0x87  /* LSP -> Client: per-node lsp pubnonces + psigs */
 #define MSG_FACTORY_CLIENT_FINAL_PSIGS  0x88
 
+/* LSP -> Client: full per-node signer partial-sig matrix (Gap B), so each
+   client can locally complete multi-signer Tier B nodes (it only holds its own
+   + the LSP's psig).  Mirror of the 0x83 all-signer nonce matrix.  Flat layout:
+   affected nodes in order, each n_signers slots of 32 bytes. */
+#define MSG_STATE_ADV_ALL_PSIGS           0x89
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -521,11 +527,16 @@ int    wire_parse_subfactory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input /* n_inputs * 66 */,
                                             const unsigned char *lsp_psigs_per_input /* n_inputs * 32 */,
-                                            uint32_t n_inputs);
+                                            uint32_t n_inputs,
+                                            const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL (single-input k>=2: n_signers*66) */,
+                                            uint32_t all_signer_pubnonces_len);
 int    wire_parse_subfactory_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_input,
                                             unsigned char *out_lsp_psigs_per_input,
-                                            uint32_t expected_n_inputs);
+                                            uint32_t expected_n_inputs,
+                                            unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                            uint32_t max_all_signer_pubnonces_len,
+                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input /* n_inputs * 32 */,
                                                   uint32_t n_inputs);
@@ -545,24 +556,47 @@ int    wire_parse_state_adv_propose_intent(const cJSON *json,
                                               int *out_trigger_leaf_side);
 
 cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf /* n * 66 */,
-                                                  uint32_t n_affected_leaves);
+                                                  uint32_t n_affected_leaves,
+                                                  const unsigned char *poison_pubnonces_per_leaf /* n * 66 or NULL */);
+/* Returns 1 (no poison), 2 (poison_pubnonces present), 0 (parse error). */
 int    wire_parse_state_adv_client_path_nonces(const cJSON *json,
                                                   unsigned char *out_pubnonces_per_leaf,
-                                                  uint32_t expected_n_affected_leaves);
+                                                  uint32_t expected_n_affected_leaves,
+                                                  unsigned char *out_poison_pubnonces_per_leaf /* n * 66 or NULL */);
 
 cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf /* n * 66 */,
                                             const unsigned char *lsp_psigs_per_leaf /* n * 32 */,
-                                            uint32_t n_affected_leaves);
+                                            uint32_t n_affected_leaves,
+                                            const unsigned char *lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
+                                            const unsigned char *lsp_poison_psigs_per_leaf /* n * 32 or NULL */,
+                                            const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL */,
+                                            uint32_t all_signer_pubnonces_len);
+/* Returns 1 (no poison), 2 (poison present), 0 (parse error). */
 int    wire_parse_state_adv_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_leaf,
                                             unsigned char *out_lsp_psigs_per_leaf,
-                                            uint32_t expected_n_affected_leaves);
+                                            uint32_t expected_n_affected_leaves,
+                                            unsigned char *out_lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
+                                            unsigned char *out_lsp_poison_psigs_per_leaf /* n * 32 or NULL */,
+                                            unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                            uint32_t max_all_signer_pubnonces_len,
+                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf /* n * 32 */,
-                                                  uint32_t n_affected_leaves);
+                                                  uint32_t n_affected_leaves,
+                                                  const unsigned char *poison_psigs_per_leaf /* n * 32 or NULL */);
+/* Returns 1 (no poison), 2 (poison_psigs present), 0 (parse error). */
 int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_leaf,
-                                                  uint32_t expected_n_affected_leaves);
+                                                  uint32_t expected_n_affected_leaves,
+                                                  unsigned char *out_poison_psigs_per_leaf /* n * 32 or NULL */);
+
+cJSON *wire_build_state_adv_all_psigs(const unsigned char *all_signer_psigs_flat /* all_len bytes */,
+                                         uint32_t all_signer_psigs_len);
+int    wire_parse_state_adv_all_psigs(const cJSON *json,
+                                         unsigned char *out_all_signer_psigs_flat,
+                                         uint32_t max_all_signer_psigs_len,
+                                         uint32_t *out_all_signer_psigs_len);
 
 /* Phase 1e.3.a factory creation reversed flow wire codec.  Multi-node ceremony:
    per-node arrays of pubnonces + psigs. */
@@ -577,11 +611,16 @@ int    wire_parse_factory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_node /* n * 66 */,
                                           const unsigned char *lsp_psigs_per_node /* n * 32 */,
-                                          uint32_t n_nodes);
+                                          uint32_t n_nodes,
+                                          const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL */,
+                                          uint32_t all_signer_pubnonces_len);
 int    wire_parse_factory_lsp_response(const cJSON *json,
                                           unsigned char *out_lsp_pubnonces_per_node,
                                           unsigned char *out_lsp_psigs_per_node,
-                                          uint32_t expected_n_nodes);
+                                          uint32_t expected_n_nodes,
+                                          unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                          uint32_t max_all_signer_pubnonces_len,
+                                          uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_factory_client_final_psigs(const unsigned char *psigs_per_node /* n * 32 */,
                                                 uint32_t n_nodes);

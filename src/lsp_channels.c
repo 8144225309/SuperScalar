@@ -2629,13 +2629,11 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
 
-    /* MVP refusal: watchtower configured -> poison TX would be required. */
-    if (mgr->watchtower) {
-        fprintf(stderr,
-            "LSP-stateless Tier B: watchtower configured (poison TX needed) -- "
-            "falling back to legacy\n");
-        return -1;
-    }
+    /* Phase 1e.2.e (Tier B poison wiring): the watchtower is configured in
+       production.  Instead of refusing, we run the per-DW-leaf L-stock poison
+       ceremony in lockstep with the state ceremony (mirror of leaf-advance
+       #330, applied per affected leaf).  Each poison step is gated on
+       poison_prepared[k]; a degraded leaf simply registers without poison. */
 
     /* Step 1: Build affected[] (same logic as legacy at line ~2725). */
     size_t affected[FACTORY_MAX_NODES];
@@ -2666,12 +2664,55 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
 
-    /* Step 2: Init MuSig session for each affected node (state only). */
+    /* Step 1.5 (Tier B poison): capture each affected DW leaf's OLD signed
+       state + prepare its L-stock poison TX (mirror of leaf-advance #330).
+       PS leaves carry no L-stock poison (it lives in their sub-factory chain).
+       Per-affected-node arrays indexed by affected[] order (k). */
+    const uint64_t TIERB_POISON_FEE_SATS = 1000;
+    int poison_prepared[FACTORY_MAX_NODES];
+    unsigned char poison_old_txid[FACTORY_MAX_NODES][32];
+    uint64_t poison_old_l_amount[FACTORY_MAX_NODES];
+    int poison_client_slot[FACTORY_MAX_NODES];
+    unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
+    unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    for (size_t k = 0; k < n_affected; k++) {
+        poison_prepared[k] = 0;
+        poison_client_slot[k] = -1;
+        poison_old_l_amount[k] = 0;
+        memset(poison_old_txid[k], 0, 32);
+        memset(lsp_poison_pubnonces_per_node[k], 0, 66);
+        memset(lsp_poison_psigs_per_node[k], 0, 32);
+        factory_node_t *an = &f->nodes[affected[k]];
+        int had_old = (an->is_signed && an->signed_tx.len > 0);
+        int old_no = an->n_outputs;
+        if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
+        poison_old_l_amount[k] = (old_no >= 2)
+            ? an->outputs[old_no - 1].amount_sats : 0;
+        if (mgr->watchtower && !an->is_ps_leaf && had_old && old_no >= 2 &&
+            poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
+                (uint64_t)(an->n_signers - 1) * 330u) {
+            if (factory_session_prepare_poison_tx_leaf(
+                    f, affected[k], poison_old_txid[k], (uint32_t)(old_no - 1),
+                    poison_old_l_amount[k], TIERB_POISON_FEE_SATS)) {
+                poison_prepared[k] = 1;  /* init_node_poison after state init */
+            }
+        }
+    }
+
+    /* Step 2: Init MuSig session for each affected node (state + poison). */
     for (size_t k = 0; k < n_affected; k++) {
         if (!factory_session_init_node(f, affected[k])) {
             fprintf(stderr,
                 "LSP-stateless Tier B: init_node[%zu] failed\n", affected[k]);
             return 0;
+        }
+        if (poison_prepared[k] &&
+            !factory_session_init_node_poison(f, affected[k])) {
+            fprintf(stderr,
+                "LSP-stateless Tier B: init_node_poison[%zu] -- degrading leaf\n",
+                affected[k]);
+            factory_session_reset_poison(f, affected[k]);
+            poison_prepared[k] = 0;
         }
     }
 
@@ -2711,9 +2752,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         unsigned char this_client_pn[FACTORY_MAX_NODES][66];
+        unsigned char this_client_poison_pn[FACTORY_MAX_NODES][66];
+        memset(this_client_poison_pn, 0, sizeof(this_client_poison_pn));
         if (!wire_parse_state_adv_client_path_nonces(nmsg.json,
                                                        (unsigned char *)this_client_pn,
-                                                       (uint32_t)n_affected)) {
+                                                       (uint32_t)n_affected,
+                                                       (unsigned char *)this_client_poison_pn)) {
             cJSON_Delete(nmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_PATH_NONCES from client %zu failed\n",
@@ -2743,6 +2787,33 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             }
             memcpy(client_pubnonces_per_node[k], this_client_pn[k], 66);
             client_slot_per_node[k] = slot;
+
+            /* Poison: if this leaf has a prepared poison TX and the client
+               sent a (non-zero) poison nonce, set it on the poison session. */
+            if (poison_prepared[k]) {
+                int pz = 1;
+                for (size_t b = 0; b < 66; b++)
+                    if (this_client_poison_pn[k][b]) { pz = 0; break; }
+                if (pz) {
+                    fprintf(stderr,
+                        "LSP-stateless Tier B: client %zu sent no poison nonce "
+                        "for node %zu -- degrading leaf poison\n", c, affected[k]);
+                    factory_session_reset_poison(f, affected[k]);
+                    poison_prepared[k] = 0;
+                } else {
+                    secp256k1_musig_pubnonce ppn;
+                    if (!musig_pubnonce_parse(lsp->ctx, &ppn, this_client_poison_pn[k]) ||
+                        !factory_session_set_nonce_poison(f, affected[k], (size_t)slot, &ppn)) {
+                        fprintf(stderr,
+                            "LSP-stateless Tier B: set client poison nonce node %zu "
+                            "-- degrading\n", affected[k]);
+                        factory_session_reset_poison(f, affected[k]);
+                        poison_prepared[k] = 0;
+                    } else {
+                        poison_client_slot[k] = slot;
+                    }
+                }
+            }
         }
     }
 
@@ -2818,16 +2889,85 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 "LSP-stateless Tier B: set LSP psig[%zu] failed\n", affected[k]);
             return 0;
         }
+
+        /* Poison (lockstep): LSP poison nonce -> set -> finalize -> partial sig.
+           lsp_poison_secnonce is a loop local, zeroed by create_partial_sig in
+           this same iteration -- no poison secnonce held across the wire recv
+           that follows (same stateless invariant as the state nonce). */
+        if (poison_prepared[k]) {
+            secp256k1_musig_secnonce lsp_poison_secnonce;
+            secp256k1_musig_pubnonce lsp_poison_pubnonce;
+            secp256k1_musig_partial_sig lsp_poison_psig;
+            unsigned char lsp_psk[32];
+            /* musig_generate_nonce takes (seckey32, pubkey, keyagg.cache); the
+               state lsp_seckey was already zeroed after the pool gen, so derive
+               a fresh local seckey and zero it right after. */
+            int pz_ok =
+                secp256k1_keypair_sec(lsp->ctx, lsp_psk, &lsp->lsp_keypair) &&
+                musig_generate_nonce(lsp->ctx, &lsp_poison_secnonce, &lsp_poison_pubnonce,
+                                       lsp_psk, &lsp->lsp_pubkey,
+                                       &f->nodes[affected[k]].keyagg.cache) &&
+                factory_session_set_nonce_poison(f, affected[k], (size_t)slot,
+                                                   &lsp_poison_pubnonce) &&
+                factory_session_finalize_node_poison(f, affected[k]) &&
+                musig_create_partial_sig(lsp->ctx, &lsp_poison_psig,
+                                           &lsp_poison_secnonce, &lsp_kp,
+                                           &f->nodes[affected[k]].poison_signing_session) &&
+                factory_session_set_partial_sig_poison(f, affected[k], (size_t)slot,
+                                                         &lsp_poison_psig);
+            memset(lsp_psk, 0, 32);
+            /* Zero the poison secnonce on any path: create_partial_sig already
+               zeroed it on success; on early-chain failure this clears the
+               generated-but-unconsumed secnonce so none lingers across the recv. */
+            memset(&lsp_poison_secnonce, 0, sizeof(lsp_poison_secnonce));
+            if (!pz_ok) {
+                fprintf(stderr,
+                    "LSP-stateless Tier B: LSP poison sign[%zu] -- degrading leaf\n",
+                    affected[k]);
+                factory_session_reset_poison(f, affected[k]);
+                poison_prepared[k] = 0;
+            } else {
+                musig_pubnonce_serialize(lsp->ctx, lsp_poison_pubnonces_per_node[k],
+                                          &lsp_poison_pubnonce);
+                musig_partial_sig_serialize(lsp->ctx, lsp_poison_psigs_per_node[k],
+                                             &lsp_poison_psig);
+            }
+        }
     }
     /* INVARIANT: every LSP secnonce in lsp_pool has been pulled and zeroed
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
 
-    /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients. */
+    /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients.
+       Gap A: also forward EVERY signer's pubnonce per node (from the session,
+       which holds all collected nonces) so each client can build the aggnonce
+       for multi-signer nodes (root/intermediates), not just 2-of-2 leaves. */
+    size_t total_nonce_slots = 0;
+    for (size_t k = 0; k < n_affected; k++)
+        total_nonce_slots += f->nodes[affected[k]].n_signers;
+    unsigned char *all_pn_flat = calloc(total_nonce_slots ? total_nonce_slots : 1, 66);
+    if (!all_pn_flat) {
+        fprintf(stderr, "LSP-stateless Tier B: alloc all_pn_flat failed\n");
+        return 0;
+    }
+    {
+        size_t base = 0;
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            for (size_t s = 0; s < an->n_signers; s++)
+                musig_pubnonce_serialize(lsp->ctx, all_pn_flat + (base + s) * 66,
+                                         &an->signing_session.pubnonces[s]);
+            base += an->n_signers;
+        }
+    }
     cJSON *response = wire_build_state_adv_lsp_response(
         (const unsigned char *)lsp_pubnonces_per_node,
         (const unsigned char *)lsp_psigs_per_node,
-        (uint32_t)n_affected);
+        (uint32_t)n_affected,
+        (const unsigned char *)lsp_poison_pubnonces_per_node,
+        (const unsigned char *)lsp_poison_psigs_per_node,
+        all_pn_flat, (uint32_t)(total_nonce_slots * 66));
+    free(all_pn_flat); all_pn_flat = NULL;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_LSP_RESPONSE, response)) {
             cJSON_Delete(response);
@@ -2851,9 +2991,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
+        unsigned char this_client_poison_psigs[FACTORY_MAX_NODES][32];
+        memset(this_client_poison_psigs, 0, sizeof(this_client_poison_psigs));
         if (!wire_parse_state_adv_client_final_psigs(pmsg.json,
                                                        (unsigned char *)this_client_psigs,
-                                                       (uint32_t)n_affected)) {
+                                                       (uint32_t)n_affected,
+                                                       (unsigned char *)this_client_poison_psigs)) {
             cJSON_Delete(pmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_FINAL_PSIGS[%zu] failed\n", c);
@@ -2877,6 +3020,33 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                     c, affected[k]);
                 return 0;
             }
+            /* Poison: set this client's poison partial sig if this leaf still
+               has poison active and the client signed for it. */
+            if (poison_prepared[k] && (int)slot == poison_client_slot[k]) {
+                secp256k1_musig_partial_sig ppsig;
+                if (!musig_partial_sig_parse(lsp->ctx, &ppsig, this_client_poison_psigs[k]) ||
+                    !factory_session_set_partial_sig_poison(f, affected[k],
+                                                              (size_t)slot, &ppsig)) {
+                    fprintf(stderr,
+                        "LSP-stateless Tier B: set client poison psig node %zu "
+                        "-- degrading\n", affected[k]);
+                    factory_session_reset_poison(f, affected[k]);
+                    poison_prepared[k] = 0;
+                }
+            }
+        }
+    }
+
+    /* Step 9b (poison): complete the poison session for each leaf that still
+       has poison active -> attaches node->poison_signed_tx. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (poison_prepared[k] &&
+            !factory_session_complete_node_poison(f, affected[k])) {
+            fprintf(stderr,
+                "LSP-stateless Tier B: complete_node_poison[%zu] -- degrading\n",
+                affected[k]);
+            factory_session_reset_poison(f, affected[k]);
+            poison_prepared[k] = 0;
         }
     }
 
@@ -2887,6 +3057,90 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 "LSP-stateless Tier B: complete_node[%zu] failed\n", affected[k]);
             return 0;
         }
+    }
+
+    /* Step 9c (Gap B): broadcast the full per-node signer-PSIG matrix so each
+       client can locally complete multi-signer nodes (it only holds its own +
+       the LSP's psig).  node->partial_sigs[] holds every psig after Step 8. */
+    {
+        size_t total_psig_slots = 0;
+        for (size_t k = 0; k < n_affected; k++)
+            total_psig_slots += f->nodes[affected[k]].n_signers;
+        unsigned char *all_psig_flat = calloc(total_psig_slots ? total_psig_slots : 1, 32);
+        if (!all_psig_flat) {
+            fprintf(stderr, "LSP-stateless Tier B: alloc all_psig_flat failed\n");
+            return 0;
+        }
+        size_t base = 0;
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            for (size_t s = 0; s < an->n_signers; s++)
+                musig_partial_sig_serialize(lsp->ctx, all_psig_flat + (base + s) * 32,
+                                            &an->partial_sigs[s]);
+            base += an->n_signers;
+        }
+        cJSON *apm = wire_build_state_adv_all_psigs(all_psig_flat,
+                                                    (uint32_t)(total_psig_slots * 32));
+        free(all_psig_flat);
+        if (!apm) {
+            fprintf(stderr, "LSP-stateless Tier B: build ALL_PSIGS failed\n");
+            return 0;
+        }
+        for (size_t c = 0; c < lsp->n_clients; c++) {
+            if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_ALL_PSIGS, apm)) {
+                cJSON_Delete(apm);
+                fprintf(stderr, "LSP-stateless Tier B: send ALL_PSIGS[%zu] failed\n", c);
+                return 0;
+            }
+        }
+        cJSON_Delete(apm);
+    }
+
+    /* Step 10 (Tier B poison): register each affected leaf's new state +
+       wire-signed L-stock poison TX with the watchtower (mirror of legacy
+       Step 10 / leaf-advance #330).  poison_signed_tx is NULL for leaves that
+       degraded or were never poison-eligible (PS leaves / no old L-stock). */
+    if (mgr->watchtower) {
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            const unsigned char *poison_data = NULL;
+            size_t poison_len = 0;
+            if (poison_prepared[k] && an->poison_is_signed &&
+                an->poison_signed_tx.len > 0) {
+                poison_data = an->poison_signed_tx.data;
+                poison_len  = an->poison_signed_tx.len;
+                printf("LSP-stateless Tier B: node %zu poison TX signed "
+                       "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
+                       (unsigned long long)poison_old_l_amount[k]);
+            }
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            size_t n_leaf_ch = 0;
+            for (size_t cc = 0; cc < mgr->n_channels; cc++) {
+                size_t c_node; uint32_t c_vout;
+                client_to_leaf(cc, f, &c_node, &c_vout);
+                if (c_node == affected[k])
+                    leaf_ch_ids[n_leaf_ch++] = (uint32_t)cc;
+            }
+            watchtower_watch_factory_node_with_channels(mgr->watchtower,
+                (uint32_t)affected[k], poison_old_txid[k],
+                an->signed_tx.data, an->signed_tx.len,
+                poison_data, poison_len,
+                leaf_ch_ids, n_leaf_ch);
+            if (poison_prepared[k])
+                factory_session_reset_poison(f, affected[k]);
+        }
+    }
+
+    /* Step 11.5 (F1): persist new-epoch chain[0] for every PS leaf + sub-factory
+       node, mirroring the legacy lsp_run_state_advance.  Only fires on
+       root-driven Tier B (the only path that re-signs PS leaves).  Without this
+       the DB keeps the OLD epoch chain[0] and force-close after rollover cannot
+       reconstruct the new signed state ("persisted bytes differ"). */
+    if (trigger_leaf_side == -1 && mgr->persist) {
+        int saved = lsp_persist_ps_chain0_all(mgr->persist, f);
+        if (saved > 0)
+            printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
+                   saved);
     }
 
     /* Step 10: Broadcast DONE (existing opcode). */
@@ -4429,6 +4683,317 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Dispatched from the public function when SS_MUSIG_STATELESS=1 AND the
    target node is single-input (factory_node_uses_multi_input returns 0).
    Multi-input + poison + WT registration deferred to Phase 1e.1.c. */
+/* Phase 1e.1.e: MULTI-INPUT stateless sub-factory chain advance.
+   Mirrors lsp_subfactory_chain_advance_stateless (single-input) but loops
+   per input.  Called from the single-input function once the unsigned tx,
+   session, sub_clients[] and slots have been resolved -- but we re-derive
+   everything needed here from (f, sub_node_i, sub) so this stays a clean
+   self-contained block.
+
+   STATELESS INVARIANT: LSP per-input secnonces are generated in Step 5 AFTER
+   the Step-4 recv of every client's pubnonces, and each lsp_secnonces[i] is
+   zeroed by musig_create_partial_sig (Step 5) before the Step-7 recv. */
+static int lsp_subfactory_chain_advance_stateless_multi(
+        lsp_channel_mgr_t *mgr, lsp_t *lsp, factory_t *f,
+        size_t sub_node_i, factory_node_t *sub,
+        const uint32_t *sub_clients, size_t n_clients_in_sub,
+        int leaf_side, int sub_idx_in_leaf, int channel_idx_in_sub,
+        uint64_t delta_sats) {
+    size_t n_inputs = sub->ps_n_prev_outputs;
+    if (n_inputs < 1) {
+        fprintf(stderr, "LSP-stateless subfactory MULTI: n_inputs=%zu invalid\n",
+                n_inputs);
+        return 0;
+    }
+
+    /* Step 1: rebuild unsigned_tx (deterministic; clients do the same). */
+    if (!factory_subfactory_chain_advance_unsigned(f, leaf_side,
+                                                    sub_idx_in_leaf,
+                                                    channel_idx_in_sub,
+                                                    delta_sats)) {
+        fprintf(stderr, "LSP-stateless subfactory MULTI: advance_unsigned failed\n");
+        return 0;
+    }
+
+    /* Step 2: init one state session per input (no poison in stateless MVP). */
+    for (size_t i = 0; i < n_inputs; i++) {
+        if (!factory_session_init_node_input(f, sub_node_i, i)) {
+            fprintf(stderr, "LSP-stateless subfactory MULTI: init input %zu failed\n", i);
+            return 0;
+        }
+    }
+
+    int lsp_slot = factory_find_signer_slot(f, sub_node_i, 0);
+    if (lsp_slot < 0) return 0;
+
+    /* Step 3: PROPOSE_INTENT (n_inputs, NO LSP nonce). */
+    cJSON *propose = wire_build_subfactory_propose_intent(
+        (uint32_t)sub_node_i, (uint32_t)n_inputs,
+        leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE_INTENT, propose)) {
+            cJSON_Delete(propose);
+            fprintf(stderr, "LSP-stateless MULTI: send PROPOSE_INTENT failed for client %u\n",
+                    sub_clients[ci]);
+            return 0;
+        }
+    }
+    cJSON_Delete(propose);
+
+    /* all_pn_per_input[(signer_slot * n_inputs + input_idx) * 66] -- same
+       layout as the legacy multi-input path so the matrix forwarded to
+       clients in LSP_RESPONSE is indexed identically on both sides. */
+    unsigned char *all_pn_per_input = calloc(sub->n_signers * n_inputs, 66);
+    if (!all_pn_per_input) return 0;
+
+    /* Step 4: collect each client's n_inputs pubnonces. */
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t nmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &nmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+            nmsg.msg_type != MSG_SUBFACTORY_CLIENT_PUBNONCES) {
+            fprintf(stderr,
+                    "LSP-stateless MULTI: expected CLIENT_PUBNONCES from client %u, got 0x%02x\n",
+                    sub_clients[ci], nmsg.msg_type);
+            if (nmsg.json) cJSON_Delete(nmsg.json);
+            free(all_pn_per_input);
+            return 0;
+        }
+        unsigned char *client_pn_buf = calloc(n_inputs, 66);
+        if (!client_pn_buf) { cJSON_Delete(nmsg.json); free(all_pn_per_input); return 0; }
+        if (!wire_parse_subfactory_client_pubnonces(nmsg.json, client_pn_buf,
+                                                     (uint32_t)n_inputs)) {
+            cJSON_Delete(nmsg.json);
+            free(client_pn_buf); free(all_pn_per_input);
+            fprintf(stderr, "LSP-stateless MULTI: parse CLIENT_PUBNONCES failed\n");
+            return 0;
+        }
+        cJSON_Delete(nmsg.json);
+        int client_slot = factory_find_signer_slot(f, sub_node_i, sub_clients[ci]);
+        if (client_slot < 0) { free(client_pn_buf); free(all_pn_per_input); return 0; }
+        for (size_t i = 0; i < n_inputs; i++)
+            memcpy(all_pn_per_input + ((size_t)client_slot * n_inputs + i) * 66,
+                   client_pn_buf + i * 66, 66);
+        free(client_pn_buf);
+    }
+
+    /* Step 5 (THE CRITICAL ATOMIC BLOCK): per input -- gen LSP secnonce, set
+       all signers' input-i nonces, finalize input-i, create LSP psig (zeros
+       secnonce[i]), set LSP psig.  No wire_recv anywhere in this block. */
+    unsigned char lsp_seckey[32];
+    if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
+        free(all_pn_per_input);
+        return 0;
+    }
+    secp256k1_musig_secnonce *lsp_secnonces =
+        calloc(n_inputs, sizeof(secp256k1_musig_secnonce));
+    unsigned char (*lsp_pn_ser)[66] = calloc(n_inputs, sizeof(unsigned char[66]));
+    unsigned char (*lsp_psig_ser)[32] = calloc(n_inputs, sizeof(unsigned char[32]));
+    if (!lsp_secnonces || !lsp_pn_ser || !lsp_psig_ser) {
+        memset(lsp_seckey, 0, 32);
+        free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+        free(all_pn_per_input);
+        return 0;
+    }
+
+    /* Build the LSP keypair once for the per-input psig calls. */
+    secp256k1_keypair lsp_kp;
+    if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
+        memset(lsp_seckey, 0, 32);
+        free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+        free(all_pn_per_input);
+        return 0;
+    }
+
+    for (size_t i = 0; i < n_inputs; i++) {
+        secp256k1_musig_pubnonce lsp_pubnonce_i;
+        if (!musig_generate_nonce(lsp->ctx, &lsp_secnonces[i], &lsp_pubnonce_i,
+                                   lsp_seckey, &lsp->lsp_pubkey,
+                                   &sub->keyagg.cache)) {
+            fprintf(stderr, "LSP-stateless MULTI: nonce gen input %zu failed\n", i);
+            memset(lsp_seckey, 0, 32);
+            free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+            free(all_pn_per_input);
+            return 0;
+        }
+        musig_pubnonce_serialize(lsp->ctx, lsp_pn_ser[i], &lsp_pubnonce_i);
+        memcpy(all_pn_per_input + ((size_t)lsp_slot * n_inputs + i) * 66,
+               lsp_pn_ser[i], 66);
+
+        /* Set every signer's nonce for THIS input. */
+        for (size_t s = 0; s < sub->n_signers; s++) {
+            secp256k1_musig_pubnonce pn;
+            if (!musig_pubnonce_parse(lsp->ctx, &pn,
+                    all_pn_per_input + (s * n_inputs + i) * 66) ||
+                !factory_session_set_nonce_input(f, sub_node_i, i, s, &pn)) {
+                fprintf(stderr,
+                        "LSP-stateless MULTI: set_nonce_input(signer=%zu input=%zu) failed\n",
+                        s, i);
+                memset(lsp_seckey, 0, 32);
+                free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+                free(all_pn_per_input);
+                return 0;
+            }
+        }
+
+        if (!factory_session_finalize_node_input(f, sub_node_i, i)) {
+            fprintf(stderr, "LSP-stateless MULTI: finalize input %zu failed\n", i);
+            memset(lsp_seckey, 0, 32);
+            free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+            free(all_pn_per_input);
+            return 0;
+        }
+
+        secp256k1_musig_partial_sig lsp_psig_i;
+        if (!musig_create_partial_sig(lsp->ctx, &lsp_psig_i,
+                &lsp_secnonces[i], &lsp_kp,
+                &sub->input_signing_sessions[i])) {
+            fprintf(stderr, "LSP-stateless MULTI: create_partial_sig input %zu failed\n", i);
+            memset(lsp_seckey, 0, 32);
+            free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+            free(all_pn_per_input);
+            return 0;
+        }
+        /* lsp_secnonces[i] zeroed by musig_create_partial_sig.  INVARIANT:
+           no LSP secnonce for input i is held across the recv that follows. */
+        if (!factory_session_set_partial_sig_input(f, sub_node_i, i,
+                                                    (size_t)lsp_slot, &lsp_psig_i)) {
+            fprintf(stderr, "LSP-stateless MULTI: set_partial_sig_input %zu failed\n", i);
+            memset(lsp_seckey, 0, 32);
+            free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+            free(all_pn_per_input);
+            return 0;
+        }
+        musig_partial_sig_serialize(lsp->ctx, lsp_psig_ser[i], &lsp_psig_i);
+    }
+    memset(lsp_seckey, 0, 32);
+    free(lsp_secnonces);  /* all entries already zeroed by create_partial_sig */
+
+    /* Build flat per-input LSP arrays for the wire response. */
+    unsigned char *lsp_pn_flat = calloc(n_inputs, 66);
+    unsigned char *lsp_psig_flat = calloc(n_inputs, 32);
+    if (!lsp_pn_flat || !lsp_psig_flat) {
+        free(lsp_pn_flat); free(lsp_psig_flat);
+        free(lsp_pn_ser); free(lsp_psig_ser);
+        free(all_pn_per_input);
+        return 0;
+    }
+    for (size_t i = 0; i < n_inputs; i++) {
+        memcpy(lsp_pn_flat + i * 66, lsp_pn_ser[i], 66);
+        memcpy(lsp_psig_flat + i * 32, lsp_psig_ser[i], 32);
+    }
+    free(lsp_pn_ser); free(lsp_psig_ser);
+
+    /* Step 6: LSP_RESPONSE -- per-input LSP nonces + psigs, plus the full
+       signer x input matrix (all_pn_per_input) as the all-signer blob so each
+       client can set every co-signer's per-input nonce and finalize. */
+    cJSON *response = wire_build_subfactory_lsp_response(
+        lsp_pn_flat, lsp_psig_flat, (uint32_t)n_inputs,
+        all_pn_per_input,
+        (uint32_t)(sub->n_signers * n_inputs * 66));
+    free(lsp_pn_flat); free(lsp_psig_flat);
+    free(all_pn_per_input);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_LSP_RESPONSE, response)) {
+            cJSON_Delete(response);
+            fprintf(stderr, "LSP-stateless MULTI: send LSP_RESPONSE failed for client %u\n",
+                    sub_clients[ci]);
+            return 0;
+        }
+    }
+    cJSON_Delete(response);
+
+    /* Step 7: collect each client's n_inputs final psigs. */
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_msg_t pmsg;
+        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[fd_idx],
+                                            &pmsg, WIRE_CEREMONY_RECV_TIMEOUT_SEC) ||
+            pmsg.msg_type != MSG_SUBFACTORY_CLIENT_FINAL_PSIGS) {
+            fprintf(stderr,
+                    "LSP-stateless MULTI: expected CLIENT_FINAL_PSIGS from client %u, got 0x%02x\n",
+                    sub_clients[ci], pmsg.msg_type);
+            if (pmsg.json) cJSON_Delete(pmsg.json);
+            return 0;
+        }
+        unsigned char *client_psig_buf = calloc(n_inputs, 32);
+        if (!client_psig_buf) { cJSON_Delete(pmsg.json); return 0; }
+        if (!wire_parse_subfactory_client_final_psigs(pmsg.json, client_psig_buf,
+                                                       (uint32_t)n_inputs)) {
+            cJSON_Delete(pmsg.json);
+            free(client_psig_buf);
+            fprintf(stderr, "LSP-stateless MULTI: parse CLIENT_FINAL_PSIGS failed\n");
+            return 0;
+        }
+        cJSON_Delete(pmsg.json);
+        int client_slot = factory_find_signer_slot(f, sub_node_i, sub_clients[ci]);
+        if (client_slot < 0) { free(client_psig_buf); return 0; }
+        for (size_t i = 0; i < n_inputs; i++) {
+            secp256k1_musig_partial_sig client_psig_i;
+            if (!musig_partial_sig_parse(lsp->ctx, &client_psig_i,
+                                          client_psig_buf + i * 32) ||
+                !factory_session_set_partial_sig_input(f, sub_node_i, i,
+                                                        (size_t)client_slot,
+                                                        &client_psig_i)) {
+                fprintf(stderr, "LSP-stateless MULTI: set client psig (client %u input %zu) failed\n",
+                        sub_clients[ci], i);
+                free(client_psig_buf);
+                return 0;
+            }
+        }
+        free(client_psig_buf);
+    }
+
+    /* Step 8: aggregate + assemble the k+1-witness signed TX. */
+    if (!factory_session_assemble_signed_tx_multi(f, sub_node_i)) {
+        fprintf(stderr, "LSP-stateless MULTI: assemble_signed_tx_multi failed\n");
+        return 0;
+    }
+
+    /* Step 9: DONE to each client. */
+    cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
+    for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+        size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+        wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
+    }
+    cJSON_Delete(done);
+
+    /* Step 10 (persist): record the chain row, mirroring the single-input
+       path's Step 10.  Without this an LSP restart loses the multi-input
+       advance and the e2e row-count assertion fails. */
+    if (mgr->persist) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, sub->txid, 32);
+        reverse_bytes(txid_display, 32);
+        size_t sstock_vout = sub->n_outputs - 1;
+        uint64_t chan_amounts[16] = {0};
+        int n_chans = (int)sstock_vout;
+        if (n_chans > 16) n_chans = 16;
+        for (int ci = 0; ci < n_chans; ci++)
+            chan_amounts[ci] = sub->outputs[ci].amount_sats;
+        persist_save_subfactory_chain_entry(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)sub_node_i,
+            sub->ps_chain_len - 1,
+            f->counter.current_epoch,
+            txid_display,
+            sub->signed_tx.data, sub->signed_tx.len,
+            sub->outputs[sstock_vout].amount_sats,
+            chan_amounts, n_chans,
+            NULL, 0);
+    }
+
+    printf("LSP-stateless subfactory MULTI-INPUT advance (n_inputs=%zu) DONE\n", n_inputs);
+    printf("LSP-stateless subfactory chain advance: leaf %d sub %d chan %d delta %llu sats DONE\n",
+           leaf_side, sub_idx_in_leaf, channel_idx_in_sub,
+           (unsigned long long)delta_sats);
+    return 1;
+}
+
 static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
                                                     lsp_t *lsp,
                                                     int leaf_side,
@@ -4451,28 +5016,9 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     if (sub_node_i >= f->n_nodes) return 0;
     factory_node_t *sub = &f->nodes[sub_node_i];
 
-    /* Phase 1e.1.b MVP scope: reject k>=2 multi-client.  Wire codec does
-       not yet relay other client pubnonces in LSP_RESPONSE.  Phase 1e.1.d
-       follow-up will extend the codec.  For now, fall back to legacy. */
-    {
-        size_t check_n_clients = 0;
-        for (size_t s = 1; s < sub->n_signers; s++) check_n_clients++;
-        if (check_n_clients > 1) {
-            fprintf(stderr,
-                "LSP-stateless subfactory: k>=2 (n_clients=%zu) not yet "
-                "supported in stateless flow -- falling back to legacy\n",
-                check_n_clients);
-            return -1;
-        }
-    }
-
-    /* Reject multi-input in this MVP -- fall back to legacy. */
-    if (factory_node_uses_multi_input(f, sub_node_i)) {
-        fprintf(stderr,
-                "LSP-stateless subfactory advance: multi-input not yet supported "
-                "in stateless flow -- falling back to legacy\n");
-        return -1;  /* signal caller to use legacy path */
-    }
+    /* Phase 1e.1.d: k>=2 multi-client now supported -- LSP_RESPONSE (0x7F)
+       forwards the full per-signer nonce array (all_pubnonces) so each client
+       can build the aggnonce and finalize.  Mirror of Tier B Gap A. */
 
     /* Sub-factory clients (one client per output != L-stock + LSP).
        Build sub_clients[] -- same shape as legacy. */
@@ -4484,6 +5030,19 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     if (n_clients_in_sub == 0) {
         fprintf(stderr, "LSP-stateless subfactory advance: no clients in sub\n");
         return 0;
+    }
+
+    /* Phase 1e.1.e: MULTI-INPUT now runs through the STATELESS path too.
+       The single-input flow below is unchanged; multi-input gets its own
+       fully-looped block that mirrors the validated single-input ordering
+       per input.  The whole point is the same BIP-327 invariant: the LSP
+       generates its per-input secnonces ONLY after collecting every client's
+       pubnonces, and each lsp_secnonces[i] is consumed/zeroed by
+       musig_create_partial_sig before the next wire_recv. */
+    if (factory_node_uses_multi_input(f, sub_node_i)) {
+        return lsp_subfactory_chain_advance_stateless_multi(
+            mgr, lsp, f, sub_node_i, sub, sub_clients, n_clients_in_sub,
+            leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
     }
 
     /* Step 1: factory_subfactory_chain_advance_unsigned — rebuild unsigned_tx. */
@@ -4605,7 +5164,9 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     /* Step 6: send LSP_RESPONSE to each client (per-client copy so each can
        individually finalize_node + sign).  Single-input -> 1 element each. */
     cJSON *response = wire_build_subfactory_lsp_response(lsp_pubnonce_ser,
-                                                          lsp_psig_ser, 1);
+                                                          lsp_psig_ser, 1,
+                                                          (const unsigned char *)all_pubnonces,
+                                                          (uint32_t)(sub->n_signers * 66));
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_LSP_RESPONSE, response)) {
@@ -4660,6 +5221,34 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
     }
     cJSON_Delete(done);
+
+    /* Step 10 (persist): save the sub-factory chain entry to ps_subfactory_chains,
+       mirroring the legacy path (Step 10 below).  Without this the stateless
+       advance signs chain[N] but never persists the row, so an LSP restart loses
+       it (and the e2e row-count assertion fails).  Stateless MVP runs no poison
+       ceremony, so pass NULL/0 for the poison TX bytes. */
+    if (mgr->persist) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, sub->txid, 32);
+        reverse_bytes(txid_display, 32);
+        size_t sstock_vout = sub->n_outputs - 1;
+        uint64_t chan_amounts[16] = {0};
+        int n_chans = (int)sstock_vout;
+        if (n_chans > 16) n_chans = 16;
+        for (int ci = 0; ci < n_chans; ci++)
+            chan_amounts[ci] = sub->outputs[ci].amount_sats;
+        persist_save_subfactory_chain_entry(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)sub_node_i,
+            sub->ps_chain_len - 1,
+            f->counter.current_epoch,
+            txid_display,
+            sub->signed_tx.data, sub->signed_tx.len,
+            sub->outputs[sstock_vout].amount_sats,
+            chan_amounts, n_chans,
+            NULL, 0);
+    }
 
     printf("LSP-stateless subfactory chain advance: leaf %d sub %d chan %d delta %llu sats DONE\n",
            leaf_side, sub_idx_in_leaf, channel_idx_in_sub,

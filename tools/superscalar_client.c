@@ -1874,6 +1874,7 @@ handle_message:
             break;
         }
 
+        case MSG_STATE_ADV_PROPOSE_INTENT:  /* stateless Tier B (#333): client_handle_state_advance dispatches by opcode */
         case MSG_STATE_ADVANCE_PROPOSE: {
             /* Tier B (Gap B + F): LSP detected per-leaf DW counter rollover
                and is driving the whole-tree re-sign ceremony.  Delegate to
@@ -1888,6 +1889,7 @@ handle_message:
             break;
         }
 
+        case MSG_SUBFACTORY_PROPOSE_INTENT:  /* stateless sub-factory (#271/#142): client_handle_subfactory_advance dispatches by opcode */
         case MSG_SUBFACTORY_PROPOSE: {
             /* Phase 2c (Gap E followup): LSP "selling sales-stock" to a
                client.  Delegate to client_handle_subfactory_advance;
@@ -3304,12 +3306,12 @@ int main(int argc, char *argv[]) {
             }
             if (g_shutdown) break;
             if (!ok) {
-                fprintf(stderr, "Client: disconnected, retrying in 5s...\n");
+                fprintf(stderr, "Client: disconnected, retrying in 1s...\n");
                 /* Run watchtower check between reconnect attempts so we can
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
-                sleep(5);
+                sleep(1);
             } else {
                 break;  /* clean exit */
             }
