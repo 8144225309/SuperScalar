@@ -476,7 +476,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                 continue;
             }
             if (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
-                msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
+                msg.msg_type == MSG_STATE_ADVANCE_PROPOSE ||
+                msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
                 /* Participate in the (per-leaf or whole-tree state-advance)
                    ceremony inline.  Derive my_index from the factory's pubkey
                    list. */
@@ -647,7 +648,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             continue;
         }
         if (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
-            all_nonces_msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
+            all_nonces_msg.msg_type == MSG_STATE_ADVANCE_PROPOSE ||
+            all_nonces_msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
             uint32_t my_idx = UINT32_MAX;
             for (size_t p = 0; p < factory->n_participants; p++) {
                 unsigned char a[33], b[33]; size_t la = 33, lb = 33;

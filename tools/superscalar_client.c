@@ -1874,6 +1874,7 @@ handle_message:
             break;
         }
 
+        case MSG_STATE_ADV_PROPOSE_INTENT:  /* stateless Tier B (#333): client_handle_state_advance dispatches by opcode */
         case MSG_STATE_ADVANCE_PROPOSE: {
             /* Tier B (Gap B + F): LSP detected per-leaf DW counter rollover
                and is driving the whole-tree re-sign ceremony.  Delegate to
