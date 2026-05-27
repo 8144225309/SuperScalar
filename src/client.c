@@ -3052,7 +3052,8 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     /* Phase 1e.1.c (#271): if the LSP sent PROPOSE_INTENT (new opcode),
        it'''s the reversed stateless flow -- dispatch.  Legacy PROPOSE
        (0x73) keeps using the path below. */
-    if (propose_msg && propose_msg->msg_type == MSG_SUBFACTORY_PROPOSE_INTENT) {
+    if (!propose_msg) return 0;
+    if (propose_msg->msg_type == MSG_SUBFACTORY_PROPOSE_INTENT) {
         return client_handle_subfactory_advance_stateless(fd, ctx, keypair,
                                                             factory, my_index,
                                                             propose_msg);
@@ -4527,7 +4528,8 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
     /* Phase 1e.2.d: if LSP sent the new stateless PROPOSE_INTENT opcode,
        dispatch to the stateless handler.  Legacy STATE_ADVANCE_PROPOSE
        continues to use the path below. */
-    if (propose_msg && propose_msg->msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
+    if (!propose_msg) return 0;
+    if (propose_msg->msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
         return client_handle_state_advance_stateless(fd, ctx, keypair,
                                                        factory, my_index,
                                                        propose_msg);
