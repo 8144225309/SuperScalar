@@ -303,12 +303,50 @@ accept_fail:
     return 0;
 }
 
+/* Phase 1e.3.b scaffolding: stub for the reversed-flow stateless factory
+   creation ceremony.  Currently returns -1 for all cases (caller falls
+   through to legacy lsp_run_factory_creation).  Phase 1e.3.c will fill in
+   the actual multi-node MuSig ceremony using the wire codec from Phase
+   1e.3.a.
+
+   Wire flow (per Phase 1e.3.a opcodes 0x85-0x88):
+     LSP   -> Client: MSG_FACTORY_PROPOSE_INTENT (no nonces)
+     Client -> LSP:   MSG_FACTORY_CLIENT_PUBNONCES (per-node pubnonces)
+     LSP atomic:      gen lsp_secnonces + set + finalize + create_partial_sigs
+                       (lsp_secnonces zeroed by musig_create_partial_sig)
+     LSP   -> Client: MSG_FACTORY_LSP_RESPONSE (per-node lsp pubnonces + psigs)
+     Client -> LSP:   MSG_FACTORY_CLIENT_FINAL_PSIGS (per-node client psigs)
+     LSP:             aggregate per node + send MSG_FACTORY_READY (existing terminal)
+
+   Returns 1 on success, 0 on failure, -1 if stateless can't handle (caller
+   falls through to legacy). */
+int lsp_run_factory_creation_stateless(lsp_t *lsp) {
+    (void)lsp;
+    fprintf(stderr,
+        "LSP-stateless factory creation: not yet implemented (Phase 1e.3.c) -- "
+        "falling back to legacy lsp_run_factory_creation\n");
+    return -1;
+}
+
 int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
                               uint64_t funding_amount,
                               const unsigned char *funding_spk, size_t funding_spk_len,
                               uint16_t step_blocks, uint32_t states_per_layer,
                               uint32_t cltv_timeout) {
+    /* Phase 1e.3.b (#271): when --musig-stateless is set, dispatch to the
+       reversed-flow stub.  Returns -1 to signal fall-through to legacy if
+       the stateless variant cannot handle this case. */
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        if (stateless && stateless[0] == '1') {
+            extern int lsp_run_factory_creation_stateless(lsp_t *);
+            int rc = lsp_run_factory_creation_stateless(lsp);
+            if (rc >= 0) return rc;
+            /* rc == -1: stateless declined; fall through to legacy. */
+        }
+    }
+
     size_t n_total = 1 + lsp->n_clients;
 
     /* Build all_pubkeys: LSP=0, clients=1..N */
