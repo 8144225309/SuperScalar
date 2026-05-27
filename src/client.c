@@ -4394,7 +4394,7 @@ static int client_handle_state_advance_stateless(int fd,
 
     /* Step 6: send CLIENT_PATH_NONCES. */
     cJSON *cpn = wire_build_state_adv_client_path_nonces(
-        (const unsigned char *)my_pubnonces_per_node, (uint32_t)n_affected);
+        (const unsigned char *)my_pubnonces_per_node, (uint32_t)n_affected, NULL);
     if (!wire_send(fd, MSG_STATE_ADV_CLIENT_PATH_NONCES, cpn)) {
         cJSON_Delete(cpn);
         fprintf(stderr,
@@ -4417,7 +4417,8 @@ static int client_handle_state_advance_stateless(int fd,
     if (!wire_parse_state_adv_lsp_response(lr.json,
                                              (unsigned char *)lsp_pubnonces_per_node,
                                              (unsigned char *)lsp_psigs_per_node,
-                                             (uint32_t)n_affected)) {
+                                             (uint32_t)n_affected,
+                                             NULL, NULL)) {
         cJSON_Delete(lr.json);
         fprintf(stderr,
             "Client-stateless Tier B %u: parse LSP_RESPONSE failed\n", my_index);
@@ -4485,7 +4486,7 @@ static int client_handle_state_advance_stateless(int fd,
 
     /* Step 9: send CLIENT_FINAL_PSIGS. */
     cJSON *fp = wire_build_state_adv_client_final_psigs(
-        (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected);
+        (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected, NULL);
     if (!wire_send(fd, MSG_STATE_ADV_CLIENT_FINAL_PSIGS, fp)) {
         cJSON_Delete(fp);
         fprintf(stderr,

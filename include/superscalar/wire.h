@@ -545,24 +545,35 @@ int    wire_parse_state_adv_propose_intent(const cJSON *json,
                                               int *out_trigger_leaf_side);
 
 cJSON *wire_build_state_adv_client_path_nonces(const unsigned char *pubnonces_per_leaf /* n * 66 */,
-                                                  uint32_t n_affected_leaves);
+                                                  uint32_t n_affected_leaves,
+                                                  const unsigned char *poison_pubnonces_per_leaf /* n * 66 or NULL */);
+/* Returns 1 (no poison), 2 (poison_pubnonces present), 0 (parse error). */
 int    wire_parse_state_adv_client_path_nonces(const cJSON *json,
                                                   unsigned char *out_pubnonces_per_leaf,
-                                                  uint32_t expected_n_affected_leaves);
+                                                  uint32_t expected_n_affected_leaves,
+                                                  unsigned char *out_poison_pubnonces_per_leaf /* n * 66 or NULL */);
 
 cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_leaf /* n * 66 */,
                                             const unsigned char *lsp_psigs_per_leaf /* n * 32 */,
-                                            uint32_t n_affected_leaves);
+                                            uint32_t n_affected_leaves,
+                                            const unsigned char *lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
+                                            const unsigned char *lsp_poison_psigs_per_leaf /* n * 32 or NULL */);
+/* Returns 1 (no poison), 2 (poison present), 0 (parse error). */
 int    wire_parse_state_adv_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_leaf,
                                             unsigned char *out_lsp_psigs_per_leaf,
-                                            uint32_t expected_n_affected_leaves);
+                                            uint32_t expected_n_affected_leaves,
+                                            unsigned char *out_lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
+                                            unsigned char *out_lsp_poison_psigs_per_leaf /* n * 32 or NULL */);
 
 cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf /* n * 32 */,
-                                                  uint32_t n_affected_leaves);
+                                                  uint32_t n_affected_leaves,
+                                                  const unsigned char *poison_psigs_per_leaf /* n * 32 or NULL */);
+/* Returns 1 (no poison), 2 (poison_psigs present), 0 (parse error). */
 int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_leaf,
-                                                  uint32_t expected_n_affected_leaves);
+                                                  uint32_t expected_n_affected_leaves,
+                                                  unsigned char *out_poison_psigs_per_leaf /* n * 32 or NULL */);
 
 /* Phase 1e.3.a factory creation reversed flow wire codec.  Multi-node ceremony:
    per-node arrays of pubnonces + psigs. */

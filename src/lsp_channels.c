@@ -2713,7 +2713,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         unsigned char this_client_pn[FACTORY_MAX_NODES][66];
         if (!wire_parse_state_adv_client_path_nonces(nmsg.json,
                                                        (unsigned char *)this_client_pn,
-                                                       (uint32_t)n_affected)) {
+                                                       (uint32_t)n_affected,
+                                                       NULL)) {
             cJSON_Delete(nmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_PATH_NONCES from client %zu failed\n",
@@ -2827,7 +2828,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     cJSON *response = wire_build_state_adv_lsp_response(
         (const unsigned char *)lsp_pubnonces_per_node,
         (const unsigned char *)lsp_psigs_per_node,
-        (uint32_t)n_affected);
+        (uint32_t)n_affected,
+        NULL, NULL);
     for (size_t c = 0; c < lsp->n_clients; c++) {
         if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_LSP_RESPONSE, response)) {
             cJSON_Delete(response);
@@ -2853,7 +2855,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
         if (!wire_parse_state_adv_client_final_psigs(pmsg.json,
                                                        (unsigned char *)this_client_psigs,
-                                                       (uint32_t)n_affected)) {
+                                                       (uint32_t)n_affected,
+                                                       NULL)) {
             cJSON_Delete(pmsg.json);
             fprintf(stderr,
                 "LSP-stateless Tier B: parse CLIENT_FINAL_PSIGS[%zu] failed\n", c);
