@@ -176,38 +176,38 @@ int lsp_accept_clients(lsp_t *lsp) {
         else
             hs_ok = wire_noise_handshake_responder(fd, lsp->ctx);
         if (!hs_ok) {
-            fprintf(stderr, "LSP: noise handshake failed for client %zu\n", i);
+            fprintf(stderr, "LSP: noise handshake failed for client %zu -- dropping, retrying slot\n", i);
             rate_limiter_handshake_end(&lsp->rate_limiter);
             wire_close(fd);
-            goto accept_fail;
+            i--; continue;
         }
         rate_limiter_handshake_end(&lsp->rate_limiter);
 
         /* Receive HELLO */
         wire_msg_t msg;
         if (!wire_recv(fd, &msg) || msg.msg_type != MSG_HELLO) {
-            fprintf(stderr, "LSP: expected HELLO from client %zu\n", i);
+            fprintf(stderr, "LSP: expected HELLO from client %zu -- dropping, retrying slot\n", i);
             wire_close(fd);
             if (msg.json) cJSON_Delete(msg.json);
-            goto accept_fail;
+            i--; continue;
         }
 
         /* Parse client pubkey */
         cJSON *pk_item = cJSON_GetObjectItem(msg.json, "pubkey");
         if (!pk_item || !cJSON_IsString(pk_item)) {
-            fprintf(stderr, "LSP: bad pubkey in HELLO from client %zu\n", i);
+            fprintf(stderr, "LSP: bad pubkey in HELLO from client %zu -- dropping, retrying slot\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
-            goto accept_fail;
+            i--; continue;
         }
 
         unsigned char pk_buf[33];
         if (hex_decode(pk_item->valuestring, pk_buf, 33) != 33 ||
             !secp256k1_ec_pubkey_parse(lsp->ctx, &lsp->client_pubkeys[i], pk_buf, 33)) {
-            fprintf(stderr, "LSP: invalid pubkey from client %zu\n", i);
+            fprintf(stderr, "LSP: invalid pubkey from client %zu -- dropping, retrying slot\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
-            goto accept_fail;
+            i--; continue;
         }
 
         /* Optional slot_hint for deterministic keyagg ordering */

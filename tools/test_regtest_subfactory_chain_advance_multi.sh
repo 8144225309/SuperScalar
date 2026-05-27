@@ -68,6 +68,13 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do
         kill -9 "$pid" 2>/dev/null || true
     done
+    # Reap detached --daemon clients: they fork away from $PIDS so the PID-kill
+    # above misses them, and they leak onto the fixed port and pollute the next
+    # run. Match by the unique per-run tmpdir marker (no self-match: this shell
+    # cmdline does not contain $TMPDIR; pkill excludes its own pid).
+    pkill -f "$TMPDIR" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "$TMPDIR" 2>/dev/null || true
     cp "$LSP_LOG" /tmp/subfactory_multi_last_lsp.log 2>/dev/null || true
     cp "$LSP_DB"  /tmp/subfactory_multi_last_lsp.db  2>/dev/null || true
     for i in $(seq 0 $((N_CLIENTS - 1))); do
@@ -254,14 +261,14 @@ fi
 # --- Verify both advances fired ---
 echo ""
 echo "=== Verifying TWO sub-factory advances fired ==="
-ADV_LINES=$(grep -cE "sub-factory.*chain extended" "$LSP_LOG" 2>/dev/null || echo 0)
+ADV_LINES=$(grep -E "chain_len=[0-9].*signed=1" "$LSP_LOG" 2>/dev/null | wc -l)
 if [ "$ADV_LINES" -lt 2 ]; then
-    echo "FAIL: expected >= 2 advance lines, got $ADV_LINES"
-    grep -E "sub-factory|FAIL|chain extended" "$LSP_LOG" | head -30
+    echo "FAIL: expected >= 2 signed advances (chain_len progression), got $ADV_LINES"
+    grep -E "chain_len=|subfactory chain advance|MULTI-INPUT|FAIL|DONE" "$LSP_LOG" | head -30
     exit 1
 fi
-echo "  $ADV_LINES advance lines:"
-grep "sub-factory.*chain extended" "$LSP_LOG" | sed 's/^/    /'
+echo "  $ADV_LINES signed advances (chain_len progression):"
+grep -E "chain_len=[0-9].*signed=1" "$LSP_LOG" | sed 's/^/    /'
 
 # --- Verify MULTI-INPUT ceremony marker (LSP side) ---
 echo ""

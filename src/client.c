@@ -2901,18 +2901,12 @@ static int client_handle_subfactory_advance_stateless(int fd,
     size_t sub_node_i = (size_t)sub_node_id;
     factory_node_t *sub = &factory->nodes[sub_node_i];
 
-    /* MVP: refuse k>=2 (multi-client) -- matches LSP-side refusal. */
-    {
-        size_t check_n_clients = 0;
-        for (size_t s = 1; s < sub->n_signers; s++) check_n_clients++;
-        if (check_n_clients > 1) {
-            fprintf(stderr,
-                "Client-stateless subfactory %u: k>=2 (n_clients=%zu) not yet "
-                "supported -- LSP should fall back to legacy\n",
-                my_index, check_n_clients);
-            return 0;
-        }
-    }
+    /* k>=2 (multi-client sub-factory) is supported: the LSP forwards the full
+       all-signer pubnonce matrix in LSP_RESPONSE (Gap A), and the co-signer
+       nonce loop below sets every other signer's nonce before finalize. The
+       client sends its CLIENT_FINAL_PSIGS for the LSP to aggregate (no local
+       complete, so no Gap B needed). Matching LSP-side refusal removed in
+       d7bdfe4. */
 
     /* Phase 1e.1.b amendment: PROPOSE_INTENT now carries the advance params
        (leaf_side, sub_idx, channel_idx, delta_sats).  Apply the advance

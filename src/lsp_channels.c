@@ -4906,6 +4906,34 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     cJSON_Delete(done);
 
+    /* Step 10 (persist): save the sub-factory chain entry to ps_subfactory_chains,
+       mirroring the legacy path (Step 10 below).  Without this the stateless
+       advance signs chain[N] but never persists the row, so an LSP restart loses
+       it (and the e2e row-count assertion fails).  Stateless MVP runs no poison
+       ceremony, so pass NULL/0 for the poison TX bytes. */
+    if (mgr->persist) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, sub->txid, 32);
+        reverse_bytes(txid_display, 32);
+        size_t sstock_vout = sub->n_outputs - 1;
+        uint64_t chan_amounts[16] = {0};
+        int n_chans = (int)sstock_vout;
+        if (n_chans > 16) n_chans = 16;
+        for (int ci = 0; ci < n_chans; ci++)
+            chan_amounts[ci] = sub->outputs[ci].amount_sats;
+        persist_save_subfactory_chain_entry(
+            (persist_t *)mgr->persist, /* factory_id = */ 0,
+            (uint32_t)sub_node_i,
+            sub->ps_chain_len - 1,
+            f->counter.current_epoch,
+            txid_display,
+            sub->signed_tx.data, sub->signed_tx.len,
+            sub->outputs[sstock_vout].amount_sats,
+            chan_amounts, n_chans,
+            NULL, 0);
+    }
+
     printf("LSP-stateless subfactory chain advance: leaf %d sub %d chan %d delta %llu sats DONE\n",
            leaf_side, sub_idx_in_leaf, channel_idx_in_sub,
            (unsigned long long)delta_sats);
