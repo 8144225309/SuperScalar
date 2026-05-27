@@ -1243,7 +1243,9 @@ int wire_parse_subfactory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input,
                                             const unsigned char *lsp_psigs_per_input,
-                                            uint32_t n_inputs) {
+                                            uint32_t n_inputs,
+                                            const unsigned char *all_signer_pubnonces_flat,
+                                            uint32_t all_signer_pubnonces_len) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !lsp_pubnonces_per_input || !lsp_psigs_per_input) {
         if (j) cJSON_Delete(j);
@@ -1253,6 +1255,12 @@ cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per
                       (size_t)n_inputs * 66);
     wire_json_add_hex(j, "lsp_psigs_per_input", lsp_psigs_per_input,
                       (size_t)n_inputs * 32);
+    if (all_signer_pubnonces_flat && all_signer_pubnonces_len > 0) {
+        wire_json_add_hex(j, "all_signer_pubnonces", all_signer_pubnonces_flat,
+                          (size_t)all_signer_pubnonces_len);
+        cJSON_AddNumberToObject(j, "all_signer_pubnonces_len",
+                                (double)all_signer_pubnonces_len);
+    }
     cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
     return j;
 }
@@ -1260,7 +1268,10 @@ cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per
 int wire_parse_subfactory_lsp_response(const cJSON *json,
                                          unsigned char *out_lsp_pubnonces_per_input,
                                          unsigned char *out_lsp_psigs_per_input,
-                                         uint32_t expected_n_inputs) {
+                                         uint32_t expected_n_inputs,
+                                         unsigned char *out_all_signer_pubnonces_flat,
+                                         uint32_t max_all_signer_pubnonces_len,
+                                         uint32_t *out_all_signer_pubnonces_len) {
     if (!json || !out_lsp_pubnonces_per_input || !out_lsp_psigs_per_input) return 0;
     cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
     if (!ni || !cJSON_IsNumber(ni)) return 0;
@@ -1273,6 +1284,18 @@ int wire_parse_subfactory_lsp_response(const cJSON *json,
                             out_lsp_psigs_per_input,
                             (size_t)expected_n_inputs * 32) !=
         (int)((size_t)expected_n_inputs * 32)) return 0;
+    if (out_all_signer_pubnonces_len) *out_all_signer_pubnonces_len = 0;
+    if (out_all_signer_pubnonces_flat && out_all_signer_pubnonces_len) {
+        cJSON *al = cJSON_GetObjectItem(json, "all_signer_pubnonces_len");
+        if (al && cJSON_IsNumber(al)) {
+            uint32_t alen = (uint32_t)al->valuedouble;
+            if (alen > max_all_signer_pubnonces_len) return 0;
+            if (wire_json_get_hex(json, "all_signer_pubnonces",
+                                    out_all_signer_pubnonces_flat, (size_t)alen) !=
+                (int)alen) return 0;
+            *out_all_signer_pubnonces_len = alen;
+        }
+    }
     return 1;
 }
 

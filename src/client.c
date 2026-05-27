@@ -2987,8 +2987,13 @@ static int client_handle_subfactory_advance_stateless(int fd,
         return 0;
     }
     unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
+    unsigned char all_pn_sub[FACTORY_MAX_SIGNERS][66];
+    uint32_t got_all_pn_len = 0;
     if (!wire_parse_subfactory_lsp_response(lr_msg.json,
-                                              lsp_pubnonce_ser, lsp_psig_ser, 1)) {
+                                              lsp_pubnonce_ser, lsp_psig_ser, 1,
+                                              (unsigned char *)all_pn_sub,
+                                              (uint32_t)sizeof(all_pn_sub),
+                                              &got_all_pn_len)) {
         cJSON_Delete(lr_msg.json);
         fprintf(stderr, "Client-stateless subfactory %u: parse LSP_RESPONSE failed\n",
                 my_index);
@@ -2996,12 +3001,26 @@ static int client_handle_subfactory_advance_stateless(int fd,
     }
     cJSON_Delete(lr_msg.json);
 
-    /* Set LSP nonce, finalize_node. */
+    /* Set LSP nonce, then (k>=2) every OTHER signer's nonce from the forwarded
+       matrix (own already set in Step 5, LSP set just below), then finalize. */
     secp256k1_musig_pubnonce lsp_pubnonce;
     if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser) ||
         !factory_session_set_nonce(factory, sub_node_i, (size_t)lsp_slot, &lsp_pubnonce)) {
         fprintf(stderr, "Client-stateless subfactory %u: set LSP nonce failed\n", my_index);
         return 0;
+    }
+    if (got_all_pn_len == (uint32_t)(sub->n_signers * 66)) {
+        for (size_t s = 0; s < sub->n_signers; s++) {
+            if (s == (size_t)my_slot || s == (size_t)lsp_slot) continue;
+            secp256k1_musig_pubnonce pn_s;
+            if (!musig_pubnonce_parse(ctx, &pn_s, all_pn_sub[s]) ||
+                !factory_session_set_nonce(factory, sub_node_i, s, &pn_s)) {
+                fprintf(stderr,
+                    "Client-stateless subfactory %u: set co-signer nonce[%zu] failed\n",
+                    my_index, s);
+                return 0;
+            }
+        }
     }
     if (!factory_session_finalize_node(factory, sub_node_i)) {
         fprintf(stderr, "Client-stateless subfactory %u: finalize_node failed\n", my_index);

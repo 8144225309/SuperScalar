@@ -4705,20 +4705,9 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     if (sub_node_i >= f->n_nodes) return 0;
     factory_node_t *sub = &f->nodes[sub_node_i];
 
-    /* Phase 1e.1.b MVP scope: reject k>=2 multi-client.  Wire codec does
-       not yet relay other client pubnonces in LSP_RESPONSE.  Phase 1e.1.d
-       follow-up will extend the codec.  For now, fall back to legacy. */
-    {
-        size_t check_n_clients = 0;
-        for (size_t s = 1; s < sub->n_signers; s++) check_n_clients++;
-        if (check_n_clients > 1) {
-            fprintf(stderr,
-                "LSP-stateless subfactory: k>=2 (n_clients=%zu) not yet "
-                "supported in stateless flow -- falling back to legacy\n",
-                check_n_clients);
-            return -1;
-        }
-    }
+    /* Phase 1e.1.d: k>=2 multi-client now supported -- LSP_RESPONSE (0x7F)
+       forwards the full per-signer nonce array (all_pubnonces) so each client
+       can build the aggnonce and finalize.  Mirror of Tier B Gap A. */
 
     /* Reject multi-input in this MVP -- fall back to legacy. */
     if (factory_node_uses_multi_input(f, sub_node_i)) {
@@ -4859,7 +4848,9 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     /* Step 6: send LSP_RESPONSE to each client (per-client copy so each can
        individually finalize_node + sign).  Single-input -> 1 element each. */
     cJSON *response = wire_build_subfactory_lsp_response(lsp_pubnonce_ser,
-                                                          lsp_psig_ser, 1);
+                                                          lsp_psig_ser, 1,
+                                                          (const unsigned char *)all_pubnonces,
+                                                          (uint32_t)(sub->n_signers * 66));
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_LSP_RESPONSE, response)) {

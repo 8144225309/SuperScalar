@@ -527,11 +527,16 @@ int    wire_parse_subfactory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input /* n_inputs * 66 */,
                                             const unsigned char *lsp_psigs_per_input /* n_inputs * 32 */,
-                                            uint32_t n_inputs);
+                                            uint32_t n_inputs,
+                                            const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL (single-input k>=2: n_signers*66) */,
+                                            uint32_t all_signer_pubnonces_len);
 int    wire_parse_subfactory_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_input,
                                             unsigned char *out_lsp_psigs_per_input,
-                                            uint32_t expected_n_inputs);
+                                            uint32_t expected_n_inputs,
+                                            unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                            uint32_t max_all_signer_pubnonces_len,
+                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input /* n_inputs * 32 */,
                                                   uint32_t n_inputs);
