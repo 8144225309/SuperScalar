@@ -1341,6 +1341,221 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
 /* --- Main ceremony (factory creation + optional channels + close) --- */
 
+/* Phase 1e.3.c (#271): client-side stateless factory-creation signing.
+
+   Runs the reversed nonce/psig exchange for INITIAL factory creation, looped
+   per NODE.  Called from client_run_with_channels after the client has built
+   its factory from FACTORY_PROPOSE and run factory_sessions_init, when
+   SS_MUSIG_STATELESS=1 and the LSP sent PROPOSE_INTENT (0x85).  On return the
+   factory sessions are finalized + each node the client signs has its own
+   partial sig sent to the LSP; the caller proceeds to recv FACTORY_READY
+   exactly as the legacy path does.
+
+   Per-node client secnonce is generated in the pubnonce phase and
+   consumed/zeroed by musig_create_partial_sig before CLIENT_FINAL_PSIGS is
+   sent, mirroring the validated sub-factory / leaf / state-advance client
+   stateless paths.
+
+   Returns 1 on success, 0 on failure. */
+static int client_factory_creation_stateless_signing(
+        int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
+        factory_t *factory, uint32_t my_index) {
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    /* Recv PROPOSE_INTENT (0x85) -- begin reversed flow. */
+    wire_msg_t imsg;
+    if (!wire_recv_handle_ping(fd, &imsg, 0) || check_msg_error(&imsg) ||
+        imsg.msg_type != MSG_FACTORY_PROPOSE_INTENT) {
+        fprintf(stderr, "Client-stateless %u: expected PROPOSE_INTENT, got 0x%02x\n",
+                my_index, imsg.json ? imsg.msg_type : 0);
+        if (imsg.json) cJSON_Delete(imsg.json);
+        return 0;
+    }
+    uint32_t intent_n_nodes = 0;
+    if (!wire_parse_factory_propose_intent(imsg.json, &intent_n_nodes)) {
+        fprintf(stderr, "Client-stateless %u: parse PROPOSE_INTENT failed\n", my_index);
+        cJSON_Delete(imsg.json);
+        return 0;
+    }
+    cJSON_Delete(imsg.json);
+    if (intent_n_nodes != (uint32_t)factory->n_nodes) {
+        fprintf(stderr, "Client-stateless %u: n_nodes mismatch (intent=%u local=%zu)\n",
+                my_index, intent_n_nodes, factory->n_nodes);
+        return 0;
+    }
+
+    size_t nn = factory->n_nodes;
+
+    secp256k1_musig_secnonce *my_secnonces =
+        calloc(nn, sizeof(secp256k1_musig_secnonce));
+    int *my_slot = calloc(nn, sizeof(int));
+    unsigned char *my_pn_per_node = calloc(nn, 66);
+    if (!my_secnonces || !my_slot || !my_pn_per_node) {
+        free(my_secnonces); free(my_slot); free(my_pn_per_node);
+        return 0;
+    }
+    for (size_t i = 0; i < nn; i++) my_slot[i] = -1;
+
+    unsigned char my_seckey[32];
+    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
+        free(my_secnonces); free(my_slot); free(my_pn_per_node);
+        return 0;
+    }
+
+    /* Step B: gen own per-node pubnonce for each node this client signs. */
+    for (size_t nidx = 0; nidx < nn; nidx++) {
+        int slot = factory_find_signer_slot(factory, nidx, my_index);
+        if (slot < 0) continue;
+        my_slot[nidx] = slot;
+        secp256k1_musig_pubnonce my_pubnonce;
+        if (!musig_generate_nonce(ctx, &my_secnonces[nidx], &my_pubnonce,
+                                   my_seckey, &my_pubkey,
+                                   &factory->nodes[nidx].keyagg.cache)) {
+            fprintf(stderr, "Client-stateless %u: nonce gen node %zu failed\n", my_index, nidx);
+            memset(my_seckey, 0, 32);
+            free(my_secnonces); free(my_slot); free(my_pn_per_node);
+            return 0;
+        }
+        musig_pubnonce_serialize(ctx, my_pn_per_node + nidx * 66, &my_pubnonce);
+        if (!factory_session_set_nonce(factory, nidx, (size_t)slot, &my_pubnonce)) {
+            fprintf(stderr, "Client-stateless %u: set own nonce node %zu failed\n", my_index, nidx);
+            memset(my_seckey, 0, 32);
+            free(my_secnonces); free(my_slot); free(my_pn_per_node);
+            return 0;
+        }
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send CLIENT_PUBNONCES (per-node; unsigned nodes carry zero nonce). */
+    {
+        cJSON *cpn = wire_build_factory_client_pubnonces(my_pn_per_node, (uint32_t)nn);
+        free(my_pn_per_node);
+        if (!cpn || !wire_send(fd, MSG_FACTORY_CLIENT_PUBNONCES, cpn)) {
+            fprintf(stderr, "Client-stateless %u: send CLIENT_PUBNONCES failed\n", my_index);
+            if (cpn) cJSON_Delete(cpn);
+            free(my_secnonces); free(my_slot);
+            return 0;
+        }
+        cJSON_Delete(cpn);
+    }
+
+    /* Recv LSP_RESPONSE: per-node LSP nonces + psigs + full signer x node matrix. */
+    wire_msg_t lr;
+    if (!wire_recv(fd, &lr) || check_msg_error(&lr) ||
+        lr.msg_type != MSG_FACTORY_LSP_RESPONSE) {
+        fprintf(stderr, "Client-stateless %u: expected LSP_RESPONSE, got 0x%02x\n",
+                my_index, lr.json ? lr.msg_type : 0);
+        if (lr.json) cJSON_Delete(lr.json);
+        free(my_secnonces); free(my_slot);
+        return 0;
+    }
+    unsigned char *lsp_pn_per_node = calloc(nn, 66);
+    unsigned char *lsp_psig_per_node = calloc(nn, 32);
+    size_t mtx_stride = (size_t)FACTORY_MAX_SIGNERS * 66;
+    unsigned char *all_pn = calloc(nn, mtx_stride);
+    uint32_t got_matrix_len = 0;
+    if (!lsp_pn_per_node || !lsp_psig_per_node || !all_pn) {
+        cJSON_Delete(lr.json);
+        free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+        free(my_secnonces); free(my_slot);
+        return 0;
+    }
+    if (!wire_parse_factory_lsp_response(lr.json, lsp_pn_per_node,
+                                         lsp_psig_per_node, (uint32_t)nn,
+                                         all_pn, (uint32_t)(nn * mtx_stride),
+                                         &got_matrix_len)) {
+        fprintf(stderr, "Client-stateless %u: parse LSP_RESPONSE failed\n", my_index);
+        cJSON_Delete(lr.json);
+        free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+        free(my_secnonces); free(my_slot);
+        return 0;
+    }
+    cJSON_Delete(lr.json);
+    (void)lsp_psig_per_node;  /* LSP psigs are aggregated LSP-side, not by client. */
+
+    int have_matrix = (got_matrix_len == (uint32_t)(nn * mtx_stride));
+
+    /* For each node this client signs: set LSP nonce + every co-signer nonce
+       from the matrix (skip own + LSP slots), finalize, create own psig. */
+    for (size_t nidx = 0; nidx < nn; nidx++) {
+        if (my_slot[nidx] < 0) continue;
+        int lsp_slot = factory_find_signer_slot(factory, nidx, 0);
+        if (lsp_slot < 0) {
+            fprintf(stderr, "Client-stateless %u: no LSP slot node %zu\n", my_index, nidx);
+            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+            free(my_secnonces); free(my_slot);
+            return 0;
+        }
+        secp256k1_musig_pubnonce lsp_pn;
+        if (!musig_pubnonce_parse(ctx, &lsp_pn, lsp_pn_per_node + nidx * 66) ||
+            !factory_session_set_nonce(factory, nidx, (size_t)lsp_slot, &lsp_pn)) {
+            fprintf(stderr, "Client-stateless %u: set LSP nonce node %zu failed\n", my_index, nidx);
+            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+            free(my_secnonces); free(my_slot);
+            return 0;
+        }
+        if (have_matrix) {
+            size_t ns = factory->nodes[nidx].n_signers;
+            for (size_t snum = 0; snum < ns; snum++) {
+                if (snum == (size_t)my_slot[nidx] || snum == (size_t)lsp_slot) continue;
+                const unsigned char *pn_ser =
+                    all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + snum) * 66;
+                secp256k1_musig_pubnonce pn_s;
+                if (!musig_pubnonce_parse(ctx, &pn_s, pn_ser) ||
+                    !factory_session_set_nonce(factory, nidx, snum, &pn_s)) {
+                    fprintf(stderr, "Client-stateless %u: set co-signer nonce node %zu slot %zu failed\n",
+                            my_index, nidx, snum);
+                    free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                    free(my_secnonces); free(my_slot);
+                    return 0;
+                }
+            }
+        }
+        if (!factory_session_finalize_node(factory, nidx)) {
+            fprintf(stderr, "Client-stateless %u: finalize_node %zu failed\n", my_index, nidx);
+            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+            free(my_secnonces); free(my_slot);
+            return 0;
+        }
+    }
+    free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+
+    /* Create own per-node psigs (zeroes each consumed secnonce). */
+    unsigned char *my_psig_per_node = calloc(nn, 32);
+    if (!my_psig_per_node) { free(my_secnonces); free(my_slot); return 0; }
+    for (size_t nidx = 0; nidx < nn; nidx++) {
+        if (my_slot[nidx] < 0) continue;
+        secp256k1_musig_partial_sig my_psig;
+        if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonces[nidx],
+                                       keypair,
+                                       &factory->nodes[nidx].signing_session)) {
+            fprintf(stderr, "Client-stateless %u: create_partial_sig node %zu failed\n", my_index, nidx);
+            free(my_psig_per_node); free(my_secnonces); free(my_slot);
+            return 0;
+        }
+        /* my_secnonces[nidx] zeroed by musig_create_partial_sig. */
+        musig_partial_sig_serialize(ctx, my_psig_per_node + nidx * 32, &my_psig);
+    }
+    free(my_secnonces); free(my_slot);
+
+    /* Send CLIENT_FINAL_PSIGS (per-node; unsigned nodes carry zero psig). */
+    {
+        cJSON *fp = wire_build_factory_client_final_psigs(my_psig_per_node, (uint32_t)nn);
+        free(my_psig_per_node);
+        if (!fp || !wire_send(fd, MSG_FACTORY_CLIENT_FINAL_PSIGS, fp)) {
+            fprintf(stderr, "Client-stateless %u: send CLIENT_FINAL_PSIGS failed\n", my_index);
+            if (fp) cJSON_Delete(fp);
+            return 0;
+        }
+        cJSON_Delete(fp);
+    }
+
+    printf("Client-stateless %u: factory-creation signing done (%zu nodes)\n",
+           my_index, nn);
+    return 1;
+}
+
 int client_run_with_channels(secp256k1_context *ctx,
                               const secp256k1_keypair *keypair,
                               const char *host, int port,
@@ -1719,6 +1934,25 @@ int client_run_with_channels(secp256k1_context *ctx,
         return 0;
     }
 
+    /* Phase 1e.3.c (#271): stateless reversed-flow factory creation.  When
+       SS_MUSIG_STATELESS=1 the LSP sends PROPOSE_INTENT (0x85) after
+       FACTORY_PROPOSE; run the per-node reversed signing, then converge at the
+       FACTORY_READY recv (post-creation steps unchanged).  The legacy
+       round-1-first nonce/psig path is wrapped in the else branch so its
+       function-scope locals stay confined. */
+    int ss_stateless_creation = 0;
+    {
+        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        ss_stateless_creation = (stateless && stateless[0] == '1');
+    }
+    /* Hoisted to function scope so done:/fail: can free it on either path.
+       The stateless path leaves it NULL (free(NULL) is a no-op). */
+    wire_bundle_entry_t *nonce_entries = NULL;
+    if (ss_stateless_creation) {
+        if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
+                                                        factory, my_index))
+            goto fail;
+    } else {
     /* Generate nonces via pool */
     unsigned char my_seckey[32];
     secp256k1_keypair_sec(ctx, my_seckey, keypair);
@@ -1740,7 +1974,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     memset(my_seckey, 0, 32);
 
     secp256k1_musig_secnonce *my_secnonce_ptrs[FACTORY_MAX_NODES];
-    wire_bundle_entry_t *nonce_entries =
+    nonce_entries =
         (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
 
     if (my_node_count > 0 && !nonce_entries) {
@@ -1952,6 +2186,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         cJSON_Delete(bundle);
         free(psig_entries);
     }
+    }  /* end else (legacy round-1-first nonce/psig path) */
 
     /* Receive FACTORY_READY */
     if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {

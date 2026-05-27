@@ -611,11 +611,16 @@ int    wire_parse_factory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_node /* n * 66 */,
                                           const unsigned char *lsp_psigs_per_node /* n * 32 */,
-                                          uint32_t n_nodes);
+                                          uint32_t n_nodes,
+                                          const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL */,
+                                          uint32_t all_signer_pubnonces_len);
 int    wire_parse_factory_lsp_response(const cJSON *json,
                                           unsigned char *out_lsp_pubnonces_per_node,
                                           unsigned char *out_lsp_psigs_per_node,
-                                          uint32_t expected_n_nodes);
+                                          uint32_t expected_n_nodes,
+                                          unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                          uint32_t max_all_signer_pubnonces_len,
+                                          uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_factory_client_final_psigs(const unsigned char *psigs_per_node /* n * 32 */,
                                                 uint32_t n_nodes);

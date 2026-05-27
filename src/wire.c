@@ -1574,7 +1574,9 @@ int wire_parse_factory_client_pubnonces(const cJSON *json,
 
 cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_node,
                                           const unsigned char *lsp_psigs_per_node,
-                                          uint32_t n_nodes) {
+                                          uint32_t n_nodes,
+                                          const unsigned char *all_signer_pubnonces_flat,
+                                          uint32_t all_signer_pubnonces_len) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !lsp_pubnonces_per_node || !lsp_psigs_per_node) {
         if (j) cJSON_Delete(j);
@@ -1584,6 +1586,18 @@ cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_no
                       (size_t)n_nodes * 66);
     wire_json_add_hex(j, "lsp_psigs_per_node", lsp_psigs_per_node,
                       (size_t)n_nodes * 32);
+    /* Optional all-signer per-node nonce matrix (sparse (node,slot,nonce)
+       bundle serialized as a flat hex blob).  Required for multi-client
+       nodes (root N-of-N, intermediates): each client needs every co-signer's
+       per-node nonce to finalize its own session and create its partial sig.
+       Mirrors wire_build_subfactory_lsp_response's all_signer_pubnonces field.
+       Backward-compatible: omitted entirely when NULL/zero-length. */
+    if (all_signer_pubnonces_flat && all_signer_pubnonces_len > 0) {
+        wire_json_add_hex(j, "all_signer_pubnonces", all_signer_pubnonces_flat,
+                          (size_t)all_signer_pubnonces_len);
+        cJSON_AddNumberToObject(j, "all_signer_pubnonces_len",
+                                (double)all_signer_pubnonces_len);
+    }
     cJSON_AddNumberToObject(j, "n_nodes", (double)n_nodes);
     return j;
 }
@@ -1591,7 +1605,10 @@ cJSON *wire_build_factory_lsp_response(const unsigned char *lsp_pubnonces_per_no
 int wire_parse_factory_lsp_response(const cJSON *json,
                                        unsigned char *out_lsp_pubnonces_per_node,
                                        unsigned char *out_lsp_psigs_per_node,
-                                       uint32_t expected_n_nodes) {
+                                       uint32_t expected_n_nodes,
+                                       unsigned char *out_all_signer_pubnonces_flat,
+                                       uint32_t max_all_signer_pubnonces_len,
+                                       uint32_t *out_all_signer_pubnonces_len) {
     if (!json || !out_lsp_pubnonces_per_node || !out_lsp_psigs_per_node) return 0;
     cJSON *n = cJSON_GetObjectItem(json, "n_nodes");
     if (!n || !cJSON_IsNumber(n)) return 0;
@@ -1604,6 +1621,18 @@ int wire_parse_factory_lsp_response(const cJSON *json,
                             out_lsp_psigs_per_node,
                             (size_t)expected_n_nodes * 32) !=
         (int)((size_t)expected_n_nodes * 32)) return 0;
+    if (out_all_signer_pubnonces_len) *out_all_signer_pubnonces_len = 0;
+    if (out_all_signer_pubnonces_flat && out_all_signer_pubnonces_len) {
+        cJSON *al = cJSON_GetObjectItem(json, "all_signer_pubnonces_len");
+        if (al && cJSON_IsNumber(al)) {
+            uint32_t alen = (uint32_t)al->valuedouble;
+            if (alen > max_all_signer_pubnonces_len) return 0;
+            if (wire_json_get_hex(json, "all_signer_pubnonces",
+                                    out_all_signer_pubnonces_flat, (size_t)alen) !=
+                (int)alen) return 0;
+            *out_all_signer_pubnonces_len = alen;
+        }
+    }
     return 1;
 }
 
