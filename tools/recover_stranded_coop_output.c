@@ -83,17 +83,17 @@ int main(int argc, char **argv) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     /* Parse seckeys. Party 0 = LSP, 1..n = clients. */
-    unsigned char seckeys[16][32];
+    unsigned char seckeys[128][32];
     size_t n_signers = 1;
     if (!parse_hex32(lsp_sk_hex, seckeys[0])) {
         fprintf(stderr, "bad lsp-seckey hex\n"); return 1;
     }
     /* split client_sks_csv on ',' */
     {
-        char buf[1024]; strncpy(buf, client_sks_csv, sizeof(buf) - 1); buf[sizeof(buf)-1] = '\0';
+        char buf[9000]; strncpy(buf, client_sks_csv, sizeof(buf) - 1); buf[sizeof(buf)-1] = '\0';
         char *save = NULL;
         for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-            if (n_signers >= 16) { fprintf(stderr, "too many signers\n"); return 1; }
+            if (n_signers >= 128) { fprintf(stderr, "too many signers\n"); return 1; }
             if (!parse_hex32(tok, seckeys[n_signers])) {
                 fprintf(stderr, "bad client seckey hex: %s\n", tok); return 1;
             }
@@ -103,8 +103,8 @@ int main(int argc, char **argv) {
     printf("Signers: %zu (1 LSP + %zu clients)\n", n_signers, n_signers - 1);
 
     /* Derive keypairs + pubkeys. */
-    secp256k1_keypair kps[16];
-    secp256k1_pubkey  pks[16];
+    secp256k1_keypair kps[128];
+    secp256k1_pubkey  pks[128];
     for (size_t i = 0; i < n_signers; i++) {
         if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) {
             fprintf(stderr, "keypair_create failed (signer %zu)\n", i); return 1;
