@@ -94,6 +94,16 @@ run_one() {
         return 1
     fi
 
+    # LSP runs in NK mode (--seckey); clients must authenticate with its
+    # static pubkey or the Noise handshake mismatches (NN client vs NK LSP).
+    # Parse it from the LSP log, mirroring tools/multi_arity_scenario.py.
+    local LSP_PUBKEY
+    LSP_PUBKEY=$(grep -oP "NK static pubkey: \\K[0-9a-f]+" "$LSP_LOG" | head -1)
+    if [ -z "$LSP_PUBKEY" ]; then
+        echo "  FAIL: could not parse LSP NK static pubkey from $LSP_LOG"
+        return 1
+    fi
+
     # Spawn clients
     for n in $(seq 0 $((N_CLIENTS - 1))); do
         local CLIENT_LOG="/tmp/${TAG}_client${n}.log"
@@ -102,6 +112,7 @@ run_one() {
         "$CLIENT_BIN" \
             --network regtest \
             --host 127.0.0.1 --port "$LSP_PORT" \
+            --lsp-pubkey "$LSP_PUBKEY" \
             --daemon \
             --seckey "${CLIENT_SECKEYS[$n]}" \
             --fee-rate 1000 \
@@ -142,8 +153,8 @@ run_one() {
         echo "  RESULT: PASS"
         # Sanity: confirm stateless path was used if requested
         if [ "$stateless" = "1" ]; then
-            if grep -q "lsp_advance_leaf_stateless" "$LSP_LOG" 2>/dev/null; then
-                echo "  STATELESS PATH: confirmed (lsp_advance_leaf_stateless invoked)"
+            if grep -q "LSP-stateless" "$LSP_LOG" 2>/dev/null; then
+                echo "  STATELESS PATH: confirmed (LSP-stateless markers present)"
             else
                 echo "  WARN: SS_MUSIG_STATELESS=1 set but no stateless markers in log"
                 echo "        (Phase 1c dispatch may not have fired — investigate)"

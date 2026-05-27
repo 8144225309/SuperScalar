@@ -1954,11 +1954,61 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        LSP_RESPONSE, and FINAL.  lsp_poison_secnonce zeroed by
        musig_create_partial_sig before any wire recv. */
 
-    /* TODO(Phase 2): watchtower_watch_factory_node_with_channels.  Skipped
-       in MVP because the new flow has no poison TX yet -- degrading would
-       broadcast SECURITY-GAP warnings on every advance.  Once poison is
-       wired, re-enable the watchtower registration to mirror the legacy
-       path's Step 9 block. */
+    /* Phase 1d.3 (#271): register old leaf state + wire-ceremony poison TX
+       with the watchtower for breach detection, mirroring the legacy path's
+       Step 9 block.  The stateless ceremony is always multi-process, so the
+       poison TX is the wire-signed one (no single-process burn_tx fallback).
+       poison_snapshot survives factory_session_reset_poison for Step 11
+       persist (reset frees node->poison_signed_tx). */
+    unsigned char *poison_snapshot = NULL;
+    size_t poison_snapshot_len = 0;
+    if (had_old_signed && mgr->watchtower) {
+        int have_poison_wire = (leaf_poison_prepared &&
+                                node->poison_is_signed &&
+                                node->poison_signed_tx.len > 0);
+        const unsigned char *poison_data = NULL;
+        size_t poison_len = 0;
+        if (have_poison_wire) {
+            poison_data = node->poison_signed_tx.data;
+            poison_len  = node->poison_signed_tx.len;
+            printf("LSP-stateless: leaf %d wire-ceremony L-stock poison TX "
+                   "registered (%zu bytes, L-stock %llu sats -> %zu clients)\n",
+                   leaf_side, poison_len,
+                   (unsigned long long)old_l_amount,
+                   node->n_signers - 1);
+        } else if (old_n_outputs >= 2) {
+            fprintf(stderr,
+                    "LSP-stateless: registering watchtower without poison TX "
+                    "(poison_prepared=%d, poison_is_signed=%d) -- DEGRADED, "
+                    "breach cannot redistribute L-stock\n",
+                    leaf_poison_prepared, node->poison_is_signed);
+        }
+
+        /* Collect channel indices that live on this leaf node. */
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        size_t n_leaf_ch = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node; uint32_t c_vout;
+            client_to_leaf(c, f, &c_node, &c_vout);
+            if (c_node == node_idx)
+                leaf_ch_ids[n_leaf_ch++] = (uint32_t)c;
+        }
+        watchtower_watch_factory_node_with_channels(mgr->watchtower,
+            (uint32_t)node_idx, old_leaf_txid,
+            node->signed_tx.data, node->signed_tx.len,
+            poison_data, poison_len,
+            leaf_ch_ids, n_leaf_ch);
+
+        /* Snapshot poison bytes for Step 11 persist before reset frees them. */
+        if (poison_data && poison_len > 0) {
+            poison_snapshot = malloc(poison_len);
+            if (poison_snapshot) {
+                memcpy(poison_snapshot, poison_data, poison_len);
+                poison_snapshot_len = poison_len;
+            }
+        }
+        factory_session_reset_poison(f, node_idx);
+    }
 
     /* Step 10: notify everyone leaf advance done. */
     cJSON *done = wire_build_leaf_advance_done(leaf_side);
@@ -1982,7 +2032,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 txid_display,
                 node->signed_tx.data, node->signed_tx.len,
                 node->outputs[0].amount_sats,
-                /* poison_tx */ NULL, 0);
+                /* poison_tx */ poison_snapshot, poison_snapshot_len);
         } else {
             uint32_t leaf_states[8];
             for (int i = 0; i < f->n_leaf_nodes; i++)
@@ -2010,6 +2060,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                           (uint32_t)f->n_participants,
                                           "success", NULL, NULL);
     }
+    free(poison_snapshot);
     return 1;
 }
 
