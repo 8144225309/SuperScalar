@@ -4300,14 +4300,47 @@ static int client_handle_state_advance_stateless(int fd,
         return 0;
     }
 
-    /* Step 2: Run factory_advance_leaf_unsigned locally.  Must return -1
-       (root rolled over, all leaves rebuilt) — mirrors caller contract on LSP. */
-    int adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
-    if (adv_rc != -1) {
-        fprintf(stderr,
-            "Client-stateless Tier B %u: advance_leaf_unsigned returned %d (expected -1)\n",
-            my_index, adv_rc);
-        return 0;
+    /* Step 2: Advance local state to mirror the LSP-side rollover, using the
+       same proven logic as the legacy client_handle_state_advance.  The client
+       may be N ticks behind the LSP (the LSP doesn't send a per-tick PROPOSE
+       before rollover), so loop until rc==-1 (rollover; trees rebuilt):
+         - root-driven  (trigger_leaf_side < 0): factory_tick_root — PS Tier B
+           block-height rollover; mirrors lsp_factory_tick_root.  Per-tick rc==0
+           means advanced within the epoch (keep ticking).
+         - leaf-driven  (>= 0): factory_advance_leaf_unsigned on the trigger
+           leaf — DW counter exhaustion.  Per-step rc==1 means advanced (keep
+           going). */
+    int adv_rc = 0;
+    {
+        int max_steps = (int)(factory->states_per_layer + 2);
+        if (max_steps < 4) max_steps = 4;
+        if (trigger_leaf_side < 0) {
+            for (int s = 0; s < max_steps; s++) {
+                adv_rc = factory_tick_root(factory);
+                if (adv_rc == -1) break;
+                if (adv_rc != 0) {
+                    fprintf(stderr, "Client-stateless Tier B %u: root tick step %d "
+                            "returned unexpected %d\n", my_index, s, adv_rc);
+                    return 0;
+                }
+            }
+        } else {
+            for (int s = 0; s < max_steps; s++) {
+                adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
+                if (adv_rc == -1) break;
+                if (adv_rc != 1) {
+                    fprintf(stderr, "Client-stateless Tier B %u: advance step %d "
+                            "returned %d\n", my_index, s, adv_rc);
+                    return 0;
+                }
+            }
+        }
+        if (adv_rc != -1) {
+            fprintf(stderr, "Client-stateless Tier B %u: rollover not reached "
+                    "within %d steps (trigger_leaf=%d)\n",
+                    my_index, max_steps, trigger_leaf_side);
+            return 0;
+        }
     }
 
     /* Step 3: Build affected[] — SAME logic as LSP. */
