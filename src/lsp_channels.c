@@ -2938,13 +2938,36 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
 
-    /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients. */
+    /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients.
+       Gap A: also forward EVERY signer's pubnonce per node (from the session,
+       which holds all collected nonces) so each client can build the aggnonce
+       for multi-signer nodes (root/intermediates), not just 2-of-2 leaves. */
+    size_t total_nonce_slots = 0;
+    for (size_t k = 0; k < n_affected; k++)
+        total_nonce_slots += f->nodes[affected[k]].n_signers;
+    unsigned char *all_pn_flat = calloc(total_nonce_slots ? total_nonce_slots : 1, 66);
+    if (!all_pn_flat) {
+        fprintf(stderr, "LSP-stateless Tier B: alloc all_pn_flat failed\n");
+        return 0;
+    }
+    {
+        size_t base = 0;
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            for (size_t s = 0; s < an->n_signers; s++)
+                musig_pubnonce_serialize(lsp->ctx, all_pn_flat + (base + s) * 66,
+                                         &an->signing_session.pubnonces[s]);
+            base += an->n_signers;
+        }
+    }
     cJSON *response = wire_build_state_adv_lsp_response(
         (const unsigned char *)lsp_pubnonces_per_node,
         (const unsigned char *)lsp_psigs_per_node,
         (uint32_t)n_affected,
         (const unsigned char *)lsp_poison_pubnonces_per_node,
-        (const unsigned char *)lsp_poison_psigs_per_node);
+        (const unsigned char *)lsp_poison_psigs_per_node,
+        all_pn_flat, (uint32_t)(total_nonce_slots * 66));
+    free(all_pn_flat); all_pn_flat = NULL;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_LSP_RESPONSE, response)) {
             cJSON_Delete(response);
@@ -3036,6 +3059,43 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
 
+    /* Step 9c (Gap B): broadcast the full per-node signer-PSIG matrix so each
+       client can locally complete multi-signer nodes (it only holds its own +
+       the LSP's psig).  node->partial_sigs[] holds every psig after Step 8. */
+    {
+        size_t total_psig_slots = 0;
+        for (size_t k = 0; k < n_affected; k++)
+            total_psig_slots += f->nodes[affected[k]].n_signers;
+        unsigned char *all_psig_flat = calloc(total_psig_slots ? total_psig_slots : 1, 32);
+        if (!all_psig_flat) {
+            fprintf(stderr, "LSP-stateless Tier B: alloc all_psig_flat failed\n");
+            return 0;
+        }
+        size_t base = 0;
+        for (size_t k = 0; k < n_affected; k++) {
+            factory_node_t *an = &f->nodes[affected[k]];
+            for (size_t s = 0; s < an->n_signers; s++)
+                musig_partial_sig_serialize(lsp->ctx, all_psig_flat + (base + s) * 32,
+                                            &an->partial_sigs[s]);
+            base += an->n_signers;
+        }
+        cJSON *apm = wire_build_state_adv_all_psigs(all_psig_flat,
+                                                    (uint32_t)(total_psig_slots * 32));
+        free(all_psig_flat);
+        if (!apm) {
+            fprintf(stderr, "LSP-stateless Tier B: build ALL_PSIGS failed\n");
+            return 0;
+        }
+        for (size_t c = 0; c < lsp->n_clients; c++) {
+            if (!wire_send(lsp->client_fds[c], MSG_STATE_ADV_ALL_PSIGS, apm)) {
+                cJSON_Delete(apm);
+                fprintf(stderr, "LSP-stateless Tier B: send ALL_PSIGS[%zu] failed\n", c);
+                return 0;
+            }
+        }
+        cJSON_Delete(apm);
+    }
+
     /* Step 10 (Tier B poison): register each affected leaf's new state +
        wire-signed L-stock poison TX with the watchtower (mirror of legacy
        Step 10 / leaf-advance #330).  poison_signed_tx is NULL for leaves that
@@ -3069,6 +3129,18 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             if (poison_prepared[k])
                 factory_session_reset_poison(f, affected[k]);
         }
+    }
+
+    /* Step 11.5 (F1): persist new-epoch chain[0] for every PS leaf + sub-factory
+       node, mirroring the legacy lsp_run_state_advance.  Only fires on
+       root-driven Tier B (the only path that re-signs PS leaves).  Without this
+       the DB keeps the OLD epoch chain[0] and force-close after rollover cannot
+       reconstruct the new signed state ("persisted bytes differ"). */
+    if (trigger_leaf_side == -1 && mgr->persist) {
+        int saved = lsp_persist_ps_chain0_all(mgr->persist, f);
+        if (saved > 0)
+            printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
+                   saved);
     }
 
     /* Step 10: Broadcast DONE (existing opcode). */

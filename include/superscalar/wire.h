@@ -184,6 +184,12 @@
 #define MSG_FACTORY_LSP_RESPONSE        0x87  /* LSP -> Client: per-node lsp pubnonces + psigs */
 #define MSG_FACTORY_CLIENT_FINAL_PSIGS  0x88
 
+/* LSP -> Client: full per-node signer partial-sig matrix (Gap B), so each
+   client can locally complete multi-signer Tier B nodes (it only holds its own
+   + the LSP's psig).  Mirror of the 0x83 all-signer nonce matrix.  Flat layout:
+   affected nodes in order, each n_signers slots of 32 bytes. */
+#define MSG_STATE_ADV_ALL_PSIGS           0x89
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -557,14 +563,19 @@ cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_
                                             const unsigned char *lsp_psigs_per_leaf /* n * 32 */,
                                             uint32_t n_affected_leaves,
                                             const unsigned char *lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
-                                            const unsigned char *lsp_poison_psigs_per_leaf /* n * 32 or NULL */);
+                                            const unsigned char *lsp_poison_psigs_per_leaf /* n * 32 or NULL */,
+                                            const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL */,
+                                            uint32_t all_signer_pubnonces_len);
 /* Returns 1 (no poison), 2 (poison present), 0 (parse error). */
 int    wire_parse_state_adv_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_leaf,
                                             unsigned char *out_lsp_psigs_per_leaf,
                                             uint32_t expected_n_affected_leaves,
                                             unsigned char *out_lsp_poison_pubnonces_per_leaf /* n * 66 or NULL */,
-                                            unsigned char *out_lsp_poison_psigs_per_leaf /* n * 32 or NULL */);
+                                            unsigned char *out_lsp_poison_psigs_per_leaf /* n * 32 or NULL */,
+                                            unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
+                                            uint32_t max_all_signer_pubnonces_len,
+                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */);
 
 cJSON *wire_build_state_adv_client_final_psigs(const unsigned char *psigs_per_leaf /* n * 32 */,
                                                   uint32_t n_affected_leaves,
@@ -574,6 +585,13 @@ int    wire_parse_state_adv_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_leaf,
                                                   uint32_t expected_n_affected_leaves,
                                                   unsigned char *out_poison_psigs_per_leaf /* n * 32 or NULL */);
+
+cJSON *wire_build_state_adv_all_psigs(const unsigned char *all_signer_psigs_flat /* all_len bytes */,
+                                         uint32_t all_signer_psigs_len);
+int    wire_parse_state_adv_all_psigs(const cJSON *json,
+                                         unsigned char *out_all_signer_psigs_flat,
+                                         uint32_t max_all_signer_psigs_len,
+                                         uint32_t *out_all_signer_psigs_len);
 
 /* Phase 1e.3.a factory creation reversed flow wire codec.  Multi-node ceremony:
    per-node arrays of pubnonces + psigs. */

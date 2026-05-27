@@ -1370,7 +1370,9 @@ cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_
                                             const unsigned char *lsp_psigs_per_leaf,
                                             uint32_t n_affected_leaves,
                                             const unsigned char *lsp_poison_pubnonces_per_leaf,
-                                            const unsigned char *lsp_poison_psigs_per_leaf) {
+                                            const unsigned char *lsp_poison_psigs_per_leaf,
+                                            const unsigned char *all_signer_pubnonces_flat,
+                                            uint32_t all_signer_pubnonces_len) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !lsp_pubnonces_per_leaf || !lsp_psigs_per_leaf) {
         if (j) cJSON_Delete(j);
@@ -1386,6 +1388,12 @@ cJSON *wire_build_state_adv_lsp_response(const unsigned char *lsp_pubnonces_per_
         wire_json_add_hex(j, "lsp_poison_psigs_per_leaf", lsp_poison_psigs_per_leaf,
                           (size_t)n_affected_leaves * 32);
     }
+    if (all_signer_pubnonces_flat && all_signer_pubnonces_len > 0) {
+        wire_json_add_hex(j, "all_signer_pubnonces", all_signer_pubnonces_flat,
+                          (size_t)all_signer_pubnonces_len);
+        cJSON_AddNumberToObject(j, "all_signer_pubnonces_len",
+                                (double)all_signer_pubnonces_len);
+    }
     cJSON_AddNumberToObject(j, "n_affected_leaves", (double)n_affected_leaves);
     return j;
 }
@@ -1395,7 +1403,10 @@ int wire_parse_state_adv_lsp_response(const cJSON *json,
                                          unsigned char *out_lsp_psigs_per_leaf,
                                          uint32_t expected_n_affected_leaves,
                                          unsigned char *out_lsp_poison_pubnonces_per_leaf,
-                                         unsigned char *out_lsp_poison_psigs_per_leaf) {
+                                         unsigned char *out_lsp_poison_psigs_per_leaf,
+                                         unsigned char *out_all_signer_pubnonces_flat,
+                                         uint32_t max_all_signer_pubnonces_len,
+                                         uint32_t *out_all_signer_pubnonces_len) {
     if (!json || !out_lsp_pubnonces_per_leaf || !out_lsp_psigs_per_leaf) return 0;
     cJSON *n = cJSON_GetObjectItem(json, "n_affected_leaves");
     if (!n || !cJSON_IsNumber(n)) return 0;
@@ -1408,6 +1419,19 @@ int wire_parse_state_adv_lsp_response(const cJSON *json,
                             out_lsp_psigs_per_leaf,
                             (size_t)expected_n_affected_leaves * 32) !=
         (int)((size_t)expected_n_affected_leaves * 32)) return 0;
+    /* Gap A: optional full per-node signer-nonce matrix (flat). */
+    if (out_all_signer_pubnonces_len) *out_all_signer_pubnonces_len = 0;
+    if (out_all_signer_pubnonces_flat && out_all_signer_pubnonces_len) {
+        cJSON *al = cJSON_GetObjectItem(json, "all_signer_pubnonces_len");
+        if (al && cJSON_IsNumber(al)) {
+            uint32_t alen = (uint32_t)al->valuedouble;
+            if (alen > max_all_signer_pubnonces_len) return 0;
+            if (wire_json_get_hex(json, "all_signer_pubnonces",
+                                    out_all_signer_pubnonces_flat, (size_t)alen) !=
+                (int)alen) return 0;
+            *out_all_signer_pubnonces_len = alen;
+        }
+    }
     if (out_lsp_poison_pubnonces_per_leaf && out_lsp_poison_psigs_per_leaf &&
         cJSON_GetObjectItem(json, "lsp_poison_pubnonces_per_leaf")) {
         if (wire_json_get_hex(json, "lsp_poison_pubnonces_per_leaf",
@@ -1457,6 +1481,31 @@ int wire_parse_state_adv_client_final_psigs(const cJSON *json,
             (int)((size_t)expected_n_affected_leaves * 32)) return 0;
         return 2;
     }
+    return 1;
+}
+
+cJSON *wire_build_state_adv_all_psigs(const unsigned char *all_signer_psigs_flat,
+                                         uint32_t all_signer_psigs_len) {
+    cJSON *j = cJSON_CreateObject();
+    if (!j || !all_signer_psigs_flat) { if (j) cJSON_Delete(j); return NULL; }
+    wire_json_add_hex(j, "all_signer_psigs", all_signer_psigs_flat,
+                      (size_t)all_signer_psigs_len);
+    cJSON_AddNumberToObject(j, "all_signer_psigs_len", (double)all_signer_psigs_len);
+    return j;
+}
+
+int wire_parse_state_adv_all_psigs(const cJSON *json,
+                                      unsigned char *out_all_signer_psigs_flat,
+                                      uint32_t max_all_signer_psigs_len,
+                                      uint32_t *out_all_signer_psigs_len) {
+    if (!json || !out_all_signer_psigs_flat || !out_all_signer_psigs_len) return 0;
+    cJSON *al = cJSON_GetObjectItem(json, "all_signer_psigs_len");
+    if (!al || !cJSON_IsNumber(al)) return 0;
+    uint32_t alen = (uint32_t)al->valuedouble;
+    if (alen > max_all_signer_psigs_len) return 0;
+    if (wire_json_get_hex(json, "all_signer_psigs", out_all_signer_psigs_flat,
+                            (size_t)alen) != (int)alen) return 0;
+    *out_all_signer_psigs_len = alen;
     return 1;
 }
 
