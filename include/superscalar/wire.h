@@ -520,29 +520,43 @@ int    wire_parse_subfactory_propose_intent(const cJSON *json,
                                               uint64_t *out_delta_sats);
 
 cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input /* n_inputs * 66 */,
-                                                uint32_t n_inputs);
+                                                uint32_t n_inputs,
+                                                const unsigned char *poison_pubnonce /* 66 or NULL */);
+/* Returns 1 (no poison), 2 (poison_pubnonce present), 0 (parse error). */
 int    wire_parse_subfactory_client_pubnonces(const cJSON *json,
                                                 unsigned char *out_pubnonces_per_input /* n_inputs * 66 */,
-                                                uint32_t expected_n_inputs);
+                                                uint32_t expected_n_inputs,
+                                                unsigned char *out_poison_pubnonce /* 66 or NULL */);
 
 cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input /* n_inputs * 66 */,
                                             const unsigned char *lsp_psigs_per_input /* n_inputs * 32 */,
                                             uint32_t n_inputs,
                                             const unsigned char *all_signer_pubnonces_flat /* all_len bytes or NULL (single-input k>=2: n_signers*66) */,
-                                            uint32_t all_signer_pubnonces_len);
+                                            uint32_t all_signer_pubnonces_len,
+                                            const unsigned char *all_signer_poison_pubnonces_flat /* n_signers*66 or NULL */,
+                                            uint32_t all_signer_poison_pubnonces_len,
+                                            const unsigned char *lsp_poison_psig /* 32 or NULL */);
+/* Returns 1 (no poison), 2 (poison present), 0 (parse error). */
 int    wire_parse_subfactory_lsp_response(const cJSON *json,
                                             unsigned char *out_lsp_pubnonces_per_input,
                                             unsigned char *out_lsp_psigs_per_input,
                                             uint32_t expected_n_inputs,
                                             unsigned char *out_all_signer_pubnonces_flat /* max_all_len bytes or NULL */,
                                             uint32_t max_all_signer_pubnonces_len,
-                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */);
+                                            uint32_t *out_all_signer_pubnonces_len /* or NULL */,
+                                            unsigned char *out_all_signer_poison_pubnonces_flat /* max_poison_len or NULL */,
+                                            uint32_t max_all_signer_poison_pubnonces_len,
+                                            uint32_t *out_all_signer_poison_pubnonces_len /* or NULL */,
+                                            unsigned char *out_lsp_poison_psig /* 32 or NULL */);
 
 cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input /* n_inputs * 32 */,
-                                                  uint32_t n_inputs);
+                                                  uint32_t n_inputs,
+                                                  const unsigned char *poison_psig /* 32 or NULL */);
+/* Returns 1 (no poison), 2 (poison_psig present), 0 (parse error). */
 int    wire_parse_subfactory_client_final_psigs(const cJSON *json,
                                                   unsigned char *out_psigs_per_input,
-                                                  uint32_t expected_n_inputs);
+                                                  uint32_t expected_n_inputs,
+                                                  unsigned char *out_poison_psig /* 32 or NULL */);
 
 /* Phase 1e.2.a Tier B state advance reversed flow wire codec.  Multi-leaf
    ceremony: per-leaf arrays of pubnonces + psigs.  n_affected_leaves is
