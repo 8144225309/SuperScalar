@@ -172,7 +172,7 @@ fi
 echo
 echo "=== Final result ==="
 if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
-    CL7_FIRED=$(grep -cE "CL7: client.*broadcast STALE" "$TMPDIR/client_${CHEATING_CLIENT}.log" 2>/dev/null || echo 0)
+    CL7_FIRED=$(grep -cE "CL7: client.*broadcast STALE" "$TMPDIR/client_${CHEATING_CLIENT}.log" 2>/dev/null)
     if [ "${CL7_FIRED:-0}" -ge 1 ]; then
         echo "  PASS: adversarial client CL7 path fired ($CL7_FIRED stale broadcasts), WT defense fired"
         
