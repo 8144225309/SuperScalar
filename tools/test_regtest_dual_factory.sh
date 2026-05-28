@@ -7,6 +7,16 @@
 # MUST use matching 64-char seckeys or the factory_init in the scaffold uses
 # wrong keys and bitcoind rejects with Invalid Schnorr at broadcast. This
 # runner codifies the correct invocation so the regression won't recur.
+#
+# NOTE (stateless matrix): --test-dual-factory is a single-process
+# pre-daemon simulation that signs both factory trees via factory_sign_all()
+# in-process -- there are no wire round-trips and no persisted secnonces, so
+# SS_MUSIG_STATELESS has nothing to toggle.  This test legitimately emits 0
+# "LSP-stateless" markers under SS_MUSIG_STATELESS=1; that is EXPECTED and
+# does not mean the stateless dispatch was bypassed.  Stateless *wire*
+# ceremony coverage lives in test_regtest_wire_leaf_advance.sh,
+# test_regtest_tier_b_rollover_ps.sh and
+# test_regtest_subfactory_chain_advance_multi.sh.
 
 set -euo pipefail
 

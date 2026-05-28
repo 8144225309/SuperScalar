@@ -35,6 +35,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Kill only THIS test's LSP/clients on its own port (bracketed so the
+# pattern can never match this shell; never touches testnet4 995x).
+kill_port() {
+    pkill -9 -f "superscalar_lsp.*--port ${LSP_PORT}\b" 2>/dev/null || true
+    pkill -9 -f "superscalar_client.*--port ${LSP_PORT}\b" 2>/dev/null || true
+}
+
+# Tear down everything spawned by the current run and free the port.
+teardown_run() {
+    for pid in "${PIDS[@]:-}"; do kill -9 "$pid" 2>/dev/null; done
+    PIDS=()
+    kill_port
+    sleep 2
+}
+
+# Clear any pre-existing leftover on our port before the first run.
+kill_port
+sleep 1
+
 run_one() {
     local label="$1"
     local stateless="$2"
@@ -78,6 +97,7 @@ run_one() {
         --db "$LSP_DB" \
         --demo --test-wire-leaf-advance \
         --lsp-balance-pct 50 \
+        --max-conn-rate 1000 --max-handshakes 256 \
         > "$LSP_LOG" 2>&1 &
     LSP_PID=$!
     PIDS+=($LSP_PID)
@@ -91,6 +111,7 @@ run_one() {
     done
     if ! grep -q "LSP: listening" "$LSP_LOG" 2>/dev/null; then
         echo "  FAIL: LSP did not start listening (see $LSP_LOG)"
+        teardown_run
         return 1
     fi
 
@@ -101,6 +122,7 @@ run_one() {
     LSP_PUBKEY=$(grep -oP "NK static pubkey: \\K[0-9a-f]+" "$LSP_LOG" | head -1)
     if [ -z "$LSP_PUBKEY" ]; then
         echo "  FAIL: could not parse LSP NK static pubkey from $LSP_LOG"
+        teardown_run
         return 1
     fi
 
@@ -141,12 +163,14 @@ run_one() {
         echo "  FAIL: never saw POST-DAEMON WIRE LEAF ADVANCE result in $LSP_LOG"
         echo "  tail of log:"
         tail -15 "$LSP_LOG" | sed 's/^/    /'
+        teardown_run
         return 1
     fi
 
-    # Kill LSP + clients
+    # Kill LSP + clients and free the port before the next run.
     for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null; done
     PIDS=()
+    kill_port
     sleep 2
 
     if grep -q "POST-DAEMON WIRE LEAF ADVANCE: PASS" "$LSP_LOG"; then
