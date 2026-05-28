@@ -2780,6 +2780,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         cJSON_Delete(nmsg.json);
+        /* C3 Tier 2 (PR-C-4): client c's nonce bundle arrived.
+           Clients are slots 1..n_clients (LSP is slot 0). */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_nonce(
+                (persist_t *)mgr->persist, c3_round_id,
+                /* signer_slot = */ (uint32_t)(c + 1));
+        }
+
         /* Distribute: for each affected node, if this client is a signer,
            record their pubnonce + slot.  An all-zero pubnonce indicates
            "I'm not a signer on this leaf" -- skip. */
@@ -2949,6 +2957,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             }
         }
     }
+    /* C3 Tier 2 (PR-C-4): LSP completed both its nonce and psig
+       contributions across all affected nodes (slot 0). */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_nonce(
+            (persist_t *)mgr->persist, c3_round_id, /* signer_slot = */ 0);
+        persist_save_signing_round_participant_psig(
+            (persist_t *)mgr->persist, c3_round_id,
+            /* signer_slot = */ 0, "verified");
+    }
+
     /* INVARIANT: every LSP secnonce in lsp_pool has been pulled and zeroed
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
@@ -3018,6 +3036,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         cJSON_Delete(pmsg.json);
+        /* C3 Tier 2 (PR-C-4): client c's psig bundle parsed + accepted. */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_psig(
+                (persist_t *)mgr->persist, c3_round_id,
+                (uint32_t)(c + 1), "verified");
+        }
         for (size_t k = 0; k < n_affected; k++) {
             int slot = factory_find_signer_slot(f, affected[k], (uint32_t)(c + 1));
             if (slot < 0) continue;
