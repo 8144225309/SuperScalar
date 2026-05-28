@@ -4304,6 +4304,24 @@ static int client_handle_leaf_advance_stateless(int fd,
                               ? ps_node->outputs[old_n_outputs_c - 1].amount_sats
                               : 0;
 
+    /* CL7: snapshot pre-advance leaf signed_tx for --cheat-client.
+       Mirrors the legacy path in client_handle_leaf_advance below; the
+       stateless dispatch in MuSig2 redesign #271/#330 bypassed the
+       legacy CL7 hook so test_regtest_cheat_client failed under
+       SS_MUSIG_STATELESS.  Broadcast lives after LEAF_ADVANCE_DONE. */
+    tx_buf_t cl7_cheat_tx;
+    tx_buf_init(&cl7_cheat_tx, 0);
+    {
+        const char *cheat_env = getenv("SS_CHEAT_CLIENT_SIDE");
+        if (cheat_env && atoi(cheat_env) == leaf_side &&
+            had_old_signed_c && ps_node->signed_tx.len > 0) {
+            tx_buf_init(&cl7_cheat_tx, (int)ps_node->signed_tx.len);
+            memcpy(cl7_cheat_tx.data, ps_node->signed_tx.data,
+                   ps_node->signed_tx.len);
+            cl7_cheat_tx.len = ps_node->signed_tx.len;
+        }
+    }
+
     /* Step 1: advance local state to mirror the LSP. */
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
@@ -4626,6 +4644,26 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
     if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    /* CL7: broadcast the snapshotted stale leaf state now that the
+       advance is recorded.  LSP/standalone WT must respond with
+       response_tx + L-stock poison TX.  Mirrors the legacy path. */
+    if (cl7_cheat_tx.len > 0 && g_client_chain_rt) {
+        char hex[CL7_TX_HEX_MAX];
+        char txid_str[65] = {0};
+        if (cl7_cheat_tx.len * 2 + 1 < CL7_TX_HEX_MAX) {
+            hex_encode(cl7_cheat_tx.data, cl7_cheat_tx.len, hex);
+            int sent = regtest_send_raw_tx(g_client_chain_rt, hex, txid_str);
+            fprintf(stderr, "CL7: client %u broadcast STALE leaf %d state: %s (sent=%d)\n",
+                    my_index, leaf_side, txid_str, sent);
+            if (persist && sent) {
+                persist_log_broadcast(persist, txid_str,
+                                       "cheat_client_stale", hex,
+                                       "ok");
+            }
+        }
+    }
+    tx_buf_free(&cl7_cheat_tx);
 
     printf("Client-stateless %u: leaf %d advance complete\n", my_index, leaf_side);
     return 1;
