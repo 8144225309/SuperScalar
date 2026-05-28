@@ -356,6 +356,31 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     if (!lsp) return -1;
     factory_t *f = &lsp->factory;
 
+    /* SF-CEREMONY-HELPERS #199 / wallet-team v34 API: journal this
+       stateless factory creation in the ceremonies table.  Mirrors the
+       legacy lsp_run_factory_creation minimum (ceremony_id derivation
+       + persist_save_ceremony at entry; participant_phase(SIGNED) per
+       client + state transition to FINALIZED at the success return).
+       cer_persisted gate so failure-to-persist is non-fatal (continues
+       the ceremony, just no journal). */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (lsp->db) {
+        lsp_ceremony_derive_id(funding_txid,
+                                PERSIST_CEREMONY_TYPE_INITIAL,
+                                (uint64_t)lsp->factory.counter.current_epoch,
+                                cer_id);
+        if (!persist_save_ceremony(lsp->db, cer_id, funding_txid,
+                                    PERSIST_CEREMONY_TYPE_INITIAL,
+                                    /*parent_ceremony_id8_or_null*/ NULL,
+                                    /*started_at_block*/ 0,
+                                    /*deadline_block*/ cltv_timeout)) {
+            fprintf(stderr, "LSP-stateless: persist_save_ceremony failed (continuing)\n");
+        } else {
+            cer_persisted = 1;
+        }
+    }
+
     /* ---- Setup: identical to legacy lsp_run_factory_creation ---- */
     size_t n_total = 1 + lsp->n_clients;
     secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
@@ -657,6 +682,32 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             }
         }
         cJSON_Delete(ready);
+    }
+
+    /* SF-CEREMONY-HELPERS #199: complete the ceremony journal.  Per-
+       client participant rows at SIGNED phase, then state transition
+       to FINALIZED (the persist_update_ceremony_state hard guard
+       requires every participant row at SIGNED — see persist.c:6836). */
+    if (cer_persisted) {
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            unsigned char pk33[33];
+            size_t pk33_len = 33;
+            if (!secp256k1_ec_pubkey_serialize(lsp->ctx, pk33, &pk33_len,
+                                                 &lsp->client_pubkeys[i],
+                                                 SECP256K1_EC_COMPRESSED)) {
+                fprintf(stderr, "LSP-stateless: serialize client %zu pubkey failed (continuing)\n", i);
+                continue;
+            }
+            if (!persist_save_participant_phase(lsp->db, cer_id, pk33,
+                                                 PERSIST_CEREMONY_PHASE_SIGNED,
+                                                 NULL, NULL, 0, 0)) {
+                fprintf(stderr, "LSP-stateless: persist_save_participant_phase(SIGNED) client %zu failed (continuing)\n", i);
+            }
+        }
+        if (!persist_update_ceremony_state(lsp->db, cer_id,
+                                            PERSIST_CEREMONY_STATE_FINALIZED)) {
+            fprintf(stderr, "LSP-stateless: persist_update_ceremony_state(FINALIZED) failed (continuing)\n");
+        }
     }
 
     printf("LSP-stateless factory creation: %u nodes signed\n", (unsigned)f->n_nodes);
