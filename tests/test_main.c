@@ -72,6 +72,9 @@ extern int test_musig_nonce_pool(void);
 extern int test_musig_partial_sig_verify(void);
 extern int test_musig_serialization(void);
 extern int test_musig_split_round_5of5(void);
+extern int test_musig_secnonce_zeroed_after_sign(void);
+extern int test_musig_secnonce_zeroed_property_loop(void);
+extern int test_musig_stateless_no_secnonce_persisted(void);
 
 extern int test_tx_buf_primitives(void);
 extern int test_build_p2tr_script_pubkey(void);
@@ -1962,6 +1965,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_musig_partial_sig_verify);
     RUN_TEST(test_musig_serialization);
     RUN_TEST(test_musig_split_round_5of5);
+
+    printf("\n=== MuSig2 stateless invariants (BIP-327) ===\n");
+    RUN_TEST(test_musig_secnonce_zeroed_after_sign);
+    RUN_TEST(test_musig_secnonce_zeroed_property_loop);
+    RUN_TEST(test_musig_stateless_no_secnonce_persisted);
 
     printf("\n=== Transaction Builder ===\n");
     RUN_TEST(test_tx_buf_primitives);
