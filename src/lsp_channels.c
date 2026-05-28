@@ -2654,6 +2654,41 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         return 1;
     }
 
+    /* C3 Tier 2 (PR-C-4): journal this stateless Tier B ceremony.
+       Mirrors the legacy lsp_run_state_advance round_start.
+       Participant-level rows (signing_round_participants) are added
+       by the recv loops below.  row_id<=0 disables journal calls. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id = */ 0,
+                                           /* node_idx = */ 0,
+                                           "tier_b_rollover",
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
+    /* SF-BACKUP-PRE-ROTATION #213: snapshot the LSP DB to backup_dir
+       (if configured) before any state mutation.  Failure to snapshot
+       warns but does NOT abort the rotation — operator decides.
+       Mirrors the legacy lsp_run_state_advance hook that the stateless
+       redesign #271/#330 didn't carry over. */
+    if (lsp->backup_dir && mgr->persist) {
+        char snap_path[512];
+        time_t now = time(NULL);
+        snprintf(snap_path, sizeof(snap_path),
+                 "%s/lsp_pre_rotation_%u_%ld.db",
+                 lsp->backup_dir,
+                 (unsigned)f->counter.current_epoch,
+                 (long)now);
+        if (!persist_take_snapshot((persist_t *)mgr->persist, snap_path,
+                                    "pre_rotation")) {
+            fprintf(stderr, "WARN: pre-rotation snapshot failed; "
+                            "continuing rotation anyway\n");
+        }
+    }
+
     /* MVP refusal: multi-input on any affected node. */
     for (size_t k = 0; k < n_affected; k++) {
         if (factory_node_uses_multi_input(f, affected[k])) {
@@ -2765,6 +2800,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         cJSON_Delete(nmsg.json);
+        /* C3 Tier 2 (PR-C-4): client c's nonce bundle arrived.
+           Clients are slots 1..n_clients (LSP is slot 0). */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_nonce(
+                (persist_t *)mgr->persist, c3_round_id,
+                /* signer_slot = */ (uint32_t)(c + 1));
+        }
+
         /* Distribute: for each affected node, if this client is a signer,
            record their pubnonce + slot.  An all-zero pubnonce indicates
            "I'm not a signer on this leaf" -- skip. */
@@ -2934,6 +2977,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             }
         }
     }
+    /* C3 Tier 2 (PR-C-4): LSP completed both its nonce and psig
+       contributions across all affected nodes (slot 0). */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_participant_nonce(
+            (persist_t *)mgr->persist, c3_round_id, /* signer_slot = */ 0);
+        persist_save_signing_round_participant_psig(
+            (persist_t *)mgr->persist, c3_round_id,
+            /* signer_slot = */ 0, "verified");
+    }
+
     /* INVARIANT: every LSP secnonce in lsp_pool has been pulled and zeroed
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
@@ -3003,6 +3056,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             return 0;
         }
         cJSON_Delete(pmsg.json);
+        /* C3 Tier 2 (PR-C-4): client c's psig bundle parsed + accepted. */
+        if (mgr->persist && c3_round_id > 0) {
+            persist_save_signing_round_participant_psig(
+                (persist_t *)mgr->persist, c3_round_id,
+                (uint32_t)(c + 1), "verified");
+        }
         for (size_t k = 0; k < n_affected; k++) {
             int slot = factory_find_signer_slot(f, affected[k], (uint32_t)(c + 1));
             if (slot < 0) continue;
@@ -3141,6 +3200,17 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (saved > 0)
             printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
                    saved);
+    }
+
+    /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist,
+                                          c3_round_id,
+                                          (uint32_t)n_affected,
+                                          (uint32_t)n_affected,
+                                          "success",
+                                          NULL,
+                                          NULL);
     }
 
     /* Step 10: Broadcast DONE (existing opcode). */
