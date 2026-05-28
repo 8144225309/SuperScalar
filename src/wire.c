@@ -1219,33 +1219,46 @@ int wire_parse_subfactory_propose_intent(const cJSON *json,
 }
 
 cJSON *wire_build_subfactory_client_pubnonces(const unsigned char *pubnonces_per_input,
-                                                uint32_t n_inputs) {
+                                                uint32_t n_inputs,
+                                                const unsigned char *poison_pubnonce) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !pubnonces_per_input) { if(j) cJSON_Delete(j); return NULL; }
     wire_json_add_hex(j, "pubnonces_per_input", pubnonces_per_input,
                       (size_t)n_inputs * 66);
+    if (poison_pubnonce)
+        wire_json_add_hex(j, "poison_pubnonce", poison_pubnonce, 66);
     cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
     return j;
 }
 
 int wire_parse_subfactory_client_pubnonces(const cJSON *json,
                                              unsigned char *out_pubnonces_per_input,
-                                             uint32_t expected_n_inputs) {
+                                             uint32_t expected_n_inputs,
+                                             unsigned char *out_poison_pubnonce) {
     if (!json || !out_pubnonces_per_input) return 0;
     cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
     if (!ni || !cJSON_IsNumber(ni)) return 0;
     if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
-    return wire_json_get_hex(json, "pubnonces_per_input",
-                               out_pubnonces_per_input,
-                               (size_t)expected_n_inputs * 66) ==
-           (int)((size_t)expected_n_inputs * 66);
+    if (wire_json_get_hex(json, "pubnonces_per_input",
+                            out_pubnonces_per_input,
+                            (size_t)expected_n_inputs * 66) !=
+        (int)((size_t)expected_n_inputs * 66)) return 0;
+    if (out_poison_pubnonce && cJSON_GetObjectItem(json, "poison_pubnonce")) {
+        if (wire_json_get_hex(json, "poison_pubnonce", out_poison_pubnonce, 66) != 66)
+            return 0;
+        return 2;
+    }
+    return 1;
 }
 
 cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per_input,
                                             const unsigned char *lsp_psigs_per_input,
                                             uint32_t n_inputs,
                                             const unsigned char *all_signer_pubnonces_flat,
-                                            uint32_t all_signer_pubnonces_len) {
+                                            uint32_t all_signer_pubnonces_len,
+                                            const unsigned char *all_signer_poison_pubnonces_flat,
+                                            uint32_t all_signer_poison_pubnonces_len,
+                                            const unsigned char *lsp_poison_psig) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !lsp_pubnonces_per_input || !lsp_psigs_per_input) {
         if (j) cJSON_Delete(j);
@@ -1261,6 +1274,18 @@ cJSON *wire_build_subfactory_lsp_response(const unsigned char *lsp_pubnonces_per
         cJSON_AddNumberToObject(j, "all_signer_pubnonces_len",
                                 (double)all_signer_pubnonces_len);
     }
+    /* Poison: forward the full all-signer poison-nonce matrix (the poison
+       session is N-of-N like state, so each client needs every co-signer's
+       poison nonce to finalize) + the LSP poison partial sig. */
+    if (all_signer_poison_pubnonces_flat && all_signer_poison_pubnonces_len > 0 &&
+        lsp_poison_psig) {
+        wire_json_add_hex(j, "all_signer_poison_pubnonces",
+                          all_signer_poison_pubnonces_flat,
+                          (size_t)all_signer_poison_pubnonces_len);
+        cJSON_AddNumberToObject(j, "all_signer_poison_pubnonces_len",
+                                (double)all_signer_poison_pubnonces_len);
+        wire_json_add_hex(j, "lsp_poison_psig", lsp_poison_psig, 32);
+    }
     cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
     return j;
 }
@@ -1271,7 +1296,11 @@ int wire_parse_subfactory_lsp_response(const cJSON *json,
                                          uint32_t expected_n_inputs,
                                          unsigned char *out_all_signer_pubnonces_flat,
                                          uint32_t max_all_signer_pubnonces_len,
-                                         uint32_t *out_all_signer_pubnonces_len) {
+                                         uint32_t *out_all_signer_pubnonces_len,
+                                         unsigned char *out_all_signer_poison_pubnonces_flat,
+                                         uint32_t max_all_signer_poison_pubnonces_len,
+                                         uint32_t *out_all_signer_poison_pubnonces_len,
+                                         unsigned char *out_lsp_poison_psig) {
     if (!json || !out_lsp_pubnonces_per_input || !out_lsp_psigs_per_input) return 0;
     cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
     if (!ni || !cJSON_IsNumber(ni)) return 0;
@@ -1296,30 +1325,56 @@ int wire_parse_subfactory_lsp_response(const cJSON *json,
             *out_all_signer_pubnonces_len = alen;
         }
     }
+    if (out_all_signer_poison_pubnonces_len) *out_all_signer_poison_pubnonces_len = 0;
+    if (out_all_signer_poison_pubnonces_flat && out_all_signer_poison_pubnonces_len &&
+        out_lsp_poison_psig &&
+        cJSON_GetObjectItem(json, "all_signer_poison_pubnonces")) {
+        cJSON *pl = cJSON_GetObjectItem(json, "all_signer_poison_pubnonces_len");
+        if (!pl || !cJSON_IsNumber(pl)) return 0;
+        uint32_t plen = (uint32_t)pl->valuedouble;
+        if (plen > max_all_signer_poison_pubnonces_len) return 0;
+        if (wire_json_get_hex(json, "all_signer_poison_pubnonces",
+                                out_all_signer_poison_pubnonces_flat, (size_t)plen) !=
+            (int)plen) return 0;
+        if (wire_json_get_hex(json, "lsp_poison_psig", out_lsp_poison_psig, 32) != 32)
+            return 0;
+        *out_all_signer_poison_pubnonces_len = plen;
+        return 2;
+    }
     return 1;
 }
 
 cJSON *wire_build_subfactory_client_final_psigs(const unsigned char *psigs_per_input,
-                                                  uint32_t n_inputs) {
+                                                  uint32_t n_inputs,
+                                                  const unsigned char *poison_psig) {
     cJSON *j = cJSON_CreateObject();
     if (!j || !psigs_per_input) { if(j) cJSON_Delete(j); return NULL; }
     wire_json_add_hex(j, "psigs_per_input", psigs_per_input,
                       (size_t)n_inputs * 32);
+    if (poison_psig)
+        wire_json_add_hex(j, "poison_psig", poison_psig, 32);
     cJSON_AddNumberToObject(j, "n_inputs", (double)n_inputs);
     return j;
 }
 
 int wire_parse_subfactory_client_final_psigs(const cJSON *json,
                                                unsigned char *out_psigs_per_input,
-                                               uint32_t expected_n_inputs) {
+                                               uint32_t expected_n_inputs,
+                                               unsigned char *out_poison_psig) {
     if (!json || !out_psigs_per_input) return 0;
     cJSON *ni = cJSON_GetObjectItem(json, "n_inputs");
     if (!ni || !cJSON_IsNumber(ni)) return 0;
     if ((uint32_t)ni->valuedouble != expected_n_inputs) return 0;
-    return wire_json_get_hex(json, "psigs_per_input",
-                               out_psigs_per_input,
-                               (size_t)expected_n_inputs * 32) ==
-           (int)((size_t)expected_n_inputs * 32);
+    if (wire_json_get_hex(json, "psigs_per_input",
+                            out_psigs_per_input,
+                            (size_t)expected_n_inputs * 32) !=
+        (int)((size_t)expected_n_inputs * 32)) return 0;
+    if (out_poison_psig && cJSON_GetObjectItem(json, "poison_psig")) {
+        if (wire_json_get_hex(json, "poison_psig", out_poison_psig, 32) != 32)
+            return 0;
+        return 2;
+    }
+    return 1;
 }
 
 /* Phase 1e.2.a -- Tier B state advance reversed flow wire codec. */
