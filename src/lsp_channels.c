@@ -2669,6 +2669,26 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                                            &c3_round_id);
     }
 
+    /* SF-BACKUP-PRE-ROTATION #213: snapshot the LSP DB to backup_dir
+       (if configured) before any state mutation.  Failure to snapshot
+       warns but does NOT abort the rotation — operator decides.
+       Mirrors the legacy lsp_run_state_advance hook that the stateless
+       redesign #271/#330 didn't carry over. */
+    if (lsp->backup_dir && mgr->persist) {
+        char snap_path[512];
+        time_t now = time(NULL);
+        snprintf(snap_path, sizeof(snap_path),
+                 "%s/lsp_pre_rotation_%u_%ld.db",
+                 lsp->backup_dir,
+                 (unsigned)f->counter.current_epoch,
+                 (long)now);
+        if (!persist_take_snapshot((persist_t *)mgr->persist, snap_path,
+                                    "pre_rotation")) {
+            fprintf(stderr, "WARN: pre-rotation snapshot failed; "
+                            "continuing rotation anyway\n");
+        }
+    }
+
     /* MVP refusal: multi-input on any affected node. */
     for (size_t k = 0; k < n_affected; k++) {
         if (factory_node_uses_multi_input(f, affected[k])) {
