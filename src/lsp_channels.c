@@ -2654,6 +2654,21 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         return 1;
     }
 
+    /* C3 Tier 2 (PR-C-4): journal this stateless Tier B ceremony.
+       Mirrors the legacy lsp_run_state_advance round_start.
+       Participant-level rows (signing_round_participants) are added
+       by the recv loops below.  row_id<=0 disables journal calls. */
+    int64_t c3_round_id = -1;
+    if (mgr->persist) {
+        persist_save_signing_round_start((persist_t *)mgr->persist,
+                                           /* factory_id = */ 0,
+                                           /* node_idx = */ 0,
+                                           "tier_b_rollover",
+                                           f->counter.current_epoch,
+                                           (uint32_t)f->n_participants,
+                                           &c3_round_id);
+    }
+
     /* MVP refusal: multi-input on any affected node. */
     for (size_t k = 0; k < n_affected; k++) {
         if (factory_node_uses_multi_input(f, affected[k])) {
@@ -3141,6 +3156,17 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (saved > 0)
             printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
                    saved);
+    }
+
+    /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
+    if (mgr->persist && c3_round_id > 0) {
+        persist_save_signing_round_done((persist_t *)mgr->persist,
+                                          c3_round_id,
+                                          (uint32_t)n_affected,
+                                          (uint32_t)n_affected,
+                                          "success",
+                                          NULL,
+                                          NULL);
     }
 
     /* Step 10: Broadcast DONE (existing opcode). */
