@@ -4,6 +4,19 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### MuSig2 Phase 3: legacy nonce-pool path deleted (#273)
+
+The legacy nonce-pool MuSig2 ceremony bodies have been **deleted permanently** in a 2-commit change set:
+
+1. The 7 legacy ceremony function bodies (~4,580 lines) — leaf advance, Tier B state advance, sub-factory chain advance, factory creation, and their client-side counterparts — were replaced with unconditional forwards to their `_stateless` equivalents.
+2. The persistence layer for nonce pools was dropped: `persist_save_nonce_pool` and `persist_load_nonce_pool` deleted, `CREATE TABLE nonce_pools` removed from the main schema.
+
+The in-memory `musig_nonce_pool_*` API in `src/musig.c` **remains** — it is still used by channel-level commit signing, JIT channels, and the stateless ceremonies themselves for ephemeral on-stack nonces. The "stateless" distinction was always about not persisting nonces across network waits, not about not having an in-memory nonce pool at all.
+
+The `SS_MUSIG_LEGACY=1` opt-out env var introduced in Phase 2 is now a no-op (kept for backward compat; future cleanup may remove it).
+
+The `nonce-safety` unit test in `tests/test_musig.c` (`test_musig_stateless_no_secnonce_persisted`) was updated: previously it asserted the `nonce_pools` table existed and had zero rows; now it asserts the table **no longer exists** — the strongest possible enforcement of the stateless invariant (no schema for any future refactor to accidentally write secnonces into).
+
 ### MuSig2 Phase 2: stateless is now the default (#272)
 
 The BIP-327 stateless MuSig2 signer (introduced in #271 / #330 / #333 / #334 / #336 and validated through the full ceremony + breach + observability stack in #337-#341) is now the **default behavior**. The legacy nonce-pool path is opt-in via `SS_MUSIG_LEGACY=1`. The opt-in `SS_MUSIG_STATELESS=1` env var is now a no-op (the legacy path no longer reads it; test scripts that still set it continue to work but the variable has no effect).
