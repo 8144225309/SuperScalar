@@ -1216,9 +1216,10 @@ extern int test_persist_signing_rounds_round_trip(void);
 extern int test_persist_pending_fee_bump_round_trip(void);
 extern int test_persist_force_close_round_trip(void);
 extern int test_persist_observability_tables(void);
-/* #248 SF-WT-TRUSTLESS Phase 1a */
+/* #248 SF-WT-TRUSTLESS Phase 1a + 1b.2 */
 extern int test_persist_wt_open_close(void);
 extern int test_persist_wt_register_watch_round_trip(void);
+extern int test_lsp_wt_register_factory_node_watch(void);
 extern int test_persist_wt_no_secrets_in_schema(void);
 extern int test_persist_old_commitment_ptlcs_round_trip(void);
 extern int test_persist_channel_round_trip(void);
@@ -3084,9 +3085,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_pending_fee_bump_round_trip);
     RUN_TEST(test_persist_force_close_round_trip);
     RUN_TEST(test_persist_observability_tables);
-    printf("\n=== #248 SF-WT-TRUSTLESS Phase 1a ===\n");
+    printf("\n=== #248 SF-WT-TRUSTLESS Phase 1a + 1b.2 ===\n");
     RUN_TEST(test_persist_wt_open_close);
     RUN_TEST(test_persist_wt_register_watch_round_trip);
+    RUN_TEST(test_lsp_wt_register_factory_node_watch);
     RUN_TEST(test_persist_wt_no_secrets_in_schema);
     RUN_TEST(test_persist_old_commitment_ptlcs_round_trip);
     RUN_TEST(test_persist_channel_round_trip);
