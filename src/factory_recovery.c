@@ -178,14 +178,20 @@ static int broadcast_node(chain_backend_t *chain, persist_t *p,
     return ok;
 }
 
-/* Check if all leaf nodes are confirmed (returns 0 if none found). */
-static int all_leaves_confirmed(fr_node_t *nodes, int n)
+/* Check if all leaf nodes are confirmed at the network-safe depth
+   (returns 0 if none found).
+   #265: was hardcoded `confs < 1` ("any confirmation at all"); now uses
+   chain_funding_confs (1 on regtest, configurable on other networks,
+   default 6 on mainnet) so factory recovery on mainnet waits for
+   reorg-safe depth before declaring the factory fully settled. */
+static int all_leaves_confirmed(chain_backend_t *chain, fr_node_t *nodes, int n)
 {
+    int min_confs = chain ? chain_funding_confs(chain, chain->is_regtest) : 1;
     int found = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(nodes[i].type, "leaf") == 0) {
             found = 1;
-            if (nodes[i].confs < 1) return 0;
+            if (nodes[i].confs < min_confs) return 0;
         }
     }
     return found;
@@ -264,7 +270,7 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
 
     /* Re-check confirmations after broadcasts and auto-close if done */
     refresh_confs(chain, nodes, n);
-    if (all_leaves_confirmed(nodes, n)) {
+    if (all_leaves_confirmed(chain, nodes, n)) {
         persist_mark_factory_closed(p, factory_id);
         printf("LSP recovery: factory %u fully settled — marked closed\n",
                factory_id);
