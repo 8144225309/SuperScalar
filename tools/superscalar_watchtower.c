@@ -1,6 +1,7 @@
 #include "superscalar/version.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/persist.h"
+#include "superscalar/persist_wt.h"
 #include "superscalar/regtest.h"
 #include "superscalar/fee.h"
 #include "superscalar/channel.h"
@@ -27,7 +28,8 @@ static void usage(const char *prog) {
         "  and broadcasts penalty transactions.\n"
         "\n"
         "Options:\n"
-        "  --db PATH           SQLite database (read-only) shared with LSP\n"
+        "  --db PATH           SQLite database (read-only) shared with LSP. DEPRECATED: prefer --wt-db (see docs/watchtower-trustless-schema.md).\n"
+        "  --wt-db PATH        Watchtower-side SQLite database (SF-WT-TRUSTLESS Phase 2, #248). No secrets. When set, hydrates watches from this file instead of (or alongside) --db.\n"
         "  --network MODE      Network: regtest, signet, testnet, testnet4, mainnet\n"
         "  --poll-interval N   Seconds between block checks (default: 30)\n"
         "  --cli-path PATH     Path to bitcoin-cli (default: bitcoin-cli)\n"
@@ -44,6 +46,8 @@ int main(int argc, char *argv[]) {
     int bump_budget_pct = 0;
     uint64_t max_bump_fee = 0;
     const char *db_path = NULL;
+    /* SF-WT-TRUSTLESS Phase 2 (#248): optional separate WT-side database. */
+    const char *wt_db_path = NULL;
     const char *network = "regtest";
     int poll_interval = 30;
     const char *cli_path = NULL;
@@ -56,6 +60,8 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
+        else if (strcmp(argv[i], "--wt-db") == 0 && i + 1 < argc)
+            wt_db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
             network = argv[++i];
         else if (strcmp(argv[i], "--poll-interval") == 0 && i + 1 < argc)
@@ -92,10 +98,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Phase 2a: --db remains required (we still hydrate channels + breach
+     * detections via lsp.db).  --wt-db is OPTIONAL — when set, ADDITIONALLY
+     * hydrates watches from the trustless wt_db file as a parallel write
+     * verifier.  Phase 2b will make --db optional and switch the primary
+     * read path. */
     if (!db_path) {
-        fprintf(stderr, "Error: --db PATH required\n");
+        fprintf(stderr, "Error: --db PATH required (Phase 2b will make this optional)\n");
         usage(argv[0]);
         return 1;
+    }
+    if (db_path && !wt_db_path) {
+        fprintf(stderr,
+                "INFO: running in legacy mode (--db only). Consider --wt-db PATH "
+                "for the SF-WT-TRUSTLESS Phase 2 parallel hydration.\n");
     }
 
     /* CL4.C: open DB read-write so the WT can read WAL-pending rows from a
@@ -190,6 +206,31 @@ int main(int argc, char *argv[]) {
     }
     if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
     if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
+
+    /* SF-WT-TRUSTLESS Phase 2a (#248): open wt_db and parallel-hydrate
+     * watches from it BEFORE the legacy lsp.db channel hydration runs.
+     * Phase 2a is observation-only — verifies that wt_db rows produced
+     * by the LSP-side Phase 1b writes are decodable and registerable.
+     * Phase 2b will use these as the PRIMARY watch source. */
+    persist_wt_t wt_pdb;
+    int use_wt_db = 0;
+    if (wt_db_path) {
+        if (!persist_wt_open(&wt_pdb, wt_db_path)) {
+            fprintf(stderr, "Error: cannot open watchtower database '%s'\n",
+                    wt_db_path);
+            persist_close(&db);
+            return 1;
+        }
+        use_wt_db = 1;
+        printf("WT-TRUSTLESS: opened wt_db at %s\n", wt_db_path);
+
+        int n_wt = watchtower_hydrate_from_wt_db(&wt, &wt_pdb);
+        if (n_wt < 0) {
+            fprintf(stderr,
+                    "WT-TRUSTLESS: WARN — hydration returned %d (proceeding "
+                    "with lsp.db hydration only)\n", n_wt);
+        }
+    }
 
     /* Hydrate channels from the DB so breach detections can build penalty TXes.
        Without this, watchtower_check() sees the breach, looks up wt->channels[
@@ -492,6 +533,10 @@ int main(int argc, char *argv[]) {
         }
     }
     if (chan_ctx) secp256k1_context_destroy(chan_ctx);
+    /* SF-WT-TRUSTLESS Phase 2a: close wt_db at natural shutdown.  Early-exit
+     * paths skip this — OS process cleanup handles them; SQLite WAL keeps
+     * committed data durable through abrupt close. */
+    if (use_wt_db) persist_wt_close(&wt_pdb);
     persist_close(&db);
     return 0;
 }
