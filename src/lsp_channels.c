@@ -4778,7 +4778,13 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         const uint32_t *sub_clients, size_t n_clients_in_sub,
         int leaf_side, int sub_idx_in_leaf, int channel_idx_in_sub,
         uint64_t delta_sats) {
-    size_t n_inputs = sub->ps_n_prev_outputs;
+    /* SF-MULTI-DISPATCH: n_inputs is the number of outputs on chain[N] that
+       chain[N+1] will spend.  Use sub->n_outputs (the PRE-advance count of
+       outputs on the current chain head) -- this is what advance_unsigned
+       will assign to sub->ps_n_prev_outputs.  Reading sub->ps_n_prev_outputs
+       here would be stale on the first advance (it's only populated by a
+       prior advance_unsigned call, of which there has been none). */
+    size_t n_inputs = sub->n_outputs;
     if (n_inputs < 1) {
         fprintf(stderr, "LSP-stateless subfactory MULTI: n_inputs=%zu invalid\n",
                 n_inputs);
@@ -5298,8 +5304,20 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
        per input.  The whole point is the same BIP-327 invariant: the LSP
        generates its per-input secnonces ONLY after collecting every client's
        pubnonces, and each lsp_secnonces[i] is consumed/zeroed by
-       musig_create_partial_sig before the next wire_recv. */
-    if (factory_node_uses_multi_input(f, sub_node_i)) {
+       musig_create_partial_sig before the next wire_recv.
+
+       SF-MULTI-DISPATCH: predict whether the chain[N+1] state we're about
+       to build is multi-input.  factory_node_uses_multi_input checks
+       ps_n_prev_outputs > 1, but that field is populated INSIDE
+       factory_subfactory_chain_advance_unsigned (called below), so at this
+       point it's still 0 for the first advance.  Predicate equivalent at
+       this point: PS sub-factory with k>=2 (n_outputs > 1) ALWAYS produces
+       a multi-input chain[N+1] -- rebuild_node_tx spends all n_outputs of
+       chain[N] as inputs.  The legacy path dispatches AFTER advance_unsigned
+       so it uses the post-state predicate; we must dispatch BEFORE because
+       _stateless_multi calls advance_unsigned itself. */
+    if (sub->is_ps_leaf && sub->type == NODE_PS_SUBFACTORY &&
+        sub->n_outputs > 1) {
         return lsp_subfactory_chain_advance_stateless_multi(
             mgr, lsp, f, sub_node_i, sub, sub_clients, n_clients_in_sub,
             leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
