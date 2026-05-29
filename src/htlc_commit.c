@@ -358,10 +358,30 @@ int htlc_commit_recv_update_fee(channel_t *ch,
     uint64_t new_kvb = (uint64_t)feerate * 4;
     uint64_t htlc_sweep_fee = (new_kvb * 180 + 999) / 1000;
     uint64_t htlc_safe_floor = htlc_sweep_fee + CHANNEL_DUST_LIMIT_SATS;
+
+    /* #257 SF-CHEAT-DUST-RACE: when SS_CHEAT_DUST_RACE is set, an attacker
+       LSP bypasses the dust-race defense above. The accepted feerate then
+       strands counterparty HTLC sweeps below dust, letting the LSP absorb
+       the HTLC into commit fees at force-close. This MUST only fire in
+       cheat-engine test runs (env var gated). Markers: LSP-CHEAT-DUST. */
+    const char *cheat = getenv("SS_CHEAT_DUST_RACE");
+    int cheat_active = (cheat && cheat[0] && cheat[0] != '0');
+
     for (size_t i = 0; i < ch->n_htlcs; i++) {
         if (ch->htlcs[i].state != HTLC_STATE_ACTIVE) continue;
         if (ch->htlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue; /* already trimmed */
         if (ch->htlcs[i].amount_sats < htlc_safe_floor) {
+            if (cheat_active) {
+                fprintf(stderr,
+                        "LSP-CHEAT-DUST: bypass HTLC[%zu] amount=%llu sats — "
+                        "feerate %u sat/kw would strand sweep (sweep_fee=%llu, "
+                        "dust=%u). Cheat accepts; HTLC will be absorbed into "
+                        "commit fees at force-close.\n",
+                        i, (unsigned long long)ch->htlcs[i].amount_sats,
+                        feerate, (unsigned long long)htlc_sweep_fee,
+                        (unsigned int)CHANNEL_DUST_LIMIT_SATS);
+                continue;
+            }
             fprintf(stderr,
                     "htlc_commit_recv_update_fee: REJECT feerate %u sat/kw — "
                     "HTLC[%zu] amount=%llu sats would yield sweep amount below dust "
@@ -377,6 +397,17 @@ int htlc_commit_recv_update_fee(channel_t *ch,
         if (ch->ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
         if (ch->ptlcs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
         if (ch->ptlcs[i].amount_sats < htlc_safe_floor) {
+            if (cheat_active) {
+                fprintf(stderr,
+                        "LSP-CHEAT-DUST: bypass PTLC[%zu] amount=%llu sats — "
+                        "feerate %u sat/kw would strand sweep (sweep_fee=%llu, "
+                        "dust=%u). Cheat accepts; PTLC will be absorbed into "
+                        "commit fees at force-close.\n",
+                        i, (unsigned long long)ch->ptlcs[i].amount_sats,
+                        feerate, (unsigned long long)htlc_sweep_fee,
+                        (unsigned int)CHANNEL_DUST_LIMIT_SATS);
+                continue;
+            }
             fprintf(stderr,
                     "htlc_commit_recv_update_fee: REJECT feerate %u sat/kw — "
                     "PTLC[%zu] amount=%llu sats would yield sweep amount below dust "
@@ -389,6 +420,11 @@ int htlc_commit_recv_update_fee(channel_t *ch,
         }
     }
 
+    if (cheat_active) {
+        fprintf(stderr,
+                "LSP-CHEAT-DUST: accept feerate %u sat/kw (dust-race defense "
+                "bypassed)\n", feerate);
+    }
     ch->fee_rate_sat_per_kvb = new_kvb;
     return 1;
 }

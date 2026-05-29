@@ -789,6 +789,14 @@ extern int test_hfb_blocks_remaining(void);
 extern int test_hfb_confirm(void);
 extern int test_hfb_budget_limits_max(void);
 extern int test_hfb_null_safety(void);
+/* #257 SF-CHEAT-DUST-RACE: HTLC dust-bump force-close race */
+extern int test_dust_race_defense_rejects_htlc(void);
+extern int test_dust_race_defense_rejects_ptlc(void);
+extern int test_dust_race_cheat_bypass(void);
+extern int test_dust_race_cheat_disabled_explicit(void);
+extern int test_dust_race_boundary_accept(void);
+extern int test_dust_race_cheat_does_not_bypass_floor(void);
+extern int test_dust_race_cheat_per_htlc(void);
 /* PR #50: BOLT #4 Onion Failure Message Parser */
 extern int test_bf_temporary_channel_failure(void);
 extern int test_bf_channel_disabled(void);
@@ -2728,6 +2736,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_hfb_confirm);
     RUN_TEST(test_hfb_budget_limits_max);
     RUN_TEST(test_hfb_null_safety);
+
+    printf("\n=== #257 SF-CHEAT-DUST-RACE: HTLC dust-bump force-close race ===\n");
+    RUN_TEST(test_dust_race_defense_rejects_htlc);
+    RUN_TEST(test_dust_race_defense_rejects_ptlc);
+    RUN_TEST(test_dust_race_cheat_bypass);
+    RUN_TEST(test_dust_race_cheat_disabled_explicit);
+    RUN_TEST(test_dust_race_boundary_accept);
+    RUN_TEST(test_dust_race_cheat_does_not_bypass_floor);
+    RUN_TEST(test_dust_race_cheat_per_htlc);
 
     printf("\n=== PR #50: BOLT #4 Onion Failure Message Parser ===\n");
     RUN_TEST(test_bf_temporary_channel_failure);
