@@ -18,6 +18,7 @@
 #include "superscalar/readiness.h"
 #include "superscalar/notify.h"
 #include "superscalar/admin_rpc.h"
+#include "superscalar/crash_inject.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1681,6 +1682,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     printf("LSP: LEAF_ADVANCE_PROPOSE sent for leaf %d\n", leaf_side);
     fflush(stdout);
 
+    lsp_crash_checkpoint("leaf_advance_propose");
+
     /* Step 3: wait for client_pubnonce. */
     wire_msg_t cpn_msg;
     int rrc = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[leaf_side],
@@ -1711,6 +1714,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         factory_session_reset_poison(f, node_idx);
         leaf_poison_prepared = 0;
     }
+
+    lsp_crash_checkpoint("leaf_advance_nonced");
 
     /* Step 4: init both sessions (state always; poison if prepped). */
     if (!factory_session_init_node(f, node_idx)) {
@@ -1899,6 +1904,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         leaf_poison_prepared = 0;
     }
 
+    lsp_crash_checkpoint("leaf_advance_signed");
+
     /* Step 9: verify the final sig against the session's keyagg+sighash
        and (on success) attach it as the node's signed_tx.  The session's
        cache is the tweaked keyagg (factory_session_finalize_node applied
@@ -2025,6 +2032,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         wire_send(lsp->client_fds[i], MSG_LEAF_ADVANCE_DONE, done);
     }
     cJSON_Delete(done);
+
+    lsp_crash_checkpoint("leaf_advance_finalize_partial");
 
     /* Step 11: persist leaf state (same shape as legacy path). */
     if (mgr->persist) {
@@ -2289,6 +2298,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     printf("LSP: STATE_ADV_PROPOSE_INTENT sent to %zu clients (Tier B)\n", lsp->n_clients);
     fflush(stdout);
 
+    lsp_crash_checkpoint("state_advance_propose");
+
     /* Step 4: Collect CLIENT_PATH_NONCES from each client.
        Each client sends pubnonces for the affected nodes they're a signer on.
        Wire format is per-leaf array (66 bytes each) indexed by affected[] order.
@@ -2383,6 +2394,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             }
         }
     }
+
+    lsp_crash_checkpoint("state_advance_nonced");
 
     /* Step 5: ATOMIC -- gen LSP nonces, set+finalize, create_partial_sig per leaf.
        Uses musig_nonce_pool_generate (same as legacy line 2790) but ONLY now,
@@ -2620,6 +2633,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
 
+    lsp_crash_checkpoint("state_advance_signed");
+
     /* Step 9b (poison): complete the poison session for each leaf that still
        has poison active -> attaches node->poison_signed_tx. */
     for (size_t k = 0; k < n_affected; k++) {
@@ -2713,6 +2728,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 factory_session_reset_poison(f, affected[k]);
         }
     }
+
+    lsp_crash_checkpoint("state_advance_finalize_partial");
 
     /* Step 11.5 (F1): persist new-epoch chain[0] for every PS leaf + sub-factory
        node, mirroring the legacy lsp_run_state_advance.  Only fires on
@@ -3548,6 +3565,8 @@ static int lsp_subfactory_chain_advance_stateless_multi(
            n_clients_in_sub, sub_node_i, n_inputs);
     fflush(stdout);
 
+    lsp_crash_checkpoint("subfactory_multi_propose");
+
     /* all_pn_per_input[(signer_slot * n_inputs + input_idx) * 66] -- same
        layout as the legacy multi-input path so the matrix forwarded to
        clients in LSP_RESPONSE is indexed identically on both sides. */
@@ -3607,6 +3626,8 @@ static int lsp_subfactory_chain_advance_stateless_multi(
             memcpy(all_poison_pn[client_slot], client_poison_pn, 66);
         free(client_pn_buf);
     }
+
+    lsp_crash_checkpoint("subfactory_multi_nonced");
 
     /* Step 5 (THE CRITICAL ATOMIC BLOCK): per input -- gen LSP secnonce, set
        all signers' input-i nonces, finalize input-i, create LSP psig (zeros
@@ -3897,6 +3918,8 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         }
     }
 
+    lsp_crash_checkpoint("subfactory_multi_signed");
+
     /* Step 8: aggregate + assemble the k+1-witness signed TX + complete poison. */
     if (!factory_session_assemble_signed_tx_multi(f, sub_node_i)) {
         fprintf(stderr, "LSP-stateless MULTI: assemble_signed_tx_multi failed\n");
@@ -3917,6 +3940,8 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
     }
     cJSON_Delete(done);
+
+    lsp_crash_checkpoint("subfactory_multi_finalize_partial");
 
     /* Step 10 (persist): record the chain row, mirroring the single-input
        path's Step 10.  Without this an LSP restart loses the multi-input
@@ -4141,6 +4166,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
            n_clients_in_sub, sub_node_i);
     fflush(stdout);
 
+    lsp_crash_checkpoint("subfactory_propose");
+
     /* Step 4: collect CLIENT_PUBNONCES from each client (state + poison). */
     unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
     unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
@@ -4181,6 +4208,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         if (poison_prepared)
             memcpy(all_poison_pubnonces[client_slot], client_poison_pn, 66);
     }
+
+    lsp_crash_checkpoint("subfactory_nonced");
 
     /* Step 5 (THE CRITICAL ATOMIC BLOCK): gen LSP secnonce, set all nonces,
        finalize_node, create_partial_sig (zeros secnonce), serialize. */
@@ -4397,6 +4426,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
 
+    lsp_crash_checkpoint("subfactory_signed");
+
     /* Step 8: aggregate + complete_node (attaches witness to signed_tx) + poison. */
     if (!factory_session_complete_node(f, sub_node_i)) {
         fprintf(stderr, "LSP-stateless subfactory: complete_node failed\n");
@@ -4418,6 +4449,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
     }
     cJSON_Delete(done);
+
+    lsp_crash_checkpoint("subfactory_finalize_partial");
 
     /* Step 10 (persist): save the sub-factory chain entry to ps_subfactory_chains,
        mirroring the legacy path (Step 10 below).  Without this the stateless
