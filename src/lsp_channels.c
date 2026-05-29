@@ -4954,10 +4954,12 @@ static int lsp_subfactory_chain_advance_stateless_multi(
     }
 
     for (size_t i = 0; i < n_inputs; i++) {
+        /* SF-MULTI-KEYAGG (#283): nonce against per-input keyagg cache
+           (channel inputs: 2-of-2; sales-stock: N-of-N). */
         secp256k1_musig_pubnonce lsp_pubnonce_i;
         if (!musig_generate_nonce(lsp->ctx, &lsp_secnonces[i], &lsp_pubnonce_i,
                                    lsp_seckey, &lsp->lsp_pubkey,
-                                   &sub->keyagg.cache)) {
+                                   &sub->input_keyaggs[i].cache)) {
             fprintf(stderr, "LSP-stateless MULTI: nonce gen input %zu failed\n", i);
             memset(lsp_seckey, 0, 32);
             free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
@@ -4968,15 +4970,24 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         memcpy(all_pn_per_input + ((size_t)lsp_slot * n_inputs + i) * 66,
                lsp_pn_ser[i], 66);
 
-        /* Set every signer's nonce for THIS input. */
+        /* SF-MULTI-KEYAGG (#283): set nonce for every signer that ACTUALLY
+           signs input i, mapping node-level slot s -> participant ->
+           per-input slot.  Skip slots where the participant doesn't sign
+           this input — wire matrix carries zero placeholders there. */
         for (size_t s = 0; s < sub->n_signers; s++) {
+            uint32_t participant = sub->signer_indices[s];
+            int per_input_slot = factory_session_get_input_signer_slot(
+                f, sub_node_i, i, participant);
+            if (per_input_slot < 0) continue;
             secp256k1_musig_pubnonce pn;
             if (!musig_pubnonce_parse(lsp->ctx, &pn,
                     all_pn_per_input + (s * n_inputs + i) * 66) ||
-                !factory_session_set_nonce_input(f, sub_node_i, i, s, &pn)) {
+                !factory_session_set_nonce_input(f, sub_node_i, i,
+                                                  (size_t)per_input_slot, &pn)) {
                 fprintf(stderr,
-                        "LSP-stateless MULTI: set_nonce_input(signer=%zu input=%zu) failed\n",
-                        s, i);
+                        "LSP-stateless MULTI: set_nonce_input(participant=%u "
+                        "input=%zu per_input_slot=%d) failed\n",
+                        participant, i, per_input_slot);
                 memset(lsp_seckey, 0, 32);
                 free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
                 free(all_pn_per_input);
@@ -4992,6 +5003,18 @@ static int lsp_subfactory_chain_advance_stateless_multi(
             return 0;
         }
 
+        /* SF-MULTI-KEYAGG (#283): LSP's per-input slot for this input. */
+        int lsp_slot_i = factory_session_get_input_signer_slot(
+            f, sub_node_i, i, 0);
+        if (lsp_slot_i < 0) {
+            fprintf(stderr,
+                    "LSP-stateless MULTI: LSP not in signer set of input %zu "
+                    "(impossible)\n", i);
+            memset(lsp_seckey, 0, 32);
+            free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
+            free(all_pn_per_input);
+            return 0;
+        }
         secp256k1_musig_partial_sig lsp_psig_i;
         if (!musig_create_partial_sig(lsp->ctx, &lsp_psig_i,
                 &lsp_secnonces[i], &lsp_kp,
@@ -5005,8 +5028,9 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         /* lsp_secnonces[i] zeroed by musig_create_partial_sig.  INVARIANT:
            no LSP secnonce for input i is held across the recv that follows. */
         if (!factory_session_set_partial_sig_input(f, sub_node_i, i,
-                                                    (size_t)lsp_slot, &lsp_psig_i)) {
-            fprintf(stderr, "LSP-stateless MULTI: set_partial_sig_input %zu failed\n", i);
+                                                    (size_t)lsp_slot_i, &lsp_psig_i)) {
+            fprintf(stderr, "LSP-stateless MULTI: set_partial_sig_input %zu "
+                    "(lsp_slot=%d) failed\n", i, lsp_slot_i);
             memset(lsp_seckey, 0, 32);
             free(lsp_secnonces); free(lsp_pn_ser); free(lsp_psig_ser);
             free(all_pn_per_input);
@@ -5143,20 +5167,32 @@ static int lsp_subfactory_chain_advance_stateless_multi(
             factory_session_reset_poison(f, sub_node_i);
             poison_prepared = 0;
         }
+        /* SF-MULTI-KEYAGG (#283): client_slot is the NODE-level slot used only
+           for the poison side-channel (N-of-N).  Per-input psig assignment
+           remaps via factory_session_get_input_signer_slot and skips inputs
+           the client does not sign. */
         int client_slot = factory_find_signer_slot(f, sub_node_i, sub_clients[ci]);
         if (client_slot < 0) {
             free(client_psig_buf);
             factory_session_reset_poison(f, sub_node_i); return 0;
         }
         for (size_t i = 0; i < n_inputs; i++) {
+            int per_input_slot = factory_session_get_input_signer_slot(
+                f, sub_node_i, i, sub_clients[ci]);
+            if (per_input_slot < 0) {
+                /* Client does not sign this input — wire carries a 32-byte
+                   zero psig placeholder (or, pre-Phase-3, garbage). */
+                continue;
+            }
             secp256k1_musig_partial_sig client_psig_i;
             if (!musig_partial_sig_parse(lsp->ctx, &client_psig_i,
                                           client_psig_buf + i * 32) ||
                 !factory_session_set_partial_sig_input(f, sub_node_i, i,
-                                                        (size_t)client_slot,
+                                                        (size_t)per_input_slot,
                                                         &client_psig_i)) {
-                fprintf(stderr, "LSP-stateless MULTI: set client psig (client %u input %zu) failed\n",
-                        sub_clients[ci], i);
+                fprintf(stderr, "LSP-stateless MULTI: set client psig "
+                        "(client %u input %zu per_input_slot=%d) failed\n",
+                        sub_clients[ci], i, per_input_slot);
                 free(client_psig_buf);
                 factory_session_reset_poison(f, sub_node_i);
                 return 0;
@@ -5963,9 +5999,13 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         for (size_t i = 0; i < n_inputs; i++) {
+            /* SF-MULTI-KEYAGG (#283): generate LSP nonce against the per-input
+               keyagg cache.  Channel inputs are 2-of-2 {client_i, LSP};
+               sales-stock input is N-of-N — both keyagg caches differ from
+               sub->keyagg (the node-level N-of-N).  LSP signs every input. */
             if (!musig_generate_nonce(lsp->ctx, &lsp_secnonces[i], &lsp_pubnonces[i],
                                        lsp_seckey, &lsp->lsp_pubkey,
-                                       &sub->keyagg.cache)) {
+                                       &sub->input_keyaggs[i].cache)) {
                 fprintf(stderr, "LSP subfactory advance (multi): "
                         "nonce gen input %zu failed\n", i);
                 free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
@@ -6102,17 +6142,36 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 memcpy(all_poison_pn[client_slot], client_poison_pn, 66);
         }
 
-        /* --- Multi-input Step 6: Set nonces on every input session, broadcast ALL_NONCES. --- */
+        /* --- Multi-input Step 6: Set nonces on every input session, broadcast ALL_NONCES. ---
+           SF-MULTI-KEYAGG (#283): set_nonce_input's signer_slot is now an index
+           into the PER-INPUT signer set (input_signer_indices[input_idx][]),
+           not the node-level set.  Channel inputs are 2-of-2 {client_i, LSP};
+           sales-stock input is N-of-N.  For each (node-level slot s, input i):
+             - map s -> participant_idx = sub->signer_indices[s]
+             - look up per-input slot via factory_session_get_input_signer_slot
+             - if participant doesn't sign this input (slot < 0), skip — the
+               wire matrix carries a zero placeholder we must NOT install.
+           The wire ALL_NONCES matrix still carries [node-level s][input i] so
+           clients can index it identically (no wire change). */
         for (size_t s = 0; s < sub->n_signers; s++) {
+            uint32_t participant = sub->signer_indices[s];
             for (size_t i = 0; i < n_inputs; i++) {
+                int per_input_slot = factory_session_get_input_signer_slot(
+                    f, (size_t)sub_node_i, i, participant);
+                if (per_input_slot < 0) {
+                    /* Signer at node-level slot s does NOT sign input i.
+                       Skip — matrix slot holds a zero pubnonce placeholder. */
+                    continue;
+                }
                 secp256k1_musig_pubnonce pn;
                 if (!musig_pubnonce_parse(lsp->ctx, &pn,
                         all_pn_per_input + (s * n_inputs + i) * 66) ||
                     !factory_session_set_nonce_input(f, (size_t)sub_node_i,
-                                                     i, s, &pn)) {
+                                                     i, (size_t)per_input_slot, &pn)) {
                     fprintf(stderr, "LSP subfactory advance (multi): "
-                            "set_nonce_input(signer=%zu, input=%zu) failed\n",
-                            s, i);
+                            "set_nonce_input(participant=%u, input=%zu, "
+                            "per_input_slot=%d) failed\n",
+                            participant, i, per_input_slot);
                     free(all_pn_per_input);
                     free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
                     memset(lsp_seckey, 0, 32);
@@ -6187,6 +6246,20 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         for (size_t i = 0; i < n_inputs; i++) {
+            /* SF-MULTI-KEYAGG (#283): resolve LSP's slot within input i's signer
+               set.  LSP (participant 0) signs every input — channel inputs are
+               {client, LSP=slot1}; sales-stock is N-of-N where LSP is whichever
+               slot signer_indices[] places participant 0 in. */
+            int lsp_slot_i = factory_session_get_input_signer_slot(
+                f, (size_t)sub_node_i, i, 0);
+            if (lsp_slot_i < 0) {
+                fprintf(stderr, "LSP subfactory advance (multi): "
+                        "LSP not in signer set of input %zu (impossible)\n", i);
+                free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
+                free(lsp_psig_ser);
+                factory_session_reset_poison(f, (size_t)sub_node_i);
+                return 0;
+            }
             secp256k1_musig_partial_sig lsp_psig_i;
             if (!musig_create_partial_sig(lsp->ctx, &lsp_psig_i,
                     &lsp_secnonces[i], &lsp_kp,
@@ -6199,10 +6272,11 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             if (!factory_session_set_partial_sig_input(f, (size_t)sub_node_i,
-                                                        i, (size_t)lsp_slot,
+                                                        i, (size_t)lsp_slot_i,
                                                         &lsp_psig_i)) {
                 fprintf(stderr, "LSP subfactory advance (multi): "
-                        "set_partial_sig_input(input=%zu) failed\n", i);
+                        "set_partial_sig_input(input=%zu, lsp_slot=%d) failed\n",
+                        i, lsp_slot_i);
                 free(lsp_secnonces); free(lsp_pubnonces); free(lsp_pn_ser);
                 free(lsp_psig_ser);
                 factory_session_reset_poison(f, (size_t)sub_node_i);
@@ -6272,6 +6346,12 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 factory_session_reset_poison(f, (size_t)sub_node_i);
                 return 0;
             }
+            /* SF-MULTI-KEYAGG (#283): client_slot is the NODE-level slot used
+               for poison only (poison is single-input N-of-N).  Per-input psig
+               assignment goes through factory_session_get_input_signer_slot so
+               we skip inputs the client does not sign (channel inputs are
+               2-of-2 LSP+client_j; client_i only signs its own channel + sales
+               stock). */
             int client_slot = factory_find_signer_slot(f, (size_t)sub_node_i,
                                                        sub_clients[ci]);
             if (client_slot < 0) {
@@ -6280,15 +6360,23 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             for (size_t i = 0; i < n_inputs; i++) {
+                int per_input_slot = factory_session_get_input_signer_slot(
+                    f, (size_t)sub_node_i, i, sub_clients[ci]);
+                if (per_input_slot < 0) {
+                    /* Client does not sign this input.  Wire carries a 32-byte
+                       zero psig placeholder (or, pre-Phase-3, garbage) — skip
+                       silently. */
+                    continue;
+                }
                 secp256k1_musig_partial_sig client_psig_i;
                 if (!musig_partial_sig_parse(lsp->ctx, &client_psig_i,
                                               client_psigs[i]) ||
                     !factory_session_set_partial_sig_input(f, (size_t)sub_node_i,
-                                                            i, (size_t)client_slot,
+                                                            i, (size_t)per_input_slot,
                                                             &client_psig_i)) {
                     fprintf(stderr, "LSP subfactory advance (multi): client %u "
-                            "psig parse/set input=%zu failed\n",
-                            sub_clients[ci], i);
+                            "psig parse/set input=%zu (per_input_slot=%d) failed\n",
+                            sub_clients[ci], i, per_input_slot);
                     free(lsp_psig_ser);
                     factory_session_reset_poison(f, (size_t)sub_node_i);
                     return 0;
