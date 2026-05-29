@@ -369,9 +369,15 @@ run_scenario() {
             fi
             ;;
         signed)
-            # At least one phase = SIGNED(3) by the time we kill.
-            if [ "$signed" -lt 1 ]; then
-                pass=0; reason="${reason:+$reason; }phase=SIGNED=$signed want >= 1"
+            # The 'signed' checkpoint fires AFTER all psigs are received but
+            # BEFORE the per-participant phase update to SIGNED is persisted
+            # (that update lives between the 'signed' and 'finalize_partial'
+            # callsites).  So at abort time we expect all participants at
+            # phase >= SENT, with EITHER signed=0 (kill before persist) or
+            # signed=CLIENTS (kill after persist).  The race-tolerant
+            # assertion is just that state did not advance to FINALIZED.
+            if [ "$sent" != "$CLIENTS" ]; then
+                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $CLIENTS"
             fi
             ;;
         finalize_partial)
