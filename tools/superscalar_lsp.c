@@ -774,9 +774,17 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         if (is_regtest) {
             regtest_mine_blocks(rt, (int)required_depth, mine_addr);
         } else {
+            /* SF-CSV-WAIT (#247): chain-aware polling.  testnet4/signet
+               block times are ~30 min; polling every 10s wasted ~180 RPC
+               calls per block.  Poll every 60s instead, and emit a progress
+               line only when the height has actually changed since the
+               last log (so the operator log is not a wall of identical
+               lines).  Total RPC traffic drops ~6x. */
+            const int POLL_INTERVAL_SECS = 60;
             int start_height = regtest_get_block_height(rt);
             int target_height = start_height + (int)required_depth;
             int waited = 0;
+            int last_logged_height = -1;
             while (regtest_get_block_height(rt) < target_height) {
                 if (waited >= confirm_timeout) {
                     fprintf(stderr, "force-close: %s BIP68 wait "
@@ -786,14 +794,17 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
                     free(tx_hex);
                     return 0;
                 }
-                sleep(10);
-                waited += 10;
+                sleep(POLL_INTERVAL_SECS);
+                waited += POLL_INTERVAL_SECS;
                 int cur_h = regtest_get_block_height(rt);
-                int blocks_left = target_height - cur_h;
-                int em = blocks_left * 10;
-                printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
-                       cur_h, target_height, waited, em / 60, em % 60);
-                fflush(stdout);
+                if (cur_h != last_logged_height) {
+                    int blocks_left = target_height - cur_h;
+                    int em = blocks_left * 10;
+                    printf("    height: %d / %d (%ds elapsed, ~%dh%02dm remaining)\n",
+                           cur_h, target_height, waited, em / 60, em % 60);
+                    fflush(stdout);
+                    last_logged_height = cur_h;
+                }
             }
         }
     }
