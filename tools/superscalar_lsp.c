@@ -324,6 +324,7 @@ static void usage(const char *prog) {
         "  --cheat-realloc      With --test-realloc: after realloc completes, broadcast the now-revoked pre-realloc leaf TX and verify watchtower defense fires (penalty TX broadcast, breach_detections row). Tests adversarial path against realloc revocation. CL2.\n"
         "  --cheat-lstock-buy   With --test-buy-liquidity: after the L-stock buy ceremony completes, broadcast the now-revoked pre-buy leaf TX and verify watchtower defense fires (penalty TX broadcast). Tests adversarial path against the L-stock buy-liquidity revocation. SF-CHEAT-LSTOCK-BUY (#255).\n"
         "  --cheat-backup-restore[=OFFSET]  #256 SF-CHEAT-BACKUP-RESTORE. When the LSP responds to a recovering client's channel_reestablish (SCB restore path), inject a stale per_commitment_point for commitment_number-OFFSET (default 1) instead of the current cn. Recovering client induced to broadcast the revoked state; watchtower must catch + penalize. Set on the LSP only.\n"
+        "  --cheat-jit          With --test-jit: after JIT channel ceremony completes, broadcast the now-revoked pre-JIT factory leaf TX (the sales-stock allocation that funded the JIT slice) and verify watchtower defense fires (penalty TX broadcast). Adversarial test against JIT channel creation (#254). CL2-style.\n"
         "  --cheat-dust-race    SF-CHEAT-DUST-RACE (#257): bypass the dust-race defense in htlc_commit_recv_update_fee. The LSP accepts peer feerate bumps that strand counterparty HTLC sweeps below the 546-sat dust limit, demonstrating the absorbed-HTLC theft path. Markers: LSP-CHEAT-DUST. Test: tools/test_regtest_cheat_dust_race.sh.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
@@ -1343,6 +1344,7 @@ int main(int argc, char *argv[]) {
                                   -Werror to keep the build green until then. */
     (void)cheat_leaf_side;
     int cheat_realloc = 0;
+    int cheat_jit = 0;          /* #254 SF-CHEAT-JIT: post-JIT adversarial stale-leaf broadcast */
     int cheat_lstock_buy = 0;           /* SF-CHEAT-LSTOCK-BUY (#255): when set, after
                                   --test-buy-liquidity completes the honest L-stock
                                   buy ceremony, broadcast the pre-buy leaf signed_tx
@@ -1870,6 +1872,24 @@ int main(int argc, char *argv[]) {
             fprintf(stderr,
                     "LSP: --cheat-backup-restore armed (SS_CHEAT_SCB_OFFSET=%s)\n",
                     getenv("SS_CHEAT_SCB_OFFSET"));
+        }
+        else if (strcmp(argv[i], "--cheat-jit") == 0) {
+            /* #254 SF-CHEAT-JIT: adversarial test against JIT channel
+               creation.  After the LSP completes the honest JIT ceremony,
+               broadcast the now-revoked pre-JIT factory leaf TX (which
+               held the sales-stock allocation that funded the JIT slice).
+               Watchtower must detect via the registered leaf state and
+               broadcast a penalty TX.  Implies --test-jit.
+               Mirrors --cheat-realloc (#249) / --cheat-daemon-rollover (#250)
+               in keeping adversarial logic in tools/_tests.inc only. */
+            cheat_jit = 1;
+            test_jit = 1;
+            setenv("SS_CHEAT_JIT", "1", 1);
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                setenv("SS_CHEAT_JIT_PHASE", argv[++i], 1);
+            } else {
+                setenv("SS_CHEAT_JIT_PHASE", "stale-broadcast", 1);
+            }
         }
         else if (strcmp(argv[i], "--cheat-dust-race") == 0) {
             /* #257 SF-CHEAT-DUST-RACE: bypass the dust-race defense in
