@@ -322,6 +322,7 @@ static void usage(const char *prog) {
         "  --cheat-state K      With --cheat-leaf and --advance-count N: snapshot+broadcast chain[K] (default 0 = oldest stale).  K in [0,N-1].  K>0 exercises the watchtower's middle-state revocation walk — boundary-only K=0/K=N-1 tests miss this path. CL3-K.\n"
         "  --musig-stateless    [PHASE 1a/EXPERIMENTAL] Opt into BIP-327 stateless-signer wire flow per MUSIG_NONCE_REDESIGN_MEMO. Currently registers the flag; full reversed-flow behavior lands in Phase 1b. Default off.\n"
         "  --cheat-realloc      With --test-realloc: after realloc completes, broadcast the now-revoked pre-realloc leaf TX and verify watchtower defense fires (penalty TX broadcast, breach_detections row). Tests adversarial path against realloc revocation. CL2.\n"
+        "  --cheat-dust-race    SF-CHEAT-DUST-RACE (#257): bypass the dust-race defense in htlc_commit_recv_update_fee. The LSP accepts peer feerate bumps that strand counterparty HTLC sweeps below the 546-sat dust limit, demonstrating the absorbed-HTLC theft path. Markers: LSP-CHEAT-DUST. Test: tools/test_regtest_cheat_dust_race.sh.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
@@ -1829,6 +1830,18 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--cheat-realloc") == 0) {
             /* CL2: enable post-finalize cheat broadcast against --test-realloc. */
             cheat_realloc = 1;
+        }
+        else if (strcmp(argv[i], "--cheat-dust-race") == 0) {
+            /* #257 SF-CHEAT-DUST-RACE: bypass the dust-race defense in
+               htlc_commit_recv_update_fee.  An accepted peer update_fee that
+               strands a counterparty HTLC sweep below the 546-sat dust limit
+               normally returns 0 (REJECT).  With this flag, the LSP accepts
+               the bump and emits LSP-CHEAT-DUST markers — at force-close the
+               affected HTLC is absorbed into commit fees instead of being
+               claimable by the counterparty.  Test:
+                 tools/test_regtest_cheat_dust_race.sh */
+            setenv("SS_CHEAT_DUST_RACE", "1", 1);
+            fprintf(stderr, "LSP-CHEAT-DUST: armed (dust-race defense bypass enabled)\n");
         }
         else if (strcmp(argv[i], "--test-dual-factory") == 0)
             test_dual_factory = 1;
