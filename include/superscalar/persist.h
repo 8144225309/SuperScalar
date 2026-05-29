@@ -353,23 +353,6 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
 /* Delete an HTLC entry (after settle/fail). */
 int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id);
 
-/* --- Nonce pool persistence --- */
-
-/* Save serialized nonce pool state. */
-int persist_save_nonce_pool(persist_t *p, uint32_t channel_id,
-                              const char *side,
-                              const unsigned char *pool_data,
-                              size_t pool_data_len,
-                              size_t next_index);
-
-/* Load nonce pool state. Returns data in caller-allocated buffer. */
-int persist_load_nonce_pool(persist_t *p, uint32_t channel_id,
-                              const char *side,
-                              unsigned char *pool_data_out,
-                              size_t max_len,
-                              size_t *data_len_out,
-                              size_t *next_index_out);
-
 /* --- Old commitment tracking (watchtower) --- */
 
 /* Save an old commitment for watchtower monitoring. */

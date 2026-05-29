@@ -927,33 +927,6 @@ int test_persist_factory_round_trip(void) {
     return 1;
 }
 
-/* ---- Test 6: Nonce pool save/load round-trip ---- */
-
-int test_persist_nonce_pool_round_trip(void) {
-    persist_t db;
-    TEST_ASSERT(persist_open(&db, NULL), "open");
-
-    /* Save some fake pool data */
-    unsigned char pool_data[128];
-    memset(pool_data, 0x42, sizeof(pool_data));
-
-    TEST_ASSERT(persist_save_nonce_pool(&db, 0, "local", pool_data, 128, 5),
-                "save nonce pool");
-
-    /* Load it back */
-    unsigned char loaded[256];
-    size_t data_len, next_idx;
-    TEST_ASSERT(persist_load_nonce_pool(&db, 0, "local", loaded, 256,
-                                          &data_len, &next_idx),
-                "load nonce pool");
-    TEST_ASSERT_EQ(data_len, 128, "data_len");
-    TEST_ASSERT_EQ(next_idx, 5, "next_index");
-    TEST_ASSERT(memcmp(loaded, pool_data, 128) == 0, "pool data matches");
-
-    persist_close(&db);
-    return 1;
-}
-
 /* ---- Test 7: Multiple channels in same database ---- */
 
 int test_persist_multi_channel(void) {

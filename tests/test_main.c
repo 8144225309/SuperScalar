@@ -1219,7 +1219,6 @@ extern int test_persist_watchtower_hydrate_round_trip(void);
 extern int test_persist_htlc_round_trip(void);
 extern int test_persist_htlc_delete(void);
 extern int test_persist_factory_round_trip(void);
-extern int test_persist_nonce_pool_round_trip(void);
 extern int test_persist_multi_channel(void);
 
 /* Phase 14: CLN Bridge */
@@ -3078,7 +3077,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_htlc_round_trip);
     RUN_TEST(test_persist_htlc_delete);
     RUN_TEST(test_persist_factory_round_trip);
-    RUN_TEST(test_persist_nonce_pool_round_trip);
     RUN_TEST(test_persist_multi_channel);
 
     printf("\n=== CLN Bridge (Phase 14) ===\n");
