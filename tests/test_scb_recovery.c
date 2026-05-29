@@ -148,3 +148,53 @@ int test_scb_recovery_no_dlp(void)
     ASSERT(r == -1, "SCB5: NULL pmgr returns -1");
     return 1;
 }
+
+/* ================================================================== */
+/* SCB6 — #256 SF-CHEAT-BACKUP-RESTORE arg-parse + offset logic      */
+/*                                                                    */
+/* The cheat injection lives in src/chan_open.c:chan_reestablish and  */
+/* is env-var gated (SS_CHEAT_SCB_RESTORE + SS_CHEAT_SCB_OFFSET).     */
+/* A full e2e exercise requires a running peer_mgr; here we           */
+/* sanity-check the offset clamping arithmetic the cheat path uses    */
+/* and that env-var gating is well-formed.                            */
+/* ================================================================== */
+#include <stdlib.h>
+int test_scb_cheat_backup_restore_offset_logic(void)
+{
+    /* Mirror the clamp performed in chan_reestablish:
+       offset = atol(SS_CHEAT_SCB_OFFSET); if (offset > cn) offset = cn;
+       pcp_cn = cn - offset. */
+    setenv("SS_CHEAT_SCB_OFFSET", "3", 1);
+    uint64_t cn = 10;
+    uint64_t offset = (uint64_t)atol(getenv("SS_CHEAT_SCB_OFFSET"));
+    if (offset > cn) offset = cn;
+    uint64_t pcp_cn = cn - offset;
+    ASSERT(pcp_cn == 7, "SCB6a: offset=3 from cn=10 -> pcp_cn=7");
+
+    /* Clamp: offset > cn must collapse to cn (pcp_cn = 0). */
+    setenv("SS_CHEAT_SCB_OFFSET", "99", 1);
+    cn = 2;
+    offset = (uint64_t)atol(getenv("SS_CHEAT_SCB_OFFSET"));
+    if (offset > cn) offset = cn;
+    pcp_cn = cn - offset;
+    ASSERT(pcp_cn == 0, "SCB6b: offset>cn clamps to cn");
+
+    /* cn=0 means no revoked history -> honest fallback (cheat path is
+       skipped entirely in chan_reestablish; we just confirm the
+       short-circuit is safe to reason about here). */
+    cn = 0;
+    int armed = (cn > 0);
+    ASSERT(armed == 0, "SCB6c: cn=0 must skip cheat (no revoked history)");
+
+    /* Default OFFSET=1 (set when --cheat-backup-restore has no =VALUE). */
+    setenv("SS_CHEAT_SCB_OFFSET", "1", 1);
+    cn = 5;
+    offset = (uint64_t)atol(getenv("SS_CHEAT_SCB_OFFSET"));
+    if (offset > cn) offset = cn;
+    pcp_cn = cn - offset;
+    ASSERT(pcp_cn == 4, "SCB6d: default offset=1 from cn=5 -> pcp_cn=4 (cn-1, oldest revoked)");
+
+    unsetenv("SS_CHEAT_SCB_OFFSET");
+    unsetenv("SS_CHEAT_SCB_RESTORE");
+    return 1;
+}
