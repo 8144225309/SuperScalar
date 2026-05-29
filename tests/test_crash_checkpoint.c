@@ -85,8 +85,10 @@ int test_crash_runtime_target_aborts(void) {
     }
     if (pid == 0) {
         /* Child: install target, trigger checkpoint, should abort. */
-        /* Silence the child's abort() stderr noise. */
-        freopen("/dev/null", "w", stderr);
+        /* Silence the child's abort() stderr noise.  Cast: cppcheck flags
+           freopen() retval unused; we genuinely don't care if stderr
+           silencing fails — the child only runs to abort. */
+        (void)!freopen("/dev/null", "w", stderr);
         lsp_crash_set_target("crash_unit_test_target");
         lsp_crash_checkpoint("crash_unit_test_target");
         _exit(0);  /* unreachable on success */
