@@ -7823,6 +7823,16 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
                li, node_idx, leaf->ps_chain_len - 1,
                poison_data ? "yes" : "no", n_leaf_ch);
 
+        /* SF-WT-TRUSTLESS Phase 1b.5c (#248): intentionally NO parallel
+         * wt_db register here.  wt_db is a durable on-disk store — its
+         * rows survive process restart, so there's nothing to
+         * "re-register" the way the in-memory watchtower needs.  If a
+         * future deployment needs to rebuild wt_db from lsp.db (e.g.
+         * wt_db file lost/corrupt), a separate one-shot migration tool
+         * `persist_v36_derive_wt_from_lsp(lsp_db, wt_db)` (see
+         * docs/watchtower-trustless-schema.md §Migration) handles that
+         * — not the restart path. */
+
         (void)pdb; /* persist_load_subfactory_chain uses sales-stock /
                       channel amounts directly from the in-memory
                       sub-factory state (already restored by
