@@ -1803,6 +1803,45 @@
                     printf("  populated %zu keypairs for burn-TX signing\n", n_total);
                 }
 
+                /* CL4-ROLLOVER (#250): snapshot every leaf's OLD signed_tx
+                   BEFORE the rollover ticks run.  After lsp_factory_tick_root
+                   completes, every leaf's signed_tx points at the NEW epoch
+                   chain[0] — so we must capture pre-rollover bytes here.
+                   Mirrored on the CL2 cheat-realloc precedent
+                   (tools/superscalar_lsp_post_daemon_tests.inc:1066). */
+                tx_buf_t cl4r_snap[FACTORY_MAX_LEAVES];
+                unsigned char cl4r_snap_txid[FACTORY_MAX_LEAVES][32];
+                int cl4r_cheat_enabled = (getenv("SS_CHEAT_ROLLOVER") != NULL);
+                for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++) {
+                    tx_buf_init(&cl4r_snap[li], 0);
+                    memset(cl4r_snap_txid[li], 0, 32);
+                }
+                if (cl4r_cheat_enabled) {
+                    for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                        size_t ni = lsp_p->factory.leaf_node_indices[li];
+                        factory_node_t *ln = &lsp_p->factory.nodes[ni];
+                        if (!ln->is_signed || ln->signed_tx.len == 0) continue;
+                        tx_buf_init(&cl4r_snap[li], ln->signed_tx.len);
+                        memcpy(cl4r_snap[li].data, ln->signed_tx.data,
+                               ln->signed_tx.len);
+                        cl4r_snap[li].len = ln->signed_tx.len;
+                        memcpy(cl4r_snap_txid[li], ln->txid, 32);
+                    }
+                    fprintf(stderr,
+                            "CL4-ROLLOVER: snapshotted %d pre-rollover leaf tx "
+                            "(leaf0 len=%zu first8=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+                            lsp_p->factory.n_leaf_nodes,
+                            cl4r_snap[0].len,
+                            cl4r_snap[0].len > 0 ? cl4r_snap[0].data[0] : 0,
+                            cl4r_snap[0].len > 1 ? cl4r_snap[0].data[1] : 0,
+                            cl4r_snap[0].len > 2 ? cl4r_snap[0].data[2] : 0,
+                            cl4r_snap[0].len > 3 ? cl4r_snap[0].data[3] : 0,
+                            cl4r_snap[0].len > 4 ? cl4r_snap[0].data[4] : 0,
+                            cl4r_snap[0].len > 5 ? cl4r_snap[0].data[5] : 0,
+                            cl4r_snap[0].len > 6 ? cl4r_snap[0].data[6] : 0,
+                            cl4r_snap[0].len > 7 ? cl4r_snap[0].data[7] : 0);
+                }
+
                 uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
                 int is_ps_factory = (lsp_p->factory.leaf_arity == FACTORY_ARITY_PS);
                 int n_iters = states_per_layer + 1;
@@ -1863,6 +1902,92 @@
                     } else {
                         printf("  epoch advanced %u → %u (rc=-1 / Tier B ceremony fired)\n",
                                epoch_before, epoch_after);
+
+                        /* CL4-ROLLOVER (#250): mid-window cheat broadcast.
+                           Adversarial LSP behavior moved here from
+                           src/lsp_rotation.c (where the cheat block lived
+                           in lsp_channels_rotate_factory which only runs
+                           under --daemon).  The test wrapper
+                           test_regtest_cheat_daemon_rollover.sh uses --demo
+                           + --test-tier-b-rollover so the rotation function
+                           is never reached.
+
+                           Mirror the CL2 cheat-realloc trick
+                           (tools/superscalar_lsp_post_daemon_tests.inc:1111):
+                           temporarily un-mark every leaf is_signed so
+                           broadcast_factory_tree_any_network lands the
+                           parent path on-chain WITHOUT new-state leaves,
+                           then broadcast the OLD snapshot of leaf 0 as
+                           the breach.  Watchtower detects + responds with
+                           penalty TX. */
+                        if (cl4r_cheat_enabled) {
+                            const char *cl4r_phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
+                            if (cl4r_phase && strcmp(cl4r_phase, "mid-window") == 0 &&
+                                cl4r_snap[0].len > 0) {
+                                int saved_is_signed[FACTORY_MAX_NODES];
+                                memset(saved_is_signed, 0, sizeof(saved_is_signed));
+                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
+                                    saved_is_signed[ni] = lsp_p->factory.nodes[ni].is_signed;
+                                    lsp_p->factory.nodes[ni].is_signed = 0;
+                                }
+                                int parent_ok = broadcast_factory_tree_any_network(
+                                    &lsp_p->factory, &rt, mine_addr, is_regtest,
+                                    confirm_timeout_secs);
+                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
+                                    lsp_p->factory.nodes[ni].is_signed = saved_is_signed[ni];
+                                }
+                                if (parent_ok) {
+                                    char *cheat_hex = malloc((size_t)cl4r_snap[0].len * 2 + 1);
+                                    char cheat_txid_str[65] = {0};
+                                    int sent = 0;
+                                    if (cheat_hex) {
+                                        hex_encode(cl4r_snap[0].data,
+                                                   (size_t)cl4r_snap[0].len,
+                                                   cheat_hex);
+                                        sent = regtest_send_raw_tx(&rt, cheat_hex,
+                                                                   cheat_txid_str);
+                                    }
+                                    fprintf(stderr,
+                                            "CL4-ROLLOVER: mid-window broadcast of "
+                                            "dying factory leaf 0 tx: sent=%d txid=%s "
+                                            "(severity=HIGH)\n",
+                                            sent, cheat_txid_str);
+                                    if (g_db) {
+                                        persist_log_broadcast(g_db,
+                                            sent ? cheat_txid_str : "?",
+                                            "cheat_rollover_stale",
+                                            cheat_hex ? cheat_hex : "",
+                                            sent ? "ok" : "failed");
+                                    }
+                                    if (sent && is_regtest) {
+                                        regtest_mine_blocks(&rt, 1, mine_addr);
+                                        watchtower_t *wt_cl4 = mgr->watchtower;
+                                        if (wt_cl4) {
+                                            int detected = watchtower_check(wt_cl4);
+                                            if (detected > 0) {
+                                                printf("CL4-ROLLOVER: BREACH DETECTED! "
+                                                       "Watchtower broadcast %d penalty tx(s)\n",
+                                                       detected);
+                                                regtest_mine_blocks(&rt, 1, mine_addr);
+                                            } else {
+                                                fprintf(stderr,
+                                                        "CL4-ROLLOVER: watchtower did NOT "
+                                                        "detect revoked broadcast (defense MISS)\n");
+                                            }
+                                        }
+                                    }
+                                    free(cheat_hex);
+                                } else {
+                                    fprintf(stderr,
+                                            "CL4-ROLLOVER: parent tree broadcast failed — "
+                                            "cannot test stale broadcast\n");
+                                }
+                            }
+                            for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++)
+                                tx_buf_free(&cl4r_snap[li]);
+                        }
 
                         /* Verify every non-PS-leaf node is signed for the new epoch.
                            F1: for PS factories, also verify PS leaves are signed
