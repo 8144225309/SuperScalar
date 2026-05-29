@@ -18,6 +18,7 @@
 #include "superscalar/readiness.h"
 #include "superscalar/notify.h"
 #include "superscalar/admin_rpc.h"
+#include "superscalar/crash_inject.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5101,6 +5102,46 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    (size_t)readiness_count_ready(rt),
                    rt->n_clients);
         }
+        return 1;
+    }
+
+    case MSG_FORCE_OUT: {
+        /* SF-CRASH-INJECT-WIRE #245 Half B: install runtime crash target. */
+        if (!getenv("SUPERSCALAR_CRASH_ALLOW")) {
+            fprintf(stderr,
+                "LSP: MSG_FORCE_OUT received but SUPERSCALAR_CRASH_ALLOW not set -- dropping\n");
+            return 1;
+        }
+        char name[64] = {0};
+        if (!wire_parse_force_out(msg->json, name)) {
+            fprintf(stderr, "LSP: MSG_FORCE_OUT parse failed\n");
+            return 1;
+        }
+        lsp_crash_set_target(name);
+        fprintf(stderr,
+            "LSP: MSG_FORCE_OUT runtime crash target installed: \"%s\"\n",
+            name[0] ? name : "<immediate>");
+        fflush(stderr);
+        if (!name[0]) {
+            /* Empty name = abort immediately at this call site. */
+            lsp_crash_checkpoint("");
+        }
+        return 1;
+    }
+
+    case MSG_ROTATE: {
+        /* SF-CRASH-INJECT-WIRE #245 Half B: trigger in-process rotation. */
+        if (!getenv("SUPERSCALAR_CRASH_ALLOW")) {
+            fprintf(stderr,
+                "LSP: MSG_ROTATE received but SUPERSCALAR_CRASH_ALLOW not set -- dropping\n");
+            return 1;
+        }
+        uint8_t mode = 0;
+        wire_parse_rotate(msg->json, &mode);
+        fprintf(stderr, "LSP: MSG_ROTATE triggering rotation (mode=%u)\n",
+                (unsigned)mode);
+        fflush(stderr);
+        (void)lsp_channels_rotate_factory(mgr, lsp);
         return 1;
     }
 

@@ -1640,6 +1640,13 @@ extern int test_distribution_tx_has_anchor(void);
 extern int test_ceremony_retry_excludes_timeout(void);
 extern int test_funding_reserve_check(void);
 
+/* SF-CRASH-INJECT-WIRE #245 Half B: crash injection wire opcodes + runtime target. */
+extern int test_crash_force_out_codec_round_trip(void);
+extern int test_crash_force_out_empty_name(void);
+extern int test_crash_rotate_codec_round_trip(void);
+extern int test_crash_runtime_target_aborts(void);
+extern int test_crash_checkpoint_mismatch_noop(void);
+
 /* Rotation Retry with Backoff tests */
 extern int test_rotation_retry_backoff(void);
 extern int test_rotation_retry_success_resets(void);
@@ -3484,6 +3491,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_distribution_tx_has_anchor);
     RUN_TEST(test_ceremony_retry_excludes_timeout);
     RUN_TEST(test_funding_reserve_check);
+
+    printf("\n=== Crash Injection (#245 Half B) ===\n");
+    RUN_TEST(test_crash_force_out_codec_round_trip);
+    RUN_TEST(test_crash_force_out_empty_name);
+    RUN_TEST(test_crash_rotate_codec_round_trip);
+    RUN_TEST(test_crash_runtime_target_aborts);
+    RUN_TEST(test_crash_checkpoint_mismatch_noop);
 
     printf("\n=== Rotation Retry with Backoff ===\n");
     RUN_TEST(test_rotation_retry_backoff);
