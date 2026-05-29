@@ -36,12 +36,25 @@
 #                        §2 dual-sig-trap guard MUST prevent FINALIZED
 #                        from being persisted in any of the 20 scenarios)
 #
-# Driver flags map each ceremony prefix to the LSP flag that triggers it:
-#   factory_creation_*  -> --demo                          (always runs first)
-#   leaf_advance_*      -> --test-leaf-advance --advance-count 1
-#   state_advance_*     -> --test-ps-advance
-#   subfactory_*        -> --test-subfactory-advance
-#   subfactory_multi_*  -> --test-subfactory-advance-multi
+# Driver flag status (first Half C2 milestone — incremental work):
+#   factory_creation_*  -> --demo                           VALIDATED 4/4 PASS
+#   leaf_advance_*      -> needs --test-wire-leaf-advance   TBD (N=2 setup;
+#                                                                see
+#                          tools/test_regtest_wire_leaf_advance.sh for the
+#                          working harness — port over its 2-client config)
+#   state_advance_*     -> needs investigation              TBD (PS_ADVANCE
+#                          may need explicit chain-advance trigger; see
+#                          tools/test_regtest_tier_b_rollover_ps.sh)
+#   subfactory_*        -> needs investigation              TBD
+#   subfactory_multi_*  -> needs investigation              TBD
+#
+# The framework is generic; landing the other 16 scenarios is mechanical:
+# 1. Identify the test-flag + N (clients) that drives the target ceremony
+#    end-to-end on regtest (look at existing tools/test_regtest_*.sh runners).
+# 2. Add a matrix row with the right driver flags + CLIENTS override.
+# 3. Run ONLY=<checkpoint> to validate; assertions are already in place.
+# 4. The §2 dual-sig-trap guard assertion is universal — it fires across
+#    all 5 ceremony types since they share persist_update_ceremony_state.
 #
 # For non-factory_creation_* scenarios, factory creation completes
 # normally (env var does not match) and then the target ceremony aborts.
