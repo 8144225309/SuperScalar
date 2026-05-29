@@ -1840,6 +1840,93 @@ int watchtower_watch_subfactory_node(watchtower_t *wt,
     return 1;
 }
 
+/* SF-WT-TRUSTLESS Phase 2 (#248): hydrate from wt_db. */
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+
+int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
+    if (!wt || !pwt || !pwt->db) return -1;
+
+    const char *sql =
+        "SELECT w.factory_id, w.parent_txid, r.response_tx_hex "
+        "FROM wt_watches w "
+        "JOIN wt_responses r ON r.response_id = w.response_id "
+        "WHERE w.superseded_at IS NULL "
+        "ORDER BY w.watch_id;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(pwt->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "watchtower_hydrate_from_wt_db: prepare failed: %s\n",
+                sqlite3_errmsg(pwt->db));
+        return -1;
+    }
+
+    int n_loaded = 0;
+    int n_skipped = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        uint32_t factory_id = (uint32_t)sqlite3_column_int(st, 0);
+        const void *parent_txid_blob = sqlite3_column_blob(st, 1);
+        int parent_txid_len = sqlite3_column_bytes(st, 1);
+        const char *response_hex = (const char *)sqlite3_column_text(st, 2);
+        int hex_len = sqlite3_column_bytes(st, 2);
+
+        if (!parent_txid_blob || parent_txid_len != 32) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
+                    "parent_txid len=%d (want 32)\n",
+                    factory_id, parent_txid_len);
+            n_skipped++;
+            continue;
+        }
+        if (!response_hex || hex_len <= 0 || (hex_len % 2) != 0) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
+                    "response_tx_hex len=%d not valid hex\n",
+                    factory_id, hex_len);
+            n_skipped++;
+            continue;
+        }
+
+        size_t resp_len = (size_t)hex_len / 2;
+        unsigned char *resp = malloc(resp_len);
+        if (!resp) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: OOM allocating %zu bytes\n",
+                    resp_len);
+            n_skipped++;
+            continue;
+        }
+        if (hex_decode(response_hex, resp, resp_len) != (int)resp_len) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: hex_decode failed for "
+                    "factory_id=%u\n", factory_id);
+            free(resp);
+            n_skipped++;
+            continue;
+        }
+
+        /* Register via the canonical factory-node watch helper.
+         * Phase 2a: no burn_tx — Phase 2b will widen the wt_db schema +
+         * helper to carry the optional L-stock burn TX alongside the
+         * response_tx. */
+        unsigned char parent_txid[32];
+        memcpy(parent_txid, parent_txid_blob, 32);
+        if (watchtower_watch_factory_node(wt, factory_id, parent_txid,
+                                            resp, resp_len, NULL, 0)) {
+            n_loaded++;
+        } else {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: watch_factory_node failed "
+                    "for factory_id=%u\n", factory_id);
+            n_skipped++;
+        }
+        free(resp);
+    }
+    sqlite3_finalize(st);
+
+    printf("WT-TRUSTLESS: hydrated %d watches from wt_db (%d skipped)\n",
+           n_loaded, n_skipped);
+    return n_loaded;
+}
+
 void watchtower_cleanup(watchtower_t *wt) {
     if (!wt) return;
     for (size_t i = 0; i < wt->n_entries; i++) {
