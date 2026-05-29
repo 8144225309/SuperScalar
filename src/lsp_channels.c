@@ -9,6 +9,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
+#include "superscalar/lsp_wt.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
 #include "superscalar/regtest.h"
@@ -2014,6 +2015,48 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             node->signed_tx.data, node->signed_tx.len,
             poison_data, poison_len,
             leaf_ch_ids, n_leaf_ch);
+
+        /* SF-WT-TRUSTLESS Phase 1b.3 (#248): mirror the same registration
+         * into wt_db when --wt-db is enabled.  The in-memory watchtower
+         * above remains canonical; wt_db is a parallel write that the
+         * Phase 2 WT-side switchover will consume.
+         *
+         * Confidently-populated fields:
+         *   factory_id    = node_idx  (matches in-memory watchtower entry)
+         *   parent_txid32 = old_leaf_txid  (the now-revoked chain[N] txid)
+         *   signed_response_tx = node->signed_tx (the new chain[N+1])
+         *   response_txid32 = node->txid (already the canonical txid of
+         *                                  the signed_tx, set during build)
+         *
+         * Phase 1b.4 will derive the remaining outpoint metadata from
+         * the OLD leaf state (parent_vout/parent_value_sat/parent_spk)
+         * and the canonical csv_delay (currently 0 = match-any-spend).
+         * The WT matches by outpoint primarily but those fields support
+         * fee math + sanity checks in the broadcast path. */
+        if (lsp && lsp->wt_db) {
+            unsigned char parent_spk_placeholder[1] = {0x00};
+            int64_t watch_id = lsp_wt_register_factory_node_watch(
+                lsp->wt_db,
+                (uint32_t)node_idx,
+                old_leaf_txid,
+                /* parent_vout      */ 0,    /* Phase 1b.4: derive from input */
+                /* parent_value_sat */ 0,    /* Phase 1b.4: from old leaf out */
+                parent_spk_placeholder, 1,   /* Phase 1b.4: from old leaf SPK */
+                /* csv_delay        */ 0,    /* Phase 1b.4: from node->nsequence */
+                node->signed_tx.data, node->signed_tx.len,
+                node->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered leaf-advance watch_id=%lld "
+                       "for node %d (Phase 1b.3 partial-fields)\n",
+                       (long long)watch_id, (int)node_idx);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "leaf-advance node %d\n", (int)node_idx);
+            }
+        }
 
         /* Snapshot poison bytes for Step 11 persist before reset frees them. */
         if (poison_data && poison_len > 0) {
