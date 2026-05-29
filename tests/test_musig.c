@@ -880,14 +880,18 @@ int test_musig_stateless_no_secnonce_persisted(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "open in-memory persist");
 
-    /* Confirm the legacy nonce_pools table exists (so we know we're asserting
-       on the real schema, not a typo). */
+        /* MUSIG-PHASE-3 (#273): the nonce_pools table no longer exists.
+       It was dropped along with the legacy persisted nonce-pool paths.
+       This is the strongest possible enforcement of the stateless
+       invariant: there is no table for any future code to write
+       secnonces into.  Assert the table is gone. */
     sqlite3_stmt *stmt;
     const char *check_sql =
         "SELECT name FROM sqlite_master WHERE type='table' AND name='nonce_pools';";
     TEST_ASSERT(sqlite3_prepare_v2(db.db, check_sql, -1, &stmt, NULL) == SQLITE_OK,
                 "prepare schema check");
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "nonce_pools table exists in schema");
+    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_DONE,
+                "nonce_pools table no longer exists in schema (dropped in Phase 3)");
     sqlite3_finalize(stmt);
 
     /* Now perform a full LSP-side stateless cycle: generate secnonce on the
@@ -926,20 +930,7 @@ int test_musig_stateless_no_secnonce_persisted(void) {
     TEST_ASSERT(musig_create_partial_sig(ctx, &psigs[1], &secnonces[1], &kps[1], &session),
                 "sign 1");
 
-    /* Assert: nonce_pools has ZERO rows (no LSP code path wrote here). */
-    const char *count_sql = "SELECT COUNT(*) FROM nonce_pools;";
-    TEST_ASSERT(sqlite3_prepare_v2(db.db, count_sql, -1, &stmt, NULL) == SQLITE_OK,
-                "prepare count");
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "count step");
-    int n_rows = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    if (n_rows != 0) {
-        printf("  FAIL: nonce_pools has %d row(s), stateless invariant requires 0\n",
-               n_rows);
-        secp256k1_context_destroy(ctx);
-        persist_close(&db);
-        return 0;
-    }
+    /* Phase 3 dropped the table -- nothing to count.  Skipped. */
 
     /* And belt-and-braces: secnonces ARE still zero (proves the cycle ran). */
     for (size_t b = 0; b < sizeof secnonces[0]; b++) {

@@ -89,13 +89,6 @@ static const char *SCHEMA_SQL =
     "  signed_resolution_tx_hex BLOB,"
     "  UNIQUE(channel_id, htlc_id)"
     ");"
-    "CREATE TABLE IF NOT EXISTS nonce_pools ("
-    "  channel_id INTEGER NOT NULL,"
-    "  side TEXT NOT NULL,"
-    "  pool_data BLOB,"
-    "  next_index INTEGER DEFAULT 0,"
-    "  PRIMARY KEY (channel_id, side)"
-    ");"
     "CREATE TABLE IF NOT EXISTS old_commitments ("
     "  channel_id INTEGER NOT NULL,"
     "  commit_num INTEGER NOT NULL,"
@@ -2883,74 +2876,7 @@ int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id) {
     return ok;
 }
 
-/* --- Nonce pool --- */
 
-int persist_save_nonce_pool(persist_t *p, uint32_t channel_id,
-                              const char *side,
-                              const unsigned char *pool_data,
-                              size_t pool_data_len,
-                              size_t next_index) {
-    if (!p || !p->db || !side) return 0;
-
-    const char *sql =
-        "INSERT OR REPLACE INTO nonce_pools "
-        "(channel_id, side, pool_data, next_index) VALUES (?, ?, ?, ?);";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-
-    sqlite3_bind_int(stmt, 1, (int)channel_id);
-    sqlite3_bind_text(stmt, 2, side, -1, SQLITE_STATIC);
-    if (pool_data && pool_data_len > 0)
-        sqlite3_bind_blob(stmt, 3, pool_data, (int)pool_data_len, SQLITE_TRANSIENT);
-    else
-        sqlite3_bind_null(stmt, 3);
-    sqlite3_bind_int(stmt, 4, (int)next_index);
-
-    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-int persist_load_nonce_pool(persist_t *p, uint32_t channel_id,
-                              const char *side,
-                              unsigned char *pool_data_out,
-                              size_t max_len,
-                              size_t *data_len_out,
-                              size_t *next_index_out) {
-    if (!p || !p->db || !side) return 0;
-
-    const char *sql =
-        "SELECT pool_data, next_index FROM nonce_pools "
-        "WHERE channel_id = ? AND side = ?;";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-
-    sqlite3_bind_int(stmt, 1, (int)channel_id);
-    sqlite3_bind_text(stmt, 2, side, -1, SQLITE_STATIC);
-
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return 0;
-    }
-
-    const void *blob = sqlite3_column_blob(stmt, 0);
-    int blob_len = sqlite3_column_bytes(stmt, 0);
-    size_t copy_len = (size_t)blob_len < max_len ? (size_t)blob_len : max_len;
-
-    if (pool_data_out && blob && copy_len > 0)
-        memcpy(pool_data_out, blob, copy_len);
-    if (data_len_out)
-        *data_len_out = copy_len;
-    if (next_index_out)
-        *next_index_out = (size_t)sqlite3_column_int(stmt, 1);
-
-    sqlite3_finalize(stmt);
-    return 1;
-}
 
 /* --- Old commitments (watchtower) --- */
 
