@@ -1647,6 +1647,24 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* Step 2: ship PROPOSE with NO nonce -- client goes first. */
+    /* SF-CRASH-INJECT-WIRE #245 Half A: journal this stateless leaf advance
+       as a STATE_UPDATE ceremony.  Salt epoch with leaf_side + chain
+       position so multiple advances per DW epoch do not collide. */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (mgr->persist) {
+        uint64_t epoch_salt = ((uint64_t)f->counter.current_epoch << 16)
+                              | ((uint64_t)leaf_side << 8)
+                              | (uint64_t)(f->nodes[node_idx].ps_chain_len & 0xff);
+        lsp_ceremony_derive_id(lsp->factory.funding_txid,
+                                PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                epoch_salt, cer_id);
+        if (persist_save_ceremony((persist_t *)mgr->persist, cer_id,
+                                   lsp->factory.funding_txid,
+                                   PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                   NULL, 0, f->cltv_timeout))
+            cer_persisted = 1;
+    }
     cJSON *propose = wire_build_leaf_advance_propose(leaf_side, NULL, NULL);
     if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_PROPOSE, propose)) {
         cJSON_Delete(propose);
@@ -1654,6 +1672,14 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
     cJSON_Delete(propose);
+    if (cer_persisted) {
+        unsigned char pk33[33];
+        lsp_ceremony_get_client_pubkey33(lsp, (size_t)leaf_side, pk33);
+        (void)persist_save_participant_phase((persist_t *)mgr->persist, cer_id,
+            pk33, PERSIST_CEREMONY_PHASE_SENT, NULL, NULL, 0, 0);
+    }
+    printf("LSP: LEAF_ADVANCE_PROPOSE sent for leaf %d\n", leaf_side);
+    fflush(stdout);
 
     /* Step 3: wait for client_pubnonce. */
     wire_msg_t cpn_msg;
@@ -2227,6 +2253,19 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
 
     /* Step 3: Send PROPOSE_INTENT to all clients (no nonces). */
+    /* SF-CRASH-INJECT-WIRE #245 Half A: journal Tier B as a ROTATE ceremony. */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (mgr->persist) {
+        lsp_ceremony_derive_id(lsp->factory.funding_txid,
+                                PERSIST_CEREMONY_TYPE_ROTATE,
+                                f->counter.current_epoch, cer_id);
+        if (persist_save_ceremony((persist_t *)mgr->persist, cer_id,
+                                   lsp->factory.funding_txid,
+                                   PERSIST_CEREMONY_TYPE_ROTATE,
+                                   NULL, 0, f->cltv_timeout))
+            cer_persisted = 1;
+    }
     cJSON *propose = wire_build_state_adv_propose_intent(
         (uint32_t)f->counter.current_epoch, (uint32_t)n_affected,
         trigger_leaf_side);
@@ -2239,6 +2278,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
     cJSON_Delete(propose);
+    if (cer_persisted) {
+        for (size_t c = 0; c < lsp->n_clients; c++) {
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, c, pk33);
+            (void)persist_save_participant_phase((persist_t *)mgr->persist, cer_id,
+                pk33, PERSIST_CEREMONY_PHASE_SENT, NULL, NULL, 0, 0);
+        }
+    }
+    printf("LSP: STATE_ADV_PROPOSE_INTENT sent to %zu clients (Tier B)\n", lsp->n_clients);
+    fflush(stdout);
 
     /* Step 4: Collect CLIENT_PATH_NONCES from each client.
        Each client sends pubnonces for the affected nodes they're a signer on.
@@ -3456,6 +3505,23 @@ static int lsp_subfactory_chain_advance_stateless_multi(
     if (lsp_slot < 0) return 0;
 
     /* Step 3: PROPOSE_INTENT (n_inputs, NO LSP nonce). */
+    /* SF-CRASH-INJECT-WIRE #245 Half A: journal sub-factory multi-input advance. */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (mgr->persist) {
+        uint64_t epoch_salt = (((uint64_t)f->counter.current_epoch << 24)
+                              | ((uint64_t)sub_node_i << 8)
+                              | ((uint64_t)sub->ps_chain_len & 0xff))
+                              | 0x80000000ull;  /* multi-input bit */
+        lsp_ceremony_derive_id(lsp->factory.funding_txid,
+                                PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                epoch_salt, cer_id);
+        if (persist_save_ceremony((persist_t *)mgr->persist, cer_id,
+                                   lsp->factory.funding_txid,
+                                   PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                   NULL, 0, f->cltv_timeout))
+            cer_persisted = 1;
+    }
     cJSON *propose = wire_build_subfactory_propose_intent(
         (uint32_t)sub_node_i, (uint32_t)n_inputs,
         leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
@@ -3469,6 +3535,18 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         }
     }
     cJSON_Delete(propose);
+    if (cer_persisted) {
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t pk_idx = (size_t)(sub_clients[ci] - 1);
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, pk_idx, pk33);
+            (void)persist_save_participant_phase((persist_t *)mgr->persist, cer_id,
+                pk33, PERSIST_CEREMONY_PHASE_SENT, NULL, NULL, 0, 0);
+        }
+    }
+    printf("LSP: SUBFACTORY_PROPOSE_INTENT sent to %zu clients (MULTI sub_node %zu n_inputs=%zu)\n",
+           n_clients_in_sub, sub_node_i, n_inputs);
+    fflush(stdout);
 
     /* all_pn_per_input[(signer_slot * n_inputs + input_idx) * 66] -- same
        layout as the legacy multi-input path so the matrix forwarded to
@@ -4023,6 +4101,22 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     }
 
     /* Step 3: send PROPOSE_INTENT to each sub-client (NO LSP nonce). */
+    /* SF-CRASH-INJECT-WIRE #245 Half A: journal sub-factory advance. */
+    unsigned char cer_id[8] = {0};
+    int cer_persisted = 0;
+    if (mgr->persist) {
+        uint64_t epoch_salt = ((uint64_t)f->counter.current_epoch << 24)
+                              | ((uint64_t)sub_node_i << 8)
+                              | ((uint64_t)sub->ps_chain_len & 0xff);
+        lsp_ceremony_derive_id(lsp->factory.funding_txid,
+                                PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                epoch_salt, cer_id);
+        if (persist_save_ceremony((persist_t *)mgr->persist, cer_id,
+                                   lsp->factory.funding_txid,
+                                   PERSIST_CEREMONY_TYPE_STATE_UPDATE,
+                                   NULL, 0, f->cltv_timeout))
+            cer_persisted = 1;
+    }
     cJSON *propose = wire_build_subfactory_propose_intent((uint32_t)sub_node_i, 1, leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
@@ -4034,6 +4128,18 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     }
     cJSON_Delete(propose);
+    if (cer_persisted) {
+        for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+            size_t pk_idx = (size_t)(sub_clients[ci] - 1);
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, pk_idx, pk33);
+            (void)persist_save_participant_phase((persist_t *)mgr->persist, cer_id,
+                pk33, PERSIST_CEREMONY_PHASE_SENT, NULL, NULL, 0, 0);
+        }
+    }
+    printf("LSP: SUBFACTORY_PROPOSE_INTENT sent to %zu clients (sub_node %zu)\n",
+           n_clients_in_sub, sub_node_i);
+    fflush(stdout);
 
     /* Step 4: collect CLIENT_PUBNONCES from each client (state + poison). */
     unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];

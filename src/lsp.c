@@ -459,6 +459,18 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             return 0;
         }
     }
+    /* SF-CRASH-INJECT-WIRE #245 Half A: mark all clients SENT at the PROPOSE
+       send-point so a crash here leaves the participant rows visible. */
+    if (cer_persisted) {
+        for (size_t i = 0; i < lsp->n_clients; i++) {
+            unsigned char pk33[33];
+            lsp_ceremony_get_client_pubkey33(lsp, i, pk33);
+            (void)persist_save_participant_phase(lsp->db, cer_id, pk33,
+                PERSIST_CEREMONY_PHASE_SENT, NULL, NULL, 0, 0);
+        }
+    }
+    printf("LSP: FACTORY_PROPOSE sent to %zu clients\n", lsp->n_clients);
+    fflush(stdout);
     cJSON_Delete(propose);
 
     if (!factory_sessions_init(f)) {

@@ -183,7 +183,7 @@ echo "--- Waiting for MSG_FACTORY_PROPOSE marker (timeout 60s) ---"
 KILL_FIRED=0
 for i in $(seq 1 60); do
     sleep 1
-    if grep -qE "starting factory creation ceremony|factory_propose|FACTORY_PROPOSE" \
+    if grep -qE "FACTORY_PROPOSE sent" \
             "$LSP_LOG" 2>/dev/null; then
         echo "  PROPOSE marker observed after ${i}s — settle 50ms, then SIGKILL"
         sleep 0.05
