@@ -98,32 +98,48 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Phase 2a: --db remains required (we still hydrate channels + breach
-     * detections via lsp.db).  --wt-db is OPTIONAL — when set, ADDITIONALLY
-     * hydrates watches from the trustless wt_db file as a parallel write
-     * verifier.  Phase 2b will make --db optional and switch the primary
-     * read path. */
-    if (!db_path) {
-        fprintf(stderr, "Error: --db PATH required (Phase 2b will make this optional)\n");
+    /* Phase 2b: --db is OPTIONAL.  When only --wt-db is set, the WT runs
+     * in TRUSTLESS MODE — never touches lsp.db, can't read revocation
+     * secrets even if forced to (the channel-hydration block is skipped
+     * entirely).  When --db is set, legacy hydration runs (with optional
+     * --wt-db parallel observation). */
+    if (!db_path && !wt_db_path) {
+        fprintf(stderr, "Error: --db PATH or --wt-db PATH required\n");
         usage(argv[0]);
         return 1;
     }
     if (db_path && !wt_db_path) {
         fprintf(stderr,
                 "INFO: running in legacy mode (--db only). Consider --wt-db PATH "
-                "for the SF-WT-TRUSTLESS Phase 2 parallel hydration.\n");
+                "for the SF-WT-TRUSTLESS Phase 2 trustless mode.\n");
+    }
+    if (!db_path && wt_db_path) {
+        fprintf(stderr,
+                "INFO: TRUSTLESS MODE — running with --wt-db only. lsp.db is "
+                "never opened; revocation secrets are inaccessible to this "
+                "process.\n");
     }
 
     /* CL4.C: open DB read-write so the WT can read WAL-pending rows from a
        concurrently-running LSP (read-only + WAL silently misses uncheckpointed
        data) and append its own response/poison TX broadcasts to broadcast_log
-       for test verification. */
+       for test verification.
+       Phase 2b: --db is optional; in TRUSTLESS MODE we skip opening lsp.db
+       entirely. */
     persist_t db;
-    if (!persist_open(&db, db_path)) {
-        fprintf(stderr, "Error: cannot open database '%s'\n", db_path);
-        return 1;
+    int use_db = 0;
+    if (db_path) {
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "Error: cannot open database '%s'\n", db_path);
+            return 1;
+        }
+        use_db = 1;
     }
 
+    if (inspect_db_mode && !use_db) {
+        fprintf(stderr, "Error: --inspect-db requires --db PATH (reads from lsp.db only)\n");
+        return 1;
+    }
     if (inspect_db_mode) {
         /* CL6: forensic dump mode.  Read-only inspection of key tables.
          * Operators run this against a snapshot DB to triage incidents
@@ -197,11 +213,14 @@ int main(int argc, char *argv[]) {
     fee_estimator_static_t fee;
     fee_estimator_static_init(&fee, 1000);
 
-    /* Initialize watchtower */
+    /* Initialize watchtower.  Phase 2b: pass NULL when --db is not set
+     * (trustless mode); src/watchtower.c is already NULL-safe for wt->db
+     * — every callsite uses `if (wt->db && wt->db->db) ...` guards. */
     watchtower_t wt;
-    if (!watchtower_init(&wt, 0, &rt, (fee_estimator_t *)&fee, &db)) {
+    if (!watchtower_init(&wt, 0, &rt, (fee_estimator_t *)&fee,
+                          use_db ? &db : NULL)) {
         fprintf(stderr, "Error: watchtower_init failed\n");
-        persist_close(&db);
+        if (use_db) persist_close(&db);
         return 1;
     }
     if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
@@ -218,7 +237,7 @@ int main(int argc, char *argv[]) {
         if (!persist_wt_open(&wt_pdb, wt_db_path)) {
             fprintf(stderr, "Error: cannot open watchtower database '%s'\n",
                     wt_db_path);
-            persist_close(&db);
+            if (use_db) persist_close(&db);
             return 1;
         }
         use_wt_db = 1;
@@ -232,13 +251,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Hydrate channels from the DB so breach detections can build penalty TXes.
-       Without this, watchtower_check() sees the breach, looks up wt->channels[
-       id], finds NULL, and falls through to "no channel N for penalty". */
-    secp256k1_context *chan_ctx =
-        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    /* Hydrate channels from the LSP DB so breach detections can build
+     * penalty TXes. Phase 2b: this is SKIPPED in trustless mode (no --db);
+     * the wt_db hydration above provides watches without requiring access
+     * to revocation secrets — the WT just broadcasts pre-signed response
+     * TXs on observed spends. */
+    secp256k1_context *chan_ctx = NULL;
     channel_t *loaded_channels[WATCHTOWER_MAX_CHANNELS] = {0};
-    if (chan_ctx) {
+    if (use_db) chan_ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    if (use_db && chan_ctx) {
         uint32_t ch_ids[WATCHTOWER_MAX_CHANNELS];
         size_t n_loaded = 0;
         if (persist_list_channel_ids(&db, ch_ids, WATCHTOWER_MAX_CHANNELS,
@@ -537,6 +559,6 @@ int main(int argc, char *argv[]) {
      * paths skip this — OS process cleanup handles them; SQLite WAL keeps
      * committed data durable through abrupt close. */
     if (use_wt_db) persist_wt_close(&wt_pdb);
-    persist_close(&db);
+    if (use_db) persist_close(&db);
     return 0;
 }
