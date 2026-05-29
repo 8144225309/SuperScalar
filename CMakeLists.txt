@@ -322,6 +322,7 @@ add_executable(test_superscalar
     tests/test_stateless_invoice.c
     tests/test_onion_msg_relay.c
     tests/test_htlc_fee_bump.c
+    tests/test_dust_recovery.c
     tests/test_bolt4_failure.c
     tests/test_payment_uri.c
     tests/test_trampoline.c

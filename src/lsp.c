@@ -521,6 +521,8 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     unsigned char *all_pn = calloc(f->n_nodes, mtx_stride);
     if (!all_pn) goto fail_pre;
 
+    lsp_crash_checkpoint("factory_creation_propose");
+
     /* Step B: collect each client's per-node pubnonces (only for nodes the
        client signs; other node slots stay zero in that client's array). */
     for (size_t c = 0; c < lsp->n_clients; c++) {
@@ -564,6 +566,8 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         }
         free(client_pn);
     }
+
+    lsp_crash_checkpoint("factory_creation_nonced");
 
     /* Step C (CRITICAL ATOMIC BLOCK -- no wire_recv inside): per node, gen the
        LSP secnonce, set the LSP slot nonce (clients' already set in Step B),
@@ -726,6 +730,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 fprintf(stderr, "LSP-stateless: persist_save_participant_phase(SIGNED) client %zu failed (continuing)\n", i);
             }
         }
+        lsp_crash_checkpoint("factory_creation_finalize_partial");
         if (!persist_update_ceremony_state(lsp->db, cer_id,
                                             PERSIST_CEREMONY_STATE_FINALIZED)) {
             fprintf(stderr, "LSP-stateless: persist_update_ceremony_state(FINALIZED) failed (continuing)\n");

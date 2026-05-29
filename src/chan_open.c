@@ -456,10 +456,42 @@ int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
     /* your_last_per_commitment_secret: all zeros if no prior revocation */
     memset(msg + pos, 0, 32); pos += 32;
     /* my_current_per_commitment_point: OUR local PCP for current commitment (BOLT #2 §3).
-     * This must be our own key — NOT the remote's. Used by peer for DLP detection. */
+     * This must be our own key — NOT the remote's. Used by peer for DLP detection.
+     *
+     * CL?-CHEAT-SCB (#256 SF-CHEAT-BACKUP-RESTORE): when SS_CHEAT_SCB_RESTORE
+     * is set, send the PCP for a *revoked* older commitment_number instead of
+     * the current one.  Adversarial scenario: client lost state and is doing
+     * SCB-driven channel_reestablish.  An honest LSP must send its CURRENT
+     * PCP so the recovering client can rebuild the correct commitment.  A
+     * malicious LSP sends a stale PCP -- inducing the client to broadcast a
+     * revoked state -- and then races to publish penalty.  The defense is
+     * watchtower-side: register the revoked PCPs at revocation receive time
+     * (#208 A3.1b) and watch for any of them on-chain.
+     *
+     * Offset (default 1 = N-1, "oldest revoked") is read from
+     * SS_CHEAT_SCB_OFFSET.  Falls back to honest behavior when no older
+     * state exists (commitment_number == 0). */
     {
         secp256k1_pubkey local_pcp;
-        if (channel_get_per_commitment_point(ch, ch->commitment_number, &local_pcp)) {
+        uint64_t pcp_cn = ch->commitment_number;
+        const char *cheat_env = getenv("SS_CHEAT_SCB_RESTORE");
+        if (cheat_env && cheat_env[0] != '0' && ch->commitment_number > 0) {
+            uint64_t offset = 1;
+            const char *off_env = getenv("SS_CHEAT_SCB_OFFSET");
+            if (off_env && off_env[0] != '\0') {
+                long v = atol(off_env);
+                if (v > 0) offset = (uint64_t)v;
+            }
+            if (offset > ch->commitment_number) offset = ch->commitment_number;
+            pcp_cn = ch->commitment_number - offset;
+            fprintf(stderr,
+                    "CL?-CHEAT-SCB: sending stale PCP for cn=%llu instead of %llu "
+                    "(offset=%llu) in channel_reestablish to peer %d\n",
+                    (unsigned long long)pcp_cn,
+                    (unsigned long long)ch->commitment_number,
+                    (unsigned long long)offset, peer_idx);
+        }
+        if (channel_get_per_commitment_point(ch, pcp_cn, &local_pcp)) {
             unsigned char pcp33[33];
             size_t pcp_len = 33;
             secp256k1_ec_pubkey_serialize(ctx, pcp33, &pcp_len,
