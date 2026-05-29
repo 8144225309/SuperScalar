@@ -508,6 +508,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         cJSON_Delete(intent);
     }
 
+    /* SF-CRASH-INJECT-WIRE #245 Half B demo callsite: PROPOSE just sent,
+       client psigs not yet collected.  Test harnesses set SUPERSCALAR_CRASH_AT
+       or MSG_FORCE_OUT target to "factory_creation_propose" to abort here. */
+    lsp_crash_checkpoint("factory_creation_propose");
+
     /* all_pn[(node_idx * FACTORY_MAX_SIGNERS + signer_slot) * 66] -- full
        signer x node nonce matrix.  Filled from client pubnonces (Step B) and
        LSP pubnonces (Step C), forwarded to clients in LSP_RESPONSE so each
@@ -682,6 +687,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         free(client_psig);
     }
 
+    /* SF-CRASH-INJECT-WIRE #245 Half B demo callsite: all client psigs
+       collected, ceremony about to finalize.  Crash here tests the
+       resume-from-N-1-signed recovery path. */
     lsp_crash_checkpoint("factory_creation_signed");
 
     /* ---- Completion: identical to legacy lsp_run_factory_creation ---- */

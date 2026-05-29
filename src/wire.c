@@ -3196,3 +3196,45 @@ int wire_parse_splice_locked(const cJSON *json,
     *new_funding_vout_out = (uint32_t)vout->valuedouble;
     return 1;
 }
+
+/* ============================================================
+ * SF-CRASH-INJECT-WIRE #245 Half B: test-only crash injection.
+ * Codec for MSG_FORCE_OUT (0x8A) and MSG_ROTATE (0x8B).
+ * Mirrors the wire_build/parse_ceremony_abort pattern.
+ * ============================================================ */
+
+cJSON *wire_build_force_out(const char *checkpoint_name) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    if (checkpoint_name && *checkpoint_name)
+        cJSON_AddStringToObject(root, "checkpoint", checkpoint_name);
+    return root;
+}
+
+int wire_parse_force_out(const cJSON *json, char out_name[64]) {
+    if (!out_name) return 0;
+    out_name[0] = '\0';
+    if (!json) return 1;  /* empty payload = immediate abort sentinel */
+    const cJSON *cp = cJSON_GetObjectItem(json, "checkpoint");
+    if (cp && cJSON_IsString(cp) && cp->valuestring) {
+        strncpy(out_name, cp->valuestring, 63);
+        out_name[63] = '\0';
+    }
+    return 1;
+}
+
+cJSON *wire_build_rotate(uint8_t mode) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    cJSON_AddNumberToObject(root, "mode", (double)mode);
+    return root;
+}
+
+int wire_parse_rotate(const cJSON *json, uint8_t *out_mode) {
+    if (!out_mode) return 0;
+    *out_mode = 0;
+    if (!json) return 1;
+    const cJSON *m = cJSON_GetObjectItem(json, "mode");
+    if (m && cJSON_IsNumber(m)) *out_mode = (uint8_t)m->valueint;
+    return 1;
+}
