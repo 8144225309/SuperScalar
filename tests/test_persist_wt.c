@@ -1,6 +1,9 @@
-/* Unit tests for include/superscalar/persist_wt.h (Phase 1a). */
+/* Unit tests for include/superscalar/persist_wt.h (Phase 1a) and
+   include/superscalar/lsp_wt.h (Phase 1b.2). */
 
 #include "superscalar/persist_wt.h"
+#include "superscalar/lsp_wt.h"
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +81,81 @@ int test_persist_wt_register_watch_round_trip(void) {
            "double-supersede no-ops");
     n = persist_wt_count_active_watches(&pwt);
     ASSERT(n == 0, "count_active = 0 after supersede");
+
+    persist_wt_close(&pwt);
+    cleanup_db();
+    return 1;
+}
+
+int test_lsp_wt_register_factory_node_watch(void) {
+    /* Phase 1b.2: thin LSP-side adapter that hex-encodes a signed-tx
+       blob and delegates to persist_wt_register_watch.  This test
+       checks: (a) the row appears, (b) the response_tx_hex column
+       holds the lowercase hex of the input bytes, (c) NULL inputs
+       are rejected. */
+    cleanup_db();
+    persist_wt_t pwt;
+    ASSERT(persist_wt_open(&pwt, WT_TMP_PATH) == 1, "open");
+
+    /* Sample signed-tx blob: 4 bytes for variety; helper hex-encodes
+       to "deadbeef".  The exact value doesn't matter — only that the
+       round-trip lands correctly. */
+    unsigned char signed_tx[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    unsigned char parent_txid[32];   memset(parent_txid, 0x11, 32);
+    unsigned char response_txid[32]; memset(response_txid, 0x22, 32);
+    unsigned char spk[34];           memset(spk, 0x33, 34);
+
+    int64_t watch_id = lsp_wt_register_factory_node_watch(&pwt,
+        /* factory_id      */ 7,
+        /* parent_txid32   */ parent_txid,
+        /* parent_vout     */ 2,
+        /* parent_value_sat*/ 500000,
+        /* parent_spk      */ spk,
+        /* parent_spk_len  */ sizeof(spk),
+        /* csv_delay       */ 100,
+        /* signed_tx       */ signed_tx,
+        /* signed_tx_len   */ sizeof(signed_tx),
+        /* response_txid32 */ response_txid,
+        /* fee_bump_budget */ 1234,
+        /* fee_bump_dline  */ 999999);
+    ASSERT(watch_id > 0, "watch_id positive");
+
+    /* Verify the response_tx_hex column got the lowercase hex form
+       of {0xDE, 0xAD, 0xBE, 0xEF} -> "deadbeef". */
+    sqlite3_stmt *st;
+    const char *sql =
+        "SELECT r.response_tx_hex FROM wt_watches w "
+        "JOIN wt_responses r ON r.response_id = w.response_id "
+        "WHERE w.watch_id = ?;";
+    ASSERT(sqlite3_prepare_v2(pwt.db, sql, -1, &st, NULL) == SQLITE_OK, "prep join");
+    sqlite3_bind_int64(st, 1, watch_id);
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "row present");
+    const char *hex = (const char *)sqlite3_column_text(st, 0);
+    ASSERT(hex != NULL, "response_tx_hex not NULL");
+    ASSERT(strcmp(hex, "deadbeef") == 0, "hex round-trip matches");
+    sqlite3_finalize(st);
+
+    /* Reject NULL pwt + NULL inputs. */
+    ASSERT(lsp_wt_register_factory_node_watch(NULL, 1, parent_txid, 0, 0,
+                                                spk, 34, 0,
+                                                signed_tx, 4,
+                                                response_txid, 0, 0) == -1,
+           "NULL pwt rejected");
+    ASSERT(lsp_wt_register_factory_node_watch(&pwt, 1, NULL, 0, 0,
+                                                spk, 34, 0,
+                                                signed_tx, 4,
+                                                response_txid, 0, 0) == -1,
+           "NULL parent_txid rejected");
+    ASSERT(lsp_wt_register_factory_node_watch(&pwt, 1, parent_txid, 0, 0,
+                                                spk, 34, 0,
+                                                NULL, 4,
+                                                response_txid, 0, 0) == -1,
+           "NULL signed_tx rejected");
+    ASSERT(lsp_wt_register_factory_node_watch(&pwt, 1, parent_txid, 0, 0,
+                                                spk, 34, 0,
+                                                signed_tx, 0,
+                                                response_txid, 0, 0) == -1,
+           "zero-len signed_tx rejected");
 
     persist_wt_close(&pwt);
     cleanup_db();
