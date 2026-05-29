@@ -1450,6 +1450,7 @@ extern int test_scb_normal_reestablish(void);
 extern int test_scb_dlp_no_watchtower_no_crash(void);
 extern int test_scb_recovery_null_channel(void);
 extern int test_scb_recovery_no_dlp(void);
+extern int test_scb_cheat_backup_restore_offset_logic(void);  /* #256 */
 
 /* PR #57: BOLT #9 feature bit negotiation */
 extern int test_bf1_our_features_payment_secret(void);
@@ -3282,6 +3283,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_scb_dlp_no_watchtower_no_crash);
     RUN_TEST(test_scb_recovery_null_channel);
     RUN_TEST(test_scb_recovery_no_dlp);
+    RUN_TEST(test_scb_cheat_backup_restore_offset_logic);  /* #256 */
     RUN_TEST(test_pending_persistence);
 
     printf("\n=== PR #57: BOLT #9 Feature Bit Negotiation ===\n");
