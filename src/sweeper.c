@@ -434,10 +434,13 @@ int sweeper_check(sweeper_t *sw)
     for (size_t i = 0; i < sw->n_entries; ) {
         sweep_entry_t *e = &sw->entries[i];
 
-        /* Check if sweep TX already confirmed → remove entry */
+        /* Check if sweep TX already confirmed -> remove entry.
+           #265: use network-safe sweep depth instead of hardcoded 3.
+           chain_sweep_confs returns 1 on regtest and the configured
+           target (default 3) on other networks. */
         if (e->state == SWEEP_BROADCAST && e->sweep_txid[0]) {
             int confs = sw->chain->get_confirmations(sw->chain, e->sweep_txid);
-            if (confs >= 3) {
+            if (confs >= chain_sweep_confs(sw->chain, sw->chain->is_regtest)) {
                 /* Confirmed — remove entry */
                 e->state = SWEEP_CONFIRMED;
                 if (sw->db) persist_delete_sweep(sw->db, e->id);
