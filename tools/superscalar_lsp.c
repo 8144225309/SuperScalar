@@ -322,6 +322,7 @@ static void usage(const char *prog) {
         "  --cheat-state K      With --cheat-leaf and --advance-count N: snapshot+broadcast chain[K] (default 0 = oldest stale).  K in [0,N-1].  K>0 exercises the watchtower's middle-state revocation walk — boundary-only K=0/K=N-1 tests miss this path. CL3-K.\n"
         "  --musig-stateless    [PHASE 1a/EXPERIMENTAL] Opt into BIP-327 stateless-signer wire flow per MUSIG_NONCE_REDESIGN_MEMO. Currently registers the flag; full reversed-flow behavior lands in Phase 1b. Default off.\n"
         "  --cheat-realloc      With --test-realloc: after realloc completes, broadcast the now-revoked pre-realloc leaf TX and verify watchtower defense fires (penalty TX broadcast, breach_detections row). Tests adversarial path against realloc revocation. CL2.\n"
+        "  --cheat-lstock-buy   With --test-buy-liquidity: after the L-stock buy ceremony completes, broadcast the now-revoked pre-buy leaf TX and verify watchtower defense fires (penalty TX broadcast). Tests adversarial path against the L-stock buy-liquidity revocation. SF-CHEAT-LSTOCK-BUY (#255).\n"
         "  --cheat-backup-restore[=OFFSET]  #256 SF-CHEAT-BACKUP-RESTORE. When the LSP responds to a recovering client's channel_reestablish (SCB restore path), inject a stale per_commitment_point for commitment_number-OFFSET (default 1) instead of the current cn. Recovering client induced to broadcast the revoked state; watchtower must catch + penalize. Set on the LSP only.\n"
         "  --cheat-dust-race    SF-CHEAT-DUST-RACE (#257): bypass the dust-race defense in htlc_commit_recv_update_fee. The LSP accepts peer feerate bumps that strand counterparty HTLC sweeps below the 546-sat dust limit, demonstrating the absorbed-HTLC theft path. Markers: LSP-CHEAT-DUST. Test: tools/test_regtest_cheat_dust_race.sh.\n"
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
@@ -1342,6 +1343,10 @@ int main(int argc, char *argv[]) {
                                   -Werror to keep the build green until then. */
     (void)cheat_leaf_side;
     int cheat_realloc = 0;
+    int cheat_lstock_buy = 0;           /* SF-CHEAT-LSTOCK-BUY (#255): when set, after
+                                  --test-buy-liquidity completes the honest L-stock
+                                  buy ceremony, broadcast the pre-buy leaf signed_tx
+                                  (now revoked) and verify the watchtower defense path. */
     secp256k1_pubkey _bridge_pubkey_arg;
     int _has_bridge_pubkey_arg = 0;     /* CL2: when set, after --test-realloc completes,
                                   broadcast the pre-realloc leaf signed_tx (now revoked)
@@ -1831,6 +1836,16 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--cheat-realloc") == 0) {
             /* CL2: enable post-finalize cheat broadcast against --test-realloc. */
             cheat_realloc = 1;
+        }
+        else if (strcmp(argv[i], "--cheat-lstock-buy") == 0) {
+            /* SF-CHEAT-LSTOCK-BUY (#255): after --test-buy-liquidity completes the
+               honest L-stock buy ceremony (which mutates the leaf signed_tx to the
+               post-buy state), broadcast the snapshotted pre-buy leaf TX and verify
+               the watchtower detects + responds with the penalty TX.
+               Mirrors the established cheat-engine pattern (--cheat-realloc / CL2). */
+            cheat_lstock_buy = 1;
+            test_buy_liquidity = 1;
+            setenv("SS_CHEAT_LSTOCK_BUY", "1", 1);
         }
         else if (strncmp(argv[i], "--cheat-backup-restore", 22) == 0) {
             /* #256 SF-CHEAT-BACKUP-RESTORE: adversarial test against the
