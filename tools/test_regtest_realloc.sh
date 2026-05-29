@@ -171,10 +171,13 @@ echo
 echo "=== Honest-run checks (no cheat overlay was set) ==="
 BREACH_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections;" 2>/dev/null || echo "?")
 echo "  breach_detections rows : $BREACH_ROWS  (want 0 — no cheat fired)"
+# Happy-path realloc mutates leaf state but does NOT broadcast — only
+# force-close or the cheat variant produces a broadcast_log row.  Print
+# this for diagnostic visibility; do not assert on it.
 BCAST_REALLOC=$(sqlite3 "$LSP_DB" \
     "SELECT count(*) FROM broadcast_log WHERE source LIKE '%realloc%';" \
     2>/dev/null || echo "?")
-echo "  broadcast_log realloc  : $BCAST_REALLOC  (want >=1 — realloc broadcast occurred)"
+echo "  broadcast_log realloc  : $BCAST_REALLOC  (informational; expect 0 on happy path)"
 
 case "$VERDICT" in
     "LEAF REALLOC TEST: PASS")
