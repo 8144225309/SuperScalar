@@ -3190,10 +3190,23 @@ static int client_handle_subfactory_advance_stateless_multi(
         free(my_secnonces); free(my_pn_flat);
         return 0;
     }
+    /* SF-MULTI-KEYAGG (#283): gen nonce against per-input keyagg cache, but
+       only for inputs this client signs.  Channel input j (0..k-1) is signed
+       only by LSP + client at sub->signer_indices[j+1]; sales-stock (input k)
+       is N-of-N.  For inputs we do NOT sign, write a 66-byte zero pubnonce as
+       a skipped-input wire marker and leave my_secnonces[i] zero so the later
+       per-input loop also skips us. */
     for (size_t i = 0; i < n_inputs; i++) {
+        if (!factory_session_input_signs(factory, sub_node_i, i, my_index)) {
+            /* Skipped input: 66 zero bytes on wire, no musig nonce gen, no
+               secnonce held to consume.  my_pn_flat slot already zero from
+               calloc; my_secnonces[i] already zero. */
+            continue;
+        }
         secp256k1_musig_pubnonce my_pubnonce_i;
         if (!musig_generate_nonce(ctx, &my_secnonces[i], &my_pubnonce_i,
-                                   my_seckey, &my_pubkey, &sub->keyagg.cache)) {
+                                   my_seckey, &my_pubkey,
+                                   &sub->input_keyaggs[i].cache)) {
             fprintf(stderr, "Client-stateless MULTI %u: nonce gen input %zu failed\n",
                     my_index, i);
             memset(my_seckey, 0, 32);
@@ -3201,10 +3214,13 @@ static int client_handle_subfactory_advance_stateless_multi(
             return 0;
         }
         musig_pubnonce_serialize(ctx, my_pn_flat + i * 66, &my_pubnonce_i);
-        if (!factory_session_set_nonce_input(factory, sub_node_i, i,
-                                             (size_t)my_slot, &my_pubnonce_i)) {
-            fprintf(stderr, "Client-stateless MULTI %u: set own nonce input %zu failed\n",
-                    my_index, i);
+        int my_slot_i = factory_session_get_input_signer_slot(
+            factory, sub_node_i, i, my_index);
+        if (my_slot_i < 0 ||
+            !factory_session_set_nonce_input(factory, sub_node_i, i,
+                                             (size_t)my_slot_i, &my_pubnonce_i)) {
+            fprintf(stderr, "Client-stateless MULTI %u: set own nonce input %zu (slot=%d) failed\n",
+                    my_index, i, my_slot_i);
             memset(my_seckey, 0, 32);
             free(my_secnonces); free(my_pn_flat);
             factory_session_reset_poison(factory, sub_node_i);
@@ -3299,8 +3315,19 @@ static int client_handle_subfactory_advance_stateless_multi(
         poison_prepared_c = 0;
     }
 
-    /* Per input: set LSP nonce + every other co-signer's nonce (skip own and
-       LSP slots, exactly like single-input), finalize, sign (zeros secnonce). */
+    /* SF-MULTI-KEYAGG (#283): per-input finalize+psig with per-input signer
+       slot remapping.  For each input i:
+         - If this client doesn't sign input i: skip the entire input (psig
+           slot stays zero, no secnonce to consume).
+         - Else: resolve own + LSP per-input slots, install LSP's nonce,
+           install every other co-signer's nonce (resolve participant via
+           node-level matrix row -> per-input slot; skip rows whose
+           participant isn't in this input's signer set), finalize, create
+           psig (zeros secnonce).
+       The matrix is indexed [node-level slot s][input i] (unchanged wire
+       layout); we translate each row's participant index through
+       factory_session_get_input_signer_slot.  Rows for participants outside
+       the per-input signer set carry zero placeholders and MUST be skipped. */
     unsigned char *my_psig_flat = calloc(n_inputs, 32);
     if (!my_psig_flat) {
         free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
@@ -3308,24 +3335,48 @@ static int client_handle_subfactory_advance_stateless_multi(
         return 0;
     }
     for (size_t i = 0; i < n_inputs; i++) {
+        if (!factory_session_input_signs(factory, sub_node_i, i, my_index)) {
+            /* Skipped input: nothing to sign, my_psig_flat slot stays zero. */
+            continue;
+        }
+        int my_slot_i = factory_session_get_input_signer_slot(
+            factory, sub_node_i, i, my_index);
+        int lsp_slot_i = factory_session_get_input_signer_slot(
+            factory, sub_node_i, i, 0);
+        if (my_slot_i < 0 || lsp_slot_i < 0) {
+            fprintf(stderr, "Client-stateless MULTI %u: per-input slot lookup "
+                    "failed input %zu (my=%d lsp=%d)\n",
+                    my_index, i, my_slot_i, lsp_slot_i);
+            goto fail;
+        }
         secp256k1_musig_pubnonce lsp_pubnonce_i;
         if (!musig_pubnonce_parse(ctx, &lsp_pubnonce_i, lsp_pn_flat + i * 66) ||
             !factory_session_set_nonce_input(factory, sub_node_i, i,
-                                             (size_t)lsp_slot, &lsp_pubnonce_i)) {
-            fprintf(stderr, "Client-stateless MULTI %u: set LSP nonce input %zu failed\n",
-                    my_index, i);
+                                             (size_t)lsp_slot_i, &lsp_pubnonce_i)) {
+            fprintf(stderr, "Client-stateless MULTI %u: set LSP nonce input %zu "
+                    "(per_input_slot=%d) failed\n", my_index, i, lsp_slot_i);
             goto fail;
         }
         if (have_matrix) {
             for (size_t scs = 0; scs < sub->n_signers; scs++) {
-                if (scs == (size_t)my_slot || scs == (size_t)lsp_slot) continue;
+                uint32_t participant = sub->signer_indices[scs];
+                /* Skip own + LSP (already set). */
+                if (participant == my_index || participant == 0) continue;
+                /* Skip co-signers who don't sign this input — their matrix
+                   row carries a 66-byte zero placeholder. */
+                int peer_slot_i = factory_session_get_input_signer_slot(
+                    factory, sub_node_i, i, participant);
+                if (peer_slot_i < 0) continue;
                 secp256k1_musig_pubnonce pn_s;
                 if (!musig_pubnonce_parse(ctx, &pn_s,
                         all_pn_per_input + (scs * n_inputs + i) * 66) ||
-                    !factory_session_set_nonce_input(factory, sub_node_i, i, scs, &pn_s)) {
+                    !factory_session_set_nonce_input(factory, sub_node_i, i,
+                                                     (size_t)peer_slot_i, &pn_s)) {
                     fprintf(stderr,
-                            "Client-stateless MULTI %u: set co-signer nonce[%zu] input %zu failed\n",
-                            my_index, scs, i);
+                            "Client-stateless MULTI %u: set co-signer nonce "
+                            "(participant=%u node_slot=%zu per_input_slot=%d) "
+                            "input %zu failed\n",
+                            my_index, participant, scs, peer_slot_i, i);
                     goto fail;
                 }
             }
@@ -3343,6 +3394,12 @@ static int client_handle_subfactory_advance_stateless_multi(
             goto fail;
         }
         /* my_secnonces[i] zeroed by musig_create_partial_sig. */
+        if (!factory_session_set_partial_sig_input(factory, sub_node_i, i,
+                                                    (size_t)my_slot_i, &my_psig_i)) {
+            fprintf(stderr, "Client-stateless MULTI %u: set own psig input %zu "
+                    "(per_input_slot=%d) failed\n", my_index, i, my_slot_i);
+            goto fail;
+        }
         musig_partial_sig_serialize(ctx, my_psig_flat + i * 32, &my_psig_i);
     }
 
@@ -3859,10 +3916,16 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
             factory_session_reset_poison(factory, (size_t)sub_node_i);
             return 0;
         }
+        /* SF-MULTI-KEYAGG (#283): gen against per-input keyagg, skip inputs we
+           don't sign (write 66-byte zero marker, leave secnonce zero). */
         for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_input_signs(factory, (size_t)sub_node_i, i, my_index)) {
+                /* my_pn_ser[i] already zero from calloc. */
+                continue;
+            }
             if (!musig_generate_nonce(ctx, &my_secnonces[i], &my_pubnonces[i],
                                        my_seckey, &my_pubkey,
-                                       &sub->keyagg.cache)) {
+                                       &sub->input_keyaggs[i].cache)) {
                 free(my_secnonces); free(my_pubnonces); free(my_pn_ser);
                 memset(my_seckey, 0, 32);
                 factory_session_reset_poison(factory, (size_t)sub_node_i);
@@ -3951,16 +4014,28 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
             poison_prepared = 0;
         }
 
-        /* Set every nonce on every input session. */
+        /* SF-MULTI-KEYAGG (#283): set nonces per-input with slot remapping.
+           Matrix row s is the node-level signer slot.  For each (s, i):
+             - participant = sub->signer_indices[s]
+             - per_input_slot = factory_session_get_input_signer_slot(... participant)
+             - skip if per_input_slot < 0 (participant doesn't sign this input,
+               matrix cell holds a 66-byte zero placeholder).
+           Poison side-channel is still N-of-N, so poison nonces use the
+           node-level slot s directly. */
         for (size_t s = 0; s < sub->n_signers; s++) {
+            uint32_t participant = sub->signer_indices[s];
             for (size_t i = 0; i < n_inputs; i++) {
+                int per_input_slot = factory_session_get_input_signer_slot(
+                    factory, (size_t)sub_node_i, i, participant);
+                if (per_input_slot < 0) continue;  /* skipped — zero placeholder. */
                 secp256k1_musig_pubnonce pn;
                 if (!musig_pubnonce_parse(ctx, &pn,
                         all_pn_per_input + (s * n_inputs + i) * 66) ||
                     !factory_session_set_nonce_input(factory, (size_t)sub_node_i,
-                                                     i, s, &pn)) {
-                    fprintf(stderr, "Client %u: set_nonce_input(s=%zu, i=%zu) failed\n",
-                            my_index, s, i);
+                                                     i, (size_t)per_input_slot, &pn)) {
+                    fprintf(stderr, "Client %u: set_nonce_input(participant=%u "
+                            "node_slot=%zu per_input_slot=%d input=%zu) failed\n",
+                            my_index, participant, s, per_input_slot, i);
                     free(all_pn_per_input);
                     free(my_secnonces); free(my_pubnonces); free(my_pn_ser);
                     memset(my_seckey, 0, 32);
@@ -3980,8 +4055,13 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
         }
         free(all_pn_per_input);
 
-        /* Finalize every input session + poison. */
+        /* SF-MULTI-KEYAGG (#283): finalize only the inputs we sign.  Inputs we
+           don't sign have only LSP's nonce installed (per-input slot 1 of a
+           2-of-2 keyagg) and missing nonce in the client slot -- finalize
+           would fail and we don't need the finalized session anyway. */
         for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_input_signs(factory, (size_t)sub_node_i, i, my_index))
+                continue;
             if (!factory_session_finalize_node_input(factory, (size_t)sub_node_i, i)) {
                 fprintf(stderr, "Client %u: finalize_input %zu failed\n",
                         my_index, i);
@@ -4005,7 +4085,23 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
             factory_session_reset_poison(factory, (size_t)sub_node_i);
             return 0;
         }
+        /* SF-MULTI-KEYAGG (#283): create + set partial sigs only for inputs we
+           sign.  Inputs we don't sign get a 32-byte zero psig marker on the
+           wire (my_psig_ser is zero-initialized from calloc). */
         for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_input_signs(factory, (size_t)sub_node_i, i, my_index))
+                continue;
+            int my_slot_i = factory_session_get_input_signer_slot(
+                factory, (size_t)sub_node_i, i, my_index);
+            if (my_slot_i < 0) {
+                fprintf(stderr, "Client %u: per-input slot lookup failed input %zu\n",
+                        my_index, i);
+                free(my_psig_ser);
+                free(my_secnonces); free(my_pubnonces); free(my_pn_ser);
+                memset(my_seckey, 0, 32);
+                factory_session_reset_poison(factory, (size_t)sub_node_i);
+                return 0;
+            }
             secp256k1_musig_partial_sig my_psig_i;
             if (!musig_create_partial_sig(ctx, &my_psig_i, &my_secnonces[i],
                                             keypair,
@@ -4018,6 +4114,8 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                 factory_session_reset_poison(factory, (size_t)sub_node_i);
                 return 0;
             }
+            (void)factory_session_set_partial_sig_input(factory, (size_t)sub_node_i,
+                                                         i, (size_t)my_slot_i, &my_psig_i);
             musig_partial_sig_serialize(ctx, my_psig_ser[i], &my_psig_i);
         }
         free(my_secnonces); free(my_pubnonces); free(my_pn_ser);
