@@ -1615,6 +1615,31 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_l_amount = (old_n_outputs >= 2)
                             ? f->nodes[pre_node_idx].outputs[old_n_outputs - 1].amount_sats
                             : 0;
+    /* SF-WT-TRUSTLESS Phase 1b.4 (#248): also snapshot the OLD chain
+     * output (vout=0)'s value + scriptpubkey + the nsequence-encoded
+     * CSV.  These feed wt_db.wt_watches so the WT can match the
+     * specific spend on-chain and the response_tx's BIP-68 timelock
+     * is properly registered.  Snapshot before factory_advance_leaf
+     * mutates outputs[]. */
+    uint64_t old_chain_amount = (old_n_outputs >= 1)
+                                ? f->nodes[pre_node_idx].outputs[0].amount_sats
+                                : 0;
+    unsigned char old_chain_spk[34];
+    size_t old_chain_spk_len = 0;
+    if (old_n_outputs >= 1) {
+        old_chain_spk_len = f->nodes[pre_node_idx].outputs[0].script_pubkey_len;
+        if (old_chain_spk_len > sizeof(old_chain_spk))
+            old_chain_spk_len = sizeof(old_chain_spk);
+        memcpy(old_chain_spk,
+               f->nodes[pre_node_idx].outputs[0].script_pubkey,
+               old_chain_spk_len);
+    }
+    /* BIP-68 nsequence: low 16 bits hold the CSV value when bit 22 is
+     * 0 (block-based units, the SuperScalar default).  Phase 1b.4
+     * uses just the low 16 bits — if a future deploy uses
+     * time-based units, this widens to 22 bits with bit-31 type-flag
+     * inspection. */
+    uint32_t old_csv_delay = (uint32_t)(f->nodes[pre_node_idx].nsequence & 0xFFFFu);
 
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
@@ -2016,41 +2041,45 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             poison_data, poison_len,
             leaf_ch_ids, n_leaf_ch);
 
-        /* SF-WT-TRUSTLESS Phase 1b.3 (#248): mirror the same registration
+        /* SF-WT-TRUSTLESS Phase 1b.3+1b.4 (#248): mirror the registration
          * into wt_db when --wt-db is enabled.  The in-memory watchtower
          * above remains canonical; wt_db is a parallel write that the
          * Phase 2 WT-side switchover will consume.
          *
-         * Confidently-populated fields:
-         *   factory_id    = node_idx  (matches in-memory watchtower entry)
-         *   parent_txid32 = old_leaf_txid  (the now-revoked chain[N] txid)
-         *   signed_response_tx = node->signed_tx (the new chain[N+1])
-         *   response_txid32 = node->txid (already the canonical txid of
-         *                                  the signed_tx, set during build)
+         * All fields now correctly derived (Phase 1b.4):
+         *   factory_id        = node_idx
+         *   parent_txid32     = old_leaf_txid
+         *   parent_vout       = 0 (chain output convention; the leaf TX's
+         *                       vout=0 is the channel/chain output that
+         *                       the response_tx spends)
+         *   parent_value_sat  = old_chain_amount (snapshotted pre-advance)
+         *   parent_spk        = old_chain_spk (snapshotted pre-advance)
+         *   csv_delay         = old_csv_delay (BIP-68 low-16-bit decode)
+         *   signed_response_tx = node->signed_tx
+         *   response_txid32   = node->txid
          *
-         * Phase 1b.4 will derive the remaining outpoint metadata from
-         * the OLD leaf state (parent_vout/parent_value_sat/parent_spk)
-         * and the canonical csv_delay (currently 0 = match-any-spend).
-         * The WT matches by outpoint primarily but those fields support
-         * fee math + sanity checks in the broadcast path. */
-        if (lsp && lsp->wt_db) {
-            unsigned char parent_spk_placeholder[1] = {0x00};
+         * fee_bump_budget/deadline are 0 — fee-bump policy is not yet
+         * exposed to leaf advance; will land if/when CPFP bumping is
+         * wired for leaf-advance responses (separate scope). */
+        if (lsp && lsp->wt_db && had_old_signed && old_chain_spk_len > 0) {
             int64_t watch_id = lsp_wt_register_factory_node_watch(
                 lsp->wt_db,
                 (uint32_t)node_idx,
                 old_leaf_txid,
-                /* parent_vout      */ 0,    /* Phase 1b.4: derive from input */
-                /* parent_value_sat */ 0,    /* Phase 1b.4: from old leaf out */
-                parent_spk_placeholder, 1,   /* Phase 1b.4: from old leaf SPK */
-                /* csv_delay        */ 0,    /* Phase 1b.4: from node->nsequence */
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ old_chain_amount,
+                old_chain_spk, old_chain_spk_len,
+                /* csv_delay        */ old_csv_delay,
                 node->signed_tx.data, node->signed_tx.len,
                 node->txid,
                 /* fee_bump_budget  */ 0,
                 /* fee_bump_dline   */ 0);
             if (watch_id > 0) {
                 printf("LSP-WT-TRUSTLESS: registered leaf-advance watch_id=%lld "
-                       "for node %d (Phase 1b.3 partial-fields)\n",
-                       (long long)watch_id, (int)node_idx);
+                       "for node %d (parent=%llu sats, csv=%u)\n",
+                       (long long)watch_id, (int)node_idx,
+                       (unsigned long long)old_chain_amount,
+                       (unsigned)old_csv_delay);
             } else {
                 fprintf(stderr,
                         "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
