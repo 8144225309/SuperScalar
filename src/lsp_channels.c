@@ -2095,11 +2095,10 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
         return 0;
     }
 
-    /* Phase 1c (#271): when --musig-stateless is in effect, dispatch to the
-       reversed-order flow.  Legacy path below is untouched. */
+    /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 falls back. */
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        if (stateless && stateless[0] == '1')
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        if (!legacy || legacy[0] != '1')
             return lsp_advance_leaf_stateless(mgr, lsp, leaf_side);
     }
 
@@ -3239,12 +3238,12 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     factory_t *f = &lsp->factory;
     if (!mgr || !lsp) return 0;
 
-    /* Phase 1e.2.b (#271): when --musig-stateless is in effect, dispatch
-       to the reversed-order flow.  Returns -1 to signal fall-through to
-       legacy if the stateless variant cannot handle this case. */
+    /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 falls back.
+       Stateless variant returns -1 to signal cases it cannot handle (legacy
+       then runs).  Phase 3 deletes the legacy fall-through. */
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        if (stateless && stateless[0] == '1') {
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        if (!legacy || legacy[0] != '1') {
             int rc = lsp_run_state_advance_stateless(mgr, lsp, trigger_leaf_side);
             if (rc >= 0) return rc;
             /* rc == -1: stateless declined; fall through to legacy below. */
@@ -5739,13 +5738,12 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     factory_t *f = &lsp->factory;
 
-    /* Phase 1e.1.b (#271): when --musig-stateless is in effect, dispatch
-       to the reversed-order flow.  The stateless variant returns -1 if
-       it cannot handle the case (multi-input etc) and falls through to
-       legacy; otherwise it handles the ceremony end-to-end. */
+    /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 falls back.
+       Stateless variant returns -1 when it cannot handle a case (e.g.
+       multi-input edge cases); legacy then runs.  Phase 3 deletes legacy. */
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        if (stateless && stateless[0] == '1') {
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        if (!legacy || legacy[0] != '1') {
             int rc = lsp_subfactory_chain_advance_stateless(
                 mgr, lsp, leaf_side, sub_idx_in_leaf,
                 channel_idx_in_sub, delta_sats);

@@ -846,9 +846,11 @@
          - Legacy path (default)
          - Phase 1c new path (when SS_MUSIG_STATELESS=1) */
     if (test_wire_leaf_advance && channels_active) {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
+        /* Phase 2 (#272): stateless is default-on; report 0 only if
+           SS_MUSIG_LEGACY=1 forces a fallback. */
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
         printf("\n=== POST-DAEMON WIRE LEAF ADVANCE TEST (stateless=%s) ===\n",
-               (stateless && stateless[0] == '1') ? "1" : "0");
+               (legacy && legacy[0] == '1') ? "0" : "1");
         fflush(stdout);
         int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
         if (adv_rc == 1) {

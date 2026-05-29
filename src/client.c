@@ -1942,8 +1942,9 @@ int client_run_with_channels(secp256k1_context *ctx,
        function-scope locals stay confined. */
     int ss_stateless_creation = 0;
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        ss_stateless_creation = (stateless && stateless[0] == '1');
+        /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 opts out. */
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        ss_stateless_creation = !(legacy && legacy[0] == '1');
     }
     /* Hoisted to function scope so done:/fail: can free it on either path.
        The stateless path leaves it NULL (free(NULL) is a no-op). */
@@ -4673,11 +4674,11 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory, uint32_t my_index,
                                  const wire_msg_t *propose_msg) {
-    /* Phase 1c (#271): when --musig-stateless is in effect, dispatch to the
-       reversed-order flow.  Legacy path below is untouched. */
+    /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 falls back
+       to the legacy nonce-pool path below.  Legacy path is deleted in Phase 3. */
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        if (stateless && stateless[0] == '1')
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        if (!legacy || legacy[0] != '1')
             return client_handle_leaf_advance_stateless(fd, ctx, keypair,
                                                           factory, my_index,
                                                           propose_msg);
