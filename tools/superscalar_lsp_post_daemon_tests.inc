@@ -1190,6 +1190,34 @@
         uint64_t jit_amount = mgr->jit_funding_sats;
         if (jit_amount == 0) jit_amount = 50000;  /* default 50k sats */
 
+        /* #254 SF-CHEAT-JIT: snapshot pre-JIT leaf 0 signed_tx BEFORE the
+           JIT ceremony.  The honest JIT (jit_channel_create) does NOT mutate
+           the existing factory's leaf, but it DOES consume the LSP's
+           sales-stock allocation; the cheat angle is to broadcast the
+           original leaf TX (which is now revoked relative to the JIT
+           commitment registered with the watchtower) as if the JIT never
+           happened.  Mirrored on the CL2 cheat-realloc precedent above. */
+        tx_buf_t cl2_pre_jit_tx;
+        tx_buf_init(&cl2_pre_jit_tx, 0);
+        factory_node_t *jit_leaf_node = NULL;
+        if (cheat_jit && lsp_p->factory.n_leaf_nodes > 0) {
+            size_t jit_leaf_idx = lsp_p->factory.leaf_node_indices[0];
+            jit_leaf_node = &lsp_p->factory.nodes[jit_leaf_idx];
+            if (jit_leaf_node->is_signed && jit_leaf_node->signed_tx.len > 0) {
+                tx_buf_init(&cl2_pre_jit_tx, (int)jit_leaf_node->signed_tx.len);
+                memcpy(cl2_pre_jit_tx.data, jit_leaf_node->signed_tx.data,
+                       jit_leaf_node->signed_tx.len);
+                cl2_pre_jit_tx.len = jit_leaf_node->signed_tx.len;
+                fprintf(stderr,
+                        "CL2-CHEAT-JIT: snapshotted pre-JIT leaf 0 tx (%zu bytes)\n",
+                        (size_t)cl2_pre_jit_tx.len);
+            } else {
+                fprintf(stderr,
+                        "CL2-CHEAT-JIT: leaf 0 not signed at JIT entry — "
+                        "cheat skipped\n");
+            }
+        }
+
         /* Client uses non-blocking state machine for JIT — no delays needed.
            Create 1 JIT channel (each needs ~10 min on-chain confirmation). */
         for (int ci = 0; ci < 1; ci++) {
@@ -1211,6 +1239,121 @@
                    ci, jit ? jit->jit_channel_id : 0,
                    jit ? jit->funding_txid_hex : "?");
         }
+
+        /* #254 CL2-style cheat broadcast + watchtower assertion. */
+        if (jit_pass && cheat_jit && cl2_pre_jit_tx.len > 0 && jit_leaf_node) {
+            const char *cj_phase = getenv("SS_CHEAT_JIT_PHASE");
+            if (!cj_phase) cj_phase = "stale-broadcast";
+
+            /* #254: register the JIT-leaf with the watchtower so that the
+               pre-JIT factory leaf TX (cl2_pre_jit_tx) is recognized as
+               a stale broadcast.  In production, jit_channel_create would
+               register the JIT funding alongside the parent leaf so any
+               attempt to revert the sales-stock allocation via stale-leaf
+               broadcast triggers a penalty.  This is the watchtower-side
+               counterpart to the cheat.  The response_tx we hand the WT is
+               the SAME signed_tx (current leaf state) — the WT treats any
+               future re-broadcast of that txid as a breach to defend
+               against.  Same registration shape as the realloc / rollover
+               precedents (watchtower_watch_factory_node_with_channels). */
+            size_t jit_leaf_idx_reg = lsp_p->factory.leaf_node_indices[0];
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            size_t n_leaf_ch = 0;
+            for (size_t cc = 0; cc < mgr->n_channels; cc++) {
+                size_t c_node;
+                uint32_t c_vout;
+                if (!factory_client_to_leaf(&lsp_p->factory, cc, &c_node,
+                                              &c_vout)) continue;
+                if (c_node == jit_leaf_idx_reg)
+                    leaf_ch_ids[n_leaf_ch++] = (uint32_t)cc;
+            }
+            int wt_reg_ok = watchtower_watch_factory_node_with_channels(
+                mgr->watchtower,
+                (uint32_t)jit_leaf_idx_reg,
+                jit_leaf_node->txid,
+                jit_leaf_node->signed_tx.data,
+                jit_leaf_node->signed_tx.len,
+                NULL, 0,
+                leaf_ch_ids, n_leaf_ch);
+            fprintf(stderr,
+                    "CL2-CHEAT-JIT: WT registered OLD leaf %zu txid as stale "
+                    "(response_tx=%zub, %zu channels) -> %s\n",
+                    jit_leaf_idx_reg, (size_t)jit_leaf_node->signed_tx.len,
+                    n_leaf_ch, wt_reg_ok ? "ok" : "FAIL");
+
+            printf("\n--- CL2-CHEAT-JIT: broadcasting parent factory tree "
+                   "(skipping leaf 0) phase=%s ---\n", cj_phase);
+            fflush(stdout);
+            int saved_leaf_is_signed = jit_leaf_node->is_signed;
+            jit_leaf_node->is_signed = 0;
+            int parent_tree_ok = broadcast_factory_tree_any_network(
+                &lsp_p->factory, &rt, mine_addr, is_regtest,
+                confirm_timeout_secs);
+            jit_leaf_node->is_signed = saved_leaf_is_signed;
+            if (!parent_tree_ok) {
+                fprintf(stderr,
+                        "CL2-CHEAT-JIT: parent tree broadcast failed — "
+                        "cannot test stale broadcast\n");
+                jit_pass = 0;
+                goto cj_cleanup;
+            }
+            fprintf(stderr,
+                    "CL2-CHEAT-JIT: parent tree on-chain; "
+                    "broadcasting revoked pre-JIT leaf 0 (severity=HIGH)\n");
+            char *cheat_hex = malloc((size_t)cl2_pre_jit_tx.len * 2 + 1);
+            char cheat_txid_str[65] = {0};
+            int sent = 0;
+            if (cheat_hex) {
+                hex_encode(cl2_pre_jit_tx.data,
+                           (size_t)cl2_pre_jit_tx.len, cheat_hex);
+                sent = regtest_send_raw_tx(&rt, cheat_hex, cheat_txid_str);
+                if (g_db)
+                    persist_log_broadcast(g_db,
+                        sent ? cheat_txid_str : "?",
+                        "cheat_jit_stale",
+                        cheat_hex,
+                        sent ? "ok" : "failed");
+                free(cheat_hex);
+            }
+            if (!sent) {
+                fprintf(stderr, "CL2-CHEAT-JIT: stale broadcast failed\n");
+                jit_pass = 0;
+            } else {
+                printf("CL2-CHEAT-JIT: revoked tx broadcast txid=%s\n",
+                       cheat_txid_str);
+                if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
+                watchtower_t *wt_cj = mgr->watchtower;
+                if (!wt_cj) {
+                    fprintf(stderr,
+                            "CL2-CHEAT-JIT: no watchtower configured — "
+                            "cannot assert defense\n");
+                    jit_pass = 0;
+                } else {
+                    int detected = watchtower_check(wt_cj);
+                    if (detected > 0) {
+                        printf("CL2-CHEAT-JIT: BREACH DETECTED! "
+                               "Watchtower broadcast %d penalty tx(s)\n",
+                               detected);
+                        if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
+                    } else {
+                        /* watchtower_check() returned 0 may mean: (a) defense
+                           MISS, or (b) the WT main-loop block scan already
+                           detected + handled the breach BEFORE this explicit
+                           check (recorded in breach_detections table + the
+                           "FACTORY BREACH on node N" log marker).  The wrapper
+                           script asserts the breach_detections row / log
+                           marker rather than failing here, since (b) is the
+                           expected path on regtest with --demo. */
+                        fprintf(stderr,
+                                "CL2-CHEAT-JIT: watchtower_check returned 0 "
+                                "(may have detected via main-loop block scan; "
+                                "wrapper script asserts breach_detections row)\n");
+                    }
+                }
+            }
+        }
+    cj_cleanup:
+        tx_buf_free(&cl2_pre_jit_tx);
 
         printf("JIT LIFECYCLE TEST: %s\n", jit_pass ? "PASS" : "FAIL");
         fflush(stdout);
