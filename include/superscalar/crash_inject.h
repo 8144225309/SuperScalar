@@ -27,4 +27,11 @@
  */
 void lsp_crash_checkpoint(const char *name);
 
+/* SF-CRASH-INJECT-WIRE #245 Half B: install a runtime crash-checkpoint
+   target.  NULL or "" clears it.  The runtime target is checked BEFORE
+   the SUPERSCALAR_CRASH_AT env var so wire-driven tests (MSG_FORCE_OUT)
+   can override compile-time settings.
+   THREAD UNSAFE -- for single-process test harness only. */
+void lsp_crash_set_target(const char *name);
+
 #endif /* SUPERSCALAR_CRASH_INJECT_H */

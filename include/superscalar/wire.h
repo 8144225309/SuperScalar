@@ -190,6 +190,21 @@
    affected nodes in order, each n_signers slots of 32 bytes. */
 #define MSG_STATE_ADV_ALL_PSIGS           0x89
 
+/* ============================================================
+ * Crash injection / test control (TEST ONLY -- gated by
+ * SUPERSCALAR_CRASH_ALLOW env var; production builds drop these).
+ * ============================================================ */
+
+/* MSG_FORCE_OUT: install a runtime crash-checkpoint target.  When the LSP
+   reaches lsp_crash_checkpoint(name) and the installed target matches,
+   the LSP aborts.  Empty name = abort immediately.  See crash_inject.h. */
+#define MSG_FORCE_OUT 0x8A
+
+/* MSG_ROTATE: trigger an in-process factory rotation independent of the
+   lifecycle timer.  Optional 1-byte mode: 0x00 full-close (default),
+   0x01 partial-close-only. */
+#define MSG_ROTATE 0x8B
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -1230,5 +1245,13 @@ cJSON *wire_build_queue_items(const queue_entry_t *entries, size_t count);
 int wire_parse_queue_done(const cJSON *json,
                            uint64_t *ids_out, size_t max_ids,
                            size_t *count_out);
+
+
+/* SF-CRASH-INJECT-WIRE #245 Half B: test-only crash injection opcodes.
+   See crash_inject.h for the lsp_crash_set_target() runtime API. */
+cJSON *wire_build_force_out(const char *checkpoint_name);
+int    wire_parse_force_out(const cJSON *json, char out_name[64]);
+cJSON *wire_build_rotate(uint8_t mode);
+int    wire_parse_rotate(const cJSON *json, uint8_t *out_mode);
 
 #endif /* SUPERSCALAR_WIRE_H */

@@ -273,6 +273,7 @@ add_executable(test_superscalar
     tests/test_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
+    tests/test_crash_checkpoint.c
     tests/test_property.c
     tests/test_backup.c
     tests/test_keyfile.c
