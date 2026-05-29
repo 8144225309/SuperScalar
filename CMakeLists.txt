@@ -251,6 +251,7 @@ add_executable(test_superscalar
     tests/test_p2p.c
     tests/test_regtest.c
     tests/test_factory.c
+    tests/test_factory_multi_input_keyagg.c
     tests/test_tapscript.c
     tests/test_shachain.c
     tests/test_channel.c
