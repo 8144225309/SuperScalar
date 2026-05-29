@@ -4,6 +4,14 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### MuSig2 Phase 2: stateless is now the default (#272)
+
+The BIP-327 stateless MuSig2 signer (introduced in #271 / #330 / #333 / #334 / #336 and validated through the full ceremony + breach + observability stack in #337-#341) is now the **default behavior**. The legacy nonce-pool path is opt-in via `SS_MUSIG_LEGACY=1`. The opt-in `SS_MUSIG_STATELESS=1` env var is now a no-op (the legacy path no longer reads it; test scripts that still set it continue to work but the variable has no effect).
+
+Migration:
+- **No action needed** if you want the new stateless behavior — it is the default.
+- If you need the legacy nonce-pool path for any reason (e.g. operational rollback), set `SS_MUSIG_LEGACY=1` in the LSP environment. This option will be removed in Phase 3.
+
 Major work merged since v0.1.13.  Roughly 220+ PRs (#88–#309).  Covers: PS k² sub-factories, full canonical mixed-arity + static-near-root, scale to N=128, all-four-paths wire-ceremony poison TX, Tier B multi-leaf state-advance ceremony, reorg correctness audit (R1–R6 mainnet pre-flight), schema migrations v22→v36, PTLC infrastructure (turnover ceremony journal, watchtower feed, security gating, production threading), cheat-engine campaign (CL1–CL7), ceremony crash-injection (API helpers + finalization guard + crash-checkpoints), dashboard buildout (12 tabs incl. Live Monitor, Defense Status, Payments, Ceremonies, TX Inventory, Outcomes, per-POV scoping), trustless watchtower schema design + Phase 1a, native Prometheus exporter, mainnet operator runbook, CLN bridge bLIP-56 skeleton (then split to external `superscalar-cln` repo), BIP-158 light-client end-to-end, splice wire-codec marked stub, and ~70 bug fixes.
 
 ### v0.1.14 audit phase 2 + 3 tests (PRs #88–#101)

@@ -5500,12 +5500,17 @@ int test_factory_ps_subfactory_chain_extension(void) {
     {
         size_t n_inp = sub->ps_n_prev_outputs;
         TEST_ASSERT_EQ((long)n_inp, 3, "chain[1] n_inputs = k+1 = 3");
-        secp256k1_musig_secnonce secnonces[3][3];
+        /* SF-MULTI-KEYAGG (#283): channel inputs sign 2-of-2; sales-stock
+           input signs N-of-N.  Drive each input against its own signer set
+           (input_signer_indices[i][s], length input_n_signers[i]). */
+        secp256k1_musig_secnonce secnonces[3][FACTORY_MAX_SIGNERS];
+        memset(secnonces, 0, sizeof(secnonces));
         for (size_t i = 0; i < n_inp; i++) {
             TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
                         "init per-input session");
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
@@ -5513,11 +5518,12 @@ int test_factory_ps_subfactory_chain_extension(void) {
                 TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]),
                             "get pubkey");
                 secp256k1_musig_pubnonce pubnonce;
-                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][j], &pubnonce,
-                                                   seckey, &pk, &sub->keyagg.cache),
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][s], &pubnonce,
+                                                   seckey, &pk,
+                                                   &sub->input_keyaggs[i].cache),
                             "gen nonce");
                 TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
-                                                              i, j, &pubnonce),
+                                                              i, s, &pubnonce),
                             "set nonce per-input");
                 memset(seckey, 0, 32);
             }
@@ -5525,15 +5531,16 @@ int test_factory_ps_subfactory_chain_extension(void) {
                         "finalize per-input");
         }
         for (size_t i = 0; i < n_inp; i++) {
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
-                                ctx, &psig, &secnonces[i][j], &kps[participant],
+                                ctx, &psig, &secnonces[i][s], &kps[participant],
                                 &sub->input_signing_sessions[i]),
                             "create per-input psig");
                 TEST_ASSERT(factory_session_set_partial_sig_input(
-                                f, (size_t)sub0_node_idx, i, j, &psig),
+                                f, (size_t)sub0_node_idx, i, s, &psig),
                             "set per-input psig");
             }
             TEST_ASSERT(factory_session_complete_node_input(
@@ -5566,26 +5573,30 @@ int test_factory_ps_subfactory_chain_extension(void) {
                     (long)(sstock_chain1 - delta2 - f->fee_per_tx),
                     "sales-stock = chain[1] - delta2 - fee");
 
-    /* Sign chain[2] via the per-input flow */
+    /* Sign chain[2] via the per-input flow.  SF-MULTI-KEYAGG (#283):
+       channel inputs sign 2-of-2; sales-stock signs N-of-N. */
     {
         size_t n_inp2 = sub->ps_n_prev_outputs;
         TEST_ASSERT_EQ((long)n_inp2, 3, "chain[2] n_inputs = 3");
-        secp256k1_musig_secnonce secnonces2[3][3];
+        secp256k1_musig_secnonce secnonces2[3][FACTORY_MAX_SIGNERS];
+        memset(secnonces2, 0, sizeof(secnonces2));
         for (size_t i = 0; i < n_inp2; i++) {
             TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
                         "chain[2] init per-input");
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
                 secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
                 secp256k1_musig_pubnonce pubnonce;
-                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces2[i][j], &pubnonce,
-                                                   seckey, &pk, &sub->keyagg.cache),
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces2[i][s], &pubnonce,
+                                                   seckey, &pk,
+                                                   &sub->input_keyaggs[i].cache),
                             "chain[2] gen nonce");
                 TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
-                                                              i, j, &pubnonce),
+                                                              i, s, &pubnonce),
                             "chain[2] set per-input nonce");
                 memset(seckey, 0, 32);
             }
@@ -5593,15 +5604,16 @@ int test_factory_ps_subfactory_chain_extension(void) {
                         "chain[2] finalize per-input");
         }
         for (size_t i = 0; i < n_inp2; i++) {
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
-                                ctx, &psig, &secnonces2[i][j], &kps[participant],
+                                ctx, &psig, &secnonces2[i][s], &kps[participant],
                                 &sub->input_signing_sessions[i]),
                             "chain[2] create psig");
                 TEST_ASSERT(factory_session_set_partial_sig_input(
-                                f, (size_t)sub0_node_idx, i, j, &psig),
+                                f, (size_t)sub0_node_idx, i, s, &psig),
                             "chain[2] set per-input psig");
             }
             TEST_ASSERT(factory_session_complete_node_input(
@@ -5702,25 +5714,29 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
     TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, delta), 1,
                     "advance ok");
 
-    /* Sign chain[1] via per-input flow. */
+    /* Sign chain[1] via per-input flow. SF-MULTI-KEYAGG (#283): channel
+       inputs sign 2-of-2; sales-stock signs N-of-N. */
     {
         size_t n_inp = sub->ps_n_prev_outputs;
-        secp256k1_musig_secnonce secnonces[3][3];
+        secp256k1_musig_secnonce secnonces[3][FACTORY_MAX_SIGNERS];
+        memset(secnonces, 0, sizeof(secnonces));
         for (size_t i = 0; i < n_inp; i++) {
             TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub0_node_idx, i),
                         "init input");
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
                 secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
                 secp256k1_musig_pubnonce pubnonce;
-                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][j], &pubnonce,
-                                                   seckey, &pk, &sub->keyagg.cache),
+                TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[i][s], &pubnonce,
+                                                   seckey, &pk,
+                                                   &sub->input_keyaggs[i].cache),
                             "gen nonce");
                 TEST_ASSERT(factory_session_set_nonce_input(f, (size_t)sub0_node_idx,
-                                                              i, j, &pubnonce),
+                                                              i, s, &pubnonce),
                             "set nonce");
                 memset(seckey, 0, 32);
             }
@@ -5728,15 +5744,16 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
                         "finalize input");
         }
         for (size_t i = 0; i < n_inp; i++) {
-            for (size_t j = 0; j < sub->n_signers; j++) {
-                uint32_t participant = sub->signer_indices[j];
+            size_t this_n = sub->input_n_signers[i];
+            for (size_t s = 0; s < this_n; s++) {
+                uint32_t participant = sub->input_signer_indices[i][s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
-                                ctx, &psig, &secnonces[i][j], &kps[participant],
+                                ctx, &psig, &secnonces[i][s], &kps[participant],
                                 &sub->input_signing_sessions[i]),
                             "create psig");
                 TEST_ASSERT(factory_session_set_partial_sig_input(
-                                f, (size_t)sub0_node_idx, i, j, &psig),
+                                f, (size_t)sub0_node_idx, i, s, &psig),
                             "set psig");
             }
         }

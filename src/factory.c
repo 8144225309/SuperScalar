@@ -1649,6 +1649,37 @@ int factory_find_signer_slot(const factory_t *f, size_t node_idx,
     return -1;
 }
 
+/* SF-MULTI-KEYAGG (#283): return participant_idx's slot in the per-input
+   signer set for input_idx, or -1 if participant_idx does not sign this
+   input.  Requires that factory_session_init_node_input has already been
+   called for (node_idx, input_idx) so the per-input signer indices are
+   populated. */
+int factory_session_get_input_signer_slot(const factory_t *f,
+                                            size_t node_idx,
+                                            size_t input_idx,
+                                            uint32_t participant_idx) {
+    if (!f || node_idx >= f->n_nodes) return -1;
+    const factory_node_t *node = &f->nodes[node_idx];
+    if (!node->input_signing_sessions) return -1;
+    if (input_idx >= node->n_input_sessions) return -1;
+    size_t n = node->input_n_signers[input_idx];
+    if (n == 0 || n > (size_t)FACTORY_MAX_SIGNERS) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (node->input_signer_indices[input_idx][i] == participant_idx)
+            return (int)i;
+    }
+    return -1;
+}
+
+/* SF-MULTI-KEYAGG (#283): boolean wrapper. */
+int factory_session_input_signs(const factory_t *f,
+                                  size_t node_idx,
+                                  size_t input_idx,
+                                  uint32_t participant_idx) {
+    return factory_session_get_input_signer_slot(f, node_idx, input_idx,
+                                                   participant_idx) >= 0;
+}
+
 int factory_sessions_init(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
@@ -2638,8 +2669,10 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
 
     free(node->input_signing_sessions);
     free(node->input_partial_sigs);
+    free(node->input_keyaggs);
     node->input_signing_sessions = NULL;
     node->input_partial_sigs = NULL;
+    node->input_keyaggs = NULL;
     node->n_input_sessions = 0;
 
     node->input_signing_sessions =
@@ -2656,9 +2689,143 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
         node->input_signing_sessions = NULL;
         return 0;
     }
+    /* SF-MULTI-KEYAGG (#283): per-input keyagg cache. */
+    node->input_keyaggs =
+        (musig_keyagg_t *)calloc(node->ps_n_prev_outputs,
+                                   sizeof(musig_keyagg_t));
+    if (!node->input_keyaggs) {
+        free(node->input_signing_sessions);
+        free(node->input_partial_sigs);
+        node->input_signing_sessions = NULL;
+        node->input_partial_sigs = NULL;
+        return 0;
+    }
     memset(node->input_partial_sigs_received, 0,
            sizeof(node->input_partial_sigs_received));
+    memset(node->input_n_signers, 0, sizeof(node->input_n_signers));
+    memset(node->input_signer_indices, 0, sizeof(node->input_signer_indices));
+    memset(node->input_merkle_root, 0, sizeof(node->input_merkle_root));
+    memset(node->input_has_merkle_root, 0, sizeof(node->input_has_merkle_root));
     node->n_input_sessions = node->ps_n_prev_outputs;
+    return 1;
+}
+
+/* SF-MULTI-KEYAGG (#283): recompute the per-channel CLTV taproot merkle
+   root used by sub-factory channel outputs.  Mirrors the chan_merkle_root
+   computation in setup_nway_leaf_outputs (~line 1240).  Returns 1 with
+   has_merkle = 1 + merkle_root32 populated when f->cltv_timeout > 0;
+   returns 1 with has_merkle = 0 (key-path only) otherwise.  Returns 0 on
+   secp256k1/tapscript failure. */
+static int compute_factory_chan_cltv_merkle(const factory_t *f,
+                                              unsigned char *merkle_root32,
+                                              int *has_merkle_out) {
+    if (!f || !merkle_root32 || !has_merkle_out) return 0;
+    *has_merkle_out = 0;
+    if (f->cltv_timeout == 0) return 1;
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
+                                              &f->pubkeys[0]))
+        return 0;
+    tapscript_leaf_t chan_cltv_leaf;
+    if (!tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
+                                        &lsp_xonly, f->ctx))
+        return 0;
+    if (!tapscript_merkle_root(merkle_root32, &chan_cltv_leaf, 1))
+        return 0;
+    *has_merkle_out = 1;
+    return 1;
+}
+
+/* SF-MULTI-KEYAGG (#283): recompute the L-stock CSV taproot merkle root
+   used by sub-factory sales-stock outputs (and leaf-level L-stock outputs).
+   Mirrors build_l_stock_spk's CSV merkle construction.  Returns 1 with
+   merkle populated on success. */
+static int compute_factory_lstock_merkle(const factory_t *f,
+                                          unsigned char *merkle_root32) {
+    if (!f || !merkle_root32) return 0;
+    secp256k1_xonly_pubkey lsp_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
+                                              &f->pubkeys[0]))
+        return 0;
+    uint32_t csv = f->l_stock_csv_blocks > 0
+                   ? f->l_stock_csv_blocks
+                   : L_STOCK_CSV_DEFAULT_BLOCKS;
+    tapscript_leaf_t csv_leaf;
+    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx))
+        return 0;
+    if (!tapscript_merkle_root(merkle_root32, &csv_leaf, 1))
+        return 0;
+    return 1;
+}
+
+/* SF-MULTI-KEYAGG (#283): compute the per-input keyagg + signer set +
+ * taproot merkle root for input `input_idx` of a multi-input sub-factory
+ * chain advance.
+ *
+ * Inputs 0..ps_n_prev_outputs-2 (channel inputs):
+ *   keyagg = MuSig({f->pubkeys[node->signer_indices[i+1]], f->pubkeys[0]})
+ *   signer order = {client, LSP}  (matches setup_nway_leaf_outputs)
+ *   merkle_root = factory channel-CLTV merkle (when cltv_timeout > 0).
+ *   n_signers = 2.
+ *
+ * Input ps_n_prev_outputs-1 (sales-stock input):
+ *   keyagg = node->keyagg  (sub-factory N-of-N).
+ *   signer order = node->signer_indices[]  (LSP at slot 0, clients 1..k).
+ *   merkle_root = node->has_taptree ? node->merkle_root : NULL.
+ *   n_signers = node->n_signers.
+ *
+ * Stores results into node->input_keyaggs[input_idx],
+ * node->input_signer_indices[input_idx][], node->input_n_signers[input_idx],
+ * node->input_merkle_root[input_idx][], node->input_has_merkle_root[input_idx].
+ *
+ * Returns 1 on success, 0 on failure. */
+static int derive_input_keyagg(const factory_t *f,
+                                factory_node_t *node,
+                                size_t input_idx) {
+    if (!f || !node) return 0;
+    if (input_idx >= node->ps_n_prev_outputs) return 0;
+    size_t k_plus_1 = node->ps_n_prev_outputs;
+    size_t sstock_idx = k_plus_1 - 1;
+
+    if (input_idx == sstock_idx) {
+        /* Sales-stock input: spends the prior chain's sales-stock output,
+           which build_l_stock_spk locks with `taproot_tweak(N-of-N agg,
+           L-stock CSV merkle)`.  The keyagg is therefore the sub-factory
+           N-of-N (node->keyagg), and the merkle root is the L-stock CSV
+           merkle (CSV delay + LSP CHECKSIG) -- NOT node->merkle_root,
+           which for PS sub-factory nodes is unused (has_taptree=0). */
+        node->input_keyaggs[input_idx] = node->keyagg;
+        node->input_n_signers[input_idx] = node->n_signers;
+        for (size_t i = 0; i < node->n_signers; i++)
+            node->input_signer_indices[input_idx][i] = node->signer_indices[i];
+        if (!compute_factory_lstock_merkle(f,
+                                            node->input_merkle_root[input_idx]))
+            return 0;
+        node->input_has_merkle_root[input_idx] = 1;
+        return 1;
+    }
+
+    /* Channel input i: per-channel keyagg {client_i, LSP} + factory chan
+       CLTV merkle (when cltv_timeout > 0).  setup_nway_leaf_outputs builds
+       channel SPKs as MuSig({client, LSP}) — signer order MUST match. */
+    if (input_idx + 1 >= node->n_signers) return 0;  /* signer_indices[i+1] must exist */
+    uint32_t client_participant = node->signer_indices[input_idx + 1];
+    secp256k1_pubkey pks[2];
+    pks[0] = f->pubkeys[client_participant];
+    pks[1] = f->pubkeys[0];
+    if (!musig_aggregate_keys(f->ctx, &node->input_keyaggs[input_idx], pks, 2))
+        return 0;
+    node->input_n_signers[input_idx] = 2;
+    node->input_signer_indices[input_idx][0] = client_participant;
+    node->input_signer_indices[input_idx][1] = 0;
+
+    int has_merkle = 0;
+    if (!compute_factory_chan_cltv_merkle(f,
+                                            node->input_merkle_root[input_idx],
+                                            &has_merkle))
+        return 0;
+    node->input_has_merkle_root[input_idx] = has_merkle;
+    if (!has_merkle) memset(node->input_merkle_root[input_idx], 0, 32);
     return 1;
 }
 
@@ -2670,12 +2837,27 @@ int factory_session_init_node_input(factory_t *f, size_t node_idx, size_t input_
     if (input_idx >= node->ps_n_prev_outputs) return 0;
     if (!ensure_input_sessions_alloc(node)) return 0;
 
+    /* SF-MULTI-KEYAGG (#283): derive the per-input keyagg before init.
+       Channel inputs use 2-of-2 {client_i, LSP}; sales-stock uses N-of-N. */
+    if (!derive_input_keyagg(f, node, input_idx)) {
+        fprintf(stderr,
+                "factory_session_init_node_input %zu/%zu: derive_input_keyagg failed\n",
+                node_idx, input_idx);
+        return 0;
+    }
     musig_session_init(&node->input_signing_sessions[input_idx],
-                        &node->keyagg, node->n_signers);
+                        &node->input_keyaggs[input_idx],
+                        node->input_n_signers[input_idx]);
     node->input_partial_sigs_received[input_idx] = 0;
     return 1;
 }
 
+/* SF-MULTI-KEYAGG (#283): `signer_slot` is the slot into the PER-INPUT
+   signer set (input_signer_indices[input_idx][]), NOT the node-level signer
+   set.  For channel inputs the per-input set has 2 entries ({client, LSP});
+   for the sales-stock input it matches node->signer_indices[].  Callers
+   should resolve participant_idx -> slot via factory_session_get_input_signer_slot
+   before calling this function. */
 int factory_session_set_nonce_input(factory_t *f, size_t node_idx, size_t input_idx,
                                       size_t signer_slot,
                                       const secp256k1_musig_pubnonce *pubnonce) {
@@ -2683,7 +2865,7 @@ int factory_session_set_nonce_input(factory_t *f, size_t node_idx, size_t input_
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->input_signing_sessions) return 0;
     if (input_idx >= node->n_input_sessions) return 0;
-    if (signer_slot >= node->n_signers) return 0;
+    if (signer_slot >= node->input_n_signers[input_idx]) return 0;
     return musig_session_set_pubnonce(&node->input_signing_sessions[input_idx],
                                         signer_slot, pubnonce);
 }
@@ -2700,7 +2882,12 @@ int factory_session_finalize_node_input(factory_t *f, size_t node_idx, size_t in
                 node_idx, input_idx);
         return 0;
     }
-    const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+    /* SF-MULTI-KEYAGG (#283): per-input merkle root.  Channel inputs use the
+       factory channel-CLTV merkle (or NULL when cltv_timeout=0); sales-stock
+       input uses the sub-factory's own merkle (or NULL when no taptree). */
+    const unsigned char *mr = node->input_has_merkle_root[input_idx]
+                              ? node->input_merkle_root[input_idx]
+                              : NULL;
     int ok = musig_session_finalize_nonces(f->ctx,
                                             &node->input_signing_sessions[input_idx],
                                             sighash, mr, NULL);
@@ -2710,6 +2897,9 @@ int factory_session_finalize_node_input(factory_t *f, size_t node_idx, size_t in
     return ok;
 }
 
+/* SF-MULTI-KEYAGG (#283): `signer_slot` is into the PER-INPUT signer set
+   (input_signer_indices[input_idx][]).  Bounds check against
+   input_n_signers[input_idx], not node->n_signers. */
 int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t input_idx,
                                             size_t signer_slot,
                                             const secp256k1_musig_partial_sig *psig) {
@@ -2718,7 +2908,7 @@ int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t 
     if (!node->input_signing_sessions) return 0;
     if (input_idx >= node->n_input_sessions) return 0;
     if (signer_slot >= (size_t)FACTORY_MAX_SIGNERS) return 0;
-    if (signer_slot >= node->n_signers) return 0;
+    if (signer_slot >= node->input_n_signers[input_idx]) return 0;
     secp256k1_musig_partial_sig *slot =
         &node->input_partial_sigs[input_idx * (size_t)FACTORY_MAX_SIGNERS + signer_slot];
     *slot = *psig;
@@ -2735,7 +2925,9 @@ int factory_session_complete_node_input(factory_t *f, size_t node_idx, size_t in
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->input_signing_sessions) return 0;
     if (input_idx >= node->n_input_sessions) return 0;
-    if (node->input_partial_sigs_received[input_idx] != (int)node->n_signers) return 0;
+    /* SF-MULTI-KEYAGG (#283): each input may have a different signer count. */
+    if (node->input_partial_sigs_received[input_idx] !=
+        (int)node->input_n_signers[input_idx]) return 0;
     return 1;
 }
 
@@ -2744,11 +2936,14 @@ int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx) {
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->input_signing_sessions) return 0;
     if (node->n_input_sessions == 0) return 0;
-    /* All inputs must have full partial sigs collected. */
+    /* All inputs must have full partial sigs collected.  SF-MULTI-KEYAGG
+       (#283): the required count is per-input. */
     for (size_t i = 0; i < node->n_input_sessions; i++) {
-        if (node->input_partial_sigs_received[i] != (int)node->n_signers) {
+        if (node->input_partial_sigs_received[i] !=
+            (int)node->input_n_signers[i]) {
             fprintf(stderr, "assemble_signed_tx_multi node=%zu input=%zu has %d/%zu sigs\n",
-                    node_idx, i, node->input_partial_sigs_received[i], node->n_signers);
+                    node_idx, i, node->input_partial_sigs_received[i],
+                    node->input_n_signers[i]);
             return 0;
         }
     }
@@ -2758,9 +2953,11 @@ int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx) {
     for (size_t i = 0; i < node->n_input_sessions; i++) {
         secp256k1_musig_partial_sig *psigs =
             &node->input_partial_sigs[i * (size_t)FACTORY_MAX_SIGNERS];
+        /* SF-MULTI-KEYAGG (#283): aggregate with the per-input signer count
+           (not the node-level n_signers). */
         if (!musig_aggregate_partial_sigs(f->ctx, sigs64 + 64 * i,
                                             &node->input_signing_sessions[i],
-                                            psigs, node->n_signers)) {
+                                            psigs, node->input_n_signers[i])) {
             free(sigs64);
             return 0;
         }
@@ -4000,6 +4197,9 @@ void factory_free(factory_t *f) {
         f->nodes[i].input_signing_sessions = NULL;
         free(f->nodes[i].input_partial_sigs);
         f->nodes[i].input_partial_sigs = NULL;
+        /* SF-MULTI-KEYAGG (#283): free per-input keyagg cache. */
+        free(f->nodes[i].input_keyaggs);
+        f->nodes[i].input_keyaggs = NULL;
         f->nodes[i].n_input_sessions = 0;
     }
     /* F4: factory-level distribution TX buffer (populated by

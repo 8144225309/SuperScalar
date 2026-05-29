@@ -101,6 +101,7 @@ extern int test_factory_advance(void);
 extern int test_factory_sign_split_round_step_by_step(void);
 extern int test_factory_split_round_with_pool(void);
 extern int test_factory_advance_split_round(void);
+extern int test_factory_multi_input_keyagg(void);
 extern int test_regtest_factory_tree(void);
 
 extern int test_bip158_backend_init(void);
@@ -1995,6 +1996,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_sign_split_round_step_by_step);
     RUN_TEST(test_factory_split_round_with_pool);
     RUN_TEST(test_factory_advance_split_round);
+    RUN_TEST(test_factory_multi_input_keyagg);
 
     printf("\n=== BIP 158 Compact Block Filters ===\n");
     RUN_TEST(test_bip158_backend_init);

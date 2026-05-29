@@ -7,5 +7,17 @@
 # Add an entry only if the leak is provably in third-party code that we
 # cannot fix and cannot reasonably work around. Every entry should have a
 # comment explaining what it suppresses and why we accept it.
-#
-# (none yet)
+
+# sqlite3 library internals.  When a process exits without calling
+# sqlite3_close (e.g. the LSP is SIGTERM'd by a test harness before its
+# main loop sees g_shutdown), sqlite intentionally retains:
+#   - the FTS3 module init globals (allocated once at module load,
+#     never freed by design — see sqlite3Fts3Init)
+#   - per-connection builtin-function tables (also one-shot init)
+#   - some parser scratch space attached to in-flight prepare_v2 frames
+# None of these are SuperScalar code paths; they are 100% inside the
+# system libsqlite3.so.  Confirmed unfixable upstream — see the sqlite
+# source under ext/fts3 + src/func.c.
+leak:sqlite3Fts3Init
+leak:sqlite3RegisterPerConnectionBuiltinFunctions
+leak:sqlite3RunParser

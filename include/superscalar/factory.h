@@ -206,6 +206,18 @@ typedef struct {
     int input_partial_sigs_received[FACTORY_MAX_OUTPUTS];   /* per-input count */
     size_t n_input_sessions;
 
+    /* SF-MULTI-KEYAGG (#283): per-input keyagg metadata.  Each input of a
+       multi-input chain advance spends a different prev-output: channel
+       outputs (2-of-2 {client_i, LSP} + factory_cltv merkle) for inputs
+       0..k-1, and the sub-factory sales-stock output (N-of-N, no merkle)
+       for input k.  These arrays are allocated by ensure_input_sessions_alloc
+       alongside input_signing_sessions and parallel-indexed by input_idx. */
+    musig_keyagg_t   *input_keyaggs;          /* length n_input_sessions */
+    uint32_t          input_signer_indices[FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS];
+    size_t            input_n_signers[FACTORY_MAX_OUTPUTS];
+    unsigned char     input_merkle_root[FACTORY_MAX_OUTPUTS][32];
+    int               input_has_merkle_root[FACTORY_MAX_OUTPUTS];
+
     /* PS sub-factory wiring (only used when ps_subfactory_arity > 1, the
        canonical k² shape from t/1242).
 
@@ -791,6 +803,21 @@ int factory_build_cooperative_close_unsigned(
 /* Find signer_slot for participant_idx in a node. Returns slot index or -1. */
 int factory_find_signer_slot(const factory_t *f, size_t node_idx,
                               uint32_t participant_idx);
+
+/* SF-MULTI-KEYAGG (#283): per-input signer-slot helpers.  Multi-input
+   sub-factory chain advance nodes use a per-input keyagg whose signer set
+   differs from the node-level signer set (channel inputs sign 2-of-2;
+   sales-stock input signs N-of-N).  These helpers expose the
+   participant->slot mapping so the wire layer can dispatch correctly. */
+int factory_session_get_input_signer_slot(const factory_t *f,
+                                            size_t node_idx,
+                                            size_t input_idx,
+                                            uint32_t participant_idx);
+int factory_session_input_signs(const factory_t *f,
+                                  size_t node_idx,
+                                  size_t input_idx,
+                                  uint32_t participant_idx);
+
 
 /* Initialize signing sessions for all nodes. Resets partial_sigs_received. */
 int factory_sessions_init(factory_t *f);

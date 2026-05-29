@@ -234,7 +234,7 @@ while [ "$WAITED" -lt 600 ]; do
         break
     fi
     if [ $((WAITED % 20)) -eq 0 ]; then
-        SUB_PROGRESS=$(grep -c "sub-factory.*chain extended\|PS K² SUB-FACTORY TEST" "$LSP_LOG" 2>/dev/null || echo 0)
+        SUB_PROGRESS=$(grep -cE "sub-factory.*chain extended|LSP-stateless subfactory MULTI-INPUT advance.*DONE|PS K² SUB-FACTORY TEST" "$LSP_LOG" 2>/dev/null || echo 0)
         echo "  ... ${WAITED}s elapsed, sub-factory markers in LSP log: $SUB_PROGRESS"
     fi
     sleep 2
@@ -271,12 +271,12 @@ if ! grep -q "PS K² SUB-FACTORY CHAIN EXTENSION TEST" "$LSP_LOG"; then
 fi
 echo "  test header present"
 
-if ! grep -q "sub-factory.*chain extended" "$LSP_LOG"; then
+if ! grep -qE "sub-factory.*chain extended|LSP-stateless subfactory MULTI-INPUT advance.*DONE" "$LSP_LOG"; then
     echo "FAIL: sub-factory chain extension never fired"
     tail -80 "$LSP_LOG"
     exit 1
 fi
-CE_LINE=$(grep "sub-factory.*chain extended" "$LSP_LOG" | head -1)
+CE_LINE=$(grep -E "sub-factory.*chain extended|LSP-stateless subfactory MULTI-INPUT advance.*DONE" "$LSP_LOG" | head -1)
 echo "  $CE_LINE"
 
 if ! grep -q "PS K² SUB-FACTORY TEST: PASS" "$LSP_LOG"; then
@@ -314,9 +314,9 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
     # multi-input ceremony (#142 SF-A) which logs "advanced (MULTI) to
     # chain_len".  Sub-factories with ps_chain_len>0 + n_prev_outputs>1
     # use the multi-input MuSig fork added in PR #270.
-    if grep -qE "sub-factory.*advanced( \(MULTI\))? to chain_len" "$LOG" 2>/dev/null; then
+    if grep -qE "sub-factory.*advanced( \(MULTI\))? to chain_len|Client-stateless subfactory MULTI-INPUT [0-9]+: advance done" "$LOG" 2>/dev/null; then
         PARTICIPATED=$((PARTICIPATED + 1))
-        SA=$(grep -E "sub-factory.*advanced( \(MULTI\))? to chain_len" "$LOG" | head -1)
+        SA=$(grep -E "sub-factory.*advanced( \(MULTI\))? to chain_len|Client-stateless subfactory MULTI-INPUT [0-9]+: advance done" "$LOG" | head -1)
         echo "  client[$i]: participated — $SA"
     else
         echo "  client[$i]: no sub-factory advance marker (may be in different sub-factory)"

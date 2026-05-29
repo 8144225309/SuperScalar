@@ -725,12 +725,12 @@ int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_spk, size_t funding_spk_len,
                               uint16_t step_blocks, uint32_t states_per_layer,
                               uint32_t cltv_timeout) {
-    /* Phase 1e.3.b (#271): when --musig-stateless is set, dispatch to the
-       reversed-flow stub.  Returns -1 to signal fall-through to legacy if
-       the stateless variant cannot handle this case. */
+    /* Phase 2 (#272): stateless is default-on; SS_MUSIG_LEGACY=1 falls back.
+       Stateless variant returns -1 to signal cases it cannot handle.
+       Phase 3 deletes the legacy fall-through. */
     {
-        const char *stateless = getenv("SS_MUSIG_STATELESS");
-        if (stateless && stateless[0] == '1') {
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        if (!legacy || legacy[0] != '1') {
             extern int lsp_run_factory_creation_stateless(lsp_t *,
                 const unsigned char *, uint32_t, uint64_t,
                 const unsigned char *, size_t, uint16_t, uint32_t, uint32_t);
