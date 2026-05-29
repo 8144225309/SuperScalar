@@ -3,6 +3,7 @@
 
 #include "channel.h"
 #include "persist.h"
+#include "persist_wt.h"
 #include "regtest.h"
 #include "fee.h"
 #include "chain_backend.h"
@@ -328,6 +329,17 @@ int watchtower_build_force_close_htlcs(const channel_t *ch,
                                          watchtower_htlc_t *htlcs_out,
                                          size_t htlcs_max,
                                          size_t *n_htlcs_out);
+
+/* SF-WT-TRUSTLESS Phase 2 (#248): hydrate the in-memory watchtower from
+ * a wt_db file (separate from lsp.db).  Reads every non-superseded row
+ * from wt_watches + wt_responses and registers each as a factory-node
+ * watch via watchtower_watch_factory_node().
+ *
+ * Returns the count of successfully registered watches on success, -1
+ * on error.  NULL inputs return -1.  Idempotent — calling twice
+ * registers each row twice (caller's responsibility to call once at
+ * startup). */
+int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt);
 
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
