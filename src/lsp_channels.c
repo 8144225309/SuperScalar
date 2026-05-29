@@ -3086,6 +3086,21 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t realloc_old_l_amount = (realloc_old_n_outputs >= 2)
         ? node->outputs[realloc_old_n_outputs - 1].amount_sats : 0;
     int realloc_had_signed = (node->is_signed && node->signed_tx.len > 0);
+    /* SF-WT-TRUSTLESS Phase 1b.5b (#248): snapshot OLD chain output for
+     * wt_db register at the bottom of this function.  Same pattern as
+     * leaf advance (Phase 1b.4) and Tier B (Phase 1b.5a). */
+    uint64_t realloc_old_chain_amount = (realloc_old_n_outputs >= 1)
+        ? node->outputs[0].amount_sats : 0;
+    unsigned char realloc_old_chain_spk[34] = {0};
+    size_t realloc_old_chain_spk_len = (realloc_old_n_outputs >= 1)
+        ? node->outputs[0].script_pubkey_len : 0;
+    if (realloc_old_chain_spk_len > sizeof(realloc_old_chain_spk))
+        realloc_old_chain_spk_len = sizeof(realloc_old_chain_spk);
+    if (realloc_old_n_outputs >= 1)
+        memcpy(realloc_old_chain_spk,
+               node->outputs[0].script_pubkey,
+               realloc_old_chain_spk_len);
+    uint32_t realloc_old_csv_delay = (uint32_t)(node->nsequence & 0xFFFFu);
 
     const uint64_t REALLOC_POISON_FEE_SATS = 1000;
     int realloc_poison_prepared = 0;
@@ -3438,6 +3453,35 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                "(response_tx=%zub, poison=%s, %zu channels)\n",
                node_idx, (size_t)node->signed_tx.len,
                poison_data ? "yes" : "no", n_leaf_ch);
+
+        /* SF-WT-TRUSTLESS Phase 1b.5b: parallel wt_db register for
+         * leaf realloc.  Uses snapshot taken before realloc mutated
+         * outputs[]. */
+        if (lsp && lsp->wt_db && realloc_had_signed && realloc_old_chain_spk_len > 0) {
+            int64_t watch_id = lsp_wt_register_factory_node_watch(
+                lsp->wt_db,
+                (uint32_t)node_idx,
+                realloc_old_leaf_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ realloc_old_chain_amount,
+                realloc_old_chain_spk, realloc_old_chain_spk_len,
+                /* csv_delay        */ realloc_old_csv_delay,
+                node->signed_tx.data, node->signed_tx.len,
+                node->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered realloc watch_id=%lld "
+                       "for node %zu (parent=%llu sats, csv=%u)\n",
+                       (long long)watch_id, node_idx,
+                       (unsigned long long)realloc_old_chain_amount,
+                       (unsigned)realloc_old_csv_delay);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "realloc node %zu\n", node_idx);
+            }
+        }
     }
 
     /* Step 12: Update channel amounts in lsp_channel_entry_t.
