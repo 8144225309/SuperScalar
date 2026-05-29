@@ -2292,6 +2292,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     int poison_client_slot[FACTORY_MAX_NODES];
     unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
     unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    /* SF-WT-TRUSTLESS Phase 1b.5 (#248): per-affected-node snapshot of
+     * the OLD chain output (vout=0) value + SPK + BIP-68 CSV.  Indexed
+     * by affected[] order (k), mirrors the per-k poison_* arrays. */
+    int wt_had_old[FACTORY_MAX_NODES];
+    uint64_t wt_old_chain_amount[FACTORY_MAX_NODES];
+    unsigned char wt_old_chain_spk[FACTORY_MAX_NODES][34];
+    size_t wt_old_chain_spk_len[FACTORY_MAX_NODES];
+    uint32_t wt_old_csv_delay[FACTORY_MAX_NODES];
     for (size_t k = 0; k < n_affected; k++) {
         poison_prepared[k] = 0;
         poison_client_slot[k] = -1;
@@ -2305,6 +2313,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
         poison_old_l_amount[k] = (old_no >= 2)
             ? an->outputs[old_no - 1].amount_sats : 0;
+        /* Phase 1b.5: chain output (vout=0) snapshot for wt_db. */
+        wt_had_old[k] = had_old;
+        wt_old_chain_amount[k] = (old_no >= 1) ? an->outputs[0].amount_sats : 0;
+        wt_old_chain_spk_len[k] = (old_no >= 1) ? an->outputs[0].script_pubkey_len : 0;
+        if (wt_old_chain_spk_len[k] > 34) wt_old_chain_spk_len[k] = 34;
+        if (old_no >= 1)
+            memcpy(wt_old_chain_spk[k],
+                   an->outputs[0].script_pubkey,
+                   wt_old_chain_spk_len[k]);
+        wt_old_csv_delay[k] = (uint32_t)(an->nsequence & 0xFFFFu);
         if (mgr->watchtower && !an->is_ps_leaf && had_old && old_no >= 2 &&
             poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
                 (uint64_t)(an->n_signers - 1) * 330u) {
@@ -2796,6 +2814,37 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 an->signed_tx.data, an->signed_tx.len,
                 poison_data, poison_len,
                 leaf_ch_ids, n_leaf_ch);
+
+            /* SF-WT-TRUSTLESS Phase 1b.5: parallel wt_db register for
+             * Tier B state advance.  Same pattern as leaf-advance
+             * (Phase 1b.3+1b.4); uses the per-k snapshot captured before
+             * factory_advance mutated the OLD chain output. */
+            if (lsp && lsp->wt_db && wt_had_old[k] && wt_old_chain_spk_len[k] > 0) {
+                int64_t watch_id = lsp_wt_register_factory_node_watch(
+                    lsp->wt_db,
+                    (uint32_t)affected[k],
+                    poison_old_txid[k],
+                    /* parent_vout      */ 0,
+                    /* parent_value_sat */ wt_old_chain_amount[k],
+                    wt_old_chain_spk[k], wt_old_chain_spk_len[k],
+                    /* csv_delay        */ wt_old_csv_delay[k],
+                    an->signed_tx.data, an->signed_tx.len,
+                    an->txid,
+                    /* fee_bump_budget  */ 0,
+                    /* fee_bump_dline   */ 0);
+                if (watch_id > 0) {
+                    printf("LSP-WT-TRUSTLESS: registered tier-B watch_id=%lld "
+                           "for node %zu (parent=%llu sats, csv=%u)\n",
+                           (long long)watch_id, affected[k],
+                           (unsigned long long)wt_old_chain_amount[k],
+                           (unsigned)wt_old_csv_delay[k]);
+                } else {
+                    fprintf(stderr,
+                            "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                            "tier-B node %zu\n", affected[k]);
+                }
+            }
+
             if (poison_prepared[k])
                 factory_session_reset_poison(f, affected[k]);
         }
