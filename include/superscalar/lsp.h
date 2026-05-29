@@ -5,6 +5,7 @@
 #include "wire.h"
 #include "rate_limit.h"
 #include "persist.h"
+#include "persist_wt.h"
 #include <secp256k1.h>
 
 #define LSP_MAX_CLIENTS 128
@@ -80,6 +81,19 @@ typedef struct {
     /* SF-BACKUP-PRE-ROTATION (#213): if non-NULL, dir to write
      * pre-rotation SQLite snapshots into.  NULL = disabled. */
     char *backup_dir;
+
+    /* SF-WT-TRUSTLESS Phase 1b (#248): optional handle to the
+     * watchtower-side persistence file.  When non-NULL, the LSP mirrors
+     * each ceremony-completion watch+response pair into this file (which
+     * the watchtower process will be the only reader of in Phase 2).
+     * Owned by the binary (tools/superscalar_lsp.c) — the lsp_t struct
+     * holds a borrowed pointer, never frees it.
+     *
+     * NULL is the legacy / not-configured state.  Phase 1b lands the
+     * struct field + CLI plumbing only; the LSP-side register callsites
+     * follow in Phase 1b.2.  See docs/watchtower-trustless-schema.md
+     * for the trust model. */
+    persist_wt_t *wt_db;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */

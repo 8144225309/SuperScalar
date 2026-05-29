@@ -72,6 +72,11 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 static volatile sig_atomic_t g_shutdown = 0;
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
 static persist_t *g_db = NULL;  /* for broadcast audit logging */
+/* SF-WT-TRUSTLESS Phase 1b (#248): optional watchtower-side DB.
+ * NULL unless --wt-db was passed.  Subsequent phases call
+ * persist_wt_register_watch on this handle from ceremony completion
+ * sites; Phase 1b.1 only wires the lifecycle. */
+static persist_wt_t *g_wt_db = NULL;
 
 /* BOLT #8 server thread — owns g_bolt8_cfg; runs blocking accept loop */
 static bolt8_server_cfg_t g_bolt8_cfg;
@@ -266,6 +271,7 @@ static void usage(const char *prog) {
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
+        "  --wt-db PATH        Watchtower-side SQLite database (SF-WT-TRUSTLESS Phase 1b, #248). When set, the LSP opens this file alongside --db and (in subsequent phases) writes watch+response entries the WT process consumes. No secrets ever cross into wt_db. See docs/watchtower-trustless-schema.md.\n"
         "  --network MODE      Network: regtest, signet, testnet, testnet4, mainnet (default: regtest)\n"
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
@@ -1293,6 +1299,8 @@ int main(int argc, char *argv[]) {
     const char *seckey_hex = NULL;
     const char *report_path = NULL;
     const char *db_path = NULL;
+    /* SF-WT-TRUSTLESS Phase 1b (#248): optional watchtower.db path. */
+    const char *wt_db_path = NULL;
     const char *backup_dir = NULL;
     const char *network = NULL;
     const char *keyfile_path = NULL;
@@ -1521,6 +1529,8 @@ int main(int argc, char *argv[]) {
             backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
+        else if (strcmp(argv[i], "--wt-db") == 0 && i + 1 < argc)
+            wt_db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
             network = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
@@ -2343,6 +2353,12 @@ int main(int argc, char *argv[]) {
     /* Initialize persistence (optional) */
     persist_t db;
     int use_db = 0;
+    /* SF-WT-TRUSTLESS Phase 1b: separate watchtower-side DB handle.
+     * Lifecycle is identical to db but the two files are decoupled — a
+     * future deployment may run the WT on a different host with read-only
+     * access to its OWN file and no knowledge of lsp.db. */
+    persist_wt_t wt_db;
+    int use_wt_db = 0;
     if (db_path) {
         if (!persist_open(&db, db_path)) {
             fprintf(stderr, "Error: cannot open database: %s\n", db_path);
@@ -2365,6 +2381,25 @@ int main(int argc, char *argv[]) {
 
         /* Wire message logging (Phase 22) */
         wire_set_log_callback(lsp_wire_log_cb, &db);
+    }
+
+    /* SF-WT-TRUSTLESS Phase 1b: open watchtower DB if requested.  This
+     * file is INDEPENDENT of lsp.db on purpose (separate file → separate
+     * unix permissions → separate trust surface).  --wt-db may be set
+     * without --db (WT-only configuration) or alongside --db (the
+     * typical case during the Phase 2 transition where lsp.db still
+     * holds the canonical state). */
+    if (wt_db_path) {
+        if (!persist_wt_open(&wt_db, wt_db_path)) {
+            fprintf(stderr, "Error: cannot open watchtower database: %s\n",
+                    wt_db_path);
+            if (use_db) persist_close(&db);
+            report_close(&rpt);
+            return 1;
+        }
+        use_wt_db = 1;
+        g_wt_db = &wt_db;
+        printf("LSP: watchtower persistence enabled (%s)\n", wt_db_path);
     }
 
     /* Tor SOCKS5 proxy setup */
@@ -3116,6 +3151,11 @@ accept_new_factory:
        can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
        supplied — leaving lsp_p->db NULL is the legacy/no-persistence path. */
     lsp_p->db = g_db;
+    /* SF-WT-TRUSTLESS Phase 1b (#248): plumb the optional watchtower-side
+     * persist handle.  NULL unless --wt-db was supplied.  Phase 1b.1 only
+     * propagates the handle; ceremony-completion callsites that emit
+     * persist_wt_register_watch calls land in Phase 1b.2. */
+    lsp_p->wt_db = g_wt_db;
     if (_has_bridge_pubkey_arg)
         lsp_set_expected_bridge_pubkey(lsp_p, &_bridge_pubkey_arg);
     /* SF-BACKUP-PRE-ROTATION (#213): operator-configurable backup dir;
@@ -4503,6 +4543,11 @@ accept_new_factory:
         goto accept_new_factory;
     }
 
+    /* SF-WT-TRUSTLESS Phase 1b: close wt_db at the natural shutdown
+     * path.  Error-path exits skip this and rely on OS process cleanup;
+     * SQLite WAL mode keeps committed data durable through abrupt close. */
+    if (use_wt_db)
+        persist_wt_close(&wt_db);
     if (use_db)
         persist_close(&db);
     if (tor_control_fd >= 0)
