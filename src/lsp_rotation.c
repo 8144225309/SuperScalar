@@ -681,49 +681,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
         /* Mark as rotated so CLI "rotate" won't try to rotate it again */
         dying->partial_rotation_done = 1;
-        /* CL4-rollover (#250): mid-window cheat broadcast. After
-           partial_rotation_done is set, the rotation has reached the
-           point where the new factory is committed enough that an
-           honest LSP wouldn't reach back into the dying factory's
-           commitments. A malicious LSP COULD broadcast a dying-factory
-           leaf TX to try to claim funds the new factory should own.
-           The watchtower must detect this on its block scan and
-           respond with the penalty TX. */
-        {
-            static int ss_cheat_rollover_fired = 0;
-            const char *cheat_on = getenv("SS_CHEAT_ROLLOVER");
-            const char *phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
-            if (!ss_cheat_rollover_fired && cheat_on && atoi(cheat_on) == 1 &&
-                phase && strcmp(phase, "mid-window") == 0 &&
-                dying && dying->factory.n_leaf_nodes > 0) {
-                size_t li = dying->factory.leaf_node_indices[0];
-                factory_node_t *cheat_leaf_node = &dying->factory.nodes[li];
-                if (cheat_leaf_node->is_signed && cheat_leaf_node->signed_tx.len > 0) {
-                    char *cheat_hex = malloc(cheat_leaf_node->signed_tx.len * 2 + 1);
-                    char cheat_txid[65] = {0};
-                    if (cheat_hex) {
-                        extern void hex_encode(const unsigned char *, size_t, char *);
-                        hex_encode(cheat_leaf_node->signed_tx.data,
-                                    cheat_leaf_node->signed_tx.len, cheat_hex);
-                        int sent = chain_be
-                            ? chain_be->send_raw_tx(chain_be, cheat_hex, cheat_txid)
-                            : (rt ? regtest_send_raw_tx(rt, cheat_hex, cheat_txid) : 0);
-                        fprintf(stderr,
-                                "CL4-ROLLOVER: mid-window broadcast of dying factory %u "
-                                "leaf 0 tx: sent=%d txid=%s (severity=HIGH)\n",
-                                dying_id, sent, cheat_txid);
-                        if (sent && mgr->persist) {
-                            persist_log_broadcast((persist_t *)mgr->persist,
-                                                    cheat_txid,
-                                                    "cheat_rollover_stale",
-                                                    cheat_hex, "ok");
-                        }
-                        free(cheat_hex);
-                        ss_cheat_rollover_fired = 1;
-                    }
-                }
-            }
-        }
+        /* CL4-rollover (#250): the mid-window adversarial broadcast that
+           used to live here was dead code on the regtest test path —
+           lsp_channels_rotate_factory only runs under --daemon (mgr->
+           rot_auto_rotate = daemon_mode in superscalar_lsp.c) but the
+           test wrapper test_regtest_cheat_daemon_rollover.sh uses --demo
+           with --test-tier-b-rollover.  Adversarial scaffolding now
+           lives in tools/superscalar_lsp_pre_daemon_tests.inc inside
+           test_tier_b_rollover (mirrors the CL2 cheat-realloc precedent:
+           cheat logic in _tests.inc, not production library code). */
 
     } else {
         /* Partial rotation: skip cooperative close, old factory expires naturally.
@@ -731,49 +697,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: Phase B — partial retirement of factory %u "
                "(distribution TX on expiry)\n", dying_id);
         dying->partial_rotation_done = 1;
-        /* CL4-rollover (#250): mid-window cheat broadcast. After
-           partial_rotation_done is set, the rotation has reached the
-           point where the new factory is committed enough that an
-           honest LSP wouldn't reach back into the dying factory's
-           commitments. A malicious LSP COULD broadcast a dying-factory
-           leaf TX to try to claim funds the new factory should own.
-           The watchtower must detect this on its block scan and
-           respond with the penalty TX. */
-        {
-            static int ss_cheat_rollover_fired = 0;
-            const char *cheat_on = getenv("SS_CHEAT_ROLLOVER");
-            const char *phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
-            if (!ss_cheat_rollover_fired && cheat_on && atoi(cheat_on) == 1 &&
-                phase && strcmp(phase, "mid-window") == 0 &&
-                dying && dying->factory.n_leaf_nodes > 0) {
-                size_t li = dying->factory.leaf_node_indices[0];
-                factory_node_t *cheat_leaf_node = &dying->factory.nodes[li];
-                if (cheat_leaf_node->is_signed && cheat_leaf_node->signed_tx.len > 0) {
-                    char *cheat_hex = malloc(cheat_leaf_node->signed_tx.len * 2 + 1);
-                    char cheat_txid[65] = {0};
-                    if (cheat_hex) {
-                        extern void hex_encode(const unsigned char *, size_t, char *);
-                        hex_encode(cheat_leaf_node->signed_tx.data,
-                                    cheat_leaf_node->signed_tx.len, cheat_hex);
-                        int sent = chain_be
-                            ? chain_be->send_raw_tx(chain_be, cheat_hex, cheat_txid)
-                            : (rt ? regtest_send_raw_tx(rt, cheat_hex, cheat_txid) : 0);
-                        fprintf(stderr,
-                                "CL4-ROLLOVER: mid-window broadcast of dying factory %u "
-                                "leaf 0 tx: sent=%d txid=%s (severity=HIGH)\n",
-                                dying_id, sent, cheat_txid);
-                        if (sent && mgr->persist) {
-                            persist_log_broadcast((persist_t *)mgr->persist,
-                                                    cheat_txid,
-                                                    "cheat_rollover_stale",
-                                                    cheat_hex, "ok");
-                        }
-                        free(cheat_hex);
-                        ss_cheat_rollover_fired = 1;
-                    }
-                }
-            }
-        }
+        /* CL4-rollover (#250): see comment in the full-close branch above —
+           mid-window cheat broadcast moved into _pre_daemon_tests.inc. */
 
         if (mgr->persist) {
             const char *st = "dying";

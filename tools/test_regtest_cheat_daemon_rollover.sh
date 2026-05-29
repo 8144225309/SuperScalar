@@ -25,6 +25,10 @@ LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 WT_BIN="$BUILD_DIR/superscalar_watchtower"
 
+# LSP NK static pubkey corresponds to LSP_SECKEY=0x...01 (BIP-340 x-only G).
+# Clients pass this via --lsp-pubkey so the Noise handshake succeeds.
+LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
 N_CLIENTS="${N_CLIENTS:-2}"
 FUNDING_SATS="${FUNDING_SATS:-200000}"
 
@@ -122,7 +126,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet ss_cheat_rollover_miner \
     --db "$LSP_DB" \
-    --demo --test-tier-b-rollover --cheat-daemon-rollover=mid-window \
+    --demo --test-tier-b-rollover --cheat-daemon-rollover mid-window \
     --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
@@ -144,6 +148,7 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
         --network regtest \
         --lsp-host 127.0.0.1 \
         --lsp-port $LSP_PORT \
+        --lsp-pubkey "$LSP_PUBKEY" \
         --seckey "$CLIENT_SECKEY" \
         --rpcuser ${RPCUSER:-rpcuser} \
         --rpcpassword ${RPCPASSWORD:-rpcpass} \
@@ -191,8 +196,11 @@ done
 echo
 echo "=== Final result ==="
 CHEAT_FIRED=$(grep -cE "CL4-ROLLOVER: mid-window broadcast" "$LSP_LOG" 2>/dev/null | head -1 || echo 0)
-WT_BREACH=$(grep -cE "FACTORY BREACH|breach detected" "$WT_LOG" 2>/dev/null | head -1 || echo 0)
-WT_PENALTY=$(grep -cE "penalty.*broadcast|response_tx.*broadcast" "$WT_LOG" 2>/dev/null | head -1 || echo 0)
+# In-process WT lives in the LSP process — its detection lines go to LSP_LOG.
+# Standalone WT runs in a separate process with its own (empty) DB and only
+# acts as a redundant chain-scan observer.  Accept either as proof of detect.
+WT_BREACH=$(grep -cE "FACTORY BREACH|BREACH DETECTED|breach detected" "$LSP_LOG" "$WT_LOG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
+WT_PENALTY=$(grep -cE "penalty.*broadcast|response_tx.*broadcast|Watchtower broadcast.*penalty" "$LSP_LOG" "$WT_LOG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
 
 echo "  cheat_fired=$CHEAT_FIRED  wt_breach=$WT_BREACH  wt_penalty=$WT_PENALTY"
 
