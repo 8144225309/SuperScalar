@@ -145,6 +145,7 @@ add_library(superscalar
     src/report.c
     src/persist.c
     src/persist_wt.c
+    src/lsp_wt.c
     src/bridge.c
     src/fee.c
     src/fee_estimator_static.c

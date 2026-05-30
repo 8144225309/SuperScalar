@@ -9,6 +9,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
+#include "superscalar/lsp_wt.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
 #include "superscalar/regtest.h"
@@ -1614,6 +1615,31 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t old_l_amount = (old_n_outputs >= 2)
                             ? f->nodes[pre_node_idx].outputs[old_n_outputs - 1].amount_sats
                             : 0;
+    /* SF-WT-TRUSTLESS Phase 1b.4 (#248): also snapshot the OLD chain
+     * output (vout=0)'s value + scriptpubkey + the nsequence-encoded
+     * CSV.  These feed wt_db.wt_watches so the WT can match the
+     * specific spend on-chain and the response_tx's BIP-68 timelock
+     * is properly registered.  Snapshot before factory_advance_leaf
+     * mutates outputs[]. */
+    uint64_t old_chain_amount = (old_n_outputs >= 1)
+                                ? f->nodes[pre_node_idx].outputs[0].amount_sats
+                                : 0;
+    unsigned char old_chain_spk[34];
+    size_t old_chain_spk_len = 0;
+    if (old_n_outputs >= 1) {
+        old_chain_spk_len = f->nodes[pre_node_idx].outputs[0].script_pubkey_len;
+        if (old_chain_spk_len > sizeof(old_chain_spk))
+            old_chain_spk_len = sizeof(old_chain_spk);
+        memcpy(old_chain_spk,
+               f->nodes[pre_node_idx].outputs[0].script_pubkey,
+               old_chain_spk_len);
+    }
+    /* BIP-68 nsequence: low 16 bits hold the CSV value when bit 22 is
+     * 0 (block-based units, the SuperScalar default).  Phase 1b.4
+     * uses just the low 16 bits — if a future deploy uses
+     * time-based units, this widens to 22 bits with bit-31 type-flag
+     * inspection. */
+    uint32_t old_csv_delay = (uint32_t)(f->nodes[pre_node_idx].nsequence & 0xFFFFu);
 
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
@@ -2015,6 +2041,52 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             poison_data, poison_len,
             leaf_ch_ids, n_leaf_ch);
 
+        /* SF-WT-TRUSTLESS Phase 1b.3+1b.4 (#248): mirror the registration
+         * into wt_db when --wt-db is enabled.  The in-memory watchtower
+         * above remains canonical; wt_db is a parallel write that the
+         * Phase 2 WT-side switchover will consume.
+         *
+         * All fields now correctly derived (Phase 1b.4):
+         *   factory_id        = node_idx
+         *   parent_txid32     = old_leaf_txid
+         *   parent_vout       = 0 (chain output convention; the leaf TX's
+         *                       vout=0 is the channel/chain output that
+         *                       the response_tx spends)
+         *   parent_value_sat  = old_chain_amount (snapshotted pre-advance)
+         *   parent_spk        = old_chain_spk (snapshotted pre-advance)
+         *   csv_delay         = old_csv_delay (BIP-68 low-16-bit decode)
+         *   signed_response_tx = node->signed_tx
+         *   response_txid32   = node->txid
+         *
+         * fee_bump_budget/deadline are 0 — fee-bump policy is not yet
+         * exposed to leaf advance; will land if/when CPFP bumping is
+         * wired for leaf-advance responses (separate scope). */
+        if (lsp && lsp->wt_db && had_old_signed && old_chain_spk_len > 0) {
+            int64_t watch_id = lsp_wt_register_factory_node_watch(
+                lsp->wt_db,
+                (uint32_t)node_idx,
+                old_leaf_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ old_chain_amount,
+                old_chain_spk, old_chain_spk_len,
+                /* csv_delay        */ old_csv_delay,
+                node->signed_tx.data, node->signed_tx.len,
+                node->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered leaf-advance watch_id=%lld "
+                       "for node %d (parent=%llu sats, csv=%u)\n",
+                       (long long)watch_id, (int)node_idx,
+                       (unsigned long long)old_chain_amount,
+                       (unsigned)old_csv_delay);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "leaf-advance node %d\n", (int)node_idx);
+            }
+        }
+
         /* Snapshot poison bytes for Step 11 persist before reset frees them. */
         if (poison_data && poison_len > 0) {
             poison_snapshot = malloc(poison_len);
@@ -2220,6 +2292,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     int poison_client_slot[FACTORY_MAX_NODES];
     unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
     unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    /* SF-WT-TRUSTLESS Phase 1b.5 (#248): per-affected-node snapshot of
+     * the OLD chain output (vout=0) value + SPK + BIP-68 CSV.  Indexed
+     * by affected[] order (k), mirrors the per-k poison_* arrays. */
+    int wt_had_old[FACTORY_MAX_NODES];
+    uint64_t wt_old_chain_amount[FACTORY_MAX_NODES];
+    unsigned char wt_old_chain_spk[FACTORY_MAX_NODES][34];
+    size_t wt_old_chain_spk_len[FACTORY_MAX_NODES];
+    uint32_t wt_old_csv_delay[FACTORY_MAX_NODES];
     for (size_t k = 0; k < n_affected; k++) {
         poison_prepared[k] = 0;
         poison_client_slot[k] = -1;
@@ -2233,6 +2313,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
         poison_old_l_amount[k] = (old_no >= 2)
             ? an->outputs[old_no - 1].amount_sats : 0;
+        /* Phase 1b.5: chain output (vout=0) snapshot for wt_db. */
+        wt_had_old[k] = had_old;
+        wt_old_chain_amount[k] = (old_no >= 1) ? an->outputs[0].amount_sats : 0;
+        wt_old_chain_spk_len[k] = (old_no >= 1) ? an->outputs[0].script_pubkey_len : 0;
+        if (wt_old_chain_spk_len[k] > 34) wt_old_chain_spk_len[k] = 34;
+        if (old_no >= 1)
+            memcpy(wt_old_chain_spk[k],
+                   an->outputs[0].script_pubkey,
+                   wt_old_chain_spk_len[k]);
+        wt_old_csv_delay[k] = (uint32_t)(an->nsequence & 0xFFFFu);
         if (mgr->watchtower && !an->is_ps_leaf && had_old && old_no >= 2 &&
             poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
                 (uint64_t)(an->n_signers - 1) * 330u) {
@@ -2724,6 +2814,37 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 an->signed_tx.data, an->signed_tx.len,
                 poison_data, poison_len,
                 leaf_ch_ids, n_leaf_ch);
+
+            /* SF-WT-TRUSTLESS Phase 1b.5: parallel wt_db register for
+             * Tier B state advance.  Same pattern as leaf-advance
+             * (Phase 1b.3+1b.4); uses the per-k snapshot captured before
+             * factory_advance mutated the OLD chain output. */
+            if (lsp && lsp->wt_db && wt_had_old[k] && wt_old_chain_spk_len[k] > 0) {
+                int64_t watch_id = lsp_wt_register_factory_node_watch(
+                    lsp->wt_db,
+                    (uint32_t)affected[k],
+                    poison_old_txid[k],
+                    /* parent_vout      */ 0,
+                    /* parent_value_sat */ wt_old_chain_amount[k],
+                    wt_old_chain_spk[k], wt_old_chain_spk_len[k],
+                    /* csv_delay        */ wt_old_csv_delay[k],
+                    an->signed_tx.data, an->signed_tx.len,
+                    an->txid,
+                    /* fee_bump_budget  */ 0,
+                    /* fee_bump_dline   */ 0);
+                if (watch_id > 0) {
+                    printf("LSP-WT-TRUSTLESS: registered tier-B watch_id=%lld "
+                           "for node %zu (parent=%llu sats, csv=%u)\n",
+                           (long long)watch_id, affected[k],
+                           (unsigned long long)wt_old_chain_amount[k],
+                           (unsigned)wt_old_csv_delay[k]);
+                } else {
+                    fprintf(stderr,
+                            "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                            "tier-B node %zu\n", affected[k]);
+                }
+            }
+
             if (poison_prepared[k])
                 factory_session_reset_poison(f, affected[k]);
         }
@@ -2965,6 +3086,21 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t realloc_old_l_amount = (realloc_old_n_outputs >= 2)
         ? node->outputs[realloc_old_n_outputs - 1].amount_sats : 0;
     int realloc_had_signed = (node->is_signed && node->signed_tx.len > 0);
+    /* SF-WT-TRUSTLESS Phase 1b.5b (#248): snapshot OLD chain output for
+     * wt_db register at the bottom of this function.  Same pattern as
+     * leaf advance (Phase 1b.4) and Tier B (Phase 1b.5a). */
+    uint64_t realloc_old_chain_amount = (realloc_old_n_outputs >= 1)
+        ? node->outputs[0].amount_sats : 0;
+    unsigned char realloc_old_chain_spk[34] = {0};
+    size_t realloc_old_chain_spk_len = (realloc_old_n_outputs >= 1)
+        ? node->outputs[0].script_pubkey_len : 0;
+    if (realloc_old_chain_spk_len > sizeof(realloc_old_chain_spk))
+        realloc_old_chain_spk_len = sizeof(realloc_old_chain_spk);
+    if (realloc_old_n_outputs >= 1)
+        memcpy(realloc_old_chain_spk,
+               node->outputs[0].script_pubkey,
+               realloc_old_chain_spk_len);
+    uint32_t realloc_old_csv_delay = (uint32_t)(node->nsequence & 0xFFFFu);
 
     const uint64_t REALLOC_POISON_FEE_SATS = 1000;
     int realloc_poison_prepared = 0;
@@ -3317,6 +3453,35 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                "(response_tx=%zub, poison=%s, %zu channels)\n",
                node_idx, (size_t)node->signed_tx.len,
                poison_data ? "yes" : "no", n_leaf_ch);
+
+        /* SF-WT-TRUSTLESS Phase 1b.5b: parallel wt_db register for
+         * leaf realloc.  Uses snapshot taken before realloc mutated
+         * outputs[]. */
+        if (lsp && lsp->wt_db && realloc_had_signed && realloc_old_chain_spk_len > 0) {
+            int64_t watch_id = lsp_wt_register_factory_node_watch(
+                lsp->wt_db,
+                (uint32_t)node_idx,
+                realloc_old_leaf_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ realloc_old_chain_amount,
+                realloc_old_chain_spk, realloc_old_chain_spk_len,
+                /* csv_delay        */ realloc_old_csv_delay,
+                node->signed_tx.data, node->signed_tx.len,
+                node->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered realloc watch_id=%lld "
+                       "for node %zu (parent=%llu sats, csv=%u)\n",
+                       (long long)watch_id, node_idx,
+                       (unsigned long long)realloc_old_chain_amount,
+                       (unsigned)realloc_old_csv_delay);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "realloc node %zu\n", node_idx);
+            }
+        }
     }
 
     /* Step 12: Update channel amounts in lsp_channel_entry_t.
@@ -7697,6 +7862,16 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
                "chain_pos=%d (poison_tx=%s, %zu channels)\n",
                li, node_idx, leaf->ps_chain_len - 1,
                poison_data ? "yes" : "no", n_leaf_ch);
+
+        /* SF-WT-TRUSTLESS Phase 1b.5c (#248): intentionally NO parallel
+         * wt_db register here.  wt_db is a durable on-disk store — its
+         * rows survive process restart, so there's nothing to
+         * "re-register" the way the in-memory watchtower needs.  If a
+         * future deployment needs to rebuild wt_db from lsp.db (e.g.
+         * wt_db file lost/corrupt), a separate one-shot migration tool
+         * `persist_v36_derive_wt_from_lsp(lsp_db, wt_db)` (see
+         * docs/watchtower-trustless-schema.md §Migration) handles that
+         * — not the restart path. */
 
         (void)pdb; /* persist_load_subfactory_chain uses sales-stock /
                       channel amounts directly from the in-memory
