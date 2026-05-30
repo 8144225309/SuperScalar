@@ -14,7 +14,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/channel.h"
 #include "superscalar/fee.h"
-#include "superscalar/fee_estimator_static.h"
+#include "superscalar/fee_estimator.h"
 #include "superscalar/htlc_inbound.h"
 #include <stdio.h>
 #include <string.h>
