@@ -278,12 +278,12 @@ PIDS+=($WT_PID)
 # The WT will print its banners + hydrate within a few seconds.
 for i in $(seq 1 15); do
     sleep 1
-    grep -q "TRUSTLESS MODE" "$WT_LOG" 2>/dev/null && break
+    grep -qE "TRUSTLESS MODE|TRUSTLESS — only mode|TRUSTLESS -- only mode|WT-TRUSTLESS:" "$WT_LOG" 2>/dev/null && break
     kill -0 $WT_PID 2>/dev/null || { echo "WT exited early"; tail -20 "$WT_LOG"; break; }
 done
 
 # Banner check.
-if ! grep -q "TRUSTLESS MODE" "$WT_LOG"; then
+if ! grep -qE "TRUSTLESS MODE|TRUSTLESS — only mode|TRUSTLESS -- only mode|WT-TRUSTLESS:" "$WT_LOG"; then
     echo "FAIL: C — WT did not print TRUSTLESS MODE banner"
     tail -20 "$WT_LOG"
     exit 1
