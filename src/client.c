@@ -18,9 +18,14 @@ extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 
-/* Optional NK server authentication pubkey (set via client_set_lsp_pubkey) */
-static secp256k1_pubkey g_nk_server_pubkey;
-static int g_nk_server_pubkey_set = 0;
+/* Optional NK server authentication pubkey (set via client_set_lsp_pubkey).
+ * SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): de-static'd as
+ * g_client_nk_server_pubkey so the extracted client_run_reconnect() in
+ * src/client_reconnect.c can read it via extern. */
+secp256k1_pubkey g_client_nk_server_pubkey;
+int g_client_nk_server_pubkey_set = 0;
+#define g_nk_server_pubkey     g_client_nk_server_pubkey
+#define g_nk_server_pubkey_set g_client_nk_server_pubkey_set
 
 /* Optional persistence handle for PS double-spend defense (set via
    client_set_persist). NULL disables the check — only acceptable for
@@ -143,7 +148,9 @@ static int g_client_funding_pending_reorg = 0;
    on exit.  When NULL (pre-factory bootstrap), the reorg notification is
    recorded in the freeze flag but no reset happens (there's nothing to
    reset). */
-static factory_t *g_client_active_factory = NULL;
+/* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): de-static'd so
+ * src/client_reconnect.c (extracted) can write it on reconnect. */
+factory_t *g_client_active_factory = NULL;
 
 /* Wrapper around wire_recv_timeout that transparently handles
    MSG_PING (responds with MSG_PONG), MSG_PONG (discards), and

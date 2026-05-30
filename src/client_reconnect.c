@@ -21,6 +21,13 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): shared state in src/client.c. */
+extern factory_t *g_client_active_factory;
+extern secp256k1_pubkey g_client_nk_server_pubkey;
+extern int g_client_nk_server_pubkey_set;
+#define g_nk_server_pubkey     g_client_nk_server_pubkey
+#define g_nk_server_pubkey_set g_client_nk_server_pubkey_set
+
 int client_run_reconnect(secp256k1_context *ctx,
                            const secp256k1_keypair *keypair,
                            const char *host, int port,
