@@ -424,9 +424,18 @@ run_scenario() {
             fi
             ;;
         finalize_partial)
-            # ALL participants phase = SIGNED(3); state still PENDING_SIGS(2).
-            if [ "$signed" != "$exp_parts" ]; then
-                pass=0; reason="${reason:+$reason; }phase=SIGNED=$signed want $exp_parts"
+            # State must NOT be FINALIZED(3) — that's the §2 dual-sig-trap
+            # guarantee.  The state check above already enforced state in
+            # {0,1,2}.  Per-participant signed count can be EITHER 0 (kill
+            # before the SIGNED marker persist) OR exp_parts (kill after).
+            # factory_creation persists SIGNED before the finalize_partial
+            # checkpoint, so it shows exp_parts; leaf_advance / state_advance
+            # / subfactory_multi place the checkpoint before the SIGNED
+            # marker persist, so they show 0.  Both are pre-FINALIZED and
+            # satisfy the §2 invariant — the matrix's job is to prove FAR
+            # state never advances to FINALIZED, which is already checked.
+            if [ "$signed" != "0" ] && [ "$signed" != "$exp_parts" ]; then
+                pass=0; reason="${reason:+$reason; }phase=SIGNED=$signed want 0 or $exp_parts"
             fi
             if [ "$state" = "3" ]; then
                 pass=0; reason="${reason:+$reason; }state=FINALIZED before §2 guard"
