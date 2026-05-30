@@ -3,12 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef _POSIX_VERSION
 #include <sys/wait.h>
 #include <signal.h>
-#include <time.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #endif
@@ -29,6 +29,17 @@ static __thread int g_regtest_poll_quiet = 0;
 static inline bool regtest_err_is_expected_poll_miss(int code) {
     return code == -5 || code == -19;
 }
+
+/* Thread-local: JSON-RPC error code captured by the most recent
+   regtest_http_rpc() invocation. Reset to 0 before each call. Allows
+   regtest_exec() to detect -18 "Requested wallet does not exist" and trigger
+   a one-shot reload + retry. See task #298. */
+static __thread int g_regtest_last_http_error = 0;
+
+/* Auto-recovery rate limit. bitcoind's "wallet not loaded" state can drive
+   long polling loops, so we coalesce concurrent -18 errors into at most one
+   loadwallet attempt per second across all callers. */
+static time_t g_regtest_last_wallet_reload = 0;
 
 #ifdef _POSIX_VERSION
 
@@ -608,6 +619,7 @@ static char *regtest_http_rpc(const regtest_t *rt,
     if (err && !cJSON_IsNull(err)) {
         cJSON *ecode = cJSON_GetObjectItem(err, "code");
         int code = (ecode && cJSON_IsNumber(ecode)) ? ecode->valueint : 0;
+        g_regtest_last_http_error = code;
         /* In poll-quiet scope, swallow the codes that are the normal negative
            answer (tx not in mempool/chain; wallet path wrong because tx not
            in this wallet). Real errors (-32700 parse, -32601 method missing,
@@ -650,6 +662,34 @@ static char *regtest_http_rpc(const regtest_t *rt,
     return out;
 }
 
+/* Auto-recovery: attempt to reload rt->wallet via a root-path (no /wallet/<name>/)
+   loadwallet RPC, then return success so the caller can retry the original
+   call. Rate-limited to at most one attempt per second; concurrent -18 errors
+   across threads collapse into a single reload. Returns 1 on success or on
+   the benign -35 "already loaded" race; 0 on real failure (caller surfaces
+   the original error). See task #298. */
+static int regtest_try_reload_wallet(const regtest_t *rt) {
+    if (rt->wallet[0] == '\0') return 0;  /* no wallet to reload */
+    time_t now = time(NULL);
+    if (now - g_regtest_last_wallet_reload < 1) return 0;
+    g_regtest_last_wallet_reload = now;
+
+    /* Stack copy with no wallet — POST to root path so bitcoind doesn't
+       require the wallet endpoint to resolve. */
+    regtest_t root = *rt;
+    root.wallet[0] = '\0';
+
+    char params[256];
+    snprintf(params, sizeof(params), "\"%s\"", rt->wallet);
+    g_regtest_last_http_error = 0;
+    char *r = regtest_http_rpc(&root, "loadwallet", params);
+    if (r) { free(r); return 1; }
+    /* -35 "already loaded" can race with another caller's reload; treat
+       as success so the caller retries instead of falling back to CLI. */
+    if (g_regtest_last_http_error == -35) return 1;
+    return 0;
+}
+
 #endif /* _POSIX_VERSION (HTTP RPC) */
 
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params) {
@@ -661,8 +701,24 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
     /* Preferred path: direct HTTP JSON-RPC (no subprocess fork).
        Falls back to fork/execvp when rpcport == 0 or HTTP fails. */
     if (rt->rpcport > 0) {
+        g_regtest_last_http_error = 0;
         char *result = regtest_http_rpc(rt, method, params);
         if (result) return result;
+        /* -18 "Requested wallet does not exist": bitcoind unloaded the wallet
+           (manual unload, restart, etc.). Reload once and retry; on persistent
+           failure we fall through to the fork+exec path which will surface
+           the error to the operator. Task #298. */
+        if (g_regtest_last_http_error == -18 &&
+            regtest_try_reload_wallet(rt))
+        {
+            g_regtest_last_http_error = 0;
+            result = regtest_http_rpc(rt, method, params);
+            if (result) {
+                fprintf(stderr, "regtest: auto-reloaded wallet '%s' after -18, "
+                                "retry of %s succeeded\n", rt->wallet, method);
+                return result;
+            }
+        }
         /* HTTP failed — fall through to fork+exec */
     }
 
