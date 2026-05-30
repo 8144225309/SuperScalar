@@ -144,6 +144,12 @@ typedef struct {
     wallet_source_t *wallet;       /* UTXO selection + signing for CPFP (may be NULL) */
     wallet_source_rpc_t _wallet_rpc_default; /* auto-init'd when rt != NULL */
     persist_t *db;
+    /* SF-WT-TRUSTLESS Phase 2c (#248): trustless wt_db handle.  Optional;
+       when non-NULL, watchtower_watch_revoked_commitment also writes the
+       pre-built penalty TX bytes into wt_db so a standalone trustless WT
+       (started with --wt-db only) can broadcast on breach without ever
+       opening lsp.db.  Set via watchtower_set_wt_db after watchtower_init. */
+    persist_wt_t *wt_db;
 
     /* P2A anchor SPK for CPFP fee bumping (anyone-can-spend, no keys needed) */
     unsigned char anchor_spk[P2A_SPK_LEN];
@@ -249,6 +255,13 @@ void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *c
 
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);
+
+/* SF-WT-TRUSTLESS Phase 2c (#248): attach an optional trustless wt_db
+   handle.  Once set, every subsequent watchtower_watch_revoked_commitment
+   call also writes a kind=WT_KIND_CHANNEL_COMMITMENT row carrying the
+   pre-built penalty TX bytes.  NULL clears the handle (no-op state).
+   Safe to call before or after watchtower entries exist. */
+void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db);
 
 /* Watch for an old factory state node. If detected, broadcast latest state tx
    and burn tx (if provided). Both are copied (caller can free theirs).
