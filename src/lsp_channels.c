@@ -3645,6 +3645,21 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         wt_old_chan_amounts[ci] = sub->outputs[ci].amount_sats;
     uint64_t wt_old_sstock_amount = (sub->n_outputs > 0)
         ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
+    /* SF-WT-TRUSTLESS Phase 2c: also snapshot parent vout/value/spk/csv for
+       trustless wt_db register (mirrors Tier B pattern at line 2299+).
+       wt_db carries parent_vout=0 by convention; legacy WT detection is
+       txid-based so vout is informational here.  outputs[0] is the first
+       channel output of the chain TX. */
+    uint64_t wt_old_chain_amount = (sub->n_outputs > 0)
+        ? sub->outputs[0].amount_sats : 0;
+    size_t wt_old_chain_spk_len = (sub->n_outputs > 0)
+        ? sub->outputs[0].script_pubkey_len : 0;
+    if (wt_old_chain_spk_len > 34) wt_old_chain_spk_len = 34;
+    unsigned char wt_old_chain_spk[34] = {0};
+    if (sub->n_outputs > 0 && wt_old_chain_spk_len > 0)
+        memcpy(wt_old_chain_spk, sub->outputs[0].script_pubkey,
+               wt_old_chain_spk_len);
+    uint32_t wt_old_csv_delay = (uint32_t)(sub->nsequence & 0xFFFFu);
     if (mgr->watchtower &&
         wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
         if (factory_session_prepare_poison_tx_subfactory(
@@ -4161,6 +4176,40 @@ static int lsp_subfactory_chain_advance_stateless_multi(
             have_poison ? sub->poison_signed_tx.len  : 0,
             wt_old_chan_amounts, wt_old_n_chans,
             wt_old_sstock_amount);
+
+        /* SF-WT-TRUSTLESS Phase 2c: parallel wt_db register for sub-factory
+         * chain advance (MULTI-input).  Mirrors the Tier B pattern at
+         * lsp_channels.c:2823.  Trustless WT consumes this row instead of
+         * needing lsp.db access. */
+        if (lsp && lsp->wt_db && wt_old_chain_spk_len > 0) {
+            int64_t watch_id = lsp_wt_register_subfactory_node_watch(
+                lsp->wt_db,
+                (uint32_t)sub_node_i,
+                wt_old_chain_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ wt_old_chain_amount,
+                wt_old_chain_spk, wt_old_chain_spk_len,
+                /* csv_delay        */ wt_old_csv_delay,
+                sub->signed_tx.data, sub->signed_tx.len,
+                sub->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered sub-factory MULTI "
+                       "watch_id=%lld for sub-node %zu (parent=%llu sats, "
+                       "csv=%u, %zu chans, sstock=%llu)\n",
+                       (long long)watch_id, sub_node_i,
+                       (unsigned long long)wt_old_chain_amount,
+                       (unsigned)wt_old_csv_delay,
+                       wt_old_n_chans,
+                       (unsigned long long)wt_old_sstock_amount);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "sub-factory MULTI node %zu\n", sub_node_i);
+            }
+        }
+
         factory_session_reset_poison(f, sub_node_i);
     }
 
@@ -4252,6 +4301,20 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         wt_old_chan_amounts[ci] = sub->outputs[ci].amount_sats;
     uint64_t wt_old_sstock_amount = (sub->n_outputs > 0)
         ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
+    /* SF-WT-TRUSTLESS Phase 2c: also snapshot parent vout/value/spk/csv for
+       trustless wt_db register (mirrors Tier B pattern at line 2299+ and
+       the multi-input branch above).  outputs[0] is the first channel
+       output of the chain TX; parent_vout=0 by convention. */
+    uint64_t wt_old_chain_amount = (sub->n_outputs > 0)
+        ? sub->outputs[0].amount_sats : 0;
+    size_t wt_old_chain_spk_len = (sub->n_outputs > 0)
+        ? sub->outputs[0].script_pubkey_len : 0;
+    if (wt_old_chain_spk_len > 34) wt_old_chain_spk_len = 34;
+    unsigned char wt_old_chain_spk[34] = {0};
+    if (sub->n_outputs > 0 && wt_old_chain_spk_len > 0)
+        memcpy(wt_old_chain_spk, sub->outputs[0].script_pubkey,
+               wt_old_chain_spk_len);
+    uint32_t wt_old_csv_delay = (uint32_t)(sub->nsequence & 0xFFFFu);
     if (mgr->watchtower &&
         wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
         if (factory_session_prepare_poison_tx_subfactory(
@@ -4679,6 +4742,38 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
             have_poison ? sub->poison_signed_tx.len  : 0,
             wt_old_chan_amounts, wt_old_n_chans,
             wt_old_sstock_amount);
+
+        /* SF-WT-TRUSTLESS Phase 2c: parallel wt_db register for sub-factory
+         * chain advance (SINGLE-input).  Mirrors the multi-input branch above
+         * and the Tier B pattern at lsp_channels.c:2823. */
+        if (lsp && lsp->wt_db && wt_old_chain_spk_len > 0) {
+            int64_t watch_id = lsp_wt_register_subfactory_node_watch(
+                lsp->wt_db,
+                (uint32_t)sub_node_i,
+                wt_old_chain_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ wt_old_chain_amount,
+                wt_old_chain_spk, wt_old_chain_spk_len,
+                /* csv_delay        */ wt_old_csv_delay,
+                sub->signed_tx.data, sub->signed_tx.len,
+                sub->txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (watch_id > 0) {
+                printf("LSP-WT-TRUSTLESS: registered sub-factory SINGLE "
+                       "watch_id=%lld for sub-node %zu (parent=%llu sats, "
+                       "csv=%u, %zu chans, sstock=%llu)\n",
+                       (long long)watch_id, sub_node_i,
+                       (unsigned long long)wt_old_chain_amount,
+                       (unsigned)wt_old_csv_delay,
+                       wt_old_n_chans,
+                       (unsigned long long)wt_old_sstock_amount);
+            } else {
+                fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db register failed for "
+                        "sub-factory SINGLE node %zu\n", sub_node_i);
+            }
+        }
 
         /* Watchtower copied the bytes; safe to free the poison-session state. */
         factory_session_reset_poison(f, sub_node_i);
