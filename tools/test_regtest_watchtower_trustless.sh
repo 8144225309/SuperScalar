@@ -312,6 +312,45 @@ if [ -r "/proc/$WT_PID/maps" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Check F (PR-E.2): nm symbol-absence on WT binary.
+# The link surgery moved 5 secret-reader functions into the
+# superscalar_secrets static lib, which the WT binary does NOT link.
+# Their symbols must be physically absent from the WT binary.
+# ---------------------------------------------------------------------------
+if command -v nm >/dev/null 2>&1; then
+    SYMBOL_HITS=$(nm -D --defined-only "$WT_BIN" 2>/dev/null \
+        | grep -E " (T|t) (persist_load_basepoints|persist_load_revocations_flat|persist_load_channel_for_watchtower|persist_load_flat_secrets|persist_load_commitment_sig)$" \
+        | wc -l)
+    echo "  secret-reader symbols: $SYMBOL_HITS  (want 0)"
+    if [ "$SYMBOL_HITS" -gt 0 ]; then
+        echo "FAIL: F — WT binary contains secret-reader symbols:"
+        nm -D --defined-only "$WT_BIN" | grep -E "persist_load_(basepoints|revocations_flat|channel_for_watchtower|flat_secrets|commitment_sig)"
+        exit 1
+    fi
+    echo "  ✓ F. WT binary contains no secret-reader symbols"
+else
+    echo "  ⚠ F. nm not available — skipping symbol-absence check (informational only)"
+fi
+
+# ---------------------------------------------------------------------------
+# Check G (PR-E.1): WT binary refuses --db flag.
+# v0.2.0 removed the legacy --db CLI from the standalone watchtower.
+# Passing it must error with a migration pointer, NOT silently succeed.
+# ---------------------------------------------------------------------------
+DB_FLAG_OUTPUT=$("$WT_BIN" --db /tmp/nonexistent.db 2>&1)
+DB_FLAG_RC=$?
+if [ "$DB_FLAG_RC" -eq 0 ]; then
+    echo "FAIL: G — WT binary accepted --db flag (exit code 0, expected non-zero)"
+    exit 1
+fi
+if ! echo "$DB_FLAG_OUTPUT" | grep -q -E "(\-\-wt-db|migration|no longer)"; then
+    echo "FAIL: G — WT --db error message missing migration pointer:"
+    echo "$DB_FLAG_OUTPUT"
+    exit 1
+fi
+echo "  ✓ G. WT binary refuses --db flag with migration error"
+
+# ---------------------------------------------------------------------------
 # Final: pass.
 # ---------------------------------------------------------------------------
 echo
@@ -322,4 +361,6 @@ echo "  B+. byte-level scan: no lsp.db secrets in wt.db: ✓"
 echo "  C. WT started in TRUSTLESS MODE                : ✓"
 echo "  D. WT hydrated watches from wt.db              : ✓ ($HYDRATED)"
 echo "  E. WT process never mapped lsp.db              : ✓"
+echo "  F. WT binary has no secret-reader symbols (nm) : ✓"
+echo "  G. WT binary refuses --db CLI flag             : ✓"
 exit 0
