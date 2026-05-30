@@ -10,6 +10,7 @@
 
 #include "superscalar/ln_dispatch.h"
 #include "superscalar/htlc_commit.h"
+#include "superscalar/lsp_wt.h"      /* SF-WT-TRUSTLESS Phase 2c PR-C.3 */
 #include "superscalar/invoice.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/onion_message.h"
@@ -712,6 +713,59 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
                                               commit_txid,
                                               n_fc_htlcs > 0 ? fc_htlcs : NULL,
                                               n_fc_htlcs);
+
+                /* SF-WT-TRUSTLESS Phase 2c PR-C.3 (#248): eagerly build a
+                 * per-HTLC timeout sweep TX and stash bytes in wt_db so a
+                 * standalone trustless WT can broadcast on CLTV expiry
+                 * without ever opening lsp.db.  channel_build_htlc_timeout_tx
+                 * needs the OLD commit-state to derive the right sigs, which
+                 * is fine here — fc_ch is the channel that just got the
+                 * force-close error, so its current state IS the OLD state. */
+                if (d->watchtower->wt_db && d->watchtower->wt_db->db) {
+                    extern void sha256_double(const unsigned char *data,
+                                                size_t len,
+                                                unsigned char *out32);
+                    for (size_t i = 0; i < n_fc_htlcs; i++) {
+                        tx_buf_t sweep;
+                        memset(&sweep, 0, sizeof(sweep));
+                        tx_buf_init(&sweep, 512);
+                        if (channel_build_htlc_timeout_tx(fc_ch, &sweep,
+                                commit_txid,
+                                fc_htlcs[i].htlc_vout,
+                                fc_htlcs[i].htlc_amount,
+                                fc_htlcs[i].htlc_spk, 34,
+                                /* htlc_index */ i)) {
+                            unsigned char sweep_txid[32];
+                            sha256_double(sweep.data, sweep.len, sweep_txid);
+                            int64_t wid = lsp_wt_register_force_close_watch(
+                                d->watchtower->wt_db,
+                                (uint32_t)peer_idx,
+                                commit_txid,
+                                fc_htlcs[i].htlc_vout,
+                                fc_htlcs[i].htlc_amount,
+                                fc_htlcs[i].htlc_spk, 34,
+                                /* csv_delay */ fc_ch->to_self_delay,
+                                sweep.data, sweep.len, sweep_txid);
+                            if (wid > 0) {
+                                fprintf(stderr,
+                                    "LSP-WT-TRUSTLESS: registered "
+                                    "force-close HTLC watch_id=%lld "
+                                    "for channel %d (htlc %zu, vout %u, "
+                                    "amount %llu sats, cltv=%u)\n",
+                                    (long long)wid, peer_idx, i,
+                                    fc_htlcs[i].htlc_vout,
+                                    (unsigned long long)fc_htlcs[i].htlc_amount,
+                                    (unsigned)fc_htlcs[i].cltv_expiry);
+                            } else {
+                                fprintf(stderr,
+                                    "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                    "force-close register failed for "
+                                    "channel %d htlc %zu\n", peer_idx, i);
+                            }
+                        }
+                        tx_buf_free(&sweep);
+                    }
+                }
             }
         }
         return MSG_ERROR;
