@@ -1843,88 +1843,121 @@ int watchtower_watch_subfactory_node(watchtower_t *wt,
 /* SF-WT-TRUSTLESS Phase 2 (#248): hydrate from wt_db. */
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
+/* SF-WT-TRUSTLESS Phase 2c hydration helper.
+ *
+ * Trustless watch model: the WT broadcasts the row's response_tx when
+ * the row's parent_txid is observed spent.  This is mechanically the
+ * SAME action for every watch kind (factory, sub-factory, channel
+ * commitment breach, force-close HTLC sweep) — only the LSP-side
+ * bookkeeping kind differs.  At hydration we use the WATCH_FACTORY_NODE
+ * in-memory shape uniformly, because its broadcast path (chain-observed
+ * parent → broadcast pre-built response_tx) is the trustless contract.
+ *
+ * The kind discriminant is consumed by the LSP and by observability
+ * dashboards via wt_db queries — the WT process itself doesn't act on
+ * it.  Per-kind counters logged at the end aid operator audits.
+ *
+ * In legacy --db mode (Phase 1) hydration of channel commitment and
+ * force-close watches goes through src/watchtower.c's revoked-commit
+ * and force-close entry points which require lsp.db secrets.  Phase 2c
+ * removes that requirement for the standalone WT binary.
+ */
+typedef struct {
+    watchtower_t *wt;
+    int n_loaded;
+    int n_skipped;
+} wt_hydrate_ctx_t;
+
+static int wt_hydrate_row_cb(uint32_t factory_id,
+                              const unsigned char parent_txid32[32],
+                              uint32_t parent_vout,
+                              uint64_t parent_value_sat,
+                              const unsigned char *parent_spk,
+                              size_t parent_spk_len,
+                              uint32_t csv_delay,
+                              const char *response_tx_hex,
+                              const unsigned char response_txid32[32],
+                              uint64_t fee_bump_budget_sat,
+                              uint32_t fee_bump_deadline_height,
+                              void *user) {
+    (void)parent_vout; (void)parent_value_sat;
+    (void)parent_spk;  (void)parent_spk_len; (void)csv_delay;
+    (void)response_txid32;
+    (void)fee_bump_budget_sat; (void)fee_bump_deadline_height;
+    wt_hydrate_ctx_t *ctx = (wt_hydrate_ctx_t *)user;
+
+    int hex_len = (int)strlen(response_tx_hex);
+    if (hex_len <= 0 || (hex_len % 2) != 0) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
+                "response_tx_hex len=%d not valid hex\n",
+                factory_id, hex_len);
+        ctx->n_skipped++;
+        return 1;
+    }
+    size_t resp_len = (size_t)hex_len / 2;
+    unsigned char *resp = malloc(resp_len);
+    if (!resp) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: OOM allocating %zu bytes\n",
+                resp_len);
+        ctx->n_skipped++;
+        return 1;
+    }
+    if (hex_decode(response_tx_hex, resp, resp_len) != (int)resp_len) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: hex_decode failed for "
+                "factory_id=%u\n", factory_id);
+        free(resp);
+        ctx->n_skipped++;
+        return 1;
+    }
+
+    unsigned char parent_txid[32];
+    memcpy(parent_txid, parent_txid32, 32);
+    if (watchtower_watch_factory_node(ctx->wt, factory_id, parent_txid,
+                                        resp, resp_len, NULL, 0)) {
+        ctx->n_loaded++;
+    } else {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: watch_factory_node failed "
+                "for factory_id=%u\n", factory_id);
+        ctx->n_skipped++;
+    }
+    free(resp);
+    return 1;
+}
+
 int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
     if (!wt || !pwt || !pwt->db) return -1;
 
-    const char *sql =
-        "SELECT w.factory_id, w.parent_txid, r.response_tx_hex "
-        "FROM wt_watches w "
-        "JOIN wt_responses r ON r.response_id = w.response_id "
-        "WHERE w.superseded_at IS NULL "
-        "ORDER BY w.watch_id;";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pwt->db, sql, -1, &st, NULL) != SQLITE_OK) {
-        fprintf(stderr, "watchtower_hydrate_from_wt_db: prepare failed: %s\n",
-                sqlite3_errmsg(pwt->db));
-        return -1;
+    wt_hydrate_ctx_t ctx = { .wt = wt, .n_loaded = 0, .n_skipped = 0 };
+
+    static const struct { wt_watch_kind_t kind; const char *label; } kinds[] = {
+        { WT_KIND_FACTORY_NODE,       "factory"       },
+        { WT_KIND_SUBFACTORY_NODE,    "subfactory"    },
+        { WT_KIND_CHANNEL_COMMITMENT, "commitment"    },
+        { WT_KIND_FORCE_CLOSE_HTLC,   "force_close"   },
+    };
+    int per_kind[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < sizeof(kinds)/sizeof(kinds[0]); i++) {
+        int before = ctx.n_loaded;
+        int visited = persist_wt_list_watches_by_kind(pwt, kinds[i].kind,
+                                                       wt_hydrate_row_cb, &ctx);
+        if (visited < 0) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: list_by_kind(%s) failed\n",
+                    kinds[i].label);
+            return -1;
+        }
+        per_kind[i] = ctx.n_loaded - before;
     }
 
-    int n_loaded = 0;
-    int n_skipped = 0;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        uint32_t factory_id = (uint32_t)sqlite3_column_int(st, 0);
-        const void *parent_txid_blob = sqlite3_column_blob(st, 1);
-        int parent_txid_len = sqlite3_column_bytes(st, 1);
-        const char *response_hex = (const char *)sqlite3_column_text(st, 2);
-        int hex_len = sqlite3_column_bytes(st, 2);
-
-        if (!parent_txid_blob || parent_txid_len != 32) {
-            fprintf(stderr,
-                    "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
-                    "parent_txid len=%d (want 32)\n",
-                    factory_id, parent_txid_len);
-            n_skipped++;
-            continue;
-        }
-        if (!response_hex || hex_len <= 0 || (hex_len % 2) != 0) {
-            fprintf(stderr,
-                    "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
-                    "response_tx_hex len=%d not valid hex\n",
-                    factory_id, hex_len);
-            n_skipped++;
-            continue;
-        }
-
-        size_t resp_len = (size_t)hex_len / 2;
-        unsigned char *resp = malloc(resp_len);
-        if (!resp) {
-            fprintf(stderr,
-                    "watchtower_hydrate_from_wt_db: OOM allocating %zu bytes\n",
-                    resp_len);
-            n_skipped++;
-            continue;
-        }
-        if (hex_decode(response_hex, resp, resp_len) != (int)resp_len) {
-            fprintf(stderr,
-                    "watchtower_hydrate_from_wt_db: hex_decode failed for "
-                    "factory_id=%u\n", factory_id);
-            free(resp);
-            n_skipped++;
-            continue;
-        }
-
-        /* Register via the canonical factory-node watch helper.
-         * Phase 2a: no burn_tx — Phase 2b will widen the wt_db schema +
-         * helper to carry the optional L-stock burn TX alongside the
-         * response_tx. */
-        unsigned char parent_txid[32];
-        memcpy(parent_txid, parent_txid_blob, 32);
-        if (watchtower_watch_factory_node(wt, factory_id, parent_txid,
-                                            resp, resp_len, NULL, 0)) {
-            n_loaded++;
-        } else {
-            fprintf(stderr,
-                    "watchtower_hydrate_from_wt_db: watch_factory_node failed "
-                    "for factory_id=%u\n", factory_id);
-            n_skipped++;
-        }
-        free(resp);
-    }
-    sqlite3_finalize(st);
-
-    printf("WT-TRUSTLESS: hydrated %d watches from wt_db (%d skipped)\n",
-           n_loaded, n_skipped);
-    return n_loaded;
+    printf("WT-TRUSTLESS: hydrated %d watches from wt_db (%d skipped) "
+           "[factory=%d subfactory=%d commitment=%d force_close=%d]\n",
+           ctx.n_loaded, ctx.n_skipped,
+           per_kind[0], per_kind[1], per_kind[2], per_kind[3]);
+    return ctx.n_loaded;
 }
 
 void watchtower_cleanup(watchtower_t *wt) {
