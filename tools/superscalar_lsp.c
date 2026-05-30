@@ -2315,6 +2315,21 @@ int main(int argc, char *argv[]) {
             "and breach penalties cannot be constructed.\n");
         return 1;
     }
+    /* SF-WT-TRUSTLESS Phase 2c PR-E (#248): mainnet also requires --wt-db
+       so the operator runs a trustless watchtower binary (the only WT
+       mode in v0.2.0) against this LSP's pre-signed response TXs.
+       Without --wt-db the LSP can still run on mainnet but loses
+       trustless WT support — flag this as an error so operators can't
+       accidentally deploy mainnet without it. */
+    if (strcmp(network, "mainnet") == 0 && !wt_db_path) {
+        fprintf(stderr,
+            "Error: mainnet requires --wt-db for the trustless watchtower.\n"
+            "v0.2.0 removed the legacy --db-only watchtower mode; the LSP\n"
+            "must populate wt.db so a standalone trustless WT can broadcast\n"
+            "penalty TXs on breach without ever opening lsp.db.\n"
+            "See docs/watchtower-trustless-schema.md for the model.\n");
+        return 1;
+    }
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg

@@ -1,6 +1,5 @@
 #include "superscalar/version.h"
 #include "superscalar/watchtower.h"
-#include "superscalar/persist.h"
 #include "superscalar/persist_wt.h"
 #include "superscalar/regtest.h"
 #include "superscalar/fee.h"
@@ -22,14 +21,18 @@ static void sigint_handler(int sig) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s --db PATH [OPTIONS]\n"
+        "Usage: %s --wt-db PATH [OPTIONS]\n"
         "\n"
-        "  Standalone watchtower: monitors blockchain for stale-state broadcasts\n"
-        "  and broadcasts penalty transactions.\n"
+        "  Standalone trustless watchtower.  Monitors blockchain for stale-state\n"
+        "  broadcasts using pre-signed response transactions provided by the LSP\n"
+        "  via watchtower.db.  This binary CANNOT read revocation secrets — even\n"
+        "  if compromised, no key material is reachable.  v0.2.0 ships trustless\n"
+        "  mode as the ONLY mode (see docs/watchtower-trustless-schema.md).\n"
         "\n"
         "Options:\n"
-        "  --db PATH           SQLite database (read-only) shared with LSP. DEPRECATED: prefer --wt-db (see docs/watchtower-trustless-schema.md).\n"
-        "  --wt-db PATH        Watchtower-side SQLite database (SF-WT-TRUSTLESS Phase 2, #248). No secrets. When set, hydrates watches from this file instead of (or alongside) --db.\n"
+        "  --wt-db PATH        Path to watchtower.db (REQUIRED).  Contains pre-signed\n"
+        "                      response TXs and watch metadata.  No secrets.  Populated\n"
+        "                      by the LSP at revocation / advance / force-close time.\n"
         "  --network MODE      Network: regtest, signet, testnet, testnet4, mainnet\n"
         "  --poll-interval N   Seconds between block checks (default: 30)\n"
         "  --cli-path PATH     Path to bitcoin-cli (default: bitcoin-cli)\n"
@@ -37,16 +40,24 @@ static void usage(const char *prog) {
         "  --rpcpassword PASS  Bitcoin RPC password\n"
         "  --datadir PATH      Bitcoin datadir\n"
         "  --rpcport PORT      Bitcoin RPC port\n"
+        "  --bump-budget-pct N CPFP fee budget as %% of penalty value (1-100, default 50)\n"
+        "  --max-bump-fee SAT  Absolute fee ceiling per CPFP bump (default 50000)\n"
         "  --version           Show version and exit\n"
-        "  --help              Show this help\n",
+        "  --help              Show this help\n"
+        "\n"
+        "Migration: v0.1.x used --db PATH (lsp.db) which exposed revocation secrets\n"
+        "to the WT process.  v0.2.0 removes this flag entirely.  To migrate:\n"
+        "  1. On the LSP, add --wt-db <path/to/wt.db>.  Restart LSP.\n"
+        "  2. On the WT, replace --db with --wt-db <same path>.\n"
+        "  3. lsp.db stays where it is; the LSP still uses it for everything else.\n",
         prog);
 }
 
 int main(int argc, char *argv[]) {
     int bump_budget_pct = 0;
     uint64_t max_bump_fee = 0;
-    const char *db_path = NULL;
-    /* SF-WT-TRUSTLESS Phase 2 (#248): optional separate WT-side database. */
+    /* SF-WT-TRUSTLESS Phase 2c (#248) PR-E: --db removed.  v0.2.0 ships
+       trustless mode as the only mode. */
     const char *wt_db_path = NULL;
     const char *network = "regtest";
     int poll_interval = 30;
@@ -54,12 +65,27 @@ int main(int argc, char *argv[]) {
     const char *rpcuser = NULL;
     const char *rpcpassword = NULL;
     const char *datadir = NULL;
-    int inspect_db_mode = 0;
     int rpcport = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
-            db_path = argv[++i];
+        if (strcmp(argv[i], "--db") == 0) {
+            fprintf(stderr,
+                "Error: --db is no longer a valid flag for the standalone\n"
+                "       watchtower.  v0.2.0 ships trustless mode as the only\n"
+                "       mode.  Use --wt-db PATH instead.\n"
+                "\n"
+                "       Migration: have your LSP run with --wt-db <path/to/wt.db>,\n"
+                "       then point this binary at the same file.  See\n"
+                "       docs/watchtower-trustless-schema.md.\n");
+            return 1;
+        }
+        else if (strcmp(argv[i], "--inspect-db") == 0) {
+            fprintf(stderr,
+                "Error: --inspect-db was removed alongside --db.  Use sqlite3\n"
+                "       directly on the wt_db file for inspection; the schema is\n"
+                "       documented at docs/watchtower-trustless-schema.md.\n");
+            return 1;
+        }
         else if (strcmp(argv[i], "--wt-db") == 0 && i + 1 < argc)
             wt_db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
@@ -85,9 +111,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        else if (strcmp(argv[i], "--inspect-db") == 0) {
-            inspect_db_mode = 1;
-        }
         else if (strcmp(argv[i], "--version") == 0) {
             printf("superscalar_watchtower %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -98,100 +121,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Phase 2b: --db is OPTIONAL.  When only --wt-db is set, the WT runs
-     * in TRUSTLESS MODE — never touches lsp.db, can't read revocation
-     * secrets even if forced to (the channel-hydration block is skipped
-     * entirely).  When --db is set, legacy hydration runs (with optional
-     * --wt-db parallel observation). */
-    if (!db_path && !wt_db_path) {
-        fprintf(stderr, "Error: --db PATH or --wt-db PATH required\n");
+    if (!wt_db_path) {
+        fprintf(stderr, "Error: --wt-db PATH is required.\n");
         usage(argv[0]);
         return 1;
-    }
-    if (db_path && !wt_db_path) {
-        fprintf(stderr,
-                "INFO: running in legacy mode (--db only). Consider --wt-db PATH "
-                "for the SF-WT-TRUSTLESS Phase 2 trustless mode.\n");
-    }
-    if (!db_path && wt_db_path) {
-        fprintf(stderr,
-                "INFO: TRUSTLESS MODE — running with --wt-db only. lsp.db is "
-                "never opened; revocation secrets are inaccessible to this "
-                "process.\n");
-    }
-
-    /* CL4.C: open DB read-write so the WT can read WAL-pending rows from a
-       concurrently-running LSP (read-only + WAL silently misses uncheckpointed
-       data) and append its own response/poison TX broadcasts to broadcast_log
-       for test verification.
-       Phase 2b: --db is optional; in TRUSTLESS MODE we skip opening lsp.db
-       entirely. */
-    persist_t db;
-    int use_db = 0;
-    if (db_path) {
-        if (!persist_open(&db, db_path)) {
-            fprintf(stderr, "Error: cannot open database '%s'\n", db_path);
-            return 1;
-        }
-        use_db = 1;
-    }
-
-    if (inspect_db_mode && !use_db) {
-        fprintf(stderr, "Error: --inspect-db requires --db PATH (reads from lsp.db only)\n");
-        return 1;
-    }
-    if (inspect_db_mode) {
-        /* CL6: forensic dump mode.  Read-only inspection of key tables.
-         * Operators run this against a snapshot DB to triage incidents
-         * without spinning up the chain backend.  Output is human-readable;
-         * for machine-readable use sqlite3 directly. */
-        printf("=== superscalar_watchtower --inspect-db ===\n");
-        printf("DB: %s\n", db_path);
-        printf("Schema version: %d\n", persist_schema_version(&db));
-        printf("\n");
-        /* Counts on key tables. */
-        struct { const char *name; const char *sql; } counts[] = {
-            { "factories",          "SELECT COUNT(*) FROM factories;" },
-            { "channels",           "SELECT COUNT(*) FROM channels;" },
-            { "old_commitments",    "SELECT COUNT(*) FROM old_commitments;" },
-            { "broadcast_log",      "SELECT COUNT(*) FROM broadcast_log;" },
-            { "breach_detections",  "SELECT COUNT(*) FROM breach_detections;" },
-            { "reorg_events",       "SELECT COUNT(*) FROM reorg_events;" },
-            { "signing_rounds",     "SELECT COUNT(*) FROM signing_rounds;" },
-            { "ceremonies",         "SELECT COUNT(*) FROM ceremonies;" },
-            { "ceremony_participants", "SELECT COUNT(*) FROM ceremony_participants;" },
-            { "revocation_releases","SELECT COUNT(*) FROM revocation_releases;" },
-        };
-        printf("Row counts:\n");
-        for (size_t k = 0; k < sizeof(counts)/sizeof(counts[0]); k++) {
-            sqlite3_stmt *stmt = NULL;
-            if (sqlite3_prepare_v2(db.db, counts[k].sql, -1, &stmt, NULL) == SQLITE_OK
-                && sqlite3_step(stmt) == SQLITE_ROW) {
-                printf("  %-24s %d\n", counts[k].name, sqlite3_column_int(stmt, 0));
-            } else {
-                printf("  %-24s (table missing)\n", counts[k].name);
-            }
-            if (stmt) sqlite3_finalize(stmt);
-        }
-        /* Last 10 broadcast_log entries. */
-        printf("\nLast 10 broadcast_log entries:\n");
-        const char *q = "SELECT broadcast_at, source, result, "
-                        "substr(txid,1,16) FROM broadcast_log "
-                        "ORDER BY broadcast_at DESC LIMIT 10;";
-        sqlite3_stmt *bl = NULL;
-        if (sqlite3_prepare_v2(db.db, q, -1, &bl, NULL) == SQLITE_OK) {
-            while (sqlite3_step(bl) == SQLITE_ROW) {
-                printf("  ts=%lld src=%-16s result=%-8s txid=%s...\n",
-                       (long long)sqlite3_column_int64(bl, 0),
-                       (const char *)sqlite3_column_text(bl, 1),
-                       (const char *)sqlite3_column_text(bl, 2),
-                       (const char *)sqlite3_column_text(bl, 3));
-            }
-            sqlite3_finalize(bl);
-        }
-        printf("\n=== done ===\n");
-        persist_close(&db);
-        return 0;
     }
 
     /* Initialize bitcoin RPC connection */
@@ -205,7 +138,6 @@ int main(int argc, char *argv[]) {
     }
     if (!rt_ok) {
         fprintf(stderr, "Error: cannot connect to bitcoind\n");
-        if (use_db) persist_close(&db);
         return 1;
     }
 
@@ -213,255 +145,43 @@ int main(int argc, char *argv[]) {
     fee_estimator_static_t fee;
     fee_estimator_static_init(&fee, 1000);
 
-    /* Initialize watchtower.  Phase 2b: pass NULL when --db is not set
-     * (trustless mode); src/watchtower.c is already NULL-safe for wt->db
-     * — every callsite uses `if (wt->db && wt->db->db) ...` guards. */
+    /* Initialize watchtower in TRUSTLESS mode: wt->db = NULL.  The
+       per-callsite NULL guards in src/watchtower.c (every wt->db deref
+       is `if (wt->db && wt->db->db) ...`) make this safe; no lsp.db
+       access ever happens in this binary. */
     watchtower_t wt;
-    if (!watchtower_init(&wt, 0, &rt, (fee_estimator_t *)&fee,
-                          use_db ? &db : NULL)) {
+    if (!watchtower_init(&wt, 0, &rt, (fee_estimator_t *)&fee, NULL)) {
         fprintf(stderr, "Error: watchtower_init failed\n");
-        if (use_db) persist_close(&db);
         return 1;
     }
     if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
     if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
 
-    /* SF-WT-TRUSTLESS Phase 2a (#248): open wt_db and parallel-hydrate
-     * watches from it BEFORE the legacy lsp.db channel hydration runs.
-     * Phase 2a is observation-only — verifies that wt_db rows produced
-     * by the LSP-side Phase 1b writes are decodable and registerable.
-     * Phase 2b will use these as the PRIMARY watch source. */
+    /* Open wt_db and hydrate watches.  All 4 watch kinds (factory,
+       sub-factory, channel commitment, force-close HTLC) are populated
+       by the LSP at revocation / advance / close time and read here.
+       No secrets are involved at any step. */
     persist_wt_t wt_pdb;
-    int use_wt_db = 0;
-    if (wt_db_path) {
-        if (!persist_wt_open(&wt_pdb, wt_db_path)) {
-            fprintf(stderr, "Error: cannot open watchtower database '%s'\n",
-                    wt_db_path);
-            if (use_db) persist_close(&db);
-            return 1;
-        }
-        use_wt_db = 1;
-        printf("WT-TRUSTLESS: opened wt_db at %s\n", wt_db_path);
-
-        int n_wt = watchtower_hydrate_from_wt_db(&wt, &wt_pdb);
-        if (n_wt < 0) {
-            fprintf(stderr,
-                    "WT-TRUSTLESS: WARN — hydration returned %d (proceeding "
-                    "with lsp.db hydration only)\n", n_wt);
-        }
+    if (!persist_wt_open(&wt_pdb, wt_db_path)) {
+        fprintf(stderr, "Error: cannot open watchtower database '%s'\n",
+                wt_db_path);
+        return 1;
     }
+    printf("WT-TRUSTLESS: opened wt_db at %s\n", wt_db_path);
 
-    /* Hydrate channels from the LSP DB so breach detections can build
-     * penalty TXes. Phase 2b: this is SKIPPED in trustless mode (no --db);
-     * the wt_db hydration above provides watches without requiring access
-     * to revocation secrets — the WT just broadcasts pre-signed response
-     * TXs on observed spends. */
-    secp256k1_context *chan_ctx = NULL;
-    channel_t *loaded_channels[WATCHTOWER_MAX_CHANNELS] = {0};
-    if (use_db) chan_ctx =
-        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    if (use_db && chan_ctx) {
-        uint32_t ch_ids[WATCHTOWER_MAX_CHANNELS];
-        size_t n_loaded = 0;
-        if (persist_list_channel_ids(&db, ch_ids, WATCHTOWER_MAX_CHANNELS,
-                                       &n_loaded) && n_loaded > 0) {
-            for (size_t i = 0; i < n_loaded; i++) {
-                channel_t *ch = calloc(1, sizeof(*ch));
-                if (!ch) continue;
-                if (!persist_load_channel_for_watchtower(&db, ch_ids[i],
-                                                          chan_ctx, ch)) {
-                    free(ch);
-                    continue;
-                }
-                if (ch_ids[i] < WATCHTOWER_MAX_CHANNELS) {
-                    /* watchtower_set_channel dropped in #208 A3.2 — penalty
-                       bytes are now pre-built at revocation time inside
-                       watchtower_watch_revoked_commitment.  Tracking
-                       loaded_channels[] is still useful for the standalone
-                       daemon's own bookkeeping (channel_cleanup at exit). */
-                    loaded_channels[ch_ids[i]] = ch;
-                } else {
-                    channel_cleanup(ch);
-                    free(ch);
-                }
-            }
-            printf("  Loaded %zu channel(s) for penalty signing\n", n_loaded);
-        }
-
-    /* CL4: hydrate PS state entries from client DB.  For each chain entry
-       except the LATEST (which represents the current state, not a stale),
-       register a watchtower entry that triggers on the OLD chain[K]'s txid
-       and broadcasts chain[K+1]'s signed_tx + chain[K]'s poison TX. */
-    {
-        #define WT_PS_MAX_KEYS 64
-        #define WT_PS_MAX_CHAIN 32
-        uint32_t f_ids[WT_PS_MAX_KEYS];
-        uint32_t n_idxs[WT_PS_MAX_KEYS];
-        size_t n_keys = 0;
-        size_t n_registered = 0;
-        if (persist_list_ps_leaf_chain_keys(&db, f_ids, n_idxs,
-                                             WT_PS_MAX_KEYS, &n_keys) && n_keys > 0) {
-            for (size_t k = 0; k < n_keys; k++) {
-                tx_buf_t chain_txs[WT_PS_MAX_CHAIN];
-                unsigned char txids[WT_PS_MAX_CHAIN][32];
-                uint64_t amounts[WT_PS_MAX_CHAIN];
-                tx_buf_t poison_txs[WT_PS_MAX_CHAIN];
-                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
-                    tx_buf_init(&chain_txs[j], 0);
-                    tx_buf_init(&poison_txs[j], 0);
-                    amounts[j] = 0;
-                }
-                int chain_len = persist_load_ps_chain(&db, f_ids[k], n_idxs[k],
-                                                       chain_txs, txids, amounts,
-                                                       poison_txs, WT_PS_MAX_CHAIN);
-                /* CL4.D / Task #40: register the initial-state defense entry.
-                   chain[0]'s persisted signed_tx + poison_tx describe state 1
-                   (post-1st-advance signed_tx) and the poison built BEFORE
-                   the 1st advance (consumes initial state's L-stock vout).
-                   Pair them with the initial txid from ps_initial_signed_states
-                   so the WT can detect a pre-PS state broadcast and respond.
-                   This closes the standalone-WT chain_len=1 gap. */
-                if (chain_len >= 1 && chain_txs[0].len > 0) {
-                    tx_buf_t init_tx = {0};
-                    unsigned char init_txid_be[32] = {0};
-                    if (persist_load_ps_initial_signed_state(&db,
-                            f_ids[k], n_idxs[k], &init_tx, init_txid_be)
-                        && init_tx.len > 0) {
-                        if (watchtower_watch_factory_node(&wt, n_idxs[k],
-                                                           init_txid_be,
-                                                           chain_txs[0].data,
-                                                           chain_txs[0].len,
-                                                           poison_txs[0].data,
-                                                           poison_txs[0].len)) {
-                            n_registered++;
-                        }
-                    }
-                    tx_buf_free(&init_tx);
-                }
-                /* Existing loop: chain[j].txid -> chain[j+1].signed_tx defense
-                   for transitions between persisted advances (j >= 1 states). */
-                for (int j = 0; j < chain_len - 1; j++) {
-                    if (chain_txs[j+1].len == 0) continue;
-                    if (watchtower_watch_factory_node(&wt, n_idxs[k],
-                                                       txids[j],
-                                                       chain_txs[j+1].data,
-                                                       chain_txs[j+1].len,
-                                                       poison_txs[j].data,
-                                                       poison_txs[j].len)) {
-                        n_registered++;
-                    }
-                }
-                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
-                    tx_buf_free(&chain_txs[j]);
-                    tx_buf_free(&poison_txs[j]);
-                }
-            }
-            printf("  Loaded %zu PS leaf chain entries for watchtower\n", n_registered);
-        }
-
-        size_t n_sub_keys = 0;
-        size_t n_sub_registered = 0;
-        if (persist_list_subfactory_chain_keys(&db, f_ids, n_idxs,
-                                                 WT_PS_MAX_KEYS, &n_sub_keys) && n_sub_keys > 0) {
-            for (size_t k = 0; k < n_sub_keys; k++) {
-                tx_buf_t chain_txs[WT_PS_MAX_CHAIN];
-                unsigned char txids[WT_PS_MAX_CHAIN][32];
-                uint64_t amounts[WT_PS_MAX_CHAIN];
-                tx_buf_t poison_txs[WT_PS_MAX_CHAIN];
-                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
-                    tx_buf_init(&chain_txs[j], 0);
-                    tx_buf_init(&poison_txs[j], 0);
-                    amounts[j] = 0;
-                }
-                uint64_t sales_stock_amounts[WT_PS_MAX_CHAIN];
-                uint64_t channel_amounts[WT_PS_MAX_CHAIN][16];
-                int n_channels_per_chain[WT_PS_MAX_CHAIN];
-                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
-                    sales_stock_amounts[j] = 0;
-                    n_channels_per_chain[j] = 0;
-                    for (int m = 0; m < 16; m++) channel_amounts[j][m] = 0;
-                }
-                int chain_len = persist_load_subfactory_chain(&db, f_ids[k], n_idxs[k],
-                                                                chain_txs, txids,
-                                                                sales_stock_amounts,
-                                                                channel_amounts,
-                                                                n_channels_per_chain,
-                                                                poison_txs, WT_PS_MAX_CHAIN);
-                (void)amounts;  /* unused for subfactory variant */
-                /* CL4.E: sub-factory analog of CL4.D / Task #40 — register the
-                   initial-state defense entry using chain[0]'s signed_tx +
-                   poison_tx paired with the pre-advance sub-factory txid from
-                   ps_initial_signed_states (saved by the v23 fix in
-                   lsp_subfactory_chain_advance). Closes the standalone-WT
-                   chain_len=1 gap for sub-factory cheats.
-                   Issue #4: register as WATCH_SUBFACTORY_NODE so the WT
-                   breach handler skips the dead response_tx broadcast that
-                   produced bitcoind -22. */
-                if (chain_len >= 1 && chain_txs[0].len > 0) {
-                    tx_buf_t init_tx = {0};
-                    unsigned char init_txid_be[32] = {0};
-                    if (persist_load_ps_initial_signed_state(&db,
-                            f_ids[k], n_idxs[k], &init_tx, init_txid_be)
-                        && init_tx.len > 0) {
-                        size_t n_ch0 = (size_t)n_channels_per_chain[0];
-                        if (watchtower_watch_subfactory_node(&wt, n_idxs[k],
-                                                              init_txid_be,
-                                                              chain_txs[0].data,
-                                                              chain_txs[0].len,
-                                                              poison_txs[0].data,
-                                                              poison_txs[0].len,
-                                                              channel_amounts[0],
-                                                              n_ch0,
-                                                              sales_stock_amounts[0])) {
-                            n_sub_registered++;
-                        }
-                    }
-                    tx_buf_free(&init_tx);
-                }
-                /* Existing loop: chain[j].txid -> chain[j+1].signed_tx for
-                   transitions between persisted advances (j >= 1 states).
-                   Issue #4: register as WATCH_SUBFACTORY_NODE — the proper
-                   sub-factory type — so the handler broadcasts ONLY the
-                   poison TX (correct defense) and skips response_tx (which
-                   fails -22 because chain[j+1]'s parent input is consumed
-                   by chain[j]'s confirmation or by the poison TX). */
-                for (int j = 0; j < chain_len - 1; j++) {
-                    if (chain_txs[j+1].len == 0) continue;
-                    size_t n_ch_j = (size_t)n_channels_per_chain[j];
-                    if (watchtower_watch_subfactory_node(&wt, n_idxs[k],
-                                                          txids[j],
-                                                          chain_txs[j+1].data,
-                                                          chain_txs[j+1].len,
-                                                          poison_txs[j].data,
-                                                          poison_txs[j].len,
-                                                          channel_amounts[j],
-                                                          n_ch_j,
-                                                          sales_stock_amounts[j])) {
-                        n_sub_registered++;
-                    }
-                }
-                for (int j = 0; j < WT_PS_MAX_CHAIN; j++) {
-                    tx_buf_free(&chain_txs[j]);
-                    tx_buf_free(&poison_txs[j]);
-                }
-            }
-            printf("  Loaded %zu PS sub-factory chain entries for watchtower\n",
-                   n_sub_registered);
-        }
-        #undef WT_PS_MAX_KEYS
-        #undef WT_PS_MAX_CHAIN
-    }
-    } else {
-        fprintf(stderr, "Warning: secp256k1 context creation failed — "
-                        "penalty TXes cannot be built\n");
+    int n_wt = watchtower_hydrate_from_wt_db(&wt, &wt_pdb);
+    if (n_wt < 0) {
+        fprintf(stderr,
+                "WT-TRUSTLESS: ERROR — hydration failed (returned %d)\n", n_wt);
+        persist_wt_close(&wt_pdb);
+        return 1;
     }
 
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    printf("SuperScalar Watchtower\n");
-    if (use_db) printf("  DB: %s (read-only)\n", db_path);
-    if (use_wt_db) printf("  WT-DB: %s\n", wt_db_path);
+    printf("SuperScalar Watchtower (TRUSTLESS — only mode)\n");
+    printf("  WT-DB: %s\n", wt_db_path);
     printf("  Network: %s\n", network);
     printf("  Poll interval: %d seconds\n", poll_interval);
     printf("  Watching for breaches...\n");
@@ -506,23 +226,9 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "[%ld] REORG (%s): height %d -> %d hash %.16s -> %.16s\n",
                     (long)time(NULL), kind_str, last_height, height,
                     last_hash, cur_hash);
-            {
-                char det[256];
-                if (reorg_kind == 2) {
-                    snprintf(det, sizeof(det),
-                             "same_height_%d hash_%.16s->%.16s",
-                             height, last_hash, cur_hash);
-                } else if (reorg_kind == 3) {
-                    snprintf(det, sizeof(det),
-                             "forward_reorg height_%d->%d hash_%.16s->%.16s",
-                             last_height, height, last_hash, cur_hash);
-                } else {
-                    snprintf(det, sizeof(det), "height_%d->%d depth_%d",
-                             last_height, height, last_height - height);
-                }
-                if (use_db)
-                    persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
-            }
+            /* Phase 2c PR-E: legacy persist_log_broadcast call removed.
+               wt_db has no broadcast_log table; reorg observability lives
+               in dashboard / external metrics. */
             watchtower_on_reorg(&wt, height, last_height);
             last_height = height;
             if (cur_hash[0]) { memcpy(last_hash, cur_hash, 65); }
@@ -550,17 +256,6 @@ int main(int argc, char *argv[]) {
 
     printf("\nShutdown requested. Cleaning up...\n");
     watchtower_cleanup(&wt);
-    for (size_t i = 0; i < WATCHTOWER_MAX_CHANNELS; i++) {
-        if (loaded_channels[i]) {
-            channel_cleanup(loaded_channels[i]);
-            free(loaded_channels[i]);
-        }
-    }
-    if (chan_ctx) secp256k1_context_destroy(chan_ctx);
-    /* SF-WT-TRUSTLESS Phase 2a: close wt_db at natural shutdown.  Early-exit
-     * paths skip this — OS process cleanup handles them; SQLite WAL keeps
-     * committed data durable through abrupt close. */
-    if (use_wt_db) persist_wt_close(&wt_pdb);
-    if (use_db) persist_close(&db);
+    persist_wt_close(&wt_pdb);
     return 0;
 }
