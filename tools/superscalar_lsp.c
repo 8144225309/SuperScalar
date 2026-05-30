@@ -2855,6 +2855,11 @@ int main(int argc, char *argv[]) {
             watchtower_init(&rec_wt, mgr->n_channels, &rt, fee_est, &db);
             /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
                bytes are pre-built at revocation receive time. */
+            /* SF-WT-TRUSTLESS Phase 2c (#248): attach wt_db on the
+               recovery-path watchtower too so post-restart breaches are
+               also trustlessly observable. */
+            if (use_wt_db)
+                watchtower_set_wt_db(&rec_wt, &wt_db);
             mgr->watchtower = &rec_wt;
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
@@ -3287,6 +3292,11 @@ accept_new_factory:
 
             /* Watchtower: init and wire into dispatch */
             watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, fee_est, g_db);
+            /* SF-WT-TRUSTLESS Phase 2c (#248): attach the global wt_db handle
+               (g_wt_db) so the dispatch-path watchtower mirrors penalty TXs
+               into wt_db for trustless WT consumption. */
+            if (g_wt_db)
+                watchtower_set_wt_db(&g_watchtower, g_wt_db);
 
             if (bump_budget_pct > 0) g_watchtower.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) g_watchtower.max_bump_fee_sat = max_bump_fee;
@@ -4129,6 +4139,13 @@ accept_new_factory:
                           use_db ? &db : NULL);
         /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
            bytes are pre-built at revocation receive time. */
+        /* SF-WT-TRUSTLESS Phase 2c (#248): attach the trustless wt_db
+           handle so watchtower_watch_revoked_commitment mirrors each
+           pre-built penalty TX into wt_db (kind=2 row).  Standalone
+           trustless WT then broadcasts from wt_db alone without ever
+           opening lsp.db. */
+        if (use_wt_db)
+            watchtower_set_wt_db(&wt, &wt_db);
         mgr->watchtower = &wt;
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;

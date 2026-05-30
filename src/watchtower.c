@@ -15,6 +15,7 @@ extern void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
+extern void sha256_double(const unsigned char *data, size_t len, unsigned char *out32);
 
 /* Authoritative check: does this serialised penalty TX contain a P2A anchor
  * at vout 1?  The build-time `use_anchor` decision (fee_should_use_anchor at
@@ -536,6 +537,61 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                 persist_save_old_commitment_witness(
                                     wt->db, channel_id, old_commit_num,
                                     penalty.data, penalty.len);
+
+                            /* SF-WT-TRUSTLESS Phase 2c (#248): mirror penalty
+                               into wt_db for trustless WT consumption.  The
+                               penalty was just built using channel secrets;
+                               wt_db never sees the secrets, only the signed
+                               bytes that the WT broadcasts on breach. */
+                            if (wt->wt_db && wt->wt_db->db) {
+                                /* response_txid = wtxid of the signed penalty
+                                   (sha256d of full bytes).  Not the canonical
+                                   non-witness txid; wt_db uses it for
+                                   observability + indexing only, not for
+                                   chain matching (chain matching keys off
+                                   parent_txid). */
+                                unsigned char resp_txid[32];
+                                sha256_double(penalty.data, penalty.len,
+                                              resp_txid);
+                                /* hex-encode the bytes for storage. */
+                                size_t hex_buf_len = penalty.len * 2 + 1;
+                                char *hex = (char *)malloc(hex_buf_len);
+                                if (hex) {
+                                    hex_encode(penalty.data, penalty.len, hex);
+                                    int64_t wid = persist_wt_register_watch(
+                                        wt->wt_db,
+                                        WT_KIND_CHANNEL_COMMITMENT,
+                                        channel_id,
+                                        old_txid,
+                                        /* parent_vout      */ 0,
+                                        /* parent_value_sat */ old_remote,
+                                        to_local_spk,
+                                        /* parent_spk_len   */ 34,
+                                        /* csv_delay        */ ch->to_self_delay,
+                                        hex,
+                                        resp_txid,
+                                        /* fee_bump_budget  */ 0,
+                                        /* fee_bump_dline   */ 0);
+                                    free(hex);
+                                    if (wid > 0) {
+                                        fprintf(stderr,
+                                            "LSP-WT-TRUSTLESS: registered "
+                                            "commitment watch_id=%lld for "
+                                            "channel %u (commit_num=%llu, "
+                                            "to_local=%llu sats)\n",
+                                            (long long)wid, channel_id,
+                                            (unsigned long long)old_commit_num,
+                                            (unsigned long long)old_remote);
+                                    } else {
+                                        fprintf(stderr,
+                                            "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                            "commitment register failed for "
+                                            "channel %u (commit_num=%llu)\n",
+                                            channel_id,
+                                            (unsigned long long)old_commit_num);
+                                    }
+                                }
+                            }
                         }
                     }
                     tx_buf_free(&penalty);
@@ -1958,6 +2014,11 @@ int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
            ctx.n_loaded, ctx.n_skipped,
            per_kind[0], per_kind[1], per_kind[2], per_kind[3]);
     return ctx.n_loaded;
+}
+
+void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db) {
+    if (!wt) return;
+    wt->wt_db = wt_db;
 }
 
 void watchtower_cleanup(watchtower_t *wt) {
