@@ -15,6 +15,7 @@ extern void chain_backend_regtest_init(chain_backend_t *backend, regtest_t *rt);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
+extern void sha256_double(const unsigned char *data, size_t len, unsigned char *out32);
 
 /* Authoritative check: does this serialised penalty TX contain a P2A anchor
  * at vout 1?  The build-time `use_anchor` decision (fee_should_use_anchor at
@@ -536,6 +537,61 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                 persist_save_old_commitment_witness(
                                     wt->db, channel_id, old_commit_num,
                                     penalty.data, penalty.len);
+
+                            /* SF-WT-TRUSTLESS Phase 2c (#248): mirror penalty
+                               into wt_db for trustless WT consumption.  The
+                               penalty was just built using channel secrets;
+                               wt_db never sees the secrets, only the signed
+                               bytes that the WT broadcasts on breach. */
+                            if (wt->wt_db && wt->wt_db->db) {
+                                /* response_txid = wtxid of the signed penalty
+                                   (sha256d of full bytes).  Not the canonical
+                                   non-witness txid; wt_db uses it for
+                                   observability + indexing only, not for
+                                   chain matching (chain matching keys off
+                                   parent_txid). */
+                                unsigned char resp_txid[32];
+                                sha256_double(penalty.data, penalty.len,
+                                              resp_txid);
+                                /* hex-encode the bytes for storage. */
+                                size_t hex_buf_len = penalty.len * 2 + 1;
+                                char *hex = (char *)malloc(hex_buf_len);
+                                if (hex) {
+                                    hex_encode(penalty.data, penalty.len, hex);
+                                    int64_t wid = persist_wt_register_watch(
+                                        wt->wt_db,
+                                        WT_KIND_CHANNEL_COMMITMENT,
+                                        channel_id,
+                                        old_txid,
+                                        /* parent_vout      */ 0,
+                                        /* parent_value_sat */ old_remote,
+                                        to_local_spk,
+                                        /* parent_spk_len   */ 34,
+                                        /* csv_delay        */ ch->to_self_delay,
+                                        hex,
+                                        resp_txid,
+                                        /* fee_bump_budget  */ 0,
+                                        /* fee_bump_dline   */ 0);
+                                    free(hex);
+                                    if (wid > 0) {
+                                        fprintf(stderr,
+                                            "LSP-WT-TRUSTLESS: registered "
+                                            "commitment watch_id=%lld for "
+                                            "channel %u (commit_num=%llu, "
+                                            "to_local=%llu sats)\n",
+                                            (long long)wid, channel_id,
+                                            (unsigned long long)old_commit_num,
+                                            (unsigned long long)old_remote);
+                                    } else {
+                                        fprintf(stderr,
+                                            "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                            "commitment register failed for "
+                                            "channel %u (commit_num=%llu)\n",
+                                            channel_id,
+                                            (unsigned long long)old_commit_num);
+                                    }
+                                }
+                            }
                         }
                     }
                     tx_buf_free(&penalty);
@@ -986,38 +1042,12 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
-            /* Auto-settle: broadcast commitment TXs for channels on this leaf.
-               After the leaf state TX confirms, each channel's funding output
-               exists on-chain. Broadcasting the commitment TX settles the
-               channel without requiring the client to be online. */
-            if (e->leaf_channel_ids && e->n_leaf_channels > 0 && wt->db) {
-                for (size_t lc = 0; lc < e->n_leaf_channels; lc++) {
-                    uint32_t ch_idx = e->leaf_channel_ids[lc];
-                    unsigned char commit_tx[4096];
-                    size_t commit_tx_len = 0;
-                    uint64_t commit_cn = 0;
-                    if (persist_load_commitment_sig(wt->db, ch_idx,
-                            &commit_cn, NULL, commit_tx, &commit_tx_len,
-                            sizeof(commit_tx)) &&
-                        commit_tx_len > 0) {
-                        char *ctx_hex = (char *)malloc(commit_tx_len * 2 + 1);
-                        if (ctx_hex) {
-                            hex_encode(commit_tx, commit_tx_len, ctx_hex);
-                            char ctx_txid[65];
-                            if (wt->chain->send_raw_tx(wt->chain, ctx_hex,
-                                                         ctx_txid))
-                                printf("  Auto-settle channel %u (cn=%llu): %s\n",
-                                       ch_idx, (unsigned long long)commit_cn,
-                                       ctx_txid);
-                            else
-                                printf("  Auto-settle channel %u: broadcast failed "
-                                       "(leaf may need more confirmations)\n",
-                                       ch_idx);
-                            free(ctx_hex);
-                        }
-                    }
-                }
-            }
+            /* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): auto-settle moved to
+             * src/watchtower_autosettle.c (linked into superscalar_secrets
+             * lib — LSP/client/tests/bridge only).  The trustless WT binary
+             * does not link autosettle and leaves wt->autosettle_fn NULL,
+             * so this is a no-op there. */
+            if (wt->autosettle_fn) wt->autosettle_fn(wt, e);
 
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
@@ -1838,6 +1868,137 @@ int watchtower_watch_subfactory_node(watchtower_t *wt,
 
     wt->n_entries++;
     return 1;
+}
+
+/* SF-WT-TRUSTLESS Phase 2 (#248): hydrate from wt_db. */
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+
+/* SF-WT-TRUSTLESS Phase 2c hydration helper.
+ *
+ * Trustless watch model: the WT broadcasts the row's response_tx when
+ * the row's parent_txid is observed spent.  This is mechanically the
+ * SAME action for every watch kind (factory, sub-factory, channel
+ * commitment breach, force-close HTLC sweep) — only the LSP-side
+ * bookkeeping kind differs.  At hydration we use the WATCH_FACTORY_NODE
+ * in-memory shape uniformly, because its broadcast path (chain-observed
+ * parent → broadcast pre-built response_tx) is the trustless contract.
+ *
+ * The kind discriminant is consumed by the LSP and by observability
+ * dashboards via wt_db queries — the WT process itself doesn't act on
+ * it.  Per-kind counters logged at the end aid operator audits.
+ *
+ * In legacy --db mode (Phase 1) hydration of channel commitment and
+ * force-close watches goes through src/watchtower.c's revoked-commit
+ * and force-close entry points which require lsp.db secrets.  Phase 2c
+ * removes that requirement for the standalone WT binary.
+ */
+typedef struct {
+    watchtower_t *wt;
+    int n_loaded;
+    int n_skipped;
+} wt_hydrate_ctx_t;
+
+static int wt_hydrate_row_cb(uint32_t factory_id,
+                              const unsigned char parent_txid32[32],
+                              uint32_t parent_vout,
+                              uint64_t parent_value_sat,
+                              const unsigned char *parent_spk,
+                              size_t parent_spk_len,
+                              uint32_t csv_delay,
+                              const char *response_tx_hex,
+                              const unsigned char response_txid32[32],
+                              uint64_t fee_bump_budget_sat,
+                              uint32_t fee_bump_deadline_height,
+                              void *user) {
+    (void)parent_vout; (void)parent_value_sat;
+    (void)parent_spk;  (void)parent_spk_len; (void)csv_delay;
+    (void)response_txid32;
+    (void)fee_bump_budget_sat; (void)fee_bump_deadline_height;
+    wt_hydrate_ctx_t *ctx = (wt_hydrate_ctx_t *)user;
+
+    int hex_len = (int)strlen(response_tx_hex);
+    if (hex_len <= 0 || (hex_len % 2) != 0) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: skip row factory_id=%u: "
+                "response_tx_hex len=%d not valid hex\n",
+                factory_id, hex_len);
+        ctx->n_skipped++;
+        return 1;
+    }
+    size_t resp_len = (size_t)hex_len / 2;
+    unsigned char *resp = malloc(resp_len);
+    if (!resp) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: OOM allocating %zu bytes\n",
+                resp_len);
+        ctx->n_skipped++;
+        return 1;
+    }
+    if (hex_decode(response_tx_hex, resp, resp_len) != (int)resp_len) {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: hex_decode failed for "
+                "factory_id=%u\n", factory_id);
+        free(resp);
+        ctx->n_skipped++;
+        return 1;
+    }
+
+    unsigned char parent_txid[32];
+    memcpy(parent_txid, parent_txid32, 32);
+    if (watchtower_watch_factory_node(ctx->wt, factory_id, parent_txid,
+                                        resp, resp_len, NULL, 0)) {
+        ctx->n_loaded++;
+    } else {
+        fprintf(stderr,
+                "watchtower_hydrate_from_wt_db: watch_factory_node failed "
+                "for factory_id=%u\n", factory_id);
+        ctx->n_skipped++;
+    }
+    free(resp);
+    return 1;
+}
+
+int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
+    if (!wt || !pwt || !pwt->db) return -1;
+
+    wt_hydrate_ctx_t ctx = { .wt = wt, .n_loaded = 0, .n_skipped = 0 };
+
+    static const struct { wt_watch_kind_t kind; const char *label; } kinds[] = {
+        { WT_KIND_FACTORY_NODE,       "factory"       },
+        { WT_KIND_SUBFACTORY_NODE,    "subfactory"    },
+        { WT_KIND_CHANNEL_COMMITMENT, "commitment"    },
+        { WT_KIND_FORCE_CLOSE_HTLC,   "force_close"   },
+    };
+    int per_kind[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < sizeof(kinds)/sizeof(kinds[0]); i++) {
+        int before = ctx.n_loaded;
+        int visited = persist_wt_list_watches_by_kind(pwt, kinds[i].kind,
+                                                       wt_hydrate_row_cb, &ctx);
+        if (visited < 0) {
+            fprintf(stderr,
+                    "watchtower_hydrate_from_wt_db: list_by_kind(%s) failed\n",
+                    kinds[i].label);
+            return -1;
+        }
+        per_kind[i] = ctx.n_loaded - before;
+    }
+
+    printf("WT-TRUSTLESS: hydrated %d watches from wt_db (%d skipped) "
+           "[factory=%d subfactory=%d commitment=%d force_close=%d]\n",
+           ctx.n_loaded, ctx.n_skipped,
+           per_kind[0], per_kind[1], per_kind[2], per_kind[3]);
+    return ctx.n_loaded;
+}
+
+void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db) {
+    if (!wt) return;
+    wt->wt_db = wt_db;
+}
+
+void watchtower_register_autosettle(watchtower_t *wt,
+    int (*fn)(struct watchtower_s *wt, watchtower_entry_t *entry)) {
+    if (!wt) return;
+    wt->autosettle_fn = fn;
 }
 
 void watchtower_cleanup(watchtower_t *wt) {

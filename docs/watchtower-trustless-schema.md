@@ -1,9 +1,22 @@
 # Watchtower trustless schema design
 
-**Status:** Design draft. Tracked as SF-WT-TRUSTLESS (mainnet-blocker per
-issue #289 §6).
+**Status (as of v0.2.0):** **Shipped — trustless watchtower is now the
+only mode.**  Standalone `superscalar_watchtower` binary contains no
+secret-reader functions (verifiable with `nm`).  All 4 watch kinds
+(factory-node, sub-factory-node, channel-commitment, force-close-HTLC)
+are populated by the LSP at the moment secrets are in scope and
+consumed by the WT process without ever opening `lsp.db`.
 **Goal:** WT process literally cannot read penalty/revocation secrets,
-even if compromised or running on hostile hardware.
+even if compromised or running on hostile hardware.  ✓ Met in v0.2.0.
+
+**Operator quick-reference (v0.2.0):**
+
+- LSP launches with `--db lsp.db --wt-db wt.db` (mainnet requires both).
+- Standalone WT launches with `--wt-db wt.db` only.  Passing `--db`
+  errors with a migration pointer.
+- Verifiable trustless guarantee:
+  `nm -D --defined-only superscalar_watchtower | grep persist_load_` →
+  empty.  See `docs/release-notes/release-notes-0.2.0.md`.
 
 ## The problem today
 
@@ -68,7 +81,67 @@ The LSP, on each ceremony completion or state advance, derives the
 trustless entries and writes them into `watchtower.db`. The WT process
 opens `watchtower.db` exclusively and never sees `lsp.db`.
 
-## Schema (proposed v36)
+## Schema (v0.2.0 — wt.db schema_version = 2)
+
+Phase 1a shipped a single-shape `wt_watches` row carrying
+`(parent_outpoint, signed_response_tx, optional fee-bump)`.  Phase 2c
+(v0.2.0) added a `watch_kind` discriminant column so the same physical
+schema can carry all 4 watch kinds without per-kind tables.
+
+```sql
+CREATE TABLE wt_watches (
+    watch_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_kind        INTEGER NOT NULL DEFAULT 0,   -- wt_watch_kind_t (see below)
+    factory_id        INTEGER NOT NULL,             -- LSP-side handle (opaque to WT)
+    parent_txid       BLOB NOT NULL,                -- 32-byte outpoint to watch
+    parent_vout       INTEGER NOT NULL,
+    parent_value_sat  INTEGER NOT NULL,
+    parent_spk        BLOB NOT NULL,
+    csv_delay         INTEGER NOT NULL,
+    response_id       INTEGER NOT NULL,             -- FK → wt_responses(response_id)
+    superseded_at     INTEGER,                      -- chain-height at supersession
+    registered_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (response_id) REFERENCES wt_responses(response_id)
+);
+CREATE INDEX wt_watches_kind_idx ON wt_watches(watch_kind) WHERE superseded_at IS NULL;
+```
+
+`watch_kind` values (stable on disk; append-only):
+
+| Value | Constant | Semantics |
+|---|---|---|
+| 0 | `WT_KIND_FACTORY_NODE` | Phase 1b — factory chain advance (DW Tier B, PS leaf advance, leaf realloc) |
+| 1 | `WT_KIND_SUBFACTORY_NODE` | Phase 2c — sub-factory chain advance (k≥2 shapes) |
+| 2 | `WT_KIND_CHANNEL_COMMITMENT` | Phase 2c — channel-level revoked-commitment penalty |
+| 3 | `WT_KIND_FORCE_CLOSE_HTLC` | Phase 2c — HTLC sweep on honest force-close (one row per HTLC) |
+
+The WT process does NOT interpret `watch_kind` at broadcast time — it
+broadcasts `response_tx_hex` when the parent outpoint is observed
+spent, regardless of kind.  Kind is consumed by:
+
+1. LSP-side helpers (`lsp_wt_register_*_watch` in
+   `include/superscalar/lsp_wt.h`) — for callsite clarity.
+2. WT-side hydration (`watchtower_hydrate_from_wt_db` in
+   `src/watchtower.c`) — to populate the correct in-memory entry kind
+   and to log per-kind counters at startup.
+3. Operator observability — `sqlite3 wt.db "SELECT watch_kind, COUNT(*)
+   FROM wt_watches GROUP BY watch_kind;"`.
+
+In-place schema migration: opening a Phase 1a wt.db (`schema_version = 1`)
+triggers an `ALTER TABLE wt_watches ADD COLUMN watch_kind INTEGER NOT
+NULL DEFAULT 0` and bumps `schema_version` to 2.  Existing rows default
+to `WT_KIND_FACTORY_NODE` (matches their semantics — Phase 1b only wrote
+factory-node watches).
+
+---
+
+## Original design notes (for historical context)
+
+The rest of this document was the pre-v0.2.0 design draft.  Most of
+what it proposed is now shipped.  Kept as-is for the design-rationale
+audit trail; see release notes for what landed.
+
+### Schema (proposed v36)
 
 ```sql
 -- Outpoints + scriptpubkeys the WT watches for chain spends.

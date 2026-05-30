@@ -77,6 +77,11 @@ static persist_t *g_db = NULL;  /* for broadcast audit logging */
  * persist_wt_register_watch on this handle from ceremony completion
  * sites; Phase 1b.1 only wires the lifecycle. */
 static persist_wt_t *g_wt_db = NULL;
+/* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): auto-settle helper lives in
+   src/watchtower_autosettle.c (linked into superscalar_secrets, which the
+   LSP binary links — superscalar_watchtower does not). */
+extern int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
+                                                 watchtower_entry_t *e);
 
 /* BOLT #8 server thread — owns g_bolt8_cfg; runs blocking accept loop */
 static bolt8_server_cfg_t g_bolt8_cfg;
@@ -2315,6 +2320,21 @@ int main(int argc, char *argv[]) {
             "and breach penalties cannot be constructed.\n");
         return 1;
     }
+    /* SF-WT-TRUSTLESS Phase 2c PR-E (#248): mainnet also requires --wt-db
+       so the operator runs a trustless watchtower binary (the only WT
+       mode in v0.2.0) against this LSP's pre-signed response TXs.
+       Without --wt-db the LSP can still run on mainnet but loses
+       trustless WT support — flag this as an error so operators can't
+       accidentally deploy mainnet without it. */
+    if (strcmp(network, "mainnet") == 0 && !wt_db_path) {
+        fprintf(stderr,
+            "Error: mainnet requires --wt-db for the trustless watchtower.\n"
+            "v0.2.0 removed the legacy --db-only watchtower mode; the LSP\n"
+            "must populate wt.db so a standalone trustless WT can broadcast\n"
+            "penalty TXs on breach without ever opening lsp.db.\n"
+            "See docs/watchtower-trustless-schema.md for the model.\n");
+        return 1;
+    }
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
@@ -2890,6 +2910,14 @@ int main(int argc, char *argv[]) {
             watchtower_init(&rec_wt, mgr->n_channels, &rt, fee_est, &db);
             /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
                bytes are pre-built at revocation receive time. */
+            /* SF-WT-TRUSTLESS Phase 2c (#248): attach wt_db on the
+               recovery-path watchtower too so post-restart breaches are
+               also trustlessly observable. */
+            if (use_wt_db)
+                watchtower_set_wt_db(&rec_wt, &wt_db);
+            /* PR-E.2: register auto-settle hook on recovery-path WT too. */
+            watchtower_register_autosettle(&rec_wt,
+                                            watchtower_autosettle_leaf_channels);
             mgr->watchtower = &rec_wt;
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
@@ -3322,6 +3350,14 @@ accept_new_factory:
 
             /* Watchtower: init and wire into dispatch */
             watchtower_init(&g_watchtower, g_channel_mgr->n_channels, NULL, fee_est, g_db);
+            /* SF-WT-TRUSTLESS Phase 2c (#248): attach the global wt_db handle
+               (g_wt_db) so the dispatch-path watchtower mirrors penalty TXs
+               into wt_db for trustless WT consumption. */
+            if (g_wt_db)
+                watchtower_set_wt_db(&g_watchtower, g_wt_db);
+            /* PR-E.2: register auto-settle hook on dispatch-path WT too. */
+            watchtower_register_autosettle(&g_watchtower,
+                                            watchtower_autosettle_leaf_channels);
 
             if (bump_budget_pct > 0) g_watchtower.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) g_watchtower.max_bump_fee_sat = max_bump_fee;
@@ -4164,6 +4200,16 @@ accept_new_factory:
                           use_db ? &db : NULL);
         /* watchtower_set_channel loop dropped in #208 A3.2 — penalty
            bytes are pre-built at revocation receive time. */
+        /* SF-WT-TRUSTLESS Phase 2c (#248): attach the trustless wt_db
+           handle so watchtower_watch_revoked_commitment mirrors each
+           pre-built penalty TX into wt_db (kind=2 row).  Standalone
+           trustless WT then broadcasts from wt_db alone without ever
+           opening lsp.db. */
+        if (use_wt_db)
+            watchtower_set_wt_db(&wt, &wt_db);
+        /* PR-E.2: register the auto-settle hook (extracted to a separate
+           TU so it doesn't appear in the trustless WT binary). */
+        watchtower_register_autosettle(&wt, watchtower_autosettle_leaf_channels);
         mgr->watchtower = &wt;
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
