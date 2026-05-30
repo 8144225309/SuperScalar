@@ -205,7 +205,7 @@ int main(int argc, char *argv[]) {
     }
     if (!rt_ok) {
         fprintf(stderr, "Error: cannot connect to bitcoind\n");
-        persist_close(&db);
+        if (use_db) persist_close(&db);
         return 1;
     }
 
@@ -460,7 +460,8 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, sigint_handler);
 
     printf("SuperScalar Watchtower\n");
-    printf("  DB: %s (read-only)\n", db_path);
+    if (use_db) printf("  DB: %s (read-only)\n", db_path);
+    if (use_wt_db) printf("  WT-DB: %s\n", wt_db_path);
     printf("  Network: %s\n", network);
     printf("  Poll interval: %d seconds\n", poll_interval);
     printf("  Watching for breaches...\n");
@@ -519,7 +520,8 @@ int main(int argc, char *argv[]) {
                     snprintf(det, sizeof(det), "height_%d->%d depth_%d",
                              last_height, height, last_height - height);
                 }
-                persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
+                if (use_db)
+                    persist_log_broadcast(&db, "", "reorg_detected", det, "ok");
             }
             watchtower_on_reorg(&wt, height, last_height);
             last_height = height;
