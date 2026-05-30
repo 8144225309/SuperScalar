@@ -102,40 +102,56 @@ BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 SCENARIO_TIMEOUT="${SCENARIO_TIMEOUT:-60}"
 
 # ---------------------------------------------------------------------------
-# Matrix definition.  Each row: CHECKPOINT|DRIVER_FLAGS|EXPECTED_PHASE
+# Matrix definition.  Each row:
+#   CHECKPOINT | DRIVER_FLAGS | EXPECTED_PHASE | N_CLIENTS | ARITY
 # EXPECTED_PHASE is the phase-class assertion family applied to the latest
-# ceremony row + its participant rows.
+# ceremony row + its participant rows.  N_CLIENTS and ARITY override the
+# globals for ceremonies that require specific factory shapes — leaf_advance
+# wants N=2 arity=1, sub-factory variants want --arity 3 with K=2 PS clients.
 # ---------------------------------------------------------------------------
 CHECKPOINTS=(
-    # Factory creation ceremony (4 kill points)
-    "factory_creation_propose|--demo|propose"
-    "factory_creation_nonced|--demo|nonced"
-    "factory_creation_signed|--demo|signed"
-    "factory_creation_finalize_partial|--demo|finalize_partial"
+    # Factory creation ceremony (4 kill points) — default N=4 arity=2
+    "factory_creation_propose|--demo|propose|4|2"
+    "factory_creation_nonced|--demo|nonced|4|2"
+    "factory_creation_signed|--demo|signed|4|2"
+    "factory_creation_finalize_partial|--demo|finalize_partial|4|2"
 
-    # Leaf advance ceremony (4 kill points)
-    "leaf_advance_propose|--demo --test-leaf-advance --advance-count 1|propose"
-    "leaf_advance_nonced|--demo --test-leaf-advance --advance-count 1|nonced"
-    "leaf_advance_signed|--demo --test-leaf-advance --advance-count 1|signed"
-    "leaf_advance_finalize_partial|--demo --test-leaf-advance --advance-count 1|finalize_partial"
+    # Leaf advance ceremony (4 kill points) — wire ceremony needs N=2 arity=1
+    # (matches tools/test_regtest_wire_leaf_advance.sh).  --test-leaf-advance
+    # is the chain-level test that bypasses the MuSig wire path; the wire
+    # variant is what calls lsp_advance_leaf_stateless where the checkpoints
+    # live (src/lsp_channels.c:1685/1718/1907/2036).
+    "leaf_advance_propose|--demo --test-wire-leaf-advance|propose|2|1"
+    "leaf_advance_nonced|--demo --test-wire-leaf-advance|nonced|2|1"
+    "leaf_advance_signed|--demo --test-wire-leaf-advance|signed|2|1"
+    "leaf_advance_finalize_partial|--demo --test-wire-leaf-advance|finalize_partial|2|1"
 
-    # Tier B state advance ceremony (4 kill points)
-    "state_advance_propose|--demo --test-ps-advance|propose"
-    "state_advance_nonced|--demo --test-ps-advance|nonced"
-    "state_advance_signed|--demo --test-ps-advance|signed"
-    "state_advance_finalize_partial|--demo --test-ps-advance|finalize_partial"
+    # Tier B state advance ceremony (4 kill points) — checkpoints live in
+    # lsp_run_state_advance_stateless (src/lsp_channels.c:2301/2398/2636/2732).
+    # --test-tier-b-rollover drives states_per_layer+1 leaf advances to
+    # trigger the root rollover that fires lsp_run_state_advance.  PS shape
+    # (--arity 3) so the rollover path is exercised.
+    "state_advance_propose|--demo --test-tier-b-rollover|propose|4|3"
+    "state_advance_nonced|--demo --test-tier-b-rollover|nonced|4|3"
+    "state_advance_signed|--demo --test-tier-b-rollover|signed|4|3"
+    "state_advance_finalize_partial|--demo --test-tier-b-rollover|finalize_partial|4|3"
 
-    # Sub-factory single-input chain advance (4 kill points)
-    "subfactory_propose|--demo --test-subfactory-advance|propose"
-    "subfactory_nonced|--demo --test-subfactory-advance|nonced"
-    "subfactory_signed|--demo --test-subfactory-advance|signed"
-    "subfactory_finalize_partial|--demo --test-subfactory-advance|finalize_partial"
+    # Sub-factory single-input chain advance (4 kill points) — checkpoints in
+    # lsp_subfactory_chain_advance_stateless (src/lsp_channels.c:4169/4212/4429/4453).
+    # --test-subfactory-advance requires --arity 3 --ps-subfactory-arity K (K>=2).
+    "subfactory_propose|--demo --test-subfactory-advance --ps-subfactory-arity 2|propose|4|3"
+    "subfactory_nonced|--demo --test-subfactory-advance --ps-subfactory-arity 2|nonced|4|3"
+    "subfactory_signed|--demo --test-subfactory-advance --ps-subfactory-arity 2|signed|4|3"
+    "subfactory_finalize_partial|--demo --test-subfactory-advance --ps-subfactory-arity 2|finalize_partial|4|3"
 
-    # Sub-factory multi-input chain advance (4 kill points)
-    "subfactory_multi_propose|--demo --test-subfactory-advance-multi|propose"
-    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi|nonced"
-    "subfactory_multi_signed|--demo --test-subfactory-advance-multi|signed"
-    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi|finalize_partial"
+    # Sub-factory multi-input chain advance (4 kill points) — checkpoints in
+    # the multi-input ceremony variant (src/lsp_channels.c:3568/3630/3921/3944).
+    # --test-subfactory-advance-multi drives TWO back-to-back advances; the
+    # second exercises the multi-input MuSig path (#142 SF-A).
+    "subfactory_multi_propose|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|propose|4|3"
+    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|nonced|4|3"
+    "subfactory_multi_signed|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|signed|4|3"
+    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|finalize_partial|4|3"
 )
 
 # Optional filter — run only checkpoints matching this glob (default: all).
@@ -190,8 +206,9 @@ echo "  bitcoin tip : $($BCLI getblockcount)"
 echo
 
 # ---------------------------------------------------------------------------
-# run_scenario CHECKPOINT DRIVER_FLAGS PHASE PORT
+# run_scenario CHECKPOINT DRIVER_FLAGS PHASE PORT [N_CLIENTS] [ARITY]
 #
+# N_CLIENTS and ARITY are per-scenario overrides; absent means use globals.
 # Returns 0 on PASS, non-zero on FAIL.  Echoes a one-line verdict to stdout
 # in the format:
 #   [PASS|FAIL] checkpoint=NAME phase=PHASE state=N parts=N/sent=N/signed=N
@@ -201,6 +218,8 @@ run_scenario() {
     local driver_flags="$2"
     local phase="$3"
     local port="$4"
+    local n_clients="${5:-$CLIENTS}"
+    local arity="${6:-$ARITY}"
 
     local tmpdir
     tmpdir=$(mktemp -d "/tmp/ss-crash-drill.${ckpt}.XXXXXX")
@@ -215,7 +234,7 @@ run_scenario() {
     "$LSP_BIN" \
         --network regtest --port "$port" \
         $driver_flags --lsp-balance-pct 50 \
-        --clients "$CLIENTS" --arity "$ARITY" \
+        --clients "$n_clients" --arity "$arity" \
         --amount "$AMOUNT" --fee-rate 1100 --confirm-timeout 86400 \
         --seckey "$LSP_SECKEY" \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
@@ -248,7 +267,7 @@ run_scenario() {
     # (Per feedback_test_scaffold_seckeys.md most --test-* drivers expect
     # this hardcoded scheme.)
     local cpids=()
-    for N in $(seq 1 $CLIENTS); do
+    for N in $(seq 1 $n_clients); do
         local hex_last
         hex_last=$(printf "%02x" $((N + 1)))
         local sk="00000000000000000000000000000000000000000000000000000000000000${hex_last}"
@@ -427,7 +446,7 @@ declare -a FAILED_NAMES=()
 
 idx=0
 for entry in "${CHECKPOINTS[@]}"; do
-    IFS='|' read -r ckpt driver_flags phase <<<"$entry"
+    IFS='|' read -r ckpt driver_flags phase row_clients row_arity <<<"$entry"
     if [[ ! "$ckpt" == $ONLY ]]; then
         SKIPPED=$((SKIPPED + 1))
         continue
@@ -437,8 +456,8 @@ for entry in "${CHECKPOINTS[@]}"; do
     port=$((PORT_BASE + idx))
     idx=$((idx + 1))
 
-    echo "--- [$idx] $ckpt (driver: $driver_flags) ---"
-    if run_scenario "$ckpt" "$driver_flags" "$phase" "$port"; then
+    echo "--- [$idx] $ckpt (driver: $driver_flags  N=${row_clients:-$CLIENTS} arity=${row_arity:-$ARITY}) ---"
+    if run_scenario "$ckpt" "$driver_flags" "$phase" "$port" "$row_clients" "$row_arity"; then
         PASSED=$((PASSED + 1))
     else
         FAILED=$((FAILED + 1))
