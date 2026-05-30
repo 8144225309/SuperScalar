@@ -1042,38 +1042,12 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
-            /* Auto-settle: broadcast commitment TXs for channels on this leaf.
-               After the leaf state TX confirms, each channel's funding output
-               exists on-chain. Broadcasting the commitment TX settles the
-               channel without requiring the client to be online. */
-            if (e->leaf_channel_ids && e->n_leaf_channels > 0 && wt->db) {
-                for (size_t lc = 0; lc < e->n_leaf_channels; lc++) {
-                    uint32_t ch_idx = e->leaf_channel_ids[lc];
-                    unsigned char commit_tx[4096];
-                    size_t commit_tx_len = 0;
-                    uint64_t commit_cn = 0;
-                    if (persist_load_commitment_sig(wt->db, ch_idx,
-                            &commit_cn, NULL, commit_tx, &commit_tx_len,
-                            sizeof(commit_tx)) &&
-                        commit_tx_len > 0) {
-                        char *ctx_hex = (char *)malloc(commit_tx_len * 2 + 1);
-                        if (ctx_hex) {
-                            hex_encode(commit_tx, commit_tx_len, ctx_hex);
-                            char ctx_txid[65];
-                            if (wt->chain->send_raw_tx(wt->chain, ctx_hex,
-                                                         ctx_txid))
-                                printf("  Auto-settle channel %u (cn=%llu): %s\n",
-                                       ch_idx, (unsigned long long)commit_cn,
-                                       ctx_txid);
-                            else
-                                printf("  Auto-settle channel %u: broadcast failed "
-                                       "(leaf may need more confirmations)\n",
-                                       ch_idx);
-                            free(ctx_hex);
-                        }
-                    }
-                }
-            }
+            /* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): auto-settle moved to
+             * src/watchtower_autosettle.c (linked into superscalar_secrets
+             * lib — LSP/client/tests/bridge only).  The trustless WT binary
+             * does not link autosettle and leaves wt->autosettle_fn NULL,
+             * so this is a no-op there. */
+            if (wt->autosettle_fn) wt->autosettle_fn(wt, e);
 
             /* Mark as penalty-broadcast (keep entry for reorg resistance) */
             e->penalty_broadcast = 1;
@@ -2019,6 +1993,12 @@ int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
 void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db) {
     if (!wt) return;
     wt->wt_db = wt_db;
+}
+
+void watchtower_register_autosettle(watchtower_t *wt,
+    int (*fn)(struct watchtower_s *wt, watchtower_entry_t *entry)) {
+    if (!wt) return;
+    wt->autosettle_fn = fn;
 }
 
 void watchtower_cleanup(watchtower_t *wt) {

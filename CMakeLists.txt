@@ -242,6 +242,32 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar PRIVATE project_sanitizers)
 endif()
 
+# --- SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248) — secrets static lib ---
+#
+# Secret-bearing persist readers (revocation secrets, channel basepoints)
+# and the auto-settle helper that calls them are isolated in their own
+# static library.  The standalone trustless watchtower binary
+# (superscalar_watchtower) does NOT link this — the symbols are
+# physically absent from that binary.  All other targets (LSP, client,
+# tests, bridge, integration helpers, recovery tools) link it because
+# they need lsp.db secret-bearing access for their normal operation.
+#
+# Verification (any Linux build):
+#   $ nm -D --defined-only build-release/superscalar_watchtower \
+#       | grep -E "persist_load_(basepoints|revocations_flat|channel_for_watchtower|flat_secrets|commitment_sig)"
+#   (empty)
+add_library(superscalar_secrets STATIC
+    src/persist_secrets.c
+    src/watchtower_autosettle.c
+)
+target_include_directories(superscalar_secrets PUBLIC include)
+target_include_directories(superscalar_secrets PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(superscalar_secrets PUBLIC superscalar)
+target_link_libraries(superscalar_secrets PRIVATE project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_secrets PRIVATE project_sanitizers)
+endif()
+
 # --- Tests ---
 add_executable(test_superscalar
     tests/test_main.c
@@ -345,7 +371,7 @@ add_executable(test_superscalar
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(test_superscalar PRIVATE superscalar project_warnings)
+target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_superscalar PRIVATE project_sanitizers)
 endif()
@@ -357,7 +383,7 @@ add_test(NAME regtest_tests COMMAND test_superscalar --regtest)
 add_executable(superscalar_lsp tools/superscalar_lsp.c)
 target_include_directories(superscalar_lsp PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar_lsp PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(superscalar_lsp PRIVATE superscalar project_warnings)
+target_link_libraries(superscalar_lsp PRIVATE superscalar superscalar_secrets project_warnings)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(superscalar_lsp PRIVATE -rdynamic)
 endif()
@@ -368,7 +394,7 @@ endif()
 add_executable(superscalar_client_bin tools/superscalar_client.c)
 target_include_directories(superscalar_client_bin PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar_client_bin PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(superscalar_client_bin PRIVATE superscalar project_warnings)
+target_link_libraries(superscalar_client_bin PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_client_bin PRIVATE project_sanitizers)
 endif()
@@ -377,7 +403,7 @@ set_target_properties(superscalar_client_bin PROPERTIES OUTPUT_NAME superscalar_
 add_executable(bip158_integration_test tools/bip158_integration_test.c)
 target_include_directories(bip158_integration_test PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(bip158_integration_test PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(bip158_integration_test PRIVATE superscalar project_warnings)
+target_link_libraries(bip158_integration_test PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(bip158_integration_test PRIVATE project_sanitizers)
 endif()
@@ -387,7 +413,7 @@ endif()
 add_executable(test_bip158_e2e_helper tools/test_bip158_e2e_helper.c)
 target_include_directories(test_bip158_e2e_helper PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_bip158_e2e_helper PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(test_bip158_e2e_helper PRIVATE superscalar project_warnings)
+target_link_libraries(test_bip158_e2e_helper PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_bip158_e2e_helper PRIVATE project_sanitizers)
 endif()
@@ -395,7 +421,7 @@ endif()
 add_executable(superscalar_bridge tools/superscalar_bridge.c)
 target_include_directories(superscalar_bridge PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar_bridge PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(superscalar_bridge PRIVATE superscalar project_warnings)
+target_link_libraries(superscalar_bridge PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_bridge PRIVATE project_sanitizers)
 endif()
@@ -410,7 +436,7 @@ endif()
 
 add_executable(recover_stranded_coop_output tools/recover_stranded_coop_output.c)
 target_include_directories(recover_stranded_coop_output PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
-target_link_libraries(recover_stranded_coop_output PRIVATE superscalar project_warnings)
+target_link_libraries(recover_stranded_coop_output PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(recover_stranded_coop_output PRIVATE project_sanitizers)
 endif()
