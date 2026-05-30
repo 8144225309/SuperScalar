@@ -3820,54 +3820,92 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
         const char *raw_hex = (const char *)sqlite3_column_text(stmt, 1);
         if (!raw_hex) continue;
 
-        /* SF-RR #150: if backend supports outpoint queries, check the first
-           input's outpoint before re-broadcasting. If it has been spent
-           (state moved on while we were down), mark stale and skip — prevents
-           infinite retry on dead pending entries. */
-        if (chain->is_outpoint_unspent) {
+        /* Parse the first input from raw_hex.  Shared by:
+             - SF-RR #150 outpoint-unspent staleness check
+             - SF-CSV-WAIT #299 BIP-68 relative-timelock gate (parent confs
+               must reach required_depth before retrying)
+           SuperScalar txs are always segwit with empty scriptSig (single byte
+           0x00), so we don't handle multi-byte scriptSig varints. */
+        char     prev_txid_disp[65] = {0};
+        uint32_t prev_vout = 0;
+        uint32_t nseq = 0;
+        int      have_parsed = 0;
+        {
             size_t hex_len = strlen(raw_hex);
             if (hex_len >= 84) {
-                /* Detect segwit marker at offset 8-11 to compute vin offset. */
                 int is_segwit = (hex_len >= 12 &&
                                  raw_hex[8] == '0' && raw_hex[9] == '0' &&
                                  raw_hex[10] == '0' && raw_hex[11] == '1');
                 size_t vin_ofs = is_segwit ? (4 + 2 + 1) * 2 : (4 + 1) * 2;
-                if (hex_len >= vin_ofs + 64 + 8) {
-                    char prev_txid_disp[65];
-                    /* prev_txid is stored LE in raw; display order reverses bytes. */
+                /* Need prev_txid(64) + prev_vout(8) + ssl(2) + nSequence(8). */
+                if (hex_len >= vin_ofs + 64 + 8 + 2 + 8) {
+                    /* prev_txid is LE in raw; display order reverses bytes. */
                     for (int j = 0; j < 32; j++) {
                         prev_txid_disp[j*2]   = raw_hex[vin_ofs + (31 - j)*2];
                         prev_txid_disp[j*2+1] = raw_hex[vin_ofs + (31 - j)*2 + 1];
                     }
-                    prev_txid_disp[64] = 0;
-                    uint32_t prev_vout = 0;
                     for (int j = 0; j < 4; j++) {
                         char hb[3] = { raw_hex[vin_ofs + 64 + j*2],
                                        raw_hex[vin_ofs + 64 + j*2 + 1], 0 };
                         prev_vout |= (uint32_t)strtoul(hb, NULL, 16) << (j * 8);
                     }
-                    int unspent = chain->is_outpoint_unspent(chain,
-                                    prev_txid_disp, prev_vout);
-                    if (unspent == 0) {
-                        fprintf(stderr,
-                            "SF-RR #150: outpoint %s:%u already spent, "
-                            "marking broadcast_log row %d stale_input_spent\n",
-                            prev_txid_disp, prev_vout, row_id);
-                        const char *upd_stale =
-                            "UPDATE broadcast_log "
-                            "SET result='stale_input_spent' WHERE id=?;";
-                        sqlite3_stmt *us;
-                        if (sqlite3_prepare_v2(p->db, upd_stale, -1, &us, NULL)
-                                == SQLITE_OK) {
-                            sqlite3_bind_int(us, 1, row_id);
-                            sqlite3_step(us);
-                            sqlite3_finalize(us);
+                    /* script_sig_len byte (segwit factory TXs always 0x00). */
+                    if (raw_hex[vin_ofs + 72] == '0' &&
+                        raw_hex[vin_ofs + 73] == '0')
+                    {
+                        for (int j = 0; j < 4; j++) {
+                            char hb[3] = { raw_hex[vin_ofs + 74 + j*2],
+                                           raw_hex[vin_ofs + 74 + j*2 + 1], 0 };
+                            nseq |= (uint32_t)strtoul(hb, NULL, 16) << (j * 8);
                         }
-                        continue;  /* skip this row */
+                        have_parsed = 1;
                     }
-                    /* unspent==1 (good) or unspent==-1 (RPC error) → fall through */
                 }
             }
+        }
+
+        /* SF-RR #150: if backend supports outpoint queries, check the first
+           input's outpoint before re-broadcasting. If it has been spent
+           (state moved on while we were down), mark stale and skip — prevents
+           infinite retry on dead pending entries. */
+        if (have_parsed && chain->is_outpoint_unspent) {
+            int unspent = chain->is_outpoint_unspent(chain,
+                            prev_txid_disp, prev_vout);
+            if (unspent == 0) {
+                fprintf(stderr,
+                    "SF-RR #150: outpoint %s:%u already spent, "
+                    "marking broadcast_log row %d stale_input_spent\n",
+                    prev_txid_disp, prev_vout, row_id);
+                const char *upd_stale =
+                    "UPDATE broadcast_log "
+                    "SET result='stale_input_spent' WHERE id=?;";
+                sqlite3_stmt *us;
+                if (sqlite3_prepare_v2(p->db, upd_stale, -1, &us, NULL)
+                        == SQLITE_OK) {
+                    sqlite3_bind_int(us, 1, row_id);
+                    sqlite3_step(us);
+                    sqlite3_finalize(us);
+                }
+                continue;  /* skip this row */
+            }
+            /* unspent==1 (good) or unspent==-1 (RPC error) → fall through */
+        }
+
+        /* SF-CSV-WAIT #299 (followup to #247): if the tx encumbers a BIP-68
+           block-based relative timelock and the parent hasn't reached that
+           depth yet, skip silently — every prior cycle's send_raw_tx returned
+           "non-BIP68-final", spamming the log without progress.  Leave the
+           row as pending_retry; we'll try again next watchtower cycle once
+           more parent confirmations accumulate. */
+        if (have_parsed && chain->get_confirmations
+            && !(nseq & 0x80000000u)         /* bit 31 clear → BIP-68 enabled */
+            && (nseq & 0x0000FFFFu) > 0       /* nonzero relative-lock value */
+            && !(nseq & 0x00400000u))         /* bit 22 clear → block-based */
+        {
+            uint32_t required_depth = nseq & 0x0000FFFFu;
+            int confs = chain->get_confirmations(chain, prev_txid_disp);
+            if (confs >= 0 && (uint32_t)confs < required_depth)
+                continue;
         }
 
         char txid_out[65] = {0};
