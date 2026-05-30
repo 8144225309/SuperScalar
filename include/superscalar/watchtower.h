@@ -121,7 +121,7 @@ typedef struct {
     htlc_fee_bump_t fee_bump;   /* deadline-aware fee escalation (replaces bump_count) */
 } watchtower_pending_t;
 
-typedef struct {
+typedef struct watchtower_s {
     watchtower_entry_t *entries;
     size_t n_entries;
     size_t entries_cap;
@@ -150,6 +150,17 @@ typedef struct {
        (started with --wt-db only) can broadcast on breach without ever
        opening lsp.db.  Set via watchtower_set_wt_db after watchtower_init. */
     persist_wt_t *wt_db;
+
+    /* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): auto-settle hook.  When
+       non-NULL, called from watchtower_check after a factory-node response
+       TX is broadcast — settles HTLC-bearing channels by broadcasting
+       their pre-signed commitment TXs (loaded from lsp.db via
+       persist_load_commitment_sig, which lives in src/persist_secrets.c).
+       The standalone trustless WT leaves this NULL — auto-settle requires
+       lsp.db access and is an LSP-side feature.  Registered by the LSP
+       via watchtower_register_autosettle after watchtower_init.  Returns
+       number of channels settled; 0 if none / not applicable. */
+    int (*autosettle_fn)(struct watchtower_s *wt, watchtower_entry_t *entry);
 
     /* P2A anchor SPK for CPFP fee bumping (anyone-can-spend, no keys needed) */
     unsigned char anchor_spk[P2A_SPK_LEN];
@@ -262,6 +273,17 @@ void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);
    pre-built penalty TX bytes.  NULL clears the handle (no-op state).
    Safe to call before or after watchtower entries exist. */
 void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db);
+
+/* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): register the auto-settle hook.
+   When set, watchtower_check calls fn(wt, entry) after broadcasting a
+   factory-node response TX, so HTLC-bearing channels on that leaf can
+   auto-settle by broadcasting their pre-signed commitment TXs.  fn
+   implementation lives in src/watchtower_autosettle.c (linked into the
+   superscalar_secrets library — LSP/client/tests/bridge only, NOT into
+   the trustless watchtower binary which leaves this NULL).  Pass NULL
+   to clear. */
+void watchtower_register_autosettle(watchtower_t *wt,
+    int (*fn)(struct watchtower_s *wt, watchtower_entry_t *entry));
 
 /* Watch for an old factory state node. If detected, broadcast latest state tx
    and burn tx (if provided). Both are copied (caller can free theirs).
