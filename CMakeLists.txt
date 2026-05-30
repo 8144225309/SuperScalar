@@ -264,6 +264,7 @@ add_library(superscalar_secrets STATIC
 )
 target_include_directories(superscalar_secrets PUBLIC include)
 target_include_directories(superscalar_secrets PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(superscalar_secrets PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_secrets PUBLIC superscalar)
 target_link_libraries(superscalar_secrets PRIVATE project_warnings)
 if(ENABLE_SANITIZERS)
