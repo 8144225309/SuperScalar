@@ -380,24 +380,24 @@ run_scenario() {
             ;;
     esac
 
-    # Total participants always == CLIENTS.
-    if [ "$parts" != "$CLIENTS" ]; then
-        pass=0; reason="${reason:+$reason; }participants=$parts want $CLIENTS"
+    # Total participants always == n_clients (this scenario's client count).
+    if [ "$parts" != "$n_clients" ]; then
+        pass=0; reason="${reason:+$reason; }participants=$parts want $n_clients"
     fi
 
     case "$phase" in
         propose)
             # All N participants must have phase >= SENT(1).
-            if [ "$sent" != "$CLIENTS" ]; then
-                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $CLIENTS"
+            if [ "$sent" != "$n_clients" ]; then
+                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $n_clients"
             fi
             ;;
         nonced)
             # At least one phase >= NONCED(2).  Since we kill JUST after the
             # nonces-recv loop, all N should typically be NONCED; allow N-1
             # for race tolerance.
-            if [ "$sent" != "$CLIENTS" ]; then
-                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $CLIENTS"
+            if [ "$sent" != "$n_clients" ]; then
+                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $n_clients"
             fi
             ;;
         signed)
@@ -406,16 +406,16 @@ run_scenario() {
             # (that update lives between the 'signed' and 'finalize_partial'
             # callsites).  So at abort time we expect all participants at
             # phase >= SENT, with EITHER signed=0 (kill before persist) or
-            # signed=CLIENTS (kill after persist).  The race-tolerant
+            # signed=n_clients (kill after persist).  The race-tolerant
             # assertion is just that state did not advance to FINALIZED.
-            if [ "$sent" != "$CLIENTS" ]; then
-                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $CLIENTS"
+            if [ "$sent" != "$n_clients" ]; then
+                pass=0; reason="${reason:+$reason; }phase>=SENT=$sent want $n_clients"
             fi
             ;;
         finalize_partial)
             # ALL participants phase = SIGNED(3); state still PENDING_SIGS(2).
-            if [ "$signed" != "$CLIENTS" ]; then
-                pass=0; reason="${reason:+$reason; }phase=SIGNED=$signed want $CLIENTS"
+            if [ "$signed" != "$n_clients" ]; then
+                pass=0; reason="${reason:+$reason; }phase=SIGNED=$signed want $n_clients"
             fi
             if [ "$state" = "3" ]; then
                 pass=0; reason="${reason:+$reason; }state=FINALIZED before §2 guard"
