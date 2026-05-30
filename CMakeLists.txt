@@ -259,6 +259,8 @@ endif()
 add_library(superscalar_secrets STATIC
     src/persist_secrets.c
     src/watchtower_autosettle.c
+    src/lsp_init_from_db.c
+    src/client_reconnect.c
 )
 target_include_directories(superscalar_secrets PUBLIC include)
 target_include_directories(superscalar_secrets PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
