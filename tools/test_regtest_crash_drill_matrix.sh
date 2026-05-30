@@ -143,14 +143,13 @@ CHECKPOINTS=(
     "state_advance_signed|--demo --test-tier-b-rollover|signed|4|3|4"
     "state_advance_finalize_partial|--demo --test-tier-b-rollover|finalize_partial|4|3|4"
 
-    # Sub-factory single-input chain advance (4 kill points) — checkpoints in
-    # lsp_subfactory_chain_advance_stateless (src/lsp_channels.c:4169/4212/4429/4453).
-    # --test-subfactory-advance requires --arity 3 --ps-subfactory-arity K (K>=2).
-    # Only the K sub-factory clients participate (not all N).
-    "subfactory_propose|--demo --test-subfactory-advance --ps-subfactory-arity 2|propose|4|3|2"
-    "subfactory_nonced|--demo --test-subfactory-advance --ps-subfactory-arity 2|nonced|4|3|2"
-    "subfactory_signed|--demo --test-subfactory-advance --ps-subfactory-arity 2|signed|4|3|2"
-    "subfactory_finalize_partial|--demo --test-subfactory-advance --ps-subfactory-arity 2|finalize_partial|4|3|2"
+    # NOTE: the 4 K=1 "single-input" subfactory_* scenarios were dropped in
+    # the same cleanup that removed the 450-line dead K=1 MVP code from
+    # lsp_subfactory_chain_advance_stateless.  All production sub-factory
+    # chain advances now route to the multi-input implementation (next
+    # block) since K>=2 is required for a NODE_PS_SUBFACTORY to exist.
+    # See git log a015f3a (#327) for the Phase 1e.1 K=1 MVP origin and
+    # the followup cleanup commit for the rationale.
 
     # Sub-factory multi-input chain advance (4 kill points) — checkpoints in
     # the multi-input ceremony variant (src/lsp_channels.c:3568/3630/3921/3944).
