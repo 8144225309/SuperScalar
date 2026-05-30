@@ -66,7 +66,12 @@ run_one() {
     local TAG="wire_leaf_advance_${stateless}"
     local LSP_LOG="/tmp/${TAG}_lsp.log"
     local LSP_DB="/tmp/${TAG}.db"
-    rm -f "$LSP_DB" "$LSP_LOG" /tmp/${TAG}_client*.log
+    # Clean per-run state including client DBs (otherwise clients enter
+    # the client_run_reconnect path expecting CHANNEL_NONCES, but the
+    # LSP is fresh and expects an initial HELLO — HELLO mismatch loop).
+    rm -f "$LSP_DB" "$LSP_DB"-wal "$LSP_DB"-shm "$LSP_LOG" \
+          /tmp/${TAG}_client*.log /tmp/${TAG}_client*.db \
+          /tmp/${TAG}_client*.db-wal /tmp/${TAG}_client*.db-shm
 
     # Wallet must exist; reuse cheat_leaf miner pattern
     bitcoin-cli -regtest -rpcuser="$RPCUSER" -rpcpassword="$RPCPASSWORD" \
