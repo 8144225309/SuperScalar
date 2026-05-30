@@ -126,3 +126,48 @@ jobs:
           gh release upload ${{ env.TAG }} \
             superscalar-${{ env.TAG }}-macos.tar.gz \
             --clobber
+
+  hashes:
+    name: SHA256SUMS
+    needs: [build-linux, build-linux-arm64, build-macos]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Download all release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/artifacts
+          # Pull every asset already attached to the draft / published Release
+          # for this tag.  Excludes any existing SHA256SUMS / SHA256SUMS.asc
+          # so we recompute deterministically.
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir /tmp/artifacts \
+            --pattern 'superscalar-*.tar.gz' \
+            --pattern 'superscalar-*.zip' \
+            --skip-existing
+          ls -la /tmp/artifacts
+      - name: Generate SHA256SUMS
+        working-directory: /tmp/artifacts
+        run: |
+          # Deterministic order — sort by filename so the file content is
+          # stable across re-runs.
+          ls superscalar-*.tar.gz superscalar-*.zip 2>/dev/null \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload SHA256SUMS to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$TAG" \
+            /tmp/artifacts/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --clobber
+      # NOTE: detached signature (SHA256SUMS.asc) is produced and uploaded
+      # manually by the release manager from an air-gapped signing host
+      # — see docs/release-process.md "Hashing and signing release artifacts".
+      # Automating GPG signing in CI would require committing a signing key
+      # to repo secrets, which violates the air-gapped signing flow.
