@@ -2,6 +2,45 @@
 
 All notable changes to SuperScalar are documented here.
 
+## v0.2.0 — Trustless Watchtower release client (#248)
+
+See `docs/release-notes/release-notes-0.2.0.md` for the operator-facing summary.
+
+### Headline
+
+- **Trustless watchtower is now the only mode.**  The standalone
+  `superscalar_watchtower` binary cannot read revocation secrets, even
+  if compromised.  Verifiable with `nm` — the 5 secret-reader symbols
+  are physically absent from the binary.
+
+### Breaking
+
+- `superscalar_watchtower --db PATH` removed.  Use `--wt-db PATH`
+  instead.  See migration steps in the release notes.
+- `superscalar_watchtower --inspect-db` removed.  Use `sqlite3 wt.db`.
+- `superscalar_lsp --network mainnet` now requires `--wt-db PATH` in
+  addition to `--db PATH`.
+
+### wt.db schema
+
+- Schema v2: added `watch_kind` discriminant column on `wt_watches`.
+  In-place migration from v1.
+- 4 watch kinds wired end-to-end: factory_node, subfactory_node,
+  channel_commitment, force_close_htlc.
+
+### Code layout
+
+- New `superscalar_secrets` CMake static library bundling the
+  secret-bearing TUs (`persist_secrets.c`, `watchtower_autosettle.c`,
+  `lsp_init_from_db.c`, `client_reconnect.c`).  LSP/client/tests/bridge
+  link it; the WT binary does not.
+
+### Bug fixes
+
+- 3 latent NULL-deref sites in `superscalar_watchtower.c` (RPC-init
+  failure path, startup banner, reorg-detection log) guarded against
+  trustless-mode (uninitialized `db`).
+
 ## Unreleased
 
 ### MuSig2 Phase 3: legacy nonce-pool path deleted (#273)
