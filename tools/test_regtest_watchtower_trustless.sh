@@ -289,7 +289,7 @@ if ! grep -qE "TRUSTLESS MODE|TRUSTLESS — only mode|TRUSTLESS -- only mode|WT-
     exit 1
 fi
 echo "  ✓ C. WT in TRUSTLESS MODE:"
-grep "TRUSTLESS MODE" "$WT_LOG" | head -1 | sed 's/^/    /'
+grep -E "TRUSTLESS MODE|TRUSTLESS — only mode|TRUSTLESS -- only mode|WT-TRUSTLESS:" "$WT_LOG" | head -1 | sed 's/^/    /'
 
 # Hydration check.
 sleep 3
