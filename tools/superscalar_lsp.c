@@ -1385,7 +1385,6 @@ int main(int argc, char *argv[]) {
     const char *funding_txid_override = NULL; /* --funding-txid: skip wallet funding, use existing UTXO */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
-    int lsp_balance_pct_explicit = 0; /* 1 if user passed --lsp-balance-pct */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
@@ -1961,7 +1960,6 @@ int main(int argc, char *argv[]) {
             routing_fee_ppm = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--lsp-balance-pct") == 0 && i + 1 < argc) {
             lsp_balance_pct = (uint16_t)atoi(argv[++i]);
-            lsp_balance_pct_explicit = 1;
             if (lsp_balance_pct > 100) {
                 fprintf(stderr, "Error: --lsp-balance-pct must be 0-100\n");
                 return 1;
