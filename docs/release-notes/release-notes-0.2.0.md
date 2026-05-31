@@ -1,5 +1,7 @@
 # SuperScalar v0.2.0 Release Notes
 
+*v0.2.0-rc1 — release candidate 1, 2026-05-31*
+
 SuperScalar v0.2.0 is the "release client" — the first version that maintainers and operators should treat as a credible mainnet candidate.  The defining change is the trustless watchtower: the standalone `superscalar_watchtower` binary literally cannot read revocation secrets, even if compromised.
 
 This document is the operator-facing summary.  See `CHANGELOG.md` for the per-commit log and `docs/watchtower-trustless-schema.md` for the trust-model design.

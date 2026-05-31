@@ -2,7 +2,7 @@
 
 All notable changes to SuperScalar are documented here.
 
-## v0.2.0 — Trustless Watchtower release client (#248)
+## v0.2.0-rc1 — 2026-05-31 — Trustless Watchtower release client (#248)
 
 See `docs/release-notes/release-notes-0.2.0.md` for the operator-facing summary.
 
