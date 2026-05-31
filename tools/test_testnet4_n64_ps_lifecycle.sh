@@ -84,7 +84,7 @@ nohup "$LSP_BIN" \
     --amount "$AMOUNT" \
     --active-blocks 50 --dying-blocks 20 \
     --step-blocks 5 --states-per-layer 2 \
-    --fee-rate "$FEE_RATE" --lsp-balance-pct 100 \
+    --fee-rate "$FEE_RATE" --lsp-balance-pct 50 \
     --confirm-timeout 86400 \
     --max-conn-rate 400 --max-handshakes 80 \
     --seckey "$LSP_SECKEY" \
@@ -108,7 +108,7 @@ for i in $(seq 1 $N_CLIENTS); do
     SK=$(printf '%064x' $((i + 1)))  # 0x02 .. 0x41
     nohup "$CLIENT_BIN" \
         --network "$NETWORK" --host 127.0.0.1 --port "$PORT" --daemon \
-        --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 100 \
+        --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 50 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $i \
         --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
         --wallet "$WALLET" --db "/tmp/ss_t4_${TAG}_c${SK:60:4}.db" \

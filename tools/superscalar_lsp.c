@@ -1385,7 +1385,6 @@ int main(int argc, char *argv[]) {
     const char *funding_txid_override = NULL; /* --funding-txid: skip wallet funding, use existing UTXO */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
-    int lsp_balance_pct_explicit = 0; /* 1 if user passed --lsp-balance-pct */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
@@ -1961,7 +1960,6 @@ int main(int argc, char *argv[]) {
             routing_fee_ppm = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--lsp-balance-pct") == 0 && i + 1 < argc) {
             lsp_balance_pct = (uint16_t)atoi(argv[++i]);
-            lsp_balance_pct_explicit = 1;
             if (lsp_balance_pct > 100) {
                 fprintf(stderr, "Error: --lsp-balance-pct must be 0-100\n");
                 return 1;
@@ -2289,18 +2287,25 @@ int main(int argc, char *argv[]) {
 
     /* --- BIP39 Test placeholder (moved after key init) --- */
 
-    /* No --demo override of lsp_balance_pct.  The production-safe default
-       (100 = LSP retains all capacity) applies to demo mode too — silently
-       handing 50% of the funding to clients was a footgun: cheat/defense
-       tests that forgot to pass --lsp-balance-pct 100 explicitly would
-       invisibly run with the wrong economics.  If you want demo payments
-       from clients (which requires them to have a balance), pass
-       --lsp-balance-pct 50 explicitly. */
-    if (demo_mode && !lsp_balance_pct_explicit && lsp_balance_pct == 100) {
+    /* --demo runs client-initiated routed payments and requires BOTH the LSP
+       and clients to hold balance on every channel.  Refuse to start when
+       the configuration makes payments structurally impossible — fail fast
+       at startup rather than burn fees on factory funding + N channels just
+       to surface "channel_add_htlc: refused" mid-flight.  Production-safe
+       default of 100% is fine for non-demo runs; explicit 0 / 100 with
+       --demo is a footgun (e.g. the N=64 testnet4 runner that this guard
+       catches).  Acceptable demo range is (0, 100) — both sides non-zero. */
+    if (demo_mode && (lsp_balance_pct == 0 || lsp_balance_pct == 100)) {
         fprintf(stderr,
-            "LSP: --demo with default --lsp-balance-pct 100 — clients will\n"
-            "     have 0 sats and any demo payment FROM a client will fail.\n"
-            "     Pass --lsp-balance-pct 50 if you want demo payments to work.\n");
+            "Error: --demo with --lsp-balance-pct %u makes routed payments\n"
+            "       structurally impossible:\n"
+            "         100 = LSP holds 100%%, clients have 0 — clients can't\n"
+            "               offer HTLCs (channel_add_htlc refuses unbacked).\n"
+            "           0 = clients hold 100%%, LSP has 0 — LSP can't route.\n"
+            "       Use --lsp-balance-pct in (0, 100); 50 is canonical for\n"
+            "       demo flows where both sides must transact.\n",
+            (unsigned)lsp_balance_pct);
+        return 1;
     }
 
     /* Mainnet safety guard: refuse unless explicitly acknowledged */
