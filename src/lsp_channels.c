@@ -75,8 +75,7 @@ static int verify_revocation_secret(const secp256k1_context *ctx,
    single-process primitive — it requires every leaf signer's seckey
    locally.  Multi-process LSPs must fall back to NULL poison_tx
    (graceful degradation) until the wire-ceremony equivalent that
-   gathers per-client partial sigs over MuSig2 lands.  Tracked in
-   .claude/CANONICAL_DESIGN_GAPS.md (Gap A follow-up).  This is a
+   gathers per-client partial sigs over MuSig2 lands.  This is a
    SECURITY GAP for multi-process deployments — the watchtower can
    detect breaches but cannot redistribute L-stock to clients. */
 /* Send the LSP's own revocation secret to a client after each commitment update.
@@ -1323,9 +1322,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 
-/* --- Phase 1c (#271): MuSig2 stateless-signer per-leaf advance ---
+/* --- Phase 1c: MuSig2 stateless-signer per-leaf advance ---
 
-   Reversed-order flow per .claude/MUSIG_NONCE_REDESIGN_MEMO sec 3.1.  The
+   Reversed-order flow per the MuSig2 nonce-redesign memo.  The
    LSP MUST NOT hold a secnonce across any wire recv-wait -- invariant
    that motivates the whole redesign.
 

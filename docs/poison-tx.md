@@ -273,5 +273,4 @@ The single-process flow shipped here is sufficient for:
   all keys (test fixtures, signet self-tests)
 - The `factory_build_burn_tx` shim that the watchtower call site uses
 
-**Tracked in `.claude/CANONICAL_DESIGN_GAPS.md` Gap A (status:
-SECURITY-CRITICAL, BLOCKS PRODUCTION).**
+**Status: SECURITY-CRITICAL, BLOCKS PRODUCTION.**
