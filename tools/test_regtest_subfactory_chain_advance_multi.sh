@@ -166,7 +166,7 @@ env $SS_ASAN_ENV "$LSP_BIN" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \
-    --demo \
+    --demo --lsp-balance-pct 50 \
     --test-subfactory-advance-multi \
     --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" \

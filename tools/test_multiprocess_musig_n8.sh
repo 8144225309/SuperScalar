@@ -211,7 +211,7 @@ stdbuf -oL "$LSP_BIN" \
     "${SNR_ARGS[@]}" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
-    --demo \
+    --demo --lsp-balance-pct 50 \
     --force-close \
     --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" \

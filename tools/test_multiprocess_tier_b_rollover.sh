@@ -166,7 +166,7 @@ stdbuf -oL "$LSP_BIN" \
     --states-per-layer "$STATES_PER_LAYER" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
-    --demo \
+    --demo --lsp-balance-pct 50 \
     --test-tier-b-rollover \
     --force-close \
     --db "$LSP_DB" \
