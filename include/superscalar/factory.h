@@ -19,7 +19,12 @@
  * 8 × tx_output_t to 16 × tx_output_t; at 506 nodes (max PS factory at
  * N=128) that's ~50KB extra per factory_t — acceptable. */
 #define FACTORY_MAX_OUTPUTS 16
-#define FACTORY_MAX_SIGNERS 128
+/* FACTORY_MAX_SIGNERS = max participants in a MuSig2 group = 1 LSP + up to
+ * N clients.  Was 128 (= LSP + 127 clients).  Bumped to 256 in #303 fix
+ * because N=128 clients + LSP = 129 signers overflowed the previous cap by
+ * exactly one pubkey slot — release build's stack canary caught the overrun
+ * on the all_pubkeys array in lsp.c:275.  256 gives headroom up to N=255. */
+#define FACTORY_MAX_SIGNERS 256
 #define FACTORY_MAX_LEAVES  128
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
