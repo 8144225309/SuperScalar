@@ -6,6 +6,8 @@
 
 SuperScalar is an implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) — laddered timeout-tree-structured Decker–Wattenhofer channel factories for Bitcoin. The protocol combines Decker–Wattenhofer invalidation, MuSig2 timeout-sig-trees, Poon–Dryja Lightning channels at the leaves, and an LSP-mediated topology. No consensus changes required.
 
+The goal: scale Bitcoin to millions of self-custodial Lightning users without a soft fork and without compromising sovereignty. A SuperScalar factory lets N clients share one on-chain UTXO while each holds full unilateral exit at any moment.
+
 ## What's here
 
 | Area | What's implemented |
@@ -44,6 +46,21 @@ For a regtest demo end-to-end in one command, see [`docs/demo-walkthrough.md`](d
 For signet operation, see [`docs/signet-ps-n8-procedure.md`](docs/signet-ps-n8-procedure.md).
 
 For mainnet operators, see [`docs/mainnet-runbook.md`](docs/mainnet-runbook.md).
+
+## Dashboard
+
+A read-only Python3 dashboard for live monitoring of factory state, channel balances, ceremonies, watchtower events, and breach-defense status. Stdlib-only — no `pip install` needed.
+
+![SuperScalar Dashboard](docs/dashboard-screenshot.png)
+
+```bash
+python3 tools/dashboard.py --demo               # synthetic data, no databases needed
+python3 tools/dashboard.py --lsp-db lsp.db --btc-network signet \
+    --btc-rpcuser <user> --btc-rpcpassword <pass>
+# open http://localhost:8080
+```
+
+12 tabs covering factory topology, channels, HTLCs, payments, ceremonies, the wire log, the watchtower, defense-mode tiles, and outcome scoring. See [`docs/dashboard.md`](docs/dashboard.md) for the full tab + flag reference.
 
 ## Build options
 
@@ -127,6 +144,8 @@ In a PS (Pseudo-Spilman) configuration, leaves chain advance by appending new st
 
 ## Security
 
+**SuperScalar is pre-1.0 software.** No external audit has been performed yet. An internal audit found 4 gaps — all fixed; see [`docs/mainnet-audit.md`](docs/mainnet-audit.md). Mainnet operation requires explicit `--accept-risk-mainnet` until v0.3.
+
 Found a vulnerability? See [`SECURITY.md`](SECURITY.md). Please **do not** open a public issue for security-sensitive matters.
 
 The trustless watchtower is the v0.2.0 headline feature — a compromised standalone `superscalar_watchtower` cannot read revocation secrets. Verify in one command:
@@ -138,6 +157,15 @@ nm -D --defined-only build/superscalar_watchtower | grep -E "persist_load_(basep
 
 See [`docs/watchtower-trustless-schema.md`](docs/watchtower-trustless-schema.md) for the trust model.
 
+## Get involved
+
+SuperScalar needs real-world operators on signet and testnet4. Even a 2-client factory running for a few days produces useful evidence.
+
+- **Run a factory** — follow [`docs/signet-ps-n8-procedure.md`](docs/signet-ps-n8-procedure.md) (works for testnet4 too)
+- **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 36 multi-party scenarios
+- **Review the cryptography** — `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c` are the load-bearing crypto modules
+- **Discuss** — the [delvingbitcoin thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) is the canonical protocol-design venue; [GitHub Discussions](https://github.com/8144225309/SuperScalar/discussions) for project coordination
+
 ## Contributing
 
 PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code style, and review process. Releases follow the procedure in [`docs/release-process.md`](docs/release-process.md).
@@ -148,7 +176,21 @@ For design discussion, the [delvingbitcoin thread](https://delvingbitcoin.org/t/
 
 MIT. See [`LICENSE`](LICENSE).
 
-## Related projects
+## Project repositories
 
-- [SuperScalar CLN bridge](https://github.com/8144225309/superscalar-cln) — bLIP-56 plugin to hybrid-route between SuperScalar and a Core Lightning node
-- [superscalar.win](https://superscalar.win) — public-facing project site
+SuperScalar is a multi-repo project. The other repositories you may need:
+
+| Repository | Purpose |
+|---|---|
+| [SuperScalar](https://github.com/8144225309/SuperScalar) (this repo) | LSP, client, bridge, watchtower — protocol implementation |
+| [superscalar-cln](https://github.com/8144225309/superscalar-cln) | bLIP-56 plugin for Core Lightning |
+| [lightning (bLIP-56 fork)](https://github.com/8144225309/lightning/tree/blip-56) | CLN fork with pluggable channel-factory hooks |
+| [superscalar-wallet](https://github.com/8144225309/superscalar-wallet) | Web wallet UI |
+| [superscalar-docs](https://github.com/8144225309/superscalar-docs) | Protocol documentation + visual guides |
+| [superscalar.win](https://superscalar.win) | Project site + protocol explainer |
+
+## Support
+
+SuperScalar is independent open-source work — no VC, no foundation. Built in public, funded entirely by the community it serves. Your contribution keeps development moving forward.
+
+Bitcoin: `bc1qym7552af6exkn68zuqcv5nhstaktkgtvjwfvmm`
