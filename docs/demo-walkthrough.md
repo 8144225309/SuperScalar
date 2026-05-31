@@ -421,7 +421,7 @@ lightning-cli listinvoices
 
 # Check factory channel balances
 sqlite3 -header -column /tmp/lsp.db \
-  "SELECT channel_id, local_amount, remote_amount FROM channels"
+  "SELECT id, slot, local_amount, remote_amount, state FROM channels"
 
 # Check bridge is connected
 lightning-cli plugin list | grep cln_plugin
@@ -475,10 +475,15 @@ python3 tools/dashboard.py \
 
 | Tab | What It Shows |
 |-----|---------------|
-| Overview | Process status, blockchain height, wallet balance |
-| Factory | Factory state (ACTIVE/DYING/EXPIRED), participant keys, DW epoch |
-| Channels | Per-channel balances, commitment number, HTLC count |
-| Protocol | Factory tree visualization, signatures, wire messages |
-| Lightning | CLN node info (if bridge connected) |
-| Watchtower | Old commitments being tracked, breach detection status |
-| Events | Recent wire messages with timestamps |
+| Overview | Process status, blockchain height, wallet balance, system health |
+| Factory | Factory state (ACTIVE/DYING/EXPIRED), participant keys, DW epoch, factory tree topology |
+| Channels & HTLCs | Per-channel balances, commitment number, HTLC count, payment-hash + preimage |
+| Payments | HTLC + PTLC payment groups (MPP rollups), per-POV scoping |
+| Protocol Log | Wire message stream with timestamp, direction, type, peer label |
+| Ceremonies | Factory creation + rotation + leaf-advance + sub-factory-advance ceremonies; participant phases |
+| Lightning Network | CLN node info, peers, channels, forwarding stats (if bridge connected) |
+| Watchtower | Old commitments tracked, breach detections, penalty TX history, PTLC sweep status |
+| Live Monitor | Chronological feed: `broadcast_log` + `breach_detections` + `reorg_events` in one stream |
+| Defense Status | Trustless-model failure-mode tiles (poison TX coverage, penalty bytes, CPFP child, etc.) |
+| TX Inventory | Preparedness scoring per TX category (commit, HTLC sweep, penalty, CPFP, factory burn) |
+| Outcomes | 13-scenario tile grid mapping each SuperScalar protocol path to whether it fired |

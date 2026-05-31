@@ -95,11 +95,13 @@ Your channel balance increases on the "remote" side (from the LSP's perspective,
 
 ```bash
 sqlite3 -header -column client.db \
-  "SELECT channel_id, local_amount, remote_amount, commitment_number FROM channels"
+  "SELECT id, slot, local_amount, remote_amount, commitment_number, state FROM channels"
 ```
 
+- `slot` = your client position in the factory (0-indexed)
 - `local_amount` = your balance (what you can send)
 - `remote_amount` = LSP's balance on your channel (what you can receive)
+- `state` = current channel lifecycle state (`open`, `closing`, etc.)
 
 ### From the Dashboard
 
@@ -180,32 +182,73 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--seckey` | **required** | Your 32-byte secret key (hex) |
-| `--host` | 127.0.0.1 | LSP hostname or IP |
-| `--port` | 9735 | LSP port |
-| `--network` | regtest | Bitcoin network |
-| `--daemon` | off | Stay running (auto-fulfill, watchtower, reconnect) |
-| `--db` | none | SQLite persistence (survives restarts) |
-| `--cli-path` | bitcoin-cli | Path to bitcoin-cli (needed for watchtower) |
-| `--rpcuser` | rpcuser | Bitcoin RPC username |
-| `--rpcpassword` | rpcpass | Bitcoin RPC password |
-| `--datadir` | (default) | Bitcoin datadir |
-| `--rpcport` | (auto) | Bitcoin RPC port override |
-| `--fee-rate` | 1000 | Fee rate for penalty transactions (sat/kvB) |
-| `--keyfile` | none | Encrypted keyfile path |
-| `--passphrase` | none | Keyfile passphrase |
-| `--lsp-pubkey` | none | LSP static pubkey for NK authentication (33-byte hex) |
-| `--tor-proxy` | none | SOCKS5 proxy for Tor connections |
-| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+### Identity + keys
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--seckey HEX` | **required** | Your 32-byte secret key (hex) |
+| `--keyfile PATH` | none | Encrypted keyfile path (alternative to `--seckey`) |
+| `--passphrase PASS` | none | Keyfile passphrase |
 | `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
-| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words |
-| `--mnemonic-passphrase` | "" | Optional BIP39 passphrase for seed derivation |
-| `--send` | — | Send payment: `DEST:AMOUNT:PREIMAGE_HEX` (can repeat) |
-| `--recv` | — | Receive payment: `PREIMAGE_HEX` (can repeat) |
-| `--channels` | off | Expect channel phase (when LSP uses `--payments`) |
-| `--report` | — | Write diagnostic JSON report to PATH |
+| `--from-mnemonic WORDS` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--mnemonic-passphrase PASS` | "" | Optional BIP39 passphrase for seed derivation |
+
+### Connection
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host HOST` | 127.0.0.1 | LSP hostname or IP (supports `.onion`) |
+| `--port PORT` | 9735 | LSP port |
+| `--lsp HOST:PORT` | — | Shorthand: sets both `--host` and `--port` from a single string |
+| `--lsp-pubkey HEX` | none | LSP static pubkey for NK authentication (33-byte compressed hex) |
+| `--participant-id N` | auto | Explicit client slot ID in the factory (auto-assigned by LSP if omitted) |
+| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / testnet4 / mainnet |
+| `--regtest` | off | Shorthand for `--network regtest` |
+| `--tor-proxy HOST:PORT` | none | SOCKS5 proxy for Tor connections (e.g. `127.0.0.1:9050`) |
+| `--tor-only` | off | Refuse all non-`.onion` outbound connections (hard privacy mode) |
+| `--daemon` | off | Stay running (auto-fulfill, watchtower, reconnect) |
+| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--min-profit-bps N` | 0 | Refuse factory proposal if LSP's profit share for this client < N bps |
 | `--i-accept-the-risk` | off | Required for mainnet operation |
+
+### Persistence + Bitcoin RPC
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db PATH` | none | SQLite persistence (survives restarts; required for crash recovery) |
+| `--cli-path PATH` | bitcoin-cli | Path to bitcoin-cli (needed for watchtower) |
+| `--rpcuser USER` | rpcuser | Bitcoin RPC username |
+| `--rpcpassword PASS` | rpcpass | Bitcoin RPC password |
+| `--datadir PATH` | (default) | Bitcoin datadir |
+| `--rpcport PORT` | (auto) | Bitcoin RPC port override |
+| `--fee-rate N` | 1000 | Fee rate for penalty / sweep transactions (sat/kvB) |
+| `--light-client HOST:PORT` | — | Use a BIP-158 P2P compact-block-filter peer instead of a local bitcoind |
+| `--light-client-fallback HOST:PORT` | — | Add a fallback BIP-158 peer (can repeat, up to 7 peers total) |
+
+### Payments
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--send DEST:AMOUNT:PREIMAGE_HEX` | — | Send HTLC payment (can repeat) |
+| `--recv PREIMAGE_HEX` | — | Receive payment (can repeat) |
+| `--pay-offer OFFER` | — | Pay a BOLT 12 offer (requires LSP bridge connection) |
+| `--channels` | off | Expect channel phase (when LSP uses `--payments`) |
+
+### Recovery (when the LSP is unreachable)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit) |
+| `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
+| `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
+
+### Misc / Diagnostic
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--report PATH` | — | Write diagnostic JSON report to PATH and exit |
 | `--version` | — | Print version and exit |
+| `--help` | — | Show all flags and exit |
 
 ## 9. Troubleshooting
 

@@ -30,8 +30,7 @@ pre-mainnet ops checklist drafted under task #151.
       and tested on a populated DB (per #185)
 - [ ] Factory funding canonical-chain guard active (#125-#129); no
       open issues against `lsp_channels_revalidate_funding`
-- [ ] Watchtower restart audit complete for R1/R5 (per
-      `.claude/WT_RESTART_AUDIT_135_161.md`, tasks #135 and #161)
+- [ ] Watchtower restart audit complete for R1/R5 (tasks #135 and #161 — signoff in PR #287 commit body)
 - [ ] Force-close cost calculator validated against on-chain replay
       (per #72 dashboard query and #136 confirmation-depth policy)
 - [ ] PTLC balance + chain-validation production threading merged
@@ -305,10 +304,9 @@ client connecting without it is connecting unauthenticated.
 
 | Signal | Source | Severity | Action |
 |--------|--------|----------|--------|
-| `reorg_events.severity = HEIGHT_REGRESSION` row appears | v29 forensic table | Page | Run Section 8 reorg incident playbook |
-| `reorg_events.severity = FORWARD_REORG` with depth > 2 | v29 forensic table | Page | Same; deeper reorg → verify funding canonicality |
-| `reorg_events.severity = SAME_HEIGHT` (tip flip) | v29 forensic table | Warn | Usually transient; investigate if rate > 1/hour |
-| `breach_detections.detected_at` row appears | v29 forensic table | Page | Section 7 force-close playbook; watchtower already broadcast the penalty TX |
+| Any new row in `reorg_events` (any class) | v29 forensic table — schema: `(id, timestamp, old_tip, new_tip, n_entries_reset)` | Page | Run Section 8 reorg incident playbook. Reorg class is inferred from `old_tip` vs `new_tip`: backward = HEIGHT_REGRESSION, same height = SAME_HEIGHT, forward with prev-hash change = FORWARD_REORG. |
+| `n_entries_reset > 0` in any `reorg_events` row | v29 forensic table | Page | Reorg invalidated in-flight watchtower entries; verify re-broadcast on new chain |
+| New row in `breach_detections` (column: `timestamp`) | v29 forensic table — schema: `(id, timestamp, channel_id, expected_commit_num, txid_seen, height_seen, response_txid)` | Page | Section 7 force-close playbook; if `response_txid` is non-null, watchtower already broadcast the penalty TX |
 | `signing_rounds` row with `slow_signer` flag | v26 ceremony forensics | Warn | One signer holding up a ceremony; check that client's connectivity |
 | Ceremony stuck in `PERSIST_CEREMONY_STATE_PENDING_SIGS` > 10 min | `ceremony_participants` (v34) | Page | One or more signers offline mid-ceremony |
 | bitcoind RPC unreachable | LSP log | Page | Watchtower scanning is stopped |
@@ -318,18 +316,20 @@ client connecting without it is connecting unauthenticated.
 
 ### Grafana / Prometheus integration
 
-TODO: there is no native Prometheus exporter. Two interim options:
+The LSP has a native Prometheus exporter (`src/prometheus_exporter.c`, shipped in PR #276). Enable it with:
 
-1. Scrape the SQLite forensic tables via a sidecar that runs the
-   dashboard SQL queries (in `tools/dashboard.py`) and emits
-   Prometheus text-format metrics. The dashboard already knows how
-   to compute force-close cost (#72), payment counts, and breach
-   status (per `tools/dashboard.py:1751` and the Live Monitor tab
-   added in #255).
-2. Parse the LSP stderr log; the daemon prints structured lines for
-   ceremony events, watchtower events, and reorg detection.
+```bash
+./superscalar_lsp ... --prometheus-port 9090
+```
 
-Either is acceptable for v1; native exporter is a follow-up.
+The endpoint exposes ceremony counts, watchtower-event totals, reorg-detector status, factory lifecycle gauges, and broadcast-log counters in standard Prometheus text format. Scrape with Grafana, Victoriametrics, or any Prometheus-compatible collector.
+
+Two complementary sources if you need data the exporter doesn't surface:
+
+1. **SQLite forensic tables**: scrape via a sidecar that runs dashboard SQL queries (see `tools/dashboard.py`) and emits Prometheus text-format metrics. The dashboard computes force-close cost (#72), payment counts, and breach status; surface its API output as Prometheus metrics if Grafana panels need the same data as the dashboard tabs.
+2. **LSP stderr log**: structured lines for ceremony events, watchtower events, and reorg detection. Pipe through `vector`, `fluentd`, or `journalctl --output=json` and feed into Loki / Promtail.
+
+The Live Monitor tab (added in #255) is the real-time human-facing equivalent of the same data.
 
 ### Log volumes
 
@@ -491,7 +491,7 @@ are starting points, not guarantees.
 | N=128, k=8 | TODO (`feat/factory-scale-128`) | TODO | TODO |
 | N=256+ | not supported | n/a | n/a |
 
-k = number of PS subfactories (see `docs/ps-subfactories.md`).
+k = number of PS subfactories (see [superscalar.win](https://superscalar.win) for the design).
 
 ### Signing time projections at N >= 64
 
@@ -529,8 +529,7 @@ gate for flipping the kill switch from `mainnet refused` to
 
 - [ ] All schema migrations v1..v34 covered by upgrade tests on a
       populated DB
-- [x] Watchtower restart audit (#135, #161) signed off — done per
-      `.claude/WT_RESTART_AUDIT_135_161.md`
+- [x] Watchtower restart audit (#135, #161) signed off (per PR #287 commit body)
 - [ ] Reorg correctness audit (#125-#129) signed off
 - [ ] Force-close cost calculator validated against on-chain replay
       (#72)
@@ -577,8 +576,7 @@ treated as "configured but not safe to operate."
 - Pre-launch checklist origin: task #151
 - Audit umbrella: #152 (SF-AUDIT)
 - Reorg correctness: #125-#129, PRs #201, #208, #210, #211, #212, #215
-- Watchtower restart: #135, #161, audit doc
-  `.claude/WT_RESTART_AUDIT_135_161.md`
+- Watchtower restart: #135, #161, signoff in PR #287 commit body
 - Confirmation depth: #136
 - Force-close cost: #72, dashboard `tools/dashboard.py`
 - Schema v29 forensic tables: `include/superscalar/persist.h:778-794`

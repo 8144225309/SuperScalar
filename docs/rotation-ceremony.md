@@ -280,4 +280,4 @@ re-signed with `signed_tx` for the new epoch.
   MSG_PATH_*)
 - Watchtower foundation: `src/watchtower.c`
 - Factory creation ceremony to mirror: `src/lsp.c::lsp_run_factory_creation`
-- Open task tracking: `.claude/CANONICAL_DESIGN_GAPS.md` Gap B + F
+- Gap B + F (this ceremony) are tracked inline in this document's "Implementation status" + "Watchtower coordination during state transitions" sections above; both are now ✅ shipped.
