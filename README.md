@@ -94,6 +94,7 @@ See [`docs/testing-guide.md`](docs/testing-guide.md) for the full test taxonomy.
 | Rotation ceremony | [`docs/rotation-ceremony.md`](docs/rotation-ceremony.md) |
 | JIT channels + rollback | [`docs/jit-and-rollback.md`](docs/jit-and-rollback.md) |
 | LSP operator guide | [`docs/lsp-operator-guide.md`](docs/lsp-operator-guide.md) |
+| Multi-party deployment coordination | [`docs/deployment-coordination.md`](docs/deployment-coordination.md) |
 | Mainnet runbook | [`docs/mainnet-runbook.md`](docs/mainnet-runbook.md) |
 | Client / user guide | [`docs/client-user-guide.md`](docs/client-user-guide.md) |
 | Testnet4 quickstart | [`docs/testnet4-quickstart.md`](docs/testnet4-quickstart.md) |
