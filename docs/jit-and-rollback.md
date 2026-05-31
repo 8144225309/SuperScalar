@@ -90,8 +90,7 @@ back the L-stock if a JIT allocation fails) — **this is not in zmn's
 spec and is not needed.**  Adding such a path would:
 
 - introduce a new spend authority on L-stock beyond the
-  `or(N-of-N, L&CSV)` zmn specifies (see Gap G in
-  `.claude/CANONICAL_DESIGN_GAPS.md`),
+  `or(N-of-N, L&CSV)` zmn specifies,
 - complicate watchtower coordination (an extra hashlock to track per
   realloc),
 - not solve any failure mode that cut-through doesn't already handle.

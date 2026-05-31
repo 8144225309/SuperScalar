@@ -163,4 +163,3 @@ extension ceremony commits to a particular protocol direction.
 - `docs/factory-arity.md` — mixed-arity tree shapes
 - `docs/rotation-ceremony.md` — Tier B ceremony (template for Phase 2)
 - t/1242 thread on Delving Bitcoin
-- `.claude/CANONICAL_DESIGN_GAPS.md` Gap E followup (task #181)

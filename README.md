@@ -60,7 +60,7 @@ python3 tools/dashboard.py --lsp-db lsp.db --btc-network signet \
 # open http://localhost:8080
 ```
 
-12 tabs covering factory topology, channels, HTLCs, payments, ceremonies, the wire log, the watchtower, defense-mode tiles, and outcome scoring. See [`docs/dashboard.md`](docs/dashboard.md) for the full tab + flag reference.
+12 tabs covering factory topology, channels, HTLCs, payments, ceremonies, the wire log, the watchtower, defense-mode tiles, and outcome scoring.
 
 ## Build options
 
@@ -144,7 +144,7 @@ In a PS (Pseudo-Spilman) configuration, leaves chain advance by appending new st
 
 ## Security
 
-**SuperScalar is pre-1.0 software.** No external audit has been performed yet. An internal audit found 4 gaps — all fixed; see [`docs/mainnet-audit.md`](docs/mainnet-audit.md). Mainnet operation requires explicit `--accept-risk-mainnet` until v0.3.
+**SuperScalar is pre-1.0 software.** No external audit has been performed yet. An internal audit found 4 gaps — all fixed. Mainnet operation requires explicit `--accept-risk-mainnet` until v0.3.
 
 Found a vulnerability? See [`SECURITY.md`](SECURITY.md). Please **do not** open a public issue for security-sensitive matters.
 

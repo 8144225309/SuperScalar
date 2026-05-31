@@ -230,8 +230,7 @@ static int add_node(
 
    Replaces the older shachain-hashlock-with-OP_RETURN-burn design from
    t/1143 (which destroyed L-stock value on cheat detection rather than
-   redistributing it).  See docs/poison-tx.md and
-   .claude/CANONICAL_DESIGN_GAPS.md (Gap A + G).
+   redistributing it).  See docs/poison-tx.md.
 
    Caller passes the leaf state node — `leaf_node->keyagg.agg_pubkey` is
    the N-of-N internal key, `leaf_node->signer_indices[]` enumerates the
@@ -832,8 +831,7 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
        against the wrong leaf's L-stock SPK (LSP-only), so commitment sigs
        could never verify on chain.  Off-chain payments still worked because
        both sides agreed on the wrong keyagg, masking the bug — caught here
-       during the canonical-design audit (.claude/CANONICAL_DESIGN_GAPS.md
-       Gap E). */
+       during the canonical-design audit. */
     if (f->leaf_arity == FACTORY_ARITY_1 || f->leaf_arity == FACTORY_ARITY_PS) {
         if (client_idx >= (size_t)f->n_leaf_nodes) return 0;
         *node_idx_out = f->leaf_node_indices[client_idx];
