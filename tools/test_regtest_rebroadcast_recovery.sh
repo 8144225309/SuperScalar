@@ -119,7 +119,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" \
-    --demo \
+    --demo --lsp-balance-pct 50 \
     > "$LSP_LOG" 2> "$LSP_ERR" &
 LSP_PID=$!
 PIDS+=($LSP_PID)

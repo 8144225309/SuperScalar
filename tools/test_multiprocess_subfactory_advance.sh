@@ -161,7 +161,7 @@ stdbuf -oL "$LSP_BIN" \
     --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
-    --demo \
+    --demo --lsp-balance-pct 50 \
     --test-subfactory-advance \
     --force-close \
     --db "$LSP_DB" \

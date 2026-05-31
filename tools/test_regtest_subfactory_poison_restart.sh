@@ -104,7 +104,7 @@ env $SS_ASAN_ENV SS_MUSIG_STATELESS="${SS_MUSIG_STATELESS:-1}" "$LSP_BIN" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \
-    --demo --test-subfactory-advance \
+    --demo --lsp-balance-pct 50 --test-subfactory-advance \
     --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" \
     --rpcuser rpcuser --rpcpassword rpcpass \

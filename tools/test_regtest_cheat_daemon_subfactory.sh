@@ -125,7 +125,7 @@ env $SS_ASAN_ENV "$LSP_BIN" \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" \
-    --demo --cheat-daemon-sub \
+    --demo --lsp-balance-pct 50 --cheat-daemon-sub \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 
