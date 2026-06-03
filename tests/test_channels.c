@@ -1718,7 +1718,7 @@ static int run_scale_payment_ring(int n_clients, int arity_code,
 
     /* Balance-aware cooperative close, on-chain amount verify, sweep gauntlet. */
     if (lsp_ok) {
-        uint64_t close_fee = 500;
+        uint64_t close_fee = 500 + (uint64_t)n_signers * 60;  /* scale with output count: a 128-output close tx is ~KBs, over the 500-sat min-relay floor */
         tx_output_t close_outputs[n_signers];
         size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
                                                           close_outputs, close_fee, NULL, 0);
