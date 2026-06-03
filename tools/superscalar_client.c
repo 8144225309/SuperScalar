@@ -808,6 +808,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         memset(pcs, 0, 32);
                     }
                 }
+                /* #313 self-custody: persist the INITIAL commitment here too, so a
+                   funded-but-never-transacted channel stays force-closeable when the
+                   LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
+                   to signed_commitments on the first payment, leaving a never-used
+                   channel unrecoverable in a cold mass-exit (Frontier B). */
+                client_persist_commitment_sig(ch, cbd);
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
@@ -817,7 +823,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     extern uint32_t g_routing_fee_ppm;  /* defined in client.c */
                     cbd->routing_fee_ppm = g_routing_fee_ppm;
                 }
-                printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
+                printf("Client %u: persisted factory + channel + basepoints%s to DB\n",
+                       my_index, ch->has_latest_commitment_sig ? " + initial commitment"
+                                                               : " (no commitment sig yet)");
             } else {
                 fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
                 persist_rollback(cbd->db);
@@ -2466,8 +2474,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        int result = factory_recovery_scan(&db, &chain);
-        printf("Force-close scan: examined %d factories\n", result);
+        /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
+           signed factory tree is published root-down. factory_recovery_scan() is the
+           passive startup/reorg scan that never broadcasts. Call repeatedly (caller
+           mines between passes) so each tree level matures its CSV; the root spends
+           the funding directly, so no distribution TX is required. */
+        char fr_status[256] = {0};
+        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+        printf("Force-close: %s (run=%d)\n", fr_status, result);
 
         /* Broadcast signed commitment TX if available */
         {
