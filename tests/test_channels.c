@@ -1778,6 +1778,10 @@ static int run_scale_payment_ring(int n_clients, int arity_code,
 
 int test_regtest_scale_payments(void) {
     setvbuf(stdout, NULL, _IONBF, 0);  /* unbuffered: progress survives a timeout kill */
+    /* Mirror the production LSP/client (superscalar_lsp.c:1289): a peer
+       disconnect must make write() return EPIPE, not kill us with SIGPIPE.
+       Set before the fork so every child inherits it. */
+    signal(SIGPIPE, SIG_IGN);
     const char *e = getenv("SCALE_N");
     int n = e ? atoi(e) : 8;
     if (n < 2) n = 2;
