@@ -61,7 +61,7 @@ typedef struct {
 } musig_nonce_pool_t;
 
 /* --- Signing session (one per transaction being signed) --- */
-#define MUSIG_SESSION_MAX_SIGNERS 256  /* >= FACTORY_MAX_SIGNERS; a 128-channel factory funding root is 129-of-129 (Push-128 #305) */
+#define MUSIG_SESSION_MAX_SIGNERS 128  /* the factory signing group is the LSP + up to 127 clients = 128 signers; a 128th client would be the 129th signer, which is out of design (the LSP is one of the 128) */
 
 typedef struct {
     secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];
