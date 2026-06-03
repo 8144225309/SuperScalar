@@ -469,3 +469,12 @@ if(ENABLE_FUZZING)
             -fsanitize=fuzzer,address,undefined)
     endforeach()
 endif()
+
+# SF-INPROC-SCALE-HARNESS (#310): single-process N-client factory-creation harness.
+add_executable(test_inproc_scale tools/test_inproc_scale.c)
+target_include_directories(test_inproc_scale PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(test_inproc_scale PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(test_inproc_scale PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_inproc_scale PRIVATE project_sanitizers)
+endif()

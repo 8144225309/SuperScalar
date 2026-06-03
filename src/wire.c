@@ -165,7 +165,12 @@ int wire_listen(const char *host, int port) {
         close(fd);
         return -1;
     }
-    if (listen(fd, 16) < 0) {
+    /* Backlog must cover a full factory's worth of near-simultaneous client
+     * connects.  16 was too small: at N>=64 a connect burst overflowed the
+     * accept queue and stalled lsp_accept_clients (surfaced by the
+     * single-process scale harness, #310).  512 comfortably covers the
+     * documented max client count (clamped by net.core.somaxconn). */
+    if (listen(fd, 512) < 0) {
         close(fd);
         return -1;
     }
