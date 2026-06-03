@@ -1459,7 +1459,7 @@ static int client_factory_creation_stateless_signing(
     }
     unsigned char *lsp_pn_per_node = calloc(nn, 66);
     unsigned char *lsp_psig_per_node = calloc(nn, 32);
-    size_t mtx_stride = (size_t)FACTORY_MAX_SIGNERS * 66;
+    size_t mtx_stride = (size_t)factory->n_participants * 66;  /* match LSP: tight stride = actual signer count */
     unsigned char *all_pn = calloc(nn, mtx_stride);
     uint32_t got_matrix_len = 0;
     if (!lsp_pn_per_node || !lsp_psig_per_node || !all_pn) {
@@ -1507,7 +1507,7 @@ static int client_factory_creation_stateless_signing(
             for (size_t snum = 0; snum < ns; snum++) {
                 if (snum == (size_t)my_slot[nidx] || snum == (size_t)lsp_slot) continue;
                 const unsigned char *pn_ser =
-                    all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + snum) * 66;
+                    all_pn + (nidx * (size_t)factory->n_participants + snum) * 66;
                 secp256k1_musig_pubnonce pn_s;
                 if (!musig_pubnonce_parse(ctx, &pn_s, pn_ser) ||
                     !factory_session_set_nonce(factory, nidx, snum, &pn_s)) {

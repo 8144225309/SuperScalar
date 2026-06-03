@@ -517,7 +517,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        signer x node nonce matrix.  Filled from client pubnonces (Step B) and
        LSP pubnonces (Step C), forwarded to clients in LSP_RESPONSE so each
        client can set every co-signer's per-node nonce and finalize. */
-    size_t mtx_stride = (size_t)FACTORY_MAX_SIGNERS * 66;
+    size_t mtx_stride = (size_t)f->n_participants * 66;  /* tight stride = actual signers, not the 256 array max -- keeps LSP_RESPONSE under the 16MB wire frame at scale */
     unsigned char *all_pn = calloc(f->n_nodes, mtx_stride);
     if (!all_pn) goto fail_pre;
 
@@ -561,7 +561,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 free(client_pn); free(all_pn);
                 goto fail_pre;
             }
-            memcpy(all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + (size_t)slot) * 66,
+            memcpy(all_pn + (nidx * (size_t)f->n_participants + (size_t)slot) * 66,
                    client_pn + nidx * 66, 66);
         }
         free(client_pn);
@@ -599,7 +599,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 goto fail_pre;
             }
             musig_pubnonce_serialize(lsp->ctx, lsp_pn_per_node + nidx * 66, &lsp_pubnonce);
-            memcpy(all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + (size_t)slot) * 66,
+            memcpy(all_pn + (nidx * (size_t)f->n_participants + (size_t)slot) * 66,
                    lsp_pn_per_node + nidx * 66, 66);
             if (!factory_session_set_nonce(f, nidx, (size_t)slot, &lsp_pubnonce)) {
                 fprintf(stderr, "LSP-stateless: set LSP nonce node %zu failed\n", nidx);
