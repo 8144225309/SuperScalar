@@ -2,30 +2,110 @@
 
 *v0.2.0-rc1 — release candidate 1, 2026-05-31*
 
-SuperScalar v0.2.0 is the "release client" — the first version that maintainers and operators should treat as a credible mainnet candidate.  The defining change is the trustless watchtower: the standalone `superscalar_watchtower` binary literally cannot read revocation secrets, even if compromised.
+v0.2.0 is the first release where SuperScalar is a credible mainnet candidate. It bundles ~265 merged PRs since v0.1.13 — a new canonical leaf shape (Pseudo-Spilman k² sub-factories), a top-to-bottom MuSig2 redesign, PTLC infrastructure, reorg-correctness pre-flight, crash-injection scaffolding, an adversarial cheat-engine campaign, and a trustless standalone watchtower.
 
-This document is the operator-facing summary.  See `CHANGELOG.md` for the per-commit log and `docs/watchtower-trustless-schema.md` for the trust-model design.
+This document is the operator-facing summary. See `CHANGELOG.md` for the full per-PR log.
 
 ---
 
-## Headline: trustless watchtower is now the only mode
+## Headline: Pseudo-Spilman k² sub-factories
 
-Pre-v0.2.0, the standalone watchtower opened `lsp.db` read-only and read revocation secrets from it to construct penalty transactions at breach detection time.  A compromised WT process meant compromised channel secrets.
+The marquee feature of v0.2.0 is the **canonical PS leaf shape from [zmn t/1242](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242)**: instead of one client per leaf, each PS leaf now hosts **k² clients distributed across k pseudo-Spilman sub-factories, with k clients per sub-factory**. The LSP holds "sales stock" inside each sub-factory that can be dynamically chained into new client channels.
 
-v0.2.0 inverts the model:
+For arity k=2 (entry-level production shape):
+- 4 clients per leaf vs 1 in pre-PS
+- Tree depth drops by ~log₂(4) per leaf compaction
+- Lower CSV budget → tighter `final_cltv_delta` for incoming HTLCs
+- Sales-stock chain extension lets the LSP refill client liquidity without a full leaf re-sign
 
-- The LSP pre-signs every penalty / sweep / response TX at the moment the relevant secret is in memory, and stashes the bytes in a separate `wt.db` (the "trustless watchtower DB") with no secrets.
-- The standalone WT opens **only** `wt.db`.  Its CLI no longer accepts `--db`.  Its binary no longer contains the secret-reader functions.  Verifiable in one command:
+Implementation landed in 13 staged PRs (Phase 1 foundation → Phase 5 signet campaign), plus the multi-input MuSig ceremony for sub-factory chain advance, force-close persistence, watchtower coverage, on-chain force-close at k=2, per-client channel sweep, and reorg invariants. At k≥3, multi-input keyagg threading is per-input-aware (no more "Invalid Schnorr" at scale).
 
-  ```
-  $ nm -D --defined-only superscalar_watchtower \
-      | grep -E "persist_load_(basepoints|revocations_flat|channel_for_watchtower|flat_secrets|commitment_sig)"
-  (empty)
-  ```
+This is what made the N=64 PS lifecycle on signet + testnet4 not just possible but *practical*.
 
-- Trust model summary: *the watchtower can broadcast pre-signed responses but cannot construct any new transactions and cannot recover any key material, even with full filesystem access to lsp.db*.
+Reference docs: `docs/ps-subfactories.md`, `docs/pseudo-spilman.md`, `docs/factory-arity.md`.
 
-All 4 watch kinds are covered:
+---
+
+## Major systems
+
+### MuSig2 stateless signer (BIP-327) — default-on
+
+Removed LSP-side secnonce persistence across network waits, per BIP-327 + Bitcoin Core PR #29675 wallet-team guidance. Closes a class of cross-ceremony nonce-reuse attacks that prior pool-based persistence couldn't fully prevent under reorgs and ceremony aborts.
+
+- Phase 0: design audit answering §8 open questions
+- Phase 1a: `MSG_CEREMONY_ABORT` opcode + `--musig-stateless` flag (feature-gated, no behavior change)
+- Phase 1b: wire opcodes for reversed per-leaf advance flow (greenfield)
+- Phase 1c: wire reversed per-leaf advance flow behind feature flag
+- Phase 1d: poison TX support in stateless per-leaf advance
+- Phase 1e: stateless coverage for sub-factory chain advance, Tier B, factory creation
+- Phase 2: stateless flipped to default-on (`SS_MUSIG_LEGACY=1` opt-out)
+- Phase 3: legacy `musig_nonce_pool_*` API deleted, `nonce_pools` SQLite schema dropped permanently
+- Watchtower registration + poison-TX persist wired into each stateless ceremony
+- Unit test asserts the `nonce_pools` table no longer exists (strongest possible invariant — no future refactor can accidentally re-persist secnonces)
+
+### Mixed-arity + static-near-root (canonical SuperScalar shape)
+
+The factory builder now implements zmn's full canonical SuperScalar design: TRUE N-way interior branching with optional static-near-root variant for depth reduction.
+
+- Phase 1: `FACTORY_MAX_OUTPUTS` 8 → 16
+- Phase 2: TRUE N-way interior + N-way leaves (arity-N leaf = N+1 outputs)
+- Phase 3: `--static-near-root N` makes N shallowest tree levels kickoff-only (no DW counter)
+- Phase 4: CLI hardening + BOLT-2016 ceiling check (rejects shapes whose worst-path EWT exceeds 2016 blocks)
+- Phase 5: multi-process MuSig coordination at N=8 mixed-arity verified on regtest
+- N=128 with `--arity 2,4,8 --static-near-root 2`: EWT = 864 blocks (vs binary baseline 3456)
+- `FACTORY_MAX_SIGNERS` 128 → 256 (fixes N=128 LSP stack canary crash)
+- `FACTORY_MAX_LEAVES` 64 → 128
+
+### Tier B (multi-leaf state-advance ceremony)
+
+The wire-ceremony equivalent of per-leaf realloc, for when the root DW counter rolls over and every leaf needs re-signing:
+
+- Full implementation with reserved wire IDs `MSG_PATH_NONCE_BUNDLE` / `ALL_NONCES` / `PSIG_BUNDLE` / `SIGN_DONE` (0x60–0x63)
+- Block-driven root rollover semantics (proper, supersedes earlier rc=-1 trigger)
+- Client loops `factory_tick_root` until rollover
+- PS leaves re-signed on root rollover + epoch-aware persistence
+- Tree-broadcast skips unsigned nodes
+- PS sub-factory chain state reset on DW epoch rollover
+- Lifted `FACTORY_ARITY_2` restriction on `lsp_realloc_leaf` + `buy_liquidity`
+- Rotation log assertion that the poison TX is fully signed (no unsigned-stub fallback)
+- Pre-rotation SQLite snapshot hook (`--backup-dir`)
+
+### PTLC (Point-Time-Locked Contracts) — enabled by default
+
+PTLC is on by default in v0.2.0. Disable with `--disable-ptlc` if you want HTLC-only channels.
+
+- Watchtower PTLC breach-defense feed (chain-level breach → sweep)
+- PTLC turnover ceremony journaled to `signing_rounds`
+- Hard guard against blind-sign seckey extraction in the PTLC pre-sign path
+- PTLC commit-tx direction fix
+- PTLCs persisted on every channel-add path
+- 5 new regtest scripts: basic / breach / restart / chain / breach-chain
+- End-to-end PTLC breach test under real chain conditions
+
+### Wire-ceremony poison TX — all 4 paths
+
+Multi-process LSPs now produce a fully-signed L-stock / sales-stock poison TX via a second MuSig2 round bundled with every state advance. Prior to this work, the watchtower received an unsigned stub poison TX on multi-process deployments:
+
+- Canonical L-stock SPK + per-client poison TX per zmn t/1242
+- Sub-factory advance path
+- Leaf advance path (DW + PS leaves)
+- `lsp_realloc_leaf` Tier B per-leaf rotation
+- Tier B root-rotation poison wire ceremony (LSP + client sides)
+- Poison TX persist + rehydrate across LSP restart (schema v22)
+- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (surfaced by the cheat-realloc test)
+
+### Trustless watchtower (default + only mode)
+
+The standalone `superscalar_watchtower` binary now opens **only** a separate `wt.db` containing pre-signed response TXs and no secrets. The LSP pre-signs every penalty/sweep/response TX at the moment the relevant secret is in memory and stashes the bytes in wt.db. A compromised WT process cannot construct any new transaction.
+
+Verifiable in one command:
+```
+nm -D --defined-only superscalar_watchtower \
+  | grep -E "persist_load_(basepoints|revocations_flat|channel_for_watchtower|flat_secrets|commitment_sig)"
+```
+Expected output: empty.
+
+Four watch kinds covered:
 
 | Watch kind | Trigger | Pre-signed response |
 |---|---|---|
@@ -34,7 +114,112 @@ All 4 watch kinds are covered:
 | `WT_KIND_CHANNEL_COMMITMENT` | Revoked commitment broadcast | Penalty TX |
 | `WT_KIND_FORCE_CLOSE_HTLC` | Honest force-close confirmed (per HTLC) | HTLC timeout sweep TX |
 
-The wt.db schema is single-table (`wt_watches`) with a `watch_kind` discriminant column.  Migration from a Phase 1a wt.db to v2 happens in place on open.
+Link surgery: secret-reader functions moved into `superscalar_secrets` static library which the LSP/client/tests/bridge link but the WT binary does not.
+
+### Reorg correctness — R1–R6 mainnet pre-flight
+
+- R1: detect same-height + forward reorgs (LSP daemon loop + heartbeat)
+- R2: wait loops use stable-confirmation helper
+- R3: per-network safe confirmation depth
+- R4: 3-kind adversarial reorg regression test against standalone WT
+- R5: `funding_pending_reorg` channel state (schema v31), `MSG_FUNDING_REORG` wire, client-side `ps_chain_len` reset, proactive mempool-expiry freeze
+- R6: standalone WT detects forward reorgs
+- Schema v29 forensic tables: `reorg_events`, `breach_detections`
+- Watchtower restart correctness audited end-to-end
+- CPFP child-broadcast / anchor mismatch fix (byte-inspection authoritative)
+- Sub-factory chain reset on reorg + height-aware reset
+- Client-side `ps_chain_len` reset on `MSG_FUNDING_REORG`
+
+### Crash recovery + injection
+
+- `SUPERSCALAR_CRASH_AT` checkpoint framework
+- Crash-injection wired at all stateless ceremony phases (PROPOSE / NONCE_BUNDLE / ALL_NONCES / PSIG_BUNDLE / DONE)
+- `MSG_FORCE_OUT` + `MSG_ROTATE` wire ops for crash-drill matrix
+- Half A: journal SENT-phase participants at every ceremony PROPOSE
+- Half C1: crash_checkpoint at all stateless ceremony phases
+- Half C2: 16/16 crash-drill matrix tests pass on regtest
+- ROTATE ceremony persistence + 4 checkpoints in `lsp_channels_rotate_factory`
+- LSP loadwallet auto-recovery hook
+- LSP self-rebroadcasts after mempool eviction
+- BIP-68 audit fix for remaining broadcast paths
+
+### Cheat-engine adversarial campaign (CL1–CL7)
+
+Seven new cheat drivers exercising worst-case adversary behavior end-to-end:
+
+- CL2: `--cheat-realloc` — adversarial pre-realloc-state broadcast
+- CL3-K: `--cheat-state K` + multistate daemon scaffold
+- CL4: `--cheat-daemon-rollover` — adversarial during Tier B rollover
+- CL4-multistate: dashboard multistate cheat tests
+- CL5: `--cheat-jit` — adversarial against JIT channel creation
+- CL6: `--cheat-lstock-buy` — adversarial against buy-liquidity path
+- CL7: `--cheat-backup-restore` — adversarial against SCB restore
+- `--cheat-dust-race` — adversarial against force-close HTLC-dust-bump race
+- `--cheat-client` net-delta assertion (cheat detection)
+- `superscalar_watchtower --inspect-wt-db` for forensic inspection
+- Per-cheat regtest script with breach-detection assertions
+
+### Schema migrations (v22 → v36)
+
+Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS), version-gated, idempotent.
+
+- v22: poison TX persist + rehydrate
+- v26: `signing_rounds` ceremony forensics journal
+- v27: fee-bump escalation persist
+- v28: force-close watch persist + subfactory reload
+- v29: `reorg_events` + `breach_detections`
+- v30: `old_commitment_ptlcs` schema groundwork
+- v33: `ps_subfactory_chains.confirmed_height` + `reorg_stale`
+- v34: ceremony tables for multi-party coordination (`ceremonies`, `ceremony_participants`, `revocation_releases`)
+- v35: per-output HTLC sweep TX persistence
+- v36: HTLC resolution TX + L-stock burn TX + agg hard guard
+- wt.db schema v2: `watch_kind` discriminant column
+
+### Observability + dashboard
+
+- Native Prometheus exporter (LSP-side metrics endpoint)
+- Watchtower penalty TX persist + signing_rounds journal
+- Per-signer instrumentation in `signing_rounds`
+- 12 dashboard tabs incl. Live Monitor, Defense Status, Payments (HTLC + PTLC), Ceremonies, TX Inventory, Outcomes, Old Commitments, per-POV scoping, multi-client switcher
+- Defense Status panel (15-mode failure taxonomy, penalty bytes tile, wallet UTXO + CPFP tiles)
+- Outcomes tiles for cheat-* scenarios
+- Freshness banner (WAL-aware)
+- Production-mode Events derivation
+- Tree-node event spam collapsed
+- Old Commitments reserve badge
+- Factory Config card + PS Leaf Chains panel
+
+### BIP-157/158 lite client
+
+- End-to-end + adversarial regtest scripts
+- BIP-158 sync headers: seed locator with genesis hash on initial sync
+- P2P tip-lag + reconnect storm fix
+- Light-client-mode LSP can verify blocks without a full-node RPC backend
+
+---
+
+## Build, packaging, CI
+
+- Multi-platform binaries auto-built on release: Linux x86_64, Linux ARM64, macOS
+- `SHA256SUMS` attached to every GitHub release
+- `superscalar_secrets` CMake static library bundles the secret-bearing TUs (`persist_secrets.c`, `watchtower_autosettle.c`, `lsp_init_from_db.c`, `client_reconnect.c`) — LSP/client/tests/bridge link it, WT binary does not
+- Bitcoin Core-style release process documented in `docs/release-process.md`
+- testnet4 fee floor enforcement (0.1 sat/vB minimum across all runner scripts)
+- `setsid` wrap for testnet4 long-runners to avoid systemd-logind SIGTERM on SSH session end
+- Sanitizer regtest job (ASan + TSan) catches leaks in wire-ceremony paths
+- 17-script regtest serial sweep on every pre-tag main
+
+## Operator tooling
+
+- New `docs/mainnet-runbook.md` (full operator runbook)
+- New `docs/release-process.md` (release maintainer checklist)
+- New `docs/watchtower-trustless-schema.md` (trust-model design)
+- New `docs/deployment-coordination.md` (multi-party deployment)
+- New `docs/poison-tx.md` (poison TX semantics)
+- Setsid-wrapped runner scripts for testnet4 long-runners
+- Stderr separation + core dumps + predeath snapshot in testnet4 runners
+- `build-release` defaults for long-runners (avoid ASan instability)
+- Sat recovery sweep tooling (`recover_exhibition_funds.py`)
 
 ---
 
@@ -42,109 +227,52 @@ The wt.db schema is single-table (`wt_watches`) with a `watch_kind` discriminant
 
 ### Watchtower CLI: `--db` removed
 
-The standalone watchtower no longer accepts `--db PATH`.  Passing it errors with:
-
 ```
 Error: --db is no longer a valid flag for the standalone watchtower.
        v0.2.0 ships trustless mode as the only mode.  Use --wt-db PATH instead.
 ```
 
-`--inspect-db` is also removed.  Use `sqlite3` directly on `wt.db` for inspection; the schema is documented at `docs/watchtower-trustless-schema.md`.
+`--inspect-db` also removed. Use `sqlite3 wt.db` directly.
 
 ### LSP: `--wt-db` required on mainnet
 
-If you launch `superscalar_lsp --network mainnet`, you must also pass `--wt-db PATH`.  Without it, the LSP cannot populate the trustless watchtower binary, so any mainnet deployment would have zero breach response capability.  Hard error:
-
 ```
 Error: mainnet requires --wt-db for the trustless watchtower.
-       v0.2.0 removed the legacy --db-only watchtower mode; the LSP
-       must populate wt.db so a standalone trustless WT can broadcast
-       penalty TXs on breach without ever opening lsp.db.
+       v0.2.0 removed the legacy --db-only watchtower mode.
 ```
 
 ### v0.1.x → v0.2.0 migration
 
-For an existing v0.1.x deployment:
+1. On the LSP: add `--wt-db /path/to/wt.db` (any path adjacent to `lsp.db`). Restart.
+2. On the WT: replace `--db /path/to/lsp.db` with `--wt-db /path/to/wt.db`. Restart.
+3. `lsp.db` stays — the LSP still uses it for channel state, ceremonies, etc. Only the WT process stops touching it.
 
-1. **On the LSP**, add `--wt-db /path/to/wt.db` to the launch command.  Pick any path adjacent to your `lsp.db`.  Restart the LSP.  It will create `wt.db` on first run and start populating it on every revocation / state advance / force-close.
-2. **On the WT**, replace `--db /path/to/lsp.db` with `--wt-db /path/to/wt.db` (the file the LSP just created).  Restart the WT.
-3. `lsp.db` stays where it is — the LSP still uses it for everything else (channel state, ceremonies, etc.).  Only the WT process stops touching it.
-
-There is no schema migration on lsp.db.  The watchtower-specific tables (`old_commitments*`, etc.) are no longer consumed by the standalone WT but remain written by the LSP for the in-process watchtower path and for future tooling.
+No schema migration required on `lsp.db`.
 
 ---
 
-## What's new (engineer-facing)
+## Validation
 
-### `wt.db` schema v2
+End-to-end PASS on three independent chains:
 
-`include/superscalar/persist_wt.h` declares the `wt_watch_kind_t` enum and the public API.  The schema in `src/persist_wt.c` adds a single `watch_kind` column to `wt_watches` (default 0 for backward compat with Phase 1a data).  In-place v1→v2 migration is run on open.
+- **regtest**: 19/19 acceptance scripts in the serial sweep
+- **signet**: full N=64 PS lifecycle (21 tree-nodes confirmed at 0.1 sat/vB)
+- **testnet4**: full N=64 PS lifecycle (21 tree-nodes confirmed under live testnet4 attack conditions)
 
-### LSP-side adapters
-
-`include/superscalar/lsp_wt.h` exposes 4 helpers, one per kind:
-
-- `lsp_wt_register_factory_node_watch` (existing)
-- `lsp_wt_register_subfactory_node_watch` (new)
-- `lsp_wt_register_commitment_watch` (new)
-- `lsp_wt_register_force_close_watch` (new)
-
-Each hex-encodes the signed response TX and calls `persist_wt_register_watch` with the matching `watch_kind`.
-
-### Wired callsites
-
-All production paths that previously registered with the legacy in-memory watchtower now also write to wt.db:
-
-- Leaf advance, Tier B advance, leaf realloc (Phase 1b — pre-existing)
-- Sub-factory chain advance, single + multi-input (new in this release)
-- 7 channel-revocation sites (lsp_channels.c × 5 + lsp_bridge.c × 2) — wired via a single-edit inside `watchtower_watch_revoked_commitment` since the penalty TX was already pre-built there (#208 A3.1b)
-- Force-close HTLC sweep at ln_dispatch.c, with per-HTLC sweep TX build via `channel_build_htlc_timeout_tx`
-
-### WT-side hydration
-
-`watchtower_hydrate_from_wt_db` walks all 4 watch kinds via `persist_wt_list_watches_by_kind`, logs per-kind counters at startup.
-
-### Link surgery
-
-5 secret-reader functions moved out of `src/persist.c` into `src/persist_secrets.c`.  The auto-settle helper moved out of `src/watchtower.c` into `src/watchtower_autosettle.c` (called via function-pointer registered by the LSP).  Two LSP-specific helpers (`lsp_channels_init_from_db`, `client_run_reconnect`) moved out of their original TUs into `src/lsp_init_from_db.c` and `src/client_reconnect.c` to break transitive symbol pulls from the WT binary's link set.  All 4 new TUs go into a new CMake static library `superscalar_secrets` which the LSP/client/tests link but the WT binary does not.
-
-### Latent bug fixes (along the way)
-
-- `superscalar_watchtower.c`: 3 NULL-deref sites in trustless mode (`persist_close(&db)` and `persist_log_broadcast(&db, ...)` on uninitialized `db`; unconditional `printf(... db_path)`) — all guarded.
+Plus the per-feature regtest suites (PTLC × 5, cheat-engine × 7, crash-drill × 16, sub-factory × 4, watchtower trustless × 3).
 
 ---
 
-## What stayed the same
-
-- Channel protocol (BOLT-1/2/4/9/11/12) — no wire changes for clients.
-- Sub-factory ceremony semantics — unchanged.
-- MuSig2 stateless signer (introduced in 0.1.x late updates) — unchanged.
-- `superscalar_client` binary — unchanged from operator perspective.
-
----
-
-## What's coming in v0.3
-
-- `lsp.db` cleanup: drop the watchtower-only tables (`old_commitments*`, etc.) since the standalone WT no longer needs them.  Schema migration with operator notice.
-- Further library split: separate `libsuperscalar_lsp_only` and `libsuperscalar_client_only` from the shared core to reduce binary surface for each tool.
-
----
-
-## Verification on your own deployment
-
-After upgrading to v0.2.0, verify the trustless guarantee on your binary:
+## Verifying your install
 
 ```
 $ nm -D --defined-only $(which superscalar_watchtower) \
     | grep -E "persist_load_(basepoints|revocations_flat|channel_for_watchtower|flat_secrets|commitment_sig)"
 ```
 
-Expected output: **empty**.  Any line in the output is a regression — file an issue.
+Expected output: **empty**. Any line in the output is a regression — file an issue.
 
-Smoke-test the trustless WT against a real chain (regtest):
-
+Smoke-test on regtest:
 ```
 $ bash tools/test_regtest_watchtower_trustless.sh
 ```
-
-Should print 6 PASS checks (A-E plus Phase 4 invariants).
