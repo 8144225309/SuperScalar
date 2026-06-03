@@ -1446,6 +1446,346 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
    close) and the spendability gauntlet at its chosen arity. Separate
    wallets + port offsets prevent sequential collision. */
 
+/* ---- Scale payment ring: N-client real-sats end-to-end (#311) ----
+   Generalizes run_multi_payment_for_arity to arbitrary N. Builds a PS factory
+   with N channels on regtest, funds it on-chain, then routes a uniform payment
+   RING -- client j pays client (j+1)%N (relayed j->LSP->(j+1)) the same amount,
+   so every one of the N channels carries a real HTLC. A uniform ring nets to
+   zero per channel, so each channel must return EXACTLY to its origin balance.
+   Finally it cooperatively closes on-chain, verifies every output amount, and
+   sweeps each output with its rightful key (the spendability gauntlet).
+
+   N comes from $SCALE_N (default 8) so the default ctest run stays cheap; run
+   SCALE_N=64 / SCALE_N=128 by hand against regtest for the scale proof. */
+static void scale_derive_sk(unsigned char sk[32], size_t idx) {
+    /* distinct small scalars; idx 0 = LSP, 1..N = clients. Same scheme as
+       test_inproc_scale (proven through the creation ceremony past 250). */
+    memset(sk, 0, 32);
+    sk[31] = (unsigned char)((idx % 250) + 1);
+    sk[0]  = 0x80;
+    sk[1]  = (unsigned char)(idx / 250);
+}
+
+static int run_scale_payment_ring(int n_clients, int arity_code,
+                                  const char *wallet_label, int port_bias) {
+    size_t N = (size_t)n_clients;
+    size_t n_signers = N + 1;            /* LSP + N clients */
+    const uint64_t amt = 1000;           /* per-hop, > CHANNEL_DUST_LIMIT_SATS */
+
+    regtest_t rt;
+    if (!regtest_init(&rt)) { printf("  FAIL: regtest not available\n"); return 0; }
+    if (!regtest_create_wallet(&rt, wallet_label)) {
+        char loadparam[128];
+        snprintf(loadparam, sizeof(loadparam), "\"%s\"", wallet_label);
+        char *lr = regtest_exec(&rt, "loadwallet", loadparam);
+        if (lr) free(lr);
+        strncpy(rt.wallet, wallet_label, sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = test_ctx();
+
+    /* N+1 deterministic keys (VLAs -> no heap bookkeeping). */
+    unsigned char sk_arr[n_signers][32];
+    secp256k1_keypair kps[n_signers];
+    secp256k1_pubkey  pks[n_signers];
+    for (size_t i = 0; i < n_signers; i++) {
+        scale_derive_sk(sk_arr[i], i);
+        if (!secp256k1_keypair_create(ctx, &kps[i], sk_arr[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Funding SPK = BIP-341 taptweak of the (N+1)-way MuSig aggregate. */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, n_signers);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    /* Derive the bech32m funding address via the node (rawtr descriptor). */
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    if (!desc_result) return 0;
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    if (!dstart) { free(desc_result); return 0; }
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen); checksummed_desc[dlen] = '\0';
+    free(desc_result);
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    if (!addr_result) return 0;
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen); fund_addr[alen] = '\0';
+    free(addr_result);
+
+    /* Fund on chain. ~100k sat/channel: ample over dust + the 1000-sat hops. */
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    double fund_btc = 0.001 * (double)N;
+    if (fund_btc < 0.01) fund_btc = 0.01;
+    /* Pull funding from the faucet wallet: at this chain height the regtest
+       subsidy has degraded (150-block halvings), so freshly-mined coinbases are
+       too small. Mine only as a fallback. */
+    if (!regtest_fund_from_faucet(&rt, fund_btc + 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    if (regtest_get_balance(&rt) < fund_btc) {
+        printf("  FAIL: wallet underfunded (%.4f < %.4f BTC) -- faucet low?\n",
+               regtest_get_balance(&rt), fund_btc);
+        return 0;
+    }
+    char funding_txid_hex[65];
+    if (!regtest_fund_address(&rt, fund_addr, fund_btc, funding_txid_hex)) {
+        printf("  FAIL: fund factory address\n"); return 0;
+    }
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256]; size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 4; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v, &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) { funding_vout = v; break; }
+        funding_amount = 0;
+    }
+    if (funding_amount == 0) { printf("  FAIL: funding output not found\n"); return 0; }
+
+    /* Build the payment ring scripts. p_j = 32 bytes of (j%255+1); h_j=sha256(p_j).
+       Sender j carries h_j; receiver (j+1)%N reveals p_j.
+         client 0:         SEND((1),h_0),  RECV(p_{N-1})
+         client j(1..N-1): RECV(p_{j-1}),  SEND((j+1)%N,h_j)
+       Client 0 is the only SEND-first node; it kicks the cascade, everyone
+       else is RECV-first so the ring closes without deadlock. */
+    unsigned char preimg[N][32];
+    unsigned char phash[N][32];
+    scripted_action_t acts[N][2];
+    multi_payment_data_t mp[N];
+    for (size_t j = 0; j < N; j++) {
+        memset(preimg[j], (int)((j % 255) + 1), 32);
+        sha256(preimg[j], 32, phash[j]);
+    }
+    for (size_t j = 0; j < N; j++) {
+        size_t prev = (j + N - 1) % N;
+        memset(acts[j], 0, sizeof(acts[j]));
+        if (j == 0) {
+            acts[j][0].type = ACTION_SEND;
+            acts[j][0].dest_client = (int)((j + 1) % N);
+            acts[j][0].amount_sats = amt;
+            memcpy(acts[j][0].payment_hash, phash[j], 32);
+            acts[j][1].type = ACTION_RECV;
+            memcpy(acts[j][1].preimage, preimg[prev], 32);
+        } else {
+            acts[j][0].type = ACTION_RECV;
+            memcpy(acts[j][0].preimage, preimg[prev], 32);
+            acts[j][1].type = ACTION_SEND;
+            acts[j][1].dest_client = (int)((j + 1) % N);
+            acts[j][1].amount_sats = amt;
+            memcpy(acts[j][1].payment_hash, phash[j], 32);
+        }
+        mp[j].actions = acts[j];
+        mp[j].n_actions = 2;
+        mp[j].current = 0;
+    }
+
+    int port = 19900 + (getpid() % 1000) + port_bias;
+
+    /* Bind+listen BEFORE forking so no client can race the listen socket
+       (connect-before-listen), and raise the rate-limiter so N same-IP
+       handshakes aren't throttled (mirrors the daemon's --max-handshakes;
+       without it the harness throttles past ~4 and clients fail their noise
+       handshake at N>=64 -- the exact symptom test_inproc_scale hit). */
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, N);
+    /* Actually listen NOW. wire_listen lives inside lsp_accept_clients, which
+       only runs after the fork, so without this the clients race the listen
+       socket; pre-listening here closes that race for every client regardless
+       of stagger (accept_clients sees a valid listen_fd and reuses it). */
+    lsp->listen_fd = wire_listen(NULL, port);
+    if (lsp->listen_fd < 0) { free(lsp); return 0; }
+    lsp->accept_timeout_sec = 120;  /* defensive: surface a stuck client as an
+                                       error rather than blocking forever */
+    lsp->max_connections = (int)N;
+    rate_limiter_init(&lsp->rate_limiter, 100000, 60, (int)N + 8);
+
+    /* Fork N client children. */
+    pid_t child[N];
+    for (size_t c = 0; c < N; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* monotonic connect stagger (~40ms/client) so clients arrive near
+               the LSP's sequential accept rate and don't time out while queued. */
+            usleep((useconds_t)c * 40000);
+            secp256k1_context *cctx = test_ctx();
+            secp256k1_keypair ckp;
+            unsigned char csk[32];
+            scale_derive_sk(csk, c + 1);
+            if (!secp256k1_keypair_create(cctx, &ckp, csk)) _exit(1);
+            int ok = client_run_with_channels(cctx, &ckp, "127.0.0.1", port,
+                                              multi_payment_client_cb, &mp[c],
+                                              NULL, NULL);
+            secp256k1_context_destroy(cctx);
+            _exit(ok ? 0 : 1);
+        }
+        if (pid < 0) {
+            fprintf(stderr, "fork failed at client %zu\n", c);
+            for (size_t k = 0; k < c; k++) { kill(child[k], SIGKILL); waitpid(child[k], NULL, 0); }
+            free(lsp);
+            return 0;
+        }
+        child[c] = pid;
+    }
+
+    /* Parent: LSP side (socket already listening from before the fork). */
+    int lsp_ok = 1;
+
+    if (!lsp_accept_clients(lsp)) { fprintf(stderr, "LSP: accept clients failed\n"); lsp_ok = 0; }
+
+    if (lsp_ok && (arity_code == FACTORY_ARITY_1 || arity_code == FACTORY_ARITY_PS ||
+                   arity_code == FACTORY_ARITY_2))
+        lsp->factory.leaf_arity = (factory_arity_t)arity_code;
+
+    if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
+                                            fund_spk, 34, 10, 4, 0)) {
+        fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
+    }
+    if (lsp_ok)
+        printf("  factory: %zu nodes, %d leaves, arity=%d\n",
+               lsp->factory.n_nodes, lsp->factory.n_leaf_nodes, (int)lsp->factory.leaf_arity);
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory, sk_arr[0], N)) {
+        fprintf(stderr, "LSP: channel init failed\n"); lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) {
+        fprintf(stderr, "LSP: basepoint exchange failed\n"); lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) {
+        fprintf(stderr, "LSP: send channel_ready failed\n"); lsp_ok = 0;
+    }
+    if (lsp_ok)
+        printf("  all %zu channels reached CHANNEL_READY\n", N);
+
+    /* Snapshot per-channel origin balances (LSP-side) before routing. */
+    uint64_t orig_local[N], orig_remote[N];
+    if (lsp_ok)
+        for (size_t i = 0; i < N; i++) {
+            orig_local[i]  = ch_mgr.entries[i].channel.local_amount;
+            orig_remote[i] = ch_mgr.entries[i].channel.remote_amount;
+        }
+
+    /* Route the ring: N payments x 2 messages each. */
+    if (lsp_ok && !lsp_channels_run_event_loop(&ch_mgr, lsp, (int)(N * 2))) {
+        fprintf(stderr, "LSP: event loop failed\n"); lsp_ok = 0;
+    }
+
+    /* Conservation: a uniform ring returns every channel to its origin. */
+    if (lsp_ok) {
+        size_t drift = 0;
+        for (size_t i = 0; i < N; i++) {
+            channel_t *ch = &ch_mgr.entries[i].channel;
+            if (ch->local_amount != orig_local[i] || ch->remote_amount != orig_remote[i]) {
+                if (drift < 6)
+                    fprintf(stderr, "  ch %zu drift: local %llu->%llu remote %llu->%llu\n", i,
+                            (unsigned long long)orig_local[i], (unsigned long long)ch->local_amount,
+                            (unsigned long long)orig_remote[i], (unsigned long long)ch->remote_amount);
+                drift++;
+            }
+        }
+        if (drift) { fprintf(stderr, "  FAIL: %zu/%zu channels drifted (ring must net zero)\n", drift, N); lsp_ok = 0; }
+        else printf("  conservation OK: all %zu channels back to origin after the %zu-hop ring\n", N, N);
+    }
+
+    /* Balance-aware cooperative close, on-chain amount verify, sweep gauntlet. */
+    if (lsp_ok) {
+        uint64_t close_fee = 500;
+        tx_output_t close_outputs[n_signers];
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                          close_outputs, close_fee, NULL, 0);
+        if (n_close != n_signers) { fprintf(stderr, "  close outputs %zu != %zu\n", n_close, n_signers); lsp_ok = 0; }
+        tx_buf_t close_tx; tx_buf_init(&close_tx, 1024 + 64 * n_signers);
+        if (lsp_ok && !lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0)) {
+            fprintf(stderr, "  cooperative close failed\n"); lsp_ok = 0;
+        } else if (lsp_ok) {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                if (regtest_get_confirmations(&rt, close_txid) < 1) {
+                    fprintf(stderr, "  close tx not confirmed\n"); lsp_ok = 0;
+                } else {
+                    for (uint32_t v = 0; v < n_signers && lsp_ok; v++) {
+                        uint64_t oc = 0; unsigned char ospk[256]; size_t osl = 0;
+                        regtest_get_tx_output(&rt, close_txid, v, &oc, ospk, &osl);
+                        if (oc != close_outputs[v].amount_sats) {
+                            fprintf(stderr, "  close out %u on-chain %llu != %llu\n", v,
+                                    (unsigned long long)oc, (unsigned long long)close_outputs[v].amount_sats);
+                            lsp_ok = 0;
+                        }
+                    }
+                    if (lsp_ok) printf("  all %zu close outputs verified on-chain\n", n_signers);
+                    if (lsp_ok && !spend_coop_close_gauntlet(ctx, &rt, close_txid, sk_arr, N)) lsp_ok = 0;
+                    else if (lsp_ok) printf("  all %zu close outputs swept by rightful owners\n", n_signers);
+                }
+            } else { fprintf(stderr, "  broadcast close tx failed\n"); lsp_ok = 0; }
+        }
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+
+    int all_children_ok = 1;
+    for (size_t c = 0; c < N; c++) {
+        int status;
+        waitpid(child[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            if (all_children_ok)
+                fprintf(stderr, "  client %zu exited %d\n", c,
+                        WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            all_children_ok = 0;
+        }
+    }
+
+    secp256k1_context_destroy(ctx);
+
+    TEST_ASSERT(lsp_ok, "scale ring: LSP operations");
+    TEST_ASSERT(all_children_ok, "scale ring: all clients completed");
+    return 1;
+}
+
+int test_regtest_scale_payments(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);  /* unbuffered: progress survives a timeout kill */
+    const char *e = getenv("SCALE_N");
+    int n = e ? atoi(e) : 8;
+    if (n < 2) n = 2;
+    if (n > 250) n = 250;
+    printf("=== scale payment ring: N=%d clients, PS arity, uniform 1000-sat ring ===\n", n);
+    return run_scale_payment_ring(n, FACTORY_ARITY_PS, "test_scale_pay", 700);
+}
+
 int test_regtest_multi_payment(void) {
     return run_multi_payment_for_arity(FACTORY_ARITY_2, "test_multi_pay", 0);
 }

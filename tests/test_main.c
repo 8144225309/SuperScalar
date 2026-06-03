@@ -1138,6 +1138,7 @@ extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
 extern int test_regtest_multi_payment_arity1(void);
 extern int test_regtest_multi_payment_arity_ps(void);
+extern int test_regtest_scale_payments(void);
 extern int test_regtest_coop_close_all_arities(void);
 extern int test_regtest_force_close_to_remote(void);
 extern int test_regtest_force_close_to_local(void);
@@ -3896,6 +3897,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_multi_payment);
     RUN_TEST(test_regtest_multi_payment_arity1);
     RUN_TEST(test_regtest_multi_payment_arity_ps);
+    RUN_TEST(test_regtest_scale_payments);
 
     printf("\n=== Spendability Gauntlet (All Close Paths × All Arities) ===\n");
     RUN_TEST(test_regtest_coop_close_all_arities);
