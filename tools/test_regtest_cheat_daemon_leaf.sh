@@ -141,7 +141,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
     --demo --cheat-daemon-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 PIDS+=($LSP_PID)

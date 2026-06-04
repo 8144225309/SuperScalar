@@ -6,7 +6,7 @@
 # clients holding balance (--lsp-balance-pct 50), routes real HTLC payments
 # through the factory (--demo --payments N), then cooperatively closes and
 # checks conservation.  This is the first time payments are actually moved
-# through a full-size factory — every prior N=64 run was --lsp-balance-pct 100
+# through a full-size factory — every prior N=64 run was --lsp-balance-pct 50
 # --force-close, which creates the tree but routes zero sats.
 #
 # Uses the proven daemon launch pattern from test_testnet4_n64_ps_lifecycle.sh

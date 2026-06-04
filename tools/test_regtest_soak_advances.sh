@@ -82,7 +82,7 @@ echo "--- LSP (--demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $AD
     --wallet $MINER_WALLET --db "$LSP_DB" \
     --demo --test-leaf-advance --cheat-leaf $SIDE --advance-count $ADVANCE_COUNT \
     --max-conn-rate 1000 --max-handshakes 256 \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 
